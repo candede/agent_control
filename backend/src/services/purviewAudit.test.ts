@@ -18,6 +18,11 @@ vi.mock("../db/pool.js", () => ({
   pool: {},
   transaction: vi.fn(() => { throw new Error("Database access is outside the worker unit-test boundary."); }),
 }));
+vi.mock("./agentInvestigations.js", () => ({
+  agentInvestigations: {
+    resolve: vi.fn(() => { throw new Error("Saved inventory reads are outside the audit worker unit-test boundary."); }),
+  },
+}));
 
 const user: AuthenticatedUser = { homeAccountId: "reader-a", tenantId: "tenant-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"], providerRoleIds: [] };
 const filters: PurviewAuditFilters = { presetId: "copilot_interactions", operations: ["CopilotInteraction"], startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(), endDateTime: new Date().toISOString(), userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [] };

@@ -1,327 +1,277 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { inventorySelectionFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { grantRuntime } from "../../scripts/database.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
+import { GraphPackagesClient } from "../services/graphPackages.js";
+import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRuntime.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
+import { StreamedInventory } from "../services/streamedInventory.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import { packageEnrichmentMigrationSql, verifyPackageEnrichmentSchema } from "./packageEnrichmentSchema.js";
-import { PackageInventoryRepository, type PackageDataScope } from "./packageInventory.js";
-import { migrations } from "./schema.js";
-import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
+import { PackageRefreshJobs, type PackageDataScope } from "./packageRefreshJobs.js";
+import { verifySchema } from "./schema.js";
 
-let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let repository: PackageInventoryRepository;
-beforeAll(async () => {
-  fixture = await testDatabase();
-  if (!migrations.some(step => String(step.sql) === packageEnrichmentMigrationSql)) {
-    await fixture.operator.query(packageEnrichmentMigrationSql);
-    await grantRuntime(fixture.operator);
-  }
-  repository = new PackageInventoryRepository(fixture.runtime);
+let fixture: Awaited<ReturnType<typeof testDatabase>>, jobs: PackageRefreshJobs;
+const selections: Awaited<ReturnType<typeof inventorySelectionFixture>>[] = [];
+beforeAll(async () => { fixture = await testDatabase(); jobs = new PackageRefreshJobs(fixture.runtime); });
+afterEach(async () => {
+  for (const selected of selections.splice(0)) await selected.queries.selections.invalidate(selected.selection.id, selected.identity);
 });
 afterAll(async () => { await fixture?.close(); });
 const scope = (): PackageDataScope => ({ tenantId: "detail-tenant", principalId: randomUUID() });
-function summary(id = "one", version = "1") {
-  return allowlistedPackage({
-    id, displayName: `Catalog ${id}`, isBlocked: false, version,
-    lastModifiedDateTime: "2026-09-24T08:00:00Z", manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    availableTo: "some", deployedTo: "none",
-  });
+const summary = (id = "one", version = "1") => allowlistedPackage({
+  id, displayName: `Catalog ${id}`, isBlocked: false, version, lastModifiedDateTime: "2026-09-24T08:00:00Z",
+  manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", availableTo: "some", deployedTo: "none",
+});
+const detail = (id = "one", version = "1"): CopilotPackageDetail => ({
+  ...summary(id, version), displayName: "Detail name", longDescription: "Saved detail description",
+  allowedUsersAndGroups: [{ resourceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", resourceType: "user" }],
+  elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "element", definition: "{}" }] }],
+});
+type Job = NonNullable<Awaited<ReturnType<PackageRefreshJobs["getJob"]>>>;
+async function collect(owner: PackageDataScope, job: Job, values: CopilotPackageDetail[], options: {
+  beforeFetch?: () => Promise<void>; observedAt?: Date; failureId?: string;
+} = {}) {
+  if (values.length > 25) throw new Error("tiny_enrichment_provider_fixture_limit");
+  const provider = new GraphPackagesClient(async url => {
+    await options.beforeFetch?.();
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith("/packages")) return Response.json({ value: values, "@odata.count": values.length });
+    const id = decodeURIComponent(path.split("/").at(-1)!);
+    if (id === options.failureId) return Response.json({ error: { code: "unavailable" } }, { status: 503 });
+    const value = values.find(item => item.id === id);
+    return value ? Response.json(value) : Response.json({ error: { code: "notFound" } }, { status: 404 });
+  }, { minimumReadIntervalMs: 0, maxAttempts: 1 });
+  const input = await inventoryJobInput(fixture.runtime, owner, "packages", job.id);
+  if (options.observedAt) input.observedAt = options.observedAt;
+  const stream = new StreamedInventory(fixture.runtime, provider);
+  const hooks = { authorize: async () => {}, completeJob: completeInventoryJob(input, "packages") };
+  return job.scopeKind === "broad" ? stream.graphCatalog(input, "synthetic", hooks)
+    : stream.exactJob(input, "synthetic", job.autoDetails, hooks);
 }
-function detail(id = "one", version = "1"): CopilotPackageDetail {
-  return {
-    ...summary(id, version), displayName: "Detail name", longDescription: "Saved detail description", identityDetailsCollected: true,
-    allowedUsersAndGroups: [{ resourceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", resourceType: "user" }],
-    elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "element", definition: "{}" }] }],
-  };
+async function publish(owner: PackageDataScope, values: CopilotPackageDetail[], requestedIds?: string[]) {
+  const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated",
+    idempotencyKey: randomUUID(), requestedIds });
+  expect(await jobs.markRunning(owner, job.id)).toBe(true);
+  return collect(owner, job, values);
 }
-async function publish(owner: PackageDataScope, values: CopilotPackageDetail[], catalogOnly = true, requestedIds?: string[]) {
-  const job = await repository.submit(owner, {
-    authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(), catalogOnly, requestedIds,
-  });
-  await repository.markRunning(owner, job.id);
-  return repository.publish(owner, job.id, { packages: values, totalRecords: values.length, pages: 1 });
-}
-async function enrich(owner: PackageDataScope, values: CopilotPackageDetail[]) {
-  const job = (await repository.claimDueDetails(owner, owner.principalId))!;
+async function claim(owner: PackageDataScope) {
+  const job = await jobs.claimDueDetails(owner, owner.principalId);
   expect(job).not.toBeNull();
-  await repository.markRunning(owner, job.id, true);
-  await repository.publish(owner, job.id, { packages: values, totalRecords: values.length, pages: 1, detailFailures: [] });
-  return job;
+  expect(await jobs.markRunning(owner, job!.id, true)).toBe(true);
+  return job!;
+}
+async function read(owner: PackageDataScope, id = "one") {
+  const selected = await inventorySelectionFixture(fixture.runtime, owner, {}, "packages");
+  selections.push(selected);
+  return { ...selected, detail: await selected.queries.packageDetail(selected.selection.id, selected.identity, id),
+    children: await selected.queries.children(selected.selection.id, selected.identity, id, { kind: "element", limit: 50 }) };
+}
+async function targetIds(owner: PackageDataScope, job: Job) {
+  const selected = await inventorySelectionFixture(fixture.runtime, owner, {}, "packages");
+  selections.push(selected);
+  return (await jobs.targets(owner, selected.identity, job.id, { limit: 20 })).value.map(value => value.id);
 }
 
-describe("persisted catalog and automatic detail enrichment", () => {
-  it.each(["interaction_required", "missing_permission"])(
-    "backs off %s across the whole detail lane, not just the failed twenty targets", async code => {
-      const owner = scope();
-      await publish(owner, Array.from({ length: 25 }, (_, index) => summary(`auth-${index}`)));
-      const first = (await repository.claimDueDetails(owner, owner.principalId))!;
-      await repository.markFailed(owner, first.id, code, "Authorization unavailable.");
-      await fixture.operator.query(`UPDATE package_refresh_jobs SET updated_at=clock_timestamp()-interval '1 minute'
-        WHERE id=$1`, [first.id]);
-      expect(await repository.claimDueDetails(owner, owner.principalId)).toBeNull();
-      const signedInAt = Date.now();
-      const retry = await repository.claimDueDetails(owner, owner.principalId, signedInAt);
-      if (code === "missing_permission") {
-        expect(retry).toBeNull();
-      } else {
-        expect(retry).not.toBeNull();
-        await repository.markFailed(owner, retry!.id, code, "MFA is still required.");
-        expect(await repository.claimDueDetails(owner, owner.principalId, signedInAt)).toBeNull();
-      }
-    },
-  );
-
-  it("verifies migration contracts and grants for the restricted runtime", async () => {
-    await expect(verifyPackageEnrichmentSchema(fixture.runtime)).resolves.toBeUndefined();
-    await expect(fixture.runtime.query("TRUNCATE package_detail_cache")).rejects.toThrow();
-  });
-
-  it("returns only the latest retained, authorized automatic detail history in every state", async () => {
+describe("streamed catalog and bounded automatic detail enrichment", () => {
+  it.each(["interaction_required", "missing_permission"])("backs off %s across the detail lane rather than trying another twenty targets", async code => {
     const owner = scope();
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toBeNull();
-    await publish(owner, [summary()]);
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toBeNull();
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({
-      id: automatic.id, status: "waiting_authorization", autoDetails: true,
-    });
-    await repository.markRunning(owner, automatic.id, true);
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({ id: automatic.id, status: "running" });
-    await repository.markFailed(owner, automatic.id, "provider_error", "Retry later.");
-    await publish(owner, [summary()]);
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({
-      id: automatic.id, status: "failed", errorCode: "provider_error",
-    });
-    expect(await repository.latestAutomaticDetailsJob(owner, "other-reader")).toBeNull();
-    expect(await repository.latestAutomaticDetailsJob({ ...owner, principalId: "other-reader" }, owner.principalId)).toBeNull();
+    await publish(owner, Array.from({ length: 25 }, (_, index) => summary(`auth-${index}`)));
+    const first = await claim(owner);
+    await jobs.markFailed(owner, first.id, code, "Authorization unavailable.");
+    await fixture.operator.query("UPDATE package_refresh_jobs SET updated_at=clock_timestamp()-interval '1 minute' WHERE id=$1", [first.id]);
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+    const signedInAt = Date.now(), retry = await jobs.claimDueDetails(owner, owner.principalId, signedInAt);
+    if (code === "missing_permission") expect(retry).toBeNull();
+    else {
+      expect(retry).not.toBeNull();
+      await jobs.markFailed(owner, retry!.id, code, "MFA is still required.");
+      expect(await jobs.claimDueDetails(owner, owner.principalId, signedInAt)).toBeNull();
+    }
   });
-
-  it("distinguishes unknown broad data from explicitly collected empty and legacy exact detail proof", async () => {
-    const unknown = scope();
-    await publish(unknown, [summary()], false);
-    const value = (await repository.get(unknown, "one"))!.package!;
-    expect(value).not.toHaveProperty("identityDetailsCollected");
-    expect(value.detailFreshness).toEqual({ state: "missing", observedAt: null, expiresAt: null });
-    const unified = await repository.readUnifiedSource(unknown);
-    expect(unified.packages[0]).not.toHaveProperty("identityDetailsCollected");
-    expect(unified.observations.one).not.toHaveProperty("identityDetails");
-    const cache = await fixture.runtime.query<{ package_data: unknown; observed_at: Date | null }>(
-      "SELECT package_data,observed_at FROM package_detail_cache WHERE tenant_id=$1 AND principal_id=$2", [unknown.tenantId, unknown.principalId]);
-    expect(cache.rows[0]).toEqual({ package_data: null, observed_at: null });
-    expect(await repository.claimDueDetails(unknown, unknown.principalId)).not.toBeNull();
-
-    const empty = scope();
-    await publish(empty, [{ ...summary(), identityDetailsCollected: true }], false);
-    expect((await repository.get(empty, "one"))!.package).toMatchObject({
-      identityDetailsCollected: true, detailFreshness: { state: "fresh" },
-    });
-    expect((await repository.get(empty, "one"))!.package).not.toHaveProperty("elementDetails");
-
-    const legacyExact = scope();
-    await publish(legacyExact, [summary()], false, ["one"]);
-    expect((await repository.get(legacyExact, "one"))!.package).toMatchObject({
-      identityDetailsCollected: true, detailFreshness: { state: "fresh" },
-    });
-
-    const legacyBroad = scope();
-    const { identityDetailsCollected: _collected, ...legacyDetail } = detail();
-    await publish(legacyBroad, [legacyDetail], false);
-    expect((await repository.get(legacyBroad, "one"))!.package).toMatchObject({
-      identityDetailsCollected: true, elementDetails: legacyDetail.elementDetails, detailFreshness: { state: "fresh" },
-    });
+  it("uses restricted native target storage rather than a second package-detail cache", async () => {
+    await verifySchema(fixture.runtime);
+    expect((await fixture.runtime.query("SELECT to_regclass('package_detail_cache') AS obsolete")).rows[0].obsolete).toBeNull();
+    await expect(fixture.runtime.query("TRUNCATE inventory_refresh_targets")).rejects.toThrow();
   });
-
-  it("deduplicates across repository instances under a database lock and bounds batches to twenty", async () => {
+  it("returns only retained authorized automatic detail history in every state", async () => {
+    const owner = scope();
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId)).toBeNull();
+    await publish(owner, [summary()]);
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId)).toBeNull();
+    const automatic = (await jobs.claimDueDetails(owner, owner.principalId))!;
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId))
+      .toMatchObject({ id: automatic.id, status: "waiting_authorization", autoDetails: true, targetCount: 1 });
+    await jobs.markRunning(owner, automatic.id, true);
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({ id: automatic.id, status: "running" });
+    await jobs.markFailed(owner, automatic.id, "provider_error", "Retry later.");
+    await publish(owner, [summary()]);
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({ id: automatic.id, status: "failed" });
+    expect(await jobs.latestAutomaticDetailsJob(owner, "other-reader")).toBeNull();
+    expect(await jobs.latestAutomaticDetailsJob({ ...owner, principalId: "other-reader" }, owner.principalId)).toBeNull();
+  });
+  it("distinguishes unknown catalog identity from explicitly collected empty exact detail", async () => {
+    const owner = scope();
+    await publish(owner, [summary()]);
+    expect((await read(owner)).detail).toMatchObject({ detailFreshness: { state: "missing", observedAt: null, expiresAt: null } });
+    expect((await read(owner)).detail).not.toHaveProperty("identityDetailsCollected");
+    await publish(owner, [summary()], ["one"]);
+    const exact = await read(owner);
+    expect(exact.detail).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+    expect(exact.children.total).toBe(0);
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+  });
+  it("deduplicates cross-instance claims under the database lock and exposes only a twenty-target page", async () => {
     const owner = scope();
     await publish(owner, Array.from({ length: 23 }, (_, index) => summary(`package-${index}`)));
-    const other = new PackageInventoryRepository(fixture.runtime);
-    const claims = await Promise.all([
-      repository.claimDueDetails(owner, owner.principalId), other.claimDueDetails(owner, owner.principalId),
-    ]);
-    const jobs = claims.filter(job => job !== null);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0]).toMatchObject({ autoDetails: true, catalogOnly: false, scopeKind: "exact" });
-    expect(jobs[0]!.requestedIds).toHaveLength(20);
+    const other = new PackageRefreshJobs(fixture.runtime);
+    const claims = (await Promise.all([jobs.claimDueDetails(owner, owner.principalId),
+      other.claimDueDetails(owner, owner.principalId)])).filter((job): job is Job => job !== null);
+    expect(claims).toHaveLength(1);
+    expect(claims[0]).toMatchObject({ autoDetails: true, scopeKind: "exact", targetCount: 20 });
+    expect(claims[0]).not.toHaveProperty("requestedIds");
+    expect(await targetIds(owner, claims[0])).toHaveLength(20);
   });
-
-  it.each([false, true])("enriches all saved readers without replacing catalog state (sparse details=%s)", async sparse => {
+  it("requires immutable per-target revision hashes for automatic work without exposing them as mutation authority", async () => {
     const owner = scope();
-    const catalog = await publish(owner, [{ ...summary(), isBlocked: true }]);
-    const beforeRevision = await readUnifiedInventoryRevision(owner, fixture.runtime);
+    await publish(owner, [summary()]);
+    const automatic = (await jobs.claimDueDetails(owner, owner.principalId))!;
+    const targets = (await fixture.runtime.query("SELECT catalog_revision_hash FROM inventory_refresh_targets WHERE job_id=$1", [automatic.id])).rows;
+    expect(targets).toEqual([{ catalog_revision_hash: expect.stringMatching(/^[a-f0-9]{64}$/) }]);
+    await expect(fixture.runtime.query(`UPDATE inventory_refresh_targets SET catalog_revision_hash=$2 WHERE job_id=$1`,
+      [automatic.id, "a".repeat(64)])).rejects.toThrow("inventory_detail_target_revision_immutable");
+    await expect(fixture.runtime.query("INSERT INTO inventory_refresh_targets(job_id,ordinal,target_id) VALUES($1,1,'unbound')",
+      [automatic.id])).rejects.toMatchObject({ code: "23514" });
+    expect(automatic).not.toHaveProperty("catalogRevisionHash");
+  });
+  it("does not reset provider backoff on an unchanged catalog but admits a changed revision and prioritizes it above stale evidence", async () => {
+    const owner = scope();
+    const initial = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated",
+      idempotencyKey: randomUUID(), requestedIds: ["changed", "old"] });
+    await jobs.markRunning(owner, initial.id);
+    await collect(owner, initial, [detail("changed"), detail("old")], { observedAt: new Date(Date.now() - 3_601_000) });
+    await publish(owner, [summary("changed", "2"), summary("old"), summary("new")]);
+    const automatic = (await jobs.claimDueDetails(owner, owner.principalId))!;
+    expect(await targetIds(owner, automatic)).toEqual(["changed", "new", "old"]);
+    await jobs.markFailed(owner, automatic.id, "provider_error", "Unavailable.");
+    await publish(owner, [{ ...summary("changed", "2"), displayName: "Only a name changed" }, summary("old"), summary("new")]);
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+    await publish(owner, [summary("changed", "3"), summary("old"), summary("new")]);
+    const changed = (await jobs.claimDueDetails(owner, owner.principalId))!;
+    expect(await targetIds(owner, changed)).toEqual(["changed"]);
+  });
+  it.each([false, true])("enriches selected readers without replacing catalog or control state (sparse=%s)", async sparse => {
+    const owner = scope(), catalog = await publish(owner, [{ ...summary(), isBlocked: true }]);
     const collected = detail();
     if (sparse) delete collected.manifestId;
-    await enrich(owner, [collected]);
-    const afterRevision = await readUnifiedInventoryRevision(owner, fixture.runtime);
-    expect(afterRevision).not.toBe(beforeRevision);
-    const saved = (await repository.get(owner, "one"))!;
-    expect(saved.package).toMatchObject({
-      displayName: "Catalog one", isBlocked: true, longDescription: "Saved detail description",
-      manifestId: summary().manifestId, identityDetailsCollected: true,
-      elementDetails: detail().elementDetails, detailFreshness: { state: "fresh" },
+    const job = await claim(owner);
+    await collect(owner, job, [collected]);
+    const detailed = await jobs.getJob(owner, job.id);
+    const result = await read(owner);
+    expect(result.detail).toMatchObject({ displayName: "Catalog one", isBlocked: true, longDescription: "Saved detail description",
+      manifestId: summary().manifestId, identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+    expect(result.children.total).toBe(1);
+    expect(result.children.value[0].payload).toMatchObject({ id: "element", definition: "{}", elementType: "DeclarativeCopilots" });
+    expect(result.raw.value[0].residual).not.toHaveProperty("elementDetails");
+    await reconcileInventoryFixture(fixture.runtime, owner);
+    const unified = await inventorySelectionFixture(fixture.runtime, owner);
+    selections.push(unified);
+    expect(inventoryPresentation(unified.raw).value[0].observations.packageSnapshots.one).toMatchObject({
+      snapshotId: catalog.baselineId, identityDetails: { snapshotId: detailed!.snapshotId, current: true },
     });
-    expect((await repository.getMany(owner, ["one"]))[0].package).toEqual(saved.package);
-    expect((await repository.list(owner)).value[0]).toEqual(saved.package);
-    const unified = await repository.readUnifiedSource(owner);
-    expect(unified.packages[0]).toEqual(saved.package);
-    expect(unified.observations.one.snapshotId).toBe(catalog.snapshotId);
-    expect(unified.observations.one.identityDetails?.observedAt).toBe(saved.package!.detailFreshness!.observedAt);
-    expect((await repository.listSnapshots(owner)).value).toHaveLength(1);
-    expect(await repository.claimDueDetails(owner, owner.principalId)).toBeNull();
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
   });
-
-  it("lets catalog publication proceed during enrichment and retains independent detail freshness", async () => {
+  it("fences late details after newer catalog state, including remove/re-add with identical markers", async () => {
     const owner = scope();
     await publish(owner, [summary()]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
-    await publish(owner, [{ ...summary(), displayName: "New catalog name", isBlocked: true }]);
-    await repository.publish(owner, automatic.id, { packages: [detail()], totalRecords: 1, pages: 1, detailFailures: [] });
-    expect((await repository.get(owner, "one"))?.package).toMatchObject({
-      displayName: "New catalog name", isBlocked: true, longDescription: "Saved detail description",
-    });
-    const first = (await repository.get(owner, "one"))!.package!.detailFreshness;
-    await publish(owner, [{ ...summary(), displayName: "Newest catalog name" }]);
-    expect((await repository.get(owner, "one"))?.package?.detailFreshness).toEqual(first);
-  });
-
-  it("fences an in-flight read after catalog removal and re-addition, including identical revision markers", async () => {
-    const owner = scope();
-    await publish(owner, [summary()]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
+    const job = await claim(owner);
     await publish(owner, []);
     await publish(owner, [summary()]);
-    await repository.publish(owner, automatic.id, { packages: [detail()], totalRecords: 1, pages: 1, detailFailures: [] });
-    expect((await repository.get(owner, "one"))?.package).not.toHaveProperty("elementDetails");
-    expect((await repository.get(owner, "one"))?.package?.detailFreshness?.state).toBe("missing");
+    await collect(owner, job, [detail()]);
+    const result = await read(owner);
+    expect(result.children.total).toBe(0);
+    expect(result.detail).toMatchObject({ detailFreshness: { state: "missing" } });
+    expect(result.detail).not.toHaveProperty("identityDetailsCollected", true);
   });
-
-  it("prioritizes changed or missing detail over stale hourly refresh and fences the old revision", async () => {
-    const owner = scope();
-    await publish(owner, [summary("old"), summary("changed")]);
-    await enrich(owner, [detail("old"), detail("changed")]);
-    await fixture.operator.query(`UPDATE package_detail_cache SET next_attempt_at=clock_timestamp()-interval '1 hour',
-      observed_at=clock_timestamp()-interval '2 hours',expires_at=clock_timestamp()-interval '1 hour'
-      WHERE tenant_id=$1 AND principal_id=$2`, [owner.tenantId, owner.principalId]);
-    await publish(owner, [summary("old"), summary("changed", "2"), summary("new")]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    expect(automatic.requestedIds).toEqual(["changed", "new", "old"]);
-    const row = await fixture.operator.query<{ detail_targets: Array<{ id: string }> }>("SELECT detail_targets FROM package_refresh_jobs WHERE id=$1", [automatic.id]);
-    expect(row.rows[0].detail_targets.map(value => value.id)).toEqual(["changed", "new", "old"]);
-    expect((await repository.get(owner, "changed"))?.package?.detailFreshness?.state).toBe("missing");
-  });
-
-  it.each([false, true])("withdraws cached identity on successful omitted metadata (exact=%s) and on automatic 404", async exact => {
+  it("retains compatible detail freshness across later catalog names while a changed revision becomes due immediately", async () => {
     const owner = scope();
     await publish(owner, [summary()]);
-    await enrich(owner, [detail()]);
-    await publish(owner, [{ ...summary(), identityDetailsCollected: true }], false, exact ? ["one"] : undefined);
-    await publish(owner, [summary()]);
-    expect((await repository.get(owner, "one"))?.package).not.toHaveProperty("elementDetails");
-    await fixture.operator.query("UPDATE package_detail_cache SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2", [owner.tenantId, owner.principalId]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
-    await repository.publish(owner, automatic.id, {
-      packages: [], totalRecords: 0, pages: 1, detailFailures: [{ id: "one", missing: true, errorCode: "not_found" }],
-    });
-    const saved = (await repository.get(owner, "one"))!;
-    expect(saved.package?.detailFreshness?.state).toBe("invalidated");
-    expect(saved.package).not.toHaveProperty("elementDetails");
-    expect((await repository.readUnifiedSource(owner)).observations.one).not.toHaveProperty("identityDetails");
+    await collect(owner, await claim(owner), [detail()]);
+    const fresh = (await read(owner)).detail.detailFreshness;
+    await publish(owner, [{ ...summary(), displayName: "Newest catalog", isBlocked: true }]);
+    expect((await read(owner)).detail).toMatchObject({ displayName: "Newest catalog", isBlocked: true, detailFreshness: fresh });
+    await publish(owner, [summary("one", "2"), summary("new")]);
+    const changed = await jobs.claimDueDetails(owner, owner.principalId);
+    expect(changed).not.toBeNull();
+    expect(await targetIds(owner, changed!)).toEqual(["new", "one"]);
+    expect((await read(owner)).detail.detailFreshness?.state).toBe("invalidated");
   });
-
-  it("retains stale descriptive data but withdraws expired identity evidence and changes the unified revision", async () => {
+  it("withdraws omitted exact identity children and preserves that explicit emptiness through a later catalog", async () => {
+    const owner = scope();
+    await publish(owner, [detail()], ["one"]);
+    expect((await read(owner)).children.total).toBe(1);
+    await publish(owner, [summary()], ["one"]);
+    await publish(owner, [summary()]);
+    const result = await read(owner);
+    expect(result.children.total).toBe(0);
+    expect(result.detail).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+  });
+  it("publishes no partial detail stage after a provider failure and truthfully pages unpublished targets", async () => {
+    const owner = scope();
+    const root = await publish(owner, [summary("one"), summary("two")]);
+    const automatic = await claim(owner);
+    await expect(collect(owner, automatic, [detail("one"), detail("two")], { failureId: "two" })).rejects.toThrow();
+    await jobs.markFailed(owner, automatic.id, "provider_error", "No complete detail stage was published.");
+    const first = await read(owner);
+    expect(first.detail.detailFreshness?.state).toBe("missing");
+    expect((await read(owner, "two")).detail.detailFreshness?.state).toBe("missing");
+    expect((await fixture.runtime.query("SELECT baseline_id,revision FROM inventory_roots WHERE scope_id=$1 AND current", [root.scopeId])).rows)
+      .toEqual([{ baseline_id: root.baselineId, revision: root.revision }]);
+    const page = await jobs.targets(owner, first.identity, automatic.id, { limit: 20 });
+    expect(page.value).toMatchObject([{ id: "one", status: "observed_unpublished" }, { id: "two", status: "failed" }]);
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+    await fixture.operator.query("UPDATE package_refresh_jobs SET updated_at=clock_timestamp()-interval '61 minutes' WHERE id=$1", [automatic.id]);
+    const retry = await jobs.claimDueDetails(owner, owner.principalId);
+    expect(retry).not.toBeNull();
+    expect(await targetIds(owner, retry!)).toEqual(["one", "two"]);
+  });
+  it("does not invent success or remove catalog membership on an automatic detail 404", async () => {
+    const owner = scope(), root = await publish(owner, [summary()]);
+    const automatic = await claim(owner);
+    await expect(collect(owner, automatic, [])).rejects.toMatchObject({ status: 404 });
+    await jobs.markFailed(owner, automatic.id, "not_found", "The detail endpoint did not return the requested package.");
+    expect((await read(owner)).detail).toMatchObject({ id: "one", detailFreshness: { state: "missing" } });
+    expect((await fixture.runtime.query("SELECT revision FROM inventory_roots WHERE scope_id=$1 AND current", [root.scopeId])).rows[0].revision)
+      .toBe(root.revision);
+    expect(await jobs.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({ status: "failed", errorCode: "not_found" });
+  });
+  it("backs off interrupted expired work without resuming an unowned provider request", async () => {
     const owner = scope();
     await publish(owner, [summary()]);
-    await enrich(owner, [detail()]);
-    const before = await readUnifiedInventoryRevision(owner, fixture.runtime);
-    await fixture.operator.query("UPDATE package_detail_cache SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2", [owner.tenantId, owner.principalId]);
-    const saved = (await repository.get(owner, "one"))!.package!;
-    expect(saved).toMatchObject({ longDescription: "Saved detail description", detailFreshness: { state: "stale" } });
-    expect(saved).not.toHaveProperty("identityDetailsCollected");
-    expect((await repository.readUnifiedSource(owner)).observations.one).not.toHaveProperty("identityDetails");
-    expect(await readUnifiedInventoryRevision(owner, fixture.runtime)).not.toBe(before);
-  });
-
-  it("backs off failures and expired restart leases instead of resuming unowned provider work", async () => {
-    const owner = scope();
-    await publish(owner, [summary()]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
-    await repository.recoverInterrupted();
-    expect(await repository.getJob(owner, automatic.id)).toMatchObject({ status: "running", autoDetails: true });
+    const automatic = await claim(owner);
+    await jobs.recoverInterrupted();
+    expect(await jobs.getJob(owner, automatic.id)).toMatchObject({ status: "running", autoDetails: true });
     await fixture.operator.query("UPDATE package_refresh_jobs SET deadline_at=clock_timestamp()-interval '1 second' WHERE id=$1", [automatic.id]);
-    expect(await repository.claimDueDetails(owner, owner.principalId)).toBeNull();
-    expect(await repository.getJob(owner, automatic.id)).toMatchObject({ status: "failed" });
-    const cached = await fixture.runtime.query<{ failure_count: number; future: boolean }>(`SELECT failure_count,next_attempt_at>clock_timestamp() AS future
-      FROM package_detail_cache WHERE tenant_id=$1 AND principal_id=$2`, [owner.tenantId, owner.principalId]);
-    expect(cached.rows[0]).toEqual({ failure_count: 1, future: true });
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+    expect(await jobs.getJob(owner, automatic.id)).toMatchObject({ status: "failed", errorCode: "package_refresh_expired" });
   });
-
-  it("publishes successful details independently and retries only failed targets after backoff", async () => {
-    const owner = scope();
-    await publish(owner, [summary("one"), summary("two")]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
-    await repository.publish(owner, automatic.id, {
-      packages: [detail("one")], totalRecords: 1, pages: 2,
-      detailFailures: [{ id: "two", missing: false, errorCode: "provider_network_error" }],
-    });
-    expect((await repository.get(owner, "one"))?.package?.detailFreshness?.state).toBe("fresh");
-    expect((await repository.get(owner, "two"))?.package?.detailFreshness?.state).toBe("missing");
-    expect(await repository.getJob(owner, automatic.id)).toMatchObject({
-      status: "failed", errorCode: "package_detail_read_failed", message: expect.stringContaining("1 deferred"),
-    });
-    const counts = await fixture.runtime.query<{ native_id: string; failure_count: number }>(`SELECT native_id,failure_count
-      FROM package_detail_cache WHERE tenant_id=$1 AND principal_id=$2 ORDER BY native_id`, [owner.tenantId, owner.principalId]);
-    expect(counts.rows).toEqual([{ native_id: "one", failure_count: 0 }, { native_id: "two", failure_count: 1 }]);
-    expect(await repository.claimDueDetails(owner, owner.principalId)).toBeNull();
-    await fixture.operator.query(`UPDATE package_detail_cache SET next_attempt_at=clock_timestamp()-interval '1 second'
-      WHERE tenant_id=$1 AND principal_id=$2 AND native_id='two'`, [owner.tenantId, owner.principalId]);
-    expect((await repository.claimDueDetails(owner, owner.principalId))?.requestedIds).toEqual(["two"]);
-  });
-
-  it("retains the previous cache and freshness while surfacing automatic read failures", async () => {
+  it("invalidates old detail selections during clean resync and cannot reuse cleared identity", async () => {
     const owner = scope();
     await publish(owner, [summary()]);
-    await enrich(owner, [detail()]);
-    const saved = (await repository.get(owner, "one"))!.package;
-    const revision = await readUnifiedInventoryRevision(owner, fixture.runtime);
-    await fixture.operator.query(`UPDATE package_detail_cache SET next_attempt_at=clock_timestamp()-interval '1 second'
-      WHERE tenant_id=$1 AND principal_id=$2`, [owner.tenantId, owner.principalId]);
-    const automatic = (await repository.claimDueDetails(owner, owner.principalId))!;
-    await repository.markRunning(owner, automatic.id, true);
-    await repository.publish(owner, automatic.id, {
-      packages: [], totalRecords: 0, pages: 1,
-      detailFailures: [{ id: "one", missing: false, errorCode: "provider_throttled" }],
-    });
-    expect((await repository.get(owner, "one"))!.package).toEqual(saved);
-    expect(await readUnifiedInventoryRevision(owner, fixture.runtime)).toBe(revision);
-    expect(await repository.latestAutomaticDetailsJob(owner, owner.principalId)).toMatchObject({
-      id: automatic.id, status: "failed", errorCode: "package_detail_read_failed",
-    });
-  });
-
-  it("clears detail generations with the saved-data reset trigger and cannot reuse old cached identity", async () => {
-    const owner = scope();
-    await publish(owner, [summary()]);
-    await enrich(owner, [detail()]);
+    await collect(owner, await claim(owner), [detail()]);
+    const pin = await read(owner);
     await fixture.runtime.query(`INSERT INTO data_sync_runs(id,tenant_id,principal_id,mode,source_ids,request_hash,clear_saved_data)
       VALUES($1,$2,$3,'full','["users","graph_packages","power_platform"]',$4,true)`,
     [randomUUID(), owner.tenantId, owner.principalId, "a".repeat(64)]);
-    expect((await fixture.runtime.query("SELECT native_id FROM package_detail_cache WHERE tenant_id=$1 AND principal_id=$2",
-      [owner.tenantId, owner.principalId])).rows).toEqual([]);
+    await expect(pin.queries.page(pin.selection.id, pin.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     await publish(owner, [summary()]);
-    expect((await repository.get(owner, "one"))?.package).not.toHaveProperty("elementDetails");
+    expect((await read(owner)).children.total).toBe(0);
   });
-
-  it("rejects catalog-only exact jobs and mismatched idempotent replay while persisting the mode", async () => {
-    const owner = scope();
-    const input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const, idempotencyKey: randomUUID() };
-    await expect(repository.submit(owner, { ...input, catalogOnly: true, requestedIds: ["one"] })).rejects.toMatchObject({ code: "invalid_package_refresh_mode" });
-    const job = await repository.submit(owner, { ...input, catalogOnly: true });
-    expect(await repository.getJob(owner, job.id)).toMatchObject({ catalogOnly: true });
-    await expect(repository.submit(owner, input)).rejects.toMatchObject({ code: "idempotency_mismatch" });
+  it("persists one unambiguous broad/exact request shape and rejects a mismatched idempotent replay", async () => {
+    const owner = scope(), input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const, idempotencyKey: randomUUID() };
+    const broad = await jobs.submit(owner, input);
+    expect(broad).toMatchObject({ scopeKind: "broad", targetCount: 0 });
+    expect(broad).not.toHaveProperty("catalogOnly");
+    await expect(jobs.submit(owner, { ...input, requestedIds: ["one"] })).rejects.toMatchObject({ code: "idempotency_mismatch" });
   });
 });

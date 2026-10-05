@@ -31,14 +31,14 @@ vi.mock("./policy.js", () => ({
     mocks.policies.set(`${method} ${path}`, policy);
   },
 }));
-vi.mock("../db/packageInventory.js", () => ({
-  PackageInventoryRepository: class { listJobs = mocks.packages; },
+vi.mock("../db/packageRefreshJobs.js", () => ({
+  PackageRefreshJobs: class { listJobs = mocks.packages; },
 }));
-vi.mock("../db/powerPlatformInventory.js", () => ({
-  PowerPlatformInventoryRepository: class { listJobs = mocks.inventory; },
+vi.mock("../db/powerPlatformRefreshJobs.js", () => ({
+  PowerPlatformRefreshJobs: class { listJobs = mocks.inventory; },
 }));
-vi.mock("../db/officialUsage.js", () => ({
-  OfficialUsageRepository: class { getAdminState = mocks.usage; },
+vi.mock("../db/officialReportImports.js", () => ({
+  OfficialReportImports: class { preview = mocks.usage; bundle = mocks.usage; },
 }));
 vi.mock("../services/dataSync.js", () => ({ dataSync: { listRuns: mocks.sync } }));
 vi.mock("../services/bulkJobs.js", () => ({ bulkJobs: { list: mocks.controls } }));
@@ -78,7 +78,7 @@ beforeEach(() => {
     load.mockReset().mockResolvedValue({ value: [] });
   }
   mocks.sync.mockReset().mockResolvedValue([]);
-  mocks.usage.mockReset().mockResolvedValue({ staging: [] });
+  mocks.usage.mockReset().mockRejectedValue(new Error("Workbench metadata must not read private import drafts."));
   mocks.applicationScope.mockReset().mockResolvedValue({ enabled: true, sharedDataScope: true });
 });
 

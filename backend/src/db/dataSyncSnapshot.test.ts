@@ -1,94 +1,109 @@
-import pg from "pg";
-import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { fixtureDirectoryUser } from "../../scripts/userSourceFixture.js";
+import { copilotServicePlanDefinitions, resolveCopilotServicePlan } from "../services/copilotServicePlans.js";
+import { directoryPlanRecord, directorySourceRecord } from "../services/userSourceRecords.js";
+import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+import { encodeBatch } from "./dataBounds.js";
 import { DataSyncRepository } from "./dataSync.js";
 
-const scope = { tenantId: "snapshot-tenant", principalId: "snapshot-reader" };
-const user = {
-  serviceEvidenceVersion: 1,
-  identity: {
-    objectId: "saved-user", userPrincipalName: "saved@example.invalid", displayName: "Saved person",
-    accountEnabled: true, userType: "Member", employeeType: null, companyName: null, department: null,
-  },
-  copilotServiceState: "enabled",
-  servicePlanSet: 0,
-};
-const plan = {
-  servicePlanId: "paid-feature", service: "M365_COPILOT_APPS", displayName: "Paid feature",
-  state: "enabled", assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled",
-};
-const encoded = {
-  serviceEvidenceVersion: 1, storageEncoding: "service-plan-sets-v1", servicePlanSets: [[plan]], users: [user],
-};
+function user(): CopilotDirectoryUser {
+  const value = fixtureDirectoryUser("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Équipe", "person@example.invalid");
+  value.copilotServiceState = "enabled";
+  value.servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
+    servicePlanId, true, [{ servicePlanId, capabilityStatus: "Enabled", assignedDateTime: "2026-01-01T00:00:00Z" }],
+  ));
+  return value;
+}
 
-describe("directory snapshot storage contract", () => {
-  it("restores encoded evidence while preserving the existing unencoded format", async () => {
-    const { servicePlanSet: _index, ...fields } = user;
-    const users = [{ ...fields, servicePlans: [plan] }];
-    expect(await readSnapshot(encoded)).toEqual(users);
-    expect(await readSnapshot({ serviceEvidenceVersion: 1, users })).toEqual(users);
-    expect(await readSnapshot({ ...encoded, servicePlanSets: [], users: [] })).toEqual([]);
+describe("retired snapshot and native typed-evidence contracts", () => {
+  it("has no snapshot codecs, whole-source writers or whole-source getters", () => {
+    const names = Object.getOwnPropertyNames(DataSyncRepository.prototype);
+    for (const removed of ["publishDirectory", "publishAppActivity", "getUserSources", "getDirectorySource",
+      "getAppActivitySource", "readSources", "getPublished"]) expect(names).not.toContain(removed);
+    const implementation = readFileSync(new URL("./dataSync.ts", import.meta.url), "utf8");
+    expect(implementation).not.toMatch(/service-plan-sets-v1|storageEncoding|servicePlanSets|snapshot_data/);
+  });
+
+  it("stores all three features as independent typed children rather than an encoded parent array", () => {
+    const value = user(), parent = directorySourceRecord(value);
+    expect(parent).toMatchObject({ identity: value.identity.objectId, display_name: "Équipe",
+      upn: "person@example.invalid", service_state: "enabled", plan_count: 3 });
+    expect(parent.residual).toEqual({ evidenceHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(parent).not.toHaveProperty("servicePlans");
+    expect(parent).not.toHaveProperty("servicePlanSet");
+    const children = value.servicePlans.map(plan => directoryPlanRecord(parent.identity, plan));
+    expect(children).toHaveLength(3);
+    expect(new Set(children.map(child => child.plan_id)).size).toBe(3);
+    for (const [index, child] of children.entries()) {
+      expect(child).toMatchObject({ user_id: parent.identity, state: "enabled", capability_status: "Enabled",
+        assigned_at: value.servicePlans[index].assignedDateTime,
+        residual: { assignedDateTime: value.servicePlans[index].assignedDateTime } });
+    }
+    children[0].residual.assignedDateTime = null;
+    expect(value.servicePlans[0].assignedDateTime).not.toBeNull();
+    expect(children[1].residual.assignedDateTime).not.toBeNull();
+  });
+
+  it("canonicalizes child order without hiding evidence or identity changes", () => {
+    const value = user(), first = directorySourceRecord(value);
+    expect(directorySourceRecord({ ...value, servicePlans: value.servicePlans.toReversed() })).toEqual(first);
+    const changed = { ...value, identity: { ...value.identity, department: "Research" } };
+    expect(directorySourceRecord(changed).residual.evidenceHash).not.toBe(first.residual.evidenceHash);
+    const changedPlans = { ...value, servicePlans: value.servicePlans.map((plan, index) => index ? plan : {
+      ...plan, assignedDateTime: "2026-02-01T00:00:00Z",
+    }) };
+    expect(directorySourceRecord(changedPlans).residual.evidenceHash).not.toBe(first.residual.evidenceHash);
   });
 
   it.each([
-    { ...encoded, storageEncoding: "unknown" },
-    { ...encoded, storageEncoding: null },
-    { ...encoded, servicePlanSets: undefined },
-    { ...encoded, servicePlanSets: {} },
-    { ...encoded, servicePlanSets: [null] },
-    { ...encoded, servicePlanSets: [[null]] },
-    { ...encoded, users: [null] },
-    ...[undefined, -1, 0.5, "0", 1].map(servicePlanSet => ({ ...encoded, users: [{ ...user, servicePlanSet }] })),
-    { ...encoded, users: [{ ...user, servicePlans: [] }] },
-    { ...encoded, users: [{ ...user, serviceEvidenceVersion: 0 }] },
-    { ...encoded, users: [{ ...user, copilotServiceState: "assigned" }] },
-  ])("rejects unsupported encodings or malformed references: %#", async snapshot => {
-    await expect(readSnapshot(snapshot)).rejects.toMatchObject({ status: 409, code: "copilot_usage_snapshot_invalid" });
+    { serviceEvidenceVersion: 0 },
+    { serviceEvidenceVersion: undefined },
+    { copilotServiceState: "assigned" },
+    { copilotServiceState: "disabled" },
+    { servicePlans: undefined },
+    { servicePlans: null },
+  ])("rejects invalid typed parent evidence: %#", patch => {
+    expect(() => directorySourceRecord({ ...user(), ...patch } as CopilotDirectoryUser))
+      .toThrow(expect.objectContaining({ status: 502, code: "provider_schema" }));
   });
 
-  it("bounds expanded evidence before copying every referenced plan set", async () => {
-    const snapshot = {
-      ...encoded,
-      servicePlanSets: [[{ ...plan, displayName: "é".repeat(170_000) }]],
-      users: Array.from({ length: 100 }, () => ({ ...user })),
-    };
-    expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThan(32 * 1024 * 1024);
-    await expect(readSnapshot(snapshot)).rejects.toMatchObject({ status: 413, code: "copilot_usage_snapshot_limit" });
+  it("rejects duplicate child identities and more than 1000 children before hashing", () => {
+    const value = user();
+    expect(() => directorySourceRecord({ ...value, servicePlans: [value.servicePlans[0],
+      { ...value.servicePlans[0], servicePlanId: value.servicePlans[0].servicePlanId.toUpperCase() }] }))
+      .toThrow(expect.objectContaining({ code: "provider_schema" }));
+    expect(() => directorySourceRecord({ ...value,
+      servicePlans: Array.from({ length: 1001 }, (_, index) => ({ ...value.servicePlans[0], servicePlanId: String(index) })) }))
+      .toThrow(expect.objectContaining({ code: "provider_schema" }));
   });
 
-  it("keeps the directory row bound when encoded evidence is small", async () => {
-    await expect(readSnapshot({ ...encoded, users: Array.from({ length: 100_001 }, () => user) }))
-      .rejects.toMatchObject({ status: 413, code: "copilot_usage_snapshot_limit" });
+  it.each([
+    ["displayName", 512], ["userPrincipalName", 320], ["companyName", 256],
+    ["department", 256], ["userType", 64], ["employeeType", 128],
+  ] as const)("enforces the typed %s field boundary without snapshot expansion", (field, limit) => {
+    const value = user();
+    expect(() => directorySourceRecord({ ...value, identity: { ...value.identity, [field]: "é".repeat(limit) } })).not.toThrow();
+    expect(() => directorySourceRecord({ ...value, identity: { ...value.identity, [field]: "é".repeat(limit + 1) } }))
+      .toThrow(expect.objectContaining({ code: "provider_schema" }));
   });
 
-  it("rejects oversized normalized writes even when repeated feature evidence could be encoded compactly", async () => {
-    const database = new pg.Pool();
-    const connect = vi.spyOn(database, "connect").mockRejectedValue(new Error("Oversized writes must not reach the database."));
-    const users = Array.from({ length: 100 }, () => ({
-      ...user, serviceEvidenceVersion: 1 as const, copilotServiceState: "enabled" as const,
-      servicePlans: [{
-        ...plan, state: "enabled" as const, capabilityStatus: "Enabled" as const,
-        displayName: "é".repeat(170_000),
-      }],
-    }));
-    try {
-      await expect(new DataSyncRepository(database).publishDirectory(scope, users, new Date().toISOString(), "Too large."))
-        .rejects.toMatchObject({ status: 413, code: "copilot_usage_snapshot_limit" });
-      expect(connect).not.toHaveBeenCalled();
-    } finally {
-      await database.end();
-    }
+  it("retains nullable child evidence and enforces child text bounds before storage", () => {
+    const value = user(), plan = value.servicePlans[0];
+    expect(directoryPlanRecord(value.identity.objectId, { ...plan, state: "unknown",
+      assignedDateTime: null, capabilityStatus: null })).toMatchObject({
+      state: "unknown", assigned_at: null, capability_status: null, residual: { assignedDateTime: null },
+    });
+    expect(() => directoryPlanRecord(value.identity.objectId, { ...plan, displayName: "é".repeat(1024) })).not.toThrow();
+    expect(() => directoryPlanRecord(value.identity.objectId, { ...plan, displayName: "é".repeat(1025) }))
+      .toThrow(expect.objectContaining({ code: "provider_schema" }));
+  });
+
+  it("bounds SQL batches independently of the retired 32-MiB snapshot contract", () => {
+    const row = directorySourceRecord(user());
+    const batch = encodeBatch(Array.from({ length: 250 }, () => row));
+    expect(batch.bytes).toBeLessThanOrEqual(1024 ** 2);
+    expect(() => encodeBatch(Array.from({ length: 251 }, () => row)))
+      .toThrow(expect.objectContaining({ code: "data_batch_rows" }));
   });
 });
-
-async function readSnapshot(snapshot: unknown) {
-  const database = new pg.Pool();
-  vi.spyOn(database, "query").mockResolvedValue({
-    rows: [{ source_id: "directory", snapshot_data: snapshot }],
-    rowCount: 1, command: "SELECT", oid: 0, fields: [],
-  });
-  try {
-    return (await new DataSyncRepository(database).getDirectorySource(scope)).value;
-  } finally {
-    await database.end();
-  }
-}

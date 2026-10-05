@@ -8,6 +8,15 @@ export type SavedPackageDetail = {
   catalogRevision?: ReturnType<typeof packageDetailRevision> | null;
 };
 
+export function projectPackageDetailAge<T extends CopilotPackageDetail>(value: T, evaluatedAt: number): T {
+  const freshness = value.detailFreshness;
+  if (freshness?.state !== "fresh" || Date.parse(freshness.expiresAt ?? "") > evaluatedAt
+    && Date.parse(freshness.observedAt ?? "") <= evaluatedAt) return value;
+  const result = { ...value, detailFreshness: { ...freshness, state: "stale" as const } };
+  delete result.identityDetailsCollected;
+  return result;
+}
+
 export function packageDetailRevision(value: CopilotPackageDetail) {
   return [value.lastModifiedDateTime, value.appId, value.manifestId, value.assetId, value.version, value.manifestVersion]
     .map(marker => marker ?? null);

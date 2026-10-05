@@ -179,6 +179,7 @@ function QuarantineControls({ snapshot, targets, variant, canManage, pendingTarg
         const next = await getQuarantineJob(activeJobId, { signal: controller.signal });
         if (cancelled || controller.signal.aborted || jobRevision.current !== requestedJobRevision) return;
         setJob(next);
+        callbacks.current.onJobChange?.(next);
         remaining -= 1;
         if (shouldPollJob(next, resumedJobId) && remaining > 0) timer = window.setTimeout(poll, quarantineJobPollIntervalMs);
         else if (shouldPollJob(next, resumedJobId)) setBoundError({ message: "Automatic job status checks stopped after one minute. Refresh explicitly to continue recovery." });

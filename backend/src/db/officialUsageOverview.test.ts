@@ -1,445 +1,272 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
+import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { retainUntilConverged } from "../../scripts/database.js";
-import { testDatabase } from "../../scripts/testDatabase.js";
-import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
-import { OfficialUsageOverviewService } from "../services/officialUsageOverview.js";
-import { parseOfficialUsageReport } from "../services/officialUsageParser.js";
-import type { OfficialUsageMetadata, OfficialUsageReportKind } from "../types/officialUsage.js";
-import { OfficialUsageRepository, type OfficialUsageScope } from "./officialUsage.js";
-
-let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let repository: OfficialUsageRepository;
-let overview: OfficialUsageOverviewService;
-const now = () => new Date("2026-07-16T01:15:00+04:00");
-
-beforeAll(async () => {
-  fixture = await testDatabase();
-  repository = new OfficialUsageRepository(fixture.runtime);
-  overview = new OfficialUsageOverviewService(fixture.runtime, now);
-});
-afterAll(async () => { await fixture?.close(); });
+import { OfficialReportImports } from "./officialReportImports.js";
+import { LargeTenantUsersReports } from "../services/largeTenantUsersReports.js";
+import { schemaRegistry } from "../services/officialReportFields.js";
+import type { OfficialUsageMetadata } from "../types/officialReportRecords.js";
+import type { ReportAgent, ReportOverviewAgent, ReportPage, ReportQuery } from "../types/officialReportData.js";
+import type { SelectionIdentity } from "../services/dataSelections.js";
 
 type Observation = { id: string; name?: string; creator?: string; responses?: number; date?: string; username?: string };
 type BundleInput = {
-  agents: Observation[];
-  relationships?: Observation[];
-  userResponses?: number;
-  metadata?: OfficialUsageMetadata;
-  correctionOfSetId?: string;
+  agents: Observation[]; relationships?: Observation[]; userResponses?: number;
+  metadata?: OfficialUsageMetadata; correctionOfSetId?: string;
 };
-
-function scope(): OfficialUsageScope {
-  return { tenantId: `overview-${randomUUID()}`, principalId: "overview-administrator" };
+const kinds = ["agents", "userAgents", "users"] as const;
+let fixture: Awaited<ReturnType<typeof testDatabase>>, imports: OfficialReportImports, reports: LargeTenantUsersReports, today: Date;
+beforeAll(async () => {
+  fixture = await testDatabase(); imports = new OfficialReportImports(fixture.runtime);
+  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-native-overview-regression-secret", 35);
+  today = (await fixture.runtime.query("SELECT clock_timestamp() AS now")).rows[0].now;
+}, 30_000);
+afterAll(async () => { await fixture?.close(); });
+const owner = (): SelectionIdentity => ({ ...selectionIdentity, tenantId: `native-overview-${randomUUID()}` });
+const day = (offset = 0) => new Date(today.getTime() + offset * 86400000).toISOString().slice(0, 10);
+const window = (start: number, end: number): OfficialUsageMetadata => ({
+  reportingPeriod: { startDate: day(start), endDate: day(end), provenance: "operator_asserted" },
+});
+async function stage(identity: SelectionIdentity, input: BundleInput, kind: typeof kinds[number], bundleId: string) {
+  async function* csv() {
+    yield Buffer.from(schemaRegistry[kind].headers.join(",") + "\n");
+    const encode = (values: string[]) => Buffer.from(values.map(value => `"${value.replaceAll('"', '""')}"`).join(",") + "\n");
+    if (kind === "users") yield encode(["user-only", "User only", "1", String(input.userResponses ?? 3), day()]);
+    else for (const [index, observation] of (kind === "agents" ? input.agents : input.relationships ?? input.agents).entries()) {
+      yield encode([observation.id, observation.name ?? observation.id, observation.creator ?? "Your org",
+        ...(kind === "agents" ? ["1", "0"] : [observation.username ?? `user-${index}`]),
+        String(observation.responses ?? 3), observation.date ?? ""]);
+    }
+  }
+  return imports.stage(identity, { bundleId, correctionOfSetId: input.correctionOfSetId }, csv(), input.metadata);
 }
-
-function reportCsv(kind: OfficialUsageReportKind, input: BundleInput) {
-  const headers = {
-    agents: "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)",
-    userAgents: "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)",
-    users: "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)",
-  };
-  const observations = kind === "userAgents" ? input.relationships ?? input.agents : input.agents;
-  const rows = kind === "users"
-    ? [["user-only", "User only", "1", String(input.userResponses ?? 3), "2026-07-15"]]
-    : observations.map((observation, index) => [
-      observation.id, observation.name ?? observation.id, observation.creator ?? "Your org",
-      ...(kind === "agents" ? ["1", "0"] : [observation.username ?? `user-${index}`]),
-      String(observation.responses ?? 3), observation.date ?? "",
-    ]);
-  return [headers[kind], ...rows.map(row => row.map(value => `"${value.replaceAll('"', '""')}"`).join(","))].join("\n");
-}
-
-async function stage(owner: OfficialUsageScope, input: BundleInput, kind: OfficialUsageReportKind, bundleId: string) {
-  const content = reportCsv(kind, input);
-  return repository.stage(owner, {
-    report: parseOfficialUsageReport(Buffer.from(content), input.metadata),
-    fileHash: createHash("sha256").update(content).digest("hex"),
-    bundleId,
-    correctionOfSetId: input.correctionOfSetId,
-  });
-}
-
-async function importBundle(owner: OfficialUsageScope, input: BundleInput) {
+async function accept(identity: SelectionIdentity, input: BundleInput) {
   const bundleId = randomUUID();
-  for (const kind of ["agents", "userAgents", "users"] as const) await stage(owner, input, kind, bundleId);
-  const preview = await repository.previewBundle(owner, bundleId);
-  return repository.acceptBundle(owner, bundleId, preview);
+  for (const kind of kinds) await stage(identity, input, kind, bundleId);
+  return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
+}
+const mutate = async (identity: SelectionIdentity, setId: string, operation: "select" | "delete") =>
+  imports.confirm(identity, await imports.confirmPreview(identity, setId, operation));
+async function overview(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50, authority = reports) {
+  const selection = await authority.capture(identity, "delegated", "overview", query);
+  return authority.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportOverviewAgent>>;
+}
+async function agents(identity: SelectionIdentity, setId: string) {
+  const selection = await reports.capture(identity, "delegated", "official_agents", { setId });
+  return reports.page(selection.id, identity) as Promise<ReportPage<ReportAgent>>;
+}
+async function historyCount(identity: SelectionIdentity) {
+  const selection = await reports.capture(identity, "delegated", "history");
+  return (await reports.page(selection.id, identity)).counts.total;
 }
 
-async function deleteSet(owner: OfficialUsageScope, setId: string) {
-  const preview = await repository.previewSetOperation(owner, "delete", setId);
-  await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "delete", setId });
-}
-
-function window(startDate: string, endDate: string): OfficialUsageMetadata {
-  return { reportingPeriod: { startDate, endDate, provenance: "operator_asserted" } };
-}
-
-describe.sequential("cumulative official agent/activity overview SQL", () => {
-  it("switches selected-set metrics without merging history or falling back after deletion", async () => {
-    const owner = scope();
-    const first = await importBundle(owner, { agents: [
-      { id: "older-only", date: "2026-06-01" }, { id: "shared", date: "2026-07-15" },
-    ] });
-    const second = await importBundle(owner, { agents: [{ id: "newer-only", date: "2026-07-15" }] });
-    expect((await overview.getOverview(owner.tenantId)).summary.reportedAgents).toBe(3);
-    expect(await overview.getOverview(owner.tenantId, { scope: "selected" })).toMatchObject({
-      summary: { retainedSets: 1, reportedAgents: 1, usedAgents: 1, activeAgents30Days: 1 },
-      agents: { value: [{ agentId: "newer-only", latestSetId: second.setId }] },
-    });
-    const preview = await repository.previewSetOperation(owner, "select", first.setId);
-    await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "select", setId: first.setId });
-    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).summary)
-      .toMatchObject({ retainedSets: 1, reportedAgents: 2, usedAgents: 2, activeAgents30Days: 1 });
-    await deleteSet(owner, first.setId);
-    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).summary)
-      .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
-    expect((await overview.getOverview(owner.tenantId)).summary.reportedAgents).toBe(1);
+describe("native cumulative overview SQL", () => {
+  it("changes selected-set metrics without merging history or silently falling back after deletion", async () => {
+    const identity = owner(), first = await accept(identity, { agents: [{ id: "older-only", date: day(-44) }, { id: "shared", date: day() }] });
+    const second = await accept(identity, { agents: [{ id: "newer-only", date: day() }] });
+    expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(3);
+    const selected = await overview(identity, { scope: "selected" });
+    expect(selected.analytics.overview).toMatchObject({ retainedSets: 1, reportedAgents: 1, usedAgents: 1, active30Days: 1 });
+    expect(selected.value).toMatchObject([{ agentId: "newer-only", latestSetId: second.setId }]);
+    await mutate(identity, first.setId, "select");
+    expect((await overview(identity, { scope: "selected" })).analytics.overview)
+      .toMatchObject({ retainedSets: 1, reportedAgents: 2, usedAgents: 2, active30Days: 1 });
+    await mutate(identity, first.setId, "delete");
+    await expect(reports.page(selected.selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect((await overview(identity, { scope: "selected" })).analytics.overview).toMatchObject({ retainedSets: 0, reportedAgents: 0 });
+    expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(1);
   });
 
-  it("honors explicit selection of a legacy superseded set without reviving it in history evidence", async () => {
-    const owner = scope();
-    const first = await importBundle(owner, { agents: [{ id: "original", date: "2026-07-01" }] });
-    await importBundle(owner, { agents: [{ id: "corrected", date: "2026-07-15" }], correctionOfSetId: first.setId });
-    const preview = await repository.previewSetOperation(owner, "select", first.setId);
-    await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "select", setId: first.setId });
-    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).agents.value)
-      .toMatchObject([{ agentId: "original" }]);
-    expect((await overview.getOverview(owner.tenantId)).agents.value).toMatchObject([{ agentId: "corrected" }]);
+  it("permits explicit superseded snapshots without reviving them in cumulative evidence", async () => {
+    const identity = owner(), first = await accept(identity, { agents: [{ id: "original", date: day(-14) }] });
+    await accept(identity, { agents: [{ id: "corrected", date: day() }], correctionOfSetId: first.setId });
+    await mutate(identity, first.setId, "select");
+    expect((await overview(identity, { scope: "selected" })).value).toMatchObject([{ agentId: "original" }]);
+    expect((await overview(identity)).value).toMatchObject([{ agentId: "corrected" }]);
   });
 
-  it("preserves the June 1–July 15 union from overlapping snapshots without adding response totals", async () => {
-    const owner = scope();
-    const dates = Array.from({ length: 45 }, (_, index) =>
-      new Date(Date.UTC(2026, 5, index + 1)).toISOString().slice(0, 10));
-    const firstInput: BundleInput = {
-      agents: [
-        ...dates.slice(0, 30).map(date => ({ id: `day-${date}`, date })),
-        { id: "shared", name: "Earlier shared", date: "2026-06-10", responses: 7 },
-      ],
-      metadata: window("2026-06-01", "2026-06-30"),
-    };
-    const secondInput: BundleInput = {
-      agents: [
-        ...dates.slice(15).map(date => ({ id: `day-${date}`, date })),
-        { id: "shared", name: "Latest shared", date: "2026-07-15", responses: 11 },
-      ],
-      metadata: window("2026-06-16", "2026-07-15"),
-    };
-    const first = await importBundle(owner, firstInput);
-    const second = await importBundle(owner, secondInput);
-    const view = await overview.getOverview(owner.tenantId, { limit: 100 });
-    expect(view.summary).toEqual({
-      retainedSets: 2, reportedAgents: 46, usedAgents: 46, activeAgents30Days: 31, undatedAgents: 0,
-      earliestActivityDateUtc: "2026-06-01", latestActivityDateUtc: "2026-07-15",
-      asOf: "2026-07-15T21:15:00.000Z", activeSinceDateUtc: "2026-06-16",
+  it("preserves a 45-day union of overlapping 30-day snapshots without adding responses", async () => {
+    const identity = owner(), dates = Array.from({ length: 45 }, (_, index) => day(index - 44));
+    const input = (start: number, end: number, name: string, date: string, responses: number): BundleInput => ({
+      agents: [...dates.slice(start, start + 30).map(date => ({ id: `day-${date}`, date })), { id: "shared", name, date, responses }],
+      metadata: window(start - 44, end),
     });
-    expect(view.agents.count).toBe(46);
-    expect(view.agents.value.find(agent => agent.agentId === "day-2026-06-01"))
-      .toMatchObject({ observationCount: 2, latestSetId: first.setId });
-    expect(view.agents.value.find(agent => agent.agentId === "day-2026-06-16"))
-      .toMatchObject({ observationCount: 4, latestSetId: second.setId });
-    expect(view.agents.value.find(agent => agent.agentId === "shared"))
-      .toMatchObject({ agentName: "Latest shared", observationCount: 4, latestSetId: second.setId });
-    expect(JSON.stringify(view)).not.toMatch(/responsesSentToUsers|totalResponses|username|activeUsers/);
-    expect((await repository.getPublished(owner.tenantId, first.setId)).reports.agents?.rows.at(-1)?.responsesSentToUsers).toBe(7);
-    expect((await repository.getPublished(owner.tenantId, second.setId)).reports.agents?.rows.at(-1)?.responsesSentToUsers).toBe(11);
-
-    const earlier = await overview.getOverview(owner.tenantId, {
-      search: "shared", startDate: "2026-06-10", endDate: "2026-06-10",
+    const first = await accept(identity, input(0, -15, "Earlier shared", day(-35), 7));
+    const secondInput = input(15, 0, "Latest shared", day(), 11), second = await accept(identity, secondInput);
+    const view = await overview(identity, {}, 100);
+    expect(view.analytics.overview).toEqual({
+      retainedSets: 2, reportedAgents: 46, usedAgents: 46, active30Days: 31, undatedAgents: 0,
+      earliestActivityDateUtc: day(-44), latestActivityDateUtc: day(),
+      asOf: view.selection.evaluatedAt, activeSinceDateUtc: day(-29),
     });
-    expect(earlier.summary).toEqual(view.summary);
-    expect(earlier.agents).toMatchObject({
-      count: 1, value: [{
-        agentId: "shared", agentName: "Earlier shared", lastActivityDateUtc: "2026-06-10",
-        latestSetId: first.setId, observationCount: 2,
-      }],
-    });
-    const defaultPage = await overview.getOverview(owner.tenantId);
-    expect(defaultPage.agents).toMatchObject({ count: 46, limit: 25, offset: 0 });
-    expect(defaultPage.agents.value).toHaveLength(25);
-    expect((await overview.getOverview(owner.tenantId, { limit: 25, offset: 25 })).agents.value).toHaveLength(21);
-
-    const repeat = await importBundle({ ...owner, principalId: "another-administrator" }, secondInput);
-    expect(repeat.setId).toBe(second.setId);
-    expect(await overview.getOverview(owner.tenantId, { limit: 100 })).toEqual(view);
+    expect(view.counts).toEqual({ total: 46, filtered: 46 });
+    expect(view.value.find(row => row.agentId === `day-${day(-44)}`)).toMatchObject({ observationCount: 2, latestSetId: first.setId });
+    expect(view.value.find(row => row.agentId === `day-${day(-29)}`)).toMatchObject({ observationCount: 4, latestSetId: second.setId });
+    expect(view.value.find(row => row.agentId === "shared")).toMatchObject({ agentName: "Latest shared", observationCount: 4, latestSetId: second.setId });
+    expect(view.analytics.responses).toBeNull();
+    expect(JSON.stringify(view.value)).not.toMatch(/responsesSentToUsers|totalResponses|username|activeUsers/);
+    expect((await agents(identity, first.setId)).value.find(row => row.agentId === "shared")?.responses).toBe(7);
+    expect((await agents(identity, second.setId)).value.find(row => row.agentId === "shared")?.responses).toBe(11);
+    const earlier = await overview(identity, { search: "shared", startDate: day(-35), endDate: day(-35) });
+    expect(earlier.analytics).toMatchObject({ basis: "filtered_rows", rowCount: 1, overview: { reportedAgents: 1 } });
+    expect(earlier.value).toMatchObject([{ agentId: "shared", agentName: "Earlier shared", observationCount: 2, latestSetId: first.setId }]);
+    const paged = await overview(identity, {}, 25);
+    expect(paged.value).toHaveLength(25); expect(paged.page.nextCursor).toEqual(expect.any(String));
+    expect((await reports.page(paged.selection.id, identity, { limit: 25, cursor: paged.page.nextCursor! })).value).toHaveLength(21);
+    expect((await accept({ ...identity, principalId: "another-administrator" }, secondInput)).setId).toBe(second.setId);
+    const repeated = await overview(identity, {}, 100);
+    expect(repeated.value).toEqual(view.value); expect(repeated.reports.historyRevision).toBe(view.reports.historyRevision);
   });
 
-  it("counts report versions once even when multiple retained sets reuse unchanged versions and relationship rows", async () => {
-    const owner = scope();
-    const input: BundleInput = {
-      agents: [{ id: "same-agent", date: "2026-07-15" }],
-      relationships: [
-        { id: "same-agent", date: "2026-07-15", username: "CaseUser" },
-        { id: "same-agent", date: "2026-07-15", username: "caseuser" },
-        { id: "same-agent", date: "2026-07-15", username: "third-user" },
-      ],
-    };
-    const first = await importBundle(owner, input);
-    const second = await importBundle(owner, { ...input, userResponses: 9 });
+  it("counts reused versions once despite overlapping retained sets and multiple relationship identities", async () => {
+    const identity = owner(), input: BundleInput = { agents: [{ id: "same-agent", date: day() }],
+      relationships: ["CaseUser", "caseuser", "third-user"].map(username => ({ id: "same-agent", username, date: day() })) };
+    const first = await accept(identity, input), second = await accept(identity, { ...input, userResponses: 9 });
     expect(first.setId).not.toBe(second.setId);
-    const view = await overview.getOverview(owner.tenantId);
-    expect(view.summary).toMatchObject({ retainedSets: 2, reportedAgents: 1, usedAgents: 1, activeAgents30Days: 1 });
-    expect(view.agents.value).toEqual([{
-      agentId: "same-agent", agentName: "same-agent", creatorTypes: ["Your org"], hasResponses: true,
-      lastActivityDateUtc: "2026-07-15", observationCount: 2, latestSetId: second.setId,
-      latestAcceptedAt: expect.any(String),
-    }]);
-    const memberships = await fixture.runtime.query<{ kind: string; versions: number }>(`SELECT kind,
-      count(DISTINCT version_id)::int AS versions FROM official_usage_set_versions
-      WHERE tenant_id=$1 GROUP BY kind ORDER BY kind`, [owner.tenantId]);
-    expect(memberships.rows).toEqual([
+    const view = await overview(identity);
+    expect(view.analytics.overview).toMatchObject({ retainedSets: 2, reportedAgents: 1, usedAgents: 1, active30Days: 1 });
+    expect(view.value).toMatchObject([{ agentId: "same-agent", observationCount: 2, creatorTypeCount: 1, latestSetId: second.setId }]);
+    expect((await fixture.runtime.query(`SELECT kind,count(DISTINCT version_id)::int AS versions FROM official_usage_set_versions
+      WHERE tenant_id=$1 GROUP BY kind ORDER BY kind`, [identity.tenantId])).rows).toEqual([
       { kind: "agents", versions: 1 }, { kind: "userAgents", versions: 1 }, { kind: "users", versions: 2 },
     ]);
-    await deleteSet(owner, second.setId);
-    expect((await overview.getOverview(owner.tenantId)).agents.value[0])
-      .toMatchObject({ latestSetId: first.setId, observationCount: 2 });
+    await mutate(identity, second.setId, "delete");
+    expect((await overview(identity)).value[0]).toMatchObject({ latestSetId: first.setId, observationCount: 2 });
   });
 
-  it("deduplicates exact agent IDs across evidence kinds but never merges case-distinct identities or Users rows", async () => {
-    const owner = scope();
-    await importBundle(owner, {
-      agents: [
-        { id: "Case", creator: "z type", responses: 0, date: "2026-07-15" },
-        { id: "case", creator: "A type", date: "2026-07-15" },
-      ],
-      relationships: [
-        { id: "Case", creator: "A type", date: "2026-07-15", username: "one" },
-        { id: "Case", creator: "z type", date: "2026-07-15", username: "two" },
-        { id: "relationship-only", creator: "Other", date: "2026-07-15" },
-      ],
-      userResponses: 999_999,
-    });
-    const view = await overview.getOverview(owner.tenantId, { sortBy: "agentName", sortDirection: "asc" });
-    expect(view.summary).toMatchObject({ reportedAgents: 3, usedAgents: 3, activeAgents30Days: 3 });
-    expect(view.agents.value.map(agent => agent.agentId)).toEqual(["Case", "case", "relationship-only"]);
-    expect(view.agents.value[0]).toMatchObject({
-      creatorTypes: ["A type", "z type"], observationCount: 2, hasResponses: true,
-    });
-    expect(view.agents.value[2]).toMatchObject({ observationCount: 1, creatorTypes: ["Other"] });
+  it("keeps exact case-distinct agent identities and creator type counts without including Users scalars", async () => {
+    const identity = owner();
+    await accept(identity, { agents: [{ id: "Case", creator: "z type", responses: 0, date: day() }, { id: "case", creator: "A type", date: day() }],
+      relationships: [{ id: "Case", creator: "A type", username: "one", date: day() },
+        { id: "Case", creator: "z type", username: "two", date: day() }, { id: "relationship-only", creator: "Other", date: day() }],
+      userResponses: 999999 });
+    const view = await overview(identity, { sort: "name", order: "asc" });
+    expect(view.analytics.overview).toMatchObject({ reportedAgents: 3, usedAgents: 3, active30Days: 3 });
+    expect(view.value.map(row => row.agentId)).toEqual(["Case", "case", "relationship-only"]);
+    expect(view.value[0]).toMatchObject({ creatorTypeCount: 2, observationCount: 2, hasResponses: true });
+    expect(view.value[2]).toMatchObject({ observationCount: 1, creatorTypeCount: 1 });
   });
 
-  it("uses positive dated evidence within exactly 30 UTC calendar dates, never upload time or mixed-row inference", async () => {
-    const owner = scope();
-    const observations: Observation[] = [
-      { id: "inclusive-start", date: "2026-06-16" },
-      { id: "stale", date: "2026-06-15" },
-      { id: "inclusive-today", date: "2026-07-15" },
-      { id: "future", date: "2026-07-16" },
-      { id: "undated" },
-      { id: "dated-zero", responses: 0, date: "2026-07-15" },
-      { id: "mixed", date: "2026-06-15" },
-      { id: "partly-dated" },
+  it("uses positive dated evidence on exactly 30 UTC dates, not upload time or mixed-row inference", async () => {
+    const identity = owner(), agents = [
+      { id: "inclusive-start", date: day(-29) }, { id: "stale", date: day(-30) }, { id: "inclusive-today", date: day() },
+      { id: "future", date: day(1) }, { id: "undated" }, { id: "dated-zero", responses: 0, date: day() },
+      { id: "mixed", date: day(-30) }, { id: "partly-dated" },
     ];
-    const imported = await importBundle(owner, {
-      agents: observations,
-      relationships: [
-        { id: "mixed", responses: 0, date: "2026-07-15" },
-        { id: "partly-dated", responses: 0, date: "2026-07-15" },
-      ],
-    });
-    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=$2 WHERE id=$1",
-      [imported.setId, now()]);
-    const view = await overview.getOverview(owner.tenantId);
-    expect(view.summary).toMatchObject({
-      reportedAgents: 8, usedAgents: 7, activeAgents30Days: 2, undatedAgents: 1,
-      earliestActivityDateUtc: "2026-06-15", latestActivityDateUtc: "2026-07-16",
-      activeSinceDateUtc: "2026-06-16",
-    });
-    expect(view.agents.value.find(agent => agent.agentId === "mixed")).toMatchObject({
-      hasResponses: true, lastActivityDateUtc: "2026-07-15",
-    });
-    expect((await overview.getOverview(owner.tenantId, { startDate: "2026-06-16", endDate: "2026-07-15" })).agents.value
-      .map(agent => agent.agentId).sort()).toEqual(["dated-zero", "inclusive-start", "inclusive-today", "mixed", "partly-dated"]);
-    const nextDay = new OfficialUsageOverviewService(fixture.runtime, () => new Date("2026-07-16T00:00:00Z"));
-    expect((await nextDay.getOverview(owner.tenantId)).summary).toMatchObject({
-      activeSinceDateUtc: "2026-06-17", activeAgents30Days: 2,
-    });
+    const accepted = await accept(identity, { agents,
+      relationships: [{ id: "mixed", responses: 0, date: day() }, { id: "partly-dated", responses: 0, date: day() }] });
+    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=$2 WHERE id=$1", [accepted.setId, today]);
+    const check = async (authority = reports) => {
+      const view = await overview(identity, {}, 50, authority);
+      expect(view.analytics.overview).toMatchObject({ reportedAgents: 8, usedAgents: 7, active30Days: 2, undatedAgents: 1,
+        earliestActivityDateUtc: day(-30), latestActivityDateUtc: day(1), activeSinceDateUtc: day(-29) });
+      expect(view.value.find(row => row.agentId === "mixed")).toMatchObject({ hasResponses: true, lastActivityDateUtc: day(), active30Days: false });
+      expect(view.value.find(row => row.agentId === "undated")).toMatchObject({ hasResponses: true, lastActivityDateUtc: null, active30Days: false });
+    };
+    await check();
+    expect((await overview(identity, { startDate: day(-29), endDate: day() })).value.map(row => row.agentId).sort())
+      .toEqual(["dated-zero", "inclusive-start", "inclusive-today", "mixed", "partly-dated"]);
+    const zoned = new pg.Pool({ ...fixture.runtime.options, password: fixturePassword, max: 4,
+      options: `-c timezone=${today.getUTCHours() < 12 ? "Etc/GMT+12" : "Etc/GMT-14"}` });
+    try { await check(new LargeTenantUsersReports(zoned, "synthetic-native-overview-regression-secret", 35)); }
+    finally { await zoned.end(); }
   });
 
-  it("searches all retained matching observations literally and paginates with stable ties and unknown dates last", async () => {
-    const owner = scope();
-    const first = await importBundle(owner, {
-      agents: [
-        { id: "A", name: "Historical label", date: "2026-06-01" },
-        { id: "only-old", name: "Archive only", date: "2026-06-01" },
-      ],
-    });
-    await importBundle(owner, {
-      agents: [
-        { id: "A", name: "Same", date: "2026-07-15" },
-        { id: "a", name: "Same", date: "2026-07-15" },
-        { id: "unknown", name: "Same" },
-        { id: "literal", name: "100%_literal", date: "2026-07-14" },
-      ],
-    });
-    const historySearch = await overview.getOverview(owner.tenantId, { search: "HISTORICAL LABEL" });
-    expect(historySearch.agents).toMatchObject({
-      count: 1, value: [{
-        agentId: "A", agentName: "Historical label", lastActivityDateUtc: "2026-06-01",
-        observationCount: 2, latestSetId: first.setId,
-      }],
-    });
-    expect((await overview.getOverview(owner.tenantId, { search: "%_" })).agents.value.map(agent => agent.agentId)).toEqual(["literal"]);
-    expect((await overview.getOverview(owner.tenantId, { search: "archive" })).agents.value[0])
-      .toMatchObject({ agentId: "only-old", latestSetId: first.setId });
-    for (const sortDirection of ["asc", "desc"] as const) {
-      const view = await overview.getOverview(owner.tenantId, { sortDirection, limit: 100 });
-      const expected = sortDirection === "asc"
-        ? ["only-old", "literal", "A", "a", "unknown"]
-        : ["A", "a", "literal", "only-old", "unknown"];
-      expect(view.agents.value.map(agent => agent.agentId)).toEqual(expected);
-      const page = await overview.getOverview(owner.tenantId, { sortDirection, limit: 2, offset: 2 });
-      expect(page.agents.count).toBe(5);
-      expect(page.agents.value.map(agent => agent.agentId)).toEqual(expected.slice(2, 4));
-      expect(page.summary).toEqual(view.summary);
+  it("searches retained observations literally and pages stable ties with unknown dates last", async () => {
+    const identity = owner(), first = await accept(identity, { agents: [{ id: "A", name: "Historical label", date: day(-44) },
+      { id: "only-old", name: "Archive only", date: day(-44) }] });
+    await accept(identity, { agents: [{ id: "A", name: "Same", date: day() }, { id: "a", name: "Same", date: day() },
+      { id: "unknown", name: "Same" }, { id: "literal", name: "100%_literal", date: day(-1) }] });
+    expect((await overview(identity, { search: "HISTORICAL LABEL" })).value)
+      .toMatchObject([{ agentId: "A", agentName: "Historical label", lastActivityDateUtc: day(-44), observationCount: 2, latestSetId: first.setId }]);
+    expect((await overview(identity, { search: "%_" })).value.map(row => row.agentId)).toEqual(["literal"]);
+    expect((await overview(identity, { search: "archive" })).value[0]).toMatchObject({ agentId: "only-old", latestSetId: first.setId });
+    for (const order of ["asc", "desc"] as const) {
+      const expected = order === "asc" ? ["only-old", "literal", "A", "a", "unknown"] : ["A", "a", "literal", "only-old", "unknown"];
+      const full = await overview(identity, { sort: "lastActivity", order }, 100), page = await overview(identity, { sort: "lastActivity", order }, 2);
+      expect(full.value.map(row => row.agentId)).toEqual(expected);
+      const second = await reports.page(page.selection.id, identity, { limit: 2, cursor: page.page.nextCursor! }) as ReportPage<ReportOverviewAgent>;
+      expect(second.value.map(row => row.agentId)).toEqual(expected.slice(2, 4));
+      expect(second.analytics).toEqual(page.analytics); expect(second.counts).toEqual({ total: 5, filtered: 5 });
+      expect((await overview(identity, { search: "same", sort: "name", order })).value.map(row => row.agentId)).toEqual(["A", "a", "unknown"]);
+      const tied = await overview(identity, { search: "same", sort: "name", order }, 1);
+      const next = await reports.page(tied.selection.id, identity, { limit: 1, cursor: tied.page.nextCursor! });
+      expect(next.value).toMatchObject([{ agentId: "a" }]);
+      expect((await reports.page(tied.selection.id, identity, { limit: 1, cursor: next.page.previousCursor! })).value).toMatchObject([{ agentId: "A" }]);
     }
-    for (const sortDirection of ["asc", "desc"] as const) {
-      expect((await overview.getOverview(owner.tenantId, { search: "same", sortBy: "agentName", sortDirection }))
-        .agents.value.map(agent => agent.agentId)).toEqual(["A", "a", "unknown"]);
-    }
-    expect((await overview.getOverview(owner.tenantId, { offset: 100_000 })).agents).toMatchObject({ count: 5, value: [] });
-    expect((await overview.getOverview(owner.tenantId, { startDate: "2026-08-01" })).agents).toMatchObject({ count: 0, value: [] });
+    expect((await overview(identity, { startDate: day(1) })).counts.filtered).toBe(0);
   });
 
-  it("searches non-ASCII names and IDs case-insensitively without merging case-distinct identities", async () => {
-    const owner = scope();
-    await importBundle(owner, {
-      agents: [
-        { id: "ПАКЕТ", name: "ÉQUIPE %_ Nord", date: "2026-07-15" },
-        { id: "пакет", name: "équipe %_ Sud", date: "2026-07-15" },
-        { id: "other", name: "Other", date: "2026-07-15" },
-      ],
-    });
+  it("searches non-ASCII names and IDs case-insensitively without merging their identities", async () => {
+    const identity = owner();
+    await accept(identity, { agents: [{ id: "ПАКЕТ", name: "ÉQUIPE %_ Nord", date: day() },
+      { id: "пакет", name: "équipe %_ Sud", date: day() }, { id: "other", name: "Other", date: day() }] });
     for (const search of ["пакет", "ПАКЕТ", "équipe", "ÉQUIPE", "%_"]) {
-      const view = await overview.getOverview(owner.tenantId, { search });
-      expect(view.summary.reportedAgents).toBe(3);
-      expect(view.agents.count, search).toBe(2);
-      expect(view.agents.value.map(agent => agent.agentId), search).toEqual(["ПАКЕТ", "пакет"]);
+      const view = await overview(identity, { search });
+      expect(view.counts.filtered, search).toBe(2); expect(view.value.map(row => row.agentId), search).toEqual(["ПАКЕТ", "пакет"]);
     }
   });
 
-  it("selects deterministic newest accepted source snapshots even when acceptance times tie", async () => {
-    const owner = scope();
-    const first = await importBundle(owner, { agents: [{ id: "shared", name: "First", date: "2026-07-01" }] });
-    const second = await importBundle(owner, { agents: [{ id: "shared", name: "Second", date: "2026-07-02" }] });
-    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=$2 WHERE tenant_id=$1", [owner.tenantId, now()]);
+  it("uses set-ID tie-breaking for the newest accepted name without erasing the historical activity maximum", async () => {
+    const identity = owner(), first = await accept(identity, { agents: [{ id: "shared", name: "First", date: day(-14) }] });
+    const second = await accept(identity, { agents: [{ id: "shared", name: "Second", date: day(-13) }] });
+    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=$2 WHERE tenant_id=$1", [identity.tenantId, today]);
     const latest = first.setId > second.setId ? first : second;
-    const view = await overview.getOverview(owner.tenantId);
-    expect(view.agents.value[0]).toMatchObject({
-      agentId: "shared", agentName: latest === first ? "First" : "Second",
-      lastActivityDateUtc: "2026-07-02", latestSetId: latest.setId, latestAcceptedAt: now().toISOString(),
-    });
+    expect((await overview(identity)).value[0]).toMatchObject({ agentId: "shared", agentName: latest === first ? "First" : "Second",
+      lastActivityDateUtc: day(-13), latestSetId: latest.setId, latestAcceptedAt: today.toISOString() });
   });
 
-  it("excludes deleted, incomplete, foreign-tenant, missing-membership and broken-version sets", async () => {
-    const owner = scope();
-    const keep = await importBundle(owner, { agents: [{ id: "keep", date: "2026-07-15" }] });
-    const deleted = await importBundle(owner, { agents: [{ id: "deleted", date: "2026-07-15" }] });
-    await deleteSet(owner, deleted.setId);
-    const partial = await stage(owner, { agents: [{ id: "incomplete", date: "2026-07-15" }] }, "agents", randomUUID());
-    await repository.accept(owner, partial.id, {
-      stagingRevision: partial.revision, fileHash: partial.fileHash, expectedActiveRevision: partial.activeRevision,
-    });
-    const broken = await importBundle(owner, { agents: [{ id: "orphan-fact", date: "2026-07-15" }] });
-    await fixture.operator.query(`DELETE FROM official_usage_version_rows row
-      USING official_usage_set_versions membership
-      WHERE membership.set_id=$1 AND membership.kind='agents' AND row.version_id=membership.version_id`, [broken.setId]);
-    const missing = await importBundle(owner, { agents: [{ id: "missing-kind", date: "2026-07-15" }] });
+  it("excludes deleted, partial, foreign, missing-membership and broken-version evidence", async () => {
+    const identity = owner(), keep = await accept(identity, { agents: [{ id: "keep", date: day() }] });
+    const deleted = await accept(identity, { agents: [{ id: "deleted", date: day() }] });
+    await mutate(identity, deleted.setId, "delete");
+    const partial = await stage(identity, { agents: [{ id: "incomplete", date: day() }] }, "agents", randomUUID());
+    await imports.accept(identity, { stagingId: partial.id, revision: partial.revision, contentHash: partial.contentHash, expectedActiveRevision: partial.activeRevision });
+    const broken = await accept(identity, { agents: [{ id: "orphan-fact", date: day() }] });
+    await fixture.operator.query(`DELETE FROM official_usage_version_rows r USING official_usage_set_versions m
+      WHERE m.set_id=$1 AND m.kind='agents' AND r.version_id=m.version_id`, [broken.setId]);
+    const missing = await accept(identity, { agents: [{ id: "missing-kind", date: day() }] });
     await fixture.operator.query("DELETE FROM official_usage_set_versions WHERE set_id=$1 AND kind='users'", [missing.setId]);
-    const deadVersion = await importBundle(owner, { agents: [{ id: "deleted-version", date: "2026-07-15" }] });
+    const dead = await accept(identity, { agents: [{ id: "deleted-version", date: day() }] });
     await fixture.operator.query(`UPDATE official_usage_versions SET deleted_at=clock_timestamp()
-      WHERE id=(SELECT version_id FROM official_usage_set_versions WHERE set_id=$1 AND kind='agents')`, [deadVersion.setId]);
-    await importBundle(scope(), { agents: [{ id: "foreign-only", date: "2026-07-15" }] });
-
-    const view = await overview.getOverview(owner.tenantId);
-    expect(view.summary).toMatchObject({ retainedSets: 1, reportedAgents: 1, usedAgents: 1, activeAgents30Days: 1 });
-    expect(view.agents.value).toMatchObject([{ agentId: "keep", latestSetId: keep.setId }]);
-    expect(view.revision).toBe(Number((await fixture.runtime.query<{ revision: string }>(
-      "SELECT revision FROM official_usage_state WHERE tenant_id=$1", [owner.tenantId])).rows[0]!.revision));
+      WHERE id=(SELECT version_id FROM official_usage_set_versions WHERE set_id=$1 AND kind='agents')`, [dead.setId]);
+    await accept(owner(), { agents: [{ id: "foreign-only", date: day() }] });
+    const view = await overview(identity);
+    expect(view.analytics.overview).toMatchObject({ retainedSets: 1, reportedAgents: 1, usedAgents: 1, active30Days: 1 });
+    expect(view.value).toMatchObject([{ agentId: "keep", latestSetId: keep.setId }]);
   });
 
-  it("excludes superseded corrections permanently while preserving explicit snapshot and raw history reads", async () => {
-    const owner = scope();
-    const metadata = window("2026-07-09", "2026-07-15");
-    const original = await importBundle(owner, {
-      metadata, agents: [{ id: "incorrect", date: "2026-07-15", responses: 999 }],
-    });
-    const corrected = await importBundle(owner, {
-      metadata, correctionOfSetId: original.setId, agents: [{ id: "intermediate", date: "2026-07-14" }],
-    });
-    const final = await importBundle(owner, {
-      metadata, correctionOfSetId: corrected.setId, agents: [{ id: "correct", date: "2026-06-01" }],
-    });
-    const view = await overview.getOverview(owner.tenantId);
-    expect(view.summary).toMatchObject({ retainedSets: 1, reportedAgents: 1, activeAgents30Days: 0 });
-    expect(view.agents.value).toMatchObject([{ agentId: "correct", latestSetId: final.setId }]);
-    expect((await repository.getPublished(owner.tenantId, original.setId)).reports.agents?.rows[0])
-      .toMatchObject({ agentId: "incorrect", responsesSentToUsers: 999 });
-    expect((await new OfficialUsageHistoryService(fixture.runtime).getHistory(owner.tenantId)).summary.importCount).toBe(3);
-    await deleteSet(owner, final.setId);
-    expect(await overview.getOverview(owner.tenantId)).toMatchObject({
-      summary: {
-        retainedSets: 0, reportedAgents: 0, usedAgents: 0, activeAgents30Days: 0, undatedAgents: 0,
-        earliestActivityDateUtc: null, latestActivityDateUtc: null,
-      },
-      agents: { count: 0, value: [] },
-    });
-    expect((await new OfficialUsageHistoryService(fixture.runtime).getHistory(owner.tenantId)).summary.importCount).toBe(2);
-    expect((await repository.getPublished(owner.tenantId, original.setId)).reports.agents?.rows[0].agentId).toBe("incorrect");
-  });
-
-  it("returns a zero-evidence summary and current revision for tenants with no eligible history", async () => {
-    const view = await overview.getOverview(scope().tenantId, { search: "none", limit: 1, offset: 10 });
-    expect(view).toMatchObject({
-      revision: 1,
-      summary: {
-        retainedSets: 0, reportedAgents: 0, usedAgents: 0, activeAgents30Days: 0, undatedAgents: 0,
-        earliestActivityDateUtc: null, latestActivityDateUtc: null,
-        asOf: now().toISOString(), activeSinceDateUtc: "2026-06-16",
-      },
-      agents: { count: 0, value: [], limit: 1, offset: 10 },
-    });
-  });
-
-  it("keeps corrected originals excluded after deleted correction payloads are purged", async () => {
-    const owner = scope();
-    const metadata = window("2026-07-09", "2026-07-15");
-    const original = await importBundle(owner, {
-      metadata, agents: [{ id: "incorrect", date: "2026-07-15" }],
-    });
-    const corrected = await importBundle(owner, {
-      metadata, correctionOfSetId: original.setId, agents: [{ id: "correct", date: "2026-07-14" }],
-    });
-    await deleteSet(owner, corrected.setId);
-    await fixture.operator.query(`UPDATE official_usage_sets
-      SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1`, [corrected.setId]);
-    await fixture.operator.query(`UPDATE official_usage_versions
-      SET deleted_at=clock_timestamp()-interval '91 days'
-      WHERE tenant_id=$1 AND deleted_at IS NOT NULL`, [owner.tenantId]);
+  it("never revives superseded evidence after deleting the correction or purging its payloads", async () => {
+    const identity = owner(), metadata = window(-6, 0);
+    const first = await accept(identity, { metadata, agents: [{ id: "incorrect", date: day(), responses: 999 }] });
+    const second = await accept(identity, { metadata, correctionOfSetId: first.setId, agents: [{ id: "intermediate", date: day(-1) }] });
+    const final = await accept(identity, { metadata, correctionOfSetId: second.setId, agents: [{ id: "correct", date: day(-44) }] });
+    expect((await overview(identity)).value).toMatchObject([{ agentId: "correct", latestSetId: final.setId }]);
+    expect((await agents(identity, first.setId)).value).toMatchObject([{ agentId: "incorrect", responses: 999 }]);
+    expect(await historyCount(identity)).toBe(3);
+    await mutate(identity, final.setId, "delete");
+    expect((await overview(identity)).analytics.overview).toMatchObject({ retainedSets: 0, reportedAgents: 0, usedAgents: 0,
+      active30Days: 0, undatedAgents: 0, earliestActivityDateUtc: null, latestActivityDateUtc: null });
+    expect(await historyCount(identity)).toBe(2);
+    await fixture.operator.query("UPDATE data_read_selections SET invalidated_at=clock_timestamp() WHERE tenant_id=$1", [identity.tenantId]);
+    await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1", [final.setId]);
+    await fixture.operator.query("UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1 AND deleted_at IS NOT NULL", [identity.tenantId]);
     await retainUntilConverged(fixture.operator);
+    expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(0);
+    expect((await agents(identity, first.setId)).value).toMatchObject([{ agentId: "incorrect" }]);
+    expect((await fixture.runtime.query("SELECT supersedes_set_id,complete FROM official_usage_sets WHERE id=$1", [final.setId])).rows)
+      .toEqual([{ supersedes_set_id: second.setId, complete: true }]);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_set_versions WHERE set_id=$1", [final.setId])).rows).toEqual([{ n: 0 }]);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_row_facts WHERE tenant_id=$1 AND agent_id='correct'", [identity.tenantId])).rows).toEqual([{ n: 0 }]);
+  });
 
-    expect((await overview.getOverview(owner.tenantId)).summary).toMatchObject({
-      retainedSets: 0, reportedAgents: 0, usedAgents: 0, activeAgents30Days: 0,
-    });
-    expect((await repository.getPublished(owner.tenantId, original.setId)).reports.agents?.rows[0].agentId)
-      .toBe("incorrect");
-    expect((await fixture.runtime.query(`SELECT supersedes_set_id,complete FROM official_usage_sets
-      WHERE id=$1`, [corrected.setId])).rows).toEqual([{ supersedes_set_id: original.setId, complete: true }]);
-    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_set_versions
-      WHERE set_id=$1`, [corrected.setId])).rows[0].count).toBe(0);
-    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_row_facts
-      WHERE tenant_id=$1 AND row_data->>'agentId'='correct'`, [owner.tenantId])).rows[0].count).toBe(0);
-
-    await deleteSet(owner, original.setId);
-    await fixture.operator.query(`UPDATE official_usage_sets
-      SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1`, [original.setId]);
-    await fixture.operator.query(`UPDATE official_usage_versions
-      SET deleted_at=clock_timestamp()-interval '91 days'
-      WHERE tenant_id=$1 AND deleted_at IS NOT NULL`, [owner.tenantId]);
-    await retainUntilConverged(fixture.operator);
-    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_sets
-      WHERE tenant_id=$1`, [owner.tenantId])).rows[0].count).toBe(0);
+  it("returns explicit zero evidence with a captured time and no inferred response totals", async () => {
+    const view = await overview(owner(), { search: "none" }, 1);
+    expect(view.analytics.overview).toEqual({ retainedSets: 0, reportedAgents: 0, usedAgents: 0, active30Days: 0, undatedAgents: 0,
+      earliestActivityDateUtc: null, latestActivityDateUtc: null, asOf: view.selection.evaluatedAt, activeSinceDateUtc: day(-29) });
+    expect(view.analytics.responses).toBeNull(); expect(view.counts).toEqual({ total: 0, filtered: 0 });
+    expect(view.value).toEqual([]); expect(view.page).toEqual({ limit: 1, nextCursor: null, previousCursor: null });
   });
 });

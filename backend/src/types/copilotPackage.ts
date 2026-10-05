@@ -41,7 +41,13 @@ export function normalizePackageStatus(value: PackageStatus | undefined): "all" 
 export type PackageAccessUpdate =
   | {
       target: PackageAccessTarget;
-      mode: PackageAccessMutationMode;
+      mode: "add";
+      scope: "specific";
+      principals: PackageAccessEntity[];
+    }
+  | {
+      target: PackageAccessTarget;
+      mode: "replace";
       scope: "specific";
       principals: PackageAccessEntity[];
     }

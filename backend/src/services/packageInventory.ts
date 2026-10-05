@@ -1,31 +1,21 @@
-import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireDelegatedToken, isRetryableIdentityProviderError, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { findTenantConfiguration } from "../config.js";
-import { PackageInventoryRepository, type PackageDataScope, type PackageRefreshInput, type PackageScanResult } from "../db/packageInventory.js";
+import { PackageRefreshJobs, type PackageDataScope, type PackageRefreshInput } from "../db/packageRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
-import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus } from "../types/dataSync.js";
 import { capabilities } from "./capabilities.js";
-import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy, type PackageReadOptions } from "./graphPackages.js";
-import { mapWithConcurrency } from "./mapWithConcurrency.js";
-import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
+import { graphErrorTelemetry, graphResponseDiagnostics } from "./graphPackages.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 import { requireProviderAdmissions } from "./operationalState.js";
-
-type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
-type PackageScanClient = Pick<GraphPackagesClient, "listCopilotAgents" | "getPackageDetails">;
-export type PackageScanOptions = Pick<PackageReadOptions, "getAccessToken" | "retryThrottlingUntilAborted"> & {
-  catalogOnly?: boolean;
-  autoDetails?: boolean;
-};
-export type PackageRefreshScan = (
-  token: string, requestedIds: readonly string[], signal: AbortSignal, onProgress: PackageRefreshProgress, options?: PackageScanOptions,
-) => Promise<PackageScanResult>;
+import { StreamedInventory } from "./streamedInventory.js";
+import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
+import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
 
 type PackageRefreshDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
@@ -34,12 +24,11 @@ type PackageRefreshDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
-  scan: PackageRefreshScan;
+  streams: (database: ConstructorParameters<typeof StreamedInventory>[0]) => Pick<StreamedInventory, "exactJob" | "graphCatalog">;
   applicationPrincipalId: (tenantId: string) => string | undefined;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
-const graphPackages = new GraphPackagesClient(fetch, packageInventoryReadPolicy);
 const defaultDependencies: PackageRefreshDependencies = {
   delegatedToken: acquireDelegatedToken,
   applicationToken: acquireApplicationToken,
@@ -47,7 +36,7 @@ const defaultDependencies: PackageRefreshDependencies = {
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
-  scan: (token, ids, signal, progress, options) => scanPackages(token, ids, signal, progress, graphPackages, options),
+  streams: database => new StreamedInventory(database),
   applicationPrincipalId: tenantId => findTenantConfiguration(tenantId)?.clientId,
   wait: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
 };
@@ -56,11 +45,10 @@ type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
 type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void>; autoDetails: boolean };
 type StartingRefresh = Omit<ActiveRefresh, "operation" | "autoDetails"> & {
   autoDetails?: boolean;
-  operation: Promise<NonNullable<Awaited<ReturnType<PackageInventoryRepository["getJob"]>>>>;
+  operation: Promise<NonNullable<Awaited<ReturnType<PackageRefreshJobs["getJob"]>>>>;
 };
 const maximumActiveRefreshes = 4;
 const maximumAutomaticRefreshes = 2;
-const exactReadConcurrency = 4;
 
 export class PackageInventoryService {
   private readonly active = new Map<string, ActiveRefresh>();
@@ -68,7 +56,7 @@ export class PackageInventoryService {
   private draining = false;
 
   constructor(
-    private readonly repository = new PackageInventoryRepository(),
+    private readonly repository = new PackageRefreshJobs(),
     private readonly dependencies: PackageRefreshDependencies = defaultDependencies,
   ) {}
 
@@ -160,7 +148,7 @@ export class PackageInventoryService {
       assertAccountSessionValidation(validation);
       requireProviderAdmissions();
     };
-    let current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>>;
+    let current: Awaited<ReturnType<PackageRefreshJobs["getJob"]>>;
     let token = "";
     let ownedWaitingJob = false;
     let markedRunning = false;
@@ -268,9 +256,18 @@ export class PackageInventoryService {
     }
   }
 
-  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>> & {}, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
+  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageRefreshJobs["getJob"]>> & {}, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
     const startedAt = performance.now();
     let stage = "inventory_collection";
+    let sourceAuthorized = false;
+    let committed = false;
+    let diagnosticsFinished = false;
+    const diagnostics = new PackageScanDiagnostics(current.scopeKind);
+    if (current.scopeKind === "exact") diagnostics.startDetails(current.targetCount);
+    const finishDiagnostics = (outcome: Parameters<PackageScanDiagnostics["finish"]>[0]) => {
+      if (!diagnosticsFinished) { diagnostics.finish(outcome); diagnosticsFinished = true; }
+    };
+    let progress = { pages: current.pageCount, observedCount: current.observedCount, totalRecords: current.totalRecords };
     const assertCurrent = () => {
       signal.throwIfAborted();
       assertAccountSessionValidation(validation);
@@ -279,29 +276,28 @@ export class PackageInventoryService {
     try {
       assertCurrent();
       operationalLog("info", "package_refresh_started", { mode: current.scopeKind });
-      const result = await this.dependencies.observeOperation(capabilityForMode(current.tokenMode),
-        { tenantId: actor.tenantId, homeAccountId: actor.principalId }, () => this.dependencies.scan(token, current.requestedIds, signal,
-        (pages, observedCount, totalRecords, message) => {
+      const input = await inventoryJobInput(this.repository.database, scope, "packages", id);
+      const streams = this.dependencies.streams(this.repository.database);
+      const options = {
+        signal, diagnostics, retryThrottlingUntilAborted: !current.autoDetails,
+        onProgress: async (value: { pages: number; observedCount: number; totalRecords?: number | null }) => {
           assertCurrent();
-          return this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message);
-        }, {
-          retryThrottlingUntilAborted: !current.autoDetails,
-          ...(current.catalogOnly ? { catalogOnly: true } : {}),
-          ...(current.autoDetails ? { autoDetails: true } : {}),
-          getAccessToken: async () => {
-            assertCurrent();
-            const capabilityId = capabilityForMode(current.tokenMode);
-            const currentToken = current.tokenMode === "delegated"
-              ? await this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
-              : await this.dependencies.applicationToken(actor.tenantId, capabilityId);
-            assertCurrent();
-            return currentToken;
-          },
-        }), { signal });
-      assertCurrent();
-      for (let attempt = 1; ; attempt += 1) {
-        stage = "publication_authorization";
-        try {
+          progress = { pages: value.pages, observedCount: value.observedCount,
+            totalRecords: current.scopeKind === "exact" ? current.targetCount : value.totalRecords ?? null };
+          await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount,
+            progress.totalRecords);
+        },
+        onRetry: async (notice: { retryDelayMs: number; throttled: boolean }) => {
+          assertCurrent();
+          await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords,
+            `${notice.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph is retrying a package read."} Waiting ${Math.ceil(notice.retryDelayMs / 1_000)} seconds before retrying (${progress.observedCount} targets observed).`);
+          assertCurrent();
+        },
+        authorize: async (publicationSignal: AbortSignal) => {
+          stage = sourceAuthorized ? "publication_authorization" : "collection_authorization";
+          for (let attempt = 1; ; attempt++) {
+          publicationSignal.throwIfAborted();
+          try {
           assertCurrent();
           const freshUser = await this.dependencies.revalidateUser(actor.tenantId, actor.principalId);
           assertCurrent();
@@ -312,33 +308,59 @@ export class PackageInventoryService {
           assertCurrent();
           await this.dependencies.requireAvailable(capabilityId, freshUser, { retryFailed: true });
           assertCurrent();
-          await commitAccountSessionValidation(validation, async () => {
+          sourceAuthorized = true;
+          stage = "inventory_collection";
+          return;
+          } catch (error) {
+            if (!transientPublicationReadinessFailure(error)) throw error;
+            await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords,
+              sourceAuthorized
+                ? "Collection is complete. Waiting for current Microsoft read authorization before publication; no packages are being downloaded again."
+                : "Waiting for current Microsoft read authorization before collection. No provider reads are running.");
             assertCurrent();
-            stage = "publication";
-            await this.repository.publish(scope, id, result);
-          });
-          break;
-        } catch (error) {
+            await this.dependencies.wait(publicationReadinessRetryDelay(error, attempt), publicationSignal);
+          }
+          }
+        },
+        getAccessToken: async () => {
           assertCurrent();
-          if (stage !== "publication_authorization" || !transientPublicationReadinessFailure(error)) throw error;
-          const retryDelayMs = publicationReadinessRetryDelay(error, attempt);
-          operationalLog("warn", "package_publication_readiness_retry", {
-            stage, attempt, retryDelayMs, count: result.packages.length, ...graphErrorTelemetry(error),
-          });
-          await this.repository.recordProgress(scope, id, result.pages, result.packages.length, result.totalRecords,
-            `All ${result.packages.length} packages collected. Microsoft readiness verification is temporarily unavailable; retrying in ${Math.ceil(retryDelayMs / 1000)} seconds. Collected data is retained in this running job; no packages are being downloaded again.`);
-          // Only publication holds the account lock; provider checks and backoff must not block sign-out.
-          await this.dependencies.wait(retryDelayMs, signal);
-        }
-      }
-      const detailsFailed = current.autoDetails && Boolean(result.detailFailures?.length);
-      operationalLog(detailsFailed ? "warn" : "info", detailsFailed ? "package_detail_read_failed" : "package_refresh_succeeded", {
-        status: detailsFailed ? "failed" : "succeeded", count: result.packages.length, pages: result.pages,
-        durationMs: Math.round(performance.now() - startedAt),
+          const capabilityId = capabilityForMode(current.tokenMode);
+          const value = current.tokenMode === "delegated"
+            ? await this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
+            : await this.dependencies.applicationToken(actor.tenantId, capabilityId);
+          assertCurrent();
+          return value;
+        },
+        commitPublication: (operation: () => Promise<void>) => commitAccountSessionValidation(validation, async () => {
+          assertCurrent();
+          await operation();
+        }),
+        completeJob: async (...args: Parameters<ReturnType<typeof completeInventoryJob>>) => {
+          assertCurrent();
+          stage = "publication";
+          await completeInventoryJob(input, "packages")(...args);
+        },
+      };
+      await this.dependencies.observeOperation(capabilityForMode(current.tokenMode),
+        { tenantId: actor.tenantId, homeAccountId: actor.principalId }, async () => {
+          if (current.scopeKind === "exact") await streams.exactJob(input, token, current.autoDetails, options);
+          else await streams.graphCatalog(input, token, options);
+          committed = true;
+        }, { signal });
+      finishDiagnostics("collected");
+      if (current.tokenMode === "delegated") await inventoryRuntime(this.repository.database).enqueue(scope);
+      operationalLog("info", "package_refresh_succeeded", {
+        status: "succeeded", durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
+      if (committed) {
+        finishDiagnostics("collected");
+        operationalLog("warn", "package_inventory_followup_failed", { stage, ...graphErrorTelemetry(error) });
+        return;
+      }
       let failure = error;
       try { assertCurrent(); } catch (currentError) { failure = currentError; }
+      finishDiagnostics(signal.aborted ? signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "cancelled" : "failed");
       operationalLog("warn", "package_refresh_execution_failed", {
         stage, ...graphErrorTelemetry(failure), durationMs: Math.round(performance.now() - startedAt),
       });
@@ -376,6 +398,7 @@ function refreshCapacityError() {
 
 function transientPublicationReadinessFailure(error: unknown): error is AppError {
   if (!(error instanceof AppError) || error.status === 401 || error.status === 403) return false;
+  if (isRetryableIdentityProviderError(error)) return true;
   if (["provider_timeout", "provider_network_error", "provider_throttled"].includes(error.code)) return true;
   if (error.code !== "provider_error" || !error.details || typeof error.details !== "object" || !("evidence" in error.details)) return false;
   const evidence = error.details.evidence;
@@ -392,132 +415,6 @@ function publicationReadinessRetryDelay(error: AppError, attempt: number) {
     ? Date.parse(details.expiresAt) : NaN;
   return error.code === "provider_throttled" && Number.isFinite(expiresAt)
     ? Math.max(backoff, expiresAt - Date.now() + 1) : backoff;
-}
-
-export async function scanPackages(
-  token: string,
-  requestedIds: readonly string[],
-  signal: AbortSignal,
-  onProgress: PackageRefreshProgress,
-  client: PackageScanClient = graphPackages,
-  options: PackageScanOptions = {},
-): Promise<PackageScanResult> {
-  const diagnostics = new PackageScanDiagnostics(requestedIds.length === 0 ? "broad" : "exact");
-  let outcome: "collected" | "failed" = "failed";
-  try {
-    const result = await collectPackages(token, requestedIds, signal, onProgress, client, diagnostics, options);
-    outcome = "collected";
-    return result;
-  } finally {
-    diagnostics.finish(signal.aborted
-      ? signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "cancelled"
-      : outcome);
-  }
-}
-
-async function collectPackages(
-  token: string,
-  requestedIds: readonly string[],
-  signal: AbortSignal,
-  onProgress: PackageRefreshProgress,
-  client: PackageScanClient,
-  diagnostics: PackageScanDiagnostics,
-  options: PackageScanOptions,
-): Promise<PackageScanResult> {
-  const broad = requestedIds.length === 0;
-  let listPages = 0;
-  let ids = requestedIds;
-  const summaries = new Map<string, CopilotPackageDetail>();
-  const detailFailures: NonNullable<PackageScanResult["detailFailures"]> = [];
-  if (broad) {
-    const listed = await client.listCopilotAgents(token, {
-      ...options,
-      signal,
-      diagnostics,
-      onProgress: async progress => {
-        listPages = progress.pages;
-        await onProgress(progress.pages, progress.observedCount, progress.observedCount,
-          options.catalogOnly ? "Reading the package catalog; detail enrichment runs separately." : "Reading the agent list before identity collection.");
-      },
-    });
-    for (const value of listed) {
-      if (summaries.has(value.id)) throw new AppError(502, "provider_schema", "The package list contains duplicate native identities.");
-      summaries.set(value.id, value);
-    }
-    ids = [...summaries.keys()];
-    if (options.catalogOnly) return { packages: [...summaries.values()], totalRecords: summaries.size, pages: Math.max(1, listPages) };
-    await onProgress(Math.max(1, listPages), 0, ids.length, `Matching agent records (0/${ids.length} identities checked).`);
-  }
-  if (!broad && ids.length > 100) throw new AppError(400, "invalid_targets", "An exact package refresh accepts at most 100 native IDs.");
-  diagnostics.startDetails(ids.length);
-  const failure = new AbortController();
-  const readSignal = AbortSignal.any([signal, failure.signal]);
-  let completed = 0;
-  let observedCount = 0;
-  let progress = Promise.resolve();
-  let retryNotice: { until: number; throttled: boolean } | undefined;
-  const reportProgress = (retry?: { retryDelayMs: number; throttled: boolean }) => {
-    if (retry && performance.now() + retry.retryDelayMs > (retryNotice?.until ?? 0)) {
-      retryNotice = { until: performance.now() + retry.retryDelayMs, throttled: retry.throttled };
-    }
-    const pages = broad ? Math.max(1, listPages) : completed;
-    const observed = broad ? completed : observedCount;
-    const total = broad ? ids.length : observedCount;
-    const remainingWaitMs = completed === ids.length ? 0 : (retryNotice?.until ?? 0) - performance.now();
-    const message = remainingWaitMs > 0
-      ? `${retryNotice?.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph package read needs a retry."} Waiting ${Math.ceil(remainingWaitMs / 1000)} seconds before retrying (${completed}/${ids.length} identities checked).`
-      : broad ? `Matching agent records (${completed}/${ids.length} identities checked).` : undefined;
-    // Serialize writes so a slow progress update cannot overwrite a newer count or retry message.
-    progress = progress.then(async () => {
-      readSignal.throwIfAborted();
-      await onProgress(pages, observed, total, message);
-    });
-    return progress;
-  };
-  const concurrency = options.autoDetails ? 2 : exactReadConcurrency;
-  const results = await mapWithConcurrency(ids, concurrency, async id => {
-    try {
-      readSignal.throwIfAborted();
-      let value: CopilotPackageDetail | null;
-      try {
-        const detail = await client.getPackageDetails(token, id, {
-          ...options,
-          signal: readSignal,
-          diagnostics,
-          onRetry: reportProgress,
-        });
-        if (detail.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
-        const summary = summaries.get(id);
-        diagnostics.compareDetail(summary, detail);
-        value = {
-          ...summary, ...detail, identityDetailsCollected: true as const,
-          authoringTool: detail.authoringTool ?? summary?.authoringTool ?? null,
-          provenance: { ...summary?.provenance, ...detail.provenance },
-        };
-      } catch (error) {
-        const missing = error instanceof AppError && error.status === 404;
-        if (options.autoDetails && !(error instanceof AppError && dataSyncFailureStatus(error.code, error.status) !== "failed")) {
-          detailFailures.push({ id, missing, errorCode: error instanceof AppError ? error.code : "provider_error" });
-        } else if (!missing) throw error;
-        value = null;
-      }
-      readSignal.throwIfAborted();
-      completed += 1;
-      if (value) observedCount += 1;
-      diagnostics.completeDetail(value !== null);
-      if (completed % concurrency === 0 || completed === ids.length) {
-        await reportProgress();
-      }
-      return value;
-    } catch (error) {
-      failure.abort(error);
-      throw readSignal.reason;
-    }
-  });
-  signal.throwIfAborted();
-  const packages = results.filter(value => value !== null);
-  return { packages, totalRecords: packages.length, pages: Math.max(1, broad ? listPages : completed),
-    ...(options.autoDetails ? { detailFailures } : {}) };
 }
 
 function capabilityForMode(mode: RefreshInput["tokenMode"]): CapabilityId {
@@ -560,6 +457,9 @@ function syncFailureCode(error: unknown) {
 
 function safeFailureMessage(error: unknown) {
   if (isAdmissionPause(error)) return `${error.message} Saved package data is unchanged.`;
+  if (error instanceof AppError && error.code === "identity_provider_error") {
+    return "Microsoft Entra ID could not renew authorization for package refresh. The previous complete inventory is unchanged; retry from Sync. If this persists, review the Entra sign-in logs and application configuration.";
+  }
   if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
     return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
   }

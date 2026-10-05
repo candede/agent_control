@@ -4,6 +4,8 @@ import { activateAccountSession, revokeAccountSessionMutations } from "../db/ses
 import { AppError } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, QuarantineJob } from "../types/copilotStudioQuarantine.js";
 
+const settleControls = vi.hoisted(() => vi.fn(async (_scope: unknown, signal: AbortSignal) => { signal.throwIfAborted(); }));
+
 vi.mock("../db/pool.js", () => ({
   pool: {},
   secretValue: vi.fn(),
@@ -11,6 +13,10 @@ vi.mock("../db/pool.js", () => ({
 }));
 vi.mock("./maintenance.js", () => ({ maintenanceActive: vi.fn(() => false) }));
 vi.mock("./operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
+vi.mock("./inventoryRuntime.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./inventoryRuntime.js")>(),
+  InventoryRuntime: class { settleControls = settleControls; },
+}));
 
 import { capabilities } from "./capabilities.js";
 import {
@@ -96,6 +102,7 @@ async function replaceSession() {
 }
 
 beforeEach(async () => {
+  settleControls.mockReset().mockImplementation(async (_scope, signal) => { signal.throwIfAborted(); });
   await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
   vi.mocked(requireProviderAdmissions).mockImplementation(() => undefined);
   vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined));
@@ -111,6 +118,17 @@ describe("quarantine execution session and cancellation boundaries", () => {
     expect(provider.setQuarantine).toHaveBeenCalledOnce();
     expect(provider.getStatus).toHaveBeenCalledTimes(3);
     expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "succeeded", expect.objectContaining({ observed: status(true) }));
+    expect(repository.release).toHaveBeenCalledOnce();
+    expect(settleControls).toHaveBeenCalledWith(scope, expect.any(AbortSignal));
+  });
+
+  it("keeps provider dispatch closed when pending inventory controls cannot settle", async () => {
+    const { repository, provider, authorize } = fixture();
+    settleControls.mockRejectedValueOnce(new Error("inventory control publication failed"));
+    await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize))
+      .rejects.toThrow("inventory control publication failed");
+    expect(repository.beginItem).not.toHaveBeenCalled();
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
     expect(repository.release).toHaveBeenCalledOnce();
   });
 

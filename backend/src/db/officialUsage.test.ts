@@ -1,424 +1,398 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { retain, retainUntilConverged } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { parseOfficialUsageReport } from "../services/officialUsageParser.js";
-import type { OfficialUsageMetadata } from "../types/officialUsage.js";
-import { OfficialUsageRepository } from "./officialUsage.js";
+import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { LargeTenantUsersReports } from "../services/largeTenantUsersReports.js";
+import { schemaRegistry } from "../services/officialReportFields.js";
+import type { OfficialUsageMetadata } from "../types/officialReportRecords.js";
+import type { ReportEndpoint, ReportQuery } from "../types/officialReportData.js";
+import type { SelectionIdentity } from "../services/dataSelections.js";
+import { OfficialReportImports } from "./officialReportImports.js";
+import { retainDeletedReportRows, retainRecordData } from "./dataRetention.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let repository: OfficialUsageRepository;
-const administrator = { tenantId: "tenant-usage", principalId: "administrator-a" };
-const otherAdministrator = { ...administrator, principalId: "administrator-b" };
+let imports: OfficialReportImports;
+let reports: LargeTenantUsersReports;
+const kinds = ["agents", "userAgents", "users"] as const;
+type Kind = typeof kinds[number];
 const metadata: OfficialUsageMetadata = {
   reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06", provenance: "operator_asserted" },
   sourceAsOf: { value: "2026-07-08T12:00:00Z", provenance: "operator_asserted" },
 };
-
 beforeAll(async () => {
   fixture = await testDatabase();
-  repository = new OfficialUsageRepository(fixture.runtime);
-});
+  imports = new OfficialReportImports(fixture.runtime);
+  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-native-repository-secret", 35);
+}, 30_000);
 afterAll(async () => { await fixture?.close(); });
 
-function csv(kind: "agents" | "userAgents" | "users", marker = "1") {
-  if (kind === "agents") return `Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nagent-${marker},Agent ${marker},Your org,1,1,4,2026-07-06`;
-  if (kind === "userAgents") return `Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nagent-${marker},Agent ${marker},Your org,User-${marker}@example.invalid,4,2026-07-06`;
-  return `Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nUser-${marker}@example.invalid,User ${marker},1,4,2026-07-06`;
+const owner = (): SelectionIdentity => ({ ...selectionIdentity, tenantId: `native-repository-${randomUUID()}` });
+function csv(kind: Kind, marker = "1") {
+  const row = kind === "agents" ? `agent-${marker},Agent ${marker},Your org,1,1,4,2026-07-06`
+    : kind === "userAgents" ? `agent-${marker},Agent ${marker},Your org,User-${marker}@example.invalid,4,2026-07-06`
+      : `User-${marker}@example.invalid,User ${marker},1,4,2026-07-06`;
+  return `${schemaRegistry[kind].headers.join(",")}\n${row}\n`;
 }
-
-async function stage(kind: "agents" | "userAgents" | "users", bundleId: string, options: {
-  marker?: string;
-  correctionOfSetId?: string;
-  scope?: typeof administrator;
-  metadata?: OfficialUsageMetadata | null;
-  content?: string;
+async function stage(identity: SelectionIdentity, bundleId: string, kind: Kind, options: {
+  marker?: string; correctionOfSetId?: string; metadata?: OfficialUsageMetadata | null; content?: string;
 } = {}) {
-  const content = options.content ?? csv(kind, options.marker);
-  return repository.stage(options.scope ?? administrator, {
-    report: parseOfficialUsageReport(Buffer.from(content), options.metadata === null ? undefined : options.metadata ?? metadata),
-    fileHash: createHash("sha256").update(content).digest("hex"),
-    bundleId,
-    correctionOfSetId: options.correctionOfSetId,
-  });
+  async function* chunks() { yield Buffer.from(options.content ?? csv(kind, options.marker)); }
+  return imports.stage(identity, { bundleId, correctionOfSetId: options.correctionOfSetId }, chunks(),
+    options.metadata === null ? undefined : options.metadata ?? metadata);
 }
-
-async function accept(staging: Awaited<ReturnType<typeof stage>>, scope = administrator) {
-  return repository.accept(scope, staging.id, {
-    stagingRevision: staging.revision,
-    fileHash: staging.fileHash,
-    expectedActiveRevision: staging.activeRevision,
-  });
+function accept(identity: SelectionIdentity, preview: Awaited<ReturnType<typeof stage>>) {
+  return imports.accept(identity, { stagingId: preview.id, revision: preview.revision,
+    contentHash: preview.contentHash, expectedActiveRevision: preview.activeRevision });
 }
-
-async function completeSet(marker = "1", correctionOfSetId?: string, sourceMetadata = metadata) {
+async function bundle(identity: SelectionIdentity, options: Parameters<typeof stage>[3] = {}) {
   const bundleId = randomUUID();
-  const previews = await Promise.all(["agents", "userAgents", "users"].map(kind => stage(kind as "agents" | "userAgents" | "users", bundleId, { marker, correctionOfSetId, metadata: sourceMetadata })));
-  const first = await accept(previews[0]);
-  const second = await accept(previews[1]);
-  const third = await accept(previews[2]);
-  return { bundleId, previews, first, second, third };
+  for (const kind of kinds) await stage(identity, bundleId, kind, options);
+  const preview = await imports.bundle(identity, bundleId);
+  return { bundleId, preview, accept: () => imports.acceptBundle(identity, bundleId, preview) };
+}
+async function page(identity: SelectionIdentity, endpoint: ReportEndpoint, query: ReportQuery = {}) {
+  return reports.page((await reports.capture(identity, "delegated", endpoint, query)).id, identity, { limit: 50 });
+}
+async function head(identity: SelectionIdentity) {
+  return (await fixture.runtime.query<{ activeSetId: string | null; activeRevision: string }>(
+    `SELECT active_set_id AS "activeSetId",revision::text AS "activeRevision" FROM official_usage_state WHERE tenant_id=$1`,
+    [identity.tenantId])).rows[0];
+}
+async function operation(identity: SelectionIdentity, setId: string, operation: "select" | "delete") {
+  return imports.confirm(identity, await imports.confirmPreview(identity, setId, operation));
+}
+async function ageSyntheticUploads(identity: SelectionIdentity, stagingId?: string) {
+  const client = await fixture.operator.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("ALTER TABLE official_usage_ingestions DISABLE TRIGGER official_upload_intent_guard");
+    await client.query(`UPDATE official_usage_ingestions SET expires_at=clock_timestamp()-interval '2 days',
+      created_at=clock_timestamp()-interval '2 days' WHERE tenant_id=$1 AND ($2::uuid IS NULL OR staging_id=$2)`, [identity.tenantId, stagingId ?? null]);
+    await client.query(`UPDATE official_usage_staging SET expires_at=clock_timestamp()-interval '2 days',
+      created_at=clock_timestamp()-interval '2 days' WHERE tenant_id=$1 AND ($2::uuid IS NULL OR id=$2)`, [identity.tenantId, stagingId ?? null]);
+    await client.query("ALTER TABLE official_usage_ingestions ENABLE TRIGGER official_upload_intent_guard");
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
 }
 
-describe.sequential("Official usage repository", () => {
-  it("atomically accepts metadata-free reports with different observed ranges and empty unknown coverage", async () => {
-    const scope = { tenantId: "tenant-automatic-usage", principalId: "administrator-automatic-usage" };
-    const bundleId = randomUUID();
+describe("native immutable official report authority", () => {
+  it("atomically accepts metadata-free reports with distinct activity ranges and grouped numeric cells", async () => {
+    const identity = owner(), bundleId = randomUUID();
     const contents = {
       agents: csv("agents").replace(",4,", ',"1,175",'),
       userAgents: csv("userAgents").replace(",4,", ',"1,175",').replace("2026-07-06", "2026-07-04"),
       users: csv("users").replace(",4,", ',"1,179",').replace("2026-07-06", "2026-06-29"),
     };
-    await Promise.all((Object.keys(contents) as Array<keyof typeof contents>).map(kind =>
-      stage(kind, bundleId, { scope, metadata: null, content: contents[kind] })));
-    const reviewed = await repository.previewBundle(scope, bundleId);
-    expect(reviewed.missingKinds).toEqual([]);
-    expect(reviewed.staging.map(item => item.reportingPeriod)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ startDate: "2026-07-06", endDate: "2026-07-06", provenance: "activity_range" }),
-      expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-04", provenance: "activity_range" }),
-      expect.objectContaining({ startDate: "2026-06-29", endDate: "2026-06-29", provenance: "activity_range" }),
-    ]));
-    expect(await repository.acceptBundle(scope, bundleId, reviewed)).toMatchObject({ complete: true });
-    const published = await repository.getPublished(scope.tenantId);
-    expect(published.activeSet?.reportingPeriod).toEqual({
-      startDate: "2026-06-29",
-      endDate: "2026-07-06",
-      provenance: "activity_range",
-    });
-    expect(Object.values(published.reports).map(report => report?.lineage.reportingPeriod.provenance))
-      .toEqual(["activity_range", "activity_range", "activity_range"]);
-    expect(published.reports.agents?.rows[0].responsesSentToUsers).toBe(1175);
-    expect(published.reports.userAgents?.rows[0].responsesSentToUsers).toBe(1175);
-    expect(published.reports.users?.rows[0].agentResponsesReceived).toBe(1179);
-
-    const emptyScope = { tenantId: "tenant-empty-usage", principalId: "administrator-empty-usage" };
-    const emptyBundleId = randomUUID();
-    const empty = {
-      agents: csv("agents").split("\n")[0],
-      userAgents: csv("userAgents").split("\n")[0],
-      users: csv("users").split("\n")[0],
-    };
-    await Promise.all((Object.keys(empty) as Array<keyof typeof empty>).map(kind =>
-      stage(kind, emptyBundleId, { scope: emptyScope, metadata: null, content: empty[kind] })));
-    const emptyReviewed = await repository.previewBundle(emptyScope, emptyBundleId);
-    expect(await repository.acceptBundle(emptyScope, emptyBundleId, emptyReviewed)).toMatchObject({ complete: true });
-    const emptyPublished = await repository.getPublished(emptyScope.tenantId);
-    expect(emptyPublished.activeSet?.reportingPeriod).toEqual({
-      startDate: null,
-      endDate: null,
-      provenance: "activity_range",
-    });
-    expect(Object.values(emptyPublished.reports).every(report =>
-      report?.reportingPeriod.startDate === null &&
-      report.reportingPeriod.endDate === null &&
-      report.reportingPeriod.days === null)).toBe(true);
+    for (const kind of kinds) {
+      const preview = await stage(identity, bundleId, kind, { metadata: null, content: contents[kind] });
+      expect(preview.reportingPeriod.provenance).toBe("activity_range");
+    }
+    const reviewed = await imports.bundle(identity, bundleId);
+    expect(reviewed.complete).toBe(true); expect(reviewed.stages).toHaveLength(3);
+    const accepted = await imports.acceptBundle(identity, bundleId, reviewed);
+    const agents = await page(identity, "official_agents"), users = await page(identity, "official_users");
+    expect(agents.reports).toMatchObject({ setId: accepted.setId,
+      reportingPeriod: { startDate: "2026-06-29", endDate: "2026-07-06", provenance: "activity_range" } });
+    expect(agents.reports.lineages.map(lineage => lineage.periodProvenance)).toEqual(["activity_range", "activity_range", "activity_range"]);
+    expect(agents.value).toMatchObject([{ responses: 1175, bridgeResponses: 1175 }]);
+    expect(users.value).toMatchObject([{ reportedResponses: 1179 }]);
   });
 
-  it("keeps incomplete submissions durable without replacing active data, then activates all three compatible kinds atomically", async () => {
-    const bundleId = randomUUID();
-    const agents = await stage("agents", bundleId);
-    const acceptedAgents = await accept(agents);
-    expect(acceptedAgents).toMatchObject({ complete: false, activeRevision: 1 });
-    expect(await repository.getAdminState(administrator)).toMatchObject({ activeSetId: null, activeRevision: 1, sets: [{ complete: false, kinds: ["agents"] }] });
-
-    const userAgents = await stage("userAgents", bundleId);
-    const users = await stage("users", bundleId);
-    await accept(userAgents);
-    const completed = await accept(users);
-    expect(completed).toMatchObject({ complete: true, activeRevision: 2, setId: acceptedAgents.setId });
-    expect(await repository.getAdminState(administrator)).toMatchObject({ activeSetId: completed.setId, activeRevision: 2, sets: [{ complete: true, kinds: ["agents", "userAgents", "users"] }] });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE tenant_id=$1", [administrator.tenantId])).rows[0].count).toBe(3);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staged_rows")).rows[0].count).toBe(0);
+  it("preserves empty complete files as zero observations and unknown coverage", async () => {
+    const identity = owner(), bundleId = randomUUID();
+    for (const kind of kinds) await stage(identity, bundleId, kind, { metadata: null, content: csv(kind).split("\n")[0] });
+    await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
+    const result = await page(identity, "official_agents");
+    expect(result.reports.reportingPeriod).toEqual({ startDate: null, endDate: null, days: null, provenance: "activity_range" });
+    expect(result.reports.lineages).toHaveLength(3);
+    expect(result.reports.lineages.every(lineage => lineage.rowCount === 0)).toBe(true);
+    expect(result.counts).toEqual({ total: 0, filtered: 0 });
+    expect(result.summary.reportedResponses).toBe(0);
   });
 
-  it("accepts different download times for one exact source snapshot but rejects mixed periods", async () => {
-    const bundleId = randomUUID();
-    const first = await stage("agents", bundleId, { correctionOfSetId: (await repository.getAdminState(administrator)).activeSetId!, metadata: { ...metadata, downloadedAt: "2026-07-08T12:00:00Z" } });
-    const second = await stage("userAgents", bundleId, { correctionOfSetId: first.correctionOfSetId ?? undefined, metadata: { ...metadata, downloadedAt: "2026-07-08T12:05:00Z" } });
-    await expect(stage("users", bundleId, { correctionOfSetId: first.correctionOfSetId ?? undefined, metadata: { ...metadata, reportingPeriod: { ...metadata.reportingPeriod, startDate: "2026-06-08" } } }))
-      .rejects.toMatchObject({ code: "invalid_reporting_period" });
-    await accept(first);
-    await accept(second);
-    expect((await repository.getAdminState(administrator)).activeSetId).not.toBeNull();
-  });
-
-  it("rejects companion reports from an incompatible source snapshot basis", async () => {
-    const activeSetId = (await repository.getAdminState(administrator)).activeSetId!;
-    const bundleId = randomUUID();
-    const first = await stage("agents", bundleId, { correctionOfSetId: activeSetId });
-    const incompatible = await stage("userAgents", bundleId, {
-      correctionOfSetId: activeSetId,
-      metadata: { ...metadata, sourceAsOf: { value: "2026-07-08T12:00:01Z", provenance: "operator_asserted" } },
-    });
-    await accept(first);
-    await expect(accept(incompatible)).rejects.toMatchObject({ code: "incompatible_bundle" });
-  });
-
-  it("preserves explicit immutable corrections and makes retries idempotent", async () => {
-    const activeBefore = (await repository.getAdminState(administrator)).activeSetId!;
-    const corrected = await completeSet("2", activeBefore);
-    expect(corrected.third.complete).toBe(true);
-    expect(corrected.third.setId).not.toBe(activeBefore);
-    expect(await accept(corrected.previews[2])).toEqual(corrected.third);
-    expect((await fixture.runtime.query("SELECT supersedes_set_id FROM official_usage_sets WHERE id=$1", [corrected.third.setId])).rows).toEqual([{ supersedes_set_id: activeBefore }]);
-    const published = await repository.getPublished(administrator.tenantId);
-    expect(published.activeSet).toMatchObject({ id: corrected.third.setId, complete: true, kinds: ["agents", "userAgents", "users"] });
-    expect(published.reports).toMatchObject({
-      agents: { kind: "agents", rows: [{ agentId: "agent-2" }], lineage: { rowCount: 1 } },
-      userAgents: { kind: "userAgents", rows: [{ username: "User-2@example.invalid" }], lineage: { rowCount: 1 } },
-      users: { kind: "users", rows: [{ username: "User-2@example.invalid" }], lineage: { rowCount: 1 } },
-    });
-  });
-
-  it("makes a newly staged exact three-file duplicate idempotent", async () => {
-    const beforeState = await repository.getAdminState(administrator);
-    const beforeCounts = (await fixture.runtime.query<{ sets: number; versions: number; artifacts: number }>(`SELECT
-      (SELECT count(*)::int FROM official_usage_sets) AS sets,
-      (SELECT count(*)::int FROM official_usage_versions) AS versions,
-      (SELECT count(*)::int FROM official_usage_artifacts) AS artifacts`)).rows[0];
-    const bundleId = randomUUID();
-    const previews = await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", bundleId, { marker: "2" })));
-
-    const accepted = await Promise.all(previews.map(preview => accept(preview)));
-
-    expect(accepted.every(result => result.setId === beforeState.activeSetId && result.complete)).toBe(true);
-    expect(await repository.getAdminState(administrator)).toMatchObject({
-      activeSetId: beforeState.activeSetId,
-      activeRevision: beforeState.activeRevision,
-    });
+  it("keeps individual partial acceptance durable and non-active until all three kinds validate", async () => {
+    const identity = owner(), bundleId = randomUUID();
+    const first = await accept(identity, await stage(identity, bundleId, "agents"));
+    expect(first).toMatchObject({ complete: false, activeRevision: "1" });
+    expect(await head(identity)).toEqual({ activeSetId: null, activeRevision: "1" });
+    expect((await page(identity, "official_agents")).value).toEqual([]);
+    const second = await accept(identity, await stage(identity, bundleId, "userAgents"));
+    expect(second).toMatchObject({ complete: false, setId: first.setId });
+    const third = await accept(identity, await stage(identity, bundleId, "users"));
+    expect(third).toEqual({ complete: true, activeRevision: "2", setId: first.setId });
+    expect(await head(identity)).toEqual({ activeSetId: first.setId, activeRevision: "2" });
     expect((await fixture.runtime.query(`SELECT
-      (SELECT count(*)::int FROM official_usage_sets) AS sets,
-      (SELECT count(*)::int FROM official_usage_versions) AS versions,
-      (SELECT count(*)::int FROM official_usage_artifacts) AS artifacts`)).rows[0]).toEqual(beforeCounts);
+      (SELECT count(*)::int FROM official_usage_version_rows WHERE tenant_id=$1) AS accepted,
+      (SELECT count(*)::int FROM official_usage_staged_rows WHERE tenant_id=$1) AS staged`, [identity.tenantId])).rows)
+      .toEqual([{ accepted: 3, staged: 0 }]);
+  });
+
+  it("accepts different download times for the same observation basis but rejects mixed reporting periods", async () => {
+    const identity = owner(), original = await (await bundle(identity)).accept(), bundleId = randomUUID();
+    const first = await stage(identity, bundleId, "agents", { correctionOfSetId: original.setId,
+      metadata: { ...metadata, downloadedAt: "2026-07-08T12:00:00Z" } });
+    const second = await stage(identity, bundleId, "userAgents", { correctionOfSetId: original.setId,
+      metadata: { ...metadata, downloadedAt: "2026-07-08T12:05:00Z" } });
+    await expect(stage(identity, bundleId, "users", { correctionOfSetId: original.setId,
+      metadata: { ...metadata, reportingPeriod: { ...metadata.reportingPeriod, startDate: "2026-06-08" } } }))
+      .rejects.toMatchObject({ code: "invalid_reporting_period" });
+    await accept(identity, first); await accept(identity, second);
+    expect((await head(identity)).activeSetId).toBe(original.setId);
+  });
+
+  it("rejects incompatible companion source snapshots without publishing partial acceptance", async () => {
+    const identity = owner(), original = await (await bundle(identity)).accept(), bundleId = randomUUID();
+    const first = await stage(identity, bundleId, "agents", { correctionOfSetId: original.setId });
+    const incompatible = await stage(identity, bundleId, "userAgents", { correctionOfSetId: original.setId,
+      metadata: { ...metadata, sourceAsOf: { value: "2026-07-08T12:00:01Z", provenance: "operator_asserted" } } });
+    await accept(identity, first);
+    await expect(accept(identity, incompatible)).rejects.toMatchObject({ code: "incompatible_bundle" });
+    expect((await head(identity)).activeSetId).toBe(original.setId);
+  });
+
+  it("preserves immutable explicit corrections and identical receipt retries", async () => {
+    const identity = owner(), original = await (await bundle(identity)).accept();
+    const correction = await bundle(identity, { marker: "2", correctionOfSetId: original.setId }), corrected = await correction.accept();
+    expect(corrected.complete).toBe(true); expect(corrected.setId).not.toBe(original.setId);
+    expect(await correction.accept()).toEqual(corrected);
+    expect((await fixture.runtime.query("SELECT supersedes_set_id FROM official_usage_sets WHERE id=$1", [corrected.setId])).rows)
+      .toEqual([{ supersedes_set_id: original.setId }]);
+    const agents = await page(identity, "official_agents"), users = await page(identity, "official_users");
+    expect(agents.reports.setId).toBe(corrected.setId);
+    expect(agents.reports.lineages).toHaveLength(3);
+    expect(agents.reports.lineages.every(lineage => lineage.rowCount === 1)).toBe(true);
+    expect(agents.value).toMatchObject([{ agentId: "agent-2" }]);
+    expect(users.value).toMatchObject([{ username: "User-2@example.invalid", relationshipCount: 1 }]);
+    expect((await page(identity, "relationships", { username: "User-2@example.invalid" })).value)
+      .toMatchObject([{ agentId: "agent-2", username: "User-2@example.invalid" }]);
+  });
+
+  it("reuses a reviewed exact bundle without advancing selection or retained history", async () => {
+    const identity = owner(), original = await (await bundle(identity)).accept();
+    const before = await page(identity, "history"), repeated = await bundle(identity), accepted = await repeated.accept();
+    expect(accepted).toEqual(original);
+    expect(await head(identity)).toEqual({ activeSetId: original.setId, activeRevision: original.activeRevision });
+    const after = await page(identity, "history");
+    expect(after.value).toEqual(before.value); expect(after.analytics.history).toEqual(before.analytics.history);
+    expect(after.reports.historyRevision).toBe(before.reports.historyRevision);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM official_usage_versions WHERE tenant_id=$1`, [identity.tenantId])).rows)
+      .toEqual([{ n: 3 }]);
+    expect(await repeated.accept()).toEqual(accepted);
   });
 
   it("rejects wrong-actor, replaced and expired previews without leaking rows", async () => {
-    const bundleId = randomUUID();
-    const replaced = await stage("agents", bundleId);
-    const current = await stage("agents", bundleId, { marker: "3" });
-    await expect(accept(replaced)).rejects.toMatchObject({ code: "staging_unavailable" });
-    await expect(accept(current, otherAdministrator)).rejects.toMatchObject({ code: "staging_not_found" });
-    await fixture.operator.query("UPDATE official_usage_staging SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [current.id]);
-    await expect(accept(current)).rejects.toMatchObject({ code: "staging_unavailable" });
-    expect(await repository.cleanupExpiredStaging()).toBeGreaterThanOrEqual(1);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staged_rows WHERE staging_id IN ($1,$2)", [replaced.id, current.id])).rows[0].count).toBe(0);
+    const identity = owner(), bundleId = randomUUID();
+    const replaced = await stage(identity, bundleId, "agents"), current = await stage(identity, bundleId, "agents", { marker: "3" });
+    await expect(accept(identity, replaced)).rejects.toMatchObject({ code: "staging_unavailable" });
+    await expect(accept({ ...identity, principalId: "another-administrator" }, current)).rejects.toMatchObject({ code: "staging_unavailable" });
+    await ageSyntheticUploads(identity, current.id);
+    await expect(accept(identity, current)).rejects.toMatchObject({ code: "staging_unavailable" });
+    expect(await imports.sweep(identity.tenantId)).toBeGreaterThanOrEqual(1);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM official_usage_staged_rows WHERE staging_id IN ($1,$2)`,
+      [replaced.id, current.id])).rows).toEqual([{ n: 0 }]);
   });
 
-  it("binds an unpublished bundle to its initiating actor and fences accepted receipt retries to the original revision", async () => {
-    const bundleId = randomUUID();
-    const preview = await stage("agents", bundleId);
-    await expect(stage("users", bundleId, { scope: otherAdministrator })).rejects.toMatchObject({ code: "bundle_owner_mismatch" });
-    const accepted = await accept(preview);
-    await expect(repository.accept(administrator, preview.id, {
-      stagingRevision: preview.revision,
-      fileHash: preview.fileHash,
-      expectedActiveRevision: preview.activeRevision + 1,
-    })).rejects.toMatchObject({ code: "active_revision_mismatch" });
-    expect(await accept(preview)).toEqual(accepted);
+  it("binds drafts to their initiating actor and immutable receipt retries to the reviewed revision", async () => {
+    const identity = owner(), bundleId = randomUUID(), preview = await stage(identity, bundleId, "agents");
+    await expect(stage({ ...identity, principalId: "another-administrator" }, bundleId, "users")).rejects.toMatchObject({ code: "bundle_owner_mismatch" });
+    const accepted = await accept(identity, preview);
+    await expect(imports.accept(identity, { stagingId: preview.id, revision: preview.revision, contentHash: preview.contentHash,
+      expectedActiveRevision: String(BigInt(preview.activeRevision) + 1n) })).rejects.toMatchObject({ code: "active_revision_mismatch" });
+    expect(await accept(identity, preview)).toEqual(accepted);
   });
 
-  it("atomically accepts a reviewed three-kind bundle and rejects an unseen companion replacement", async () => {
-    const scope = { tenantId: "tenant-bundle-atomic", principalId: "administrator-bundle" };
-    const bundleId = randomUUID();
-    await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", bundleId, { scope })));
-    const stalePreview = await repository.previewBundle(scope, bundleId);
-    expect(stalePreview.missingKinds).toEqual([]);
-    await stage("users", bundleId, { scope, marker: "replacement" });
-    await expect(repository.acceptBundle(scope, bundleId, stalePreview)).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_versions WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(0);
+  it("records the actual reviewed revision when accepting a draft created before another publication", async () => {
+    const identity = owner(), preview = await stage(identity, randomUUID(), "agents");
+    const current = await (await bundle(identity, { marker: "current" })).accept();
+    const confirmation = { stagingId: preview.id, revision: preview.revision, contentHash: preview.contentHash,
+      expectedActiveRevision: current.activeRevision };
+    const accepted = await imports.accept(identity, confirmation);
+    expect(accepted.complete).toBe(false);
+    expect(await imports.accept(identity, confirmation)).toEqual(accepted);
+    await expect(accept(identity, preview)).rejects.toMatchObject({ code: "active_revision_mismatch" });
+    expect((await head(identity)).activeSetId).toBe(current.setId);
+  });
 
-    const reviewed = await repository.previewBundle(scope, bundleId);
-    const concurrent = await Promise.all([
-      repository.acceptBundle(scope, bundleId, reviewed),
-      repository.acceptBundle(scope, bundleId, reviewed),
-    ]);
-    const accepted = concurrent[0];
-    expect(concurrent[1]).toEqual(accepted);
-    expect(accepted).toMatchObject({ complete: true, reusedExistingSet: false });
-    await expect(repository.acceptBundle(scope, bundleId, { ...reviewed, bundleHash: "f".repeat(64) }))
-      .rejects.toMatchObject({ code: "bundle_fence_mismatch" });
-    await expect(repository.acceptBundle(scope, bundleId, { ...reviewed, expectedActiveRevision: reviewed.expectedActiveRevision + 1 }))
-      .rejects.toMatchObject({ code: "bundle_fence_mismatch" });
-    await expect(repository.acceptBundle({ ...scope, principalId: "administrator-other" }, bundleId, reviewed))
-      .rejects.toMatchObject({ code: "bundle_owner_mismatch" });
-    await expect(repository.acceptBundle({ ...scope, tenantId: "tenant-other" }, bundleId, reviewed))
-      .rejects.toMatchObject({ code: "bundle_not_found" });
-    await fixture.operator.query(`UPDATE official_usage_staging SET created_at=clock_timestamp()-interval '2 days'
-      WHERE tenant_id=$1 AND bundle_id=$2`, [scope.tenantId, bundleId]);
+  it("guards the durable acceptance revision against changes after publication", async () => {
+    const identity = owner(); await (await bundle(identity)).accept();
+    await expect(fixture.runtime.query(`UPDATE official_usage_ingestions SET acceptance_revision=acceptance_revision+1
+      WHERE tenant_id=$1 AND kind='agents'`, [identity.tenantId])).rejects.toThrow("official_acceptance_receipt_immutable");
+  });
+
+  it("rejects unseen companion replacement and altered, foreign or cross-tenant bundle confirmations", async () => {
+    const identity = owner(), staged = await bundle(identity), stale = staged.preview;
+    await stage(identity, staged.bundleId, "users", { marker: "replacement" });
+    await expect(staged.accept()).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM official_usage_versions WHERE tenant_id=$1`, [identity.tenantId])).rows).toEqual([{ n: 0 }]);
+    const reviewed = await imports.bundle(identity, staged.bundleId), accepted = await imports.acceptBundle(identity, staged.bundleId, reviewed);
+    expect(await imports.acceptBundle(identity, staged.bundleId, reviewed)).toEqual(accepted);
+    for (const input of [{ ...reviewed, bundleHash: "f".repeat(64) },
+      { ...reviewed, expectedActiveRevision: String(BigInt(reviewed.expectedActiveRevision) + 1n) }, stale]) {
+      await expect(imports.acceptBundle(identity, staged.bundleId, input)).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
+    }
+    for (const outsider of [{ ...identity, principalId: "another-administrator" }, owner()]) {
+      await expect(imports.acceptBundle(outsider, staged.bundleId, reviewed)).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
+    }
+    await ageSyntheticUploads(identity);
     await retain(fixture.operator);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE tenant_id=$1 AND bundle_id=$2", [scope.tenantId, bundleId])).rows[0].count).toBe(0);
-    expect(await repository.acceptBundle(scope, bundleId, reviewed)).toEqual(accepted);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_staging WHERE tenant_id=$1", [identity.tenantId])).rows).toEqual([{ n: 0 }]);
+    expect(await imports.acceptBundle(identity, staged.bundleId, reviewed)).toEqual(accepted);
     expect((await fixture.runtime.query(`SELECT
-      (SELECT count(*)::int FROM official_usage_bundle_receipts WHERE tenant_id=$1 AND bundle_id=$2) AS receipts,
+      (SELECT count(*)::int FROM official_usage_bundle_receipts WHERE tenant_id=$1) AS receipts,
       (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
-      (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions`, [scope.tenantId, bundleId])).rows[0])
-      .toEqual({ receipts: 1, sets: 1, versions: 3 });
-    expect((await repository.getPublished(scope.tenantId)).reports).toMatchObject({ agents: {}, userAgents: {}, users: {} });
-
-    const deletion = await repository.previewSetOperation(scope, "delete", accepted.setId);
-    await repository.confirmSetOperation(scope, deletion.id, { ...deletion, operation: "delete", setId: accepted.setId });
-    await expect(repository.acceptBundle(scope, bundleId, reviewed))
-      .rejects.toMatchObject({ code: "deleted_report_duplicate" });
-    expect(await repository.getAdminState(scope)).toMatchObject({ activeSetId: null, activeRevision: accepted.activeRevision + 1 });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_versions WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(3);
+      (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions`, [identity.tenantId])).rows)
+      .toEqual([{ receipts: 1, sets: 1, versions: 3 }]);
+    await operation(identity, accepted.setId, "delete");
+    await expect(imports.acceptBundle(identity, staged.bundleId, reviewed)).rejects.toMatchObject({ code: "deleted_report_duplicate" });
+    expect(await head(identity)).toEqual({ activeSetId: null, activeRevision: String(BigInt(accepted.activeRevision) + 1n) });
   });
 
-  it("rejects incompatible companion basis during bundle preview", async () => {
-    const scope = { tenantId: "tenant-bundle-basis", principalId: "administrator-basis" };
-    const bundleId = randomUUID();
-    await stage("agents", bundleId, { scope });
-    await stage("userAgents", bundleId, {
-      scope,
-      metadata: { ...metadata, sourceAsOf: { value: "2026-07-08T12:00:01Z", provenance: "operator_asserted" } },
-    });
-    await stage("users", bundleId, { scope });
-    await expect(repository.previewBundle(scope, bundleId)).rejects.toMatchObject({ code: "incompatible_bundle" });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_versions WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(0);
+  it("rejects incompatible observation bases while reviewing a complete bundle", async () => {
+    const identity = owner(), bundleId = randomUUID();
+    await stage(identity, bundleId, "agents");
+    await stage(identity, bundleId, "userAgents", {
+      metadata: { ...metadata, sourceAsOf: { value: "2026-07-08T12:00:01Z", provenance: "operator_asserted" } } });
+    await stage(identity, bundleId, "users");
+    await expect(imports.bundle(identity, bundleId)).rejects.toMatchObject({ code: "incompatible_bundle" });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_versions WHERE tenant_id=$1", [identity.tenantId])).rows).toEqual([{ n: 0 }]);
   });
 
-  it("rolls back atomic bundle publication after one or two persisted memberships", async () => {
-    await fixture.operator.query(`CREATE FUNCTION phase06_fail_bundle_membership() RETURNS trigger LANGUAGE plpgsql AS $$
-      DECLARE membership_count integer;
-      BEGIN
-        SELECT count(*) INTO membership_count FROM official_usage_set_versions WHERE set_id=NEW.set_id;
-        IF (NEW.tenant_id='tenant-bundle-rollback-one' AND membership_count>=1)
-          OR (NEW.tenant_id='tenant-bundle-rollback-two' AND membership_count>=2)
-        THEN RAISE EXCEPTION 'phase06 local membership failure'; END IF;
-        RETURN NEW;
-      END $$;
-      CREATE TRIGGER phase06_fail_bundle_membership BEFORE INSERT ON official_usage_set_versions
-        FOR EACH ROW EXECUTE FUNCTION phase06_fail_bundle_membership()`);
+  it("idempotently serializes concurrent acceptance of the same immutable bundle confirmation", async () => {
+    const identity = owner(), staged = await bundle(identity);
+    const other = new OfficialReportImports(fixture.runtime);
+    const [first, second] = await Promise.all([staged.accept(), other.acceptBundle(identity, staged.bundleId, staged.preview)]);
+    expect(first).toEqual(second);
+    expect((await page(identity, "history")).counts.total).toBe(1);
+    expect((await fixture.runtime.query(`SELECT
+      (SELECT count(*)::int FROM official_usage_bundle_receipts WHERE tenant_id=$1) AS receipts,
+      (SELECT count(*)::int FROM official_usage_audit WHERE tenant_id=$1 AND action='accepted') AS audits`, [identity.tenantId])).rows)
+      .toEqual([{ receipts: 1, audits: 3 }]);
+  });
+
+  it.each([1, 2])("atomically rejects publication failure after %i pending memberships and retries the same review", async count => {
+    const identity = owner(), staged = await bundle(identity), failedTenant = identity.tenantId.replaceAll("'", "''");
+    await fixture.operator.query(`CREATE FUNCTION phase02b_fail_membership() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.tenant_id='${failedTenant}' AND (SELECT count(*) FROM official_usage_set_versions WHERE set_id=NEW.set_id)>=${count}
+        THEN RAISE EXCEPTION 'synthetic membership failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER phase02b_fail_membership BEFORE INSERT ON official_usage_set_versions FOR EACH ROW EXECUTE FUNCTION phase02b_fail_membership()`);
     try {
-      for (const suffix of ["one", "two"]) {
-        const scope = { tenantId: `tenant-bundle-rollback-${suffix}`, principalId: "administrator-rollback" };
-        const bundleId = randomUUID();
-        await Promise.all(["agents", "userAgents", "users"].map(kind =>
-          stage(kind as "agents" | "userAgents" | "users", bundleId, { scope })));
-        const reviewed = await repository.previewBundle(scope, bundleId);
-        await expect(repository.acceptBundle(scope, bundleId, reviewed)).rejects.toThrow("phase06 local membership failure");
-        expect((await fixture.runtime.query(`SELECT
-          (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
-          (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions,
-          (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1) AS artifacts,
-          (SELECT count(*)::int FROM official_usage_bundle_receipts WHERE tenant_id=$1) AS receipts`, [scope.tenantId])).rows[0])
-          .toEqual({ sets: 0, versions: 0, artifacts: 0, receipts: 0 });
-        expect(await repository.getAdminState(scope)).toMatchObject({ activeSetId: null, activeRevision: 1 });
-      }
+      await expect(staged.accept()).rejects.toThrow("synthetic membership failure");
+      expect(await head(identity)).toEqual({ activeSetId: null, activeRevision: "1" });
+      expect((await page(identity, "history")).counts.total).toBe(0);
+      expect((await page(identity, "official_agents")).value).toEqual([]);
+      expect((await fixture.runtime.query(`SELECT
+        (SELECT count(*)::int FROM official_usage_set_versions WHERE tenant_id=$1) AS memberships,
+        (SELECT count(*)::int FROM official_usage_history_memberships WHERE tenant_id=$1) AS history,
+        (SELECT count(*)::int FROM official_usage_bundle_receipts WHERE tenant_id=$1) AS receipts,
+        (SELECT count(*)::int FROM official_usage_audit WHERE tenant_id=$1 AND action='accepted') AS audits`, [identity.tenantId])).rows)
+        .toEqual([{ memberships: 0, history: 0, receipts: 0, audits: 0 }]);
     } finally {
-      await fixture.operator.query("DROP TRIGGER phase06_fail_bundle_membership ON official_usage_set_versions; DROP FUNCTION phase06_fail_bundle_membership()");
+      await fixture.operator.query("DROP TRIGGER phase02b_fail_membership ON official_usage_set_versions; DROP FUNCTION phase02b_fail_membership()");
     }
+    const accepted = await staged.accept(); expect(accepted.complete).toBe(true);
+    expect((await page(identity, "official_agents")).counts.total).toBe(1);
   });
 
-  it("resumes an actor-owned incomplete retained set with missing companions", async () => {
-    const scope = { tenantId: "tenant-bundle-resume", principalId: "administrator-resume" };
-    const bundleId = randomUUID();
-    await accept(await stage("agents", bundleId, { scope }), scope);
-    await stage("userAgents", bundleId, { scope });
-    await stage("users", bundleId, { scope });
-    const reviewed = await repository.previewBundle(scope, bundleId);
-    expect(reviewed.acceptedVersions.map(version => version.kind)).toEqual(["agents"]);
-    expect(reviewed.missingKinds).toEqual([]);
-    expect((await repository.acceptBundle(scope, bundleId, reviewed)).complete).toBe(true);
+  it("resumes a partially accepted actor-owned bundle without copying accepted versions again", async () => {
+    const identity = owner(), bundleId = randomUUID();
+    const first = await accept(identity, await stage(identity, bundleId, "agents"));
+    for (const kind of ["userAgents", "users"] as const) await stage(identity, bundleId, kind);
+    const reviewed = await imports.bundle(identity, bundleId);
+    expect(reviewed.complete).toBe(true); expect(reviewed.stages.map(stage => stage.kind)).toEqual(["agents", "userAgents", "users"]);
+    expect(await imports.acceptBundle(identity, bundleId, reviewed)).toMatchObject({ complete: true, setId: first.setId });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_versions WHERE tenant_id=$1", [identity.tenantId])).rows).toEqual([{ n: 3 }]);
   });
 
-  it("revision-fences concurrent selection and delete confirmations and never falls back after active deletion", async () => {
-    const scope = { tenantId: "tenant-selection-race", principalId: "administrator-selection" };
-    const firstBundleId = randomUUID();
-    await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", firstBundleId, { scope, marker: "selection-1" })));
-    const prior = await repository.acceptBundle(scope, firstBundleId, await repository.previewBundle(scope, firstBundleId));
-    const secondBundleId = randomUUID();
-    await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", secondBundleId, { scope, marker: "selection-2", correctionOfSetId: prior.setId })));
-    const active = await repository.acceptBundle(scope, secondBundleId, await repository.previewBundle(scope, secondBundleId));
-    const selectPreview = await repository.previewSetOperation(scope, "select", prior.setId);
-    const deletePreview = await repository.previewSetOperation(scope, "delete", active.setId);
-    const [selected, deleted] = await Promise.allSettled([
-      repository.confirmSetOperation(scope, selectPreview.id, { ...selectPreview, operation: "select", setId: prior.setId }),
-      repository.confirmSetOperation(scope, deletePreview.id, { ...deletePreview, operation: "delete", setId: active.setId }),
-    ]);
+  it("revision-fences concurrent selection and deletion without falling back after active deletion", async () => {
+    const identity = owner(), prior = await (await bundle(identity)).accept(), active = await (await bundle(identity, { marker: "2" })).accept();
+    const select = await imports.confirmPreview(identity, prior.setId, "select"), remove = await imports.confirmPreview(identity, active.setId, "delete");
+    const [selected, deleted] = await Promise.allSettled([imports.confirm(identity, select), imports.confirm(identity, remove)]);
     expect([selected.status, deleted.status].sort()).toEqual(["fulfilled", "rejected"]);
-
-    const state = await repository.getAdminState(scope);
     if (selected.status === "fulfilled") {
-      expect(state.activeSetId).toBe(prior.setId);
-      const finalDeletePreview = await repository.previewSetOperation(scope, "delete", prior.setId);
-      const afterDelete = await repository.confirmSetOperation(scope, finalDeletePreview.id, { ...finalDeletePreview, operation: "delete", setId: prior.setId });
-      expect(afterDelete.activeSetId).toBeNull();
-      expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows row JOIN official_usage_set_versions membership ON membership.version_id=row.version_id WHERE membership.set_id=$1", [prior.setId])).rows[0].count).toBe(0);
-    } else {
-      expect(state.activeSetId).toBeNull();
-      expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows row JOIN official_usage_set_versions membership ON membership.version_id=row.version_id WHERE membership.set_id=$1", [active.setId])).rows[0].count).toBe(0);
-      expect(state.sets.find(reportSet => reportSet.id === prior.setId)?.deletedAt).toBeNull();
-    }
+      expect((await head(identity)).activeSetId).toBe(prior.setId);
+      expect((await operation(identity, prior.setId, "delete")).activeSetId).toBeNull();
+    } else expect((await head(identity)).activeSetId).toBeNull();
+    expect((await page(identity, "official_agents")).value).toEqual([]);
+    expect((await page(identity, "history")).counts.total).toBe(1);
   });
 
-  it("applies finite retention and keeps runtime from mutating immutable accepted content", async () => {
-    const version = (await fixture.runtime.query<{ id: string; tenant_id: string; kind: string }>(`SELECT version.id,version.tenant_id,version.kind
-      FROM official_usage_versions version JOIN official_usage_set_versions membership ON membership.version_id=version.id
-      WHERE version.deleted_at IS NULL LIMIT 1`)).rows[0];
-    if (version) {
-      await expect(fixture.runtime.query("UPDATE official_usage_versions SET row_count=row_count+1 WHERE id=$1", [version.id])).rejects.toThrow("immutable");
-      await expect(fixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
-        SELECT $1,$2,$3,49999,payload_hash FROM official_usage_row_facts
-        WHERE tenant_id=$2 AND kind=$3 LIMIT 1`, [version.id, version.tenant_id, version.kind])).rejects.toThrow("published or deleted");
-    }
-    await fixture.operator.query("UPDATE official_usage_staging SET expires_at=clock_timestamp()-interval '1 second' WHERE status='active'");
+  it("protects immutable accepted content and reclaims expired pending row copies", async () => {
+    const identity = owner(); await (await bundle(identity)).accept();
+    const version = (await fixture.runtime.query(`SELECT id,kind FROM official_usage_versions WHERE tenant_id=$1 ORDER BY id LIMIT 1`, [identity.tenantId])).rows[0];
+    await expect(fixture.runtime.query("UPDATE official_usage_versions SET row_count=row_count+1 WHERE id=$1", [version.id])).rejects.toThrow("immutable");
+    await expect(fixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
+      SELECT $1,$2,$3,49999,payload_hash FROM official_usage_row_facts WHERE tenant_id=$2 AND kind=$3 LIMIT 1`,
+    [version.id, identity.tenantId, version.kind])).rejects.toThrow("published or deleted");
+    const pending = await stage(identity, randomUUID(), "agents", { marker: "pending" });
+    await ageSyntheticUploads(identity, pending.id);
     await retain(fixture.operator);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staged_rows")).rows[0].count).toBe(0);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_staged_rows WHERE staging_id=$1", [pending.id])).rows).toEqual([{ n: 0 }]);
   });
 
-  it("retains accepted content past legacy expiry boundaries until explicit deletion", async () => {
-    const scope = { tenantId: "tenant-retention", principalId: "administrator-retention" };
-    const bundleId = randomUUID();
-    const previews = await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", bundleId, { scope, metadata })));
-    for (const preview of previews) await accept(preview, scope);
-    const published = await repository.getPublished(scope.tenantId);
-    expect(published.activeSet).not.toBeNull();
-    expect(Object.keys(published.reports).sort()).toEqual(["agents", "userAgents", "users"]);
+  it("keeps deleted rows pinned and reclaims them in at most 250-row runtime batches after release", async () => {
+    const identity = owner(), bundleId = randomUUID();
+    for (const kind of kinds) {
+      async function* chunks() {
+        yield Buffer.from(`${schemaRegistry[kind].headers.join(",")}\n`);
+        if (kind === "agents") for (let n = 0; n < 251; n++) yield Buffer.from(csv(kind, String(n)).split("\n")[1] + "\n");
+      }
+      await imports.stage(identity, { bundleId }, chunks(), metadata);
+    }
+    const accepted = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
+    const selected = await reports.capture(identity, "delegated", "history");
+    await operation(identity, accepted.setId, "delete");
+    const rows = async () => (await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_version_rows WHERE tenant_id=$1", [identity.tenantId])).rows[0].n;
+    expect(await rows()).toBe(251);
+    await expect(reports.page(selected.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect(await imports.connections.run(client => retainDeletedReportRows(client))).toBe(0);
+    await retain(fixture.operator, { dryRun: true });
+    expect(await rows()).toBe(251);
+    await reports.selections.invalidate(selected.id, identity);
+    expect((await imports.connections.run(client => retainRecordData(client))).recordDeletedReportRows).toBe(250);
+    expect(await rows()).toBe(1);
+    expect((await imports.connections.run(client => retainRecordData(client))).recordDeletedReportRows).toBe(1);
+    expect(await rows()).toBe(0);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_row_facts WHERE tenant_id=$1", [identity.tenantId])).rows)
+      .toEqual([{ n: 251 }]);
+    await retainUntilConverged(fixture.operator, { batchSize: 250 });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_row_facts WHERE tenant_id=$1", [identity.tenantId])).rows)
+      .toEqual([{ n: 0 }]);
+  }, 30_000);
 
-    await fixture.operator.query(`UPDATE official_usage_staging SET created_at=clock_timestamp()-interval '2 days'
-      WHERE tenant_id=$1 AND status='accepted'`, [scope.tenantId]);
+  it("retains accepted null-expiry content and receipts until explicit deletion and bounded purge", async () => {
+    const identity = owner(), staged = await bundle(identity), accepted = await staged.accept();
+    await ageSyntheticUploads(identity);
+    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=clock_timestamp()-interval '181 days' WHERE tenant_id=$1", [identity.tenantId]);
     await retain(fixture.operator);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(0);
-    expect((await repository.getPublished(scope.tenantId)).reports.agents?.rows).toHaveLength(1);
-
-    await fixture.operator.query(`UPDATE official_usage_sets
-      SET expires_at=clock_timestamp()-interval '1 second',accepted_at=clock_timestamp()-interval '181 days'
-      WHERE tenant_id=$1`, [scope.tenantId]);
-    await fixture.operator.query("UPDATE official_usage_versions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
-    await fixture.operator.query("UPDATE official_usage_artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
-    await retain(fixture.operator);
-    const afterLegacyExpiry = await repository.getPublished(scope.tenantId);
-    expect(afterLegacyExpiry.activeSet?.id).toBe(published.activeSet?.id);
-    expect(afterLegacyExpiry.reports.agents?.rows).toHaveLength(1);
-
-    const deletion = await repository.previewSetOperation(scope, "delete", published.activeSet!.id);
-    await repository.confirmSetOperation(scope, deletion.id, {
-      ...deletion,
-      operation: "delete",
-      setId: published.activeSet!.id,
-    });
-    expect((await repository.getPublished(scope.tenantId)).activeSet).toBeNull();
-    await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [scope.tenantId]);
-    await fixture.operator.query("UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [scope.tenantId]);
-    await fixture.operator.query("UPDATE official_usage_audit SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
-    await retainUntilConverged(fixture.operator, { batchSize: 5_000 });
+    expect((await page(identity, "official_agents")).value).toHaveLength(1);
+    expect(await staged.accept()).toEqual(accepted);
+    expect((await fixture.runtime.query(`SELECT
+      (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1 AND expires_at IS NOT NULL) AS sets,
+      (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1 AND expires_at IS NOT NULL) AS versions,
+      (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1 AND expires_at IS NOT NULL) AS artifacts`, [identity.tenantId])).rows)
+      .toEqual([{ sets: 0, versions: 0, artifacts: 0 }]);
+    await operation(identity, accepted.setId, "delete");
+    expect((await page(identity, "official_agents")).value).toEqual([]);
+    await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [identity.tenantId]);
+    await fixture.operator.query("UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [identity.tenantId]);
+    await fixture.operator.query("UPDATE official_usage_audit SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [identity.tenantId]);
+    const selections = await fixture.runtime.query("SELECT id FROM data_read_selections WHERE tenant_id=$1 ORDER BY id LIMIT 250", [identity.tenantId]);
+    for (const selected of selections.rows) await reports.selections.invalidate(selected.id, identity);
+    // Model a restarted operator whose persisted traversal has already passed this tenant.
+    await fixture.operator.query(`UPDATE data_lifecycle_progress SET cursor=jsonb_build_object('step',0,'tenant',$1::text)
+      WHERE worker='operator'`, [identity.tenantId]);
+    await retainUntilConverged(fixture.operator, { batchSize: 250 });
     expect((await fixture.runtime.query(`SELECT
       (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
       (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions,
       (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1) AS artifacts,
-      (SELECT count(*)::int FROM official_usage_row_facts WHERE tenant_id=$1) AS facts`, [scope.tenantId])).rows[0])
-      .toEqual({ sets: 0, versions: 0, artifacts: 0, facts: 0 });
-  });
+      (SELECT count(*)::int FROM official_usage_row_facts WHERE tenant_id=$1) AS facts`, [identity.tenantId])).rows)
+      .toEqual([{ sets: 0, versions: 0, artifacts: 0, facts: 0 }]);
+  }, 30_000);
 
-  it("records legacy cleanup acknowledgement without receiving legacy report content", async () => {
-    await repository.acknowledgeLegacyCleanup(administrator);
-    expect((await fixture.runtime.query("SELECT action,row_count,target_kind FROM official_usage_audit WHERE action='legacy_cleanup_acknowledged'")).rows).toEqual([
-      { action: "legacy_cleanup_acknowledged", row_count: null, target_kind: null },
-    ]);
+  it("does not recreate the retired cleanup-acknowledgement mutation", () => {
+    expect(imports).not.toHaveProperty("acknowledgeLegacyCleanup");
   });
 });

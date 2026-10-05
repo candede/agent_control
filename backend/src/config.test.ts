@@ -3,11 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const retiredTenantSettings = ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "TENANT_DOMAINS", "TENANT_DISPLAY_NAME"]
+  .flatMap(name => [name, `${name}_FILE`]);
 const names = [
   "NODE_ENV", "WEBSITE_SITE_NAME", "FRONTEND_ORIGIN", "REDIRECT_URI",
-  "TENANT_ID", "TENANT_ID_FILE", "CLIENT_ID", "CLIENT_ID_FILE",
-  "CLIENT_SECRET", "CLIENT_SECRET_FILE", "SESSION_SECRET", "SESSION_SECRET_FILE",
-  "TENANTS_JSON", "TENANTS_JSON_FILE", "TENANT_DOMAINS", "TENANT_DOMAINS_FILE", "TENANT_DISPLAY_NAME",
+  ...retiredTenantSettings, "SESSION_SECRET", "SESSION_SECRET_FILE",
+  "TENANTS_JSON", "TENANTS_JSON_FILE",
   "TRUST_PROXY", "BOOTSTRAP_ADMIN", "BOOTSTRAP_ROLES", "AGENT_CONTROL_ADMIN", "AGENT_CONTROL_FIXTURE_MODE", "OFFICIAL_USAGE_STALE_AFTER_DAYS",
   "AGENT_CONTROL_AUTH_BYPASS", "AUTH_BYPASS", "ALLOW_ANY_ORIGIN", "SQLITE_PATH", "DATABASE_URL",
   "ENABLE_RAW_PROVIDER_DATA", "ENABLE_ARBITRARY_KQL", "DISABLE_RETENTION",
@@ -57,14 +58,14 @@ describe("runtime configuration", () => {
   it("rejects incomplete, insecure, or weak Azure production configuration", async () => {
     const incomplete = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", FRONTEND_ORIGIN: "https://frontend.example", REDIRECT_URI: "https://frontend.example/api/auth/callback", SESSION_SECRET: "x".repeat(32) });
     expect(() => incomplete.validateRuntimeConfig()).toThrow("Azure requires");
-    const weak = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", FRONTEND_ORIGIN: "https://frontend.example", REDIRECT_URI: "https://frontend.example/api/auth/callback", TENANT_ID: "11111111-1111-1111-1111-111111111111", CLIENT_ID: "22222222-2222-2222-2222-222222222222", CLIENT_SECRET: "secret", TENANT_DOMAINS: "example.invalid", SESSION_SECRET: "short" });
+    const weak = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", FRONTEND_ORIGIN: "https://frontend.example", REDIRECT_URI: "https://frontend.example/api/auth/callback", TENANTS_JSON: JSON.stringify([tenantA]), SESSION_SECRET: "short" });
     expect(() => weak.validateRuntimeConfig()).toThrow("at least 32 bytes");
-    const insecure = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", TENANT_ID: "11111111-1111-1111-1111-111111111111", CLIENT_ID: "22222222-2222-2222-2222-222222222222", CLIENT_SECRET: "secret", TENANT_DOMAINS: "example.invalid", SESSION_SECRET: "x".repeat(32) });
+    const insecure = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", TENANTS_JSON: JSON.stringify([tenantA]), SESSION_SECRET: "x".repeat(32) });
     expect(() => insecure.validateRuntimeConfig()).toThrow("Azure requires");
   });
 
   it("accepts complete Azure settings and derives trusted-proxy behavior", async () => {
-    const loaded = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", FRONTEND_ORIGIN: "https://frontend.example", REDIRECT_URI: "https://frontend.example/api/auth/callback", TENANT_ID: "11111111-1111-1111-1111-111111111111", CLIENT_ID: "22222222-2222-2222-2222-222222222222", CLIENT_SECRET: "secret", TENANT_DOMAINS: "example.invalid", SESSION_SECRET: "x".repeat(32) });
+    const loaded = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", NODE_ENV: "production", FRONTEND_ORIGIN: "https://frontend.example", REDIRECT_URI: "https://frontend.example/api/auth/callback", TENANTS_JSON: JSON.stringify([tenantA]), SESSION_SECRET: "x".repeat(32) });
     expect(() => loaded.validateRuntimeConfig()).not.toThrow();
     expect(loaded.authConfigured).toBe(true);
     expect(loaded.config.trustProxy).toBe(true);
@@ -128,6 +129,7 @@ describe("runtime configuration", () => {
         [tenantA, { ...tenantB, domains: ["A.EXAMPLE"] }],
         [{ ...tenantA, domains: ["a.example", "A.EXAMPLE"] }],
         [{ ...tenantA, domains: [] }],
+        [{ ...tenantA, domains: undefined }],
         [{ ...tenantA, domains: ["*.a.example"] }],
         [{ ...tenantA, domains: ["https://a.example"] }],
         [{ ...tenantA, domains: ["admin@a.example"] }],
@@ -145,26 +147,15 @@ describe("runtime configuration", () => {
       await expect(loadConfig({ TENANTS_JSON: JSON.stringify(tenantA) })).rejects.toThrow("JSON array");
     });
 
-    it("migrates legacy settings without losing the saved application credentials", async () => {
-      const legacy = {
-        TENANT_ID: tenantA.tenantId, CLIENT_ID: tenantA.clientId, CLIENT_SECRET: tenantA.clientSecret,
-        TENANT_DOMAINS: "a.example, alias.a.example", TENANT_DISPLAY_NAME: tenantA.displayName, SESSION_SECRET: "x".repeat(32),
-      };
-      const loaded = await loadConfig(legacy);
-      loaded.validateRuntimeConfig();
-      expect(loaded.config.tenants).toEqual([tenantA]);
-      expect(loaded.resolveTenantForUsername("admin@alias.a.example").tenant).toEqual(tenantA);
-      const missingDomains = await loadConfig({ ...legacy, TENANT_DOMAINS: "" });
-      expect(missingDomains.authConfigured).toBe(false);
-      expect(missingDomains.config.tenants[0]).toMatchObject({ tenantId: tenantA.tenantId, clientId: tenantA.clientId, clientSecret: tenantA.clientSecret });
-      expect(() => missingDomains.validateRuntimeConfig()).toThrow("Existing tenant credentials are retained");
-      expect(() => missingDomains.resolveTenantForUsername("admin@any.example")).toThrow("accepted sign-in domains");
+    it.each(retiredTenantSettings)("rejects standalone %s without a registry and explains the required configuration", async name => {
+      await expect(loadConfig({ [name]: "synthetic-retired-setting", SESSION_SECRET: "x".repeat(32) }))
+        .rejects.toThrow("must use TENANTS_JSON or TENANTS_JSON_FILE");
     });
 
-    it("treats the registry as authoritative rather than silently reintroducing a removed legacy tenant", async () => {
+    it("ignores stale standalone settings when a valid registry is configured", async () => {
       const loaded = await loadConfig({
-        TENANTS_JSON: JSON.stringify([tenantB]), TENANT_ID: tenantA.tenantId, CLIENT_ID: tenantA.clientId,
-        CLIENT_SECRET: tenantA.clientSecret, TENANT_DOMAINS: "a.example", SESSION_SECRET: "x".repeat(32),
+        ...Object.fromEntries(retiredTenantSettings.map(name => [name, "synthetic-ignored-retired-setting"])),
+        TENANTS_JSON: JSON.stringify([tenantB]), SESSION_SECRET: "x".repeat(32),
       });
       loaded.validateRuntimeConfig();
       expect(loaded.config.tenants).toEqual([tenantB]);
@@ -172,7 +163,7 @@ describe("runtime configuration", () => {
       expect(() => loaded.getTenantConfiguration(tenantA.tenantId)).toThrow("not configured");
     });
 
-    it("loads the protected registry file ahead of inline or legacy credentials", async () => {
+    it("loads the protected registry file ahead of inline values without reading retired credential files", async () => {
       const directory = mkdtempSync(join(tmpdir(), "agent-control-tenant-config-"));
       const filename = join(directory, "tenants.json");
       try {

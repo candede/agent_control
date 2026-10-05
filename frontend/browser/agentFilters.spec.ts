@@ -1,29 +1,29 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
-import { matchesAgentFilters } from "../../backend/src/types/agentPresentation";
-import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { layoutTime, mockLayoutApi, unifiedAgents, mockInventoryFacets } from "./layoutFixtures";
+import { encodeInventoryFacet } from "../../backend/src/types/inventoryFacets";
+import { fulfillInventoryPage, inventoryFixtureFacet, inventoryFixtureQuery } from "./selectedInventoryFixture";
 
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
-const inventoryWithEnvironments = {
-  ...unifiedAgents,
-  facets: { ...unifiedAgents.facets, environments: [
+const environments = [
     { value: "environment-a", label: "Finance production" },
     { value: "environment-b", label: "Development" },
-  ] },
-};
+  ];
+const inventoryWithEnvironments = { ...unifiedAgents };
 
 test("filtered results keep Clear filters inline and show the matching total without a duplicate report row", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.route("**/api/agent-inventory?*", route => {
-    const query = new URL(route.request().url()).searchParams;
+    const query = inventoryFixtureQuery(route);
+    const type = inventoryFixtureFacet(query, "type");
     const value = unifiedAgents.value.filter(record =>
-      matchesAgentFilters(record, { type: query.get("type") ?? undefined })
-      && (!query.get("publisher") || record.packages.some(item => item.publisher === query.get("publisher")))
+      (type === undefined || record.packages.some(item => item.type === type))
+      && (!query.has("publisher") || record.packages.some(item => item.publisher === inventoryFixtureFacet(query, "publisher")))
       && (!query.get("search") || record.displayName.includes(query.get("search")!)));
-    return route.fulfill({ json: { ...unifiedAgents, value, count: value.length } });
+    return fulfillInventoryPage(route, { ...unifiedAgents, value, counts: { ...unifiedAgents.counts, filtered: value.length } });
   });
   await page.goto("/agents");
   const toolbar = page.locator(".agent-grid-toolbar");
@@ -38,9 +38,13 @@ test("filtered results keep Clear filters inline and show the matching total wit
     await page.setViewportSize(viewport);
     await page.evaluate(async () => { await document.fonts.ready; });
     await expect(category).toHaveValue("");
+    await expect(category.getByRole("option", { name: "1st party agents", exact: true })).toHaveCount(1);
+    await expect(category.getByRole("option", { name: "3rd party agents", exact: true })).toHaveCount(1);
+    await expect(toolbar.locator(".inventory-facet-compact details")).toHaveCount(0);
+    await expect(toolbar.getByLabel("Search and page show agents options")).toHaveCount(0);
     const initialHeight = (await toolbar.boundingBox())!.height;
     for (const type of ["firstParty", "thirdParty", "shared"]) {
-      await category.selectOption(type);
+      await category.selectOption(encodeInventoryFacet(type));
       await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
       await expect(count).toHaveText("1 matching agent");
       await expect(toolbar.locator(".agent-filter-chips")).toHaveCount(0);
@@ -67,7 +71,7 @@ test("filtered results keep Clear filters inline and show the matching total wit
     await expect(search).toHaveValue("");
     await toolbar.getByRole("button", { name: "Filters", exact: true }).click();
     await page.getByRole("dialog", { name: "Filter agents" }).getByRole("combobox", { name: "Publisher", exact: true })
-      .selectOption("Synthetic Finance");
+      .selectOption(encodeInventoryFacet("Synthetic Finance"));
     await page.keyboard.press("Escape");
     await expect(count).toHaveText("1 matching agent");
     await expect(toolbar.getByRole("button", { name: "Remove publisher filter" })).toBeVisible();
@@ -84,15 +88,15 @@ test("matching count uses the full server total and distinguishes loading and fa
   let finishRead!: () => void;
   const pendingRead = new Promise<void>(resolve => { finishRead = resolve; });
   await page.route("**/api/agent-inventory?*", async route => {
-    const search = new URL(route.request().url()).searchParams.get("search");
+    const search = inventoryFixtureQuery(route).get("search");
     if (search === "pending") {
       await pendingRead;
-      return route.fulfill({ json: { ...unifiedAgents, count: 1093 } });
+      return fulfillInventoryPage(route, { ...unifiedAgents, counts: { total: 1093, scoped: 1093, filtered: 1093, packageTargets: 1093 } });
     }
     if (search === "failed") return route.fulfill({
       status: 503, json: { code: "snapshot_unavailable", detail: "Synthetic inventory read failed." },
     });
-    return route.fulfill({ json: unifiedAgents });
+    return fulfillInventoryPage(route, unifiedAgents);
   });
   await page.goto("/agents");
   const toolbar = page.locator(".agent-grid-toolbar");
@@ -150,6 +154,7 @@ test("one compact toolbar opens accessible detailed filters without moving the t
     await test.step(`${viewport.width}px closed toolbar and nonmodal filter geometry`, async () => {
       await page.setViewportSize(viewport);
       await page.evaluate(async () => { await document.fonts.ready; window.scrollTo(0, 0); });
+      await expect(page.getByRole("status").filter({ hasText: "Loading selected report evidence..." })).toHaveCount(0);
       const actualViewport = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
       expect(actualViewport, "Headless layout viewport matches the requested dimensions").toEqual(viewport);
       const initialTableTop = await table.evaluate(element => element.getBoundingClientRect().top + window.scrollY);
@@ -206,6 +211,18 @@ test("one compact toolbar opens accessible detailed filters without moving the t
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
       for (const control of await dialog.locator("input, select, button").all()) {
         await control.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
+        if (viewport.width === 768 && await control.textContent() === "Reset filters") {
+          await info.attach("filter-reset-geometry", { contentType: "application/json", body: JSON.stringify(await control.evaluate(element => {
+            const ancestors = [];
+            for (let node: Element | null = element; node; node = node.parentElement) {
+              const style = getComputedStyle(node);
+              ancestors.push({ tag: node.tagName, className: node.className, rect: node.getBoundingClientRect().toJSON(),
+                overflowX: style.overflowX, overflowY: style.overflowY, scrollTop: node.scrollTop,
+                scrollHeight: node.scrollHeight, clientHeight: node.clientHeight, scrollWidth: node.scrollWidth, clientWidth: node.clientWidth });
+            }
+            return { width: innerWidth, height: innerHeight, ancestors };
+          }), null, 2) });
+        }
         await expect.soft(control).toBeInViewport({ ratio: 1, timeout: 1_000 });
       }
       await dialog.getByRole("button", { name: "Close filters" }).scrollIntoViewIfNeeded();
@@ -240,7 +257,13 @@ test("filter dialog flips near the viewport bottom and stays contained and focus
   await expect(firstField).toBeFocused();
 
   async function assertPlacement(name: string, placement: "above" | "below" | "fixed") {
-    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await expect.poll(() => dialog.evaluate((panel, desiredPlacement) => {
+      const box = panel.getBoundingClientRect();
+      return box.top >= 16 && box.bottom <= window.innerHeight - 16
+        && box.left >= 0 && box.right <= window.innerWidth
+        && panel.getAttribute("data-side") === (desiredPlacement === "above" ? "above" : "below")
+        && getComputedStyle(panel).position === (desiredPlacement === "fixed" ? "fixed" : "absolute");
+    }, placement)).toBe(true);
     const geometry = await dialog.evaluate(panel => {
       const box = panel.getBoundingClientRect();
       const anchor = panel.closest(".agent-filter-picker")!.getBoundingClientRect();
@@ -281,13 +304,13 @@ test("filter dialog flips near the viewport bottom and stays contained and focus
   expect(scrolled.panel.height).toBeLessThan(initial.panel.height);
   expect(scrolled.tableTop).toBeCloseTo(tableTop, 1);
 
-  await page.setViewportSize({ width: 768, height: 900 });
+  await page.setViewportSize({ width: 768, height: 1100 });
   await assertPlacement("resized-below", "below");
   await page.setViewportSize({ width: 360, height: 780 });
   await assertPlacement("mobile-fixed", "fixed");
   await page.setViewportSize({ width: 1280, height: 600 });
   await assertPlacement("short-fixed", "fixed");
-  await page.setViewportSize({ width: 768, height: 900 });
+  await page.setViewportSize({ width: 768, height: 1100 });
   await assertPlacement("restored-anchor", "below");
   const sort = dialog.getByRole("combobox", { name: "Sort", exact: true });
   await sort.focus();
@@ -344,13 +367,14 @@ test("filter dismissal supports the close button, Escape, outside click and nonm
 
 test("environment selection retains keyboard focus during and after the saved-results refresh", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
+  await mockInventoryFacets(page, { environmentId: environments });
   let finishRefresh: (() => Promise<void>) | undefined;
   await page.route("**/api/agent-inventory?*", route => {
-    if (new URL(route.request().url()).searchParams.get("environmentId") === "environment-a") {
-      finishRefresh = () => route.fulfill({ json: inventoryWithEnvironments });
+    if (inventoryFixtureFacet(inventoryFixtureQuery(route), "environmentId") === "environment-a") {
+      finishRefresh = () => fulfillInventoryPage(route, inventoryWithEnvironments);
       return;
     }
-    return route.fulfill({ json: inventoryWithEnvironments });
+    return fulfillInventoryPage(route, inventoryWithEnvironments);
   });
   await page.goto("/agents");
   await page.getByRole("button", { name: "Filters", exact: true }).click();
@@ -358,7 +382,7 @@ test("environment selection retains keyboard focus during and after the saved-re
   const environment = dialog.getByRole("combobox", { name: "Environment", exact: true });
   try {
     await environment.focus();
-    await environment.selectOption("environment-a");
+    await environment.selectOption(encodeInventoryFacet("environment-a"));
     await expect.poll(() => Boolean(finishRefresh)).toBe(true);
     await expect(environment).toHaveAttribute("aria-busy", "true");
     await expect(environment).toBeFocused();
@@ -367,7 +391,7 @@ test("environment selection retains keyboard focus during and after the saved-re
     if (finishRefresh) await finishRefresh();
   }
   await expect(environment).toHaveAttribute("aria-busy", "false");
-  await expect(environment).toHaveValue("environment-a");
+  await expect(environment).toHaveValue(encodeInventoryFacet("environment-a"));
   await expect(environment).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Filters, 1 active", exact: true })).toBeFocused();
@@ -376,10 +400,11 @@ test("environment selection retains keyboard focus during and after the saved-re
 
 test("closed filters preserve request parameters and history while Clear and Reset preserve sorting", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
+  await mockInventoryFacets(page, { environmentId: environments });
   const queries: URLSearchParams[] = [];
   await page.route("**/api/agent-inventory?*", route => {
-    queries.push(new URL(route.request().url()).searchParams);
-    return route.fulfill({ json: inventoryWithEnvironments });
+    queries.push(inventoryFixtureQuery(route));
+    return fulfillInventoryPage(route, inventoryWithEnvironments);
   });
   await page.goto("/agents?source=power_platform&linkState=matched");
   const trigger = page.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ });
@@ -388,27 +413,27 @@ test("closed filters preserve request parameters and history while Clear and Res
   await expect(page).toHaveURL(/\/agents$/);
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill("policy");
   await trigger.click();
-  await dialog.getByRole("combobox", { name: "Assigned access", exact: true }).selectOption("available:some");
-  await dialog.getByRole("combobox", { name: "Host", exact: true }).selectOption("Teams");
-  await dialog.getByRole("combobox", { name: "Built with", exact: true }).selectOption("Copilot Studio");
+  await dialog.getByRole("combobox", { name: "Assigned access", exact: true }).selectOption(encodeInventoryFacet("some"));
+  await dialog.getByRole("combobox", { name: "Host", exact: true }).selectOption(encodeInventoryFacet("Teams"));
+  await dialog.getByRole("combobox", { name: "Built with", exact: true }).selectOption(encodeInventoryFacet("Copilot Studio"));
   await dialog.getByRole("spinbutton", { name: "Created within days" }).fill("60");
   await dialog.getByRole("combobox", { name: "Package status", exact: true }).selectOption("blocked");
-  await dialog.getByRole("combobox", { name: "Publisher", exact: true }).selectOption("Synthetic Finance");
+  await dialog.getByRole("combobox", { name: "Publisher", exact: true }).selectOption(encodeInventoryFacet("Synthetic Finance"));
   const beforeEnvironmentSearch = page.url();
   await dialog.getByRole("searchbox", { name: "Search environments" }).fill("fin");
   const environment = dialog.getByRole("combobox", { name: "Environment", exact: true });
   await expect(environment.getByRole("option")).toHaveCount(2);
   expect(page.url()).toBe(beforeEnvironmentSearch);
   await environment.focus();
-  await environment.selectOption("environment-a");
+  await environment.selectOption(encodeInventoryFacet("environment-a"));
   await expect(environment).toBeFocused();
   await expect(trigger).toHaveAccessibleName("Filters, 7 active");
   await dialog.getByRole("combobox", { name: "Sort", exact: true }).selectOption("lastModifiedAt:desc");
   await expect.poll(() => queries.at(-1)?.get("sortDirection")).toBe("desc");
   const latest = queries.at(-1)!;
   expect(Object.fromEntries(["environmentId", "publisher", "availableTo", "host", "platform", "createdWithinDays", "sortBy", "search", "blocked"].map(key => [key, latest.get(key)]))).toEqual({
-    environmentId: "environment-a", publisher: "Synthetic Finance",
-    availableTo: "available:some", host: "Teams", platform: "Copilot Studio", createdWithinDays: "60", sortBy: "lastModifiedAt",
+    environmentId: encodeInventoryFacet("environment-a"), publisher: encodeInventoryFacet("Synthetic Finance"),
+    availableTo: encodeInventoryFacet("some"), host: encodeInventoryFacet("Teams"), platform: encodeInventoryFacet("Copilot Studio"), createdWithinDays: "60", sortBy: "lastModifiedAt",
     search: "policy", blocked: "true",
   });
   expect(queries.every(query => !query.has("source") && !query.has("linkState"))).toBe(true);
@@ -430,7 +455,7 @@ test("closed filters preserve request parameters and history while Clear and Res
   await expect(trigger).toHaveAccessibleName("Filters, 7 active");
   await expect(dialog).toHaveCount(0);
   await trigger.click();
-  await expect(environment).toHaveValue("environment-a");
+  await expect(environment).toHaveValue(encodeInventoryFacet("environment-a"));
   await expect(dialog.getByRole("combobox", { name: "Sort", exact: true })).toHaveValue("lastModifiedAt:desc");
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Clear filters", exact: true }).click();
@@ -444,11 +469,11 @@ test("closed filters preserve request parameters and history while Clear and Res
   await trigger.click();
   await expect(dialog.getByRole("combobox", { name: "Sort", exact: true })).toHaveValue("lastModifiedAt:desc");
   await expect(dialog.getByRole("button", { name: "Reset filters" })).toBeDisabled();
-  await dialog.getByRole("combobox", { name: "Host", exact: true }).selectOption("Teams");
+  await dialog.getByRole("combobox", { name: "Host", exact: true }).selectOption(encodeInventoryFacet("Teams"));
   await dialog.getByRole("button", { name: "Reset filters" }).click();
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("combobox", { name: "Built with", exact: true })).toBeFocused();
-  await expect(dialog.getByRole("combobox", { name: "Host", exact: true })).toHaveValue("all");
+  await expect(dialog.getByRole("combobox", { name: "Host", exact: true })).toHaveValue("");
   await expect(dialog.getByRole("combobox", { name: "Sort", exact: true })).toHaveValue("lastModifiedAt:desc");
   await expect(page).toHaveURL(/\/agents\?sort=lastModifiedAt&direction=desc$/);
   await expect(dialog.getByRole("button", { name: "Reset filters" })).toBeDisabled();
@@ -457,23 +482,24 @@ test("closed filters preserve request parameters and history while Clear and Res
 
 test("bookmarks expose active restrictions as chips without automatically opening detailed filters", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  await page.goto("/agents?platform=Copilot+Studio&createdWithinDays=30&availability=available%3Asome&host=Teams");
+  await page.goto(`/agents?${new URLSearchParams({ platform: encodeInventoryFacet("Copilot Studio"),
+    createdWithinDays: "30", availability: encodeInventoryFacet("some"), host: encodeInventoryFacet("Teams") })}`);
   const trigger = page.getByRole("button", { name: "Filters, 4 active", exact: true });
   const dialog = page.getByRole("dialog", { name: "Filter agents", exact: true });
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
   await expect(dialog).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Remove built with filter" })).toContainText("Copilot Studio");
   await expect(page.getByRole("button", { name: "Remove created within filter" })).toContainText("30 days");
-  await expect(page.getByRole("button", { name: "Remove assigned access filter" })).toContainText("Some users");
+  await expect(page.getByRole("button", { name: "Remove assigned access filter" })).toContainText("some");
   await expect(page.getByRole("button", { name: "Remove host filter" })).toContainText("Teams");
   await page.reload();
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
   await expect(dialog).toHaveCount(0);
   await trigger.click();
-  await expect(dialog.getByRole("combobox", { name: "Built with", exact: true })).toHaveValue("Copilot Studio");
+  await expect(dialog.getByRole("combobox", { name: "Built with", exact: true })).toHaveValue(encodeInventoryFacet("Copilot Studio"));
   await expect(dialog.getByRole("spinbutton", { name: "Created within days" })).toHaveValue("30");
-  await expect(dialog.getByRole("combobox", { name: "Host", exact: true })).toHaveValue("Teams");
-  await expect(dialog.getByRole("combobox", { name: "Assigned access", exact: true })).toHaveValue("available:some");
+  await expect(dialog.getByRole("combobox", { name: "Host", exact: true })).toHaveValue(encodeInventoryFacet("Teams"));
+  await expect(dialog.getByRole("combobox", { name: "Assigned access", exact: true })).toHaveValue(encodeInventoryFacet("some"));
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Remove host filter", exact: true }).focus();
   await page.keyboard.press("Enter");
@@ -484,21 +510,22 @@ test("bookmarks expose active restrictions as chips without automatically openin
 
 test("each chip removes only its own restriction and Clear also resets search and view but not sorting", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
+  await mockInventoryFacets(page, { environmentId: environments });
   const queries: URLSearchParams[] = [];
   await page.route("**/api/agent-inventory?*", route => {
-    queries.push(new URL(route.request().url()).searchParams);
-    return route.fulfill({ json: inventoryWithEnvironments });
+    queries.push(inventoryFixtureQuery(route));
+    return fulfillInventoryPage(route, inventoryWithEnvironments);
   });
   await page.goto("/agents");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill("policy");
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("firstParty");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption(encodeInventoryFacet("firstParty"));
   const trigger = page.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "Filter agents", exact: true });
   for (const [name, value] of [
-    ["Built with", "Copilot Studio"], ["Assigned access", "available:some"], ["Host", "Teams"],
-    ["Publisher", "Synthetic Finance"], ["Package status", "blocked"], ["Environment", "environment-a"],
+    ["Built with", encodeInventoryFacet("Copilot Studio")], ["Assigned access", encodeInventoryFacet("some")], ["Host", encodeInventoryFacet("Teams")],
+    ["Publisher", encodeInventoryFacet("Synthetic Finance")], ["Package status", "blocked"], ["Environment", encodeInventoryFacet("environment-a")],
     ["Sort", "lastModifiedAt:desc"],
   ]) {
     await dialog.getByRole("combobox", { name, exact: true }).selectOption(value);
@@ -507,8 +534,8 @@ test("each chip removes only its own restriction and Clear also resets search an
   await page.keyboard.press("Escape");
   await expect(trigger).toHaveAccessibleName("Filters, 7 active");
   const remaining: Record<string, string> = {
-    platform: "Copilot Studio", availableTo: "available:some", host: "Teams", publisher: "Synthetic Finance",
-    blocked: "true", environmentId: "environment-a", createdWithinDays: "60",
+    platform: encodeInventoryFacet("Copilot Studio"), availableTo: encodeInventoryFacet("some"), host: encodeInventoryFacet("Teams"), publisher: encodeInventoryFacet("Synthetic Finance"),
+    blocked: "true", environmentId: encodeInventoryFacet("environment-a"), createdWithinDays: "60",
   };
   for (const [name, key] of [
     ["built with", "platform"], ["assigned access", "availableTo"], ["host", "host"],
@@ -522,7 +549,7 @@ test("each chip removes only its own restriction and Clear also resets search an
     const latest = queries.at(-1)!;
     expect(Object.fromEntries(Object.keys(remaining).map(field => [field, latest.get(field)]))).toEqual(remaining);
     expect(Object.fromEntries(["search", "type", "sortBy", "sortDirection"].map(field => [field, latest.get(field)]))).toEqual({
-      search: "policy", type: "firstParty", sortBy: "lastModifiedAt", sortDirection: "desc",
+      search: "policy", type: encodeInventoryFacet("firstParty"), sortBy: "lastModifiedAt", sortDirection: "desc",
     });
     await expect(page.getByRole("button", { name: `Remove ${name} filter`, exact: true })).toHaveCount(0);
     await expect(trigger).toHaveAccessibleName(Object.keys(remaining).length ? `Filters, ${Object.keys(remaining).length} active` : "Filters");
@@ -536,7 +563,7 @@ test("each chip removes only its own restriction and Clear also resets search an
   await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toHaveValue("");
   await expect(page).toHaveURL(/\/agents\?sort=lastModifiedAt&direction=desc$/);
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("firstParty");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption(encodeInventoryFacet("firstParty"));
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
   expect(unexpected).toEqual([]);
 });

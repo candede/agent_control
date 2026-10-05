@@ -7,9 +7,10 @@ import {
   permissionLayoutRequestKind,
 } from "../../browser/permissionFixtures";
 import {
-  blockAgent, blockAgents, blockAllAgents, checkCapabilities, getCapabilities, getCurrentUser, stageOfficialUsageReport,
-  startPackageRefresh, submitPurviewAuditSearch, unblockAgent, unblockAgents, unblockAllAgents,
+  blockAgent, blockAgents, checkCapabilities, getCapabilities, getCurrentUser,
+  startPackageRefresh, submitPurviewAuditSearch, unblockAgent, unblockAgents,
 } from "../api/client";
+import { stageReport } from "../api/reportData";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -93,7 +94,7 @@ describe("permission layout request contract", () => {
 });
 
 describe("permission browser request sentinels", () => {
-  it.each(["/api/capabilities/check", "/api/data-sync/auto-refresh", "/api/auth/consent", "/api/auth/logout"])("permits only the expected POST command %s", path => {
+  it.each(["/api/capabilities/check", "/api/data-sync/auto-refresh", "/api/agent-inventory/selections", "/api/auth/consent", "/api/auth/logout"])("permits only the expected POST command %s", path => {
     expect(isUnexpectedPermissionCommand("POST", path)).toBe(false);
     expect(isUnexpectedPermissionCommand("DELETE", path)).toBe(true);
   });
@@ -170,20 +171,18 @@ describe("permission browser request sentinels", () => {
       startDateTime: "2026-09-08T12:00:00.000Z", endDateTime: "2026-09-08T13:00:00.000Z",
       userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
     });
-    await stageOfficialUsageReport(new File(["synthetic"], "agents.csv"), { bundleId: "synthetic-bundle" });
+    await stageReport(new File(["synthetic"], "agents.csv"), { bundleId: "60000000-0000-4000-8000-000000000001" }, {});
     await startPackageRefresh("delegated", { idempotencyKey: "synthetic-key" });
     await blockAgent("package/encoded", "confirmation");
     await unblockAgent("package/encoded", "confirmation");
     await blockAgents(["package"], "confirmation");
     await unblockAgents(["package"], "confirmation");
-    await blockAllAgents("confirmation");
-    await unblockAllAgents("confirmation");
 
     const requests = fetchMock.mock.calls.map(([url, init]) => ({
       path: new URL(String(url), "http://localhost:3001").pathname, method: init?.method ?? "GET",
     }));
-    expect(requests).toHaveLength(9);
+    expect(requests).toHaveLength(7);
     expect(requests.every(({ method, path }) => isUnexpectedPermissionCommand(method, path))).toBe(true);
-    expect(requests.filter(({ method, path }) => isPackageMutationRequest(method, path))).toHaveLength(6);
+    expect(requests.filter(({ method, path }) => isPackageMutationRequest(method, path))).toHaveLength(4);
   });
 });

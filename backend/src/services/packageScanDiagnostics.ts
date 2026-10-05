@@ -37,12 +37,12 @@ export class PackageScanDiagnostics {
 
   constructor(private readonly mode: "broad" | "exact") {}
 
-  catalogPage(values: readonly unknown[], page: number, hasContinuation: boolean, durationMs: number) {
+  catalogPage(values: readonly unknown[], page: number, hasContinuation: boolean, durationMs: number, totalRecords?: number) {
     this.pages = page;
     this.listedCount += values.length;
     this.log("package_catalog_page", {
       stage: "catalog", page, pageSize: values.length, observedCount: this.listedCount,
-      hasContinuation, durationMs: Math.round(durationMs),
+      hasContinuation, durationMs: Math.round(durationMs), totalRecords,
     });
     const rows: Record<string, unknown>[] = values.map(value => isRecord(value) ? value : {});
     for (const [field, kind] of detailFields) {

@@ -33,7 +33,7 @@ describe("workbench metadata", () => {
     });
   });
 
-  it("moves report workflow labels to Sync without renaming APIs or changing authority", () => {
+  it("keeps report workflows in Sync with native imports and cancellable persisted exports", () => {
     const actions = getWorkbenchMetadata().actions;
     expect(actions.find(action => action.id === "usage.import")).toMatchObject({
       label: "Import reports in Sync", roles: ["AgentControl.Admin"], capabilityId: "reports.official.import",
@@ -45,7 +45,10 @@ describe("workbench metadata", () => {
     });
     expect(actions.find(action => action.id === "usage.export.aggregate")).toMatchObject({
       label: "Export report snapshot in Sync", roles: ["AgentControl.Viewer"],
-      method: "GET", route: "/api/official-usage/aggregate.csv",
+      method: "POST", route: "/api/data-exports", recovery: "cancel_unsent",
+    });
+    expect(actions.find(action => action.id === "usage.export.users")).toMatchObject({
+      roles: ["AgentControl.Viewer"], method: "POST", route: "/api/data-exports", recovery: "cancel_unsent",
     });
   });
 
@@ -88,7 +91,7 @@ describe("workbench metadata", () => {
       capabilityId: "powerPlatform.quarantine.manage",
     });
     expect(metadata.actions.find(action => action.id === "packages.refresh.identities")).toMatchObject({
-      route: "/api/agents/refresh-jobs",
+      route: "/api/agents/refresh-selection",
       method: "POST",
       nativeTarget: "graph_package_id",
       capabilityId: "graph.package.read.delegated",

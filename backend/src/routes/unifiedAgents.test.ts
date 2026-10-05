@@ -1,80 +1,106 @@
 import { describe, expect, it } from "vitest";
-import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
+import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
 import {
-  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentViews,
-  unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
+  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys,
+  unifiedAgentViews, unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
 } from "../types/unifiedAgents.js";
+import { decodeInventoryFacet, encodeInventoryFacet, inventoryFacetFields } from "../types/inventoryFacets.js";
 
-const filterEnums = {
+const enums = {
   view: unifiedAgentViews, endUserAccess: unifiedAgentAccessFilters, reportedUsage: unifiedAgentUsageFilters,
   management: unifiedAgentManagementFilters, relevance: unifiedAgentRelevanceFilters,
+  inventoryScope: unifiedAgentInventoryScopes, sortBy: unifiedAgentSortKeys,
 };
 
-describe("unified agent inventory query", () => {
-  it.each(["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", " firstParty "])(
-    "preserves the exact provider type %s for lists and exports", type => {
-      expect(unifiedAgentInventoryQuery({ type })).toMatchObject({ type });
-      expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { type } }).query).toMatchObject({ type });
-    },
-  );
+describe("selected inventory query protocol", () => {
+  it.each(inventoryFacetFields)("preserves exact %s literals and tagged unknowns without sentinel collisions", field => {
+    for (const literal of ["all", "__unknown__", "__some_or_all__", "available:all", "~null", "~some-or-all", " firstParty ", "公司🌏", null]) {
+      const wire = encodeInventoryFacet(literal);
+      expect(decodeInventoryFacet(wire)).toBe(literal);
+      expect(unifiedAgentInventoryQuery({ [field]: wire })[field]).toBe(literal);
+    }
+    expect(unifiedAgentInventoryQuery({})[field]).toBeUndefined();
+  });
 
-  it.each(["", " ", null, 1, true, {}, ["firstParty"], ["firstParty", "shared"], "bad\ntype", "bad\0type", "x".repeat(4097)])(
-    "rejects malformed provider type %j without dropping the filter", type => {
-      expect(() => unifiedAgentInventoryQuery({ type })).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { type } })).toThrow();
-    },
-  );
-
-  it.each(Object.entries(filterEnums).flatMap(([key, values]) => values.map(value => ({ key, value }))))(
-    "accepts exact $key=$value enum selections for lists and exports", ({ key, value }) => {
-      expect(unifiedAgentInventoryQuery({ [key]: value })).toMatchObject({ [key]: value });
-      expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { [key]: value } }).query).toMatchObject({ [key]: value });
-    },
-  );
-
-  it.each(Object.keys(filterEnums))("rejects malformed %s selections instead of silently clearing filters", key => {
-    for (const value of ["future", " all", "all ", "All", "", null, true, 1, {}, ["all"], ["all", "unknown"], "__proto__"]) {
-      expect(() => unifiedAgentInventoryQuery({ [key]: value }), JSON.stringify(value))
+  it.each(inventoryFacetFields)("rejects malformed or ambiguous %s wire values rather than silently broadening", field => {
+    for (const value of ["", " ", "all", "__unknown__", null, 1, true, {}, ["~null"], ["~null", "~string:x"],
+      "~string:", "~string:bad\nvalue", "~string:bad\0value", `~string:${"x".repeat(field === "environmentId" ? 513 : 4097)}`]) {
+      expect(() => unifiedAgentInventoryQuery({ [field]: value }), JSON.stringify(value))
         .toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { [key]: value } }), JSON.stringify(value)).toThrow();
     }
-    expect(unifiedAgentInventoryQuery({ [key]: undefined })[key as keyof typeof filterEnums]).toBeUndefined();
+    if (field !== "availableTo") expect(() => unifiedAgentInventoryQuery({ [field]: "~some-or-all" })).toThrow();
   });
 
-  it("preserves all combined filters and legacy relevance in exported queries without accepting scope overrides", () => {
-    const query = {
-      inventoryScope: "catalog", view: "copilot_studio", endUserAccess: "unavailable", reportedUsage: "used",
-      management: "organization_managed", relevance: "organization", publisher: "Publisher",
-      platform: "Copilot Studio", sortBy: "responses", sortDirection: "desc",
-    };
-    expect(unifiedAgentInventoryQuery(query)).toMatchObject(query);
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query }).query).toMatchObject(query);
-    for (const invalid of [
-      { endUserAccess: "used" }, { reportedUsage: "unknown" }, { management: "organization" }, { relevance: "user_managed" },
-    ]) {
-      expect(() => unifiedAgentInventoryQuery(invalid)).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: invalid })).toThrow();
-    }
-    for (const extra of [{ tenantId: "other" }, { principalId: "other" }, { filters: query }, { limit: 1 }, { offset: 1 }]) {
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { ...query, ...extra } }))
-        .toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
-    }
-    for (const key of Object.keys(filterEnums)) {
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), recordIds: ["graph_packages:package"], query: { [key]: "all" } }))
-        .toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
+  it("distinguishes the explicit combined assignment from every provider literal", () => {
+    expect(unifiedAgentInventoryQuery({ availableTo: "~some-or-all" }).availableTo).toEqual({ kind: "some-or-all" });
+    expect(unifiedAgentInventoryQuery({ availableTo: encodeInventoryFacet("~some-or-all") }).availableTo).toBe("~some-or-all");
+  });
+
+  it.each(Object.entries(enums).flatMap(([key, values]) => values.map(value => ({ key, value }))))(
+    "accepts exact $key=$value", ({ key, value }) => {
+      expect(unifiedAgentInventoryQuery({ [key]: value })).toMatchObject({ [key]: value });
+    },
+  );
+
+  it.each(Object.keys(enums))("rejects malformed %s enum choices", key => {
+    for (const value of ["not-a-choice", " all", "all ", "All", null, true, 1, {}, ["all", "unknown"]]) {
+      expect(() => unifiedAgentInventoryQuery({ [key]: value }), JSON.stringify(value)).toThrow();
     }
   });
 
-  it("validates bounded exact responsibility input without accepting scope overrides or name joins", () => {
-    expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", offset: "250", limit: "100" }))
-      .toEqual({ objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", search: undefined, offset: 250, limit: 100 });
+  it("preserves independent combined filters and bounded selected-page sorting", () => {
+    const query = unifiedAgentInventoryQuery({
+      search: " agent ", recordId: "graph_packages:package-a", operationIdPrefix: "a5331a93",
+      inventoryScope: "catalog", source: "both", linkState: "matched", environmentId: "~string:environment-a",
+      blocked: "true", publisher: "~string:Publisher", availableTo: "~some-or-all", host: "~string:Teams",
+      platform: "~string:Copilot Studio", createdWithinDays: "30", sortBy: "lastModifiedAt", sortDirection: "desc", limit: "25",
+      relevance: "organization", view: "used", endUserAccess: "unavailable", reportedUsage: "used", management: "organization_managed",
+    });
+    expect(query).toMatchObject({
+      search: "agent", recordId: "graph_packages:package-a", operationIdPrefix: "a5331a93",
+      inventoryScope: "catalog", source: "both", linkState: "matched", environmentId: "environment-a",
+      blocked: true, publisher: "Publisher", availableTo: { kind: "some-or-all" }, host: "Teams", platform: "Copilot Studio",
+      createdWithinDays: 30, sortBy: "lastModifiedAt", sortDirection: "desc", limit: 25,
+      relevance: "organization", view: "used", endUserAccess: "unavailable", reportedUsage: "used", management: "organization_managed",
+    });
+    expect(query).not.toHaveProperty("offset");
+  });
+
+  it("round-trips exact opaque source identities and canonical UUIDs", () => {
+    const target = { source: "power_platform" as const, environmentId: "environment-a", nativeId: "native:with/slash%value" };
+    const id = unifiedAgentRecordId(target);
+    expect(parseUnifiedAgentRecordId(id)).toEqual(target);
+    expect(unifiedAgentInventoryQuery({ recordId: id }).recordId).toBe(id);
+    expect(unifiedAgentInventoryQuery({ recordId: "agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" }).recordId)
+      .toBe("agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    for (const recordId of ["unqualified-id", "power_platform:missing-environment", "power_platform:env:%ZZ", "graph_packages:",
+      "agent:", "agent:name", "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:package"]) {
+      expect(() => unifiedAgentInventoryQuery({ recordId })).toThrow();
+    }
+  });
+
+  it("requires bounded pages, known boolean/numeric filters, and exact operation references", () => {
+    expect(unifiedAgentInventoryQuery({})).toMatchObject({
+      inventoryScope: "all", source: "all", sortBy: "displayName", sortDirection: "asc", limit: 50,
+    });
+    for (const query of [{ source: "application" }, { limit: "101" }, { limit: "0" }, { blocked: "all" },
+      { createdWithinDays: "0" }, { operationIdPrefix: "invalid%prefix" }]) {
+      expect(() => unifiedAgentInventoryQuery(query)).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
+    }
+  });
+
+  it("validates exact responsibility identifiers without tenant or name overrides", () => {
+    const selectionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", selectionId, cursor: "selected-page", limit: "100" }))
+      .toEqual({ objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", search: undefined, selectionId, cursor: "selected-page", limit: 100 });
     for (const query of [{ objectId: "alice@example.invalid" }, { objectId: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
-      { tenantId: "other" }, { principalId: "other" }, { name: "Alice" }, { limit: "101" }, { limit: "0" },
-      { offset: "-1" }, { offset: "30001" }, { offset: "NaN" }, { search: "bad\nname" }, { search: "x".repeat(257) }]) {
-      expect(() => agentResponsibilityQuery(query)).toThrowError(expect.objectContaining({ code: "invalid_responsibility_query" }));
+      { tenantId: "other" }, { principalId: "other" }, { name: "Alice" }, { limit: "101" }, { offset: "-1" },
+      { offset: "30001" }, { search: "bad\nname" }, { search: "x".repeat(257) }]) {
+      expect(() => agentResponsibilityQuery(query)).toThrow();
     }
   });
-  it("accepts only saved record identifiers for persistent people resolution, not arbitrary directory IDs", () => {
+
+  it("accepts only saved record identifiers for persistent people resolution", () => {
     expect(agentPeopleResolveInput({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }))
       .toEqual({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", force: false });
     expect(agentPeopleResolveInput({ recordId: "graph_packages:package", force: true }).force).toBe(true);
@@ -82,152 +108,5 @@ describe("unified agent inventory query", () => {
       { recordId: "graph_packages:package", principalId: "other" }, { ids: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] }]) {
       expect(() => agentPeopleResolveInput(input)).toThrow();
     }
-  });
-  it.each(["available", "unavailable", "availability_unknown"])("accepts the %s access view for lists and exports", view => {
-    expect(unifiedAgentInventoryQuery({ view }).view).toBe(view);
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view } }).query.view).toBe(view);
-  });
-
-  it.each(unifiedAgentInventoryScopes)("accepts the %s inventory scope for lists and filtered exports", inventoryScope => {
-    expect(unifiedAgentInventoryQuery({ inventoryScope, source: "power_platform" }))
-      .toMatchObject({ inventoryScope, source: "power_platform" });
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { inventoryScope, source: "both" } }).query)
-      .toMatchObject({ inventoryScope, source: "both" });
-    expect(() => unifiedAgentExportInput({
-      revision: "a".repeat(64), recordIds: ["graph_packages:package"], query: { inventoryScope },
-    })).toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
-  });
-
-  it.each(["graph_packages", "power_platform", "Catalog", "catalog ", "none", 1, true, {}])(
-    "rejects invalid inventory scope %j", inventoryScope => {
-      expect(() => unifiedAgentInventoryQuery({ inventoryScope }))
-        .toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { inventoryScope } })).toThrow();
-    },
-  );
-
-  it("accepts organizational and usage views and new column sorting for list and export", () => {
-    expect(unifiedAgentInventoryQuery({ view: "organization", sortBy: "deployment" })).toMatchObject({ view: "organization", sortBy: "deployment" });
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view: "used", sortBy: "responses", sortDirection: "desc" } }).query)
-      .toMatchObject({ view: "used", sortBy: "responses", sortDirection: "desc" });
-    expect(() => unifiedAgentInventoryQuery({ view: "active-guessed" })).toThrow();
-    expect(() => unifiedAgentInventoryQuery({ sortBy: "actions" })).toThrow();
-  });
-
-  it("parses typed filters, sorting and pagination", () => {
-    expect(unifiedAgentInventoryQuery({
-      search: " agent ",
-      recordId: "graph_packages:package-a",
-      operationIdPrefix: "a5331a93",
-      inventoryScope: "catalog",
-      source: "both",
-      linkState: "matched",
-      environmentId: " environment-a ",
-      blocked: "true",
-      publisher: "Publisher",
-      availableTo: "available:some",
-      host: "Teams",
-      platform: "Copilot Studio",
-      createdWithinDays: "30",
-      sortBy: "lastModifiedAt",
-      sortDirection: "desc",
-      limit: "25",
-      offset: "50",
-    })).toEqual({
-      search: "agent",
-      recordId: "graph_packages:package-a",
-      operationIdPrefix: "a5331a93",
-      inventoryScope: "catalog",
-      source: "both",
-      linkState: "matched",
-      environmentId: "environment-a",
-      blocked: true,
-      publisher: "Publisher",
-      availableTo: "available:some",
-      host: "Teams",
-      platform: "Copilot Studio",
-      createdWithinDays: 30,
-      sortBy: "lastModifiedAt",
-      sortDirection: "desc",
-      limit: 25,
-      offset: 50,
-    });
-  });
-
-  it("round-trips source-qualified identities and rejects malformed deep links", () => {
-    const target = { source: "power_platform" as const, environmentId: "environment-a", nativeId: "native:with/slash%value" };
-    const id = unifiedAgentRecordId(target);
-    expect(parseUnifiedAgentRecordId(id)).toEqual(target);
-    expect(unifiedAgentInventoryQuery({ recordId: id }).recordId).toBe(id);
-    for (const recordId of ["unqualified-id", "power_platform:missing-environment", "power_platform:env:%ZZ", "graph_packages:"]) {
-      expect(() => unifiedAgentInventoryQuery({ recordId })).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-    }
-  });
-
-  it("accepts canonical agent UUIDs while rejecting malformed or unscoped canonical links", () => {
-    const agentId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-    const target = { source: "canonical" as const, agentId: agentId.toLowerCase() };
-    expect(parseUnifiedAgentRecordId(`agent:${agentId}`)).toEqual(target);
-    expect(unifiedAgentRecordId(target)).toBe(`agent:${agentId.toLowerCase()}`);
-    expect(unifiedAgentInventoryQuery({ recordId: `agent:${agentId}` }).recordId).toBe(`agent:${agentId.toLowerCase()}`);
-    for (const recordId of ["agent:", "agent:name", `agent:${agentId}:package`, `agent:${agentId}\n`]) {
-      expect(() => unifiedAgentInventoryQuery({ recordId })).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
-    }
-  });
-
-  it("defaults to a bounded delegated saved read contract and rejects invalid filters", () => {
-    expect(unifiedAgentInventoryQuery({})).toMatchObject({
-      inventoryScope: "all",
-      source: "all",
-      sortBy: "displayName",
-      sortDirection: "asc",
-      limit: 50,
-      offset: 0,
-    });
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64) }).query.inventoryScope).toBe("all");
-    expect(unifiedAgentExportInput({ revision: "a".repeat(64), recordIds: ["graph_packages:package"] }).query.inventoryScope).toBe("all");
-    expect(() => unifiedAgentInventoryQuery({ source: "application" })).toThrowError(expect.objectContaining({
-      code: "invalid_agent_inventory_query",
-    }));
-    expect(() => unifiedAgentInventoryQuery({ limit: "251" })).toThrowError(expect.objectContaining({
-      code: "invalid_agent_inventory_query",
-    }));
-    expect(() => unifiedAgentInventoryQuery({ blocked: "all" })).toThrowError(expect.objectContaining({
-      code: "invalid_agent_inventory_query",
-    }));
-    expect(() => unifiedAgentInventoryQuery({ createdWithinDays: "0" })).toThrowError(expect.objectContaining({
-      code: "invalid_agent_inventory_query",
-    }));
-    expect(() => unifiedAgentInventoryQuery({ operationIdPrefix: "invalid%prefix" })).toThrowError(expect.objectContaining({
-      code: "invalid_agent_inventory_query",
-    }));
-  });
-
-  it("parses typed unified export filters without accepting pagination or provider-specific selection", () => {
-    expect(unifiedAgentExportInput({
-      revision: "A".repeat(64), query: { environmentId: "environment-a", blocked: false, createdWithinDays: 30, sortDirection: "desc" },
-    })).toMatchObject({
-      revision: "a".repeat(64), query: { environmentId: "environment-a", blocked: false, createdWithinDays: 30, sortDirection: "desc" },
-    });
-    for (const input of [
-      {}, { revision: "invalid" }, { revision: "a".repeat(64), query: [] },
-      { revision: "a".repeat(64), query: { limit: 1 } }, { revision: "a".repeat(64), query: { offset: 1 } },
-      { revision: "a".repeat(64), query: { environmentId: 123 } },
-      { revision: "a".repeat(64), query: { blocked: {} } }, { revision: "a".repeat(64), source: "graph_packages" },
-    ]) expect(() => unifiedAgentExportInput(input)).toThrow();
-  });
-
-  it("accepts exact canonical/source aliases and rejects ambiguous export selection intent", () => {
-    const canonical = "agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-    expect(unifiedAgentExportInput({
-      revision: "a".repeat(64), recordIds: [canonical, canonical.toLowerCase(), "graph_packages:opaque%2Fid"],
-      query: { sortBy: "displayName", sortDirection: "desc" },
-    })).toMatchObject({ recordIds: [canonical.toLowerCase(), "graph_packages:opaque%2Fid"] });
-    for (const recordIds of [[], null, [1], ["unqualified"], ["graph_packages:"], Array.from({ length: 5_001 }, () => canonical)]) {
-      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), recordIds })).toThrow();
-    }
-    expect(() => unifiedAgentExportInput({
-      revision: "a".repeat(64), recordIds: [canonical], query: { environmentId: "environment-a" },
-    })).toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
   });
 });

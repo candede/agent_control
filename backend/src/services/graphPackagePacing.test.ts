@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { GraphPackagesClient, packageInventoryReadPolicy, type FetchLike } from "./graphPackages.js";
-import { scanPackages } from "./packageInventory.js";
+import { measureGraphDetails } from "./inventoryProviderTestSupport.js";
 
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const value = (id = "package") => ({ id, displayName: id, isBlocked: false });
@@ -53,20 +53,19 @@ describe("adaptive package read pacing", () => {
   it("does not retain the four-per-second ceiling after a transient throttle clears", async () => {
     async function collect(adaptivePacing: boolean) {
       const started = performance.now();
-      const listed = Array.from({ length: 1_072 }, (_, index) => value(`package-${index}`));
       let throttleCount = 0;
       let calls = 0;
       const fetcher: FetchLike = async input => {
         calls += 1;
         const url = new URL(input);
         await wait(20);
-        if (url.pathname.endsWith("/packages")) return Response.json({ value: listed });
+        expect(url.pathname).not.toBe("/v1.0/copilot/admin/catalog/packages");
         if (!throttleCount) { throttleCount += 1; return throttled(); }
         return Response.json(value(url.pathname.split("/").at(-1)));
       };
       const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, adaptivePacing, delay: wait });
-      const scan = scanPackages("token", [], new AbortController().signal, async () => undefined, client);
-      await Promise.all([expect(scan).resolves.toMatchObject({ totalRecords: 1_072 }), vi.runAllTimersAsync()]);
+      const reads = measureGraphDetails(client, 1_072);
+      await Promise.all([expect(reads).resolves.toEqual({ observedCount: 1_072 }), vi.runAllTimersAsync()]);
       return { elapsedMs: performance.now() - started, calls, throttleCount };
     }
     const fixed = await collect(false);
@@ -180,16 +179,15 @@ describe("adaptive package read pacing", () => {
       return String(performance.now());
     });
     const controller = new AbortController();
-    const scans = Promise.all(Array.from({ length: 4 }, (_, scan) => scanPackages(
-      "expired", Array.from({ length: 12 }, (_, index) => `package-${scan}-${index}`),
-      controller.signal, async () => undefined, client, { getAccessToken },
+    const scans = Promise.all(Array.from({ length: 4 }, (_, caller) => measureGraphDetails(
+      client, 12, { signal: controller.signal, getAccessToken }, { id: index => `package-${caller}-${index}` },
     )));
     const completed = vi.fn();
     const observed = scans.then(completed, error => error);
     try {
       await vi.advanceTimersByTimeAsync(120_000);
       expect(completed).toHaveBeenCalledOnce();
-      expect(completed.mock.calls[0][0].map((scan: { totalRecords: number }) => scan.totalRecords)).toEqual([12, 12, 12, 12]);
+      expect(completed.mock.calls[0][0]).toEqual(Array.from({ length: 4 }, () => ({ observedCount: 12 })));
       expect(starts).toHaveLength(48);
       expect(starts.every((at, index) => index === 0 || at - starts[index - 1] >= 2_000)).toBe(true);
       expect(getAccessToken.mock.calls.length).toBeGreaterThan(48);

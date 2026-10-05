@@ -2,8 +2,8 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bootstrap, databaseOperatorFailure, migrate, preflightMigrations } from "./database.js";
-import { migrations, migrationChecksum } from "../src/db/schema.js";
+import { bootstrap, databaseOperatorFailure, initializeSchema, preflightSchema } from "./database.js";
+import { schemaFingerprint } from "../src/db/schema.js";
 import { fixturePassword, testDatabase } from "./testDatabase.js";
 
 const execute = promisify(execFile);
@@ -19,8 +19,8 @@ function preflightCommand() {
 
 describe.sequential("read-only database deployment preflight", () => {
   it("accepts a fresh database without creating schema or bootstrapping runtime access", async () => {
-    const expected = { state: "fresh", currentVersion: 0, targetVersion: migrations.at(-1)!.version };
-    expect(await preflightMigrations(fixture.operator)).toEqual(expected);
+    const expected = { state: "fresh", currentFingerprint: null, targetFingerprint: schemaFingerprint };
+    expect(await preflightSchema(fixture.operator)).toEqual(expected);
     const result = await preflightCommand();
     expect(JSON.parse(result.stdout)).toEqual({
       event: "database_operator_command", command: "preflight", outcome: "succeeded", ...expected,
@@ -29,67 +29,69 @@ describe.sequential("read-only database deployment preflight", () => {
     expect((await fixture.operator.query("SELECT count(*)::int AS count FROM pg_class WHERE relnamespace='public'::regnamespace")).rows[0].count).toBe(0);
   });
 
-  it("rejects unversioned saved tables without deleting or modifying them", async () => {
+  it("requires an explicit reset for an unrelated saved schema without changing its data", async () => {
     await fixture.operator.query("CREATE TABLE preflight_probe(id integer); INSERT INTO preflight_probe VALUES (7)");
     try {
-      await expect(preflightMigrations(fixture.operator)).rejects.toMatchObject({ code: "database_schema_unversioned" });
+      await expect(preflightSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+      await expect(initializeSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
       expect((await fixture.operator.query("SELECT id FROM preflight_probe")).rows).toEqual([{ id: 7 }]);
-      expect((await fixture.operator.query("SELECT to_regclass('public.schema_migrations') AS name")).rows[0].name).toBeNull();
+      expect((await fixture.operator.query("SELECT to_regclass('public.app_schema') AS name")).rows[0].name).toBeNull();
     } finally { await fixture.operator.query("DROP TABLE preflight_probe"); }
   });
 
-  it("accepts a matching migration prefix without applying its pending migrations", async () => {
-    await bootstrap(fixture.operator, fixturePassword);
-    await migrate(fixture.operator, migrations.slice(0, 1));
-    const before = (await fixture.operator.query("SELECT * FROM schema_migrations")).rows;
-    expect(await preflightMigrations(fixture.operator)).toEqual({
-      state: "compatible", currentVersion: 1, targetVersion: migrations.at(-1)!.version,
-    });
-    expect((await fixture.operator.query("SELECT * FROM schema_migrations")).rows).toEqual(before);
+  it("rejects leftover functions and types even when no tables exist", async () => {
+    for (const [create, drop] of [
+      ["CREATE FUNCTION preflight_probe() RETURNS integer LANGUAGE sql AS 'SELECT 1'", "DROP FUNCTION preflight_probe()"],
+      ["CREATE TYPE preflight_probe AS ENUM ('saved')", "DROP TYPE preflight_probe"],
+    ]) {
+      await fixture.operator.query(create);
+      try {
+        await expect(preflightSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+        await expect(initializeSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+      } finally { await fixture.operator.query(drop); }
+    }
   });
 
-  it("reports modified checksums explicitly, including through the CLI, without bypassing migration rejection", async () => {
-    await fixture.operator.query("UPDATE schema_migrations SET checksum='old-schema' WHERE version=1");
+  it("accepts the current schema without changing its singleton identity", async () => {
+    await bootstrap(fixture.operator, fixturePassword);
+    await initializeSchema(fixture.operator);
+    const before = (await fixture.operator.query("SELECT * FROM app_schema")).rows;
+    expect(await preflightSchema(fixture.operator)).toEqual({
+      state: "current", currentFingerprint: schemaFingerprint, targetFingerprint: schemaFingerprint,
+    });
+    await initializeSchema(fixture.operator);
+    expect((await fixture.operator.query("SELECT * FROM app_schema")).rows).toEqual(before);
+  });
+
+  it("reports an incompatible fingerprint explicitly through preflight and initialization without changing it", async () => {
+    const incompatible = "0".repeat(64);
+    await fixture.operator.query("UPDATE app_schema SET fingerprint=$1", [incompatible]);
     try {
-      await expect(preflightMigrations(fixture.operator)).rejects.toMatchObject({
-        code: "database_schema_incompatible", migrationVersion: 1,
-        message: expect.stringContaining("fresh development database"),
+      await expect(preflightSchema(fixture.operator)).rejects.toMatchObject({
+        code: "database_schema_reset_required",
+        message: expect.stringContaining("Explicitly reset"),
       });
       await expect(preflightCommand()).rejects.toMatchObject({
         code: 1, stdout: "",
-        stderr: expect.stringContaining('"code":"database_schema_incompatible"'),
+        stderr: expect.stringContaining('"code":"database_schema_reset_required"'),
       });
-      await expect(migrate(fixture.operator)).rejects.toMatchObject({ code: "database_schema_incompatible", migrationVersion: 1 });
-      expect((await fixture.operator.query("SELECT version,checksum FROM schema_migrations")).rows).toEqual([{ version: 1, checksum: "old-schema" }]);
+      await expect(initializeSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+      expect((await fixture.operator.query("SELECT fingerprint FROM app_schema")).rows).toEqual([{ fingerprint: incompatible }]);
     } finally {
-      await fixture.operator.query("UPDATE schema_migrations SET checksum=$1 WHERE version=1", [migrationChecksum(migrations[0].sql)]);
+      await fixture.operator.query("UPDATE app_schema SET fingerprint=$1", [schemaFingerprint]);
     }
   });
 
-  it("rejects unknown future versions without altering the saved history", async () => {
-    await fixture.operator.query("INSERT INTO schema_migrations(version,checksum) VALUES (999,'future-schema')");
+  it("requires reset when the schema identity row is missing instead of repairing it", async () => {
+    const before = (await fixture.operator.query("DELETE FROM app_schema RETURNING *")).rows[0];
     try {
-      await expect(preflightMigrations(fixture.operator)).rejects.toMatchObject({ code: "database_schema_incompatible", migrationVersion: 999 });
-      expect((await fixture.operator.query("SELECT count(*)::int AS count FROM schema_migrations")).rows[0].count).toBe(2);
-    } finally { await fixture.operator.query("DELETE FROM schema_migrations WHERE version=999"); }
-  });
-
-  it("rejects a gap even if the remaining checksum matches a compiled migration", async () => {
-    await fixture.operator.query("UPDATE schema_migrations SET version=2,checksum=$1 WHERE version=1", [migrationChecksum(migrations[1].sql)]);
-    try {
-      await expect(preflightMigrations(fixture.operator)).rejects.toMatchObject({ code: "database_schema_incompatible", migrationVersion: 2 });
+      await expect(preflightSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+      await expect(initializeSchema(fixture.operator)).rejects.toMatchObject({ code: "database_schema_reset_required" });
+      expect((await fixture.operator.query("SELECT * FROM app_schema")).rows).toEqual([]);
     } finally {
-      await fixture.operator.query("UPDATE schema_migrations SET version=1,checksum=$1 WHERE version=2", [migrationChecksum(migrations[0].sql)]);
+      await fixture.operator.query("INSERT INTO app_schema(singleton,fingerprint,initialized_at) VALUES (true,$1,$2)",
+        [before.fingerprint, before.initialized_at]);
     }
-  });
-
-  it("accepts the current schema and leaves the complete history unchanged", async () => {
-    await migrate(fixture.operator);
-    const before = (await fixture.operator.query("SELECT * FROM schema_migrations ORDER BY version")).rows;
-    expect(await preflightMigrations(fixture.operator)).toEqual({
-      state: "compatible", currentVersion: migrations.at(-1)!.version, targetVersion: migrations.at(-1)!.version,
-    });
-    expect((await fixture.operator.query("SELECT * FROM schema_migrations ORDER BY version")).rows).toEqual(before);
   });
 });
 

@@ -11,6 +11,17 @@ afterEach(() => {
 });
 
 describe("error telemetry", () => {
+  it("preserves bounded admission Retry-After without changing other error contracts", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = new AppError(503, "data_queue_full", "data_queue_full");
+    error.retryAfterSeconds = 5;
+    const response = { locals: {}, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    errorHandler(error, { route: { path: "/fixture" } } as Request, response as unknown as Response, vi.fn());
+    expect(response.setHeader).toHaveBeenCalledWith("Retry-After", "5");
+    expect(response.status).toHaveBeenCalledWith(503);
+  });
   it("classifies timeouts and cancellation without serializing exception text or details", () => {
     expect(errorTelemetry(new DOMException("private-token", "TimeoutError"), "provider_error"))
       .toEqual({ errorCode: "provider_error", errorKind: "timeout" });

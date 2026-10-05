@@ -1,10 +1,15 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { mockLayoutApi } from "./layoutFixtures";
 import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
-import { copilotUsageFixture, licensedUser } from "../src/test/copilotUsageFixture";
-import { usageFixtureSetId, usageUsersFixture } from "../src/test/usageInsightsFixture";
-import { activeWithoutPaidPublished, activeWithoutPaidUsersFixture, reportLicenseDirectory } from "./userCohortFixtures";
+import type { ReportRelationship } from "../../backend/src/types/officialReportData";
+import { reportExportColumns } from "../../backend/src/types/officialReportData";
+import { reportUser } from "../src/test/reportDataFixture";
+import { selectedFixtureReports, selectedLicensedUser, selectedPlansPage, selectedReportUsersPage, selectedUsersPage } from "../src/test/selectedUsageFixture";
+import { selectedCohortData, selectedCohortRead, type SelectedCohortData } from "./selectedCohortFixture";
+import { mockSelectedPaidUsers } from "./selectedPaidFixture";
+
+const usageFixtureSetId = selectedFixtureReports.setId!;
 
 async function paidFilters(page: Page) {
   const filters = page.getByRole("dialog", { name: "Filter users", exact: true });
@@ -24,53 +29,50 @@ async function expectPaidSort(page: Page, value: string) {
   await filters.getByRole("button", { name: "Close filters" }).click();
 }
 
-async function mockReportedUsers(page: Page, published = activeWithoutPaidPublished, directory = reportLicenseDirectory(published)) {
-  const measurements: Array<{ offset: number; users: number; relationships: number; bytes: number; projectionMs: number }> = [];
-  await page.route(url => url.pathname === "/api/official-usage/users", route => {
+async function mockReportedUsers(page: Page, source: SelectedCohortData = selectedCohortData()) {
+  const measurements: Array<{ path: string; cursor: string | null; users: number; relationships: number; bytes: number; projectionMs: number }> = [];
+  const captures = new Map<string, URLSearchParams>();
+  await page.route(url => url.pathname === "/api/official-usage/users" || url.pathname.startsWith("/api/official-usage/users/"), route => {
     expect(route.request().method()).toBe("GET");
-    const params = new URL(route.request().url()).searchParams;
-    expect(params.get("licenseCohort")).toBe("active_without_paid");
-    if (params.has("setId") && params.get("setId") !== published.activeSet?.id) {
+    const url = new URL(route.request().url()), params = url.searchParams, root = url.pathname === "/api/official-usage/users";
+    if (root) expect(params.get("licenseCohort")).toBe("active_without_paid");
+    if (params.has("setId") && params.get("setId") !== source.directory.reports.setId) {
       return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
     }
-    const sort = params.get("sortBy");
-    const cohort = params.get("cohort");
-    const activity = params.get("activity");
+    const requested = params.get("selectionId");
+    if (requested && !captures.has(requested)) return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "Unknown synthetic report selection." } });
+    if (!root && !requested) throw new Error("An exact report child requires a captured selection");
+    const id = requested ?? `80000000-0000-4000-8000-${String(captures.size + 1).padStart(12, "0")}`;
+    if (!requested) {
+      if (captures.size >= 128) throw new Error("Synthetic capture limit exceeded");
+      captures.set(id, new URLSearchParams(params));
+    }
     const started = performance.now();
-    const view = activeWithoutPaidUsersFixture({
-      staleAfterDays: 35,
-      search: params.get("search") ?? undefined, agentId: params.get("agentId") ?? undefined,
-      company: params.get("company") ?? undefined, department: params.get("department") ?? undefined,
-      creatorType: params.get("creatorType") ?? undefined, responsesOnly: params.get("responsesOnly") === "true",
-      startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
-      lowResponseThreshold: Number(params.get("lowResponseThreshold") ?? 5),
-      cohort: cohort === "zero" || cohort === "low" || cohort === "review" ? cohort : "all",
-      activity: activity === "recent" || activity === "inactive" || activity === "no-activity" ? activity : "all",
-      userSortBy: sort === "responses" || sort === "agentsUsed" || sort === "lastActivity" || sort === "displayName" ? sort : "responses",
-      sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
-      limit: Number(params.get("limit") ?? 50), offset: Number(params.get("offset") ?? 0),
-    }, published, directory);
+    const view = selectedCohortRead(url.href, { ...source, directory: {
+      ...source.directory, selection: { ...source.directory.selection, id },
+    } });
+    if (!view) return route.fulfill({ status: 404, json: { code: "synthetic_exact_not_found", detail: "No selected reported user." } });
     const body = JSON.stringify(view);
     measurements.push({
-      offset: view.users.offset, users: view.users.value.length,
-      relationships: view.users.value.reduce((count, user) => count + user.rows.length, 0),
+      path: url.pathname, cursor: params.get("cursor"), users: root && Array.isArray(view.value) ? view.value.length : 0,
+      relationships: url.pathname.endsWith("/agents") && Array.isArray(view.value) ? view.value.length : 0,
       bytes: Buffer.byteLength(body), projectionMs: performance.now() - started,
     });
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(1024 * 1024);
     return route.fulfill({ contentType: "application/json", body });
   });
-  return measurements;
+  return { measurements, captures, source };
 }
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
 test("expanded data sources and coverage stays concise without disclaimer paragraphs", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
+  const fixture = selectedUsersPage();
   fixture.sources.directory.message = "Checked 4 directory users.";
-  fixture.sources.appActivity.state = "partial";
-  fixture.sources.appActivity.message = "Loaded 4 app activity rows; 1 unmatched identity was not joined.";
-  fixture.notices = ["This dashboard is read-only and never changes license assignments."];
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  fixture.sources.app_activity.state = "partial";
+  fixture.sources.app_activity.message = "Loaded 4 app activity rows; 1 unmatched identity was not joined.";
+  await mockSelectedPaidUsers(page, fixture);
   await page.goto("/users");
   const coverage = page.locator(".copilot-users-provenance");
   const summary = coverage.getByText("Data sources and coverage", { exact: true });
@@ -80,10 +82,9 @@ test("expanded data sources and coverage stays concise without disclaimer paragr
   await expect(coverage).toHaveAttribute("open", "");
   await expect(coverage.getByText("Checked 4 directory users.", { exact: true })).toBeVisible();
   await expect(coverage.getByText("Office app activity: Incomplete", { exact: true })).toBeVisible();
-  await expect(coverage.getByText(fixture.sources.appActivity.message, { exact: true })).toBeVisible();
-  await expect(coverage.getByText(/Directory observed:.*App activity observed:/)).toBeVisible();
-  await expect(coverage.getByText(/^Checked:/)).toHaveCount(3);
-  await expect(coverage.locator(":scope > p")).toHaveCount(1);
+  await expect(coverage.getByText(fixture.sources.app_activity.message, { exact: true })).toBeVisible();
+  await expect(coverage.getByText(/^Checked: Sep 12, 2026/)).toHaveCount(2);
+  await expect(coverage.getByRole("region", { name: "Report provenance" })).toContainText("Imported Sep 12, 2026");
   await expect(coverage).not.toContainText(/read-only|license assignments|Identities are matched|Only verified active paid|reports can lag|coaching signal/);
   expect((await coverage.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(110);
   expect(await coverage.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
@@ -107,6 +108,27 @@ test("all user summary cards filter directly with readable selected, hover and k
   await expect(page.getByRole("button", { name: "Licensed users", exact: true })).toHaveCount(0);
   await expect(all).toHaveAttribute("aria-pressed", "true");
   await expect(cards.locator("strong")).toHaveText(["4", "2", "2", "1"]);
+  if (info.project.name === "desktop") {
+    const positions = await cards.evaluateAll(elements => elements.map(element => element.getBoundingClientRect().top));
+    expect(Math.max(...positions) - Math.min(...positions)).toBeLessThanOrEqual(1);
+    const controls = page.locator(".user-activity-controls .agent-query-bar");
+    const positionsInRow = await controls.locator(":scope > *")
+      .evaluateAll(elements => elements.map(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.top + rect.height / 2;
+      }));
+    expect(positionsInRow).toHaveLength(4);
+    expect(Math.max(...positionsInRow) - Math.min(...positionsInRow)).toBeLessThanOrEqual(1);
+  }
+  const name = table.getByRole("button", { name: "Ada", exact: true });
+  await expect(name).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(name).toHaveCSS("text-decoration-line", "underline");
+  const email = name.locator("..").locator("small").first();
+  await expect(email).toHaveCSS("display", "block");
+  await expect(email).toHaveCSS("margin-top", "4px");
+  await expect(name.locator("..")).toHaveCSS("text-transform", "none");
+  const nameBounds = await name.boundingBox(), emailBounds = await email.boundingBox();
+  expect(emailBounds!.y).toBeGreaterThanOrEqual(nameBounds!.y + nameBounds!.height + 3);
   for (const card of await cards.all()) {
     const contentInsets = await card.evaluate(element => {
       const style = getComputedStyle(element);
@@ -152,17 +174,15 @@ test("all user summary cards filter directly with readable selected, hover and k
 
 test("no reported activity includes identifiable absence and follows the selected reports", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
-  fixture.unresolvedImportedIdentities = [];
-  fixture.counts.unresolvedImportedIdentities = 0;
-  const bridge = licensedUser(5, "Bridge", 100);
-  bridge.importedUsage!.missingUserReport = true;
-  const conflict = licensedUser(6, "Conflict", 100);
-  conflict.importedUsage!.reportedResponsesReceived = 0;
-  conflict.importedUsage!.reviewCohort = "zero_responses";
-  fixture.users.push(bridge, conflict);
-  fixture.counts.licensedUsers = 6;
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  const fixture = selectedUsersPage();
+  fixture.summary.unresolvedIdentities = 0;
+  fixture.value[3] = { ...fixture.value[3], agentActivityState: "none", bridgeResponses: 0 };
+  const bridge = selectedLicensedUser(5, "Bridge", 100);
+  bridge.reportedResponses = null; bridge.reportedAgentsUsed = null;
+  const conflict = selectedLicensedUser(6, "Conflict", 100);
+  conflict.reportedResponses = 0;
+  fixture.value.push(bridge, conflict);
+  await mockSelectedPaidUsers(page, fixture);
   await page.goto("/users");
   const summary = page.getByRole("group", { name: "M365 Copilot license summary", exact: true });
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
@@ -183,43 +203,39 @@ test("no reported activity includes identifiable absence and follows the selecte
   const detail = page.getByRole("dialog", { name: "Drew", exact: true });
   await expect(detail.getByText("No reported agent activity", { exact: true })).toBeVisible();
   await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
-  await expect(detail.getByText("No agent activity in the selected reports.", { exact: true })).toBeVisible();
+  await expect(detail.getByText("No agent relationships match.", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
-  fixture.users[3] = licensedUser(4, "Drew", 20);
-  for (const user of fixture.users) {
-    if (user.importedUsage) user.importedUsage.datasetScope.reportSetId = "new-selection";
-  }
+  fixture.value[3] = selectedLicensedUser(4, "Drew", 20);
+  fixture.reports = { ...fixture.reports, setId: "70000000-0000-4000-8000-000000000007",
+    activeSetId: "70000000-0000-4000-8000-000000000007", activeRevision: "5" };
   await page.reload();
   await expect(noActivity.locator("strong")).toHaveText("1");
   await noActivity.click();
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.getByRole("row", { name: /Cleo/ })).toBeVisible();
-  fixture.sources.importedAgentUsage.state = "stale";
+  fixture.reports.availability = "stale";
+  fixture.value = fixture.value.map(user => ({ ...user, agentActivityState: "unknown" }));
   await page.reload();
   await expect(noActivity.locator("strong")).toHaveText("Unknown");
   await noActivity.click();
-  await expect(table).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Agent usage unavailable", exact: true })).toBeVisible();
+  await expect(table.locator("tbody tr")).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: "Reports are out of date." })).toBeVisible();
   expect(unexpected).toEqual([]);
 });
 
 test("paid users remain searchable beyond four thousand without exposing checked nonpaid candidates", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
-  fixture.users = Array.from({ length: 4_053 }, (_, index) => {
-    return licensedUser(index + 1, `Person${String(index).padStart(4, "0")}`, index < 10 ? 100 - index : index === 10 ? 0 : null);
+  const fixture = selectedUsersPage();
+  fixture.value = Array.from({ length: 4_053 }, (_, index) => {
+    return selectedLicensedUser(index + 1, `Person${String(index).padStart(4, "0")}`, index < 10 ? 100 - index : index === 10 ? 0 : null);
   });
-  const excluded = licensedUser(5_000, "Disabled candidate", 300);
-  excluded.copilotServiceState = excluded.servicePlans[0].state = "disabled";
-  const unknown = licensedUser(5_001, "Unverified candidate", 400);
-  unknown.copilotServiceState = unknown.servicePlans[0].state = "unknown";
-  fixture.users.push(excluded, unknown);
-  fixture.counts.licensedUsers = 4_053;
-  let snapshots = 0;
-  await page.route("**/api/copilot-usage/users", route => {
-    snapshots += 1;
-    return route.fulfill({ json: fixture });
-  });
+  const excluded = selectedLicensedUser(5_000, "Disabled candidate", 300);
+  excluded.copilotServiceState = "disabled"; excluded.entitlement = "paid_inactive";
+  const unknown = selectedLicensedUser(5_001, "Unverified candidate", 400);
+  unknown.copilotServiceState = "unknown"; unknown.entitlement = "unknown";
+  fixture.value.push(excluded, unknown);
+  const evidence = await mockSelectedPaidUsers(page, fixture);
+  const snapshots = () => evidence.reads.filter(read => read.path === "/api/copilot-usage/users").length;
   await page.goto("/users");
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
@@ -232,23 +248,24 @@ test("paid users remain searchable beyond four thousand without exposing checked
   await expect(page.getByRole("button", { name: "All checked users", exact: true })).toHaveCount(0);
   await expect(page.getByText("Unlinked report identities", { exact: true })).toHaveCount(0);
   await expect(table.getByRole("row", { name: /Disabled candidate|Unverified candidate/ })).toHaveCount(0);
-  const initialSnapshots = snapshots;
+  const initialSnapshots = snapshots();
   expect(initialSnapshots).toBeGreaterThan(0);
-  await page.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(page.getByLabel("Copilot user pages")).toContainText("51-100 of 4,053");
-  const responsesHeading = table.getByRole("button", { name: "Sort by Agent responses", exact: true });
+  await page.getByRole("button", { name: "Next users", exact: true }).click();
+  await expect(page.getByLabel("users pages")).toContainText("4,053 matching users; 50 on this page");
+  expect(evidence.reads.at(-1)?.query.has("cursor")).toBe(true);
+  const responsesHeading = table.getByRole("button", { name: "Agent responses", exact: true });
   await responsesHeading.click();
-  await expect(page.getByLabel("Copilot user pages")).toContainText("1-50 of 4,053");
+  await expect(page.getByRole("button", { name: "Previous users" })).toBeDisabled();
   await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "ascending");
   await expect(table.locator("tbody tr").first()).toContainText("Person0010");
   await expect(table.locator("tbody tr").nth(11)).toContainText("Unknown");
   await expect(responsesHeading).toBeFocused();
-  await expectPaidSort(page, "responses-asc");
+  await expectPaidSort(page, "responses:asc");
   await responsesHeading.focus();
   await responsesHeading.press("Enter");
   await expect(table.locator("tbody tr").first()).toContainText("Person0000");
   await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "descending");
-  await expectPaidSort(page, "responses-desc");
+  await expectPaidSort(page, "responses:desc");
   await page.getByRole("searchbox", { name: "Search users or agents" }).fill("person4052");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.locator("tbody tr")).toContainText("Person4052");
@@ -258,7 +275,8 @@ test("paid users remain searchable beyond four thousand without exposing checked
   await expect(detail.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(active.locator("strong")).toHaveText("4,053");
-  expect(snapshots).toBe(initialSnapshots);
+  expect(snapshots()).toBeGreaterThan(initialSnapshots);
+  expect(evidence.reads.every(read => read.rows <= 50 && read.bytes <= 1024 * 1024)).toBe(true);
   expect(unexpected).toEqual([]);
 });
 
@@ -268,11 +286,14 @@ test("effectively licensed users lead with useful data and support ranked employ
   await expect(page.getByRole("button", { name: "Drew", exact: true })).toBeVisible();
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(4);
-  await expect(table.getByRole("columnheader")).toHaveText(["User", "Agent responses", "Agents used", "Company", "Department", "Last activity"]);
+  await expect(table.getByRole("columnheader")).toHaveCount(6);
+  for (const [index, name] of ["User", "Agent responses", "Agents used", "Company", "Department", "Last activity"].entries()) {
+    await expect(table.getByRole("columnheader").nth(index)).toHaveAccessibleName(name);
+  }
   await expect(table.getByRole("rowheader")).toHaveCount(4);
   for (const header of await table.getByRole("rowheader").all()) await expect(header).toHaveAttribute("scope", "row");
   await expect(table).not.toContainText(/M365 Copilot licensed|Paid features:|Users report only|Follow-up/);
-  await expect(page.getByRole("button", { name: /Export.*CSV/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Export users CSV", exact: true })).toBeEnabled();
   await expect(table.getByRole("row", { name: /Cleo/ })).toContainText("0");
   await expect(table.getByRole("row", { name: /Drew/ })).toContainText("Unknown");
   await expect(page.getByText("Unlinked report identities", { exact: true })).toHaveCount(0);
@@ -285,11 +306,11 @@ test("effectively licensed users lead with useful data and support ranked employ
     const bounds = await table.boundingBox();
     expect(bounds!.y, "Useful employee rows should start within the first desktop viewport").toBeLessThan(700);
   }
-  await sortPaidUsers(page, "responses-asc");
+  await sortPaidUsers(page, "responses:asc");
   await expect(table.locator("tbody tr")).toHaveCount(4);
   await expect(table.locator("tbody tr").first()).toContainText("Cleo");
   await expect(table.locator("tbody tr").last()).toContainText("Drew");
-  await sortPaidUsers(page, "responses-desc");
+  await sortPaidUsers(page, "responses:desc");
   await expect(table.locator("tbody tr").first()).toContainText("Ada");
   const results = await new AxeBuilder({ page }).include(".copilot-users").analyze();
   expect(results.violations).toEqual([]);
@@ -313,28 +334,24 @@ test("effectively licensed users lead with useful data and support ranked employ
   expect(unexpected).toEqual([]);
 });
 
-test("paid user filters stay concise, accessible and client-paged with exact organization matching", async ({ page }, info) => {
+test("paid user filters stay concise, accessible and server-paged with exact organization matching", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
-  fixture.users = Array.from({ length: 103 }, (_, index) => {
-    const user = licensedUser(index + 1, `Person${String(index).padStart(3, "0")}`, 200 - index);
+  const fixture = selectedUsersPage();
+  fixture.value = Array.from({ length: 103 }, (_, index) => {
+    const user = selectedLicensedUser(index + 1, `Person${String(index).padStart(3, "0")}`, 200 - index);
     user.directory.companyName = index < 52 ? index % 2 ? "Contoso" : " Contoso " : "Fabrikam";
     user.directory.department = index < 52 ? " Engineering " : "Sales";
     return user;
   });
-  const missing = licensedUser(104, "Missing", null);
+  const missing = selectedLicensedUser(104, "Missing", null);
   missing.directory.companyName = missing.directory.department = null;
-  const excluded = licensedUser(105, "Excluded", 999);
-  excluded.copilotServiceState = excluded.servicePlans[0].state = "disabled";
+  const excluded = selectedLicensedUser(105, "Excluded", 999);
+  excluded.copilotServiceState = "disabled"; excluded.entitlement = "paid_inactive";
   excluded.directory.companyName = "Excluded company";
   excluded.directory.department = "Excluded department";
-  fixture.users.push(missing, excluded);
-  fixture.counts.licensedUsers = 104;
-  let snapshots = 0;
-  await page.route("**/api/copilot-usage/users", route => {
-    snapshots += 1;
-    return route.fulfill({ json: fixture });
-  });
+  fixture.value.push(missing, excluded);
+  const evidence = await mockSelectedPaidUsers(page, fixture);
+  const snapshots = () => evidence.reads.filter(read => read.path === "/api/copilot-usage/users").length;
   await page.goto("/users");
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   const toolbar = page.getByRole("region", { name: "User filters", exact: true });
@@ -343,15 +360,15 @@ test("paid user filters stay concise, accessible and client-paged with exact org
   const search = toolbar.getByRole("searchbox", { name: "Search users or agents", exact: true });
   const summary = page.getByRole("group", { name: "M365 Copilot license summary", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(50);
-  const initialSnapshots = snapshots;
+  const initialSnapshots = snapshots();
   await expect(matching).toContainText("104 matching users");
   await expect(summary.getByRole("button", { name: "Active M365 Copilot licensed users", exact: true }))
     .toHaveAccessibleDescription("104. Licensed users with active paid features");
-  await expect(page.getByRole("button", { name: /Export.*CSV/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Export users CSV", exact: true })).toBeEnabled();
   await expect(trigger).toHaveAccessibleName("Filters");
   expect(await toolbar.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
-  const tableBefore = await table.boundingBox();
   await trigger.focus();
+  const tableBefore = await table.boundingBox();
   await trigger.press("Enter");
   const filters = page.getByRole("dialog", { name: "Filter users", exact: true });
   const company = filters.getByRole("combobox", { name: "Company", exact: true });
@@ -367,20 +384,20 @@ test("paid user filters stay concise, accessible and client-paged with exact org
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
   expect(bounds!.y).toBeGreaterThanOrEqual(0);
   expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height);
-  await expect(company.locator("option")).toHaveText(["All companies", "Contoso", "Fabrikam"]);
-  await expect(department.locator("option")).toHaveText(["All departments", "Engineering", "Sales"]);
+  await expect(company.locator("option")).toHaveText(["All companies", "Contoso", "Fabrikam", "Not reported"]);
+  await expect(department.locator("option")).toHaveText(["All departments", "Engineering", "Sales", "Not reported"]);
   await expect(activity.locator("option")).toHaveText(["All paid users", "Using agents", "Needs attention", "No reported agent activity"]);
   await expect(threshold).toHaveValue("5");
   await expect(threshold).toHaveAttribute("min", "1");
   await expect(threshold).toHaveAttribute("max", "100000000");
-  await expect(sort.locator("option")).toHaveCount(8);
+  await expect(sort.locator("option")).toHaveCount(14);
   await expect(sort.getByRole("option", { name: /license|follow-up/i })).toHaveCount(0);
   await expect(filters.getByRole("combobox", { name: "Agent responses", exact: true })).toHaveCount(0);
-  await company.selectOption("Contoso");
-  await department.selectOption("Engineering");
+  await company.selectOption("~string:Contoso");
+  await department.selectOption("~string:Engineering");
   await threshold.fill("200");
-  await activity.selectOption("attention");
-  await sort.selectOption("name-desc");
+  await activity.selectOption("needs_attention");
+  await sort.selectOption("name:desc");
   await expect(company).toHaveCSS("box-shadow", "none");
   await expect(summary.getByRole("button", { name: "Needs attention", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(matching).toContainText("52 matching users");
@@ -401,39 +418,43 @@ test("paid user filters stay concise, accessible and client-paged with exact org
   await expect(page.getByLabel("Active filters").getByRole("button")).toHaveCount(4);
   await expect(trigger).toHaveAccessibleName("Filters, 4 active");
   await page.screenshot({ path: info.outputPath("paid-user-organization-filters.png") });
-  await page.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(page.getByLabel("Copilot user pages")).toContainText("51-52 of 52");
+  await page.getByRole("button", { name: "Next users", exact: true }).click();
+  await expect(page.getByLabel("users pages")).toContainText("52 matching users; 2 on this page");
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await search.fill("Person050");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.getByRole("rowheader")).toContainText("Person050");
   await expect(matching).toContainText("1 matching user");
   await paidFilters(page);
-  await expect(company.locator("option")).toHaveText(["All companies", "Contoso", "Fabrikam"]);
-  await expect(department.locator("option")).toHaveText(["All departments", "Engineering", "Sales"]);
-  await department.selectOption("Sales");
-  await expect(page.getByRole("heading", { name: "No users match", exact: true })).toBeVisible();
+  await expect(company.locator("option")).toHaveText(["All companies", "Contoso"]);
+  await expect(department.locator("option")).toHaveText(["All departments", "Engineering"]);
+  await filters.getByRole("button", { name: "Close filters" }).click();
+  await search.fill("Person999");
+  await expect(page.getByRole("heading", { name: "No users match" })).toBeVisible();
   await expect(matching).toContainText("0 matching users");
+  await paidFilters(page);
   await filters.getByRole("button", { name: "Reset filters", exact: true }).click();
   await expect(company).toHaveValue("");
   await expect(department).toHaveValue("");
   await expect(activity).toHaveValue("licensed");
   await expect(threshold).toHaveValue("5");
-  await expect(sort).toHaveValue("name-desc");
+  await expect(sort).toHaveValue("name:desc");
   await expect(search).toHaveValue("");
   await expect(matching).toContainText("104 matching users");
-  await expect(page.getByLabel("Copilot user pages")).toContainText("1-50 of 104");
+  await expect(page.getByLabel("users pages")).toContainText("104 matching users; 50 on this page");
+  await expect(page.getByRole("button", { name: "Previous users" })).toBeDisabled();
   await expect(summary.getByRole("button", { name: "Active M365 Copilot licensed users", exact: true })).toHaveAttribute("aria-pressed", "true");
   await filters.getByRole("button", { name: "Close filters" }).click();
   await summary.getByRole("button", { name: "Using agents", exact: true }).click();
-  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.getByRole("button", { name: "Next users", exact: true }).click();
   await paidFilters(page);
-  await expect(activity).toHaveValue("using");
+  await expect(activity).toHaveValue("using_agents");
   await filters.getByRole("button", { name: "Close filters" }).click();
   await page.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await expect(page.getByLabel("Copilot user pages")).toContainText("1-50 of 104");
+  await expect(page.getByLabel("users pages")).toContainText("104 matching users; 50 on this page");
+  await expect(page.getByRole("button", { name: "Previous users" })).toBeDisabled();
   await expect(table.getByRole("rowheader").first()).toContainText("Person102");
-  await expectPaidSort(page, "name-desc");
+  await expectPaidSort(page, "name:desc");
   await search.fill("Missing");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.getByRole("cell")).toHaveText(["Unknown", "Unknown", "Not set", "Not set", "Not reported"]);
@@ -448,23 +469,26 @@ test("paid user filters stay concise, accessible and client-paged with exact org
   expect(await page.locator("body").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   await expect(trigger).toHaveAccessibleName("Filters");
-  expect(snapshots).toBe(initialSnapshots);
+  expect(snapshots()).toBeGreaterThan(initialSnapshots);
+  expect(evidence.reads.every(read => read.rows <= 50 && read.bytes <= 1024 * 1024)).toBe(true);
   expect(unexpected).toEqual([]);
 });
 
 test("disabled bundle candidates stay excluded from paid cohorts and licensed adoption", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
-  fixture.users[1].copilotServiceState = fixture.users[1].servicePlans[0].state = "disabled";
-  fixture.users[2].copilotServiceState = fixture.users[2].servicePlans[0].state = "warning";
-  fixture.users[3].copilotServiceState = "partially_enabled";
-  fixture.users[3].servicePlans.push({
+  const fixture = selectedUsersPage();
+  fixture.value[1].copilotServiceState = "disabled"; fixture.value[1].entitlement = "paid_inactive";
+  fixture.value[2].copilotServiceState = "warning";
+  fixture.value[3].copilotServiceState = "partially_enabled"; fixture.value[3].servicePlanCount = 2;
+  const mixedPlans = [...selectedPlansPage().value, {
     servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS",
-    displayName: "Microsoft 365 Copilot in Microsoft Teams", state: "unknown",
+    displayName: "Microsoft 365 Copilot in Microsoft Teams", state: "unknown" as const,
     assignedDateTime: null, capabilityStatus: null,
-  });
-  fixture.counts.licensedUsers = 3;
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  }];
+  await mockSelectedPaidUsers(page, fixture, new Map([
+    [fixture.value[2].directory.objectId, selectedPlansPage().value.map(plan => ({ ...plan, state: "warning" as const }))],
+    [fixture.value[3].directory.objectId, mixedPlans],
+  ]));
   await page.goto("/users");
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   await expect(page.getByRole("combobox", { name: "User cohort", exact: true })).toHaveValue("licenses");
@@ -499,10 +523,10 @@ test("disabled bundle candidates stay excluded from paid cohorts and licensed ad
 
 test("retained licensing evidence preserves last-known context without claiming current entitlement", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
+  const fixture = selectedUsersPage();
   fixture.sources.directory.state = "partial";
-  fixture.users[1].copilotServiceState = fixture.users[1].servicePlans[0].state = "disabled";
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  fixture.value[1].copilotServiceState = "disabled"; fixture.value[1].entitlement = "paid_inactive";
+  await mockSelectedPaidUsers(page, fixture);
   await page.goto("/users");
   await expect(page.getByRole("region", { name: "Paid license scope and coverage" })).toHaveCount(0);
   await expect(page.getByText("Active M365 Copilot licensed users", { exact: true }).locator("..")).toContainText("Unknown");
@@ -517,19 +541,22 @@ test("retained licensing evidence preserves last-known context without claiming 
   await expect(table.locator("tbody tr")).toHaveCount(3);
   await expect(table.getByRole("row", { name: /Ben/ })).toHaveCount(0);
   await page.getByRole("button", { name: "Needs attention", exact: true }).click();
-  await expect(table).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "No last-saved users in this cohort" })).toBeVisible();
+  await expect(table.locator("tbody tr")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "No users match" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "License data partial." })).toBeVisible();
   expect(unexpected).toEqual([]);
 });
 
 test("paid user details retain their agent breakdown without navigating to the nonpaid cohort", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await mockReportedUsers(page);
-  const directory = structuredClone(copilotUsageFixture);
-  directory.users = directory.users.map(user => ({
-    ...user, importedUsage: usageUsersFixture().users.value.find(row => row.username === user.directory.userPrincipalName) ?? null,
-  }));
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: directory }));
+  const directory = selectedUsersPage();
+  directory.value = directory.value.map(user => {
+    const report = selectedReportUsersPage().value.find(row => row.username === user.directory.userPrincipalName);
+    return report ? { ...user, reportedResponses: report.reportedResponses, reportedAgentsUsed: report.reportedAgentsUsed,
+      relationshipCount: report.relationshipCount, bridgeResponses: report.bridgeResponses } : user;
+  });
+  await mockSelectedPaidUsers(page, directory);
   await page.goto("/users");
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const detail = page.getByRole("dialog", { name: "Ada", exact: true });
@@ -547,12 +574,12 @@ test("paid user details retain their agent breakdown without navigating to the n
 
 test("report permission recovery is visible without hiding service assignments", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const fixture = structuredClone(copilotUsageFixture);
-  fixture.sources.appActivity = {
-    ...fixture.sources.appActivity, state: "unavailable",
+  const fixture = selectedUsersPage();
+  fixture.sources.app_activity = {
+    ...fixture.sources.app_activity, state: "unavailable",
     message: "Check Reports.Read.All admin consent on the existing Entra app and the signed-in user's Reports Reader role.",
   };
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  await mockSelectedPaidUsers(page, fixture);
   await page.goto("/users");
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(4);
@@ -561,52 +588,53 @@ test("report permission recovery is visible without hiding service assignments",
   await expect(notice).toContainText("Permissions");
   await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
   await page.getByText("Data sources and coverage", { exact: true }).click();
-  await expect(page.locator(".copilot-users-provenance").getByText(fixture.sources.appActivity.message, { exact: true })).toBeVisible();
+  await expect(page.locator(".copilot-users-provenance").getByText(fixture.sources.app_activity.message!, { exact: true })).toBeVisible();
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   expect(unexpected).toEqual([]);
 });
 
 test("the active nonpaid cohort excludes paid and unknown identities and explains incomplete coverage", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const responsibilityReads: string[] = [];
-  page.on("request", request => { if (new URL(request.url()).pathname === "/api/agent-responsibility") responsibilityReads.push(request.url()); });
-  await mockReportedUsers(page);
+  const responsibilityReads: URLSearchParams[] = [];
+  page.on("request", request => { const url = new URL(request.url()); if (url.pathname === "/api/agent-responsibility") responsibilityReads.push(url.searchParams); });
+  const { source } = await mockReportedUsers(page);
   await page.goto("/users?view=activity");
-  const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  const table = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(table.getByRole("row", { name: /Emery|Finley/ })).toHaveCount(2);
   await expect(table.getByRole("row", { name: /Ada|Ben|Cleo|Concealed report user/ })).toHaveCount(0);
-  await expect(page.getByText(/1 user needs a license check\. Run Users sync/)).toBeVisible();
+  await expect(page.getByText(/1 active report user needs a license check\. Run Users sync/)).toBeVisible();
   await expect(table.getByText("License not verified", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toHaveCount(0);
-  await table.getByRole("button", { name: "View reported details for Emery" }).click();
+  await table.getByRole("button", { name: "Emery", exact: true }).click();
   const details = page.getByRole("dialog", { name: "Emery" });
   await expect(details.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
   await expect(details.getByText("License not verified", { exact: true })).toHaveCount(0);
   await expect(details.getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toHaveCount(0);
   await details.getByRole("tab", { name: "Responsibility", exact: true }).click();
-  await expect(details.getByText(/Link this user to a directory identity/)).toBeVisible();
-  expect(responsibilityReads).toEqual([]);
+  await expect.poll(() => responsibilityReads.length).toBe(1);
+  expect(responsibilityReads[0].get("objectId")).toBe(source.directory.value.find(row => row.directory.userPrincipalName === "emery@example.invalid")!.directory.objectId);
+  await expect(details.getByText(/Link this user to a directory identity/)).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });
 
 test("unavailable license coverage hides retained candidates and disables CSV until Users sync recovers", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const directory = reportLicenseDirectory();
-  directory.attemptStatus = "failed";
+  const source = selectedCohortData(), directory = source.directory.sources.directory;
+  directory.attemptStatus = "failed"; directory.state = "unavailable";
   directory.message = "Current license status is unavailable. Run Users sync.";
-  await mockReportedUsers(page, activeWithoutPaidPublished, directory);
+  await mockReportedUsers(page, source);
   await page.goto("/users?view=activity");
   await expect(page.getByText(/Run Users sync/).first()).toBeVisible();
   await expect(page.getByText(/license.*unavailable/i).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: /^View reported details for/ })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Reported user activity" }).locator("tbody tr")).toHaveCount(0);
   await expect(page.getByText("Emery", { exact: true })).toHaveCount(0);
-  directory.attemptStatus = "available";
+  directory.attemptStatus = "available"; directory.state = "available";
   directory.message = null;
   await page.reload();
-  const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  const table = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
   expect(unexpected).toEqual([]);
@@ -614,25 +642,23 @@ test("unavailable license coverage hides retained candidates and disables CSV un
 
 test("reloading a newly saved license snapshot transfers users between cohorts without changing report history", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const licenses = reportLicenseDirectory();
-  await mockReportedUsers(page, activeWithoutPaidPublished, licenses);
-  const directory = structuredClone(copilotUsageFixture);
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: directory }));
+  const source = selectedCohortData(), directory = source.directory, reportsBefore = structuredClone(source.directory.reports);
+  await mockReportedUsers(page, source);
+  await mockSelectedPaidUsers(page, directory);
   await page.goto("/users");
   const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
   await expect(page.getByRole("button", { name: "Ada", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Emery", exact: true })).toHaveCount(0);
   await cohort.selectOption("activity");
-  const activity = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  const activity = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(activity.getByRole("row", { name: /Emery/ })).toBeVisible();
   await expect(activity.getByRole("row", { name: /Ada/ })).toHaveCount(0);
 
-  directory.users[0].copilotServiceState = directory.users[0].servicePlans[0].state = "disabled";
-  directory.users.push(licensedUser(20, "Emery", 215));
-  for (const user of licenses.value!) {
-    if (user.identity.userPrincipalName === "ada@example.invalid") user.copilotServiceState = "disabled";
-    if (user.identity.userPrincipalName === "emery@example.invalid") user.copilotServiceState = "enabled";
+  for (const user of directory.value) {
+    if (user.directory.userPrincipalName === "ada@example.invalid") { user.copilotServiceState = "disabled"; user.entitlement = "paid_inactive"; }
+    if (user.directory.userPrincipalName === "emery@example.invalid") { user.copilotServiceState = "enabled"; user.entitlement = "paid_active"; user.servicePlanCount = 1; }
   }
+  directory.sources.directory = { ...directory.sources.directory, generationId: "70000000-0000-4000-8000-000000000007", revision: "3" };
   await page.reload();
   await expect(activity.locator("tbody tr")).toHaveCount(2);
   await expect(activity.getByRole("row", { name: /Ada/ })).toBeVisible();
@@ -640,48 +666,59 @@ test("reloading a newly saved license snapshot transfers users between cohorts w
   await cohort.selectOption("licenses");
   await expect(page.getByRole("button", { name: "Ada", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Emery", exact: true })).toBeVisible();
+  expect(source.directory.reports).toEqual(reportsBefore);
   expect(unexpected).toEqual([]);
 });
 
 test("reported activity stays bounded with 2,053 users and 1,005 agents for one user", async ({ page }, info) => {
   test.setTimeout(60_000);
   const unexpected = await mockLayoutApi(page);
-  const published = structuredClone(activeWithoutPaidPublished);
+  const source = selectedCohortData();
   const largeUserName = `Person0000 ${"Long synthetic display name ".repeat(8).trim()}`;
   const largeAgentName = `Agent1004 ${"LongAgentName".repeat(20)}`;
-  published.reports.users!.rows = Array.from({ length: 2_053 }, (_, index) => ({
+  source.users = Array.from({ length: 2_053 }, (_, index) => reportUser(index + 1, {
     username: `person${index}@example.invalid`, displayName: index === 0 ? largeUserName : `Person${String(index).padStart(4, "0")}`,
-    numberOfAgentsUsed: index === 0 ? 1_005 : 1, agentResponsesReceived: index === 0 ? 50_000 : 1,
+    reportedAgentsUsed: index === 0 ? 1_005 : 1, reportedResponses: index === 0 ? 50_000 : 1, userLastActivityDateUtc: null, lastActivityDateUtc: null,
   }));
-  published.reports.userAgents!.rows = [
-    ...Array.from({ length: 1_005 }, (_, index) => ({
+  source.relationships = [
+    ...Array.from({ length: 1_005 }, (_, index): ReportRelationship => ({
+      id: `large-link-${index}`, identityStatus: "unresolved", lastActivityDateUtc: null,
       username: "person0@example.invalid", agentId: `agent-${index}`, agentName: index === 1_004 ? largeAgentName : `Agent${String(index).padStart(4, "0")}`,
-      creatorType: "Your org", responsesSentToUsers: 2,
+      creatorType: "Your org", responses: 2,
     })),
-    ...published.reports.users!.rows.slice(1).map((user, index) => ({
+    ...source.users.slice(1).map((user, index): ReportRelationship => ({
+      id: `other-link-${index}`, identityStatus: "unresolved", lastActivityDateUtc: null,
       username: user.username, agentId: `specialist-${index + 1}`, agentName: `Specialist${index + 1}`,
-      creatorType: "Microsoft", responsesSentToUsers: 1,
+      creatorType: "Microsoft", responses: 1,
     })),
   ];
-  const measurements = await mockReportedUsers(page, published);
-  const directory = structuredClone(copilotUsageFixture);
-  directory.sources.directory.state = "unavailable";
-  directory.users = [];
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: directory }));
+  source.directory.value = source.users.map((user, index) => {
+    const value = selectedLicensedUser(index + 1, user.displayName, user.reportedResponses);
+    value.directory.userPrincipalName = user.username; value.copilotServiceState = "disabled";
+    value.entitlement = "no_paid"; value.servicePlanCount = 0;
+    return value;
+  });
+  source.directory.sources.directory = { ...source.directory.sources.directory, rowCount: 2053, attemptObservedCount: 2053 };
+  const { measurements } = await mockReportedUsers(page, source);
+  await page.route(url => url.pathname === "/api/copilot-usage/users", route => {
+    unexpected.push("Forbidden whole paid-directory enrichment");
+    return route.fulfill({ status: 500, json: { error: "Use the exact selected report directory child" } });
+  });
   await page.goto("/users?view=activity");
-  const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  const table = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(50);
   await expect(table.getByRole("columnheader")).toHaveCount(6);
-  await expect(page.getByLabel("Reported user pages")).toContainText("1-50 of 2,053");
+  await expect(page.getByLabel("users pages")).toContainText("2,053 matching users; 50 on this page");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(table.getByRole("row", { name: /Person0000/ })).toBeVisible();
   await page.getByRole("button", { name: "Next users", exact: true }).click();
-  await expect(page.getByLabel("Reported user pages")).toContainText("51-100 of 2,053");
+  await expect(page.getByRole("button", { name: "Previous users" })).toBeEnabled();
+  expect(measurements.some(read => read.path === "/api/official-usage/users" && read.cursor === "fixture:50")).toBe(true);
   await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("Specialist2052");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.locator("tbody tr")).toContainText("Person2052");
   await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("");
-  const detailButton = table.getByRole("button", { name: `View reported details for ${largeUserName}`, exact: true });
+  const detailButton = table.getByRole("button", { name: largeUserName, exact: true });
   await detailButton.focus();
   await page.keyboard.press("Enter");
   const dialog = page.getByRole("dialog", { name: largeUserName, exact: true });
@@ -689,16 +726,16 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
   const agents = dialog.getByRole("region", { name: "User agent breakdown" });
   await expect(agents.locator("tbody tr")).toHaveCount(50);
   const readsBeforeAgentPaging = measurements.length;
-  await expect(dialog.getByLabel("User agent pages")).toContainText("1-50 of 1,005");
+  await expect(dialog.getByLabel("agents pages")).toContainText("1,005 matching agents; 50 on this page");
   await dialog.getByRole("button", { name: "Next agents" }).click();
-  await expect(dialog.getByLabel("User agent pages")).toContainText("51-100 of 1,005");
+  await expect(dialog.getByRole("button", { name: "Previous agents" })).toBeEnabled();
   await dialog.getByRole("searchbox", { name: "Search this user's agents" }).fill("agent-1004");
   await expect(agents.locator("tbody tr")).toHaveCount(1);
   await expect(agents.getByRole("button", { name: `${largeAgentName}: active users without paid Copilot`, exact: true })).toBeVisible();
-  expect(measurements).toHaveLength(readsBeforeAgentPaging);
+  expect(measurements.length).toBeGreaterThanOrEqual(readsBeforeAgentPaging + 2);
   expect(measurements.every(read => read.users <= 50)).toBe(true);
-  expect(measurements.some(read => read.offset === 50)).toBe(true);
-  expect(measurements.some(read => read.relationships >= 1_005)).toBe(true);
+  expect(measurements.some(read => read.cursor === "fixture:50")).toBe(true);
+  expect(measurements.every(read => read.relationships <= 50 && read.bytes <= 1024 * 1024)).toBe(true);
   await info.attach("reported-users-scale.json", { body: JSON.stringify(measurements, null, 2), contentType: "application/json" });
   await agents.getByRole("button", { name: `${largeAgentName}: active users without paid Copilot`, exact: true }).hover();
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
@@ -714,42 +751,61 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
 
 test("legacy matrix links open activity and filtered CSV exports pin the displayed report", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const directory = reportLicenseDirectory();
-  for (const user of directory.value!) {
-    user.identity.companyName = user.identity.userPrincipalName === "emery@example.invalid" ? "Contoso" : "Fabrikam";
-    user.identity.department = user.identity.userPrincipalName === "emery@example.invalid" ? "Engineering" : "Sales";
+  await page.addInitScript(() => { URL.createObjectURL = () => { throw new Error("Report downloads must not create client-side blobs"); }; });
+  const source = selectedCohortData();
+  for (const user of source.directory.value) {
+    user.directory.companyName = user.directory.userPrincipalName === "emery@example.invalid" ? "Contoso" : "Fabrikam";
+    user.directory.department = user.directory.userPrincipalName === "emery@example.invalid" ? "Engineering" : "Sales";
   }
-  await mockReportedUsers(page, activeWithoutPaidPublished, directory);
+  const { captures } = await mockReportedUsers(page, source);
   let exported: URLSearchParams | undefined;
-  await page.route("**/api/official-usage/users.csv?*", route => {
-    exported = new URL(route.request().url()).searchParams;
-    expect(route.request().method()).toBe("GET");
-    expect(exported.get("setId")).toBe(usageFixtureSetId);
-    expect(exported.get("licenseCohort")).toBe("active_without_paid");
-    const users = activeWithoutPaidUsersFixture({
-      staleAfterDays: 35,
-      search: exported.get("search") ?? undefined, agentId: exported.get("agentId") ?? undefined,
-      company: exported.get("company") ?? undefined, department: exported.get("department") ?? undefined,
-      userSortBy: exported.get("sortBy") === "agentsUsed" ? "agentsUsed" : "responses",
-      sortDirection: exported.get("sortDirection") === "asc" ? "asc" : "desc",
-      lowResponseThreshold: Number(exported.get("lowResponseThreshold") ?? 5),
-      cohort: exported.get("cohort") === "low" ? "low" : "all", limit: 100_000, offset: 0,
-    }, activeWithoutPaidPublished, directory).users.value;
-    const rows = users.flatMap(user => (user.rows.length ? user.rows : [undefined]).map(row => ({
-      username: user.username, displayName: user.displayName, reportedResponsesReceived: user.reportedResponsesReceived,
-      licenseAssignmentStatus: user.licenseAssignmentStatus,
-      agentId: row?.agentId, responsesSentToUsers: row?.responsesSentToUsers, reportSetId: user.datasetScope.reportSetId,
-    })));
-    return route.fulfill({ contentType: "text/csv", body: usageCsvFixture(
-      ["username", "displayName", "reportedResponsesReceived", "licenseAssignmentStatus", "agentId", "responsesSentToUsers", "reportSetId"], rows,
-    ) });
+  let csv = Buffer.alloc(0), exportRows = 0, nativeDownloads = 0;
+  const metadataBytes: number[] = [], exportId = "60000000-0000-4000-8000-000000000006";
+  const nativeDownload = (route: Route) => {
+    expect(route.request().isNavigationRequest()).toBe(true);
+    nativeDownloads++;
+    return route.fulfill({ contentType: "text/csv; charset=utf-8", headers: { "Content-Disposition": 'attachment; filename="official-users.csv"' }, body: csv });
+  };
+  await page.context().route(url => url.pathname === `/api/data-exports/${exportId}/download`, nativeDownload);
+  await page.route(url => url.pathname === `/api/data-exports/${exportId}/download`, nativeDownload);
+  await page.route(url => url.pathname.startsWith("/api/data-exports") && !url.pathname.endsWith("/download"), route => {
+    const request = route.request(), path = new URL(request.url()).pathname;
+    if (path === "/api/data-exports") {
+      expect(request.method()).toBe("POST");
+      const input: { selectionId: string; kind: string } = request.postDataJSON();
+      expect(input).toEqual({ selectionId: expect.any(String), kind: "official_users", idempotencyKey: expect.any(String) });
+      expect(captures.has(input.selectionId)).toBe(true);
+      exported = new URLSearchParams(captures.get(input.selectionId));
+      const selected = selectedCohortRead(`/api/official-usage/users?${exported}`, source);
+      if (!selected || !("filters" in selected)) throw new Error("Expected a frozen reported-user page");
+      const rows = selected.value.flatMap(user => {
+        if (!("username" in user) || !("reportedResponses" in user)) throw new Error("Expected scalar reported-user facts");
+        const relationships = source.relationships.filter(row => row.username === user.username);
+        return (relationships.length ? relationships : [null]).map(row => ({
+          username: user.username, displayName: user.displayName, reportedResponsesReceived: user.reportedResponses,
+          licenseAssignmentStatus: "no_active_paid_license", entitlement: user.entitlement,
+          agentId: row?.agentId, responsesSentToUsers: row?.responses, reportSetId: source.directory.reports.setId,
+        }));
+      });
+      csv = usageCsvFixture([...reportExportColumns.official_users], rows); exportRows = rows.length;
+      return route.fulfill({ status: 202, json: { id: exportId } });
+    }
+    expect(request.method()).toBe("GET");
+    expect(path).toBe(`/api/data-exports/${exportId}`);
+    const body = JSON.stringify({ id: exportId, status: "ready", rows: exportRows, bytes: Buffer.byteLength(csv),
+      expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(), error: null, limit: null, observed: null });
+    metadataBytes.push(Buffer.byteLength(body));
+    return route.fulfill({ contentType: "application/json", body });
   });
-  await page.goto(`/users?view=matrix&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}&q=Emery`);
-  const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  await page.goto(`/users?view=matrix&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}&q=Emer`);
+  const table = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("combobox", { name: "User cohort", exact: true })).toHaveValue("activity");
   await expect(table.locator("tbody tr")).toContainText("215");
+  await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("Emery");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(page.getByText(/All-agent user totals repeat|Advanced user filters|Membership uses current saved/)).toHaveCount(0);
+  await page.getByRole("button", { name: /^Filters/ }).focus();
   const tableBefore = await table.boundingBox();
   const toolbar = page.getByRole("region", { name: "User filters", exact: true });
   const toolbarBounds = await toolbar.boundingBox();
@@ -766,14 +822,14 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
   expect(panelBounds!.x + panelBounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
   expect(panelBounds!.y + panelBounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height);
   await expect(filters.getByLabel(/Relationship creator|User recency|User activity start|User activity end/)).toHaveCount(0);
-  await filters.getByRole("combobox", { name: "Company", exact: true }).selectOption("Contoso");
+  await filters.getByRole("combobox", { name: "Company", exact: true }).selectOption("~string:Contoso");
   await expect(filters.getByRole("combobox", { name: "Company", exact: true })).toHaveCSS("box-shadow", "none");
-  await filters.getByRole("combobox", { name: "Department", exact: true }).selectOption("Engineering");
+  await filters.getByRole("combobox", { name: "Department", exact: true }).selectOption("~string:Engineering");
   await filters.getByRole("combobox", { name: "Agent responses", exact: true }).selectOption("low");
   await page.getByLabel("Low-response threshold").fill("250");
-  await filters.getByRole("combobox", { name: "Sort", exact: true }).selectOption("agents-asc");
+  await filters.getByRole("combobox", { name: "Sort", exact: true }).selectOption("agentsUsed:asc");
   await expect(table.locator("tbody tr")).toHaveCount(1);
-  expect((await new AxeBuilder({ page }).include(".reported-users").analyze()).violations).toEqual([]);
+  expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   await filters.screenshot({ path: info.outputPath("user-filter-popup.png") });
   await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: /^Filters/ })).toBeFocused();
@@ -783,8 +839,10 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export users CSV" }).click();
+  await page.getByRole("link", { name: "Download CSV", exact: true }).click();
   const file = await download;
-  expect(file.suggestedFilename()).toBe("reported-user-activity.csv");
+  expect(nativeDownloads).toBe(1);
+  expect(file.suggestedFilename()).toBe("official-users.csv");
   const rows = await downloadedCsvRows(file);
   expect(rows).toHaveLength(2);
   expect(rows.every(row => row.licenseAssignmentStatus === "no_active_paid_license")).toBe(true);
@@ -797,15 +855,17 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
   expect(exported?.get("licenseCohort")).toBe("active_without_paid");
   expect(exported?.get("search")).toBe("Emery");
   expect(exported?.get("agentId")).toBe("helpdesk/report:2");
-  expect(exported?.get("company")).toBe("Contoso");
-  expect(exported?.get("department")).toBe("Engineering");
+  expect(exported?.get("company")).toBe("~string:Contoso");
+  expect(exported?.get("department")).toBe("~string:Engineering");
   expect(exported?.get("lowResponseThreshold")).toBe("250");
   expect(exported?.get("cohort")).toBe("low");
   for (const removed of ["creatorType", "activity", "startDate", "endDate", "responsesOnly"]) expect(exported?.has(removed)).toBe(false);
-  expect(exported?.get("sortBy")).toBe("agentsUsed");
-  expect(exported?.get("sortDirection")).toBe("asc");
+  expect(exported?.get("sort")).toBe("agentsUsed");
+  expect(exported?.get("order")).toBe("asc");
   expect(exported?.has("offset")).toBe(false);
-  expect(exported?.has("limit")).toBe(false);
+  expect(nativeDownloads).toBe(1);
+  expect(metadataBytes).toHaveLength(2);
+  expect(metadataBytes.every(bytes => bytes < 1024)).toBe(true);
   expect(unexpected).toEqual([]);
 });
 
@@ -820,8 +880,8 @@ test("an unavailable exact reported snapshot does not fall back to current repor
   const unavailable = "99999999-9999-4999-8999-999999999999";
   await page.goto(`/users?view=activity&snapshot=${unavailable}`);
   await expect(page.getByRole("alert")).toContainText("The exact synthetic report set is unavailable.");
-  const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
-  await expect(table).toHaveCount(0);
+  const table = page.getByRole("region", { name: "Reported user activity", exact: true });
+  await expect(table.locator("tbody tr")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
   expect(requests.length).toBeGreaterThan(0);
   expect(requests.every(query => query.get("setId") === unavailable)).toBe(true);

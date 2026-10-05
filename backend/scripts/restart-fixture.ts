@@ -1,23 +1,30 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import pg from "pg";
 import { databaseSettings, secretValue } from "../src/db/pool.js";
 import { createJobConfirmation, JobRepository, type JobInput, type JobIntentInput } from "../src/db/jobs.js";
 import { PackageMutationQualificationRepository } from "../src/db/packageMutationQualifications.js";
-import { PowerPlatformInventoryRepository } from "../src/db/powerPlatformInventory.js";
-import { PackageInventoryRepository } from "../src/db/packageInventory.js";
-import { OfficialUsageRepository } from "../src/db/officialUsage.js";
+import { PowerPlatformRefreshJobs } from "../src/db/powerPlatformRefreshJobs.js";
+import { PackageRefreshJobs } from "../src/db/packageRefreshJobs.js";
+import { NativeInventory } from "../src/db/nativeInventory.js";
+import { refreshInventoryFixture } from "./inventoryFixtures.js";
+import { powerPlatformInventoryRecord } from "../src/services/inventoryRecordProjection.js";
+import { OfficialReportImports } from "../src/db/officialReportImports.js";
+import { LargeTenantUsersReports } from "../src/services/largeTenantUsersReports.js";
+import { officialReportFingerprint } from "./officialReportFingerprint.js";
+import { reportIdentity } from "../src/services/reportIdentity.js";
+import { OfficialReportExports } from "../src/services/officialReportExports.js";
 import { PurviewAuditRepository, type PurviewAuditScope } from "../src/db/purviewAudit.js";
 import { DefenderHuntingRepository, type DefenderHuntingScope } from "../src/db/defenderHunting.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "../src/db/copilotStudioQuarantine.js";
 import type { FrozenQuarantineTarget, QuarantineAuthority } from "../src/types/copilotStudioQuarantine.js";
 import { runBulkJob } from "../src/services/bulkJobs.js";
 import { GraphPackagesClient } from "../src/services/graphPackages.js";
-import { parseOfficialUsageReport } from "../src/services/officialUsageParser.js";
-import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../src/services/officialUsageViews.js";
 import { testDatabase } from "./testDatabase.js";
 import { fingerprints } from "./backup.js";
+import { DataGenerations } from "../src/db/dataGenerations.js";
+import { generationInput } from "./largeTenantFixtures.js";
 
 const receiptFile=process.argv[3];
 const scope={tenantId:"11111111-1111-4111-8111-111111111111",principalId:"phase01-fixture-principal"};
@@ -35,9 +42,12 @@ if (process.argv[2] === "seed") {
   const fixture=await testDatabase();
   const repository=new JobRepository(fixture.runtime);
   const qualifications=new PackageMutationQualificationRepository(fixture.runtime);
-  const inventory=new PowerPlatformInventoryRepository(fixture.runtime);
-  const packages=new PackageInventoryRepository(fixture.runtime);
-  const officialUsage=new OfficialUsageRepository(fixture.runtime);
+  const inventory=new PowerPlatformRefreshJobs(fixture.runtime);
+  const packages=new PackageRefreshJobs(fixture.runtime);
+  const officialUsage=new OfficialReportImports(fixture.runtime);
+  const reportReader=new LargeTenantUsersReports(fixture.runtime,"synthetic-restart-report-cursor-secret",35);
+  const reportUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Admin" as const]};
+  const reportScope=await reportIdentity(fixture.runtime,reportUser);
   const purviewAudit=new PurviewAuditRepository(fixture.runtime);
   const defenderHunting=new DefenderHuntingRepository(fixture.runtime);
   const quarantine=new CopilotStudioQuarantineRepository(fixture.runtime);
@@ -47,17 +57,17 @@ if (process.argv[2] === "seed") {
     const unsent=await repository.submit(scope,input(["only-unsent"]));
     const inventoryCompleted=await inventory.submit(scope,{idempotencyKey:"restart-completed",roleScope:"full",requestedTypes:["microsoft.powerplatform/environments"]});
     assert.equal(await inventory.markRunning(scope,inventoryCompleted.id),true);
-    await inventory.publish(scope,inventoryCompleted.id,{resources:[],queriedTypes:["microsoft.powerplatform/environments"],environmentScope:null,totalRecords:0,pages:1,unknownFieldCount:0});
+    await refreshInventoryFixture(fixture.runtime,scope,inventoryCompleted.id,"power_platform",[],["microsoft.powerplatform/environments"]);
     const quarantineInventory=await inventory.submit(scope,{idempotencyKey:"restart-quarantine-inventory",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
     assert.equal(await inventory.markRunning(scope,quarantineInventory.id),true);
-    await inventory.publish(scope,quarantineInventory.id,{resources:quarantineTargetIds.map(target=>({tenantId:scope.tenantId,nativeId:target.nativeId,
+    await refreshInventoryFixture(fixture.runtime,scope,quarantineInventory.id,"power_platform",quarantineTargetIds.map(target=>powerPlatformInventoryRecord({tenantId:scope.tenantId,nativeId:target.nativeId,
       type:"microsoft.copilotstudio/agents" as const,location:null,displayName:target.nativeId,environmentId:scope.tenantId,createdAt:null,createdBy:null,
       lastPublishedAt:null,sourceSystem:"power_platform" as const,authoringTool:"Copilot Studio",creatorType:"unknown" as const,agentKind:"copilot_studio_agent",
       lifecycle:"published" as const,identityConfidence:"exact_native" as const,identifiers:[{kind:"power_platform_resource_id" as const,value:target.nativeId},
         {kind:"environment_id" as const,value:scope.tenantId},{kind:"cds_bot_id" as const,value:target.botId}],provenance:{},
-      details:{isQuarantined:false},unknownFieldCount:0})),queriedTypes:["microsoft.copilotstudio/agents"],environmentScope:null,totalRecords:quarantineTargetIds.length,pages:1,unknownFieldCount:0});
+      details:{isQuarantined:false},unknownFieldCount:0})),["microsoft.copilotstudio/agents"]);
     const quarantineSnapshotId=(await inventory.getJob(scope,quarantineInventory.id))!.snapshotId!;
-    const resolvedQuarantineTargets=await inventory.resolveQuarantineTargets(scope,quarantineSnapshotId,quarantineTargetIds.map(target=>target.nativeId));
+    const resolvedQuarantineTargets=await new NativeInventory(fixture.runtime).resolveQuarantineTargets(scope,quarantineSnapshotId,quarantineTargetIds.map(target=>target.nativeId));
     const frozenQuarantineTargets=resolvedQuarantineTargets.map((target):FrozenQuarantineTarget=>({...target,directStatus:{environmentId:target.environmentId,
       botId:target.botId,isBotQuarantined:false,lastUpdateTimeUtc:"2026-09-09T10:00:00.123Z",observedAt:new Date().toISOString(),correlationId:randomUUID()}}));
     for (const target of quarantineTargetIds) await fixture.operator.query(`INSERT INTO copilot_quarantine_qualifications
@@ -79,7 +89,7 @@ if (process.argv[2] === "seed") {
     assert.equal(await packages.markRunning(scope,packageInterrupted.id),true);
     const packageCompleted=await packages.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:"package-restart-completed"});
     assert.equal(await packages.markRunning(scope,packageCompleted.id),true);
-    await packages.publish(scope,packageCompleted.id,{packages:[],totalRecords:0,pages:1});
+    await refreshInventoryFixture(fixture.runtime,scope,packageCompleted.id,"packages",[]);
     const purviewScope:PurviewAuditScope={tenantId:scope.tenantId,authorizationPrincipalId:scope.principalId,resultScope:{kind:"principal",scopeId:scope.principalId,configurationRevision:null},tokenMode:"delegated"};
     const purviewFilters={presetId:"copilot_interactions" as const,operations:["CopilotInteraction"],startDateTime:"2026-09-09T09:00:00.000Z",endDateTime:"2026-09-09T09:30:00.000Z",userPrincipalNames:[],ipAddresses:[],objectIds:[],administrativeUnitIds:[]};
     const purviewInterruptedCreate=await purviewAudit.submit(purviewScope,{idempotencyKey:"purview-restart-create",filters:purviewFilters});
@@ -125,18 +135,22 @@ if (process.argv[2] === "seed") {
     ];
     for (const csv of usageReports) {
       const bytes=Buffer.from(csv,"utf8");
-      await officialUsage.stage(scope,{report:parseOfficialUsageReport(bytes,usageMetadata),fileHash:createHash("sha256").update(bytes).digest("hex"),bundleId:usageBundleId});
+      await officialUsage.stage(reportScope,{bundleId:usageBundleId},(async function*(){yield bytes;})(),usageMetadata);
       bytes.fill(0);
     }
-    const usagePreview=await officialUsage.previewBundle(scope,usageBundleId);
-    assert.deepEqual(usagePreview.missingKinds,[]);
-    assert.equal((await officialUsage.acceptBundle(scope,usageBundleId,{bundleHash:usagePreview.bundleHash,expectedActiveRevision:usagePreview.expectedActiveRevision})).complete,true);
+    const usagePreview=await officialUsage.bundle(reportScope,usageBundleId);
+    assert.equal(usagePreview.complete,true);
+    assert.equal((await officialUsage.acceptBundle(reportScope,usageBundleId,{bundleHash:usagePreview.bundleHash,expectedActiveRevision:usagePreview.expectedActiveRevision})).complete,true);
+    const exportSelection=await reportReader.capture(reportScope,"delegated","official_users");
+    const exportId=await new OfficialReportExports(reportReader,reportUser,"synthetic-restart-report-cursor-secret").create(reportScope,{selectionId:exportSelection.id,kind:"official_users"});
     await assertOfficialUsageRawBytesAbsent(fixture.operator);
-    writeFileSync(receiptFile,JSON.stringify({database:fixture.name,job:job.id,unsent:unsent.id,inventoryInterrupted:inventoryInterrupted.id,inventoryCompleted:inventoryCompleted.id,packageInterrupted:packageInterrupted.id,packageCompleted:packageCompleted.id,purviewInterruptedCreate:purviewInterruptedCreate.id,purviewInterruptedPoll:purviewInterruptedPoll.id,purviewCompleted:purviewCompleted.id,defenderInterrupted:defenderInterrupted.id,defenderCompleted:defenderCompleted.id,quarantineSucceeded:quarantineSucceeded.id,quarantineSent:quarantineSent.id,quarantineUnsent:quarantineUnsent.id,quarantineAuthority,quarantineTargets:quarantineTargetIds,canaryJob:canaryJob.id,canaryOriginal:canaryOriginal.id,canaryRestoration:canaryRestoration.id,canaryIdentity:qualificationIdentity,officialUsage:await officialUsageFingerprint(officialUsage),tables:await fingerprints(fixture.operator)}),{mode:0o600});
+    const lifecycleInput=generationInput({scope:{tenantId:scope.tenantId,principalId:scope.principalId,kind:"principal",tokenMode:"delegated",source:"directory",selector:"restart-heartbeat"}});
+    const lifecycleLease=await new DataGenerations(fixture.runtime).begin(lifecycleInput);
+    writeFileSync(receiptFile,JSON.stringify({database:fixture.name,lifecycleInput,lifecycleLease,exportId,job:job.id,unsent:unsent.id,inventoryInterrupted:inventoryInterrupted.id,inventoryCompleted:inventoryCompleted.id,packageInterrupted:packageInterrupted.id,packageCompleted:packageCompleted.id,purviewInterruptedCreate:purviewInterruptedCreate.id,purviewInterruptedPoll:purviewInterruptedPoll.id,purviewCompleted:purviewCompleted.id,defenderInterrupted:defenderInterrupted.id,defenderCompleted:defenderCompleted.id,quarantineSucceeded:quarantineSucceeded.id,quarantineSent:quarantineSent.id,quarantineUnsent:quarantineUnsent.id,quarantineAuthority,quarantineTargets:quarantineTargetIds,canaryJob:canaryJob.id,canaryOriginal:canaryOriginal.id,canaryRestoration:canaryRestoration.id,canaryIdentity:qualificationIdentity,officialUsage:await officialReportFingerprint(reportReader,reportScope),tables:await fingerprints(fixture.operator)}),{mode:0o600});
     seeded=true;
     console.log(JSON.stringify({event:"restart_fixture_seeded",outcome:"passed"}));
   } finally {
-    if (seeded) await Promise.allSettled([fixture.operator.end(),fixture.runtime.end()]);
+    if (seeded) await fixture.release();
     else await fixture.close();
   }
 } else if (process.argv[2] === "verify" || process.argv[2] === "expire") {
@@ -147,7 +161,15 @@ if (process.argv[2] === "seed") {
     if (process.argv[2] === "verify") {
       assert.deepEqual(await fingerprints(operator),receipt.tables);
       console.log(JSON.stringify({event:"persistent_fixture_fingerprints",outcome:"passed"}));
-    } else await operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])",[[receipt.job,receipt.canaryJob]]);
+    } else {
+      const dispatch=(await operator.query("SELECT target_id,status,sent_at IS NOT NULL AS sent FROM job_items WHERE job_id=$1 ORDER BY ordinal",[receipt.job])).rows;
+      assert.deepEqual(dispatch.map(row=>[row.target_id,row.status,row.sent]),[["a-success","succeeded",true],["b-uncertain","running",true],["c-unsent","queued",false]]);
+      assert.equal((await operator.query("SELECT sent_at IS NOT NULL AS sent FROM job_items WHERE job_id=$1",[receipt.canaryJob])).rows[0].sent,true);
+      assert.equal((await operator.query("SELECT sent_at IS NOT NULL AS sent FROM copilot_quarantine_job_items WHERE job_id=$1",[receipt.quarantineSent])).rows[0].sent,true);
+      console.log(JSON.stringify({event:"restart_fixture_dispatch_verified",outcome:"passed",items:dispatch.length}));
+      await operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])",[[receipt.job,receipt.canaryJob]]);
+      if(receipt.lifecycleLease) await operator.query("UPDATE data_generations SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",[receipt.lifecycleLease.id]);
+    }
   }
   finally { await operator.end(); }
 } else {
@@ -183,20 +205,6 @@ if (process.argv[2] === "seed") {
     const cleanup=new pg.Pool(databaseSettings());
     try { await cleanup.query(`DROP DATABASE "${receipt.database}" WITH (FORCE)`); } finally { await cleanup.end(); }
   }
-}
-
-async function officialUsageFingerprint(repository:OfficialUsageRepository) {
-  const published=await repository.getPublished(scope.tenantId);
-  const options={staleAfterDays:35,now:new Date("2026-09-08T12:00:00.000Z")};
-  const aggregate=buildOfficialUsageAggregateView(published,[],options);
-  const users=buildOfficialUsageUserView(published,options);
-  return {
-    activeSetId:published.activeSet?.id??null,
-    activeRevision:published.activeRevision,
-    lineage:aggregate.lineages.map(value=>({...value,sourceAsOf:value.sourceAsOf??null,downloadedAt:value.downloadedAt??null})).sort((left,right)=>left.versionId<right.versionId?-1:left.versionId>right.versionId?1:0),
-    aggregate:{responses:aggregate.summary.usage.totalResponses,activeUsers:aggregate.summary.usage.totalActiveUsers,reportAgents:aggregate.agents.count},
-    users:{count:users.users.count,responses:users.counts.totalResponsesReceived,accessRows:users.counts.accessRows},
-  };
 }
 
 async function assertOfficialUsageRawBytesAbsent(database:pg.Pool) {

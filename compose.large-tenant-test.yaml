@@ -1,0 +1,12 @@
+services:
+  test-postgres:
+    command: [postgres, -c, shared_buffers=32MB, -c, min_wal_size=32MB, -c, max_wal_size=1GB]
+    tmpfs: !reset []
+    volumes:
+      - large-tenant-data:/var/lib/postgresql/data
+  test-db:
+    environment:
+      NPM_CONFIG_REGISTRY: https://packagefeedproxy.microsoft.io/npm/
+    volumes: !reset []
+volumes:
+  large-tenant-data:

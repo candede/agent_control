@@ -7,18 +7,21 @@ import { AppError } from "../errors.js";
 import { reconcileBulkJob, runBulkJob } from "./bulkJobs.js";
 import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, type FetchLike } from "./graphPackages.js";
-import { PackageInventoryRepository } from "../db/packageInventory.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
-import { UnifiedAgentRegistry } from "../db/unifiedAgentRegistry.js";
-import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
-import { UnifiedAgentsService } from "./unifiedAgents.js";
-import { AgentUsageService } from "./agentUsage.js";
-import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
+import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
+import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
+import { inventorySelectionFixture, reconcileInventoryFixture, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { packageInventoryRecord, powerPlatformInventoryRecord } from "./inventoryRecordProjection.js";
+import { inventoryPresentation } from "./inventoryPresentation.js";
+import { readPackageControls } from "../db/packageControls.js";
+import type { InventoryQuery } from "../db/inventoryQueries.js";
+import { DataExports } from "./dataExports.js";
+import { inventoryExportColumns, inventoryExportSource } from "./inventoryExports.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
 import { AuditLog } from "./auditLog.js";
 import { DataSyncRepository } from "../db/dataSync.js";
 import { loadOperationalState } from "./operationalState.js";
+import { usageIdentity } from "../db/agentUsageTestSupport.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: JobRepository;
@@ -31,31 +34,28 @@ afterEach(() => vi.restoreAllMocks());
 afterAll(async () => { await fixture?.close(); });
 
 async function savedReadbackInventory(owner: { tenantId: string; principalId: string }) {
-  const packages = new PackageInventoryRepository(fixture.runtime);
-  const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+  const packages = new PackageRefreshJobs(fixture.runtime);
+  const powerPlatform = new PowerPlatformRefreshJobs(fixture.runtime);
   const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const manifestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const refresh = await packages.submit(owner, {
     authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(),
   });
   await packages.markRunning(owner, refresh.id);
-  await packages.publish(owner, refresh.id, {
-    packages: ["readback-package", "untouched-package"].map(id => allowlistedPackage({
+  const baseline = await refreshInventoryFixture(fixture.runtime, owner, refresh.id, "packages",
+    ["readback-package", "untouched-package"].map(id => packageInventoryRecord(allowlistedPackage({
       id, displayName: id === "readback-package" ? "Reviewed package" : "Untouched package",
       isBlocked: false, availableTo: "some", deployedTo: "some",
       ...(id === "readback-package" ? {
         manifestId, platform: "Microsoft 365 Copilot Agent Builder", elementTypes: ["DeclarativeCopilots"],
         elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "", definition: "{}" }] }],
       } : {}),
-    })),
-    totalRecords: 2, pages: 1,
-  });
+    }))));
   const native = await powerPlatform.submit(owner, {
     idempotencyKey: randomUUID(), roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"],
   });
   await powerPlatform.markRunning(owner, native.id);
-  await powerPlatform.publish(owner, native.id, {
-    resources: [{
+  await refreshInventoryFixture(fixture.runtime, owner, native.id, "power_platform", [powerPlatformInventoryRecord({
       tenantId: owner.tenantId, nativeId: manifestId, type: "microsoft.copilotstudio/agents", environmentId,
       displayName: "Reviewed package", location: null, createdAt: null,
       createdBy: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", lastPublishedAt: null,
@@ -63,23 +63,29 @@ async function savedReadbackInventory(owner: { tenantId: string; principalId: st
       lifecycle: "published", identityConfidence: "exact_native",
       identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "power_platform_resource_id", value: manifestId }],
       provenance: {}, details: { schemaName: manifestId, isQuarantined: false }, unknownFieldCount: 0,
-    }],
-    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
-  });
-  const service = new UnifiedAgentsService({
-    packages, powerPlatform,
-    usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
-    resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
-    readRevision: (scope, database = fixture.runtime) => readUnifiedInventoryRevision(scope, database),
-  });
-  return { packages, service };
+    })], ["microsoft.copilotstudio/agents"]);
+  return { packages, baseline };
+}
+
+async function canonicalPage(owner: typeof scope, query: InventoryQuery = {}) {
+  const selected = await inventorySelectionFixture(fixture.runtime, owner, query);
+  return { ...selected, page: inventoryPresentation(selected.raw) };
+}
+async function packageDetail(owner: typeof scope, id: string) {
+  const selected = await inventorySelectionFixture(fixture.runtime, owner, {}, "packages");
+  return selected.queries.packageDetail(selected.selection.id, selected.identity, id);
+}
+async function controlReceiptCount(owner: typeof scope) {
+  return (await fixture.runtime.query(`SELECT count(*)::integer AS count FROM package_inventory_snapshots
+    WHERE tenant_id=$1 AND principal_id=$2 AND observation_kind IN ('block','access')`,
+  [owner.tenantId, owner.principalId])).rows[0].count as number;
 }
 
 describe("Durable bulk execution", () => {
   it.each(["block", "availability", "installation", "skipped"] as const)("publishes verified %s readback before exposing its terminal result", async operation => {
     const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
     const saved = await savedReadbackInventory(owner);
-    const before = await saved.service.list(owner);
+    const before = await canonicalPage(owner);
     let providerState = {
       id: "readback-package", displayName: "Reviewed package", isBlocked: operation === "skipped",
       availableTo: "some", deployedTo: "some",
@@ -116,10 +122,12 @@ describe("Durable bulk execution", () => {
     expect(await jobs.get(job.id, owner)).toMatchObject({
       status: "succeeded", succeeded: operation === "skipped" ? 0 : 1, skipped: operation === "skipped" ? 1 : 0,
     });
-    const after = await saved.service.list(owner);
-    expect(after.revision).not.toBe(before.revision);
-    const changed = after.value.flatMap(row => row.packages).find(item => item.id === providerState.id)!;
-    const stored = (await saved.packages.get(owner, providerState.id))?.package;
+    await expect(before.queries.page(before.selection.id, before.identity)).rejects.toThrow("selection_invalidated");
+    await reconcileInventoryFixture(fixture.runtime, owner);
+    const after = await canonicalPage(owner);
+    expect(after.raw.freshness.capturedRevision).not.toBe(before.raw.freshness.capturedRevision);
+    const changed = after.page.value.flatMap(row => row.packages).find(item => item.id === providerState.id)!;
+    const stored = await packageDetail(owner, providerState.id);
     if (operation === "availability" || operation === "installation") {
       expect(stored).toMatchObject({
         allowedUsersAndGroups: providerState.allowedUsersAndGroups,
@@ -129,23 +137,27 @@ describe("Durable bulk execution", () => {
       expect(stored).not.toHaveProperty("allowedUsersAndGroups");
       expect(stored).not.toHaveProperty("acquireUsersAndGroups");
     }
-    expect(after.count).toBe(before.count);
-    expect(after.value.find(row => row.presence === "both")?.id).toBe(before.value.find(row => row.presence === "both")?.id);
+    expect(after.page.counts.total).toBe(before.page.counts.total);
+    expect(after.page.value.find(row => row.presence === "both")?.id).toBe(before.page.value.find(row => row.presence === "both")?.id);
     expect(changed).toMatchObject({
       id: providerState.id, isBlocked: providerState.isBlocked,
       availableTo: providerState.availableTo, deployedTo: providerState.deployedTo,
     });
-    expect(after.value.flatMap(row => row.packages).find(item => item.id === "untouched-package")).toMatchObject({
+    expect(after.page.value.flatMap(row => row.packages).find(item => item.id === "untouched-package")).toMatchObject({
       isBlocked: false, availableTo: "some", deployedTo: "some",
     });
-    const filtered = await saved.service.list(owner, operation === "block" || operation === "skipped"
+    const filtered = await canonicalPage(owner, operation === "block" || operation === "skipped"
       ? { blocked: false } : { availableTo: "some" });
-    expect(filtered.count).toBe(operation === "installation" ? 2 : 1);
-    expect(filtered.filteredSummary.total).toBe(filtered.count);
-    await expect(saved.service.forExport(owner, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-    const exported = await saved.service.forExport(owner, after.revision!);
-    expect(exported.value.flatMap(row => row.packages).find(item => item.id === providerState.id)).toMatchObject(changed);
-    expect((await saved.service.list({ ...owner, principalId: "another-reader" })).count).toBe(0);
+    expect(filtered.page.counts.filtered).toBe(operation === "installation" ? 2 : 1);
+    expect(filtered.page.filteredSummary.total).toBe(filtered.page.counts.filtered);
+    const exports = new DataExports(fixture.runtime, after.queries.selections, async () => {});
+    await expect(exports.create(before.identity, { selectionId: before.selection.id, queryHash: before.selection.queryHash,
+      kind: "unified_agents", filename: "synthetic.csv" })).rejects.toThrow("selection_invalidated");
+    const exportId = await exports.create(after.identity, { selectionId: after.selection.id, queryHash: after.selection.queryHash,
+      kind: "unified_agents", filename: "synthetic.csv" });
+    await exports.build(exportId, after.identity, inventoryExportColumns.unified_agents, inventoryExportSource(after.queries, after.identity));
+    expect(await exports.status(exportId, after.identity)).toMatchObject({ status: "ready" });
+    await expect(after.queries.page(after.selection.id, { ...after.identity, principalId: "another-reader" })).rejects.toThrow("selection_invalidated");
     expect(fetcher).toHaveBeenCalledTimes(operation === "skipped" ? 1 : 4);
     expect((await saved.packages.listJobs(owner, owner.principalId)).value).toHaveLength(1);
     const receipt = await fixture.runtime.query("SELECT metadata FROM audit_events WHERE operation_id=$1 AND status=$2", [job.id, operation === "skipped" ? "skipped" : "succeeded"]);
@@ -155,9 +167,9 @@ describe("Durable bulk execution", () => {
   it("keeps one canonical agent through sparse block and unblock readbacks across all saved views", async () => {
     const owner = { tenantId: "block-cycle-tenant", principalId: randomUUID() };
     const saved = await savedReadbackInventory(owner);
-    const before = await saved.service.list(owner, { search: "Reviewed" });
-    expect(before.count).toBe(1);
-    const original = before.value[0];
+    const before = await canonicalPage(owner, { search: "Reviewed" });
+    expect(before.page.counts.filtered).toBe(1);
+    const original = before.page.value[0];
     let blocked = false;
     const provider = new GraphPackagesClient(async (url, request) => {
       if (request?.method === "POST") {
@@ -174,43 +186,44 @@ describe("Durable bulk execution", () => {
       }));
       await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
       expect(await jobs.get(job.id, owner)).toMatchObject({ status: "succeeded", succeeded: 1 });
-      const membership = await fixture.runtime.query(`SELECT package_snapshot_id,matching_evidence FROM unified_agent_sources
-        WHERE tenant_id=$1 AND principal_id=$2 AND source='graph_packages' AND native_id='readback-package'`,
-      [owner.tenantId, owner.principalId]);
-      expect(membership.rows[0]).toMatchObject({
-        package_snapshot_id: original.observations.packageSnapshots["readback-package"].snapshotId,
-        matching_evidence: original.identity.packageEvidence[0].evidence,
-      });
-      const page = await saved.service.list(owner, { search: "Reviewed" });
-      expect(page.count).toBe(1);
+      await reconcileInventoryFixture(fixture.runtime, owner);
+      const selected = await canonicalPage(owner, { search: "Reviewed" }), page = selected.page;
+      const membership = await fixture.runtime.query(`SELECT s.evidence FROM inventory_memberships m
+        JOIN inventory_roots root ON root.baseline_id=m.baseline_id AND root.current
+        JOIN data_scope_epochs owner ON owner.id=root.scope_id
+        JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
+        JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
+        WHERE owner.tenant_id=$1 AND owner.principal_id=$2 AND root.domain='canonical'
+          AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
+          AND r.domain='packages' AND r.native_id='readback-package'`, [owner.tenantId, owner.principalId]);
+      expect(page.counts.filtered).toBe(1);
       expect(page.value[0]).toMatchObject({
         id: original.id, presence: "both", identity: original.identity,
         powerPlatformResource: original.powerPlatformResource,
         packages: [{ isBlocked: action === "block", manifestId: original.packages[0].manifestId }],
       });
-      expect(page.value[0].observations.packageSnapshots).toEqual(original.observations.packageSnapshots);
-      expect((await saved.service.list(owner, { recordId: original.id })).count).toBe(1);
+      expect(page.value[0].observations.packageSnapshots["readback-package"].observedAt)
+        .toBe(original.observations.packageSnapshots["readback-package"].observedAt);
+      expect(membership.rows.map(row => row.evidence)).toContainEqual(original.identity.packageEvidence[0].evidence);
+      expect((await selected.queries.exact(selected.selection.id, selected.identity, [original.id.slice(6)]))).toHaveLength(1);
       const expected = { id: "readback-package", isBlocked: action === "block", manifestId: original.packages[0].manifestId };
-      expect((await saved.packages.get(owner, expected.id))?.package).toMatchObject(expected);
-      expect((await saved.packages.getMany(owner, [expected.id]))[0].package).toMatchObject(expected);
-      const list = await saved.packages.list(owner, { search: "Reviewed", blocked: action === "block" });
-      expect(list).toMatchObject({ count: 1, value: [expected], summary: { total: 2, blocked: action === "block" ? 1 : 0 } });
-      const exported = await saved.service.forExport(owner, page.revision!);
-      expect(exported.value.filter(row => row.packages.some(pkg => pkg.id === expected.id))).toHaveLength(1);
-      expect(exported.value.find(row => row.id === original.id)?.packages[0]).toMatchObject(expected);
+      expect(await packageDetail(owner, expected.id)).toMatchObject(expected);
+      const list = await inventorySelectionFixture(fixture.runtime, owner, { search: "Reviewed", blocked: action === "block" }, "packages");
+      expect(list.raw.counts).toMatchObject({ total: 2, filtered: 1 });
+      expect(list.raw.value[0].residual).toMatchObject(expected);
+      expect((await list.queries.exact(list.selection.id, list.identity, [expected.id]))[0].residual).toMatchObject(expected);
+      expect(page.value.find(row => row.id === original.id)?.packages[0]).toMatchObject(expected);
     }
-    const baseline = await fixture.runtime.query(`SELECT resource.package_data FROM package_inventory_resources resource
-      JOIN package_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
-      WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.observation_kind='inventory'
-        AND resource.native_id='readback-package'`, [owner.tenantId, owner.principalId]);
-    expect(baseline.rows[0].package_data).not.toHaveProperty("controlObservations");
-    expect(baseline.rows[0].package_data.isBlocked).toBe(false);
+    const baseline = await fixture.runtime.query(`SELECT residual FROM package_record_rows
+      WHERE generation_id=$1 AND identity='readback-package'`, [saved.baseline.baselineId]);
+    expect(baseline.rows[0].residual).not.toHaveProperty("controlObservations");
+    expect(baseline.rows[0].residual.isBlocked).toBe(false);
   });
 
   it("rolls back readback inventory and revisions when the success audit cannot be stored", async () => {
     const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
-    const saved = await savedReadbackInventory(owner);
-    const before = await saved.service.list(owner);
+    await savedReadbackInventory(owner);
+    const before = await canonicalPage(owner);
     let blocked = false;
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
       if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
@@ -224,16 +237,16 @@ describe("Durable bulk execution", () => {
     vi.spyOn(AuditLog.prototype, "completeEvent").mockRejectedValueOnce(new Error("synthetic audit failure"));
     await runBulkJob(job.id, owner, false, jobs, new GraphPackagesClient(fetcher), async () => "synthetic-token");
     expect(await jobs.get(job.id, owner)).toMatchObject({ status: "partial", inconclusive: 1, succeeded: 0 });
-    expect((await saved.service.list(owner)).revision).toBe(before.revision);
-    expect(await saved.packages.get(owner, "readback-package")).toMatchObject({ package: { isBlocked: false } });
-    const snapshots = await fixture.runtime.query("SELECT scope_kind FROM package_inventory_snapshots WHERE tenant_id=$1 AND principal_id=$2", [owner.tenantId, owner.principalId]);
-    expect(snapshots.rows).toEqual([{ scope_kind: "broad" }]);
+    expect((await canonicalPage(owner)).raw.freshness.capturedRevision).toBe(before.raw.freshness.capturedRevision);
+    expect((await before.queries.page(before.selection.id, before.identity)).value).toEqual(before.raw.value);
+    expect(await packageDetail(owner, "readback-package")).toMatchObject({ isBlocked: false });
+    expect(await controlReceiptCount(owner)).toBe(0);
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
   it("does not republish an in-flight readback across a confirmed saved-data clear", async () => {
     const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
-    const saved = await savedReadbackInventory(owner);
+    await savedReadbackInventory(owner);
     let blocked = false;
     let cleared = false;
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
@@ -253,12 +266,16 @@ describe("Durable bulk execution", () => {
     const provider = new GraphPackagesClient(fetcher);
     await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
     expect(await jobs.get(job.id, owner)).toMatchObject({
-      status: "partial", inconclusive: 1, results: [{ errorCode: "package_readback_superseded" }],
+      status: "partial", inconclusive: 1,
     });
-    expect(await saved.packages.get(owner, "readback-package")).toBeUndefined();
+    expect((await jobs.items(job.id, await usageIdentity(fixture.runtime, owner))).value).toMatchObject([{ errorCode: "package_readback_superseded" }]);
+    expect(await readPackageControls(fixture.runtime, owner, ["readback-package"])).toEqual([]);
     const reconciled = await reconcileBulkJob(job.id, owner, jobs, provider, async () => "synthetic-token");
     expect(reconciled).toMatchObject({ status: "succeeded", reconciliation: { attempted: 1, failed: 0 } });
-    expect(await saved.packages.get(owner, "readback-package")).toMatchObject({ package: { isBlocked: true } });
+    expect(await readPackageControls(fixture.runtime, owner, ["readback-package"])).toMatchObject([{ detail: { isBlocked: true } }]);
+    expect((await fixture.runtime.query(`SELECT count(*)::integer AS count FROM inventory_roots r
+      JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.current AND s.tenant_id=$1 AND s.principal_id=$2`,
+    [owner.tenantId, owner.principalId])).rows[0].count).toBe(0);
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
@@ -326,7 +343,7 @@ describe("Durable bulk execution", () => {
       const provider = new GraphPackagesClient(fetcher, { maxAttempts: 1 });
       const job = await jobs.submit(scope, input());
       await runBulkJob(job.id, scope, false, jobs, provider, async () => "ephemeral-token");
-      const previousRevision = await readUnifiedInventoryRevision(scope, fixture.runtime);
+      const previousRevision = await controlReceiptCount(scope);
       const authorizationCapabilities: string[] = [];
       const reconciled = await reconcileBulkJob(job.id, scope, jobs, provider, async (_scope, capabilityId) => {
         authorizationCapabilities.push(capabilityId);
@@ -340,9 +357,11 @@ describe("Durable bulk execution", () => {
       ]);
       expect(reconciled).toMatchObject(applied
         ? { status: "succeeded", succeeded: 1, reconciliation: { attempted: 1, failed: 0 } }
-        : { status: "partial", inconclusive: 1, results: [{ reconciliationStatus: "verified_not_applied", retryEligible: true }], reconciliation: { attempted: 1, failed: 0 } });
-      expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).not.toBe(previousRevision);
-      expect(await new PackageInventoryRepository(fixture.runtime).get(scope, "package-1")).toMatchObject({ package: { isBlocked: applied } });
+        : { status: "partial", inconclusive: 1, retryEligible: 1, reconciliationRequired: 0, reconciliation: { attempted: 1, failed: 0 } });
+      if (!applied) expect((await jobs.items(job.id, await usageIdentity(fixture.runtime, scope))).value)
+        .toMatchObject([{ reconciliationStatus: "verified_not_applied", retryEligible: true }]);
+      expect(await controlReceiptCount(scope)).not.toBe(previousRevision);
+      expect(await readPackageControls(fixture.runtime, scope, ["package-1"])).toMatchObject([{ detail: { isBlocked: applied } }]);
     }
   });
 
@@ -359,14 +378,15 @@ describe("Durable bulk execution", () => {
       if (authorizationCount > 1) throw new AppError(403, "missing_internal_role", "Operator role revoked");
       return "ephemeral-token";
     })).rejects.toMatchObject({ code: "missing_internal_role" });
-    expect(await jobs.get(revokedJob.id, scope)).toMatchObject({ results: [{ reconciliationStatus: "required" }] });
+    expect((await jobs.items(revokedJob.id, await usageIdentity(fixture.runtime, scope))).value).toMatchObject([{ reconciliationStatus: "required" }]);
 
     const cancelledJob = await jobs.submit(scope, input());
     await runBulkJob(cancelledJob.id, scope, false, jobs, provider, async () => "ephemeral-token");
     await jobs.cancel(cancelledJob.id, scope);
     const readCount = vi.fn(async () => "ephemeral-token");
     const cancelled = await reconcileBulkJob(cancelledJob.id, scope, jobs, provider, readCount);
-    expect(cancelled).toMatchObject({ reconciliation: { attempted: 1, failed: 1 }, results: [{ reconciliationStatus: "required" }] });
+    expect(cancelled).toMatchObject({ reconciliation: { attempted: 1, failed: 1 }, reconciliationRequired: 1 });
+    expect((await jobs.items(cancelledJob.id, await usageIdentity(fixture.runtime, scope))).value).toMatchObject([{ reconciliationStatus: "required" }]);
   });
 
   it.each(["maintenance", "provider_requalification_required"] as const)(
@@ -384,7 +404,7 @@ describe("Durable bulk execution", () => {
           : Response.json({ id: decodeURIComponent(new URL(url).pathname.split("/").at(-1)!), displayName: "Fixture", isBlocked: false }),
         { maxAttempts: 1 });
         await runBulkJob(job.id, owner, false, jobs, provider, async () => "ephemeral-token");
-        const revision = await readUnifiedInventoryRevision(owner, fixture.runtime);
+        const revision = await controlReceiptCount(owner);
         const closeAdmissions = async () => {
           if (errorCode === "maintenance") vi.stubEnv("MAINTENANCE_MODE", "true");
           else {
@@ -421,8 +441,8 @@ describe("Durable bulk execution", () => {
           expect(reads, stage).toHaveBeenCalledTimes(["readback", "publication", "next-item"].includes(stage) ? 1 : 0);
           expect(authorize, stage).toHaveBeenCalledTimes(stage === "start" ? 0 : ["publication", "next-item"].includes(stage) ? 2 : 1);
           const current = await jobs.get(job.id, owner);
-          expect(current?.results.filter(item => item.reconciliationStatus === "required"), stage).toHaveLength(1);
-          if (stage !== "next-item") expect(await readUnifiedInventoryRevision(owner, fixture.runtime), stage).toBe(revision);
+          expect(current?.reconciliationRequired, stage).toBe(1);
+          if (stage !== "next-item") expect(await controlReceiptCount(owner), stage).toBe(revision);
         } finally {
           vi.unstubAllEnvs();
           await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
@@ -501,7 +521,7 @@ describe("Durable bulk execution", () => {
     });
     const raceJobs = new JobRepository(fixture.runtime);
     const job = await raceJobs.submit(raceScope, candidate);
-    const revision = await readUnifiedInventoryRevision(raceScope, fixture.runtime);
+    const revision = await controlReceiptCount(raceScope);
     let releaseReadback!: (value: Response) => void;
     const readback = new Promise<Response>(resolve => { releaseReadback = resolve; });
     const blocked = new Set<string>();
@@ -522,11 +542,12 @@ describe("Durable bulk execution", () => {
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
     expect(await raceJobs.get(job.id, raceScope)).toMatchObject({
       status: "partial", completed: 1, succeeded: 0, inconclusive: 1, canResume: targetCount > 1,
-      results: [{ id: "package-1", status: "inconclusive", errorCode: "unauthorized", reconciliationStatus: "required", retryEligible: false }],
-      result: { inconclusive: 1 },
+      reconciliationRequired: 1, retryEligible: 0,
     });
-    expect(await readUnifiedInventoryRevision(raceScope, fixture.runtime)).toBe(revision);
-    expect(await new PackageInventoryRepository(fixture.runtime).get(raceScope, "package-1")).toBeUndefined();
+    expect((await raceJobs.items(job.id, await usageIdentity(fixture.runtime, raceScope))).value[0])
+      .toMatchObject({ id: "package-1", status: "inconclusive", errorCode: "unauthorized", reconciliationStatus: "required", retryEligible: false });
+    expect(await controlReceiptCount(raceScope)).toBe(revision);
+    expect(await readPackageControls(fixture.runtime, raceScope, ["package-1"])).toEqual([]);
     const audit = await fixture.runtime.query("SELECT status FROM audit_events WHERE operation_id=$1", [job.id]);
     expect(audit.rows.map(row => row.status)).toContain("inconclusive");
     expect(audit.rows.map(row => row.status)).not.toContain("succeeded");

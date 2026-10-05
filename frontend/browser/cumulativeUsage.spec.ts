@@ -23,7 +23,7 @@ for (const role of ["Admin", "Viewer"] as const) {
     });
     await page.goto("/sync?reports=manage");
     const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
-    const history = modal.getByRole("region", { name: "Saved reports", exact: true });
+    const history = modal.getByRole("region", { name: "Saved report sets", exact: true });
     await expect(modal.getByRole("region", { name: "Saved report sets", exact: true })).toContainText("1 saved report set");
     await expect(history.locator("tbody tr")).toHaveCount(1);
     await expect(modal.getByRole("table")).toHaveCount(1);

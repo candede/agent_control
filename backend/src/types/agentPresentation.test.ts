@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { agentColumnValue, agentManagement, agentPersonLabel, agentRelevanceReasons, agentUserAvailability, matchesAgentFilters, matchesAgentView, summarizeAgentAvailability } from "./agentPresentation.js";
+import { agentColumnValue, agentManagement, agentPersonLabel, agentRelevanceReasons, agentUserAvailability, matchesAgentView } from "./agentPresentation.js";
 import type { CopilotPackage } from "./copilotPackage.js";
 import type { PowerPlatformResource } from "./powerPlatformInventory.js";
 import type { UnifiedAgentRecord } from "./unifiedAgents.js";
-import { unifiedAgentAccessFilters, unifiedAgentManagementFilters, unifiedAgentQuickViews, unifiedAgentRelevanceFilters, unifiedAgentUsageFilters } from "./unifiedAgents.js";
 
 function record(packages: Array<Partial<CopilotPackage>> = [{}]): UnifiedAgentRecord {
   return {
@@ -53,9 +52,8 @@ describe("agent quick views and independent filters", () => {
     const value = record(types.map(type => ({
       type, publisher: "Microsoft", displayName: "Microsoft Copilot", authoringTool: "Microsoft Copilot Studio",
     })));
-    value.usage = { status: "unlinked", responses: 100, reportSetId: "report", activeUsers: 1, lastActivityDateUtc: null,
-      associations: [{ reportAgentId: "report-agent", reportAgentName: "Microsoft Copilot",
-        basis: "exact_package_id", target: { source: "graph_packages", packageId: "package-0" } }] };
+    value.usage = { recordId: value.id, status: "unlinked", responses: 100, reportSetId: "report",
+      activeUsers: 1, lastActivityDateUtc: null, associationCount: 1 };
     expect(matchesAgentView(value, "first_party")).toBe(first);
     expect(matchesAgentView(value, "third_party")).toBe(third);
   });
@@ -167,8 +165,7 @@ describe("agent quick views and independent filters", () => {
     value.packages[1].isBlocked = false;
     value.powerPlatformResource = nativeResource({ details: { isQuarantined: true } });
     expect(agentManagement(value)).toBe("organization_managed");
-    expect(matchesAgentFilters(value, { view: "organization_managed", endUserAccess: "unavailable" })).toBe(true);
-    expect(matchesAgentFilters(value, { view: "organization_managed", endUserAccess: "available" })).toBe(false);
+    expect(agentUserAvailability(value)).toBe("unavailable");
     value.packages = record([personalPackage]).packages;
     expect(agentManagement(value)).toBe("user_managed");
   });
@@ -181,42 +178,11 @@ describe("agent quick views and independent filters", () => {
     { status: "unavailable", responses: 5, used: false },
   ] as const)("filters reported usage by positive linked responses, not activity or report names: $status $responses", ({ status, responses, used }) => {
     const value = record([{ type: "external", availableTo: "all" }]);
-    value.usage = { status, responses, reportSetId: "report", activeUsers: 99, lastActivityDateUtc: "2026-09-17", associations: [] };
-    expect(matchesAgentFilters(value, { reportedUsage: "used" })).toBe(used);
+    value.usage = { recordId: value.id, status, responses, reportSetId: "report", activeUsers: 99,
+      lastActivityDateUtc: "2026-09-17", associationCount: status === "linked" ? 1 : 0 };
     expect(matchesAgentView(value, "used")).toBe(used);
-    expect(matchesAgentFilters(value, { relevance: "organization" })).toBe(used);
-    expect(matchesAgentFilters(value, { relevance: "unknown" })).toBe(!used);
-  });
-
-  it("intersects all six quick views with every independent filter and preserves legacy view meanings", () => {
-    const value = record([{
-      type: "external", authoringTool: "Copilot Studio", availableTo: "all", controlObservations: { access: accessObservation },
-    }]);
-    value.usage = { status: "linked", responses: 3, reportSetId: "report", activeUsers: 1, lastActivityDateUtc: null, associations: [] };
-    for (const view of unifiedAgentQuickViews) {
-      for (const endUserAccess of unifiedAgentAccessFilters) {
-        for (const reportedUsage of unifiedAgentUsageFilters) {
-          for (const management of unifiedAgentManagementFilters) {
-            for (const relevance of unifiedAgentRelevanceFilters) {
-              const query = { view, endUserAccess, reportedUsage, management, relevance };
-              expect(matchesAgentFilters(value, query), JSON.stringify(query)).toBe(
-                ["all", "third_party", "copilot_studio", "organization_managed"].includes(view)
-                && ["all", "available"].includes(endUserAccess)
-                && ["all", "organization_managed"].includes(management)
-                && ["all", "organization"].includes(relevance),
-              );
-            }
-          }
-        }
-      }
-    }
-    expect(matchesAgentFilters(value, { view: "used", management: "organization_managed" })).toBe(true);
-    expect(matchesAgentFilters(value, { view: "organization", endUserAccess: "available" })).toBe(true);
-    expect(matchesAgentFilters(value, { view: "available", endUserAccess: "unavailable" })).toBe(false);
-    const unknown = record([{}]);
-    expect(matchesAgentFilters(unknown, { view: "unknown", management: "unknown", endUserAccess: "unknown", relevance: "unknown" })).toBe(true);
-    expect(matchesAgentFilters(unknown, { view: "availability_unknown", reportedUsage: "used" })).toBe(false);
-    expect(matchesAgentFilters(unknown, {})).toBe(true);
+    expect(matchesAgentView(value, "organization")).toBe(used);
+    expect(matchesAgentView(value, "unknown")).toBe(!used);
   });
 });
 
@@ -254,22 +220,6 @@ describe("agent presentation and organizational relevance", () => {
     expect(agentColumnValue(value, "builtWith")).toBe("Explicit provider tool");
   });
 
-  it("counts created or Teams-available logical agents once without claiming usage", () => {
-    const both = record([
-      { type: "custom", availableTo: "all", supportedHosts: ["Teams"] },
-      { type: "custom", availableTo: "some", supportedHosts: ["teams"] },
-    ]);
-    const available = record([{ type: "external", availableTo: "availableToSome", supportedHosts: [" Teams "] }]);
-    const created = record([{ type: "custom", isBlocked: true }]);
-    const unknown = record([{ type: "external", supportedHosts: ["Teams"], availableTo: "unknown" }]);
-    const blocked = record([{ type: "external", isBlocked: true, supportedHosts: ["Teams"], availableTo: "all" }]);
-    const otherHost = record([{ type: "external", supportedHosts: ["Copilot"], availableTo: "all" }]);
-    expect(summarizeAgentAvailability([both, available, created, unknown, blocked, otherHost])).toEqual({
-      availableToUsers: 3, organizationCreated: 2, teamsAvailable: 2, createdOrAvailable: 3,
-    });
-    expect(matchesAgentView(both, "used")).toBe(false);
-    expect(summarizeAgentAvailability([])).toEqual({ availableToUsers: 0, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 0 });
-  });
 
   it.each([
     { packages: [{ type: "external", availableTo: "all", supportedHosts: ["Copilot"] }], state: "available", label: "All users" },
@@ -282,15 +232,15 @@ describe("agent presentation and organizational relevance", () => {
     { packages: [{ availableTo: "all", isBlocked: true }, { availableTo: "some" }], state: "available", label: "Specific users or groups" },
     { packages: [{ availableTo: "all", isBlocked: true }, {}], state: "unknown", label: null },
     { packages: [], state: "unknown", label: null },
-  ])("uses the same end-user access classification for counts, filters and columns: $state $label", ({ packages, state, label }) => {
+  ])("uses one end-user access classification for saved views and columns: $state $label", ({ packages, state, label }) => {
     const value = record(packages);
-    value.usage = { status: "linked", reportSetId: "report", responses: 12, activeUsers: 1, lastActivityDateUtc: null, associations: [] };
+    value.usage = { recordId: value.id, status: "linked", reportSetId: "report", responses: 12,
+      activeUsers: 1, lastActivityDateUtc: null, associationCount: 1 };
     expect(agentUserAvailability(value)).toBe(state);
     expect(matchesAgentView(value, "all")).toBe(true);
     expect(matchesAgentView(value, "available")).toBe(state === "available");
     expect(matchesAgentView(value, "unavailable")).toBe(state === "unavailable");
     expect(matchesAgentView(value, "availability_unknown")).toBe(state === "unknown");
-    expect(summarizeAgentAvailability([value]).availableToUsers).toBe(Number(state === "available"));
     expect(agentColumnValue(value, "availability")).toBe(label);
   });
 
@@ -304,7 +254,6 @@ describe("agent presentation and organizational relevance", () => {
       provenance: {}, details: { isQuarantined: true }, unknownFieldCount: 0,
     };
     expect(agentUserAvailability(value)).toBe("unavailable");
-    expect(summarizeAgentAvailability([value]).availableToUsers).toBe(0);
     value.powerPlatformResource.details.isQuarantined = false;
     value.packages = [];
     expect(agentUserAvailability(value)).toBe("unknown");
@@ -336,7 +285,8 @@ describe("agent presentation and organizational relevance", () => {
     const value = record([{ type: "external", deployedTo: "none" }, { type: "custom" }]);
     expect(matchesAgentView(value, "organization")).toBe(true);
     value.packages.pop();
-    value.usage = { status: "linked", reportSetId: "report", responses: 10, activeUsers: 1, lastActivityDateUtc: null, associations: [] };
+    value.usage = { recordId: value.id, status: "linked", reportSetId: "report", responses: 10,
+      activeUsers: 1, lastActivityDateUtc: null, associationCount: 1 };
     expect(matchesAgentView(value, "used")).toBe(true);
     expect(matchesAgentView(value, "organization")).toBe(true);
     value.usage.responses = 0;

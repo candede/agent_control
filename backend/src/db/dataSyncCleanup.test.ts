@@ -1,32 +1,58 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { parseOfficialUsageReport } from "../services/officialUsageParser.js";
+import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { publishFixtureDirectory, publishFixtureEmptyActivity } from "../../scripts/userSourceFixture.js";
+import { inventorySelectionFixture, refreshInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { fingerprints } from "../../scripts/backup.js";
+import { AppError } from "../errors.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import type { StartDataSyncInput } from "../types/dataSync.js";
 import { powerPlatformResourceTypes, type PowerPlatformResource } from "../types/powerPlatformInventory.js";
-import { DataSyncRepository, type DataSyncScope } from "./dataSync.js";
+import { DataSyncRepository, requireUserPublication, type DataSyncScope, type UserSourcePublication } from "./dataSync.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
-import { OfficialUsageRepository } from "./officialUsage.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { OfficialReportImports } from "./officialReportImports.js";
+import { UserSourceStages } from "./userSourceStages.js";
+import { UserSourcesRepository } from "./userSources.js";
+import { PackageRefreshJobs } from "./packageRefreshJobs.js";
+import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
+import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRuntime.js";
+import { packageInventoryRecord, powerPlatformInventoryRecord } from "../services/inventoryRecordProjection.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: DataSyncRepository;
-let packages: PackageInventoryRepository;
-let inventory: PowerPlatformInventoryRepository;
+let packages: PackageRefreshJobs;
+let inventory: PowerPlatformRefreshJobs;
 
 beforeAll(async () => {
   fixture = await testDatabase();
   repository = new DataSyncRepository(fixture.runtime);
-  packages = new PackageInventoryRepository(fixture.runtime);
-  inventory = new PowerPlatformInventoryRepository(fixture.runtime);
+  packages = new PackageRefreshJobs(fixture.runtime);
+  inventory = new PowerPlatformRefreshJobs(fixture.runtime);
 });
 afterAll(async () => { await fixture?.close(); });
 
 const cleanInput = { mode: "full", clearSavedData: true } as const;
 const now = () => new Date().toISOString();
 const newScope = (): DataSyncScope => ({ tenantId: `tenant-${randomUUID()}`, principalId: `viewer-${randomUUID()}` });
+const identity = (scope: DataSyncScope) => ({ ...selectionIdentity, ...scope });
+async function userPage(scope: DataSyncScope) {
+  const reader = new UserSourcesRepository(fixture.runtime, "synthetic-native-cleanup-source-secret");
+  const selected = await reader.capture(identity(scope), "delegated");
+  return reader.page(selected.id, identity(scope));
+}
+function collectSource(scope: DataSyncScope, source: "directory" | "app_activity", publication: UserSourcePublication, failure?: Error) {
+  const stages = new UserSourceStages(fixture.runtime);
+  return stages.execute(generationInput({
+    scope: { ...generationInput().scope, ...scope, source }, jobKind: "data_sync", ...publication,
+  }), async lease => {
+    if (failure) throw failure;
+    const key = await stages.query(lease, source === "directory" ? "discovery" : "activity", "synthetic:cleanup-empty");
+    await stages.page(lease, key, "synthetic:cleanup-empty", 0, 0);
+    await stages.finishQuery(lease, key);
+  }, { beforePublish: async () => {}, completeJob: client => requireUserPublication(client, scope, publication) });
+}
 
 describe("clean full data sync admission", () => {
   it("validates the cleanup contract even when callers bypass HTTP parsing", async () => {
@@ -62,6 +88,7 @@ describe("clean full data sync admission", () => {
     const otherPrincipal = { ...scope, principalId: "other-viewer" };
     const otherTenant = { ...scope, tenantId: "other-tenant" };
     await seedSnapshots(scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope);
     await seedSnapshots(otherPrincipal);
     await seedSnapshots(otherTenant);
     const othersBefore = await Promise.all([scopedSnapshots(otherPrincipal), scopedSnapshots(otherTenant)]);
@@ -84,7 +111,7 @@ describe("clean full data sync admission", () => {
       "official_usage_artifacts", "official_usage_sets", "official_usage_versions", "official_usage_state",
       "official_usage_row_facts", "official_usage_version_rows", "official_usage_set_versions",
       "official_usage_bundle_receipts", "official_usage_audit", "audit_events", "jobs", "job_items", "job_attempts",
-      "package_refresh_jobs", "power_platform_refresh_jobs", "source_identifiers", "capability_configuration",
+      "package_refresh_jobs", "power_platform_refresh_jobs", "inventory_canonical_ids", "capability_configuration",
       "capability_evidence", "package_mutation_qualifications", "copilot_quarantine_status_observations",
       "copilot_quarantine_jobs", "copilot_quarantine_audit", "operational_state",
     ];
@@ -96,10 +123,12 @@ describe("clean full data sync admission", () => {
       expect.objectContaining({ source: "power_platform", count: null, lastSuccessAt: null }),
       expect.objectContaining({ source: "users", count: null, lastSuccessAt: null }),
     ]);
-    expect(await scopedSnapshots(scope)).toEqual({
-      copilot_usage_snapshots: [], copilot_usage_source_state: [],
-      package_inventory_snapshots: [], package_inventory_resources: [],
-      power_platform_inventory_snapshots: [], power_platform_inventory_resources: [],
+    expect(await scopedSnapshots(scope)).toMatchObject({
+      userSources: { value: [], sources: {
+        directory: { state: "unavailable", generationId: null, rowCount: null },
+        app_activity: { state: "unavailable", generationId: null, rowCount: null },
+      } },
+      inventoryRoots: [], inventoryRecords: [],
     });
     expect(await repository.listMarkers(scope)).toEqual([
       expect.objectContaining({ source: "users", status: "not_started", count: null }),
@@ -109,9 +138,9 @@ describe("clean full data sync admission", () => {
     ]);
     expect(await tableRows(preservedTables)).toEqual(preserved);
     expect(await Promise.all([scopedSnapshots(otherPrincipal), scopedSnapshots(otherTenant)])).toEqual(othersBefore);
-    expect(await packages.readUnifiedSource(scope)).toMatchObject({ packages: [], snapshot: null, observations: {} });
-    expect(await inventory.list(scope)).toMatchObject({ value: [], snapshot: null });
-    expect((await repository.getUserSources(scope)).directory).toMatchObject({ value: null, rowCount: null, lastSuccessAt: null });
+    await expect(selected.queries.page(selected.selection.id, selected.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect((await scopedSnapshots(scope)).inventoryRecords).toEqual([]);
+    expect((await userPage(scope)).sources.directory).toMatchObject({ state: "unavailable", generationId: null, rowCount: null, observedAt: null });
     await expect(fixture.runtime.query("DELETE FROM package_inventory_snapshots WHERE tenant_id=$1", [scope.tenantId])).rejects.toThrow();
     await expect(fixture.runtime.query("DELETE FROM data_sync_success_markers WHERE tenant_id=$1", [scope.tenantId])).rejects.toThrow();
     await expect(fixture.runtime.query("SELECT clear_admitted_data_sync_snapshots()")).rejects.toThrow();
@@ -123,7 +152,7 @@ describe("clean full data sync admission", () => {
     const [first, second] = await Promise.all([repository.submit(scope, cleanInput), repository.submit(scope, cleanInput)]);
     expect(first.run.id).toBe(second.run.id);
     expect([first.created, second.created].sort()).toEqual([false, true]);
-    await repository.publishDirectory(scope, [], now(), "Replacement saved zero users.");
+    await publishFixtureDirectory(fixture.runtime, identity(scope), []);
     const replacement = await scopedSnapshots(scope);
     expect(await repository.submit(scope, cleanInput)).toMatchObject({ created: false, run: { id: first.run.id } });
     await expect(repository.submit(scope, { mode: "full" })).rejects.toMatchObject({ code: "data_sync_active" });
@@ -180,9 +209,9 @@ describe("clean full data sync admission", () => {
     else await inventory.cancel(scope, job.id);
     await repository.submit(scope, cleanInput);
     await expect(publishProvider(scope, provider, job.id)).rejects.toMatchObject({
-      code: provider === "packages" ? "package_refresh_state" : "inventory_job_state",
+      code: "inventory_job_fenced",
     });
-    expect((await (provider === "packages" ? packages : inventory).list(scope)).snapshot).toBeNull();
+    expect((await scopedSnapshots(scope)).inventoryRoots).toEqual([]);
   });
 
   it.each(["packages", "inventory"] as const)("serializes %s publication with clean admission", async provider => {
@@ -197,10 +226,10 @@ describe("clean full data sync admission", () => {
     expect(publication.status).toBe("fulfilled");
     if (admission.status === "rejected") {
       expect(admission.reason).toMatchObject({ code: "data_sync_source_active" });
-      expect((await (provider === "packages" ? packages : inventory).list(scope)).snapshot).not.toBeNull();
+      expect((await scopedSnapshots(scope)).inventoryRoots.length).toBeGreaterThan(0);
       await repository.submit(scope, cleanInput);
     }
-    expect((await (provider === "packages" ? packages : inventory).list(scope)).snapshot).toBeNull();
+    expect((await scopedSnapshots(scope)).inventoryRoots).toEqual([]);
   });
 
   it("fences stopped user attempts and keeps failed replacement data missing instead of stale or zero", async () => {
@@ -211,15 +240,12 @@ describe("clean full data sync admission", () => {
     await repository.updateSource(scope, old.run.id, "users", {
       status: "running", jobId: publication.jobId, message: "Reading old user sources.", canRetry: false,
     });
-    await repository.publishDirectory(scope, [], now(), "Previously successful empty directory.", publication);
+    await collectSource(scope, "directory", publication);
     await repository.cancel(scope, old.run.id);
     const clean = await repository.submit(scope, cleanInput);
-    await expect(repository.publishDirectory(scope, [], now(), "Late old directory.", publication))
-      .rejects.toMatchObject({ code: "data_sync_publication_superseded" });
-    await expect(repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, now(), "Late old report.", publication))
-      .rejects.toMatchObject({ code: "data_sync_publication_superseded" });
-    await expect(repository.recordUserSourceFailure(scope, "directory", "failed", "Late old error.", now(), publication))
-      .rejects.toMatchObject({ code: "data_sync_publication_superseded" });
+    await expect(collectSource(scope, "directory", publication)).rejects.toThrow("data_source_job_fenced");
+    await expect(collectSource(scope, "app_activity", publication)).rejects.toThrow("data_source_job_fenced");
+    await expect(collectSource(scope, "directory", publication, new Error("Late old error."))).rejects.toThrow("data_source_job_fenced");
     await repository.updateSource(scope, old.run.id, "users", {
       status: "succeeded", jobId: publication.jobId, count: 0, message: "Late worker completion.", canRetry: false,
     });
@@ -228,12 +254,13 @@ describe("clean full data sync admission", () => {
     await repository.updateSource(scope, clean.run.id, "users", {
       status: "running", jobId: failedPublication.jobId, message: "Reading replacement.", canRetry: false,
     });
-    await repository.recordUserSourceFailure(scope, "directory", "permission_required", "Directory permission required.", now(), failedPublication);
+    await expect(collectSource(scope, "directory", failedPublication, new AppError(403, "permission_required", "Directory permission required.")))
+      .rejects.toMatchObject({ status: 403, code: "permission_required" });
     await repository.updateSource(scope, clean.run.id, "users", {
       status: "failed", jobId: failedPublication.jobId, message: "Replacement failed.", canRetry: true,
     });
-    expect((await repository.getUserSources(scope)).directory).toMatchObject({
-      attemptStatus: "permission_required", value: null, rowCount: null, lastSuccessAt: null,
+    expect((await userPage(scope)).sources.directory).toMatchObject({
+      attemptStatus: "permission_required", generationId: null, rowCount: null, observedAt: null,
     });
     expect((await repository.listMarkers(scope))[0]).toMatchObject({ source: "users", status: "not_started", count: null });
     await repository.retry(scope, clean.run.id, ["users"]);
@@ -246,34 +273,40 @@ describe("clean full data sync admission", () => {
     await repository.updateSource(scope, clean.run.id, "users", {
       status: "running", jobId: replacement.jobId, message: "Retrying replacement.", canRetry: false,
     });
-    await expect(repository.publishDirectory(scope, [], now(), "Late previous attempt.", failedPublication))
-      .rejects.toMatchObject({ code: "data_sync_publication_superseded" });
+    await expect(collectSource(scope, "directory", failedPublication)).rejects.toThrow("data_source_job_fenced");
     await repository.updateSource(scope, clean.run.id, "users", {
       status: "succeeded", jobId: failedPublication.jobId, count: 0, message: "Late previous attempt completion.", canRetry: false,
     });
     expect((await repository.getRun(scope, clean.run.id))?.sources.find(source => source.source === "users")?.status).toBe("running");
-    await repository.publishDirectory(scope, [], now(), "New successful zero-row directory.", replacement);
-    expect((await repository.getUserSources(scope)).directory).toMatchObject({ value: [], rowCount: 0 });
+    await collectSource(scope, "directory", replacement);
+    expect(await userPage(scope)).toMatchObject({ value: [], sources: { directory: { state: "available", generationId: expect.any(String), rowCount: 0 } } });
   });
 });
 
 async function seedSnapshots(scope: DataSyncScope) {
-  await repository.publishDirectory(scope, [], now(), "Saved prior empty directory.");
-  await repository.publishDirectory(scope, [], now(), "Saved latest empty directory.");
-  await repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, now(), "Saved activity.");
+  await publishFixtureDirectory(fixture.runtime, identity(scope), []);
+  await publishFixtureDirectory(fixture.runtime, identity(scope), []);
+  await publishFixtureEmptyActivity(fixture.runtime, identity(scope));
   for (const requestedIds of [[], ["package"]]) {
     const job = await packages.submit(scope, {
       authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(), requestedIds,
     });
     await packages.markRunning(scope, job.id);
-    await packages.publish(scope, job.id, {
-      packages: [allowlistedPackage({ id: "package", displayName: "Fixture package", isBlocked: false })],
-      totalRecords: 1, pages: 1,
-    });
+    const records = [packageInventoryRecord(allowlistedPackage({ id: "package", displayName: "Fixture package", isBlocked: false }))];
+    if (!requestedIds.length) await refreshInventoryFixture(fixture.runtime, scope, job.id, "packages", records);
+    else {
+      const input = await inventoryJobInput(fixture.runtime, scope, "packages", job.id);
+      const stages = new InventoryGenerations(fixture.runtime);
+      await stages.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: requestedIds }, async lease => {
+        await stages.appendBounded(lease, records);
+      }, { authorize: async () => {}, completeJob: completeInventoryJob(input, "packages") });
+      await reconcileInventoryFixture(fixture.runtime, scope);
+    }
   }
   const job = await submitProvider(scope, "inventory");
   await inventory.markRunning(scope, job.id);
-  await inventory.publish(scope, job.id, { resources: [resource(scope)], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+  await refreshInventoryFixture(fixture.runtime, scope, job.id, "power_platform",
+    [powerPlatformInventoryRecord(resource(scope))], [...powerPlatformResourceTypes]);
   for (const source of ["users", "graph_packages", "power_platform", "usage_reports"] as const) {
     await repository.recordSuccessMarker(scope, source, source === "usage_reports" ? 3 : 1, now());
   }
@@ -287,8 +320,8 @@ function submitProvider(scope: DataSyncScope, provider: "packages" | "inventory"
 
 function publishProvider(scope: DataSyncScope, provider: "packages" | "inventory", jobId: string) {
   return provider === "packages"
-    ? packages.publish(scope, jobId, { packages: [], totalRecords: 0, pages: 1 })
-    : inventory.publish(scope, jobId, { resources: [], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null, totalRecords: 0, pages: 1, unknownFieldCount: 0 });
+    ? refreshInventoryFixture(fixture.runtime, scope, jobId, "packages", [])
+    : refreshInventoryFixture(fixture.runtime, scope, jobId, "power_platform", [], [...powerPlatformResourceTypes]);
 }
 
 function resource(scope: DataSyncScope): PowerPlatformResource {
@@ -302,38 +335,42 @@ function resource(scope: DataSyncScope): PowerPlatformResource {
 }
 
 async function scopedSnapshots(scope: DataSyncScope) {
-  const tables = [
-    "copilot_usage_snapshots", "copilot_usage_source_state", "package_inventory_snapshots", "package_inventory_resources",
-    "power_platform_inventory_snapshots", "power_platform_inventory_resources",
-  ];
-  return Object.fromEntries(await Promise.all(tables.map(async table => [
-    table,
-    (await fixture.runtime.query(`SELECT to_jsonb(value) AS value FROM ${table} value
-      WHERE tenant_id=$1 AND principal_id=$2 ORDER BY to_jsonb(value)::text`, [scope.tenantId, scope.principalId])).rows,
-  ])));
+  const inventoryRoots = (await fixture.runtime.query(`SELECT root.scope_id,root.baseline_id,root.revision,root.domain
+    FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
+    JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
+    JOIN data_generations generation ON generation.id=revision.generation_id
+    WHERE root.current AND scope.tenant_id=$1 AND scope.principal_id=$2
+      AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
+      AND generation.state='published' AND generation.expires_at>clock_timestamp()
+    ORDER BY root.scope_id LIMIT 17`, [scope.tenantId, scope.principalId])).rows;
+  expect(inventoryRoots.length).toBeLessThan(17);
+  const inventoryRecords = (await fixture.runtime.query(`SELECT record.generation_id,record.identity,record.domain
+    FROM inventory_roots root JOIN inventory_memberships membership ON membership.baseline_id=root.baseline_id
+      AND membership.valid_from_revision<=root.revision AND (membership.valid_to_revision IS NULL OR membership.valid_to_revision>root.revision)
+    JOIN inventory_records record ON record.generation_id=membership.generation_id AND record.identity=membership.identity
+    WHERE root.scope_id=ANY($1::uuid[]) AND root.current ORDER BY record.domain,record.identity LIMIT 250`,
+  [inventoryRoots.map(root => root.scope_id)])).rows;
+  expect(inventoryRecords.length).toBeLessThan(250);
+  const { selection: _selection, ...userSources } = await userPage(scope);
+  return { inventoryRoots, inventoryRecords, userSources };
 }
 
 async function tableRows(tables: string[]) {
-  return Object.fromEntries(await Promise.all(tables.map(async table => [
-    table, (await fixture.runtime.query(`SELECT to_jsonb(value) AS value FROM ${table} value ORDER BY to_jsonb(value)::text`)).rows,
-  ])));
+  return fingerprints(fixture.operator, tables);
 }
 
 async function seedAcceptedUsage(scope: DataSyncScope) {
-  const official = new OfficialUsageRepository(fixture.runtime);
+  const official = new OfficialReportImports(fixture.runtime);
   const bundleId = randomUUID();
   for (const content of [
     "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nagent,Agent,Your org,1,0,4,2026-08-15",
     "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nagent,Agent,Your org,user@example.invalid,4,2026-08-15",
     "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nuser@example.invalid,User,1,4,2026-08-15",
   ]) {
-    await official.stage(scope, {
-      report: parseOfficialUsageReport(Buffer.from(content), {
+    await official.stage(identity(scope), { bundleId }, (async function* () { yield Buffer.from(content); })(), {
         reportingPeriod: { startDate: "2026-08-02", endDate: "2026-08-31", provenance: "operator_asserted" },
         sourceAsOf: { value: "2026-09-01T00:00:00.000Z", provenance: "operator_asserted" },
-      }),
-      fileHash: createHash("sha256").update(content).digest("hex"), bundleId,
     });
   }
-  await official.acceptBundle(scope, bundleId, await official.previewBundle(scope, bundleId));
+  await official.acceptBundle(identity(scope), bundleId, await official.bundle(identity(scope), bundleId));
 }

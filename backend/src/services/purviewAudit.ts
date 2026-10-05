@@ -210,9 +210,10 @@ export class PurviewAuditService {
     return this.repository.relatedInventoryRecords(await this.readScope(user), target, limit);
   }
 
-  async agentRecords(user: AuthenticatedUser, recordId: string, query: AgentPurviewQuery): Promise<AgentPurviewRecordPage> {
+  async agentRecords(user: AuthenticatedUser, recordId: string, query: AgentPurviewQuery,
+    context = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations)): Promise<AgentPurviewRecordPage> {
     requireViewer(user);
-    const resolve = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations);
+    const resolve = context;
     const current = await resolve(actorScope(user), recordId);
     if (!current.purviewTarget) throw new AppError(409, "agent_investigation_unavailable", current.context.purview.reason!);
     const readScope = await this.readScope(user);

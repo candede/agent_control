@@ -11,8 +11,10 @@ const mocks = vi.hoisted(() => {
     Pool: vi.fn(),
     databaseSettings: vi.fn(() => ({ database: "agentcontrol_test_control" })),
     bootstrap: vi.fn(async () => undefined),
-    migrate: vi.fn(async () => undefined),
+    initializeSchema: vi.fn(async () => undefined),
     grantRuntime: vi.fn(async () => undefined),
+    template: vi.fn<() => Promise<string | undefined>>(async () => undefined),
+    verify: vi.fn(async () => undefined),
   };
 });
 
@@ -22,17 +24,21 @@ vi.mock("../src/db/pool.js", () => ({
   secretValue: () => undefined,
 }));
 vi.mock("./database.js", () => ({
-  bootstrap: mocks.bootstrap, migrate: mocks.migrate, grantRuntime: mocks.grantRuntime,
+  bootstrap: mocks.bootstrap, initializeSchema: mocks.initializeSchema, grantRuntime: mocks.grantRuntime,
 }));
+vi.mock("./testDatabaseTemplate.js", () => ({ prepareTestSchemaTemplate: mocks.template }));
+vi.mock("../src/db/schema.js", () => ({ verifySchema: mocks.verify }));
 
 beforeEach(() => {
   for (const pool of [mocks.admin, mocks.operator, mocks.runtime]) {
     pool.query.mockReset().mockResolvedValue({ rows: [] });
     pool.end.mockReset().mockResolvedValue(undefined);
   }
-  for (const operation of [mocks.bootstrap, mocks.migrate, mocks.grantRuntime]) {
+  for (const operation of [mocks.bootstrap, mocks.initializeSchema, mocks.grantRuntime]) {
     operation.mockReset().mockResolvedValue(undefined);
   }
+  mocks.template.mockReset().mockResolvedValue(undefined);
+  mocks.verify.mockReset().mockResolvedValue(undefined);
   mocks.databaseSettings.mockReset().mockReturnValue({ database: "agentcontrol_test_control" });
   mocks.Pool.mockReset()
     .mockImplementationOnce(function () { return mocks.admin; })
@@ -42,6 +48,26 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); });
 
 describe("isolated test database lifecycle without PostgreSQL", () => {
+  it("clones only the prepared owned template while retaining bootstrap and runtime schema verification", async () => {
+    mocks.template.mockResolvedValue("agentcontrol_test_schema_1234");
+    const fixture = await testDatabase();
+    expect(mocks.admin.query).toHaveBeenCalledExactlyOnceWith(
+      `CREATE DATABASE "${fixture.name}" TEMPLATE "agentcontrol_test_schema_1234" ALLOW_CONNECTIONS true`);
+    expect(mocks.bootstrap).toHaveBeenCalledOnce();
+    expect(mocks.verify).toHaveBeenCalledExactlyOnceWith(mocks.runtime);
+    expect(mocks.initializeSchema).not.toHaveBeenCalled();
+    expect(mocks.grantRuntime).not.toHaveBeenCalled();
+    await fixture.close();
+    expect(mocks.admin.query).toHaveBeenLastCalledWith(`DROP DATABASE "${fixture.name}"`);
+  });
+
+  it("never creates a leaf database when its template fails identity verification", async () => {
+    mocks.template.mockRejectedValue(new Error("test_schema_template_identity"));
+    await expect(testDatabase()).rejects.toThrow("test_schema_template_identity");
+    expect(mocks.admin.query).not.toHaveBeenCalled();
+    expect(mocks.admin.end).toHaveBeenCalledOnce();
+  });
+
   it("rejects an unguarded database before constructing any pools", async () => {
     mocks.databaseSettings.mockReturnValue({ database: "agentcontrol" });
     await expect(testDatabase()).rejects.toThrow("separately named agentcontrol_test_*");
@@ -53,7 +79,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
     expect(fixture.name).toMatch(/^agentcontrol_test_[a-f0-9]{32}$/);
     expect(mocks.admin.query).toHaveBeenCalledExactlyOnceWith(`CREATE DATABASE "${fixture.name}"`);
     expect(mocks.bootstrap).toHaveBeenCalledOnce();
-    expect(mocks.migrate).toHaveBeenCalledExactlyOnceWith(mocks.operator);
+    expect(mocks.initializeSchema).toHaveBeenCalledExactlyOnceWith(mocks.operator);
     expect(mocks.grantRuntime).toHaveBeenCalledExactlyOnceWith(mocks.operator);
     expect(mocks.admin.end).not.toHaveBeenCalled();
     await fixture.close();
@@ -67,7 +93,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
   it("retains the uninitialized fixture option", async () => {
     const fixture = await testDatabase(false);
     expect(mocks.bootstrap).not.toHaveBeenCalled();
-    expect(mocks.migrate).not.toHaveBeenCalled();
+    expect(mocks.initializeSchema).not.toHaveBeenCalled();
     expect(mocks.grantRuntime).not.toHaveBeenCalled();
     await fixture.close();
     expect(mocks.admin.end).toHaveBeenCalledOnce();
@@ -82,7 +108,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
     expect(mocks.Pool).toHaveBeenCalledOnce();
   });
 
-  it.each(["bootstrap", "migrate", "grantRuntime"] as const)("cleans up when %s fails before returning a fixture", async stage => {
+  it.each(["bootstrap", "initializeSchema", "grantRuntime"] as const)("cleans up when %s fails before returning a fixture", async stage => {
     const failure = new Error(`${stage} failed`);
     mocks[stage].mockRejectedValueOnce(failure);
     await expect(testDatabase()).rejects.toBe(failure);
@@ -103,9 +129,9 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
   });
 
   it("reports both initialization and cleanup failures", async () => {
-    const setupFailure = new Error("migration failed");
+    const setupFailure = new Error("schema initialization failed");
     const cleanupFailure = new Error("drop failed");
-    mocks.migrate.mockRejectedValueOnce(setupFailure);
+    mocks.initializeSchema.mockRejectedValueOnce(setupFailure);
     mocks.admin.query.mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(cleanupFailure);
     await expect(testDatabase()).rejects.toMatchObject({
       name: "AggregateError", errors: [setupFailure, cleanupFailure],

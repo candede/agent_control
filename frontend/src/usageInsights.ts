@@ -1,7 +1,6 @@
-import type { OfficialUsageAggregateView, OfficialUsageSetSummary } from "./api/client";
-import { usersRouteSearch, workbenchUrl } from "./workbenchRouting";
+import type { ReportMetadata } from "../../backend/src/types/officialReportData";
 
-export function usageAvailabilityLabel(value: OfficialUsageAggregateView["availability"]) {
+export function usageAvailabilityLabel(value: ReportMetadata["availability"]) {
   const labels = {
     active: "Selected report",
     stale: "Out-of-date report",
@@ -13,8 +12,8 @@ export function usageAvailabilityLabel(value: OfficialUsageAggregateView["availa
   return labels[value];
 }
 
-export function usageCoverageLabel(set: OfficialUsageSetSummary | null) {
-  if (!set?.reportingPeriod.startDate || !set.reportingPeriod.endDate) return "Reporting period not supplied";
+export function usageCoverageLabel(set: Pick<ReportMetadata, "reportingPeriod"> | null) {
+  if (!set?.reportingPeriod?.startDate || !set.reportingPeriod.endDate) return "Reporting period not supplied";
   const { startDate, endDate, provenance } = set.reportingPeriod;
   const label = provenance === "activity_range" ? "Observed activity range"
     : provenance === "operator_asserted" ? "Admin-supplied period" : "Reporting period";
@@ -35,14 +34,4 @@ export function usageDate(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? "Not reported" : new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium", timeZone: "UTC",
   }).format(date);
-}
-
-export function usagePageLabel(page: { value: readonly unknown[]; count: number; offset: number }, items: string) {
-  if (!page.count) return `No matching ${items}`;
-  if (!page.value.length) return `No ${items} on this page (${page.count.toLocaleString()} matching)`;
-  return `${(page.offset + 1).toLocaleString()}-${Math.min(page.offset + page.value.length, page.count).toLocaleString()} of ${page.count.toLocaleString()} ${items}`;
-}
-
-export function reportedUserActivityUrl(agentId?: string, reportSetId?: string, search = "") {
-  return workbenchUrl("users", usersRouteSearch({ view: "activity", agentId, reportSetId, search, page: 0 }));
 }

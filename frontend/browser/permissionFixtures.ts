@@ -1,4 +1,4 @@
-export function fixtureLoginUrl(scenario: string) {
+export function fixtureLoginUrl(scenario: string, username = "fixture@example.invalid") {
   if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser") {
     throw new Error("Real HTTP browser checks require the isolated synthetic-auth fixture.");
   }
@@ -8,7 +8,8 @@ export function fixtureLoginUrl(scenario: string) {
     throw new Error("The browser fixture requires a plain HTTP loopback origin.");
   }
   const login = new URL("/api/auth/login", origin);
-  login.searchParams.set("username", "fixture@example.invalid");
+  if (!/^fixture@(?:example\.invalid|csv-(?:desktop|mobile)\.example\.invalid)$/.test(username)) throw new Error("Invalid synthetic sign-in identity.");
+  login.searchParams.set("username", username);
   login.searchParams.set("returnTo", `/permissions?${new URLSearchParams({ fixture: scenario })}`);
   return login.href;
 }
@@ -33,6 +34,7 @@ export function isUnexpectedPermissionCommand(method: string, pathname: string) 
   return method !== "POST" || ![
     "/api/capabilities/check",
     "/api/data-sync/auto-refresh",
+    "/api/agent-inventory/selections",
     "/api/auth/consent",
     "/api/auth/logout",
   ].includes(pathname);

@@ -14,6 +14,7 @@ import {
   type FetchLike,
 } from "./graphPackages.js";
 import { allowlistedPackage } from "./packageObservation.js";
+import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 
 vi.mock("node:timers/promises", { spy: true });
 
@@ -49,14 +50,42 @@ describe("GraphPackagesClient", () => {
 
   it.each([null, {}, { value: null }, { value: {} }])("rejects invalid inventory page schemas: %j", async body => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json(body));
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token")).rejects.toMatchObject({ code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("rejects an inventory page with no response body", async () => {
     const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 204 }));
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token")).rejects.toMatchObject({ code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("follows opaque continuation links despite changing catalog count hints and empty intermediate pages", async () => {
+    const urls = [buildCopilotAgentsListUrl(), `${buildCopilotAgentsListUrl()}&$skiptoken=second`,
+      `${buildCopilotAgentsListUrl()}&$skiptoken=third`];
+    let page = 0;
+    const fetcher = vi.fn<FetchLike>(async url => {
+      expect(String(url)).toBe(urls[page]);
+      const current = page++;
+      return Response.json({
+        value: current === 1 ? [] : [{ id: `P_${current}`, displayName: "Package", isBlocked: false }],
+        "@odata.count": [951, 0, 1][current],
+        ...(current < 2 ? { "@odata.nextLink": urls[current + 1] } : {}),
+      });
+    });
+    const onProgress = vi.fn();
+    expect(await tinyGraphCatalog(new GraphPackagesClient(fetcher), "token", { onProgress }))
+      .toMatchObject([{ id: "P_0" }, { id: "P_2" }]);
+    expect(onProgress.mock.calls.map(([progress]) => progress)).toEqual([
+      { pages: 1, observedCount: 1, totalRecords: null },
+      { pages: 2, observedCount: 1, totalRecords: null },
+      { pages: 3, observedCount: 2, totalRecords: 2 },
+    ]);
+  });
+
+  it.each([null, -1, 1.5, "2"])("rejects malformed catalog count metadata: %j", async count => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [], "@odata.count": count }));
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it.each([null, false, true, 0, 1, "", "   ", {}, []].map(nextLink => ({ nextLink })))("rejects an invalid inventory continuation link: $nextLink", async ({ nextLink }) => {
@@ -65,14 +94,14 @@ describe("GraphPackagesClient", () => {
       "@odata.nextLink": nextLink,
     }));
     const onProgress = vi.fn();
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token", { onProgress })).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token", { onProgress })).rejects.toMatchObject({ code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(onProgress).not.toHaveBeenCalled();
   });
 
   it.each(["not a URL", "/v1.0/copilot/admin/catalog/packages?page=2", "https://["])("rejects a malformed continuation URL without fetching it: %s", async nextLink => {
-    const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [], "@odata.nextLink": nextLink }));
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "invalid_provider_link" });
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [{ id: "P_1", displayName: "Package", isBlocked: false }], "@odata.nextLink": nextLink }));
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
@@ -97,7 +126,7 @@ describe("GraphPackagesClient", () => {
       }));
       const client = new GraphPackagesClient(fetcher);
       const result = operation === "probe" ? client.checkCatalogAccess("token")
-        : operation === "inventory" ? client.listCopilotAgents("token") : client.getPackageDetails("token", "P_1");
+        : operation === "inventory" ? tinyGraphCatalog(client, "token") : client.getPackageDetails("token", "P_1");
       const assertion = expect(result).resolves.toEqual(operation === "probe" ? undefined
         : operation === "inventory" ? [] : expect.objectContaining({ id: "P_1", isBlocked: false }));
       await vi.advanceTimersByTimeAsync(12_000);
@@ -140,7 +169,7 @@ describe("GraphPackagesClient", () => {
     const reason = new AppError(409, "cancelled", "Cancelled");
     const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [] }));
     const onProgress = vi.fn(async () => { controller.abort(reason); });
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token", {
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token", {
       signal: controller.signal, onProgress,
     })).rejects.toBe(reason);
     expect(fetcher).toHaveBeenCalledOnce();
@@ -332,12 +361,12 @@ describe("GraphPackagesClient", () => {
           },
         ],
         "@odata.nextLink":
-          "https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?page=2",
+          `${buildCopilotAgentsListUrl()}&page=2`,
       });
     });
 
     const client = new GraphPackagesClient(fetcher);
-    const agents = await client.listCopilotAgents("token");
+    const agents = await tinyGraphCatalog(client, "token");
 
     expect(agents.map((agent) => agent.id)).toEqual(["P_1", "P_2"]);
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -345,11 +374,11 @@ describe("GraphPackagesClient", () => {
 
   it("rejects a hostile pagination link before sending the token", async () => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json({
-      value: [],
+      value: [{ id: "P_1", displayName: "Package", isBlocked: false }],
       "@odata.nextLink": "https://unapproved.invalid/v1.0/copilot/admin/catalog/packages",
     }));
 
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "token")).rejects.toMatchObject({
       status: 502,
       code: "invalid_provider_link",
     });
@@ -772,7 +801,7 @@ describe("GraphPackagesClient", () => {
       { maxAttempts: 1 },
     );
 
-    await expect(client.listCopilotAgents("token")).rejects.toMatchObject({
+    await expect(tinyGraphCatalog(client, "token")).rejects.toMatchObject({
       status: 503,
       code: "graph_error",
       message: "Microsoft Graph request failed with status 503.",

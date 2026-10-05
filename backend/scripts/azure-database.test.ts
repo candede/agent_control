@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { migrations } from "../src/db/schema.js";
-import { migrate, bootstrap, grantRuntime } from "./database.js";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { schemaFingerprint } from "../src/db/schema.js";
+import { initializeSchema, bootstrap, grantRuntime } from "./database.js";
 import { testDatabase, fixturePassword } from "./testDatabase.js";
 import {
   enterAzureMaintenance,
@@ -13,61 +16,61 @@ import {
 
 let initialized: Awaited<ReturnType<typeof testDatabase>>;
 let empty: Awaited<ReturnType<typeof testDatabase>>;
-let previousRelease: Awaited<ReturnType<typeof testDatabase>>;
 
 beforeAll(async () => {
   initialized = await testDatabase();
   empty = await testDatabase(false);
-  previousRelease = await testDatabase(false);
-  await bootstrap(previousRelease.operator, fixturePassword);
-  await migrate(previousRelease.operator, migrations.slice(0, -1));
-  await grantRuntime(previousRelease.operator);
 });
 afterAll(async () => {
   await initialized.close();
   await empty.close();
-  await previousRelease.close();
 });
 
 describe("Azure database identity and sequencing guards", () => {
-  it("separates explicitly empty first install from an exact known upgrade", async () => {
-    await expect(preflightAzureDatabase(empty.operator, "fresh", 0, empty.name)).resolves.toMatchObject({
+  it("rejects unsupported operator actions without emitting a success result", async () => {
+    await expect(promisify(execFile)(process.execPath,
+      ["--import", "tsx", fileURLToPath(new URL("./azure-database.ts", import.meta.url)), "unsupported"],
+      { env: { ...process.env, PGDATABASE: initialized.name }, timeout: 15_000 },
+    )).rejects.toMatchObject({
+      code: 1, stdout: "", stderr: expect.stringContaining('"outcome":"failed"'),
+    });
+  });
+
+  it("separates explicitly empty first install from an existing current schema", async () => {
+    await expect(preflightAzureDatabase(empty.operator, "fresh", empty.name)).resolves.toMatchObject({
       mode: "fresh",
       database: empty.name,
-      currentVersion: 0,
+      currentFingerprint: null,
+      targetFingerprint: schemaFingerprint,
       tableCount: 0,
     });
     await bootstrap(empty.operator, fixturePassword);
-    await migrate(empty.operator);
+    await initializeSchema(empty.operator);
     await grantRuntime(empty.operator);
-    await expect(preflightAzureDatabase(empty.operator, "fresh", 0, empty.name)).rejects.toThrow("never replaced");
-    await expect(preflightAzureDatabase(empty.operator, "upgrade", migrations.length, empty.name)).resolves.toMatchObject({
-      currentVersion: migrations.length,
+    await expect(preflightAzureDatabase(empty.operator, "fresh", empty.name)).rejects.toThrow("never replaced");
+    await expect(preflightAzureDatabase(empty.operator, "existing", empty.name)).resolves.toMatchObject({
+      currentFingerprint: schemaFingerprint,
     });
   });
 
   it("rejects missing, stale and modified expected schemas instead of initializing", async () => {
     const blank = await testDatabase(false);
     try {
-      await expect(preflightAzureDatabase(blank.operator, "upgrade", migrations.length, blank.name)).rejects.toThrow("initialization fallback");
+      await expect(preflightAzureDatabase(blank.operator, "existing", blank.name)).rejects.toThrow("initialization fallback");
     } finally {
       await blank.close();
     }
-    await expect(preflightAzureDatabase(initialized.operator, "upgrade", migrations.length - 1, initialized.name)).rejects.toThrow("exact approved");
-    await initialized.operator.query("UPDATE schema_migrations SET checksum='changed' WHERE version=$1", [migrations.length]);
-    await expect(preflightAzureDatabase(initialized.operator, "upgrade", migrations.length, initialized.name)).rejects.toThrow("modified migration");
-    await initialized.operator.query("UPDATE schema_migrations SET checksum=$1 WHERE version=$2", [
-      (await empty.operator.query("SELECT checksum FROM schema_migrations WHERE version=$1", [migrations.length])).rows[0].checksum,
-      migrations.length,
-    ]);
+    await initialized.operator.query("UPDATE app_schema SET fingerprint=repeat('0',64)");
+    try {
+      await expect(preflightAzureDatabase(initialized.operator, "existing", initialized.name))
+        .rejects.toMatchObject({ code: "database_schema_reset_required" });
+    } finally { await initialized.operator.query("UPDATE app_schema SET fingerprint=$1", [schemaFingerprint]); }
   });
 
-  it("accepts the approved previous-release baseline and the current schema on repeat deployment", async () => {
-    await expect(preflightAzureDatabase(previousRelease.operator, "upgrade", migrations.length - 1, previousRelease.name))
-      .resolves.toMatchObject({ currentVersion: migrations.length - 1 });
-    await migrate(previousRelease.operator);
-    await expect(preflightAzureDatabase(previousRelease.operator, "upgrade", migrations.length, previousRelease.name))
-      .resolves.toMatchObject({ currentVersion: migrations.length });
+  it("accepts repeated initialization and deployment of the exact current schema", async () => {
+    await initializeSchema(initialized.operator);
+    await expect(preflightAzureDatabase(initialized.operator, "existing", initialized.name))
+      .resolves.toMatchObject({ currentFingerprint: schemaFingerprint, targetFingerprint: schemaFingerprint });
   });
 
   it("keeps maintenance closed through drain and reopens with provider work disabled", async () => {
@@ -94,7 +97,7 @@ describe("Azure database identity and sequencing guards", () => {
   });
 
   it("requires the fixed administrator and exact database identity", async () => {
-    await expect(preflightAzureDatabase(initialized.runtime, "upgrade", migrations.length, initialized.name)).rejects.toThrow("requires agentcontrol_admin");
+    await expect(preflightAzureDatabase(initialized.runtime, "existing", initialized.name)).rejects.toThrow("requires agentcontrol_admin");
     await expect(verifyAzureRuntimePrivileges(initialized.runtime, initialized.name)).resolves.toMatchObject({
       user: "agentcontrol_app",
       ddlDenied: true,

@@ -126,7 +126,6 @@
   overflow-wrap: anywhere;
 }
 
-.agent-investigations .hunting-readiness,
 .agent-investigations .hunting-primary-fields {
   grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
 }
@@ -138,10 +137,8 @@
   background: #fff;
 }
 
-.agent-insight-actions,
 .agent-insight-toolbar,
-.agent-insight-pagination,
-.agent-usage-context {
+.agent-insight-pagination {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -149,72 +146,14 @@
   min-width: 0;
 }
 
-.agent-insight-empty h4,
-.agent-usage-context p {
+.agent-insight-empty h4 {
   margin: 0;
-}
-
-.agent-usage-context {
-  color: var(--muted);
-  font-size: 0.8rem;
-}
-
-.agent-usage-context p {
-  flex-basis: 100%;
-}
-
-.agent-insight-badge {
-  padding: 4px 8px;
-  border-radius: 5px;
-  color: #254f48;
-  background: #e8f1ef;
-  font-weight: 650;
-}
-
-.agent-insight-badge.attention {
-  color: #745019;
-  background: #fff0d5;
 }
 
 .agent-usage-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
-}
-
-.agent-usage-date-range,
-.agent-usage-users {
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-}
-
-.agent-usage-date-range > span,
-.agent-usage-date-range > small {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.agent-usage-users h4 {
-  margin: 0;
-}
-
-.agent-usage-users input {
-  flex: 1;
-  min-width: 150px;
-}
-
-.agent-usage-users td {
-  overflow-wrap: anywhere;
-}
-
-.agent-usage-users th:first-child {
-  width: 70%;
-}
-
-.agent-usage-users th:last-child,
-.agent-usage-users td:last-child {
-  text-align: right;
 }
 
 .agent-usage-metric {
@@ -254,58 +193,8 @@
   font-size: 0.8rem;
 }
 
-.agent-usage-metric dd,
-.agent-usage-confirmation dd {
+.agent-usage-metric dd {
   margin: 0;
-}
-
-.agent-usage-association-list {
-  display: grid;
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.agent-usage-association-list li,
-.agent-usage-confirmation {
-  display: grid;
-  gap: 12px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.agent-usage-association-list li > div:first-child,
-.agent-usage-confirmation label:not(.agent-usage-confirm-checkbox),
-.agent-usage-confirmation dl {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-}
-
-.agent-usage-association-list code,
-.agent-usage-confirmation code {
-  display: block;
-  overflow-wrap: anywhere;
-}
-
-.agent-usage-confirmation select {
-  width: 100%;
-  min-width: 0;
-}
-
-.agent-usage-confirm-checkbox {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.agent-usage-confirm-checkbox input {
-  flex: none;
-  width: auto;
 }
 
 .agent-insight-note,

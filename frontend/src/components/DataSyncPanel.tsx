@@ -35,6 +35,8 @@ import {
 import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { SyncDialog } from "./SyncDialog";
+import { FirstSyncNotice } from "./FirstSyncNotice";
+import type { AutomaticRefreshStatus } from "../useAutomaticRefresh";
 import {
   automaticSyncSources,
   formatSyncInstant as formatInstant,
@@ -56,6 +58,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   principalKey: string;
   canUploadUsage: boolean;
   active?: boolean;
+  onOpenSync?: () => void;
+  automaticRefresh?: AutomaticRefreshStatus;
   onSetupRequiredChange?: (required: boolean) => void;
   onRunsChanged?: () => void;
   requestedRunId?: string;
@@ -67,6 +71,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   principalKey,
   canUploadUsage,
   active = true,
+  onOpenSync,
+  automaticRefresh,
   onSetupRequiredChange,
   onRunsChanged,
   requestedRunId,
@@ -446,7 +452,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     );
   }
 
-  if (!active) return null;
+  if (!active) return onOpenSync && (!state || state.onboardingRequired) ? (
+    <FirstSyncNotice state={state} loading={loading} busy={Boolean(busy)} error={error}
+      automaticRefresh={automaticRefresh} cannotStart={cannotStart}
+      onStart={sources => void start("initial", sources)}
+      onCheckStatus={() => void refresh()} onOpenSync={onOpenSync} />
+  ) : null;
 
   return (
     <section className="data-sync-panel" aria-labelledby="data-sync-heading" aria-busy={loading || Boolean(busy)}>

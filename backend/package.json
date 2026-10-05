@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@azure/msal-node": "^5.3.1",
-    "@types/multer": "^2.2.0",
     "connect-pg-simple": "^10.0.0",
     "csv-parse": "^7.0.2",
     "express": "^5.2.1",
@@ -30,6 +29,7 @@
     "@types/connect-pg-simple": "^7.0.3",
     "@types/express": "^5.0.6",
     "@types/express-session": "^1.18.2",
+    "@types/multer": "^2.2.0",
     "@types/node": "^24.13.2",
     "@types/pg": "^8.15.6",
     "fflate": "^0.8.2",

@@ -1,21 +1,16 @@
-import type { AgentUsageContext, AgentUsageSummary } from "../api/client";
-import { usageFixtureSetId, usageInsightsPublished } from "./usageInsightsFixture";
+import type { InventoryReportContext, InventoryReportSummary } from "../../../backend/src/types/unifiedAgents";
+import { reports, reportSetId } from "./reportDataFixture";
 
 export const automaticUsagePackageId = "P_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 export const automaticUsageReportName = "Excel (Agent)";
-export const automaticUsageContext: AgentUsageContext = {
-  availability: "active", revision: "b".repeat(64), reportSet: usageInsightsPublished.activeSet,
-  lineages: [usageInsightsPublished.reports.agents!.lineage],
+export const automaticUsageContext: InventoryReportContext = {
+  revision: "b".repeat(64), reports, expiresAt: reports.expiresAt,
 };
 
-export function automaticAgentUsageFixture(overrides: Partial<AgentUsageSummary> = {}): AgentUsageSummary {
+export function automaticAgentUsageFixture(overrides: Partial<InventoryReportSummary> = {}): InventoryReportSummary {
   return {
-    status: "linked", reportSetId: usageFixtureSetId, responses: 181, activeUsers: 7,
+    recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", status: "linked", reportSetId, responses: 181, activeUsers: 7, associationCount: 1,
     lastActivityDateUtc: "2026-09-12T00:00:00.000Z",
-    associations: [{
-      reportAgentId: automaticUsagePackageId, reportAgentName: automaticUsageReportName,
-      basis: "exact_package_id", target: { source: "graph_packages", packageId: automaticUsagePackageId },
-    }],
     ...overrides,
   };
 }

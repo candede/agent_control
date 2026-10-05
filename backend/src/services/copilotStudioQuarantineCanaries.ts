@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { CopilotStudioQuarantineCanaryRepository, type QuarantineCanaryApproval } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { NativeInventory } from "../db/nativeInventory.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority, QuarantineJob } from "../types/copilotStudioQuarantine.js";
@@ -33,7 +33,7 @@ export class CopilotStudioQuarantineCanaryService {
   constructor(
     private readonly canaries = new CopilotStudioQuarantineCanaryRepository(),
     private readonly jobs = new CopilotStudioQuarantineRepository(),
-    private readonly inventory = new PowerPlatformInventoryRepository(),
+    private readonly inventory = new NativeInventory(),
     private readonly provider = new CopilotStudioQuarantineClient(),
     private readonly dependencies: CanaryDependencies = defaultDependencies,
   ) {}

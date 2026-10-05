@@ -1,202 +1,163 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as api from "../api/client";
-import { usageAggregateFixture } from "../test/usageInsightsFixture";
+import type { ReportAgent, ReportPage } from "../../../backend/src/types/officialReportData";
+import { ApiError } from "../api/client";
+import * as api from "../api/reportData";
+import { reportAgent, reportPage, reports, reportSetId, selectionId } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 import { OfficialUsageSnapshot } from "./OfficialUsageSnapshot";
 import { SavedQueryProvider } from "./SavedQueryProvider";
-import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
+vi.mock("../api/reportData", async original => ({ ...await original<typeof import("../api/reportData")>(),
+  readReportPage: vi.fn(), readReportDetail: vi.fn(), readReportFacet: vi.fn(),
+  createReportExport: vi.fn(), reportExportStatus: vi.fn(), cancelReportExport: vi.fn() }));
 const props = { activityWindowDays: 30, revision: 0, onBack: vi.fn() };
+function page(setId = reportSetId, name = "Researcher") {
+  return reportPage([reportAgent(1, { agentName: name })], { reports: { ...reports, setId },
+    page: { limit: 50, nextCursor: "next", previousCursor: null } });
+}
 beforeEach(() => {
-  vi.clearAllMocks();
-  vi.spyOn(api, "getOfficialUsageAggregate").mockImplementation(async query => {
-    const data = usageAggregateFixture({ staleAfterDays: 35, ...query, agentSortBy: query?.sortBy });
-    if (query?.setId) data.activeSet!.id = query.setId;
-    return data;
-  });
+  vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("/users") ? reportPage([]) : page(query?.setId));
+  vi.mocked(api.readReportDetail).mockResolvedValue({ value: reportAgent(1, { agentName: "Researcher" }),
+    reports, sources: page().sources, selection: page().selection });
+  vi.mocked(api.readReportFacet).mockResolvedValue({ value: [], counts: { total: 0, filtered: 0 },
+    page: { limit: 50, nextCursor: null, previousCursor: null }, selection: page().selection });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
-describe("controlled snapshot inspection", () => {
-  it("loads the exact set and window with source details, tenant totals, and one back action", async () => {
-    render(<OfficialUsageSnapshot {...props} setId="retained-set" activityWindowDays={7} />);
+describe("exact selected snapshot inspection", () => {
+  it("loads the exact set and requested activity window, tenant totals and lazy detail without changing the active set", async () => {
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} activityWindowDays={7} />);
     expect(screen.getByRole("region", { name: "Snapshot inspection" })).toHaveAttribute("tabindex", "0");
-    await screen.findByRole("region", { name: "Report agent rows" });
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledWith(
-      expect.objectContaining({ setId: "retained-set", activityWindowDays: 7, limit: 25, offset: 0 }), { signal: expect.any(AbortSignal) });
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
+    await screen.findByRole("button", { name: "Researcher" });
+    expect(api.readReportPage).toHaveBeenCalledWith("official-usage/aggregate",
+      expect.objectContaining({ setId: reportSetId, activityWindowDays: 7, limit: 50 }), expect.any(AbortSignal));
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("1,000,000");
     expect(screen.getByText(/does not change the selected report set/)).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Researcher" }));
-    expect(screen.getByRole("region", { name: "Source details for Researcher" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+    fireEvent.click(screen.getByRole("button", { name: "Researcher" }));
+    await within(screen.getByRole("region", { name: "Exact reported agent details" })).findByRole("heading", { name: "Researcher" });
+    expect(api.readReportDetail).toHaveBeenCalledWith("official-usage/agents/agent-1", selectionId, expect.any(AbortSignal));
+    fireEvent.click(screen.getByRole("button", { name: "Back to reports" }));
     expect(props.onBack).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: /View current snapshot|Refresh snapshot/ })).not.toBeInTheDocument();
   });
-
-  it("pages and resets the offset for search, date and sort changes", async () => {
-    vi.mocked(api.getOfficialUsageAggregate).mockImplementation(async query => {
-      const data = usageAggregateFixture({ staleAfterDays: 35, ...query, agentSortBy: query?.sortBy });
-      data.agents.count = 40;
-      return data;
-    });
+  it("resets cursors when search, sort or dates change and prevents reversed-date reads and exports", async () => {
     render(<OfficialUsageSnapshot {...props} />);
-    await userEvent.click(await screen.findByRole("button", { name: "Next agents" }));
-    await waitFor(() => expect(api.getOfficialUsageAggregate).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 25 }), expect.anything()));
-    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Helpdesk" } });
-    await waitFor(() => expect(api.getOfficialUsageAggregate).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0, search: "Helpdesk" }), expect.anything()));
-    expect(await screen.findByRole("button", { name: "Helpdesk" })).toBeVisible();
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order agents by" }), "agentName-asc");
-    await waitFor(() => expect(api.getOfficialUsageAggregate).toHaveBeenLastCalledWith(expect.objectContaining({ sortBy: "agentName", sortDirection: "asc" }), expect.anything()));
-    expect(await screen.findByRole("columnheader", { name: "Agent" })).toHaveAttribute("aria-sort", "ascending");
-    fireEvent.change(screen.getByLabelText("Agent last activity on or after (UTC)"), { target: { value: "2026-09-10" } });
-    await waitFor(() => expect(api.getOfficialUsageAggregate).toHaveBeenLastCalledWith(expect.objectContaining({ startDate: "2026-09-10", offset: 0 }), expect.anything()));
-    const count = vi.mocked(api.getOfficialUsageAggregate).mock.calls.length;
-    fireEvent.change(screen.getByLabelText("Agent last activity on or before (UTC)"), { target: { value: "2026-09-01" } });
+    await screen.findByRole("button", { name: "Researcher" });
+    fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate",
+      expect.objectContaining({ cursor: "next", selectionId }), expect.any(AbortSignal)));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "Helpdesk" } });
+    await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.search).toBe("Helpdesk"));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.cursor).toBeUndefined();
+    await userEvent.selectOptions(screen.getByLabelText("Sort agents"), "name:asc");
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", expect.objectContaining({ sort: "name", order: "asc" }), expect.any(AbortSignal));
+    fireEvent.change(screen.getByLabelText("Activity start date"), { target: { value: "2026-02-20" } });
+    const before = vi.mocked(api.readReportPage).mock.calls.length;
+    fireEvent.change(screen.getByLabelText("Activity end date"), { target: { value: "2026-02-01" } });
     expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before");
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(count);
-    expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
+    expect(api.readReportPage).toHaveBeenCalledTimes(before);
+    expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
   });
-
-  it.each([401, 403])("clears snapshot evidence on denied refresh (%s), then retries", async status => {
-    const view = render(<OfficialUsageSnapshot {...props} />);
-    await screen.findByRole("region", { name: "Report agent rows" });
-    vi.mocked(api.getOfficialUsageAggregate).mockRejectedValueOnce(new api.ApiError(status, "denied", "Snapshot access denied."));
-    view.rerender(<OfficialUsageSnapshot {...props} revision={1} />);
+  it.each([401, 403])("removes all private snapshot evidence after status %s and retries the same exact selection", async status => {
+    const view = render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await screen.findByRole("button", { name: "Researcher" });
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(status, "forbidden", "Snapshot access denied"));
+    view.rerender(<OfficialUsageSnapshot {...props} setId={reportSetId} revision={1} />);
+    await screen.findByRole("alert");
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Snapshot access denied.");
-    expect(screen.queryByText("Report quality & sources")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Retry report" }));
-    expect(await screen.findByRole("region", { name: "Report agent rows" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    const pending = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve(page()));
+    await screen.findByRole("button", { name: "Researcher" });
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", expect.objectContaining({ setId: reportSetId, selectionId }), expect.any(AbortSignal));
   });
-
-  it("withholds old snapshot evidence and ignores obsolete success/failure when set or window changes", async () => {
-    let finish!: (data: api.OfficialUsageAggregateView) => void;
-    vi.mocked(api.getOfficialUsageAggregate).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  it("honors changed controlled windows and report IDs while ignoring an obsolete transport", async () => {
+    const pending = deferred<ReportPage<ReportAgent>>(); vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
     const view = render(<OfficialUsageSnapshot {...props} setId="A" />);
-    const signal = vi.mocked(api.getOfficialUsageAggregate).mock.calls[0][1]?.signal;
+    const signal = vi.mocked(api.readReportPage).mock.calls[0][2];
     view.rerender(<OfficialUsageSnapshot {...props} setId="B" activityWindowDays={7} />);
-    await screen.findByRole("region", { name: "Report agent rows" });
+    await screen.findByRole("button", { name: "Researcher" });
     expect(signal?.aborted).toBe(true);
-    const old = usageAggregateFixture();
-    old.agents.value[0].agentName = "Obsolete agent";
-    await act(async () => finish(old));
-    expect(screen.queryByText("Obsolete agent")).not.toBeInTheDocument();
-    let fail!: (error: Error) => void;
-    vi.mocked(api.getOfficialUsageAggregate).mockReturnValueOnce(new Promise((_resolve, reject) => { fail = reject; }));
-    view.rerender(<OfficialUsageSnapshot {...props} setId="C" />);
-    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    view.rerender(<OfficialUsageSnapshot {...props} setId="B" />);
-    await screen.findByRole("region", { name: "Report agent rows" });
-    await act(async () => fail(new api.ApiError(403, "old", "Obsolete denial")));
-    expect(screen.queryByText("Obsolete denial")).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Report agent rows" })).toBeVisible();
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate",
+      expect.objectContaining({ setId: "B", activityWindowDays: 7 }), expect.any(AbortSignal));
+    await act(async () => pending.resolve(page("A", "Obsolete")));
+    expect(screen.queryByRole("button", { name: "Obsolete" })).not.toBeInTheDocument();
   });
-
-  it("deduplicates saved reads and aborts abandoned reads on unmount", async () => {
-    vi.mocked(api.getOfficialUsageAggregate).mockReturnValue(new Promise(() => {}));
-    const view = render(<SavedQueryProvider>
-      <OfficialUsageSnapshot {...props} />
-      <OfficialUsageSnapshot {...props} />
-    </SavedQueryProvider>);
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledOnce();
-    const signal = vi.mocked(api.getOfficialUsageAggregate).mock.calls[0][1]?.signal;
+  it("deduplicates concurrent snapshot reads and aborts the abandoned request on unmount", async () => {
+    const pending = deferred<ReportPage<ReportAgent>>(); vi.mocked(api.readReportPage).mockReturnValue(pending.promise);
+    const view = render(<SavedQueryProvider><OfficialUsageSnapshot {...props} /><OfficialUsageSnapshot {...props} /></SavedQueryProvider>);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    const signal = vi.mocked(api.readReportPage).mock.calls[0][2];
     view.unmount();
     expect(signal?.aborted).toBe(true);
   });
-
-  it("discards the old summary after a report change and never substitutes the current set after a retained read fails", async () => {
-    const view = render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
-    await screen.findByRole("region", { name: "Snapshot tenant totals" });
-    let reject!: (failure: Error) => void;
-    vi.mocked(api.getOfficialUsageAggregate).mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail; }));
-    view.rerender(<OfficialUsageSnapshot {...props} revision={1} setId="retained-set" />);
-    expect(screen.getByText("Loading official usage...")).toBeVisible();
+  it("never substitutes the current set after an exact retained-set read fails", async () => {
+    vi.mocked(api.readReportPage).mockRejectedValue(new ApiError(404, "report_set_unavailable", "Retained set unavailable"));
+    render(<OfficialUsageSnapshot {...props} setId="retained" />);
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.readReportPage).mock.calls.every(call => call[1]?.setId === "retained")).toBe(true);
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
-    await act(async () => reject(new api.ApiError(404, "not_found", "The retained set was deleted.")));
-    expect(await screen.findByRole("alert")).toHaveTextContent("The retained set was deleted.");
+  });
+  it("preserves explicitly retained immutable tenant totals on a filter transport failure but never stale rows or export", async () => {
+    render(<OfficialUsageSnapshot {...props} setId="retained" />);
+    await screen.findByRole("button", { name: "Researcher" });
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(0, "network_error", "Search unavailable"));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "Changed filter" } });
+    await screen.findByRole("alert");
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("1,000,000");
+    expect(screen.getByText(/previously read snapshot totals/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
+  });
+  it("does not use retained totals or replay a read after a fenced serialization conflict", async () => {
+    const view = render(<OfficialUsageSnapshot {...props} setId="retained" />);
+    await screen.findByRole("button", { name: "Researcher" });
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(503, "data_read_conflict", "The selected read conflicted"));
+    view.rerender(<OfficialUsageSnapshot {...props} setId="retained" revision={1} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("selected read conflicted");
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(vi.mocked(api.getOfficialUsageAggregate).mock.calls.every(([query]) => query?.setId === "retained-set")).toBe(true);
-    await userEvent.click(screen.getByRole("button", { name: "Retry report" }));
-    expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
-
-  it("preserves the same-generation summary on filter failure, but not stale rows or exports", async () => {
-    render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
-    await screen.findByRole("region", { name: "Report agent rows" });
-    vi.mocked(api.getOfficialUsageAggregate).mockRejectedValueOnce(new Error("Filtered rows unavailable."));
-    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Helpdesk" } });
-    expect(await screen.findByRole("alert")).toHaveTextContent("Filtered rows unavailable.");
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
-    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
-  });
-
-  it("isolates revisions from a pre-action read kept alive by a parallel saved observer", async () => {
-    const client = createSavedQueryClient();
-    const renderSnapshot = (revision: number) => <SavedQueryProvider client={client}>
-      <OfficialUsageSnapshot {...props} revision={revision} setId="retained-set" />
+  it("isolates a new revision from an older request retained by another observer", async () => {
+    const pending = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockResolvedValue(page(reportSetId, "Current"));
+    const panels = (revision: number) => <SavedQueryProvider>
+      <section aria-label="Previous"><OfficialUsageSnapshot {...props} /></section>
+      <section aria-label="Current"><OfficialUsageSnapshot {...props} revision={revision} /></section>
     </SavedQueryProvider>;
-    const view = render(renderSnapshot(0));
-    await screen.findByRole("region", { name: "Snapshot tenant totals" });
-    let finishOld!: (value: api.OfficialUsageAggregateView) => void;
-    let finishNew!: (value: api.OfficialUsageAggregateView) => void;
-    vi.mocked(api.getOfficialUsageAggregate)
-      .mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }))
-      .mockReturnValueOnce(new Promise(resolve => { finishNew = resolve; }));
-    const request = { setId: "retained-set", activityWindowDays: 30, limit: 25, offset: 0 };
-    const lease = new AbortController();
-    const oldRead = readSavedQuery(client, ["official-usage-aggregate", request, 0, 0],
-      signal => api.getOfficialUsageAggregate(request, { signal }), lease.signal);
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(2);
-    const oldSignal = vi.mocked(api.getOfficialUsageAggregate).mock.calls[1][1]?.signal;
-    view.rerender(renderSnapshot(1));
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(3);
-    expect(oldSignal?.aborted).toBe(false);
-    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    const fresh = usageAggregateFixture();
-    fresh.activeSet!.id = "retained-set";
-    fresh.summary.usage.totalResponses = 1234;
-    await act(async () => finishNew(fresh));
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("1,234");
-    const obsolete = usageAggregateFixture();
-    obsolete.activeSet!.id = "retained-set";
-    obsolete.summary.usage.totalResponses = 9999;
-    await act(async () => { finishOld(obsolete); await oldRead; });
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("1,234");
-    expect(screen.queryByText("9,999")).not.toBeInTheDocument();
-    lease.abort();
-    client.clear();
+    const view = render(panels(0));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    view.rerender(panels(1));
+    await within(screen.getByRole("region", { name: "Current" })).findByRole("button", { name: "Current" });
+    await act(async () => pending.resolve(page(reportSetId, "Previous")));
+    await within(screen.getByRole("region", { name: "Previous" })).findByRole("button", { name: "Previous" });
+    expect(within(screen.getByRole("region", { name: "Current" })).queryByRole("button", { name: "Previous" })).not.toBeInTheDocument();
   });
-
-  it("aborts an in-flight read when the date range becomes reversed and ignores its late result", async () => {
-    render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
-    await screen.findByRole("region", { name: "Report agent rows" });
-    let finish!: (value: api.OfficialUsageAggregateView) => void;
-    vi.mocked(api.getOfficialUsageAggregate).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
-    fireEvent.change(screen.getByLabelText("Agent last activity on or after (UTC)"), { target: { value: "2026-09-10" } });
-    const signal = vi.mocked(api.getOfficialUsageAggregate).mock.calls.at(-1)?.[1]?.signal;
-    fireEvent.change(screen.getByLabelText("Agent last activity on or before (UTC)"), { target: { value: "2026-09-01" } });
+  it("aborts a pending read when dates become reversed and ignores its eventual rows", async () => {
+    render(<OfficialUsageSnapshot {...props} />);
+    await screen.findByRole("button", { name: "Researcher" });
+    const pending = deferred<ReportPage<ReportAgent>>(); vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    fireEvent.change(screen.getByLabelText("Activity start date"), { target: { value: "2026-02-20" } });
+    const signal = vi.mocked(api.readReportPage).mock.calls.at(-1)?.[2];
+    fireEvent.change(screen.getByLabelText("Activity end date"), { target: { value: "2026-02-01" } });
     expect(signal?.aborted).toBe(true);
-    expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before");
-    expect(screen.queryByRole("button", { name: "Refresh snapshot" })).not.toBeInTheDocument();
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(2);
-    const obsolete = usageAggregateFixture();
-    obsolete.summary.usage.totalResponses = 9999;
-    await act(async () => finish(obsolete));
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
-    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
-  });
-
-  it.each(["current", "missing"] as const)("rejects a %s response to an exact retained-set request", async response => {
-    const unexpected = usageAggregateFixture();
-    if (response === "missing") unexpected.activeSet = null;
-    vi.mocked(api.getOfficialUsageAggregate).mockResolvedValue(unexpected);
-    render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("No current snapshot has been substituted");
+    await act(async () => pending.resolve(page(reportSetId, "Obsolete")));
+    expect(screen.queryByRole("button", { name: "Obsolete" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledOnce();
+  });
+  it.each([reportSetId, null])("rejects response set %s for another explicitly requested retained set", async setId => {
+    vi.mocked(api.readReportPage).mockResolvedValue({ ...page(), reports: { ...reports, setId } });
+    render(<OfficialUsageSnapshot {...props} setId="retained" />);
+    await screen.findByRole("button", { name: "Restart selection" });
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
   });
 });

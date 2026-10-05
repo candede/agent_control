@@ -100,12 +100,12 @@ export function AgentSyncTools({
             <p>Some packages do not supply native-agent linking metadata. Repeating a successful read does not guarantee a match. Source-only records do not by themselves prove missing agents.</p>
             {invalidPackages > 0 ? <div className="notice" role="status">
               <strong>{invalidPackages.toLocaleString()} package{invalidPackages === 1 ? " has" : "s have"} invalid saved matching metadata.</strong>{" "}
-              Select affected agents on Agents and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. Refreshing metadata does not guarantee a cross-source match.
+              Select affected agents on Agents and use <strong>Refresh matching details</strong> for 1-5,000 selected packages, or <strong>Refresh agents</strong> for the full inventory. Refreshing metadata does not guarantee a cross-source match.
             </div> : null}
             {currentInventory && (currentInventory.summary.conflicting > 0 || currentInventory.summary.ambiguous > 0) ? <p role="status">
               {currentInventory.summary.conflicting.toLocaleString()} conflicting and {currentInventory.summary.ambiguous.toLocaleString()} ambiguous agent records require review. Inspect their matching details on Agents; names alone cannot resolve them.
             </p> : null}
-            <p>{selectedPackageCount.toLocaleString()} published target{selectedPackageCount === 1 ? "" : "s"} selected. You can also recheck 1-100 selected targets without refreshing the full list.</p>
+            <p>{selectedPackageCount.toLocaleString()} published target{selectedPackageCount === 1 ? "" : "s"} selected. You can recheck 1-5,000 targets from the server selection without refreshing the full list.</p>
             <div className="inline-actions">
               <WorkbenchActionGate actionId="packages.refresh">
                 <button type="button" className="secondary" disabled={refreshingPackages} onClick={onRefreshPackages}>
@@ -113,7 +113,7 @@ export function AgentSyncTools({
                 </button>
               </WorkbenchActionGate>
               <WorkbenchActionGate actionId="packages.refresh.identities">
-                <button type="button" className="secondary" disabled={refreshingPackages || selectedPackageCount < 1 || selectedPackageCount > 100} onClick={onRefreshMatchingDetails}>
+                <button type="button" className="secondary" disabled={refreshingPackages || selectedPackageCount < 1 || selectedPackageCount > 5000} onClick={onRefreshMatchingDetails}>
                   Refresh matching details
                 </button>
               </WorkbenchActionGate>

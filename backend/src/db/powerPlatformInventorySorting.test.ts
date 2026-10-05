@@ -1,69 +1,65 @@
-import type pg from "pg";
-import { describe, expect, it, vi } from "vitest";
-import { PowerPlatformInventoryRepository, type InventoryListQuery } from "./powerPlatformInventory.js";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { seedSelectedInventory } from "../../scripts/selectedInventoryFixture.js";
+import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { NativeInventory } from "./nativeInventory.js";
+import { nativeInventoryKey } from "../services/inventoryRecordProjection.js";
 
-vi.mock("./pool.js", () => ({
-  secretValue: () => undefined,
-  pool: { query: () => { throw new Error("Live database access is forbidden in this contract test."); } },
-  transaction: () => { throw new Error("Transactions are forbidden in this contract test."); },
-}));
-vi.mock("../services/operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
-vi.mock("../services/copilotStudioQuarantine.js", () => ({ validateQuarantineTarget: vi.fn() }));
-vi.mock("./packageInventory.js", () => ({ PackageInventoryRepository: vi.fn() }));
+let database: Awaited<ReturnType<typeof testDatabase>>;
+beforeAll(async () => { database = await testDatabase(); });
+afterAll(async () => { await database?.close(); });
+function resource(nativeId: string, fields: Partial<PowerPlatformResource> = {}): PowerPlatformResource {
+  return { nativeId, tenantId: "synthetic", environmentId: null, type: "microsoft.copilotstudio/agents",
+    displayName: null, location: null, createdAt: null, createdBy: null, lastPublishedAt: null, sourceSystem: "power_platform",
+    authoringTool: null, creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "unknown",
+    identityConfidence: "exact_native", identifiers: [], provenance: {}, details: {}, unknownFieldCount: 0, ...fields };
+}
 
-const scope = { tenantId: "tenant-a", principalId: "reader-a" };
-const snapshot = {
-  id: "11111111-1111-4111-8111-111111111111", role_scope: "full", environment_scope: "",
-  requested_types: ["microsoft.copilotstudio/agents"], queried_types: ["microsoft.copilotstudio/agents"],
-  observed_count: 0, total_records: 0, page_count: 1, unknown_field_count: 0,
-  observed_at: new Date("2026-09-20T12:00:00.000Z"), expires_at: new Date("2026-09-22T12:00:00.000Z"),
-};
+describe("selected native source sorting and current exact controls", () => {
+  it.each((["displayName", "environment", "createdAt", "lastPublishedAt"] as const).flatMap(sortBy =>
+    (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection }))))(
+    "sorts $sortBy $sortDirection before bounded keysets, with nulls last and previous-page round trips", async query => {
+      const source = await seedSelectedInventory(database.runtime, { resources: [
+        resource("a", { displayName: "Alpha", environmentId: "environment-a",
+          createdAt: "2026-09-01T00:00:00Z", lastPublishedAt: "2026-09-01T00:00:00Z" }),
+        resource("b", { displayName: "Beta", environmentId: "environment-b",
+          createdAt: "2026-09-02T00:00:00Z", lastPublishedAt: "2026-09-02T00:00:00Z" }),
+        resource("tie", { displayName: "Beta", environmentId: "environment-b",
+          createdAt: "2026-09-01T20:00:00-04:00", lastPublishedAt: "2026-09-02T04:00:00+04:00" }),
+        resource("unknown", { displayName: "Z unknown" }),
+      ] });
+      const selected = await source.select(query, 2, "power_platform");
+      expect(selected.raw.counts).toMatchObject({ total: 4, filtered: 4 });
+      const second = await source.queries.page(selected.selection.id, source.identity, { limit: 2, cursor: selected.raw.page.nextCursor! });
+      expect(second.page.nextCursor).toBeNull();
+      expect(second.page.previousCursor).toBeTruthy();
+      const previous = await source.queries.page(selected.selection.id, source.identity, { limit: 2, cursor: second.page.previousCursor! });
+      expect(previous.value).toEqual(selected.raw.value);
+      const rows = [...selected.raw.value, ...second.value];
+      const value = (row: PowerPlatformResource) => query.sortBy === "displayName" ? row.displayName
+        : query.sortBy === "environment" ? row.environmentId
+        : row[query.sortBy] === null ? null : Date.parse(row[query.sortBy]!);
+      const expected = [...source.input.resources!].sort((left, right) => {
+        const a = value(left), b = value(right), direction = query.sortDirection === "desc" ? -1 : 1;
+        const tie = Buffer.compare(Buffer.from(nativeInventoryKey(left)), Buffer.from(nativeInventoryKey(right))) * direction;
+        if (a === null || b === null) return a === b ? tie : a === null ? 1 : -1;
+        const order = typeof a === "number" && typeof b === "number" ? a - b
+          : Buffer.compare(Buffer.from(String(a).normalize("NFKC").toLowerCase()), Buffer.from(String(b).normalize("NFKC").toLowerCase()));
+        return order * direction || tie;
+      }).map(row => row.nativeId);
+      const ids = rows.map(row => row.nativeId);
+      expect(ids).toEqual(expected);
+      expect(new Set(ids).size).toBe(4);
+    });
 
-describe("saved inventory list and selection contracts", () => {
-  it.each([
-    ["displayName", 'display_name COLLATE "C"'],
-    ["environmentId", 'NULLIF(environment_id, \'\') COLLATE "C"'],
-    ["createdAt", "created_at"],
-    ["lastPublishedAt", "last_published_at"],
-  ] satisfies [NonNullable<InventoryListQuery["sortBy"]>, string][])(
-    "sorts %s before pagination with missing values last in either direction", async (sortBy, expression) => {
-      for (const sortDirection of ["asc", "desc"] as const) {
-        const query = vi.fn()
-          .mockResolvedValueOnce({ rows: [snapshot] })
-          .mockResolvedValueOnce({ rows: [] })
-          .mockResolvedValueOnce({ rows: [{ count: 0 }] })
-          .mockResolvedValueOnce({ rows: [] });
-        const repository = new PowerPlatformInventoryRepository({ query } as unknown as pg.Pool);
-        const page = await repository.list(scope, {
-          snapshotId: snapshot.id, search: "agent", sortBy, sortDirection, limit: 50, offset: 50,
-        });
-        const [sql, values] = query.mock.calls[3]!;
-        expect(sql).toContain(`ORDER BY ${expression} ${sortDirection.toUpperCase()} NULLS LAST`);
-        expect(sql).toContain(',resource_type COLLATE "C" ASC,environment_id COLLATE "C" ASC,native_id COLLATE "C" ASC LIMIT $5 OFFSET $6');
-        expect(sql).toContain("resource_type='microsoft.copilotstudio/agents'");
-        expect(values).toEqual([snapshot.id, scope.tenantId, scope.principalId, "%agent%", 50, 50]);
-        expect(page).toMatchObject({ value: [], count: 0, snapshot: { id: snapshot.id } });
-        expect(query).toHaveBeenCalledTimes(4);
-      }
-    },
-  );
-
-  it("rejects equal-sized selection results when one native ID is ambiguous and another is absent", async () => {
-    const agentType = "microsoft.copilotstudio/agents";
-    const row = {
-      tenant_id: scope.tenantId, native_id: "duplicate", resource_type: agentType, environment_id: "environment-a",
-      location: null, display_name: "Agent", created_at: null, created_by: null, last_published_at: null,
-      source_system: "power_platform", authoring_tool: "Copilot Studio", creator_type: "unknown",
-      agent_kind: "copilot_studio_agent", lifecycle: "draft", identity_confidence: "exact_native",
-      identifiers: [], provenance: {}, details: {}, unknown_field_count: 0,
-    };
-    const query = vi.fn()
-      .mockResolvedValueOnce({ rows: [{ ...snapshot, requested_types: [agentType], queried_types: [agentType], observed_count: 2, total_records: 2 }] })
-      .mockResolvedValueOnce({ rows: [row, { ...row, environment_id: "environment-b" }] })
-      .mockResolvedValueOnce({ rows: [{ snapshot_id: snapshot.id, resource_type: agentType, count: 2, unique_count: 2, environment_matches: true }] });
-    const repository = new PowerPlatformInventoryRepository({ query } as unknown as pg.Pool);
-    await expect(repository.getQuarantineSelection(scope, snapshot.id, ["duplicate", "absent"]))
-      .rejects.toMatchObject({ status: 409, code: "inventory_selection_stale" });
-    expect(query).toHaveBeenCalledTimes(2);
+  it("rejects equal-sized results containing one ambiguous native identity and one absent identity", async () => {
+    const source = await seedSelectedInventory(database.runtime, { resources: [
+      resource("duplicate", { environmentId: "environment-a" }), resource("duplicate", { environmentId: "environment-b" }),
+    ] });
+    const controls = new NativeInventory(database.runtime);
+    await expect(controls.getQuarantineSelection(source.scope, source.resources!.baselineId, ["duplicate", "absent"]))
+      .rejects.toMatchObject({ code: "quarantine_target_ambiguous" });
+    await expect(controls.getQuarantineSelection(source.scope, source.resources!.baselineId, ["absent"]))
+      .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
   });
 });

@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { getTenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
-import { PackageInventoryRepository } from "../db/packageInventory.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
+import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
 import { requestScope } from "../middleware/auth.js";
 import { capabilities } from "../services/capabilities.js";
 import { dataSync } from "../services/dataSync.js";
@@ -12,8 +12,8 @@ import type { DataSyncRun } from "../types/dataSync.js";
 import { policyRoute } from "./policy.js";
 
 export const workbenchRouter = Router();
-const packageRepository = new PackageInventoryRepository();
-const inventoryRepository = new PowerPlatformInventoryRepository();
+const packageRepository = new PackageRefreshJobs();
+const inventoryRepository = new PowerPlatformRefreshJobs();
 const syncSourceLabels = {
   users: "Users",
   graph_packages: "Graph packages",
@@ -42,11 +42,11 @@ export function dataSyncJobSummary(run: DataSyncRun): WorkbenchJobSummary {
 }
 
 export function packageRefreshJobSummary(
-  job: Awaited<ReturnType<PackageInventoryRepository["listJobs"]>>["value"][number],
+  job: Awaited<ReturnType<PackageRefreshJobs["listJobs"]>>["value"][number],
 ): WorkbenchJobSummary {
   return {
     id: job.id, source: "package-refresh", label: "Package inventory refresh", tokenMode: job.tokenMode,
-    target: job.scopeKind === "exact" ? `${job.requestedIds.length} exact Graph package target${job.requestedIds.length === 1 ? "" : "s"}`
+    target: job.scopeKind === "exact" ? `${job.targetCount} exact Graph package target${job.targetCount === 1 ? "" : "s"}`
       : job.tokenMode === "application" ? "Application Graph package catalog" : "Current principal Graph package catalog",
     status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
     ...sourceJobDates(job),
@@ -56,7 +56,7 @@ export function packageRefreshJobSummary(
 }
 
 export function powerPlatformJobSummary(
-  job: Awaited<ReturnType<PowerPlatformInventoryRepository["listJobs"]>>["value"][number],
+  job: Awaited<ReturnType<PowerPlatformRefreshJobs["listJobs"]>>["value"][number],
 ): WorkbenchJobSummary {
   return {
     id: job.id, source: "power-platform", label: "Power Platform inventory refresh",

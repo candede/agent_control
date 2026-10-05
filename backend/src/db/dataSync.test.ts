@@ -1,14 +1,31 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
-import { copilotServicePlanDefinitions, resolveCopilotServicePlan } from "../services/copilotServicePlans.js";
+import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+import { copilotServicePlanDefinitions, resolveCopilotServicePlan, summarizeCopilotServices } from "../services/copilotServicePlans.js";
+import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { publishFixtureDirectory, publishFixtureEmptyActivity } from "../../scripts/userSourceFixture.js";
+import { UserSourcesRepository } from "./userSources.js";
+import { UserSourceStages } from "./userSourceStages.js";
+import { DataGenerations } from "./dataGenerations.js";
+import { AppError } from "../errors.js";
 import { DataSyncRepository } from "./dataSync.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
+import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: DataSyncRepository;
 const scope = { tenantId: "tenant-data-sync", principalId: "viewer-a" };
+const identity = (owner: typeof scope) => ({ ...selectionIdentity, ...owner });
+const sourceReader = () => new UserSourcesRepository(fixture.runtime, "synthetic-data-sync-source-read-secret");
+async function sourcePage(owner: typeof scope) {
+  const reader = sourceReader(), selected = await reader.capture(identity(owner), "delegated");
+  return reader.page(selected.id, identity(owner));
+}
+function failSource(owner: typeof scope, source: "directory" | "app_activity", error: Error) {
+  return new UserSourceStages(fixture.runtime).execute(generationInput({
+    scope: { ...generationInput().scope, ...owner, source },
+  }), async () => { throw error; }, { beforePublish: async () => {} });
+}
 
 beforeAll(async () => {
   fixture = await testDatabase();
@@ -149,100 +166,69 @@ describe.sequential("Data sync repository", () => {
 
   it("keeps run and saved user data private to the tenant and principal", async () => {
     expect(await repository.getRun({ ...scope, principalId: "viewer-b" }, (await repository.getLatestRun(scope))!.id)).toBeUndefined();
-    await repository.publishDirectory(scope, [directoryUser("saved@example.com")], "2026-09-15T10:00:00.000Z", "Saved one record.");
-    expect((await repository.getUserSources(scope)).directory.value).toHaveLength(1);
-    expect((await repository.getUserSources({ ...scope, principalId: "viewer-b" })).directory.value).toBeNull();
-    expect((await repository.getUserSources({ tenantId: "other-tenant", principalId: scope.principalId })).directory.value).toBeNull();
-  });
-
-  it("preserves the last good normalized snapshots when a later source attempt fails", async () => {
-    const report: CopilotReportResult = { users: [], reportRefreshDate: null };
-    await repository.publishAppActivity(scope, report, "2026-09-15T10:01:00.000Z", "Saved empty activity report.");
-    await repository.recordUserSourceFailure(scope, "directory", "permission_required", "Directory permission was denied.", "2026-09-15T10:02:00.000Z");
-    const saved = await repository.getUserSources(scope);
-    expect(saved.directory).toMatchObject({
-      attemptStatus: "permission_required",
-      rowCount: 1,
-      value: [{ identity: { userPrincipalName: "saved@example.com" } }],
-    });
-    expect(saved.appActivity).toMatchObject({ attemptStatus: "available", rowCount: 0, value: report });
-  });
-
-  it("withholds expired user snapshots even when the last attempt succeeded", async () => {
-    const owner = { ...scope, principalId: "expired-user-sources" };
-    const observedAt = new Date().toISOString();
-    const directoryId = await repository.publishDirectory(owner, [], observedAt, "Saved an empty directory.");
-    const reportId = await repository.publishAppActivity(owner, { users: [], reportRefreshDate: null }, observedAt, "Saved an empty report.");
-    await fixture.operator.query(`UPDATE copilot_usage_snapshots SET expires_at=clock_timestamp()-interval '1 second'
-      WHERE id=ANY($1::uuid[])`, [[directoryId, reportId]]);
-
-    const saved = await repository.getUserSources(owner);
-    for (const source of [saved.directory, saved.appActivity]) {
-      expect(source).toMatchObject({
-        attemptStatus: "available", lastSuccessAt: observedAt, rowCount: 0, value: null, observedAt: null,
-      });
+    await publishFixtureDirectory(fixture.runtime, identity(scope), [directoryUser("saved@example.com")]);
+    expect((await sourcePage(scope)).value).toHaveLength(1);
+    for (const owner of [{ ...scope, principalId: "viewer-b" }, { tenantId: "other-tenant", principalId: scope.principalId }]) {
+      const page = await sourcePage(owner);
+      expect(page.value).toEqual([]);
+      expect(page.sources.directory).toMatchObject({ generationId: null, rowCount: null });
     }
   });
 
-  it("persists company and department in the licensed-user snapshot across repository instances", async () => {
+  it("preserves the last good record generation when a later independent source attempt fails", async () => {
+    await publishFixtureEmptyActivity(fixture.runtime, identity(scope));
+    await expect(failSource(scope, "directory", new AppError(403, "permission_required", "Directory permission was denied.")))
+      .rejects.toMatchObject({ code: "permission_required" });
+    const saved = await sourcePage(scope);
+    expect(saved.sources.directory).toMatchObject({ attemptStatus: "permission_required", rowCount: 1 });
+    expect(saved.value).toEqual([expect.objectContaining({ directory: expect.objectContaining({ userPrincipalName: "saved@example.com" }) })]);
+    expect(saved.sources.app_activity).toMatchObject({ attemptStatus: "available", rowCount: 0, reportRefreshDate: null });
+  });
+
+  it("withholds expired source rows and counts at the captured read time even when the last attempt succeeded", async () => {
+    const owner = { ...scope, principalId: "expired-user-sources" };
+    await publishFixtureDirectory(fixture.runtime, identity(owner), []);
+    await publishFixtureEmptyActivity(fixture.runtime, identity(owner));
+    const reader = sourceReader();
+    await reader.connections.selectedRead(async client => {
+      const saved = await reader.metadataInRead(client, { ...owner, tokenMode: "delegated" }, new Date(Date.now() + 2 * 86400000));
+      for (const source of [saved.directory, saved.app_activity]) expect(source).toMatchObject({
+        state: "unavailable", generationId: null, rowCount: null, observedAt: null,
+      });
+    });
+  });
+
+  it.each(["clear", "revoke"] as const)("does not revive old attempt counts after a %s fence", async operation => {
+    const owner = { ...scope, principalId: `fenced-user-attempt-${operation}` };
+    let current = identity(owner);
+    await publishFixtureDirectory(fixture.runtime, current, [directoryUser("fenced@example.invalid")]);
+    await publishFixtureEmptyActivity(fixture.runtime, current);
+    expect((await sourcePage(owner)).sources.directory.rowCount).toBe(1);
+    if (operation === "clear") await repository.submit(owner, { mode: "full", clearSavedData: true });
+    else current = { ...current, sessionEpoch: await new DataGenerations(fixture.runtime).revokePrincipal(owner.tenantId, owner.principalId) };
+    const reader = sourceReader(), selected = await reader.capture(current, "delegated");
+    const page = await reader.page(selected.id, current);
+    expect(page.value).toEqual([]);
+    for (const source of [page.sources.directory, page.sources.app_activity]) expect(source).toMatchObject({
+      generationId: null, attemptStatus: null, attemptedAt: null, attemptObservedCount: null, rowCount: null, state: "unavailable",
+    });
+  });
+
+  it("persists company and department in native user rows across repository instances", async () => {
     const owner = { ...scope, principalId: "organization-reader" };
     const user = directoryUser("organization@example.invalid");
     user.identity.companyName = "Example Health";
     user.identity.department = "Clinical Services";
-    await repository.publishDirectory(owner, [user], new Date().toISOString(), "Saved organization metadata.");
-    expect(await new DataSyncRepository(fixture.runtime).getDirectorySource(owner)).toMatchObject({
-      rowCount: 1, value: [{ identity: {
+    await publishFixtureDirectory(fixture.runtime, identity(owner), [user]);
+    expect(await sourcePage(owner)).toMatchObject({
+      counts: { total: 1, filtered: 1 }, value: [{ directory: {
         userPrincipalName: "organization@example.invalid", companyName: "Example Health", department: "Clinical Services",
       } }],
     });
-    expect((await repository.getDirectorySource({ ...owner, principalId: "other-reader" })).value).toBeNull();
+    expect((await sourcePage({ ...owner, principalId: "other-reader" })).sources.directory.rowCount).toBeNull();
   });
 
-  it.each([0, 1, 2, 501])("measures the exact unencoded JSONB bytes in bounded batches for %i users", async count => {
-    const users = Array.from({ length: count }, (_, index) => {
-      const user = directoryUser(`person${index}@example.com`);
-      user.identity.department = 'Caf\u00e9 "Engineering"\n\\Support';
-      return user;
-    });
-    const whole = await fixture.runtime.query<{ bytes: number }>(
-      "SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify({ serviceEvidenceVersion: 1, users })],
-    );
-    expect(await measureUnencodedDirectoryBytes(users)).toBe(whole.rows[0].bytes);
-  });
-
-  it("persists and reloads all 30,001 paid-license users with all three paid features within the snapshot byte bound", async () => {
-    const owner = { ...scope, principalId: "large-paid-license-roster" };
-    const servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
-      servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
-    ));
-    const users = Array.from({ length: 30_001 }, (_, index) => {
-      const user = directoryUser(`person${index}@example.com`);
-      user.identity.displayName = `Person ${index}`;
-      user.identity.companyName = "Contoso Health";
-      user.copilotServiceState = "enabled";
-      user.servicePlans = servicePlans;
-      return user;
-    });
-    const original = JSON.stringify({ serviceEvidenceVersion: 1, users });
-    const bytes = Buffer.byteLength(original);
-    expect(bytes).toBeGreaterThan(30 * 1024 * 1024);
-    expect(bytes).toBeLessThan(32 * 1024 * 1024);
-    expect(await measureUnencodedDirectoryBytes(users)).toBeGreaterThan(32 * 1024 * 1024);
-    await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved all matching paid-license users.");
-
-    const saved = await new DataSyncRepository(fixture.runtime).getDirectorySource(owner);
-    expect(saved).toMatchObject({ attemptStatus: "available", rowCount: 30_001 });
-    expect(saved.value).toHaveLength(30_001);
-    expect(saved.value).toEqual(users);
-    expect(saved.value?.at(-1)).toEqual(users.at(-1));
-    expect(saved.value?.every(user => user.servicePlans.length === 3)).toBe(true);
-    const storage = await fixture.runtime.query<{ bytes: number }>(`SELECT octet_length(snapshot_data::text) AS bytes
-      FROM copilot_usage_snapshots WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory' AND is_current`,
-    [owner.tenantId, owner.principalId]);
-    expect(storage.rows[0].bytes).toBeLessThanOrEqual(32 * 1024 * 1024);
-  }, 30_000);
-
-  it("losslessly reloads distinct service-plan sets without sharing mutable feature evidence between users", async () => {
+  it("losslessly pages distinct immutable service-plan sets without sharing mutable feature evidence between users", async () => {
     const owner = { ...scope, principalId: "mixed-paid-license-roster" };
     const enabled = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
       servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
@@ -256,81 +242,53 @@ describe.sequential("Data sync repository", () => {
     const sets = [enabled, changed, [], enabled, changed, enabled.slice(1)];
     const users = sets.map((servicePlans, index) => ({
       ...directoryUser(`person${index}@example.com`), servicePlans,
+      copilotServiceState: servicePlans.length ? summarizeCopilotServices(servicePlans) : "disabled" as const,
     }));
-    await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved complete mixed service evidence.");
-    const storage = await fixture.runtime.query<{ encoding: string }>(`
-      SELECT snapshot_data->>'storageEncoding' AS encoding FROM copilot_usage_snapshots
-      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory' AND is_current`,
-    [owner.tenantId, owner.principalId]);
-    expect(storage.rows[0].encoding).toBe("service-plan-sets-v1");
-    const saved = await new DataSyncRepository(fixture.runtime).getUserSources(owner);
-    expect(saved.directory.value).toEqual(users);
-    expect(saved.directory.value![0].servicePlans).not.toBe(saved.directory.value![3].servicePlans);
-    expect(saved.directory.value![0].servicePlans[0]).not.toBe(saved.directory.value![3].servicePlans[0]);
+    await publishFixtureDirectory(fixture.runtime, identity(owner), users);
+    const reader = sourceReader(), selected = await reader.capture(identity(owner), "delegated");
+    const first = await reader.plans(selected.id, identity(owner), users[0].identity.objectId);
+    for (const user of users) {
+      const plans = await reader.plans(selected.id, identity(owner), user.identity.objectId);
+      expect(plans.counts.total).toBe(user.servicePlans.length);
+      expect(plans.value).toEqual(user.servicePlans.toSorted((left, right) => left.servicePlanId.localeCompare(right.servicePlanId)));
+      expect(plans.value).not.toBe(first.value);
+      if (plans.value.length) expect(plans.value[0]).not.toBe(first.value[0]);
+    }
   });
 
-  it("reads an existing unencoded service-evidence-v1 snapshot without migration or refresh", async () => {
-    const owner = { ...scope, principalId: "legacy-service-evidence-reader" };
-    const user = directoryUser("legacy@example.invalid");
-    user.servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
-      servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
-    ));
-    const observedAt = new Date().toISOString();
-    await fixture.runtime.query(`WITH saved AS (
-      INSERT INTO copilot_usage_snapshots(id,tenant_id,principal_id,source_id,snapshot_data,row_count,observed_at)
-      VALUES($1,$2,$3,'directory',$4::jsonb,1,$5)
-      RETURNING id,tenant_id,principal_id,source_id,observed_at,row_count)
-      INSERT INTO copilot_usage_source_state(
-        tenant_id,principal_id,source_id,attempt_status,message,attempted_at,last_success_at,row_count,current_snapshot_id)
-      SELECT tenant_id,principal_id,source_id,'available','Previously saved service evidence.',
-        observed_at,observed_at,row_count,id FROM saved`,
-    [randomUUID(), owner.tenantId, owner.principalId, JSON.stringify({ serviceEvidenceVersion: 1, users: [user] }), observedAt]);
-    const reader = new DataSyncRepository(fixture.runtime);
-    expect(await reader.getDirectorySource(owner)).toMatchObject({
-      attemptStatus: "available", rowCount: 1, observedAt, value: [user],
-    });
-    expect((await reader.getUserSources(owner)).directory.value).toEqual([user]);
+  it("removes the old snapshot containers and whole-source getter/writer surface instead of decoding or converting them", async () => {
+    expect((await fixture.runtime.query(`SELECT to_regclass('public.copilot_usage_snapshots') AS snapshots,
+      to_regclass('public.copilot_usage_source_state') AS source_state`)).rows[0]).toEqual({ snapshots: null, source_state: null });
+    const methods = Object.getOwnPropertyNames(DataSyncRepository.prototype);
+    for (const method of ["getDirectorySource", "getUserSources", "publishDirectory", "publishAppActivity"]) expect(methods).not.toContain(method);
   });
 
   it.each(["directory", "app_activity"] as const)(
-    "enforces the actual JSONB UTF-8 byte boundary for %s and rolls back an oversized replacement",
+    "rejects invalid typed %s evidence before replacing its complete saved head",
     async source => {
-      const owner = { ...scope, principalId: `snapshot-byte-bound-${source}` };
+      const owner = { ...scope, principalId: `record-bound-${source}` };
       const user = directoryUser("byte-bound@example.invalid");
-      const report: CopilotReportResult = { users: [], reportRefreshDate: "" };
-      user.identity.department = "";
-      const payload = () => source === "directory" ? { serviceEvidenceVersion: 1, users: [user] } : report;
-      const fixed = await fixture.runtime.query<{ bytes: number }>(
-        "SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify(payload())],
-      );
-      const remaining = 32 * 1024 * 1024 - fixed.rows[0].bytes;
-      const text = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
-      if (source === "directory") user.identity.department = text;
-      else report.reportRefreshDate = text;
-      const observedAt = new Date().toISOString();
-      const publish = () => source === "directory"
-        ? repository.publishDirectory(owner, [user], observedAt, "Saved at the byte bound.")
-        : repository.publishAppActivity(owner, report, observedAt, "Saved at the byte bound.");
-      const id = await publish();
-      const stored = await fixture.runtime.query<{ bytes: number }>(
-        "SELECT octet_length(snapshot_data::text) AS bytes FROM copilot_usage_snapshots WHERE id=$1", [id],
-      );
-      expect(stored.rows[0].bytes).toBe(32 * 1024 * 1024);
-
-      if (source === "directory") user.identity.department += "x";
-      else report.reportRefreshDate += "x";
-      expect(Buffer.byteLength(JSON.stringify(payload()))).toBeLessThanOrEqual(32 * 1024 * 1024);
-      await expect(publish()).rejects.toMatchObject({ status: 413, code: "copilot_usage_snapshot_limit" });
-      const retained = await fixture.runtime.query(`
-        SELECT snapshot.id,state.current_snapshot_id,state.row_count,state.attempt_status
-        FROM copilot_usage_snapshots snapshot JOIN copilot_usage_source_state state
-          ON state.current_snapshot_id=snapshot.id
-        WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.source_id=$3 AND snapshot.is_current`,
-      [owner.tenantId, owner.principalId, source]);
-      expect(retained.rows).toEqual([{
-        id, current_snapshot_id: id, row_count: source === "directory" ? 1 : 0, attempt_status: "available",
-      }]);
-    }, 30_000,
+      const before = source === "directory"
+        ? await publishFixtureDirectory(fixture.runtime, identity(owner), [user])
+        : await publishFixtureEmptyActivity(fixture.runtime, identity(owner));
+      if (source === "directory") {
+        user.identity.department = "é".repeat(257);
+        await expect(publishFixtureDirectory(fixture.runtime, identity(owner), [user])).rejects.toMatchObject({ code: "provider_schema" });
+      } else {
+        const stages = new UserSourceStages(fixture.runtime);
+        await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, ...owner, source } }), async lease => {
+          const key = await stages.query(lease, "activity", "synthetic:invalid-date");
+          await stages.activity(lease, key, [{
+            identity: "000000", upn_key: "person@example.invalid", period: "D30", report_refresh_date: "2026-02-30",
+            last_activity_date: null, chat_date: null, teams_date: null, word_date: null, excel_date: null,
+            powerpoint_date: null, outlook_date: null, onenote_date: null, loop_date: null, residual: {},
+          }]);
+        }, { beforePublish: async () => {} })).rejects.toMatchObject({ code: "provider_schema" });
+      }
+      expect((await sourcePage(owner)).sources[source]).toMatchObject({
+        generationId: before.generationId, rowCount: source === "directory" ? 1 : 0, attemptStatus: "failed",
+      });
+    },
   );
 
   it("retries only incomplete top-level sources and retains every child association", async () => {
@@ -347,7 +305,7 @@ describe.sequential("Data sync repository", () => {
     await expect(repository.retry(scope, run.id, ["power_platform"])).rejects.toMatchObject({ code: "data_sync_source_complete" });
     await expect(repository.retry(scope, run.id, ["usage_reports"])).rejects.toMatchObject({ code: "data_sync_source_complete" });
     expect(await repository.retry(scope, run.id, ["graph_packages"])).toEqual(["graph_packages"]);
-    const packages = new PackageInventoryRepository(fixture.runtime);
+    const packages = new PackageRefreshJobs(fixture.runtime);
     const firstJob = (await packages.submit(scope, { tokenMode: "delegated",
       authorizationPrincipalId: scope.principalId, idempotencyKey: `${run.id}-first` })).id;
     await repository.attachJob(scope, run.id, "graph_packages", firstJob);
@@ -407,23 +365,6 @@ describe.sequential("Data sync repository", () => {
     expect((await repository.listRuns(retryScope)).map(run => run.id)).toEqual([newer.run.id, older.run.id]);
   });
 });
-
-async function measureUnencodedDirectoryBytes(users: readonly CopilotDirectoryUser[]) {
-  const query = "SELECT octet_length($1::jsonb::text) AS bytes";
-  const empty = await fixture.runtime.query<{ bytes: number }>(
-    query, [JSON.stringify({ serviceEvidenceVersion: 1, users: [] })],
-  );
-  let bytes = empty.rows[0].bytes;
-  // Measure the legacy representation in batches to bound PostgreSQL working memory.
-  for (let offset = 0; offset < users.length; offset += 500) {
-    const batch = await fixture.runtime.query<{ bytes: number }>(
-      query, [JSON.stringify(users.slice(offset, offset + 500))],
-    );
-    // The empty envelope owns the brackets; JSONB separates array entries with ", ".
-    bytes += batch.rows[0].bytes - 2 + (offset === 0 ? 0 : 2);
-  }
-  return bytes;
-}
 
 function directoryUser(userPrincipalName: string): CopilotDirectoryUser {
   return {

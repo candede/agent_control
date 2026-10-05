@@ -82,7 +82,7 @@ function fakeRepository(state: PackageMutationState = prestate, action: JobRow["
       };
     }),
     async withTargetLock<T>(_lease: Lease, _item: JobItem, operation: () => Promise<T>) { return operation(); },
-    markSent: vi.fn(async () => undefined),
+    settleInventoryControls: vi.fn(async () => undefined), markSent: vi.fn(async () => undefined),
     finishItem: vi.fn(async () => undefined),
     pauseItemForAuthorization: vi.fn(async () => undefined),
     release: vi.fn(async () => undefined),

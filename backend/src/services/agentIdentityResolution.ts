@@ -184,8 +184,6 @@ function resolutionFailure(error: unknown): AgentIdentityFailure | undefined {
   return undefined;
 }
 
-export const agentIdentityResolution = new AgentIdentityResolutionService();
-
 function userScope(user: AuthenticatedUser) {
   if (!user.tenantId || !user.homeAccountId || !hasAppRole(user.roles, "AgentControl.Viewer")) {
     throw new AppError(403, "missing_internal_role", "Identity resolution requires a tenant-scoped Viewer session.");

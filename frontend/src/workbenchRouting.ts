@@ -6,6 +6,7 @@ import {
 } from "../../backend/src/types/unifiedAgents";
 import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
 import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
+import { decodeInventoryFacet, encodeInventoryFacet, type InventoryFacetValue } from "../../backend/src/types/inventoryFacets";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
@@ -13,17 +14,17 @@ export type WorkbenchViewId = "agents" | "users" | "sync" | "audit" | "permissio
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
-  packageType: string;
+  packageType?: string | null;
   endUserAccess: UnifiedAgentAccessFilter;
   reportedUsage: UnifiedAgentUsageFilter;
   management: UnifiedAgentManagementFilter;
   relevance: UnifiedAgentRelevanceFilter;
   search: string;
   status: "all" | "allowed" | "blocked";
-  publisher: string;
-  availability: string;
-  host: string;
-  platform: string;
+  publisher?: string | null;
+  availability?: InventoryFacetValue;
+  host?: string | null;
+  platform?: string | null;
   createdWithinDays: string;
   sortBy: UnifiedAgentSort;
   sortDirection: "asc" | "desc";
@@ -39,7 +40,7 @@ export type AgentRouteState = {
   syncRunId?: string;
   source: "all" | "graph_packages" | "power_platform" | "both";
   linkState: "all" | "matched" | "unmatched" | "ambiguous" | "conflicting";
-  environmentId: string;
+  environmentId?: string | null;
   inventorySnapshotId?: string;
   selectedPowerPlatformIds: string[];
   quarantineJobId?: string;
@@ -62,6 +63,8 @@ export type SyncReportRouteState = {
 export type UsersRouteState = {
   view: "licenses" | "activity" | "responsibility";
   personId?: string;
+  selectionId?: string;
+  cursor?: string;
   search: string;
   agentId?: string;
   reportSetId?: string;
@@ -161,14 +164,14 @@ export function parseAgentRoute(search: string): AgentRouteState {
   const selectedIds = [...new Set(params.getAll("selected").filter(validSelectedId))].slice(0, maximumPackageSelection);
   const selectionCount = boundedSelectionCount(params.get("selectionCount"));
   const selectionStored = params.get("selectionState") === "session" && selectionCount !== undefined;
-  const environmentId = bounded(params.get("environment"), 512) ?? "";
+  const environmentId = routeFacet(params, "environment", 512);
   const rawDetailId = agentRecordId(params.get("detail"));
   const detailId = rawDetailId && !parseUnifiedAgentRecordId(rawDetailId) && params.get("source") === "power_platform" && environmentId
     ? unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: rawDetailId })
     : rawDetailId;
   return {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
-    packageType: bounded(params.get("type"), 4096) ?? (legacyView === "first_party" ? "firstParty" : legacyView === "third_party" ? "thirdParty" : ""),
+    packageType: params.has("type") ? routeFacet(params, "type", 4096) : legacyView === "first_party" ? "firstParty" : legacyView === "third_party" ? "thirdParty" : undefined,
     endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access"))
       ?? (legacyView === "available" || legacyView === "unavailable" ? legacyView : legacyView === "availability_unknown" ? "unknown" : "all"),
     reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (legacyView === "used" ? "used" : "all"),
@@ -178,10 +181,10 @@ export function parseAgentRoute(search: string): AgentRouteState {
       ?? (legacyView === "organization" || legacyView === "unknown" ? legacyView : "all"),
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
-    publisher: bounded(params.get("publisher"), 256) ?? "all",
-    availability: bounded(params.get("availability"), 128) ?? "all",
-    host: bounded(params.get("host"), 256) ?? "all",
-    platform: bounded(params.get("platform"), 256) ?? (legacyView === "copilot_studio" ? "Copilot Studio" : "all"),
+    publisher: routeFacet(params, "publisher", 4096),
+    availability: routeFacet(params, "availability", 4096, true),
+    host: routeFacet(params, "host", 4096),
+    platform: params.has("platform") ? routeFacet(params, "platform", 4096) : legacyView === "copilot_studio" ? "Copilot Studio" : undefined,
     createdWithinDays: boundedIntegerText(params.get("createdWithinDays"), 3650),
     sortBy: unifiedAgentSortKeys.find(value => value === sortBy) ?? "displayName",
     sortDirection: params.get("direction") === "desc" ? "desc" : "asc",
@@ -203,20 +206,31 @@ export function parseAgentRoute(search: string): AgentRouteState {
   };
 }
 
+function routeFacet(params: URLSearchParams, key: string, maximum: number): string | null | undefined;
+function routeFacet(params: URLSearchParams, key: string, maximum: number, combined: true): InventoryFacetValue | undefined;
+function routeFacet(params: URLSearchParams, key: string, maximum: number, combined = false) {
+  const value = params.get(key);
+  if (value === null || params.getAll(key).length !== 1 || value.length > maximum + 8 || /[\r\n\0]/.test(value)) return undefined;
+  try {
+    const decoded = decodeInventoryFacet(value);
+    return decoded === null || typeof decoded === "string" && decoded.length > 0 || combined && typeof decoded === "object" ? decoded : undefined;
+  } catch { return undefined; }
+}
+
 export function agentRouteSearch(state: AgentRouteState) {
   const params = new URLSearchParams();
   if (state.inventoryScope !== "catalog") params.set("inventory", state.inventoryScope);
-  if (state.packageType) params.set("type", state.packageType);
+  if (state.packageType !== undefined) params.set("type", encodeInventoryFacet(state.packageType));
   if (state.endUserAccess !== "all") params.set("access", state.endUserAccess);
   if (state.reportedUsage !== "all") params.set("usage", state.reportedUsage);
   if (state.management !== "all") params.set("management", state.management);
   if (state.relevance !== "all") params.set("relevance", state.relevance);
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.status !== "all") params.set("status", state.status);
-  if (state.publisher !== "all") params.set("publisher", state.publisher);
-  if (state.availability !== "all") params.set("availability", state.availability);
-  if (state.host !== "all") params.set("host", state.host);
-  if (state.platform !== "all") params.set("platform", state.platform);
+  if (state.publisher !== undefined) params.set("publisher", encodeInventoryFacet(state.publisher));
+  if (state.availability !== undefined) params.set("availability", encodeInventoryFacet(state.availability));
+  if (state.host !== undefined) params.set("host", encodeInventoryFacet(state.host));
+  if (state.platform !== undefined) params.set("platform", encodeInventoryFacet(state.platform));
   if (state.createdWithinDays) params.set("createdWithinDays", state.createdWithinDays);
   if (state.sortBy !== "displayName") params.set("sort", state.sortBy);
   if (state.sortDirection !== "asc") params.set("direction", state.sortDirection);
@@ -229,10 +243,15 @@ export function agentRouteSearch(state: AgentRouteState) {
   }
   if (state.controlJobId && validSelectedId(state.controlJobId)) params.set("controlJob", state.controlJobId);
   if (state.syncRunId && validSelectedId(state.syncRunId)) params.set("syncRun", state.syncRunId);
-  if (state.environmentId.trim()) params.set("environment", state.environmentId.trim().slice(0, 512));
+  if (state.environmentId !== undefined) params.set("environment", encodeInventoryFacet(state.environmentId));
   if (state.inventorySnapshotId) params.set("inventorySnapshot", state.inventorySnapshotId);
   for (const id of [...new Set(state.selectedPowerPlatformIds.filter(value => agentRecordId(value) !== undefined))].slice(0, 25)) params.append("selectedResource", id);
   if (state.quarantineJobId && validSelectedId(state.quarantineJobId)) params.set("quarantineJob", state.quarantineJobId);
+  if (state.selectionStorage === "session" && boundedSelectionCount(String(state.selectionCount)) !== undefined) {
+    params.set("selectionState", "session");
+    params.set("selectionCount", String(state.selectionCount));
+    return params;
+  }
   const selectedIds = [...new Set(state.selectedIds.filter(validSelectedId))].slice(0, maximumPackageSelection);
   for (const id of selectedIds) {
     params.append("selected", id);
@@ -318,6 +337,10 @@ export function parseUsersRoute(search: string): UsersRouteState {
       : params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
     ...(params.get("view") === "responsibility" && params.has("person")
       ? { personId: bounded(params.get("person"), 128) || "invalid" } : {}),
+    ...(params.get("view") === "responsibility" && params.has("selection")
+      ? { selectionId: bounded(params.get("selection"), 64) || "invalid" } : {}),
+    ...(params.get("view") === "responsibility" && params.has("cursor")
+      ? { cursor: bounded(params.get("cursor"), 4096) || "invalid" } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: bounded(params.get("snapshot"), 512),
@@ -332,6 +355,8 @@ export function usersRouteSearch(state: UsersRouteState) {
   if (state.view === "responsibility") {
     if (state.personId) params.set("person", isDirectoryObjectId(state.personId) ? state.personId.toLowerCase() : "invalid");
     if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
+    if (state.selectionId) params.set("selection", state.selectionId);
+    if (state.cursor && state.selectionId) params.set("cursor", state.cursor);
     if (state.page > 0) params.set("page", String(Math.min(601, state.page + 1)));
     return params;
   }

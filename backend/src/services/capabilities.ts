@@ -3,7 +3,7 @@ import { hasAppRole, supportsAutomaticCapabilityCheck, type CapabilityCheckProgr
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
 import { getTenantConfiguration } from "../config.js";
-import { acquireApplicationToken, acquireDelegatedToken } from "../auth/msal.js";
+import { acquireApplicationToken, acquireDelegatedToken, isRetryableIdentityProviderError } from "../auth/msal.js";
 import { adminManagedPermissionsMessage } from "../auth/flows.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision, type CapabilityConfiguration, type CapabilityEvidence, type EvidenceKey } from "../db/capabilities.js";
 import { capabilityDefinitions, getCapabilityDefinition, hasAnyRole } from "./capabilityRegistry.js";
@@ -13,6 +13,7 @@ import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.j
 import type { AuditAction } from "../types/audit.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { operationalLog } from "./telemetry.js";
+import { mapWithConcurrency } from "./mapWithConcurrency.js";
 
 const evidenceTtlMs = 5 * 60 * 1000;
 const operationEvidenceTtlMs = 24 * 60 * 60 * 1000;
@@ -51,7 +52,7 @@ export class CapabilityService {
     if (!user.tenantId || !user.homeAccountId) throw AppError.unauthorized("Capability reporting requires an exact account.");
     const validation = beginAccountSessionValidation(user.tenantId, user.homeAccountId);
     const entries = capabilityDefinitions.map(definition => ({ definition, generation: this.generation(definition.id, user) }));
-    const views = await Promise.all(entries.map(async ({ definition, generation }) => {
+    const views = await mapWithConcurrency(entries, 1, async ({ definition, generation }) => {
       const [current, configuration, operationFailure] = await Promise.all([
         this.decision(definition, user),
         definition.mode === "application" ? this.currentConfiguration(definition, user, generation) : undefined,
@@ -64,7 +65,7 @@ export class CapabilityService {
         ...(operationFailure ? { operationFailure } : {}),
         ...(configuration ? { configuration: { enabled: configuration.enabled, sharedDataScope: configuration.sharedDataScope } } : {}),
       };
-    }));
+    });
     for (const { definition, generation } of entries) this.requireGeneration(definition.id, user, generation);
     assertAccountSessionValidation(validation);
     return views;
@@ -557,8 +558,7 @@ function readinessRetryDelay(error: unknown) {
   const cooldown = retryAfter(error);
   if (cooldown !== undefined && cooldown > 1_000) return undefined;
   if (error instanceof AppError && safeProbeDetails(error)?.category === "provider_throttled") return cooldown === undefined ? undefined : Math.max(10, cooldown);
-  const tokenTransient = error instanceof AppError && error.code === "identity_provider_error"
-    && error.details !== null && typeof error.details === "object" && "retryable" in error.details && error.details.retryable === true;
+  const tokenTransient = isRetryableIdentityProviderError(error);
   const transient = error instanceof TypeError || error instanceof Error && error.name === "TimeoutError"
     || error instanceof AppError && (["provider_network_error", "provider_timeout"].includes(error.code)
       || tokenTransient || [500, 502, 503, 504].includes(error.status) && error.code !== "identity_provider_error"

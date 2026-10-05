@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import type { SyncReportRouteState } from "../workbenchRouting";
 import { trapDialogFocus } from "../dialogFocus";
@@ -14,16 +14,33 @@ type OfficialUsageImportModalProps = {
   revision: number;
   onChanged: () => void;
   onImported: () => void;
-  onLegacyCleared?: () => void;
 };
+type ImportSession = { sequence: number; owner: object; initialStagingId?: string; correctionOfSetId?: string;
+  routeStage?: string; pending?: { from?: string; to?: string } };
 
 export function OfficialUsageImportModal({
-  route, onRouteChange, canManage, revision, onChanged, onImported, onLegacyCleared,
+  route, onRouteChange, canManage, revision, onChanged, onImported,
 }: OfficialUsageImportModalProps) {
   const open = Boolean(route);
   const importDenied = route?.view === "import" && !canManage;
   const view = importDenied ? "manage" : route?.view;
-  const [resumeBundleId, setResumeBundleId] = useState<string>();
+  const [importSession, setImportSession] = useState<ImportSession>();
+  const importOwner = useRef<object | undefined>(undefined);
+  const importing = open && canManage && view === "import";
+  let draft = importSession;
+  if (!importing && draft) { setImportSession(undefined); draft = undefined; }
+  if (importing) {
+    const stage = route?.stagingId;
+    if (!draft || draft.correctionOfSetId !== route?.reportSetId
+      || (draft.pending ? stage !== draft.pending.from && stage !== draft.pending.to : stage !== draft.routeStage)) {
+      draft = { sequence: (draft?.sequence ?? -1) + 1, owner: {}, initialStagingId: stage, correctionOfSetId: route?.reportSetId, routeStage: stage };
+      setImportSession(draft);
+    } else if (draft.pending && stage === draft.pending.to) {
+      draft = { ...draft, routeStage: stage, pending: undefined }; setImportSession(draft);
+    }
+  }
+  const activeDraft = draft;
+  useLayoutEffect(() => { importOwner.current = importSession?.owner; return () => { importOwner.current = undefined; }; }, [importSession?.owner]);
   const importer = useRef<OfficialUsageImportHandle>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -81,7 +98,6 @@ export function OfficialUsageImportModal({
       }}
       onClose={event => {
         if (event.target !== event.currentTarget || event.currentTarget.open) return;
-        setResumeBundleId(undefined);
         if (open) onRouteChange(undefined);
         const target = returnTarget.current;
         if (target?.isConnected) {
@@ -110,20 +126,26 @@ export function OfficialUsageImportModal({
           </p> : null}
         </div>
         {view === "manage" ? <div className="usage-modal-header-actions">
-          {canManage ? <button type="button" onClick={() => { setResumeBundleId(undefined); navigate("import"); }}>Add CSV reports</button> : null}
+          {canManage ? <button type="button" onClick={() => navigate("import")}>Add CSV reports</button> : null}
           <button ref={closeButton} type="button" className="icon-button" aria-label="Close reports" onClick={dismiss}><X size={20} /></button>
         </div> : null}
       </header>
       <div className="usage-modal-content">
-        {open && canManage && view === "import" ? <OfficialUsageImportPanel
-          key={route?.stagingId ?? resumeBundleId ?? "new"} ref={importer}
-          initialStagingId={route?.stagingId} initialBundleId={resumeBundleId}
+        {importing && activeDraft ? <OfficialUsageImportPanel
+          key={activeDraft.sequence} ref={importer}
+          initialStagingId={activeDraft.initialStagingId}
+          correctionOfSetId={activeDraft.correctionOfSetId}
+          onStaged={stagingId => {
+            if (route?.view !== "import" || route.stagingId === stagingId || importOwner.current !== activeDraft.owner) return;
+            setImportSession(current => current?.owner === activeDraft.owner ? { ...current, pending: { from: route.stagingId, to: stagingId } } : current);
+            onRouteChange({ ...route, stagingId });
+          }}
           onChanged={onChanged} onCancel={() => onRouteChange(undefined)}
           onDone={() => { onRouteChange(undefined); onImported(); }} /> : null}
         {open && view === "manage" ? <OfficialUsageManageReports revision={revision} canManage={canManage}
-          onChanged={onChanged} onLegacyCleared={onLegacyCleared}
+          onChanged={onChanged}
           onViewSnapshot={setId => navigate("snapshot", setId)}
-          onResumeImport={bundleId => { setResumeBundleId(bundleId); navigate("import"); }} /> : null}
+          onCorrect={setId => navigate("import", setId)} /> : null}
         {open && view === "snapshot" ? <OfficialUsageSnapshot setId={route?.reportSetId}
           activityWindowDays={route?.activityWindowDays ?? 30} revision={revision}
           onBack={() => navigate("manage")} /> : null}

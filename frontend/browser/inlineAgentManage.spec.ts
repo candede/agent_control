@@ -19,7 +19,7 @@ test("edits access and installation and reviews blocking inside one agent modal"
     ...agent, availableTo: "all", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
   };
   const views: CapabilityView[] = capabilityDefinitions.filter(definition =>
-    ["graph.package.access.manage", "graph.package.block.manage", "graph.directory.read"].includes(definition.id),
+    ["graph.package.read.delegated", "graph.package.access.manage", "graph.package.block.manage", "graph.directory.read"].includes(definition.id),
   ).map(definition => ({
     definition,
     decision: {
@@ -32,13 +32,13 @@ test("edits access and installation and reviews blocking inside one agent modal"
     },
   }));
   await page.route(/\/api\/capabilities(?:\/check)?$/, route => route.fulfill({ json: { value: views } }));
-  await page.route(`**/api/agents/${agent.id}`, route => route.fulfill({ json: detail }));
+  await page.route(url => url.pathname === `/api/agents/${agent.id}/detail`, route => route.fulfill({ json: detail }));
   await page.route("**/api/directory/principals?*", route => route.fulfill({ json: { value: [principal] } }));
   await page.route("**/api/directory/principals/resolve", route => route.fulfill({ json: { value: [principal] } }));
   let freshReads = 0;
   const refresh: PackageRefreshJob = {
     id: "inline-exact-read", authorizationPrincipalId: "layout-principal", tokenMode: "delegated",
-    scopeKind: "exact", requestedIds: [agent.id], status: "succeeded", pageCount: 1,
+    scopeKind: "exact", targetCount: 1, resultRevision: layoutTime, status: "succeeded", pageCount: 1,
     observedCount: 1, totalRecords: 1, snapshotId: unifiedAgents.value[0].observations.graphPackages!.snapshotId,
     createdAt: layoutTime, attemptedAt: layoutTime, updatedAt: layoutTime, finishedAt: layoutTime,
   };
@@ -78,16 +78,18 @@ test("edits access and installation and reviews blocking inside one agent modal"
     detail = update.target === "availability"
       ? { ...detail, availableTo: update.scope === "none" ? "none" : "some", allowedUsersAndGroups: update.principals }
       : { ...detail, deployedTo: update.scope === "none" ? "none" : "some", acquireUsersAndGroups: update.principals };
-    const result = {
-      total: 1, succeeded: 1, failed: 0, skipped: 0, accessUpdate: update,
-      results: [{ id: agent.id, displayName: agent.displayName, status: "succeeded" }],
-    };
     return route.fulfill({ json: {
       id: `inline-update-${writes.length}`, action: `update-${update.target}`, accessUpdate: update,
       status: "succeeded", canResume: false, total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0,
-      results: result.results, result, createdAt: layoutTime, updatedAt: layoutTime, completedAt: layoutTime,
+      inconclusive: 0, cancelled: 0, queued: 0, reconciliationRequired: 0, retryEligible: 0,
+      resultRevision: layoutTime, createdAt: layoutTime, updatedAt: layoutTime, completedAt: layoutTime,
     } });
   });
+  await page.route("**/api/agents/bulk-jobs/inline-update-*/items?*", route => route.fulfill({ json: {
+    value: [{ id: agent.id, displayName: agent.displayName, status: "succeeded" }],
+    revision: layoutTime, counts: { total: 1, filtered: 1 },
+    page: { limit: 100, nextCursor: null, previousCursor: null },
+  } }));
 
   await page.goto("/agents");
   await page.getByRole("button", { name: `View details for ${agent.displayName}`, exact: true }).click();

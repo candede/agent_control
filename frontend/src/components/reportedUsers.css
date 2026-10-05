@@ -2,11 +2,14 @@
 .reported-users p { margin: 0; font-size: 13px; line-height: 1.5; }
 .user-activity-controls { display: grid; gap: 8px; }
 .user-activity-controls .agent-query-bar { grid-template-columns: minmax(160px, 1fr) auto auto; }
-.user-activity-controls .agent-query-bar:has(> button) { grid-template-columns: minmax(160px, 1fr) auto auto auto; }
+.user-activity-controls .agent-query-bar:has(> .report-export) { grid-template-columns: minmax(160px, 1fr) auto auto auto; }
+.user-activity-controls .report-export { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.user-activity-controls .report-export > button { white-space: nowrap; }
+.user-activity-controls .report-export:has(p) { grid-column: 1 / -1; }
 .user-activity-controls .agent-filter-fields input,
 .user-activity-controls .agent-filter-fields select { width: 100%; min-width: 0; }
-.reported-users-snapshot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; }
 .reported-users-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.reported-users-snapshot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin: 0; }
 .reported-users-empty { padding: 24px 16px; border: 1px solid var(--border); border-radius: 8px; text-align: center; }
 .reported-users-empty h3,
 .reported-users-empty h4 { margin: 0 0 8px; }
@@ -21,9 +24,6 @@
 .reported-users-table tbody th { color: var(--text-h); background: var(--surface); font-size: 14px; font-weight: 600; text-transform: none; letter-spacing: normal; overflow-wrap: anywhere; }
 .reported-users-table small { display: block; font-weight: 400; margin-top: 4px; overflow-wrap: anywhere; }
 .reported-users-table td { overflow-wrap: anywhere; }
-.reported-user-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 0 0 16px; }
-.reported-user-facts dt { font-size: 12px; color: var(--muted); }
-.reported-user-facts dd { font-size: 18px; font-weight: 700; margin: 4px 0 0; color: var(--text-h); }
 .reported-user-agents > p,
 .reported-user-agents > .copilot-users-toolbar,
 .reported-user-agents > .copilot-users-pagination { margin-block: 12px; }
@@ -37,10 +37,10 @@ button.reported-agent-button:hover { background: #f5f2e9; color: var(--ink); }
 
 @media (max-width: 760px) {
   .user-activity-controls .agent-query-bar,
-  .user-activity-controls .agent-query-bar:has(> button) { grid-template-columns: minmax(0, 1fr) auto; }
+  .user-activity-controls .agent-query-bar:has(> .report-export) { grid-template-columns: minmax(0, 1fr) auto; }
   .user-activity-controls .agent-search-field { position: static; grid-column: 1 / -1; grid-row: 1; }
   .user-activity-controls .agent-query-summary { grid-column: 1 / -1; grid-row: 2; }
   .user-activity-controls .agent-filter-picker { grid-column: 1; grid-row: 3; }
-  .user-activity-controls .agent-query-bar > button { grid-column: 2; grid-row: 3; }
-  .reported-user-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .user-activity-controls .agent-query-bar > .report-export { grid-column: 2; grid-row: 3; }
+  .user-activity-controls .agent-query-bar > .report-export:has(p) { grid-column: 1 / -1; grid-row: 4; }
 }

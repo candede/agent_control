@@ -4,11 +4,27 @@ import { join } from "node:path";
 import type { Request, Response } from "express";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pool } from "../db/pool.js";
-import { httpTelemetry, observeDatabasePool, operationalLog, requestRouteTemplate, safeTelemetry, withTelemetryContext } from "./telemetry.js";
+import { httpTelemetry, observeDatabasePool, observeRuntimeResources, operationalLog, requestRouteTemplate, safeTelemetry, withTelemetryContext } from "./telemetry.js";
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("operational telemetry", () => {
+  it("samples actual heap and pool gauges including idle zeros without credentials", () => {
+    vi.spyOn(process, "memoryUsage").mockReturnValue({ rss: 100, heapUsed: 20, heapTotal: 30, external: 4, arrayBuffers: 2 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    observeRuntimeResources({ totalCount: 2, idleCount: 2, waitingCount: 0, admissionState: { foreground: 0, queue: 0 } });
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+      timestamp: expect.any(String), level: "info", event: "runtime_resource_sample",
+      rssBytes: 100, heapUsedBytes: 20, heapTotalBytes: 30, externalBytes: 4, arrayBufferBytes: 2,
+      poolTotal: 2, poolIdle: 2, poolWaiting: 0, poolForeground: 0, poolQueue: 0,
+    });
+    for (const field of ["rssBytes", "heapUsedBytes", "heapTotalBytes", "externalBytes", "arrayBufferBytes", "poolTotal", "poolIdle", "poolWaiting", "poolForeground", "poolQueue"]) {
+      for (const value of [-1, 0.5, Infinity, "secret", true, {}]) expect(safeTelemetry({ [field]: value })).toEqual({});
+    }
+    observeRuntimeResources({ totalCount: 2, idleCount: 2, waitingCount: 0 });
+    expect(JSON.parse(log.mock.calls[1][0])).not.toHaveProperty("poolQueue");
+  });
+
   it("retains only bounded allowlisted metadata", () => {
     expect(safeTelemetry({
       requestId: "request-1", status: 429, token: "secret", cookie: "secret",
@@ -259,7 +275,7 @@ describe("operational telemetry", () => {
       quarantine_job_stopped: "backend/src/services/copilotStudioQuarantineJobs.ts",
       job_write_uncertain: "backend/src/services/bulkJobs.ts",
       quarantine_write_uncertain: "backend/src/services/copilotStudioQuarantineJobs.ts",
-      official_usage_upload_cleanup_failed: "backend/src/routes/officialUsage.ts",
+      official_usage_upload_cleanup_failed: "backend/src/routes/officialReportMultipart.ts",
       database_pool_error: "backend/src/db/pool.ts",
       database_pool_saturated: "backend/src/services/telemetry.ts",
       session_store_error: "backend/src/db/sessions.ts",

@@ -2,7 +2,6 @@ import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type Re
 import { X } from "lucide-react";
 import {
   type AppRole,
-  type AgentUsageContext,
   type BulkActionResult,
   type CopilotPackage,
   type CopilotPackageDetail,
@@ -20,6 +19,7 @@ import { AgentAccessManagement } from "./AgentAccessManagement";
 import { AgentUsagePanel } from "./AgentUsagePanel";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { WorkbenchActionGate, useWorkbenchAction } from "../workbenchActionContext";
+import { InventoryMembers } from "./InventoryMembers";
 import "./agentInsights.css";
 
 const tabs = ["identities", "reports", "controls", "audit-security"] as const;
@@ -31,12 +31,13 @@ const tabLabels: Record<DetailTab, string> = {
   controls: "Manage",
 };
 type Props = {
+  selectionId?: string;
   record: UnifiedAgentRecord;
   activeTab?: string;
   roles: AppRole[];
   onTabChange: (tab: string) => void;
   onClose: () => void;
-  onInspectPackage: (item: CopilotPackage) => void;
+  onInspectPackage: (item: Pick<CopilotPackage, "id">) => void;
   selectedPackageId?: string;
   packageDetail?: CopilotPackageDetail;
   packageDetailStale?: boolean;
@@ -52,7 +53,7 @@ type Props = {
   packageControlError?: { packageId: string; message: string };
   packageResults?: BulkActionResult["results"];
   dataRevision?: number;
-  usageContext?: AgentUsageContext;
+  usageContext?: import("../../../backend/src/types/unifiedAgents").InventoryReportContext;
   inventoryRevision?: string;
   inventoryError?: string;
   onRetryInventory?: () => void;
@@ -62,6 +63,7 @@ type Props = {
 };
 
 export function UnifiedAgentDetailModal({
+  selectionId,
   record,
   activeTab,
   roles,
@@ -143,7 +145,7 @@ export function UnifiedAgentDetailModal({
   const packageResult = packageResults?.find(result => result.id === selectedPackage?.id);
   const controlError = packageControlError && packageControlError.packageId === selectedPackage?.id ? packageControlError.message : undefined;
   const packageKey = JSON.stringify([
-    record.id, selectedPackage?.id, inventoryRevision,
+    record.id, selectedPackage?.id, selectionId, inventoryRevision,
     selectedPackage ? record.observations.packageSnapshots[selectedPackage.id]?.snapshotId : undefined,
     record.observations.graphPackages?.snapshotId,
   ]);
@@ -244,19 +246,28 @@ export function UnifiedAgentDetailModal({
           onClick={onRetryInventory}>Retry saved inventory</button> : null}
       </div> : null}
       <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
+        {!inventoryError && onRetryInventory ? <div className="table-actions"><button type="button" className="secondary"
+          disabled={packageInventoryPending || packageActionsBusy || hasPackageConfirmation}
+          onClick={onRetryInventory}>Reload saved inventory</button></div> : null}
+        {selectedTab === "identities" && selectionId ? <InventoryMembers key={record.id}
+          selectionId={selectionId} recordId={record.id}
+          onInspectPackage={canInspectPackage ? id => onInspectPackage({ id }) : undefined} /> : null}
         {usesPackageDetails && (selectedPackage || missingPackageSelection) ? <>
           {record.packages.length > 1 || missingPackageSelection ? <div className="agent-version-selector">
             <label htmlFor={packageSelectId}>Published version details</label>
             <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || hasPackageConfirmation}
               onChange={event => setPackageSelection(current => ({ ...current, recordId: record.id, packageId: event.target.value }))}>
-              {missingPackageSelection ? <option value="" disabled>Selected version unavailable</option> : null}
+              {missingPackageSelection ? <option value="" disabled>{packageDetailLoading ? "Loading selected version..." : "Selected version unavailable"}</option> : null}
               {record.packages.map((item, index) => <option key={item.id} value={item.id}>
                 {packageLabels[index]}{packageLabels.indexOf(packageLabels[index]) !== packageLabels.lastIndexOf(packageLabels[index]) ? ` (${index + 1})` : ""}
               </option>)}
             </select>
           </div> : null}
-          {missingPackageSelection ? <p className="error-banner" role="alert">
-            The selected published version <code>{preferredPackageId}</code> is no longer in this saved agent inventory.
+          {missingPackageSelection && packageDetailLoading ? <p role="status">Loading selected published version...</p> : null}
+          {missingPackageSelection && !packageDetailLoading ? <p className="error-banner" role="alert">
+            The selected published version <code>{preferredPackageId}</code> {record.packagesComplete === false
+              ? "is not in the loaded version preview. Inspect it from the paged source members." : "is no longer in this saved agent inventory."}
+            {packageDetailError ? ` ${packageDetailError}` : ""}
             Choose an available version explicitly or <a href="/sync">refresh agent inventory</a>.
           </p> : null}
           {selectedPackage && !selectedDetail && !hasPackageConfirmation ? packageDetailError ? <WorkbenchActionGate actionId="packages.inspect" compact>
@@ -267,13 +278,13 @@ export function UnifiedAgentDetailModal({
         </> : null}
         {selectedTab === "identities" ? <AgentOverview onOpenPerson={onOpenPerson} key={overviewKey}
           record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
-        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.reportSet?.id])}
-          record={record} context={usageContext} inventoryRevision={inventoryRevision} dataRevision={dataRevision}
+        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, selectionId, usageContext?.reports.setId])}
+          record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId, inventoryRevision])} dataRevision={dataRevision}
           canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy || packageInventoryPending || Boolean(inventoryError)} onChanged={onUsageChanged} /> : null}
         {selectedTab === "audit-security" ?
           <AgentInvestigationsPanel recordId={record.id} agentName={record.displayName} roles={roles}
-            revision={JSON.stringify([inventoryRevision, dataRevision, record.observations.powerPlatform?.snapshotId])} /> : null}
+            revision={JSON.stringify([selectionId, inventoryRevision, dataRevision, record.observations.powerPlatform?.snapshotId])} /> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage</h3>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
@@ -288,7 +299,8 @@ export function UnifiedAgentDetailModal({
           <AgentAccessManagement key={`${record.id}:${selectedPackage.id}`} revision={packageAccessRevisions?.get(selectedPackage.id) ?? 0}
             agent={selectedPackage} detail={packageDetailLoading ? undefined : currentDetail} canManage={canManage} canEditAccess={canEditAccess}
             showName={selectedPackage.displayName !== record.displayName}
-            active={selectedTab === "controls" && !hasPackageConfirmation}
+            active={selectedTab === "controls" && !hasPackageConfirmation && !packageDetailLoading
+              && !packageDetailStale && !packageInventoryPending && !inventoryError}
             busy={packageActionsBusy || hasPackageConfirmation} loading={packageDetailLoading && !selectedDetail}
             onUpdate={onUpdatePackageAccess} onSetBlocked={onSetPackageBlocked} />
         </div> : null}

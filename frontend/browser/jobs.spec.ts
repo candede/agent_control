@@ -23,7 +23,7 @@ for (const path of ["/jobs", "/jobs/?source=package-controls"]) {
     await page.goBack();
     await expect(page).toHaveURL("/sync");
     await expect(page.getByRole("heading", { name: "Sync history" })).toBeVisible();
-    expect(commands.filter(command => command !== "POST /api/capabilities/check")).toEqual([]);
+    expect(commands.filter(command => !["POST /api/capabilities/check", "POST /api/agent-inventory/selections"].includes(command))).toEqual([]);
     expect(unexpected).toEqual([]);
   });
 }

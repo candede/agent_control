@@ -2,13 +2,12 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { useImperativeHandle, useState, type Ref } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import * as api from "../api/client";
+import * as api from "../api/reportData";
 import type { SyncReportRouteState } from "../workbenchRouting";
 import { OfficialUsageImportModal } from "./OfficialUsageImportModal";
 import type { OfficialUsageImportHandle } from "./OfficialUsageImportPanel";
-import { usageAggregateFixture } from "../test/usageInsightsFixture";
+import { historySet, reportAgent, reportPage, reportSetId } from "../test/reportDataFixture";
 import { mockNativeDialogs } from "../test/dialog";
-import { reportHistoryFixture } from "./reportHistoryFixture";
 
 mockNativeDialogs();
 const importMount = vi.hoisted(() => vi.fn());
@@ -39,14 +38,15 @@ function Host({ canManage = true }: { canManage?: boolean }) {
 beforeEach(() => {
   vi.restoreAllMocks();
   importMount.mockClear();
-  vi.spyOn(api, "getOfficialUsageAggregate").mockImplementation(async query => {
-    const data = usageAggregateFixture();
-    if (query?.setId) data.activeSet!.id = query.setId;
+  vi.spyOn(api, "readReportPage").mockImplementation(async (path, query) => {
+    const data = reportPage<unknown>(path === "official-usage/history" ? [historySet()] : [reportAgent()], { counts: { total: 1, filtered: 1 } });
+    if (query?.setId) data.reports = { ...data.reports, setId: query.setId };
     return data;
   });
-  vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(reportHistoryFixture());
-  vi.spyOn(api, "getOfficialUsageOverview");
-  vi.spyOn(api, "getOfficialUsageAdminState");
+  vi.spyOn(api, "readReportFacet").mockResolvedValue({ value: [], selection: reportPage([]).selection,
+    counts: { total: 0, filtered: 0 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
+  vi.spyOn(api, "previewReportOperation");
+  vi.spyOn(api, "confirmReportOperation");
 });
 
 describe("focused report dialogs", () => {
@@ -141,7 +141,7 @@ describe("focused report dialogs", () => {
     render(<RoutedHost />);
     await userEvent.click(await screen.findByRole("button", { name: "View report" }));
     expect(screen.getByRole("dialog", { name: "Report details" })).toBeVisible();
-    await screen.findByRole("region", { name: "Snapshot tenant totals" });
+    await screen.findByRole("region", { name: "Agent activity report" });
     expect(screen.queryByRole("button", { name: /Refresh snapshot|View current snapshot|Close reports/ })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
     expect(screen.getByRole("dialog", { name: "Manage reports" })).toBeVisible();
@@ -154,8 +154,9 @@ describe("focused report dialogs", () => {
     expect(screen.getByRole("dialog", { name: "Manage reports" })).toHaveTextContent("An administrator is required");
     await screen.findByRole("table");
     expect(importMount).not.toHaveBeenCalled();
-    expect(api.getOfficialUsageAdminState).not.toHaveBeenCalled();
-    expect(api.getOfficialUsageOverview).not.toHaveBeenCalled();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(vi.mocked(api.readReportPage).mock.calls.every(([path]) => path === "official-usage/history")).toBe(true);
     expect(screen.queryByRole("button", { name: /Add CSV|Delete/ })).not.toBeInTheDocument();
   });
 
@@ -167,7 +168,7 @@ describe("focused report dialogs", () => {
     expect(screen.queryByRole("table", { hidden: true })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Open reports" }));
     await screen.findByRole("table");
-    expect(api.getOfficialUsageHistory).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.readReportPage).mock.calls.filter(([path]) => path === "official-usage/history")).toHaveLength(2);
   });
 
   it("passes explicit staging and report-window links without silently substituting defaults", async () => {
@@ -175,9 +176,9 @@ describe("focused report dialogs", () => {
     const view = render(<OfficialUsageImportModal {...props} route={{ view: "import", stagingId: "exact-stage", activityWindowDays: 7 }} />);
     expect(importMount).toHaveBeenLastCalledWith("exact-stage");
     await act(async () => view.rerender(<OfficialUsageImportModal {...props}
-      route={{ view: "snapshot", reportSetId: "exact-report", activityWindowDays: 7 }} />));
-    await screen.findByRole("region", { name: "Snapshot tenant totals" });
-    expect(api.getOfficialUsageAggregate).toHaveBeenCalledWith(expect.objectContaining({ setId: "exact-report", activityWindowDays: 7 }), expect.anything());
+      route={{ view: "snapshot", reportSetId, activityWindowDays: 7 }} />));
+    await screen.findByRole("region", { name: "Agent activity report" });
+    expect(api.readReportPage).toHaveBeenCalledWith("official-usage/aggregate", expect.objectContaining({ setId: reportSetId, activityWindowDays: 7 }), expect.any(AbortSignal));
     expect(screen.queryByLabelText("Selected import draft")).not.toBeInTheDocument();
   });
 });

@@ -1,26 +1,9 @@
-import { useMemo } from "react";
-import { getOfficialUsageOverview, type OfficialUsageOverviewQuery, type OfficialUsageOverviewView } from "./api/client";
-import { useSavedQuery } from "./savedQueries";
-
-export function useOfficialUsageOverview({
-  scope, search, startDate, endDate, sortBy = "lastActivity", sortDirection = "desc", limit = 25, offset = 0,
-}: OfficialUsageOverviewQuery, revision: number) {
-  const query = useMemo<OfficialUsageOverviewQuery>(() => (
-    { scope, search, startDate, endDate, sortBy, sortDirection, limit, offset }
-  ), [scope, search, startDate, endDate, sortBy, sortDirection, limit, offset]);
-  const validation = startDate && endDate && startDate > endDate
+import type { ReportOverviewAgent } from "../../backend/src/types/officialReportData";
+import type { ReportPageRequest } from "./api/reportData";
+import { useReportPage } from "./useReportPage";
+export function useOfficialUsageOverview(query: ReportPageRequest, revision: number, enabled = true) {
+  const validation = query.startDate && query.endDate && query.startDate > query.endDate
     ? "The activity start date must be on or before the end date." : undefined;
-  const read = useSavedQuery<OfficialUsageOverviewView>({
-    queryKey: ["saved", "official-usage-overview", query, revision],
-    queryFn: ({ signal }) => getOfficialUsageOverview(query, { signal }),
-    enabled: !validation,
-  });
-
-  return {
-    data: validation || read.isFetching || read.isError ? undefined : read.data,
-    error: validation ?? (read.error instanceof Error ? read.error.message
-      : read.error ? "Retained agent activity could not be loaded." : undefined),
-    loading: !validation && (read.isPending || read.isFetching),
-    retry: () => { if (!validation) void read.refetch(); },
-  };
+  const read = useReportPage<ReportOverviewAgent>("official-usage/overview", query, revision, enabled && !validation);
+  return { ...read, validation };
 }

@@ -19,20 +19,17 @@ param(
     [string]$ResourceGroupName,
     [string]$Region,
     [string]$AppRegistrationClientId,
-    [string[]]$TenantDomains,
-    [string]$TenantDisplayName,
     [ValidateSet('agent-control-tenants-json')]
-    [string]$TenantRegistrySecretName,
+    [string]$TenantRegistrySecretName = 'agent-control-tenants-json',
     [string]$TenantRegistryRegistrationApprovalReference,
     [string]$AppServicePlanName,
     [string]$AppServiceName,
     [string]$PostgresServerName,
     [string]$ExistingVaultResourceId,
     [string]$CanonicalOrigin,
-    [ValidateSet('fresh', 'upgrade', 'legacy_import')]
+    [ValidateSet('fresh', 'existing')]
     [string]$InstallationMode,
     [switch]$FirstInstallApproved,
-    [int]$ExpectedSchemaVersion = 26,
     [string[]]$AppOutboundIpv4Addresses,
     [string]$RunnerIpv4Address,
     [string]$ActionGroupResourceId,
@@ -50,9 +47,7 @@ param(
     [string]$ApprovalReference,
     [string]$BurstableRiskAcceptanceReference,
     [string]$SecretVersionsJson,
-    [string]$ExistingSecretVersionsJson,
-    [string]$LegacyAuditBackupPath,
-    [string]$LegacyAuditBackupSha256
+    [string]$ExistingSecretVersionsJson
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,17 +69,13 @@ function New-TargetFromParameters {
     $script:ResourceGroupName = Read-NonSecretValue 'Approved resource group' $ResourceGroupName
     $script:Region = Read-NonSecretValue 'Approved Azure region' $Region
     $script:AppRegistrationClientId = Read-NonSecretValue 'Existing Entra application/client GUID' $AppRegistrationClientId
-    if ($TenantRegistrySecretName) {
-        $script:TenantRegistryRegistrationApprovalReference = Read-NonSecretValue 'Approval reference for callback, roles, assignments and grants in EVERY registry tenant' $TenantRegistryRegistrationApprovalReference
-    } elseif (-not $TenantDomains) {
-        $script:TenantDomains = @((Read-NonSecretValue 'Accepted username domains (comma-separated exact domains; no tenant discovery)' '') -split ',' | ForEach-Object Trim)
-    }
+    $script:TenantRegistryRegistrationApprovalReference = Read-NonSecretValue 'Approval reference for callback, roles, assignments and grants in EVERY registry tenant' $TenantRegistryRegistrationApprovalReference
     $script:AppServicePlanName = Read-NonSecretValue 'App Service Plan name' $AppServicePlanName
     $script:AppServiceName = Read-NonSecretValue 'App Service name' $AppServiceName
     $script:PostgresServerName = Read-NonSecretValue 'PostgreSQL Flexible Server name' $PostgresServerName
     $script:ExistingVaultResourceId = Read-NonSecretValue 'Full existing Key Vault ARM resource ID' $ExistingVaultResourceId
     $script:CanonicalOrigin = Read-NonSecretValue 'Canonical HTTPS origin' $CanonicalOrigin
-    $script:InstallationMode = Read-NonSecretValue 'Installation mode: fresh, upgrade, or legacy_import' $InstallationMode
+    $script:InstallationMode = Read-NonSecretValue 'Installation mode: fresh or existing (exact current schema)' $InstallationMode
     $script:RunnerIpv4Address = Read-NonSecretValue 'Exact approved temporary runner IPv4 address' $RunnerIpv4Address
     if (-not $AppOutboundIpv4Addresses) {
         $script:AppOutboundIpv4Addresses = @((Read-NonSecretValue 'Approved App Service outbound IPv4 addresses (comma separated)' '') -split ',' | ForEach-Object Trim)
@@ -131,17 +122,10 @@ function New-TargetFromParameters {
     } else {
         $values = @()
         foreach ($name in $requiredSecrets) {
-            if ($name -ceq $TenantRegistrySecretName) {
-                $version = [string](Read-Host "Currently deployed non-secret version for $name [Enter only for first registry migration]")
-                if ([string]::IsNullOrWhiteSpace($version)) { continue }
-            } else { $version = Read-NonSecretValue "Currently deployed non-secret version for $name" '' }
+            $version = Read-NonSecretValue "Currently deployed non-secret version for $name" ''
             $values += [PSCustomObject]@{ name = $name; version = $version.Trim() }
         }
         $values
-    }
-    if ($InstallationMode -eq 'legacy_import') {
-        $script:LegacyAuditBackupPath = Read-NonSecretValue 'SQLite-safe legacy audit backup path' $LegacyAuditBackupPath
-        $script:LegacyAuditBackupSha256 = Read-NonSecretValue 'Legacy audit backup SHA-256' $LegacyAuditBackupSha256
     }
     $estimateTotal = ($script:EstimateItemNames | ForEach-Object { [decimal]$items.$_ } | Measure-Object -Sum).Sum
     $expected = [PSCustomObject]@{
@@ -157,8 +141,6 @@ function New-TargetFromParameters {
         resourceGroup = $ResourceGroupName
         region = $Region
         entraApplicationId = $AppRegistrationClientId
-        tenantDomains = @($TenantDomains | Where-Object { $null -ne $_ })
-        tenantDisplayName = $TenantDisplayName
         tenantRegistrySecretName = $TenantRegistrySecretName
         tenantRegistryRegistrationApprovalReference = $TenantRegistryRegistrationApprovalReference
         canonicalOrigin = $CanonicalOrigin.TrimEnd('/')
@@ -168,10 +150,7 @@ function New-TargetFromParameters {
         firstInstallApproved = [bool]$FirstInstallApproved
         expectedResourceIds = $expected
         expectedDatabaseName = 'agentcontrol'
-        expectedSchemaVersion = $ExpectedSchemaVersion
         runnerIpv4Address = $RunnerIpv4Address
-        legacyAuditBackupPath = $LegacyAuditBackupPath
-        legacyAuditBackupSha256 = $LegacyAuditBackupSha256
         resources = [PSCustomObject]@{
             appServicePlan = [PSCustomObject]@{ name = $AppServicePlanName; sku = 'B1'; linux = $true; instanceCount = 1 }
             appService = [PSCustomObject]@{ name = $AppServiceName; nodeMajor = 24; remoteBuildEnabled = $false }

@@ -2,10 +2,11 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 import { layoutTime, mockLayoutApi } from "./layoutFixtures";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
-import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { selectedFixtureRead } from "../src/test/selectedUsageFixture";
 import { responsibilityFixture } from "../src/test/agentResponsibilityFixture";
 
 async function openUser(page: Page) {
+  await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
   const reads = { users: 0, responsibility: 0, refresh: 0 };
@@ -14,9 +15,11 @@ async function openUser(page: Page) {
     if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)
       && new URL(request.url()).pathname !== "/api/capabilities/check") writes.push(new URL(request.url()).pathname);
   });
-  await page.route("**/api/copilot-usage/users", route => {
-    reads.users += 1;
-    return route.fulfill({ json: copilotUsageFixture });
+  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), route => {
+    if (new URL(route.request().url()).pathname === "/api/copilot-usage/users") reads.users += 1;
+    const body = selectedFixtureRead(route.request().url());
+    expect(body, "Every user detail and child read uses an exact selected contract").toBeDefined();
+    return route.fulfill({ json: body });
   });
   await page.route("**/api/agent-responsibility?**", route => {
     reads.responsibility += 1;
@@ -42,7 +45,7 @@ test("user details organize useful data into consistent accessible tabs without 
   await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit"]);
   await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toContainText("Contoso Health");
   await expect(dialog.getByLabel("User summary")).toContainText("200");
-  await expect(dialog.getByText("Aug 14, 2026 - Sep 12, 2026", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Reporting period: 2026-08-14 to 2026-09-12", { exact: true })).toBeVisible();
   expect(reads.responsibility).toBe(0);
   const bounds = await dialog.boundingBox();
   await dialog.screenshot({ path: info.outputPath("user-overview.png") });

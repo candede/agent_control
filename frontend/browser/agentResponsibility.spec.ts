@@ -1,11 +1,12 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import { projectAgentResponsibility } from "../../backend/src/services/agentResponsibility";
+import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
 import type { UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
-import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { selectedUsersPage } from "../src/test/selectedUsageFixture";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
+import { fulfillInventoryPage, inventoryFixtureQuery, isInventorySelectionRequest } from "./selectedInventoryFixture";
 
 const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -36,7 +37,8 @@ const record: UnifiedAgentRecord = {
 
 function inventory(records = [record]): UnifiedAgentInventoryPage {
   const summary = { total: records.length, linked: 0, graphOnly: 0, powerPlatformOnly: records.length, ambiguous: 0, conflicting: 0 };
-  return { ...unifiedAgents, revision: "a".repeat(64), value: records, count: records.length, summary, filteredSummary: summary,
+  return { ...unifiedAgents, value: records, counts: { total: records.length, scoped: records.length, filtered: records.length, packageTargets: 0 },
+    summary, filteredSummary: summary,
     inventoryScope: "all", scopeSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: records.length, logicalAgentCount: records.length }),
     sources: { graphPackages: unifiedAgents.sources.graphPackages, powerPlatform: { state: "available", observation, error: null } },
@@ -51,26 +53,27 @@ async function fixture(page: Page, records = [record]) {
   page.on("request", request => {
     const path = new URL(request.url()).pathname;
     requests.push(path);
-    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(path);
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request) && !isInventorySelectionRequest(request)) writes.push(path);
   });
-  await page.route("**/api/agent-inventory*", route => {
-    const query = new URL(route.request().url()).searchParams;
+  await page.route(url => url.pathname === "/api/agent-inventory", route => {
+    const query = inventoryFixtureQuery(route);
     const exact = query.get("recordId");
     const data = inventory(records);
     const inventoryScope = exact ? "all" : query.get("inventoryScope") === "catalog" ? "catalog" : "power_platform_only";
     const scoped = inventoryScope === "catalog" ? inventory([]) : data;
     const value = exact ? records.filter(record => record.id === exact) : scoped.value;
-    return route.fulfill({ json: { ...data, inventoryScope, scopeSummary: scoped.summary,
-      value, count: value.length, filteredSummary: { ...scoped.summary, total: value.length } } });
+    return fulfillInventoryPage(route, { ...data, inventoryScope, scopeSummary: scoped.summary,
+      value, counts: { ...data.counts, scoped: scoped.summary.total, filtered: value.length },
+      filteredSummary: { ...scoped.summary, total: value.length } });
   });
   await page.route("**/api/agent-responsibility*", route => {
     const query = new URL(route.request().url()).searchParams;
     const objectId = query.get("objectId") ?? undefined;
-    const paid = copilotUsageFixture.users.find(user => user.directory.objectId === objectId);
+    const paid = selectedUsersPage().value.find(user => user.directory.objectId === objectId);
     const known = !objectId || records.some(record => Object.values(record.people ?? {}).some(person => person.objectId === objectId)) || paid;
     if (!known) return route.fulfill({ status: 404, json: { detail: "Exact saved person unavailable", code: "responsibility_person_unavailable" } });
     return route.fulfill({ json: projectAgentResponsibility(inventory(records), {
-      objectId, search: query.get("search") ?? undefined, limit: Number(query.get("limit") ?? 50), offset: Number(query.get("offset") ?? 0),
+      objectId, search: query.get("search") ?? undefined, limit: Number(query.get("limit") ?? 50), cursor: query.get("cursor") ?? undefined,
     }, paid ? { ...paid.directory, observedAt: layoutTime } : undefined) });
   });
   await page.route("**/api/inventory/resources/native-responsibility/related*", route => route.fulfill({ json: {
@@ -172,7 +175,9 @@ test("unavailable sources and removed canonical agents fail explicitly rather th
   await page.route("**/api/agent-responsibility*", route => route.fulfill({ json: projectAgentResponsibility(inventory(), { objectId: owner }) }));
   await page.reload();
   await expect(page.getByRole("button", { name: "Open agent Responsibility review agent" })).toBeVisible();
-  await page.route("**/api/agent-inventory*", route => route.fulfill({ json: inventory([]) }));
+  await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route, inventory([])));
+  await page.route(url => url.pathname === `/api/agent-inventory/${encodeURIComponent(inventory().value[0].id)}/detail`,
+    route => route.fulfill({ status: 404, json: { code: "record_not_found", detail: "The exact agent is not available in the current saved inventory." } }));
   await page.getByRole("button", { name: "Open agent Responsibility review agent" }).click();
   await expect(page.getByRole("alert").filter({ hasText: "The exact agent is not available in the current saved inventory." })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);

@@ -4,7 +4,6 @@ import type { UnifiedAgentAccessFilter, UnifiedAgentInventoryScope, UnifiedAgent
 import { agentInventoryScopeOptions, inventoryScopeAgentCount } from "../agentColumns";
 import { useOfficialUsageOverview } from "../useOfficialUsageOverview";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate } from "../usageInsights";
-import "./cumulativeUsage.css";
 
 function scopeCount(inventory: UnifiedAgentInventoryPage | undefined, scope: UnifiedAgentInventoryScope) {
   const hasCatalog = inventory?.sources.graphPackages.state !== undefined && inventory.sources.graphPackages.state !== "unavailable";
@@ -41,14 +40,17 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   inventoryScope?: UnifiedAgentInventoryScope;
   reportSelector?: ReactNode;
 }) {
-  const { data, loading, error, retry } = useOfficialUsageOverview({ scope: "selected", limit: 1 }, revision);
+  const usageContext = inventory?.usageContext;
+  const { data, loading, error, retry, invalidated, restart } = useOfficialUsageOverview({
+    scope: "selected", setId: usageContext?.reports.setId ?? undefined, limit: 1,
+  }, revision, Boolean(inventory));
   const hasCatalog = inventory?.sources.graphPackages.state !== undefined && inventory.sources.graphPackages.state !== "unavailable";
   const hasPowerPlatform = inventory?.sources.powerPlatform.state !== undefined && inventory.sources.powerPlatform.state !== "unavailable";
   const hasInventory = inventoryScope === "catalog" ? hasCatalog : inventoryScope === "power_platform_only" ? hasPowerPlatform : hasCatalog || hasPowerPlatform;
   const selectedScope = agentInventoryScopeOptions.find(option => option.value === inventoryScope)!;
   const scopedInventory = inventory?.inventoryScope === inventoryScope ? inventory : undefined;
-  const reports = data?.summary.retainedSets ? data.summary : undefined;
-  const usageContext = inventory?.usageContext;
+  const reports = data?.reports.setId && data.analytics.overview && data.analytics.overview.retainedSets > 0
+    && (!usageContext || data.reports.setId === usageContext.reports.setId) ? data.analytics.overview : null;
   return <section className="agent-inventory-overview" aria-label="Agent inventory overview">
     {inventoryScope !== "catalog" && inventory && !hasCatalog ? <p className="agent-inventory-scope-warning" aria-live="polite">
       The package catalog is unavailable. Catalog matching is incomplete until that source is collected.
@@ -63,17 +65,17 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
         hint={reports ? "In selected report set" : "No selected report data"}
         selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
-      <Metric label="Reported active · 30 days" value={reports?.activeAgents30Days ?? null}
-        hint={reports && data ? `${usageDate(data.summary.activeSinceDateUtc)} - ${usageDate(data.summary.asOf)} (UTC)` : "No selected report data"} />
+      <Metric label="Reported active · 30 days" value={reports?.active30Days ?? null}
+        hint={reports ? `${usageDate(reports.activeSinceDateUtc)} - ${usageDate(reports.asOf)} (UTC)` : "No selected report data"} />
       <div className="agent-report-context" title="Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero.">
         <span className="agent-context-label">Report context</span>
-        {reportSelector ?? <span>{usageContext ? usageCoverageLabel(usageContext.reportSet) : "Selected report set"}</span>}
-        {usageContext && usageContext.availability !== "active"
-          ? <span role="status">{usageAvailabilityLabel(usageContext.availability)}</span> : null}
+        {reportSelector ?? <span>{usageContext ? usageCoverageLabel(usageContext.reports) : "Selected report set"}</span>}
+        {usageContext && usageContext.reports.availability !== "active"
+          ? <span role="status">{usageAvailabilityLabel(usageContext.reports.availability)}</span> : null}
       </div>
     </div>
-    {loading ? <p role="status">Loading selected report evidence...</p> : null}
-    {error ? <p className="error-banner" role="alert">{error} <button className="secondary" type="button" onClick={retry}>Retry activity evidence</button></p> : null}
+    {loading ? <p className="sr-only" role="status">Loading selected report evidence...</p> : null}
+    {error ? <p className="error-banner" role="alert">{error.message} <button className="secondary" type="button" onClick={invalidated ? restart : retry}>{invalidated ? "Restart selection" : "Retry activity evidence"}</button></p> : null}
   </section>;
 }
 

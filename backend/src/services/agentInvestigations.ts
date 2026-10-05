@@ -6,11 +6,10 @@ import { AgentIdentityRepository, type AgentIdentityCacheState, type AgentIdenti
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
-import { unifiedAgents } from "./unifiedAgents.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { liveInventory } from "../db/liveInventory.js";
 import { normalizeNativeIdentity, resolveExactInventoryIdentity } from "./inventoryIdentity.js";
 
-type InventoryScope = Parameters<typeof unifiedAgents.list>[0];
+type InventoryScope = Parameters<typeof liveInventory.record>[0];
 
 const cacheReasons: Partial<Record<AgentIdentityCacheStatus, { reason: string; reasonCode: AgentInvestigationReasonCode }>> = {
   missing: { reason: "No typed directory mapping is saved for this current source. Explicitly resolve its log identity.",
@@ -28,24 +27,22 @@ const cacheReasons: Partial<Record<AgentIdentityCacheStatus, { reason: string; r
 };
 
 export class AgentInvestigationsService {
-  constructor(private readonly inventory: Pick<typeof unifiedAgents, "list" | "assertRevision"> = unifiedAgents,
-    private readonly identities: Pick<PowerPlatformInventoryRepository, "readIdentityCandidates"> = new PowerPlatformInventoryRepository(),
+  constructor(private readonly inventory: Pick<typeof liveInventory, "withRead" | "record" | "assertCurrent"> = liveInventory,
+    private readonly identities: Pick<typeof liveInventory, "identityCandidates"> = liveInventory,
     private readonly mappings: Pick<AgentIdentityRepository, "readState"> = new AgentIdentityRepository()) {}
 
   async resolve(scope: InventoryScope, value: unknown): Promise<{
     context: AgentInvestigationContext; purviewTarget?: AgentPurviewTarget; identitySource?: AgentIdentitySource; inventoryRevision?: string;
   }> {
     const recordId = investigationRecordId(value);
-    const page = await this.inventory.list(scope, { recordId, limit: 1 });
-    const record = page.value[0];
-    if (page.count !== 1 || !record) throw new AppError(404, "agent_not_found", "The current saved agent is unavailable. Refresh Agents.");
-    const resource = record.powerPlatformResource;
-    const observation = record.observations.powerPlatform;
+    const loaded = await this.inventory.withRead(async read => {
+    const record = await this.inventory.record(scope, recordId, read);
+    const resource = record.native?.resource;
+    const observation = record.native?.observation;
     const uncertain = record.identity.invalidMetadata || ["ambiguous", "conflicting"].includes(record.identity.state);
-    const current = Boolean(page.revision) && resource?.type === "microsoft.copilotstudio/agents"
+    const current = Boolean(record.revision) && resource?.type === "microsoft.copilotstudio/agents"
       && resource.tenantId.toLowerCase() === scope.tenantId.toLowerCase()
-      && observation?.current === true && Date.parse(observation.expiresAt) > Date.now()
-      && page.sources.powerPlatform.state !== "unavailable";
+      && observation?.current === true && Date.parse(observation.expiresAt) > Date.now();
     const unsupported = !resource || resource.type !== "microsoft.copilotstudio/agents" || resource.agentKind === "agent_builder_agent";
     const commonReasonCode: AgentInvestigationReasonCode | undefined = unsupported ? "unsupported_identity_crosswalk"
       : uncertain ? "ambiguous_identity" : !current ? "stale_source" : undefined;
@@ -53,7 +50,7 @@ export class AgentInvestigationsService {
       : uncertain ? "Saved identity metadata is ambiguous or conflicting. Refresh and resolve the agent identity first."
       : !current ? "A current authorized Power Platform agent identity is required. Refresh Agents first." : undefined;
     const exactIds = (kind: "entra_app_id" | "cds_bot_id" | "entra_agent_id") => {
-      const values = resource?.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value) ?? [];
+      const values = record.native?.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value) ?? [];
       if (values.some(id => !isDirectoryObjectId(id))) return [];
       return [...new Set(values.map(id => id.toLowerCase()))];
     };
@@ -61,7 +58,7 @@ export class AgentInvestigationsService {
     const bots = exactIds("cds_bot_id");
     const agentIds = exactIds("entra_agent_id");
     const candidates = !commonReason && (applicationIds.length === 1 || bots.length === 1 || agentIds.length === 1)
-      ? await this.identities.readIdentityCandidates(scope, ["microsoft.copilotstudio/agents"]).catch(error => {
+      ? await this.identities.identityCandidates(scope, record, read).catch(error => {
         if (error instanceof AppError && error.code === "snapshot_invalidated") throw sourceChanged();
         throw error;
       }) : [];
@@ -74,7 +71,7 @@ export class AgentInvestigationsService {
         && match.candidate.environmentId?.toLowerCase() === resource.environmentId?.toLowerCase();
     };
     const agentProvenance = resource?.provenance?.entraAgentId;
-    const candidateMissing = !resource?.identifiers.some(identifier => identifier.kind === "entra_agent_id");
+    const candidateMissing = !record.native?.identifiers.some(identifier => identifier.kind === "entra_agent_id");
     const resolutionCode: AgentInvestigationReasonCode | undefined = commonReasonCode
       ?? (resource?.agentKind !== "copilot_studio_agent" ? "unsupported_identity_crosswalk"
         : candidateMissing ? "missing_identity_candidate"
@@ -94,9 +91,14 @@ export class AgentInvestigationsService {
         observation.snapshotId, resource.nativeId, resource.environmentId, agentIds[0], agentProvenance,
       ])).digest("hex"),
     } : undefined;
-    const savedCache: AgentIdentityCacheState = identitySource ? await this.mappings.readState(scope, identitySource) : { status: "source_unavailable" };
-    if (current && page.revision) {
-      try { await this.inventory.assertRevision(scope, page.revision); }
+    const savedCache: AgentIdentityCacheState = identitySource ? await this.mappings.readState(scope, identitySource, read.client) : { status: "source_unavailable" };
+    return { record, resource, observation, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
+      identitySource, savedCache, resolutionReason, resolutionCode };
+    });
+    const { record, resource, observation, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
+      identitySource, savedCache, resolutionReason, resolutionCode } = loaded;
+    if (current) {
+      try { await this.inventory.assertCurrent(scope, record.id, record.revision); }
       catch (error) {
         if (error instanceof AppError && error.code === "inventory_changed") throw sourceChanged();
         throw error;
@@ -131,7 +133,7 @@ export class AgentInvestigationsService {
       || !unambiguous("cds_bot_id", bots)
       ? "Saved Purview association requires an exact bot ID and its current environment." : undefined);
     return {
-      inventoryRevision: page.revision,
+      inventoryRevision: record.revision,
       ...(identitySource ? { identitySource } : {}),
       context: {
         recordId: record.id, displayName: record.displayName,

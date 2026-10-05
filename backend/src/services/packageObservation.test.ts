@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 import { GraphPackagesClient, verifyPackageMutationConverged } from "./graphPackages.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
@@ -67,7 +68,7 @@ describe("complete package observations", () => {
     const fetcher = vi.fn(async () => Response.json(operation === "detail" ? invalid : { value: [invalid] }));
     const client = new GraphPackagesClient(fetcher);
     const observation = operation === "catalog" ? client.checkCatalogAccess("fixture-token")
-      : operation === "inventory" ? client.listCopilotAgents("fixture-token")
+      : operation === "inventory" ? tinyGraphCatalog(client, "fixture-token")
         : client.getPackageDetails("fixture-token", base.id);
     await expect(observation).rejects.toMatchObject({ status: 502, code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
@@ -85,7 +86,7 @@ describe("persistable package text", () => {
     const fetcher = vi.fn(async () => new Response(body));
     const client = new GraphPackagesClient(fetcher);
     const observation = operation === "catalog" ? client.checkCatalogAccess("fixture-token")
-      : operation === "inventory" ? client.listCopilotAgents("fixture-token")
+      : operation === "inventory" ? tinyGraphCatalog(client, "fixture-token")
         : client.getPackageDetails("fixture-token", base.id);
     await expect(observation).rejects.toMatchObject({ status: 502, code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();

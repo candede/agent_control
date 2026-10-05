@@ -8,6 +8,7 @@ import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { normalizePackageStatus } from "../types/copilotPackage.js";
+import { inventoryLimits, type InventoryPage } from "../types/inventoryRecords.js";
 import type {
   CopilotPackage,
   CopilotPackageDetail,
@@ -70,7 +71,7 @@ export type PackageReadOptions = {
   diagnostics?: PackageScanDiagnostics;
   getAccessToken?: () => Promise<string>;
   retryThrottlingUntilAborted?: boolean;
-  onProgress?: (progress: { pages: number; observedCount: number }) => void | Promise<void>;
+  onProgress?: (progress: { pages: number; observedCount: number; totalRecords?: number | null }) => void | Promise<void>;
   onRetry?: (retry: { attempt: number; retryDelayMs: number; throttled: boolean }) => void | Promise<void>;
 };
 
@@ -106,34 +107,6 @@ export class GraphPackagesClient {
     this.readIntervalMs = this.retryPolicy.minimumReadIntervalMs;
   }
 
-  async listCopilotAgents(accessToken: string, options: PackageReadOptions = {}) {
-    const packages: CopilotPackage[] = [];
-    let nextUrl: string | undefined = buildCopilotAgentsListUrl();
-    const visited = new Set<string>();
-
-    while (nextUrl) {
-      if (visited.has(nextUrl) || visited.size >= 100 || packages.length >= 5000) {
-        throw new AppError(502, "provider_result_limit", "Package inventory exceeded the bounded page/result limit.");
-      }
-      visited.add(nextUrl);
-      const pageStartedAt = this.retryPolicy.now();
-      const page: GraphCollectionResponse<CopilotPackage> =
-        await this.requestReadWithRetry(nextUrl, accessToken, options, "catalog");
-      if (!page || !Array.isArray(page.value) || page.value.length + packages.length > 5000) throw new AppError(502, "provider_schema", "Package collection is invalid or oversized.");
-      const nextLink = page["@odata.nextLink"];
-      if (nextLink !== undefined && (typeof nextLink !== "string" || !nextLink.trim())) {
-        throw new AppError(502, "provider_schema", "Package collection continuation link is invalid.");
-      }
-      options.diagnostics?.catalogPage(page.value, visited.size, nextLink !== undefined, this.retryPolicy.now() - pageStartedAt);
-      packages.push(...page.value.map(allowlistedPackage));
-      await options.onProgress?.({ pages: visited.size, observedCount: packages.length });
-      options.signal?.throwIfAborted();
-      nextUrl = nextLink;
-    }
-
-    return packages;
-  }
-
   async checkCatalogAccess(accessToken: string, signal?: AbortSignal) {
     const page = await this.requestReadWithRetry<GraphCollectionResponse<CopilotPackage>>(
       buildCopilotAgentsListUrl(),
@@ -143,6 +116,48 @@ export class GraphPackagesClient {
     );
     if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Package access check returned an invalid collection.");
     page.value.forEach(allowlistedPackage);
+  }
+
+  async *catalogPages(accessToken: string, options: PackageReadOptions & {
+    visit: (token: string) => Promise<void>;
+  }): AsyncGenerator<InventoryPage<CopilotPackageDetail>> {
+    const signal = AbortSignal.any([AbortSignal.timeout(inventoryLimits.graphDeadlineMs), ...options.signal ? [options.signal] : []]);
+    let url: string | undefined = buildCopilotAgentsListUrl();
+    let pages = 0;
+    let observed = 0;
+    while (url) {
+      signal.throwIfAborted();
+      if (++pages > inventoryLimits.pages) throw new AppError(502, "provider_page_limit", "Inventory exceeds 10000 pages.");
+      let target: URL;
+      try { target = new URL(url); }
+      catch { throw new AppError(502, "invalid_provider_link", "Invalid catalog continuation URL."); }
+      if (target.origin !== "https://graph.microsoft.com" || target.username || target.password) throw new AppError(502, "invalid_provider_link", "Invalid catalog origin.");
+      if (target.pathname.replace(/\/$/, "") !== "/v1.0/copilot/admin/catalog/packages"
+        || target.searchParams.get("$filter") !== copilotFilter) throw new AppError(502, "invalid_provider_link", "Catalog continuation changed its selector.");
+      await options.visit(url);
+      const started = this.retryPolicy.now();
+      const page: GraphCollectionResponse<CopilotPackage> & { "@odata.count"?: number } = await this.requestReadWithRetry(
+        url, accessToken, { ...options, signal }, "catalog");
+      if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Invalid catalog page.");
+      const count = page["@odata.count"];
+      if (count !== undefined) {
+        if (!Number.isSafeInteger(count) || count < 0) throw new AppError(502, "provider_schema", "Invalid catalog count.");
+      }
+      const next: string | undefined = page["@odata.nextLink"];
+      if (next !== undefined && (typeof next !== "string" || !next.trim() || next.length > 8192)) {
+        throw new AppError(502, "provider_schema", "Invalid catalog continuation.");
+      }
+      observed += page.value.length;
+      if (observed > inventoryLimits.sourceRows) throw new AppError(502, "provider_result_limit", "Inventory exceeds 100000 source records.");
+      // This filtered endpoint is server-paged: only the opaque nextLink establishes completion.
+      const expected = next === undefined ? observed : null;
+      options.diagnostics?.catalogPage(page.value, pages, next !== undefined, this.retryPolicy.now() - started, count);
+      yield { token: url, nextToken: next ?? null, records: page.value.map(allowlistedPackage),
+        rawCount: page.value.length, expectedCount: expected, page: pages };
+      await options.onProgress?.({ pages, observedCount: observed, totalRecords: expected });
+      signal.throwIfAborted();
+      url = next;
+    }
   }
 
   async getPackageDetails(accessToken: string, id: string, options: PackageReadOptions = {}) {
@@ -767,7 +782,7 @@ function retryAfterFromDetails(details: unknown) {
   return undefined;
 }
 
-function retryAfterMs(value: string | null) {
+export function retryAfterMs(value: string | null) {
   if (!value) {
     return undefined;
   }

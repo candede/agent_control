@@ -16,15 +16,6 @@ const listTableFeatures = tableFeatures({
 
 export type ListColumn<T extends RowData> = ColumnDef<typeof listTableFeatures, T>;
 
-export function restoreTableSortFocus(region: HTMLElement | null, label: string | undefined) {
-  if (!region || !label) return;
-  const focused = document.activeElement;
-  // An asynchronous sort must not steal focus if the user moved to another control.
-  if (focused && focused !== document.body && focused.isConnected) return;
-  [...region.querySelectorAll<HTMLButtonElement>(".table-sort-heading")]
-    .find(button => button.getAttribute("aria-label") === `Sort by ${label}`)?.focus();
-}
-
 export function useListTable<T extends RowData>({
   data, columns, sorting, onSortingChange, getRowId, manualSorting = false,
 }: {

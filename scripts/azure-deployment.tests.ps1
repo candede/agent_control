@@ -30,7 +30,7 @@ function Save-Json {
 }
 
 function New-Target {
-    param([ValidateSet('fresh', 'upgrade', 'legacy_import')][string]$Mode = 'upgrade',[switch]$Registry)
+    param([ValidateSet('fresh', 'existing')][string]$Mode = 'existing')
     $tenant = '11111111-1111-4111-8111-111111111111'
     $subscription = '22222222-2222-4222-8222-222222222222'
     $group = 'fixture-agent-control'
@@ -38,7 +38,6 @@ function New-Target {
     $app = 'fixture-agent-control-app'
     $postgres = 'fixture-agent-control-postgres'
     $secretNames = @($script:RequiredSecretNames)
-    if ($Registry) { $secretNames += 'agent-control-tenants-json' }
     $versions = @($secretNames | ForEach-Object { [PSCustomObject]@{ name = $_; version = 'fixtureversion1' } })
     return [PSCustomObject]@{
         contractVersion = 2
@@ -48,10 +47,8 @@ function New-Target {
         resourceGroup = $group
         region = 'fixtureregion'
         entraApplicationId = '33333333-3333-4333-8333-333333333333'
-        tenantDomains = @('contoso.com')
-        tenantDisplayName = 'Contoso'
-        tenantRegistrySecretName = $(if ($Registry) { 'agent-control-tenants-json' } else { '' })
-        tenantRegistryRegistrationApprovalReference = $(if ($Registry) { 'fixture-every-tenant-registration-approval' } else { '' })
+        tenantRegistrySecretName = 'agent-control-tenants-json'
+        tenantRegistryRegistrationApprovalReference = 'fixture-every-tenant-registration-approval'
         canonicalOrigin = "https://$app.azurewebsites.net"
         callbackUri = "https://$app.azurewebsites.net/api/auth/callback"
         existingVaultResourceId = "/subscriptions/$subscription/resourceGroups/fixture-security/providers/Microsoft.KeyVault/vaults/fixture-vault"
@@ -63,10 +60,7 @@ function New-Target {
             postgresFlexibleServer = "/subscriptions/$subscription/resourceGroups/$group/providers/Microsoft.DBforPostgreSQL/flexibleServers/$postgres"
         }
         expectedDatabaseName = 'agentcontrol'
-        expectedSchemaVersion = 26
         runnerIpv4Address = '192.0.2.10'
-        legacyAuditBackupPath = $(if ($Mode -eq 'legacy_import') { (Join-Path $scratch 'fixture-legacy.sqlite') } else { $null })
-        legacyAuditBackupSha256 = $(if ($Mode -eq 'legacy_import') { 'a' * 64 } else { $null })
         resources = [PSCustomObject]@{
             appServicePlan = [PSCustomObject]@{ name = $plan; sku = 'B1'; linux = $true; instanceCount = 1 }
             appService = [PSCustomObject]@{ name = $app; nodeMajor = 24; remoteBuildEnabled = $false }
@@ -108,7 +102,6 @@ function New-Target {
             burstablePocLimitationsAccepted = $true
             reference = 'fixture-risk-acceptance-1'
         }
-        legacyStaticWebApp = [PSCustomObject]@{ resourceId = $null; retirementApproved = $false; approvalReference = $null }
         preparedVaultContract = [PSCustomObject]@{
             secretNames = $secretNames
             runtimeConsumers = @($secretNames | Where-Object { $_ -cne 'agent-control-postgres-admin-password' })
@@ -139,9 +132,9 @@ $script:OperationNames = @(
     'prerequisites', 'operator_identity', 'bicep_build', 'sku_pricing_preflight', 'vault_preflight',
     'registration_verify', 'qualification_preflight', 'target_inventory', 'release_inspection', 'bicep_what_if',
     'approval_checkpoint', 'resume_verify', 'resource_deploy', 'network_reconcile', 'enter_maintenance',
-    'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_migrate', 'legacy_import',
+    'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
     'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
-    'authentication_smoke_verify', 'database_reopen', 'open_and_verify', 'retire_legacy_swa',
+    'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
     'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup'
 )
 
@@ -156,7 +149,7 @@ function Add-Az {
     Add-Command $Fixture $Operation az (@($Arguments) + @('--only-show-errors', '-o', 'json')) -Json $Json -ExitCode $ExitCode
 }
 function Add-DatabaseCommand {
-    param($Fixture, [string]$Operation, $Target, [string[]]$Command, [string]$Server = '', [string]$CurrentServer = '', [switch]$RuntimeRole, [switch]$Legacy)
+    param($Fixture, [string]$Operation, $Target, [string[]]$Command, [string]$Server = '', [string]$CurrentServer = '', [switch]$RuntimeRole)
     $databaseServer = if ($Server) { $Server } else { $Target.resources.postgresFlexibleServer.name }
     $args = @('run', '--rm', '--platform', 'linux/amd64',
         '--mount', 'type=bind,source={{ROOT}}/artifacts/azure-bootstrap/{{RUN_ID}},target=/run/secrets,readonly',
@@ -165,12 +158,13 @@ function Add-DatabaseCommand {
         '-e', "PGPASSWORD_FILE=/run/secrets/$(if ($RuntimeRole) { 'postgres-app' } else { 'postgres-admin' })",
         '-e', 'APP_PGPASSWORD_FILE=/run/secrets/postgres-app', '-e', 'PGSSLMODE=verify-full')
     if ($CurrentServer) { $args += @('-e', "CURRENT_PGHOST=$CurrentServer.postgres.database.azure.com") }
-    if ($Legacy) {
-        $args += @('--mount', "type=bind,source=$($Target.legacyAuditBackupPath),target=/legacy/audit.sqlite,readonly")
-        $Command = @($Command[0], '/legacy/audit.sqlite', $Command[2])
-    }
     $args += @('agent-control-azure-operator:local') + $Command
-    Add-Command $Fixture $Operation docker $args -Output '{"outcome":"succeeded"}'
+    $evidence = if ($Command[0] -ceq 'backend/scripts/azure-database.ts' -and $Command[1] -ceq 'preflight') {
+        @{mode=$Command[2];database=$Command[3];currentFingerprint=$(if ($Command[2] -ceq 'fresh') { $null } else { 'a'*64 });targetFingerprint=('a'*64);tableCount=$(if ($Command[2] -ceq 'fresh') { 0 } else { 1 })}
+    } elseif ($RuntimeRole) {
+        @{user='agentcontrol_app';database=$Target.expectedDatabaseName;ddlDenied=$true;auditMutationDenied=$true}
+    } else { @{outcome='succeeded'} }
+    Add-Command $Fixture $Operation docker $args -Json $evidence
 }
 function ReferenceStatus {
     param($Target, [string]$Status = 'Resolved', [string]$MismatchSetting)
@@ -234,8 +228,6 @@ function New-Fixture {
     }
     foreach ($name in (Get-AzureRequiredSecretNames $Target)) {
         $value = "synthetic-fixture-$name-value-that-is-long-enough-0001"
-        if ($name -eq 'agent-control-tenant-id') { $value = $Target.tenantId }
-        if ($name -eq 'agent-control-client-id') { $value = $Target.entraApplicationId }
         if ($name -eq 'agent-control-tenants-json') { $value = ConvertTo-Json -InputObject @(New-RegistryProfiles $Target) -Depth 20 }
         Add-Az $fixture vault_preflight @('keyvault', 'secret', 'show', '--vault-name', 'fixture-vault', '--name', $name,
             '--version', 'fixtureversion1') -Json @{ value = $value; attributes = @{ enabled = $true; expires = [DateTimeOffset]::UtcNow.AddDays(30).ToString('o') } }
@@ -270,8 +262,8 @@ function New-Fixture {
     }
     if ($FreshResourcesExist) {
         Add-DatabaseCommand $fixture resume_verify $Target @('backend/scripts/azure-database.ts', 'preflight',
-            $(if ($ResumeDatabaseInitialized) { 'upgrade' } else { 'fresh' }),
-            $(if ($ResumeDatabaseInitialized) { '27' } else { '0' }))
+            $(if ($Target.installationMode -ceq 'existing' -or $ResumeDatabaseInitialized) { 'existing' } else { 'fresh' }),
+            $Target.expectedDatabaseName)
         Add-Az $fixture resume_verify @('webapp', 'config', 'appsettings', 'list', '--ids', $Target.expectedResourceIds.appService) -Json @(
             @{ name = 'MAINTENANCE_MODE'; value = 'true' }
         )
@@ -314,12 +306,8 @@ function New-Fixture {
         status = 'Completed'
     }
     Add-DatabaseCommand $fixture database_preflight $Target @('backend/scripts/azure-database.ts', 'preflight',
-        $Target.installationMode, $(if ($Target.installationMode -eq 'fresh') { '0' } else { [string]$Target.expectedSchemaVersion }))
-    Add-DatabaseCommand $fixture database_migrate $Target @('backend/scripts/database.ts')
-    if ($Target.installationMode -eq 'legacy_import') {
-        Add-DatabaseCommand $fixture legacy_import $Target @('backend/scripts/import-legacy-audit.ts', $Target.legacyAuditBackupPath,
-            $Target.legacyAuditBackupSha256) -Legacy
-    }
+        $Target.installationMode, $Target.expectedDatabaseName)
+    Add-DatabaseCommand $fixture database_initialize $Target @('backend/scripts/database.ts', 'initialize')
     Add-Az $fixture package_deploy @('webapp', 'deploy', '--ids', $Target.expectedResourceIds.appService, '--src-path',
         '{{ARTIFACT}}', '--type', 'zip', '--clean', 'false', '--restart', 'false') -Json @{}
     Add-RuntimeCommands $fixture $Target
@@ -387,12 +375,6 @@ function New-Fixture {
     Add-Command $fixture open_and_verify __http_get__ @("$($Target.canonicalOrigin)/api/ready") -Output '{"ok":true}' -ExitCode 200
     Add-Command $fixture open_and_verify __http_get__ @("$($Target.canonicalOrigin)/api/auth/status") `
         -Output "{`"authConfigured`":true,`"callback`":`"$($Target.callbackUri)`"}" -ExitCode 200
-    if ($Target.legacyStaticWebApp.resourceId) {
-        Add-Az $fixture retire_legacy_swa @('resource', 'show', '--ids', $Target.legacyStaticWebApp.resourceId) -Json @{
-            id = $Target.legacyStaticWebApp.resourceId; type = 'Microsoft.Web/staticSites'; tags = @{ app = 'agent-control' }
-        }
-        Add-Az $fixture retire_legacy_swa @('resource', 'delete', '--ids', $Target.legacyStaticWebApp.resourceId) -Json @{}
-    }
     if ($Pitr -or $Recovery) {
         Add-Az $fixture pitr_restore @('postgres', 'flexible-server', 'restore', '--subscription', $Target.subscriptionId,
             '--resource-group', $Target.resourceGroup, '--name', "$($Target.resources.postgresFlexibleServer.name)-restore-{{RUN_ID_8}}",
@@ -476,6 +458,22 @@ try {
         [Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$parseErrors) | Out-Null
         Assert-True (@($parseErrors).Count -eq 0) "PowerShell syntax failed for $file"
     }
+    $dockerfile = (Get-Content -LiteralPath (Join-Path $root 'Dockerfile') -Raw) -replace '\\\r?\n[ \t]*', ' '
+    $operatorStage = [regex]::Match($dockerfile, '(?ims)^FROM[ \t]+[^\r\n]+[ \t]+AS[ \t]+operator[ \t]*\r?\n(?<body>.*?)(?=^FROM[ \t]|\z)')
+    Assert-True $operatorStage.Success 'Dockerfile must define the Azure operator stage.'
+    $operatorSourceFiles = @(foreach ($copy in [regex]::Matches($operatorStage.Groups['body'].Value, '(?im)^[ \t]*COPY[ \t]+(?<arguments>[^\r\n]+)')) {
+        $parts = @($copy.Groups['arguments'].Value.Trim() -split '[ \t]+')
+        if ($parts[-1] -ceq 'backend/scripts/' -and @($parts | Where-Object { $_ -like '--from=*' }).Count -eq 0) {
+            $parts[0..($parts.Count - 2)]
+        }
+    })
+    foreach ($requiredArtifact in @('backend/scripts/azure-database.ts','backend/scripts/azure-pitr.ts','backend/scripts/release-inspect.mjs')) {
+        Assert-True ($requiredArtifact -cin $operatorSourceFiles) "Operator stage must copy $requiredArtifact into backend/scripts/; later stages and host files are not runtime inputs."
+        Assert-True (Test-Path -LiteralPath (Join-Path $root $requiredArtifact) -PathType Leaf) "Required operator artifact $requiredArtifact is missing from the build context."
+    }
+    $vaultAccess = Get-Content -LiteralPath (Join-Path $root 'infra/key-vault-access.bicep') -Raw
+    Assert-True ($vaultAccess -cmatch '(?m)^[ \t]*@minLength\(3\)[ \t]*\r?\n[ \t]*@maxLength\(3\)[ \t]*\r?\n[ \t]*param runtimeSecretNames array[ \t]*$') `
+        'Key Vault access module must require exactly three runtime secret names.'
     $bicep = Get-Content -LiteralPath (Join-Path $root 'infra/main.bicep') -Raw
     Assert-True (-not $bicep.Contains("categoryGroup: 'allLogs'") -and
         $bicep.Contains("category: 'AppServiceConsoleLogs'") -and
@@ -486,42 +484,97 @@ try {
         $bicep.Contains("metricName: 'HealthCheckStatus'") -and
         $bicep.Contains('parse_json(ResultDescription).event') -and -not $bicep.Contains('ResultDescription has_any')) `
         'Bicep containment, silent-availability, or structured-event monitoring contract is incomplete.'
-    Assert-True ($bicep.Contains("settingName: 'TENANTS_JSON'") -and $bicep.Contains('version: tenantRegistrySecretVersion') -and
-        $bicep.Contains("name: 'TENANT_DOMAINS'") -and $bicep.Contains("value: join(tenantDomains, ',')") -and
-        $bicep.Contains('runtimeSecretNames: [for secret in runtimeSecrets: secret.name]')) `
-        'Registry secret reference, explicit legacy domains or least-privilege runtime secret scope is missing.'
-
     $target = New-Target
-    Assert-True ((Test-ApprovedAzureTarget $target Mock).expectedSchemaVersion -eq 26) 'Valid target was rejected.'
-    $currentSchemaTarget = Copy-Object $target
-    $currentSchemaTarget.expectedSchemaVersion = 27
-    Assert-True ((Test-ApprovedAzureTarget $currentSchemaTarget Mock).expectedSchemaVersion -eq 27) 'Current two-role schema baseline was rejected.'
-    $currentSchemaContext = New-Context $currentSchemaTarget (New-Fixture $currentSchemaTarget) 'current-schema'
+    Assert-True ((Test-ApprovedAzureTarget $target Mock).installationMode -ceq 'existing') 'Valid current-schema target was rejected.'
+    $example = Get-Content -LiteralPath (Join-Path $root 'infra/production-target.example.json') -Raw | ConvertFrom-Json
+    foreach ($name in @('legacyAuditBackupPath', 'legacyAuditBackupSha256', 'legacyStaticWebApp', 'expectedSchemaVersion','tenantDomains','tenantDisplayName')) {
+        Assert-True ($name -notin @($example.PSObject.Properties.Name)) "Example still advertises retired option $name."
+        foreach ($value in @($null, '', $false, @{}, @{ resourceId = 'retired-target'; retirementApproved = $true }, 'retired-input')) {
+            $invalid = Copy-Object $target
+            $invalid | Add-Member -NotePropertyName $name -NotePropertyValue $value
+            Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } "$name.*no longer supported"
+            $invalidDictionary = $invalid | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40 -AsHashtable
+            Assert-Fails { Test-ApprovedAzureTarget $invalidDictionary Mock } "$name.*no longer supported"
+        }
+    }
+    $invalidCase = Copy-Object $target
+    $invalidCase | Add-Member -NotePropertyName 'LegacyStaticWebApp' -NotePropertyValue $null
+    Assert-Fails { Test-ApprovedAzureTarget $invalidCase Mock } 'legacyStaticWebApp.*no longer supported'
+    $retiredTarget = Copy-Object $target
+    $retiredTarget.installationMode = 'legacy_import'
+    Assert-Fails { Test-ApprovedAzureTarget $retiredTarget Mock } 'only fresh or existing'
+    $rejectedReceipt = Join-Path $scratch 'retired-input-receipt.json'
+    foreach ($arguments in @(
+        @('-InstallationMode', 'legacy_import'),
+        @('-InstallationMode', 'upgrade'),
+        @('-ExpectedSchemaVersion', '26'),
+        @('-TenantDomains', 'example.invalid'),
+        @('-TenantDisplayName', 'Retired standalone profile'),
+        @('-LegacyAuditBackupPath', 'retired-input'),
+        @('-LegacyAuditBackupSha256', ('a' * 64))
+    )) {
+        $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+            -Action Plan -ExecutionMode Mock -ReceiptPath $rejectedReceipt @arguments 2>&1
+        Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'ValidateSet|does not belong to the set|parameter cannot be found') `
+            'Retired named input did not fail at parameter binding.'
+        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Retired named input produced an execution receipt.'
+    }
+    foreach ($invalid in @($retiredTarget, $invalidCase)) {
+        $invalidPath = Save-Json $invalid 'retired-target.json'
+        $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+            -Action Plan -ExecutionMode Mock -TargetFile $invalidPath -ReceiptPath $rejectedReceipt 2>&1
+        Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'installationMode|legacyStaticWebApp') `
+            "Retired target input did not fail before context creation: $($output -join "`n")"
+        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Retired target input produced an execution receipt.'
+    }
+    foreach ($step in @('legacy_import', 'retire_legacy_swa', 'database_migrate')) {
+        $retiredContext = New-Context $target (New-Fixture $target) "retired-$step" 'Plan'
+        Assert-Fails { Invoke-DeploymentOperation $retiredContext $step } 'not registered'
+        Assert-True ($retiredContext.CommandOffsets.Count -eq 0 -and $retiredContext.Owned.Count -eq 0 -and
+            -not $retiredContext.BootstrapSecretsMaterialized) 'Retired operation reached external commands or materialized credentials.'
+        foreach ($field in @('completedSteps', 'failedStep', 'attemptedSteps')) {
+            $retiredReceipt = Write-AzureDeploymentReceipt $retiredContext 'failed' '' @{}
+            $retiredReceipt.completedSteps = @()
+            $retiredReceipt.attemptedSteps = @()
+            $retiredReceipt[$field] = $(if ($field -eq 'failedStep') { $step } else { @($step) })
+            $retiredReceiptPath = Save-Json $retiredReceipt "retired-$step-$field-receipt.json"
+            Assert-Fails { Import-AzureDeploymentReceipt $retiredContext $retiredReceiptPath 'Plan' } 'unknown completed step|unsupported failed or attempted step'
+        }
+    }
+    $currentSchemaContext = New-Context $target (New-Fixture $target) 'current-schema'
     Set-SyntheticBootstrapSecrets $currentSchemaContext
-    Invoke-DeploymentOperation $currentSchemaContext database_preflight | Out-Null
+    $schemaEvidence=Invoke-DeploymentOperation $currentSchemaContext database_preflight
+    Assert-True ($schemaEvidence.mode -ceq 'existing' -and $schemaEvidence.database -ceq 'agentcontrol' -and
+        $schemaEvidence.currentFingerprint -ceq $schemaEvidence.targetFingerprint -and
+        $schemaEvidence.targetFingerprint -cmatch '^[a-f0-9]{64}$' -and
+        'schemaVersion' -notin @($schemaEvidence.PSObject.Properties.Name)) 'Current schema evidence retained a numeric baseline or lost its fingerprint.'
     Remove-AzureSensitiveDirectories $currentSchemaContext
+    $existingResume=New-Context $target (New-Fixture $target -FreshResourcesExist) 'existing-before-initialize'
+    $existingResume.Resuming=$true
+    $existingResume.Completed.Add('resource_deploy')
+    Set-SyntheticBootstrapSecrets $existingResume
+    Assert-True ((Invoke-DeploymentOperation $existingResume resume_verify).exactStateVerified -eq $true) 'Existing-target resume before initialization incorrectly required an empty schema.'
+    Remove-AzureSensitiveDirectories $existingResume
     foreach ($case in @(
         @{ mutate = { param($t) $t.isApproval = $false }; error = 'isApproval' },
-        @{ mutate = { param($t) $t.expectedSchemaVersion = 25 }; error = 'approved baseline' },
+        @{ mutate = { param($t) $t.installationMode = 'upgrade' }; error = 'only fresh or existing' },
         @{ mutate = { param($t) $t.estimate.monthlyTotal = 9 }; error = 'total' },
         @{ mutate = { param($t) $t.resources.postgresFlexibleServer.sku = 'Standard_D2s_v3' }; error = 'renewed estimate' },
         @{ mutate = { param($t) $t.resources.approvedAppOutboundIpv4Addresses = @() }; error = 'outbound' },
-        @{ mutate = { param($t) $t.tenantDomains = @() }; error = 'accepted sign-in domain' },
-        @{ mutate = { param($t) $t.tenantDomains = @('*.contoso.com') }; error = 'exact organization domains' },
-        @{ mutate = { param($t) $t.tenantDomains = @('contoso.com','CONTOSO.com') }; error = 'duplicate accepted domain' }
+        @{ mutate = { param($t) $t.tenantRegistrySecretName = '' }; error = 'TENANTS_JSON is required' },
+        @{ mutate = { param($t) $t.tenantRegistrySecretName = 'wrong-secret' }; error = 'TENANTS_JSON is required' }
     )) {
         $invalid = Copy-Object $target
         & $case.mutate $invalid
         Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } $case.error
     }
     $changedVersion = Copy-Object $target
-    $changedVersion.preparedVaultContract.versions[5].version = 'fixtureversion2'
+    $changedVersion.preparedVaultContract.versions[-1].version = 'fixtureversion2'
     Assert-Fails { Test-ApprovedAzureTarget $changedVersion Mock } 'Phase 11 coordinated-rotation prerequisite'
     Assert-True (-not (Get-Content -LiteralPath (Join-Path $root 'deploy-azure.ps1') -Raw).Contains('CredentialRotation')) 'Wizard still exposes credential rotation.'
 
-    $registryTarget = New-Target -Registry
-    $registryTarget.tenantDomains = @()
-    Assert-True ((Test-ApprovedAzureTarget $registryTarget Mock).tenantRegistrySecretName -ceq 'agent-control-tenants-json') 'Authoritative registry target incorrectly required legacy domains.'
+    $registryTarget = New-Target
+    Assert-True ((Test-ApprovedAzureTarget $registryTarget Mock).tenantRegistrySecretName -ceq 'agent-control-tenants-json') 'Registry-only target was rejected.'
     $dateLikeProfile = @(New-RegistryProfiles $registryTarget)[0]
     $dateLikeProfile.displayName = '2026-09-26T00:00:00Z'
     $dateLikeProfile.clientSecret = '2026-09-26T00:00:00Z'
@@ -538,7 +591,7 @@ try {
     $parameters = ($parameterText | ConvertFrom-Json).parameters
     Assert-True ($parameters.tenantRegistrySecretName.value -ceq 'agent-control-tenants-json' -and $parameters.tenantRegistrySecretVersion.value -ceq 'fixtureversion1') 'Azure did not select the immutable registry reference.'
     Assert-True (-not $parameterText.Contains('synthetic-secondary-tenant-secret') -and -not $parameterText.Contains('synthetic-fixture-agent-control-client-secret')) 'Registry credentials leaked into ARM parameters.'
-    Assert-True ((Invoke-DeploymentOperation $registryContext runtime_access_verify).runtimeSecretCount -eq 6) 'Runtime verification did not require the sixth native registry reference.'
+    Assert-True ((Invoke-DeploymentOperation $registryContext runtime_access_verify).runtimeSecretCount -eq 3) 'Runtime verification did not require exactly three native registry/session/database references.'
     $registryRegistration = Invoke-DeploymentOperation $registryContext registration_verify
     Assert-True ($registryRegistration.primaryRegistrationVerified -and -not $registryRegistration.additionalRegistrationsVerified -and
         $registryRegistration.tenantRegistryRegistrationApprovalReference -ceq $registryTarget.tenantRegistryRegistrationApprovalReference) 'Registry registration evidence overclaimed verification of another directory.'
@@ -547,24 +600,19 @@ try {
     Assert-True (-not $registryReceipt.Contains('synthetic-secondary-tenant-secret') -and -not $registryReceipt.Contains('synthetic-fixture-agent-control-client-secret')) 'Registry credentials leaked into a deployment receipt.'
     Remove-AzureSensitiveDirectories $registryContext
 
-    $legacyParameters = New-Context $target (New-Fixture $target) 'legacy-domains'
-    $legacyParameterFile = New-AzureParameterFile $legacyParameters
-    $legacyParameterValues = (Get-Content -LiteralPath $legacyParameterFile -Raw | ConvertFrom-Json).parameters
-    Assert-True (($legacyParameterValues.tenantDomains.value -join ',') -ceq 'contoso.com' -and $legacyParameterValues.tenantDisplayName.value -ceq 'Contoso') 'Legacy accepted domains/display name did not reach ARM.'
-    Assert-True ($legacyParameterValues.tenantRegistrySecretName.value -ceq '') 'Legacy deployment unexpectedly enabled registry mode.'
-    Remove-AzureSensitiveDirectories $legacyParameters
-
-    $registryMigration = Copy-Object $registryTarget
-    $registryMigration.preparedVaultContract.existingVersions = @($registryMigration.preparedVaultContract.existingVersions | Where-Object name -CNE 'agent-control-tenants-json')
-    Assert-True ((Test-ApprovedAzureTarget $registryMigration Mock).preparedVaultContract.versions.Count -eq 7) 'First registry migration rejected the six unchanged legacy versions.'
-    $migratingContext = New-Context $registryMigration (New-Fixture $registryMigration) 'registry-migration'
-    Assert-True ((Invoke-DeploymentOperation $migratingContext vault_preflight).tenantProfileCount -eq 2) 'First registry migration did not retain the approved primary identity.'
-    Remove-AzureSensitiveDirectories $migratingContext
+    foreach ($name in @('tenantDomains','tenantDisplayName','tenantIdSecretVersion','clientIdSecretVersion','clientSecretVersion')) {
+        Assert-True ($name -notin @($parameters.PSObject.Properties.Name)) "ARM parameters still produce standalone tenant input $name."
+    }
+    Assert-True ((Get-AzureRequiredSecretNames $target).Count -eq 4 -and
+        (@((Get-AzureRuntimeSecretReferences $target).Keys) -join ',') -ceq 'TENANTS_JSON,SESSION_SECRET,PGPASSWORD') 'Azure still exposes standalone tenant credentials.'
+    $missingRegistryVersion = Copy-Object $registryTarget
+    $missingRegistryVersion.preparedVaultContract.existingVersions = @($missingRegistryVersion.preparedVaultContract.existingVersions | Where-Object name -CNE 'agent-control-tenants-json')
+    Assert-Fails { Test-ApprovedAzureTarget $missingRegistryVersion Mock } 'every previously selected version'
     $idnProfiles = @(New-RegistryProfiles $registryTarget)
     $idnProfiles[1].domains = @("b$([char]0x00fc)cher.example")
     $idnRegistryValue = ConvertTo-Json -InputObject $idnProfiles -Depth 20
     $idnFixture = New-Fixture $registryTarget
-    $idnFixture.commands.vault_preflight[7].json.value = $idnRegistryValue
+    $idnFixture.commands.vault_preflight[1].json.value = $idnRegistryValue
     $idnContext = New-Context $registryTarget $idnFixture 'registry-unicode-letter-idn'
     Assert-True ((Invoke-DeploymentOperation $idnContext vault_preflight).tenantProfileCount -eq 2 -and
         $idnContext.SecretValues['agent-control-tenants-json'] -ceq $idnRegistryValue) 'Azure rejected a supported Unicode-letter domain or rewrote the protected registry during validation.'
@@ -584,14 +632,13 @@ try {
         @{ name='duplicate-domain'; mutate={ param($p) $p[1].domains=@('CONTOSO.com') }; error='duplicate accepted domain' },
         @{ name='duplicate-tenant'; mutate={ param($p) $p[1].tenantId=$p[0].tenantId }; error='duplicate tenant' },
         @{ name='invalid-secret'; mutate={ param($p) $p[1].clientSecret="synthetic-secret`ninvalid" }; error='single-line client secret' },
-        @{ name='replaced-primary'; mutate={ param($p) $p[0].clientId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }; error='approved primary tenant' },
-        @{ name='rotated-primary'; mutate={ param($p) $p[0].clientSecret='synthetic-unapproved-rotation' }; error='preserve the approved legacy client secret' }
+        @{ name='replaced-primary'; mutate={ param($p) $p[0].clientId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }; error='approved primary tenant' }
     )) {
-        $profiles = @(New-RegistryProfiles $registryMigration)
+        $profiles = @(New-RegistryProfiles $registryTarget)
         if ($case.mutate) { & $case.mutate $profiles }
-        $fixture = New-Fixture $registryMigration
-        $fixture.commands.vault_preflight[7].json.value = $(if ($case.ContainsKey('json')) { $case.json } else { ConvertTo-Json -InputObject $profiles -Depth 20 })
-        $invalidRegistry = New-Context $registryMigration $fixture "registry-$($case.name)"
+        $fixture = New-Fixture $registryTarget
+        $fixture.commands.vault_preflight[1].json.value = $(if ($case.ContainsKey('json')) { $case.json } else { ConvertTo-Json -InputObject $profiles -Depth 20 })
+        $invalidRegistry = New-Context $registryTarget $fixture "registry-$($case.name)"
         try { Assert-Fails { Invoke-DeploymentOperation $invalidRegistry vault_preflight } $case.error }
         catch { throw "Registry case $($case.name): $($_.Exception.Message)" }
     }
@@ -607,13 +654,13 @@ try {
         Set-SyntheticBootstrapSecrets $badReference
         Assert-Fails { Invoke-DeploymentOperation $badReference runtime_access_verify } 'native Key Vault references'
     }
-    foreach ($mode in @('fresh','upgrade')) {
-        $fullRegistryTarget = if ($mode -eq 'fresh') { New-Target fresh -Registry } else { Copy-Object $registryMigration }
+    foreach ($mode in @('fresh','existing')) {
+        $fullRegistryTarget = New-Target $mode
         $fullRegistryContext = New-Context $fullRegistryTarget (New-Fixture $fullRegistryTarget) "registry-full-$mode"
         $fullRegistryReceipt = Invoke-AzureDeployment $fullRegistryContext Deploy
         Assert-True ($fullRegistryReceipt.status -ceq 'deployed' -and
             $fullRegistryReceipt.evidence.vault_preflight.tenantProfileCount -eq 2 -and
-            $fullRegistryReceipt.evidence.runtime_access_verify.runtimeSecretCount -eq 6) 'Mock registry deployment did not carry validated profiles through the complete release flow.'
+            $fullRegistryReceipt.evidence.runtime_access_verify.runtimeSecretCount -eq 3) 'Mock registry deployment did not carry validated profiles through the complete release flow.'
         Assert-True (-not [IO.File]::ReadAllText($fullRegistryContext.ReceiptPath).Contains('synthetic-secondary-tenant-secret')) 'Complete registry deployment leaked credentials.'
     }
 
@@ -663,27 +710,27 @@ try {
 
     $runtimeDefault = New-Context $target (New-Fixture $target) 'runtime-default'
     Set-SyntheticBootstrapSecrets $runtimeDefault
-    Assert-True ((Invoke-DeploymentOperation $runtimeDefault runtime_access_verify).runtimeSecretCount -eq 5) 'Default native-reference/admin exclusion failed.'
+    Assert-True ((Invoke-DeploymentOperation $runtimeDefault runtime_access_verify).runtimeSecretCount -eq 3) 'Default native-reference/admin exclusion failed.'
     Remove-AzureSensitiveDirectories $runtimeDefault
 
     $backupDefault = New-Context $target (New-Fixture $target) 'backup-default'
     Assert-True ((Invoke-DeploymentOperation $backupDefault backup_health_verify).status -eq 'completed') 'Default release-backup health proof failed.'
 
-    $context = New-Context $target (New-Fixture $target) 'upgrade'
+    $context = New-Context $target (New-Fixture $target) 'existing'
     Assert-True ((Test-AuthenticationSmokeReceipt $context '').authentication -eq 'human-approved-contract') 'Synthetic authentication receipt contract was rejected.'
     $receipt = Invoke-AzureDeployment $context Deploy
-    Assert-True ($receipt.status -eq 'deployed') 'Command-level upgrade did not complete.'
+    Assert-True ($receipt.status -eq 'deployed') 'Command-level existing did not complete.'
     $calls = @($context.Calls)
-    foreach ($required in @('enter_maintenance', 'managed_backup', 'backup_health_verify', 'resource_deploy', 'database_migrate', 'start_contained',
+    foreach ($required in @('enter_maintenance', 'managed_backup', 'backup_health_verify', 'resource_deploy', 'database_initialize', 'start_contained',
         'contained_smoke', 'authentication_smoke_verify', 'database_reopen', 'open_and_verify', 'cleanup')) {
-        Assert-True ($required -in $calls) "Upgrade omitted $required."
+        Assert-True ($required -in $calls) "Existing deployment omitted $required."
     }
     Assert-True ($receipt.evidence.resource_deploy.admission -eq 'closed' -and $receipt.evidence.resource_deploy.app -eq 'stopped' -and
         $receipt.evidence.backup_health_verify.status -eq 'completed') 'Resource deployment or release backup was not proven contained.'
     Assert-True ([array]::IndexOf($calls, 'contained_smoke') -lt [array]::IndexOf($calls, 'database_reopen') -and
         [array]::IndexOf($calls, 'database_reopen') -lt [array]::IndexOf($calls, 'open_and_verify')) 'Public admission opened before contained/auth/database sequencing.'
     Assert-True ($receipt.evidence.open_and_verify.loginProof -eq 'human-approved-receipt') 'Liveness was mislabeled as login proof.'
-    Assert-True (@($context.Owned).Count -eq 0) 'Upgrade left an owned resource.'
+    Assert-True (@($context.Owned).Count -eq 0) 'Existing deployment left an owned resource.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "artifacts/azure-bootstrap/$($context.RunId)"))) 'Bootstrap secrets were not cleaned.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "artifacts/azure-parameters/$($context.RunId)"))) 'Parameter files were not cleaned.'
 
@@ -697,7 +744,7 @@ try {
             'agent-control-postgres-admin-password' = 'synthetic-admin-password-at-least-thirty-two-characters'
             'agent-control-postgres-app-password' = 'synthetic-runtime-password-at-least-thirty-two-characters'
         }
-        Invoke-AzureDatabaseContainer $materialContext @('backend/scripts/azure-database.ts', 'preflight', 'upgrade', '26') | Out-Null
+        Invoke-AzureDatabaseContainer $materialContext @('backend/scripts/azure-database.ts', 'preflight', 'existing', $target.expectedDatabaseName) | Out-Null
         Assert-True ((Test-Path -LiteralPath (Join-Path $materialContext.BootstrapDirectory 'postgres-admin')) -and
             (Test-Path -LiteralPath (Join-Path $materialContext.BootstrapDirectory 'postgres-app'))) 'Database command did not receive actual secret files.'
     } finally {
@@ -712,21 +759,21 @@ try {
     Set-SyntheticBootstrapSecrets $delayed
     Assert-True ((Invoke-DeploymentOperation $delayed runtime_access_verify).propagationAttempts -eq 2) 'Bounded reference propagation was not retried.'
     $mismatchFixture = New-Fixture $target
-    Add-RuntimeCommands $mismatchFixture $target @((ReferenceStatus $target 'Resolved' 'CLIENT_SECRET'), (ReferenceStatus $target 'Resolved' 'CLIENT_SECRET'),
-        (ReferenceStatus $target 'Resolved' 'CLIENT_SECRET'), (ReferenceStatus $target 'Resolved' 'CLIENT_SECRET'), (ReferenceStatus $target 'Resolved' 'CLIENT_SECRET'))
+    Add-RuntimeCommands $mismatchFixture $target @((ReferenceStatus $target 'Resolved' 'TENANTS_JSON'), (ReferenceStatus $target 'Resolved' 'TENANTS_JSON'),
+        (ReferenceStatus $target 'Resolved' 'TENANTS_JSON'), (ReferenceStatus $target 'Resolved' 'TENANTS_JSON'), (ReferenceStatus $target 'Resolved' 'TENANTS_JSON'))
     $mismatch = New-Context $target $mismatchFixture 'runtime-mismatch'
     Set-SyntheticBootstrapSecrets $mismatch
-    Assert-Fails { Invoke-DeploymentOperation $mismatch runtime_access_verify } 'including CLIENT_SECRET'
+    Assert-Fails { Invoke-DeploymentOperation $mismatch runtime_access_verify } 'including TENANTS_JSON'
     $deniedFixture = New-Fixture $target
     Add-RuntimeCommands $deniedFixture $target @(3, 3, 3, 3, 3)
     $denied = New-Context $target $deniedFixture 'runtime-denied'
     Set-SyntheticBootstrapSecrets $denied
-    Assert-Fails { Invoke-DeploymentOperation $denied runtime_access_verify } 'including CLIENT_SECRET'
+    Assert-Fails { Invoke-DeploymentOperation $denied runtime_access_verify } 'including TENANTS_JSON'
     $networkFixture = New-Fixture $target
     Add-RuntimeCommands $networkFixture $target @(7, 7, 7, 7, 7)
     $network = New-Context $target $networkFixture 'runtime-network'
     Set-SyntheticBootstrapSecrets $network
-    Assert-Fails { Invoke-DeploymentOperation $network runtime_access_verify } 'including CLIENT_SECRET'
+    Assert-Fails { Invoke-DeploymentOperation $network runtime_access_verify } 'including TENANTS_JSON'
     $adminAccessFixture = New-Fixture $target
     $adminAccessFixture.commands.runtime_access_verify[-2].json = @(@{ roleDefinitionId = 'fixture-custom-secret-reader' })
     Add-Az $adminAccessFixture runtime_access_verify @('role', 'definition', 'list', '--name', 'fixture-custom-secret-reader') -Json @(@{
@@ -778,7 +825,7 @@ try {
     $fresh = New-Context $freshTarget (New-Fixture $freshTarget) 'fresh'
     Assert-True ((Invoke-AzureDeployment $fresh Deploy).status -eq 'deployed') 'Fresh command-level workflow failed.'
     Assert-True ('managed_backup' -in @($fresh.Calls) -and 'backup_health_verify' -in @($fresh.Calls) -and
-        [array]::IndexOf(@($fresh.Calls), 'database_migrate') -lt [array]::IndexOf(@($fresh.Calls), 'managed_backup') -and
+        [array]::IndexOf(@($fresh.Calls), 'database_initialize') -lt [array]::IndexOf(@($fresh.Calls), 'managed_backup') -and
         'enter_maintenance' -in @($fresh.Calls)) 'Fresh workflow did not contain and back up the initialized database before opening.'
 
     $containmentFixture = New-Fixture $freshTarget
@@ -845,7 +892,7 @@ try {
     $firstContext.ReceiptPath = $firstReceiptPath
     Assert-Fails { Invoke-AzureDeployment $firstContext Deploy } 'stopped'
     $firstReceipt = Get-Content -LiteralPath $firstReceiptPath -Raw | ConvertFrom-Json
-    Assert-True ('resource_deploy' -in @($firstReceipt.completedSteps) -and 'database_migrate' -notin @($firstReceipt.completedSteps)) 'Fresh pre-bootstrap interruption receipt is incomplete.'
+    Assert-True ('resource_deploy' -in @($firstReceipt.completedSteps) -and 'database_initialize' -notin @($firstReceipt.completedSteps)) 'Fresh pre-bootstrap interruption receipt is incomplete.'
     $uncontainedReceiptPath = Join-Path $scratch 'fresh-uncontained-resume-receipt.json'
     Copy-Item -LiteralPath $firstReceiptPath -Destination $uncontainedReceiptPath
     $uncontainedFixture = New-Fixture $freshTarget -FreshResourcesExist
@@ -870,12 +917,12 @@ try {
     $postBootstrap.ReceiptPath = $postBootstrapReceiptPath
     Assert-Fails { Invoke-AzureDeployment $postBootstrap Deploy } 'stopped'
     $postReceipt = Get-Content -LiteralPath $postBootstrapReceiptPath -Raw | ConvertFrom-Json
-    Assert-True ('database_migrate' -in @($postReceipt.completedSteps) -and 'package_deploy' -in @($postReceipt.completedSteps)) 'Post-bootstrap interruption lost completed write evidence.'
+    Assert-True ('database_initialize' -in @($postReceipt.completedSteps) -and 'package_deploy' -in @($postReceipt.completedSteps)) 'Post-bootstrap interruption lost completed write evidence.'
     $postResumeFixture = New-Fixture $freshTarget -FreshResourcesExist -ResumeDatabaseInitialized
     $postResume = New-Context $freshTarget $postResumeFixture 'fresh-post-bootstrap-resume' 'Deploy' $postBootstrapReceiptPath
     New-SmokeReceipt $postResume 'fresh-post-bootstrap-resume-auth.json' | Out-Null
     Assert-True ((Invoke-AzureDeployment $postResume Deploy).status -eq 'deployed') 'Receipt-bound post-bootstrap resume failed.'
-    Assert-True ('resume-skip:database_migrate' -in @($postResume.Calls) -and 'resume-skip:package_deploy' -in @($postResume.Calls)) 'Post-bootstrap resume replayed completed writes.'
+    Assert-True ('resume-skip:database_initialize' -in @($postResume.Calls) -and 'resume-skip:package_deploy' -in @($postResume.Calls)) 'Post-bootstrap resume replayed completed writes.'
 
     foreach ($processCase in @(
         @{ name = 'process-before-bootstrap'; failureOperation = 'database_preflight'; initialized = $false },
@@ -905,7 +952,7 @@ try {
             "$($processCase.name) did not resume across process invocations."
         $processLog = Get-Content -LiteralPath $processCommandLog -Raw
         Assert-True (-not $processLog.Contains('"operation":"resource_deploy"') -and
-            (-not $processCase.initialized -or -not $processLog.Contains('"operation":"database_migrate"'))) `
+            (-not $processCase.initialized -or -not $processLog.Contains('"operation":"database_initialize"'))) `
             "$($processCase.name) replayed a completed external write across processes."
     }
 
@@ -962,10 +1009,10 @@ try {
     & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Plan -ExecutionMode Mock `
         -MockFixturePath $parameterFixturePath -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $namedReceipt `
         -TenantId $parameterTarget.tenantId -SubscriptionId $parameterTarget.subscriptionId -ResourceGroupName $parameterTarget.resourceGroup `
-        -Region $parameterTarget.region -AppRegistrationClientId $parameterTarget.entraApplicationId -TenantDomains $parameterTarget.tenantDomains -TenantDisplayName $parameterTarget.tenantDisplayName `
+        -Region $parameterTarget.region -AppRegistrationClientId $parameterTarget.entraApplicationId -TenantRegistryRegistrationApprovalReference $parameterTarget.tenantRegistryRegistrationApprovalReference `
         -AppServicePlanName $parameterTarget.resources.appServicePlan.name -AppServiceName $parameterTarget.resources.appService.name `
         -PostgresServerName $parameterTarget.resources.postgresFlexibleServer.name -ExistingVaultResourceId $parameterTarget.existingVaultResourceId `
-        -CanonicalOrigin $parameterTarget.canonicalOrigin -InstallationMode upgrade -ExpectedSchemaVersion 26 `
+        -CanonicalOrigin $parameterTarget.canonicalOrigin -InstallationMode existing `
         -AppOutboundIpv4Addresses $parameterTarget.resources.approvedAppOutboundIpv4Addresses -RunnerIpv4Address $parameterTarget.runnerIpv4Address `
         -ActionGroupResourceId $parameterTarget.resources.monitoring.actionGroupResourceId -EstimateAsOfDate $parameterTarget.estimate.asOfDate `
         -EstimateSource $parameterTarget.estimate.source -EstimateCurrency $parameterTarget.estimate.currency -EstimateItemsJson $itemsJson `
@@ -976,6 +1023,11 @@ try {
         -BurstableRiskAcceptanceReference $parameterTarget.riskAcceptance.reference -SecretVersionsJson $versionsJson -ExistingSecretVersionsJson $existingJson | Out-Null
     Assert-True ($LASTEXITCODE -eq 0 -and (Get-Content -LiteralPath $namedReceipt -Raw | ConvertFrom-Json).status -eq 'previewed_not_deployed') 'Complete named parameters prompted or diverged from target-file execution.'
 
+    Assert-True ($bicep.Contains("settingName: 'TENANTS_JSON'") -and $bicep.Contains('version: tenantRegistrySecretVersion') -and
+        -not $bicep.Contains("'TENANT_ID'") -and -not $bicep.Contains("'CLIENT_ID'") -and
+        -not $bicep.Contains("'CLIENT_SECRET'") -and -not $bicep.Contains("'TENANT_DOMAINS'") -and -not $bicep.Contains("'TENANT_DISPLAY_NAME'") -and
+        $bicep.Contains('runtimeSecretNames: [for secret in runtimeSecrets: secret.name]')) `
+        'Registry-only secret references or least-privilege runtime secret scope are missing.'
     Write-Host "Passed $script:Checks Azure deployment command-level assertions."
 } catch {
     Get-ChildItem -LiteralPath $scratch -Filter '*receipt.json' -ErrorAction SilentlyContinue | ForEach-Object {

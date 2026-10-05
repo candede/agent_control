@@ -1,11 +1,18 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import type { BulkActionJob, BulkJobStatus, SessionUser } from "../api/client";
+import { getBulkActionJobItems, type BulkActionJob, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { BulkActions } from "./BulkActions";
+vi.mock("../api/client", async original => ({
+  ...await original<typeof import("../api/client")>(), getBulkActionJobItems: vi.fn(),
+}));
+beforeEach(() => {
+  vi.mocked(getBulkActionJobItems).mockResolvedValue({ value: [], revision: "1", counts: { total: 4, filtered: 4 },
+    page: { limit: 50, nextCursor: null, previousCursor: null } });
+});
 
 const user: SessionUser = {
   homeAccountId: "fixture", tenantId: "tenant", displayName: "Admin", username: "admin@example.invalid",
@@ -14,7 +21,7 @@ const user: SessionUser = {
 const running: BulkActionJob = {
   id: "job-1", action: "block", targetBlockedState: true, status: "running", canResume: false,
   total: 4, completed: 1, succeeded: 1, failed: 0, skipped: 0, currentAgentName: "Support agent",
-  results: [{ id: "completed", displayName: "Completed agent", status: "succeeded" }],
+  inconclusive: 0, cancelled: 0, queued: 2, reconciliationRequired: 0, retryEligible: 0, resultRevision: "1",
   createdAt: "2026-09-25T09:00:00Z", updatedAt: "2026-09-25T09:01:00Z",
 };
 function mount(overrides: Partial<Parameters<typeof BulkActions>[0]> = {}, roles = user.roles, metadata = true) {
@@ -84,9 +91,11 @@ describe("unified access job panel", () => {
   });
 
   it("preserves sign-in, resume and read-only reconciliation inside the same panel", async () => {
+    vi.mocked(getBulkActionJobItems).mockResolvedValue({ value: [{ id: "uncertain", displayName: "Uncertain agent",
+      status: "inconclusive", reconciliationStatus: "required", message: "Provider response lost." }],
+    revision: "1", counts: { total: 4, filtered: 4 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
     const { panel, props } = mount({ job: {
-      ...running, status: "waiting_authorization", canResume: true,
-      results: [{ id: "uncertain", displayName: "Uncertain agent", status: "inconclusive", reconciliationStatus: "required", message: "Provider response lost." }],
+      ...running, status: "waiting_authorization", canResume: true, inconclusive: 1, reconciliationRequired: 1,
     } });
     expect(panel.getByRole("link", { name: "Sign in again" })).toHaveAttribute("href", "/api/auth/login");
     await userEvent.click(panel.getByRole("button", { name: "Resume unprocessed tasks" }));
@@ -94,14 +103,12 @@ describe("unified access job panel", () => {
     expect(props.onJobCommand).toHaveBeenNthCalledWith(1, "resume");
     expect(props.onJobCommand).toHaveBeenNthCalledWith(2, "reconcile");
     expect(panel.getByText("1 uncertain")).toBeVisible();
-    await userEvent.click(panel.getByText("Review 1 failed or uncertain changes"));
-    expect(panel.getByText("Provider response lost.")).toBeVisible();
+    expect(await panel.findByText("Provider response lost.")).toBeVisible();
   });
 
   it.each(["cancel", "resume", "reconcile"] as const)("disables recovery controls while %s is pending", operation => {
     const { panel } = mount({ jobCommand: operation, job: {
-      ...running, status: "partial", canResume: true,
-      results: [{ id: "uncertain", displayName: "Agent", status: "inconclusive", reconciliationStatus: "required" }],
+      ...running, status: "partial", canResume: true, inconclusive: 1, reconciliationRequired: 1,
     } });
     for (const button of panel.getAllByRole("button")) expect(button).toBeDisabled();
     expect(panel.getByRole("status")).toHaveTextContent(operation === "cancel" ? "Cancelling" : operation === "resume" ? "Resuming" : "Checking results");
@@ -113,11 +120,12 @@ describe("unified access job panel", () => {
   });
 
   it("shows terminal counts once and does not imply that cancellation undid applied changes", () => {
-    const results: BulkActionJob["results"] = [
-      ...running.results, { id: "cancelled", displayName: "Cancelled agent", status: "cancelled" },
+    const results: BulkPackageResult[] = [
+      { id: "completed", displayName: "Completed agent", status: "succeeded" },
+      { id: "cancelled", displayName: "Cancelled agent", status: "cancelled" },
     ];
     const result = { targetBlockedState: true, total: 2, succeeded: 1, failed: 0, skipped: 0, results };
-    const { panel } = mount({ result, job: { ...running, ...result, completed: 2, status: "cancelled", result } });
+    const { panel } = mount({ result, job: { ...running, total: 2, completed: 2, status: "cancelled", cancelled: 1 } });
     expect(panel.getAllByText("1 succeeded")).toHaveLength(1);
     expect(panel.getByText("1 cancelled")).toBeVisible();
     expect(panel.getByText(/Changes already in progress may still finish/)).toBeVisible();

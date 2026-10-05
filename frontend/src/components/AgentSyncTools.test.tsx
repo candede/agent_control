@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { powerPlatformResourceTypes, type UnifiedAgentInventoryPage } from "../api/client";
 import { AgentSyncTools } from "./AgentSyncTools";
-import { createInventoryVerification, createUnifiedVerification } from "../test/inventoryVerification";
+import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "../test/inventoryVerification";
 import { mockNativeDialogs } from "../test/dialog";
 
 mockNativeDialogs();
@@ -36,10 +36,10 @@ function inventory(agentCount: number | null = 1247): UnifiedAgentInventoryPage 
   const summary = { total: 1561, linked: 690, graphOnly: 314, powerPlatformOnly: 557, conflicting: 0, ambiguous: 0 };
   return {
     inventoryScope: "all", scopeSummary: summary,
-    value: [], count: 1561, offset: 0, limit: 50, summary, filteredSummary: summary,
+    ...inventoryPageMetadata({ total: 1561, scoped: 1561, filtered: 1561, packageTargets: 1010 }),
+    value: [], summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 1010, powerPlatformAgentCount: 1247, logicalAgentCount: 1561 }),
     identityCollection: { checkedPackages: 1010, pendingPackages: 0 },
-    facets: { environments: [], platforms: [], types: [] },
     sources: {
       graphPackages: { state: "available", observation: {
         id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, tokenMode: "delegated", scopeKind: "broad",
@@ -144,12 +144,12 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it.each([0, 1, 100, 101])("requires 1-100 exact targets for matching refresh, with %s selected", async count => {
+  it.each([0, 1, 100, 101, 5000, 5001])("requires 1-5000 staged targets for matching refresh, with %s selected", async count => {
     const actions = props({ selectedPackageCount: count });
     render(<AgentSyncTools {...actions} />);
     await userEvent.click(screen.getByText("View diagnostics"));
     const refresh = screen.getByRole("button", { name: "Refresh matching details" });
-    if (count > 0 && count <= 100) {
+    if (count > 0 && count <= 5000) {
       expect(refresh).toBeEnabled();
       await userEvent.click(refresh);
       expect(actions.onRefreshMatchingDetails).toHaveBeenCalledOnce();

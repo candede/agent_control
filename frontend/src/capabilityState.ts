@@ -56,22 +56,6 @@ export function currentVerification(view: CapabilityView, now = Date.now()) {
   return decision.verification === "provider" || decision.verification === "token" ? decision.verification : undefined;
 }
 
-export function verificationLabel(view: CapabilityView, now = Date.now()) {
-  switch (currentVerification(view, now)) {
-    case "provider": return "Provider-verified";
-    case "token": return "Token acquired; provider authorization not verified";
-    case "local": return "Authorized by local policy; no provider check";
-    case "on_demand": return "Ready to try; Microsoft validates permission on the actual operation";
-  }
-  if (!capabilityModeEnabled(view)) return "Disabled; no current verification";
-  if (view.definition.mode === "local") return "Local policy authorization not established";
-  if (evidenceIsStale(view, now)) return "Stale evidence; no current verification";
-  if (!view.decision.checkedAt) return "Not checked; no current verification";
-  if (view.decision.status !== "available") return "Check did not establish current availability";
-  if (!view.decision.authorized) return "Not authorized; no current verification";
-  return "Current verification unavailable";
-}
-
 export function operationAccessLabel(view: CapabilityView, now = Date.now()) {
   const { definition } = view;
   if (definition.probe.kind === "on_demand") return "Microsoft validates permission when the operation is requested";
@@ -149,55 +133,6 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
         ? "Authorization is available, but current verification evidence is missing or inconsistent."
         : "Authorization is available, but the verification level was not reported.";
   }
-}
-
-export function capabilityStatusLabel(view: CapabilityView, now = Date.now()) {
-  if (!capabilityModeEnabled(view)) return "Disabled";
-  if (view.decision.evidence?.category === "interaction_required") return "Interaction required";
-  if (view.decision.evidence?.category === "authorization_expired") return "Authorization expired";
-  if (view.decision.status === "provider_error" && view.decision.evidence?.category === "provider_timeout") return "Check timed out";
-  if (view.decision.status === "available") {
-    if (!view.decision.authorized) return "Not authorized";
-    if (currentVerification(view, now) === "on_demand") return "Ready to try";
-    if (evidenceIsStale(view, now)) return "Evidence stale";
-    if (view.definition.mode !== "local" && !view.decision.checkedAt) return "Not checked";
-    if (!currentVerification(view, now)) return "Verification unavailable";
-    if (currentVerification(view, now) === "token") return "Ready to try";
-  }
-  return statusLabels[view.decision.status];
-}
-
-export function capabilityNextStep(view: CapabilityView, now = Date.now()): { text: string; href?: string; label?: string } | undefined {
-  if (view.decision.status === "missing_permission") return {
-    text: "Ask your administrator to add the required API permissions and grant admin consent in the existing Entra app registration. Then sign in again and check status.",
-    href: "https://entra.microsoft.com/", label: "Admin setup",
-  };
-  if (["interaction_required", "authorization_expired"].includes(view.decision.evidence?.category ?? "")) return view.definition.mode === "application" ? {
-    text: "Ask an administrator to verify the app registration's credentials and previously granted application API permissions. Then retry the explicit application-scope operation.",
-    href: "https://entra.microsoft.com/", label: "Admin setup",
-  } : {
-    text: "Normal sign-in can complete MFA or refresh your session. It does not configure feature permissions; those remain administrator prerequisites.",
-    href: "/api/auth/login?returnTo=%2Fpermissions", label: "Sign in again",
-  };
-  const verification = currentVerification(view, now);
-  if (verification !== "token" && verification !== "on_demand") return undefined;
-  if (view.definition.probe.kind === "on_demand" && view.definition.id.startsWith("graph.package.")) return {
-    text: "Package changes require administrator-pregranted delegated CopilotPackages.ReadWrite.All. Open Agents to review and confirm the exact package targets. Microsoft validates access on each operation.",
-    href: "/agents", label: "Open Agents",
-  };
-  if (view.definition.id.startsWith("powerPlatform.quarantine.")) return {
-    text: "Open Agents to check status or confirm a change for exact inventoried Copilot Studio agents. Microsoft validates permission on each operation.",
-    href: "/agents", label: "Open Agents",
-  };
-  if (view.definition.id.startsWith("purview.audit.search.")) return {
-    text: "Open Audit and explicitly submit a bounded Purview search to verify operation access. Ready to try is not a failure; permission checks do not start searches.",
-    href: "/audit", label: "Open Audit",
-  };
-  if (view.definition.id.startsWith("defender.hunting.")) return {
-    text: "Open Agents, select an agent, and use its Activity tab to run a bounded Defender investigation. The agent identity is filled automatically. Permission checks do not run hunting queries.",
-    href: "/agents", label: "Open Agents",
-  };
-  return undefined;
 }
 
 function providerEvidenceIsFresh(view: CapabilityView, now: number) {

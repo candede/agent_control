@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CopilotStudioQuarantineCanaryRepository, type QuarantineCanaryApproval } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "../db/copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { NativeInventory } from "../db/nativeInventory.js";
 import { pool } from "../db/pool.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
@@ -71,7 +71,7 @@ function fixture() {
   const restorationJob = job(restoration, 1);
   const canaries = new CopilotStudioQuarantineCanaryRepository();
   const jobs = new CopilotStudioQuarantineRepository();
-  const inventory = new PowerPlatformInventoryRepository();
+  const inventory = new NativeInventory();
   const provider = new CopilotStudioQuarantineClient();
   const dependencies = {
     revalidateUser: vi.fn(async () => user),

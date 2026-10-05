@@ -4,6 +4,7 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import type { CapabilityView, InventorySourceAwareDetail, UnifiedAgentRecord } from "../src/api/client";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 const ownerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const creatorId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -42,17 +43,17 @@ function nativeRecord(): UnifiedAgentRecord {
 async function mockPeopleInventory(page: Page, record: UnifiedAgentRecord) {
   const unexpected = await mockLayoutApi(page);
   const summary = { total: 1, linked: 0, graphOnly: 0, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 };
-  await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
-    ...unifiedAgents, value: [record], count: 1, summary, filteredSummary: summary,
+  await page.route("**/api/agent-inventory?*", route => fulfillInventoryPage(route, {
+    ...unifiedAgents, value: [record], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 0 }, summary, filteredSummary: summary,
     inventoryScope: "power_platform_only", scopeSummary: summary,
     inventoryOverview: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 },
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 1, logicalAgentCount: 1 }, { sourceScopes: false }),
     sources: {
       graphPackages: { state: "unavailable", observation: null, error: { source: "graph_packages", code: "snapshot_unavailable", message: "No saved Graph inventory." } },
-      powerPlatform: { state: "available", observation: record.observations.powerPlatform, error: null },
+      powerPlatform: { state: "available", observation: record.observations.powerPlatform!, error: null },
     },
     errors: [{ source: "graph_packages", code: "snapshot_unavailable", message: "No saved Graph inventory." }],
-  } }));
+  }));
   const related: InventorySourceAwareDetail = {
     source: "power_platform", nativeId, resourceType: record.powerPlatformResource!.type,
     environmentId: record.environmentId, snapshotId: record.observations.powerPlatform!.snapshotId,
@@ -174,6 +175,7 @@ test("missing creator lookup is bounded, shows errors, and retries without hidin
   ]);
   await expect.poll(() => inventoryReads.length).toBeGreaterThan(readsBeforeRetry);
   await page.getByRole("button", { name: "Close unified agent details" }).click();
+  await expect(page.getByRole("dialog", { name: nativeId, exact: true })).toHaveCount(0);
   await expect(table.getByRole("row").filter({ has: page.getByRole("button", { name: nativeId, exact: true }) })).toContainText("Resolved creator");
   await page.getByRole("button", { name: nativeId, exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent information" }).getByText("Created by", { exact: true }).locator("..")).toContainText("Resolved creator");

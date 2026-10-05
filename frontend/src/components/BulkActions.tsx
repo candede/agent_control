@@ -11,6 +11,7 @@ import { CircleStop, LoaderCircle, Play, RefreshCw } from "lucide-react";
 import { isJobPolling } from "../jobStatus";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { PreviewBadge } from "./PermissionCenter";
+import { BulkJobItems } from "./BulkJobItems";
 
 export type BulkJobCommand = "resume" | "cancel" | "reconcile" | "refresh";
 
@@ -45,6 +46,7 @@ type BulkActionsProps = {
   job?: BulkActionJob;
   jobCommand?: BulkJobCommand;
   jobError?: string;
+  owner?: string;
   selectedCount: number;
   onBlockAll: () => void;
   onManageAccess: () => void;
@@ -60,6 +62,7 @@ export function BulkActions({
   job,
   jobCommand,
   jobError,
+  owner,
   selectedCount,
   onBlockAll,
   onManageAccess,
@@ -68,10 +71,10 @@ export function BulkActions({
 }: BulkActionsProps) {
   const active = Boolean(busyAction || jobCommand || (job && (isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization")));
   const summary = job ?? progress ?? result;
-  const outcomes = job?.results ?? result?.results ?? [];
-  const inconclusive = outcomes.filter(item => item.status === "inconclusive").length;
-  const cancelled = outcomes.filter(item => item.status === "cancelled").length;
-  const needsReconciliation = outcomes.some(item => item.status === "inconclusive" && item.reconciliationStatus === "required");
+  const outcomes = job ? [] : result?.results ?? [];
+  const inconclusive = job?.inconclusive ?? outcomes.filter(item => item.status === "inconclusive").length;
+  const cancelled = job?.cancelled ?? outcomes.filter(item => item.status === "cancelled").length;
+  const needsReconciliation = job ? job.reconciliationRequired > 0 : outcomes.some(item => item.status === "inconclusive" && item.reconciliationStatus === "required");
   const completed = job?.completed ?? progress?.completed;
   const total = summary?.total ?? 0;
   const percent = completed === undefined ? undefined : total === 0 ? 100 : Math.round(completed / total * 100);
@@ -87,7 +90,7 @@ export function BulkActions({
     0,
     failedResults.length - visibleFailures.length,
   );
-  const sideEffectErrors = (job ? job.result : result)?.sideEffectErrors ?? [];
+  const sideEffectErrors = job ? [] : result?.sideEffectErrors ?? [];
 
   return (
     <section className="bulk-panel" aria-label="Exact package bulk actions">
@@ -185,6 +188,7 @@ export function BulkActions({
         </div>
         {job?.status === "running" && job.currentAgentName ? <p className="bulk-job-current">Current agent: <strong>{job.currentAgentName}</strong></p> : null}
         {message ? <p className="bulk-job-message">{message}</p> : null}
+        {job ? <BulkJobItems key={`${owner ?? ""}:${job.id}`} job={job} owner={owner} /> : null}
         {failedResults.length > 0 ? (
           <details className="bulk-failures">
             <summary>Review {failedResults.length} {inconclusive ? "failed or uncertain changes" : "failed changes"}</summary>

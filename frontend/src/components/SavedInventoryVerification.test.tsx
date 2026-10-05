@@ -1,17 +1,17 @@
 import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { UnifiedAgentInventoryPage } from "../api/client";
-import { createInventoryVerification, createUnifiedVerification } from "../test/inventoryVerification";
+import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "../test/inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 
 function emptyInventory(): UnifiedAgentInventoryPage {
   const summary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, conflicting: 0, ambiguous: 0 };
   return {
+    ...inventoryPageMetadata(),
     inventoryScope: "all", scopeSummary: summary,
-    value: [], count: 0, offset: 0, limit: 50, summary, filteredSummary: summary,
+    value: [], summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
     identityCollection: { checkedPackages: 0, pendingPackages: 0 },
-    facets: { environments: [], platforms: [], types: [] },
     sources: {
       graphPackages: { state: "available", observation: {
         id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, tokenMode: "delegated", scopeKind: "broad",
@@ -41,6 +41,24 @@ function withoutSource(inventory: UnifiedAgentInventoryPage, source: keyof Unifi
 }
 
 describe("SavedAgentInventoryVerification source availability", () => {
+  it.each([
+    { coverage: "covered", count: 0, label: "Authorized query verified" },
+    { coverage: "covered", count: null, label: "Authorized query verified" },
+    { coverage: "not_requested", count: null, label: "Not requested" },
+    { coverage: "not_authorized_scope", count: null, label: "Not queried (role scope)" },
+    { coverage: "unknown", count: null, label: "Unknown (not verified)" },
+    { coverage: "unknown", count: 0, label: "Unknown (not verified)" },
+  ] as const)("keeps $coverage coverage separate from the observed count $count", ({ coverage, count, label }) => {
+    const inventory = emptyInventory();
+    const observation = inventory.sources.powerPlatform.observation!;
+    inventory.sources.powerPlatform.observation = { ...observation, coverage, coveredCount: count };
+    render(<SavedAgentInventoryVerification inventory={inventory} />);
+    const details = within(screen.getByRole("region", { name: "Saved Power Platform query verification" }));
+    expect(details.getByText("Power Platform agents observed").nextElementSibling).toHaveTextContent(count === null ? /^Not established$/ : /^0$/);
+    expect(details.getByText("Agent type query").nextElementSibling?.textContent).toBe(label);
+    expect(details.getByText(/not a fresh Microsoft read or proof of universal tenant visibility/)).toBeVisible();
+  });
+
   it("does not describe stale package details as missing metadata or certify their freshness", () => {
     const inventory = emptyInventory();
     inventory.identityCollection = { checkedPackages: 0, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } };

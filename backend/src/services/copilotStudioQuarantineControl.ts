@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { NativeInventory } from "../db/nativeInventory.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction } from "../types/copilotStudioQuarantine.js";
@@ -32,7 +32,7 @@ const defaultDependencies: ControlDependencies = {
 export class CopilotStudioQuarantineControlService {
   constructor(
     private readonly repository = copilotStudioQuarantineJobs,
-    private readonly inventory = new PowerPlatformInventoryRepository(),
+    private readonly inventory = new NativeInventory(),
     private readonly provider = new CopilotStudioQuarantineClient(),
     private readonly dependencies: ControlDependencies = defaultDependencies,
   ) {}

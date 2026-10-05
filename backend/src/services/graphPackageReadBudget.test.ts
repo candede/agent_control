@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
-import { GraphPackagesClient, graphError, graphErrorTelemetry, packageInventoryReadPolicy, type FetchLike } from "./graphPackages.js";
-import { scanPackages } from "./packageInventory.js";
+import { GraphPackagesClient, graphError, graphErrorTelemetry, packageInventoryReadPolicy, type FetchLike, type PackageReadOptions } from "./graphPackages.js";
+import { measureGraphDetails } from "./inventoryProviderTestSupport.js";
 
 const throttledResponse = (headers?: ResponseInit["headers"], status = 424) => Response.json({
   error: { code: "UnknownError", message: "Too many requests private-token person@example.invalid" },
@@ -11,9 +11,8 @@ const packageResponse = (id = "package") => Response.json({ id, displayName: id,
 const timerDelay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 describe("Graph inventory read budget", () => {
-  it.each([1071, 5000])("collects %i healthy package details without an artificial four-reads-per-second ceiling", async count => {
+  it.each([1071, 5000])("checks %i healthy exact details with bounded callers and no artificial four-reads-per-second ceiling", async count => {
     vi.useFakeTimers();
-    const listed = Array.from({ length: count }, (_, index) => ({ id: `package-${index}`, displayName: `Agent ${index}`, isBlocked: false }));
     let active = 0;
     let maximumActive = 0;
     let finishedAt = 0;
@@ -23,20 +22,19 @@ describe("Graph inventory read budget", () => {
       await timerDelay(50);
       active -= 1;
       finishedAt = performance.now();
-      return new URL(input).pathname.endsWith("/packages")
-        ? Response.json({ value: listed }) : packageResponse(new URL(input).pathname.split("/").at(-1)!);
+      expect(new URL(input).pathname).not.toBe("/v1.0/copilot/admin/catalog/packages");
+      return packageResponse(new URL(input).pathname.split("/").at(-1)!);
     });
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), 15 * 60_000);
     try {
       const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: timerDelay });
-      const result = scanPackages("token", [], controller.signal, async () => undefined, client).finally(() => clearTimeout(deadline));
-      const assertion = expect(result).resolves.toMatchObject({ totalRecords: count, pages: 1 });
+      const result = measureGraphDetails(client, count, { signal: controller.signal }).finally(() => clearTimeout(deadline));
+      const assertion = expect(result).resolves.toEqual({ observedCount: count });
       await Promise.all([assertion, vi.runAllTimersAsync()]);
-      expect((await result).packages.map(value => value.id)).toEqual(listed.map(value => value.id));
-      expect(fetcher).toHaveBeenCalledTimes(count + 1);
+      expect(fetcher).toHaveBeenCalledTimes(count);
       expect(maximumActive).toBe(4);
-      expect(finishedAt).toBeLessThanOrEqual(50 + Math.ceil(count / 4) * 50);
+      expect(finishedAt).toBeLessThanOrEqual(Math.ceil(count / 4) * 50);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -206,12 +204,11 @@ describe("Graph inventory read budget", () => {
     }
   });
 
-  it("completes all 1,010 identities under recurring throttling within the full-job deadline", async () => {
+  it("checks all 1,010 exact identities under recurring throttling within a bounded caller deadline", async () => {
     vi.useFakeTimers();
-    const listed = Array.from({ length: 1010 }, (_, index) => ({ id: `package-${index}`, displayName: `Agent ${index}`, isBlocked: false }));
     const reads: number[] = [];
     const windows = new Map<number, number>();
-    const progress = vi.fn<Parameters<typeof scanPackages>[3]>(async () => undefined);
+    const progress = vi.fn<NonNullable<PackageReadOptions["onRetry"]>>(async () => undefined);
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), 15 * 60_000);
     const fetcher = vi.fn<FetchLike>(async input => {
@@ -222,27 +219,21 @@ describe("Graph inventory read budget", () => {
       windows.set(window, count);
       if (count > 144) return throttledResponse();
       const url = new URL(input);
-      if (url.pathname.endsWith("/packages")) return Response.json(url.searchParams.has("page")
-        ? { value: listed.slice(500) }
-        : { value: listed.slice(0, 500), "@odata.nextLink": "https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?page=2" });
+      expect(url.pathname).not.toBe("/v1.0/copilot/admin/catalog/packages");
       return packageResponse(url.pathname.split("/").at(-1)!);
     });
     try {
       const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: timerDelay });
-      const result = scanPackages("token", [], controller.signal, progress, client).finally(() => clearTimeout(deadline));
-      const assertion = expect(result).resolves.toMatchObject({ totalRecords: 1010, pages: 2 });
+      const result = measureGraphDetails(client, 1010, { signal: controller.signal, onRetry: progress }).finally(() => clearTimeout(deadline));
+      const assertion = expect(result).resolves.toEqual({ observedCount: 1010 });
       await vi.runAllTimersAsync();
       await assertion;
-      const completed = await result;
-      expect(completed.packages.map(value => value.id)).toEqual(listed.map(value => value.id));
-      expect(completed.packages.every(value => value.identityDetailsCollected === true)).toBe(true);
       const pacedReads = reads.filter(at => at >= 30_000);
       expect(pacedReads.length).toBeGreaterThan(0);
       expect(pacedReads.every((at, index) => index === 0 || at - pacedReads[index - 1]! >= packageInventoryReadPolicy.throttledReadIntervalMs)).toBe(true);
       expect(reads.at(-1)).toBeLessThan(15 * 60_000);
-      expect(fetcher.mock.calls.length).toBeGreaterThan(1012);
-      expect(progress.mock.calls.some(call => call[3]?.includes("Microsoft Graph is throttling"))).toBe(true);
-      expect(progress).toHaveBeenLastCalledWith(2, 1010, 1010, "Matching agent records (1010/1010 identities checked).");
+      expect(fetcher.mock.calls.length).toBeGreaterThan(1010);
+      expect(progress.mock.calls.some(([notice]) => notice.throttled)).toBe(true);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

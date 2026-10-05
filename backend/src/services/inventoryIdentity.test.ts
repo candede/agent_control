@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeNativeIdentity, packageInventoryIdentity, powerPlatformAgentKey, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "./inventoryIdentity.js";
+import { normalizeNativeIdentity, powerPlatformAgentKey, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "./inventoryIdentity.js";
 
 function identity(overrides: Partial<InventoryIdentityRecord> = {}): InventoryIdentityRecord {
   return {
@@ -130,23 +130,14 @@ describe("exact inventory identity resolution", () => {
     });
   });
 
-  it("retains typed package identifiers without treating package app IDs as Entra app IDs", () => {
-    const packaged = packageInventoryIdentity("tenant-a", {
-      id: "package-a",
-      displayName: "Package",
-      isBlocked: false,
-      appId: "same-guid",
-      manifestId: "manifest-a",
-      assetId: "asset-a",
+  it("does not treat package app IDs as Entra app IDs", () => {
+    const packaged = identity({
+      nativeId: "package-a",
+      environmentId: null,
       sourceSystem: "graph_packages",
-      authoringTool: null,
-      creatorType: "unknown",
-      agentKind: "copilot_package",
-      lifecycle: "unknown",
-      identityConfidence: "exact_native",
-      provenance: {},
+      resourceType: "microsoft.graph/copilotpackages",
+      identifiers: [{ kind: "package_id", value: "package-a" }, { kind: "package_app_id", value: "same-guid" }],
     });
-    expect(packaged.identifiers.map(identifier => identifier.kind)).toEqual(["asset_id", "manifest_id", "package_app_id", "package_id"]);
     expect(resolveExactInventoryIdentity(packaged, [identity({ identifiers: [{ kind: "entra_app_id", value: "same-guid" }] })])).toEqual({
       status: "unresolved",
       reason: "no_documented_cross_source_relation",

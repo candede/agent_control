@@ -40,7 +40,6 @@ policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/audit", { access:
 });
 
 policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/jobs/:id", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  await copilotStudioQuarantineJobs.recoverInterrupted();
   const job = await copilotStudioQuarantineJobs.get(requestScope(request), requiredUuid(request.params.id, "job ID"));
   if (!job) throw new AppError(404, "not_found", "Quarantine job was not found.");
   response.json(job);
@@ -56,8 +55,10 @@ policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/resume"
   if (request.body?.confirmed !== true || Object.keys(request.body).length !== 1) throw new AppError(400, "confirmation_required", "Resume accepts only explicit confirmed true for unsent work.");
   const scope = requestScope(request);
   const id = requiredUuid(request.params.id, "job ID");
-  await copilotStudioQuarantineJobs.recoverInterrupted();
-  const job = await copilotStudioQuarantineJobs.get(scope, id);
+  let job = await copilotStudioQuarantineJobs.get(scope, id);
+  if (!job) throw new AppError(404, "not_found", "Quarantine job was not found.");
+  await copilotStudioQuarantineJobs.recoverJob(scope, id);
+  job = await copilotStudioQuarantineJobs.get(scope, id);
   if (!job) throw new AppError(404, "not_found", "Quarantine job was not found.");
   if (!job.canResume) throw new AppError(409, "not_resumable", "No authorized unsent quarantine work can be resumed.");
   launchCopilotStudioQuarantineJob(id, scope, true);

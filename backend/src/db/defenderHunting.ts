@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
-import { resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
+import type { InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { defenderHuntingTemplates, type DefenderHuntingFilters, type DefenderHuntingHistory, type DefenderHuntingJob,
   type DefenderHuntingAuthorityBinding, type DefenderHuntingQualificationBinding, type DefenderHuntingQualificationEvidence,
   type DefenderHuntingQueryResult, type DefenderHuntingResultScope, type DefenderHuntingRetainedScope,
   type DefenderHuntingRetainedScopeBinding,
   type DefenderHuntingRow, type DefenderHuntingRowPage, type DefenderHuntingSnapshot, type DefenderHuntingTokenMode } from "../types/defenderHunting.js";
-import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
+import { InventoryIdentityQueries, type InventoryIdentityReadScope } from "./inventoryIdentityQueries.js";
 import { pool, transaction } from "./pool.js";
 
 export type DefenderHuntingScope = {
@@ -33,7 +33,7 @@ export type DefenderHuntingExecution = { owner: string; version: number };
 type JobRow = {
   id: string; authorization_principal_id: string; result_scope_id: string; result_scope_kind: DefenderHuntingResultScope["kind"];
   result_scope_configuration_revision: string | null; token_mode: DefenderHuntingTokenMode; status: DefenderHuntingJob["status"];
-  filters: DefenderHuntingFilters; query_version: 1 | 2 | 3; retained_scope_id: string | null; local_request_id: string; provider_request_id: string | null;
+  filters: DefenderHuntingFilters; query_version: 3; retained_scope_id: string | null; local_request_id: string; provider_request_id: string | null;
   provider_request_count: number; activation_count: number; execution_version: string; execution_owner: string | null;
   provider_row_count: number; stored_row_count: number; byte_count: number; result_complete: boolean; no_data: boolean;
   partial_reason: DefenderHuntingJob["partialReason"]; observed_start: Date | null; observed_end: Date | null;
@@ -49,7 +49,7 @@ type JobRow = {
 type SnapshotRow = {
   id: string; job_id: string; result_scope_id: string; result_scope_kind: DefenderHuntingResultScope["kind"];
   result_scope_configuration_revision: string | null; filters: DefenderHuntingFilters; source_table: "AgentsInfo" | "CloudAppEvents";
-  query_version: 1 | 2 | 3; requested_start: Date; requested_end: Date; observed_start: Date | null; observed_end: Date | null;
+  query_version: 3; requested_start: Date; requested_end: Date; observed_start: Date | null; observed_end: Date | null;
   unobserved_start: Date | null; unobserved_end: Date | null; observation_time: Date; result_complete: boolean; no_data: boolean;
   partial_reason: DefenderHuntingSnapshot["partialReason"]; provider_row_count: number; stored_row_count: number; byte_count: number; expires_at: Date;
 };
@@ -419,22 +419,25 @@ export class DefenderHuntingRepository {
     const identityScope = scope.inventoryIdentityScope;
     if (!identityScope) return rows.map(() => ({ status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const }));
     if (identityScope.principalId !== scope.authorizationPrincipalId) throw new AppError(403, "scope_mismatch", "Hunting inventory association requires the current reader's private identity scope.");
-    const identities = await new PowerPlatformInventoryRepository(this.database).readIdentityCandidates(
-      { tenantId: scope.tenantId, principalId: identityScope.principalId }, identityScope.resourceTypes,
-    );
-    return rows.map(row => {
+    const inventory = new InventoryIdentityQueries(this.database);
+    return inventory.read(async client => {
+    const result = [];
+    for (const row of rows) {
       const identifiers: InventoryIdentityRecord["identifiers"] = row.sourceTable === "AgentsInfo"
         ? [...(row.entraAgentObjectId ? [{ kind: "entra_agent_id" as const, value: row.entraAgentObjectId }] : []),
           ...(row.entraBlueprintId ? [{ kind: "entra_blueprint_id" as const, value: row.entraBlueprintId }] : [])]
         : [...(row.targetAgentBlueprintId ? [{ kind: "entra_blueprint_id" as const, value: row.targetAgentBlueprintId }] : []),
           ...(row.agentBlueprintId ? [{ kind: "entra_blueprint_id" as const, value: row.agentBlueprintId }] : [])];
-      const resolution = resolveExactInventoryIdentity({ nativeId: row.sourceTable === "AgentsInfo" ? row.agentId : row.reportId ?? row.spanId ?? "unidentified",
+      const resolution = await inventory.resolve(client, { tenantId: scope.tenantId, principalId: identityScope.principalId },
+        identityScope.resourceTypes, { nativeId: row.sourceTable === "AgentsInfo" ? row.agentId : row.reportId ?? row.spanId ?? "unidentified",
         tenantId: scope.tenantId, environmentId: null, sourceSystem: "defender_hunting", resourceType: `microsoft.defender/${row.sourceTable}`, identifiers },
-      identities, { blueprintParentAcrossSources: true });
-      if (resolution.status === "resolved") return { status: "resolved" as const, sourceSystem: resolution.candidate.sourceSystem as "power_platform" | "graph_packages",
-        nativeId: resolution.candidate.nativeId, resourceType: resolution.candidate.resourceType, environmentId: resolution.candidate.environmentId, matchedKind: "entra_agent_id" as const };
-      if (resolution.status === "ambiguous") return { status: "ambiguous" as const, reason: resolution.reason, candidateCount: resolution.candidateCount ?? resolution.candidates.length };
-      return { status: "unresolved" as const, reason: resolution.reason };
+      { blueprintParentAcrossSources: true });
+      if (resolution.status === "resolved") result.push({ status: "resolved" as const, sourceSystem: resolution.candidate.sourceSystem as "power_platform" | "graph_packages",
+        nativeId: resolution.candidate.nativeId, resourceType: resolution.candidate.resourceType, environmentId: resolution.candidate.environmentId, matchedKind: "entra_agent_id" as const });
+      else if (resolution.status === "ambiguous") result.push({ status: "ambiguous" as const, reason: resolution.reason, candidateCount: resolution.candidateCount ?? resolution.candidates.length });
+      else result.push({ status: "unresolved" as const, reason: resolution.reason });
+    }
+    return result;
     });
   }
 

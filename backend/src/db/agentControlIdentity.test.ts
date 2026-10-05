@@ -1,36 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import { inventoryInput, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
+import { NativeInventory } from "./nativeInventory.js";
 
-describe("corroborated agent control identity", () => {
-  it("uses the same fresh scoped proof for catalog and server controls, never a bare native-ID alias", async () => {
+describe("corroborated current agent control identity", () => {
+  it("uses fresh scoped canonical proof, never a bare native-ID or historical source alias", async () => {
     const fixture = await testDatabase();
     try {
       const scope = { tenantId: "identity-tenant", principalId: "identity-reader" };
       const environmentId = "11111111-1111-4111-8111-111111111111";
       const botId = "22222222-2222-4222-8222-222222222222";
-      const inventory = new PowerPlatformInventoryRepository(fixture.runtime);
-      const packages = new PackageInventoryRepository(fixture.runtime);
-      const resource: PowerPlatformResource = {
-        tenantId: scope.tenantId, nativeId: botId, environmentId, type: "microsoft.copilotstudio/agents",
-        location: null, displayName: "Clinical agent", createdAt: null, createdBy: null, lastPublishedAt: null,
-        sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown",
-        agentKind: "copilot_studio_agent", lifecycle: "published", identityConfidence: "exact_native",
+      const inventory = new NativeInventory(fixture.runtime);
+      const native = await nativeInventoryFixture(fixture.runtime, scope, [{
+        nativeId: botId, environmentId, displayName: "Clinical agent", authoringTool: "Copilot Studio", lifecycle: "published",
         identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "power_platform_resource_id", value: botId }],
-        provenance: {}, details: { schemaName: "cr123_clinical", isQuarantined: false }, unknownFieldCount: 0,
-      };
-      const inventoryJob = await inventory.submit(scope, {
-        idempotencyKey: "native-only-inventory", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
-      });
-      await inventory.markRunning(scope, inventoryJob.id);
-      const saved = await inventory.publish(scope, inventoryJob.id, {
-        resources: [resource], queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
-      });
-      await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
-        .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
+        details: { schemaName: "cr123_clinical", isQuarantined: false },
+      }]);
+      await reconcileInventoryFixture(fixture.runtime, scope);
+      const resolve = () => inventory.resolveQuarantineTargets(scope, native.baselineId, [botId]);
+      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
       const packaged = allowlistedPackage({
         id: "published-version", displayName: "Clinical agent", isBlocked: false,
         version: "1", lastModifiedDateTime: "2026-09-15T12:00:00.000Z",
@@ -38,42 +29,51 @@ describe("corroborated agent control identity", () => {
           SourceIds: { EnvironmentId: environmentId, CdsBotId: botId, SchemaName: "cr123_clinical" },
         }) }] }],
       });
-      const publish = async (principalId: string, key: string) => {
-        const owner = { ...scope, principalId };
-        const job = await packages.submit(owner, { authorizationPrincipalId: principalId, tokenMode: "delegated", idempotencyKey: key });
-        await packages.markRunning(owner, job.id);
-        return packages.publish(owner, job.id, { packages: [packaged], totalRecords: 1, pages: 1 });
+      const publish = async (principalId: string, mode: "baseline" | "delta", detail = packaged, expiresAt?: Date) => {
+        const input = inventoryInput(principalId);
+        input.scope.tenantId = scope.tenantId;
+        if (expiresAt) input.expiresAt = expiresAt;
+        const stages = new InventoryGenerations(fixture.runtime);
+        const record = packageInventoryRecord(detail);
+        const root = await stages.execute(input, { domain: "packages", mode,
+          channel: mode === "baseline" ? "catalog" : "exact", ...(mode === "delta" ? { targets: [detail.id] } : {}) },
+        async lease => {
+          await stages.appendBounded(lease, [record]);
+          if (mode === "baseline") {
+            await stages.visit(lease, "source");
+            await stages.acceptPage(lease, { token: "source", nextToken: null, records: [record], rawCount: 1, expectedCount: 1, page: 1 }, 1);
+          }
+        }, { authorize: async () => {} });
+        await reconcileInventoryFixture(fixture.runtime, { ...scope, principalId });
+        return root;
       };
-      await publish("another-reader", "private-proof");
-      await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
-        .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
-      const proof = await publish(scope.principalId, "current-proof");
-      expect(await inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
-        .toMatchObject([{ resourceNativeId: botId, environmentId, botId, snapshotId: saved.snapshotId }]);
-      expect((await inventory.readUnifiedSource(scope)).resources[0].identifiers)
-        .not.toContainEqual({ kind: "cds_bot_id", value: botId });
-      await fixture.operator.query("UPDATE package_inventory_snapshots SET observed_at=clock_timestamp()-interval '25 hours' WHERE id=$1", [proof.snapshotId]);
-      await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
-        .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
-      const exact = await packages.submit(scope, {
-        authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "retained-exact-proof", requestedIds: [packaged.id],
-      });
-      await packages.markRunning(scope, exact.id);
-      await packages.publish(scope, exact.id, { packages: [packaged], totalRecords: 1, pages: 1 });
-      const refreshed = await packages.submit(scope, {
-        authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "complete-without-metadata",
-      });
-      await packages.markRunning(scope, refreshed.id);
-      await packages.publish(scope, refreshed.id, {
-        packages: [{ ...packaged, elementDetails: undefined, identityDetailsCollected: true }], totalRecords: 1, pages: 1,
-      });
-      const latest = await packages.readUnifiedSource(scope);
-      expect(latest.packages[0].elementDetails).toBeUndefined();
-      expect(latest.observations[packaged.id].identityDetails).toBeUndefined();
-      await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
-        .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
-    } finally {
-      await fixture.close();
-    }
+      await publish("another-reader", "baseline");
+      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
+      const proof = await publish(scope.principalId, "baseline", packaged, new Date(Date.now() + 2000));
+      expect(await resolve()).toMatchObject([{ resourceNativeId: botId, environmentId, botId, snapshotId: native.baselineId }]);
+      expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM inventory_facts
+        WHERE generation_id=$1 AND kind='identifier' AND payload->>'kind'='cds_bot_id'`, [native.baselineId])).rows[0].n).toBe(0);
+
+      await expect(fixture.operator.query("UPDATE data_generations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [proof.baselineId]))
+        .rejects.toThrow("data_generation_intent_immutable");
+      await expect.poll(async () => {
+        try { await resolve(); return "available"; }
+        catch (error) { return (error as { code?: string }).code; }
+      }, { timeout: 3000 }).toBe("quarantine_target_unavailable");
+      await reconcileInventoryFixture(fixture.runtime, scope);
+      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
+
+      await publish(scope.principalId, "delta");
+      expect(await resolve()).toMatchObject([{ resourceNativeId: botId, environmentId, botId }]);
+      await publish(scope.principalId, "baseline", { ...packaged, elementDetails: undefined, identityDetailsCollected: true });
+      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
+      expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM inventory_facts f
+        JOIN inventory_memberships m ON m.generation_id=f.generation_id AND m.identity=f.identity
+        JOIN inventory_roots r ON r.baseline_id=m.baseline_id AND r.current
+        JOIN data_scope_epochs s ON s.id=r.scope_id
+        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND r.domain='packages' AND f.kind='element'
+          AND m.valid_from_revision<=r.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>r.revision)`,
+      [scope.tenantId, scope.principalId])).rows[0].n).toBe(0);
+    } finally { await fixture.close(); }
   });
 });

@@ -1,15 +1,17 @@
-import type { OfficialUsageAggregateView } from "../api/client";
-import { usageAvailabilityLabel, usageCoverageLabel, usageDate } from "../usageInsights";
-
-type ReportContext = Pick<OfficialUsageAggregateView, "availability" | "activeSet" | "lineages">;
-
-export function UsageReportContext({ data }: { data: ReportContext }) {
-  return <div className="agent-usage-context">
-    <span className={`agent-insight-badge ${data.availability === "active" ? "" : "attention"}`}>{usageAvailabilityLabel(data.availability)}</span>
-    <span>{usageCoverageLabel(data.activeSet)}</span>
-    {data.activeSet?.acceptedAt ? <span>Imported {usageDate(data.activeSet.acceptedAt)}</span> : null}
-    {data.availability === "stale" ? <p>Historical totals remain visible. Refresh the reports before making adoption decisions.</p> : null}
-    {data.activeSet?.reportingPeriod.provenance === "activity_range" ? <p>These dates describe observed activity, not a proven reporting window.</p> : null}
-    {data.lineages.some(lineage => lineage.sourceFreshness === "unknown") ? <p>Source refresh time is not supplied for one or more exports. Import time does not establish source freshness.</p> : null}
-  </div>;
+import type { ReportMetadata } from "../../../backend/src/types/officialReportData";
+import { usageAvailabilityLabel, usageDate } from "../usageInsights";
+export function UsageReportContext({ reports, inlineSources = false }: { reports: ReportMetadata; inlineSources?: boolean }) {
+  const sources = <><dl>{reports.lineages.map(lineage => <div key={lineage.kind}><dt>{lineage.kind}</dt>
+    <dd>{lineage.rowCount.toLocaleString()} rows; version {lineage.versionId}; source freshness {lineage.sourceFreshness};
+      source as of {usageDate(lineage.sourceAsOf)} ({lineage.sourceAsOfProvenance})</dd></div>)}</dl>
+    <p>History revision {reports.historyRevision}; selected set {reports.setId ?? "None"}. Activity dates do not prove continuous coverage. Counts across reports are not additive. Import time does not establish source freshness.</p></>;
+  return <section className="usage-report-context" aria-label="Report provenance">
+    <span>{usageAvailabilityLabel(reports.availability)}</span>
+    <span>Reporting period: {reports.reportingPeriod?.startDate ?? "Not supplied"} to {reports.reportingPeriod?.endDate ?? "Not supplied"}</span>
+    <span>Provenance: {reports.reportingPeriod?.provenance ?? "Unknown"}</span><span>Imported {usageDate(reports.acceptedAt)}</span>
+    {reports.availability === "stale" ? <p role="status">Reports are out of date. Historical totals remain visible, not current activity.</p> : null}
+    {reports.reportingPeriod?.provenance === "activity_range" ? <p>Observed dates are last-activity dates, not a proven reporting window.</p> : null}
+    {inlineSources ? <section className="usage-report-sources" aria-label="Report sources"><h4>Report sources</h4>{sources}</section>
+      : <details><summary>Report sources</summary>{sources}</details>}
+  </section>;
 }

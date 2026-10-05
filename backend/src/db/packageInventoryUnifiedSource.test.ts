@@ -1,231 +1,324 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { inventoryInput, inventorySelectionFixture, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import { resolvePackageAgentLinks } from "../services/packageAgentIdentity.js";
+import { GraphPackagesClient } from "../services/graphPackages.js";
+import { StreamedInventory } from "../services/streamedInventory.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { pool } from "./pool.js";
+import { publishPackageReadback, readPackageInventoryGeneration } from "./packageControls.js";
+import { dataConnections } from "./dataConnections.js";
+import { LiveInventory } from "./liveInventory.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import type { InventoryQuery } from "./inventoryQueries.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 
-const scope = { tenantId: "unified-tenant", principalId: "unified-reader" };
-const broad = {
-  id: "11111111-1111-4111-8111-111111111111",
-  token_mode: "delegated",
-  scope_kind: "broad",
-  requested_ids: [],
-  observed_count: 0,
-  total_records: 0,
-  page_count: 1,
-  observed_at: new Date("2026-09-22T00:00:00.000Z"),
-  read_started_at: new Date("2026-09-22T00:00:00.000Z"),
-  expires_at: new Date("2026-10-22T00:00:00.000Z"),
-};
-const exact = {
-  snapshot_id: "22222222-2222-4222-8222-222222222222",
-  observed_at: new Date("2026-09-23T00:00:00.000Z"),
-  read_started_at: new Date("2026-09-23T00:00:00.000Z"),
-  expires_at: new Date("2026-10-23T00:00:00.000Z"),
-};
-const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
+let database: Awaited<ReturnType<typeof testDatabase>>;
+beforeAll(async () => { database = await testDatabase(); });
+afterAll(async () => { await database?.close(); });
+const packageValue = (id: string, isBlocked = false) => allowlistedPackage({ id, displayName: id, isBlocked });
 
-function packageValue(id: string, isBlocked = false) {
-  return allowlistedPackage({ id, displayName: id, isBlocked });
-}
-
-function controlRow(package_data: CopilotPackageDetail) {
+function provider() {
+  const scope = { tenantId: "typed-package-observations", principalId: randomUUID() };
+  let catalog: CopilotPackageDetail[] = [];
+  const exact = new Map<string, CopilotPackageDetail>();
+  const graph = new GraphPackagesClient(async url => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith("/packages")) return Response.json({ value: catalog, "@odata.count": catalog.length });
+    const id = decodeURIComponent(path.split("/").at(-1)!);
+    return exact.has(id) ? Response.json(exact.get(id)) : Response.json({ error: { code: "notFound" } }, { status: 404 });
+  }, { minimumReadIntervalMs: 0, maxAttempts: 1 });
+  const streamed = new StreamedInventory(database.runtime, graph);
+  const input = () => {
+    const value = inventoryInput(scope.principalId);
+    value.scope.tenantId = scope.tenantId;
+    return value;
+  };
   return {
-    id: exact.snapshot_id, native_id: package_data.id, package_data,
-    control_state: { kind: "block", isBlocked: package_data.isBlocked },
-    observed_at: exact.observed_at, expires_at: exact.expires_at, identity_revalidation_required: false,
+    scope, exact,
+    async catalogPage(values: CopilotPackageDetail[]) {
+      if (values.length > 20) throw new Error("tiny_provider_fixture_limit");
+      catalog = values;
+      const root = await streamed.graphCatalog(input(), "synthetic", { authorize: async () => {} });
+      await reconcileInventoryFixture(database.runtime, scope);
+      return root;
+    },
+    async exactPage(ids: string[], detailOnly = false, observedAt?: Date) {
+      const generation = input();
+      if (observedAt) generation.observedAt = observedAt;
+      const root = await (detailOnly ? streamed.details : streamed.exact).call(streamed, generation, "synthetic", ids, { authorize: async () => {} });
+      await reconcileInventoryFixture(database.runtime, scope);
+      return root;
+    },
+    async read(query: InventoryQuery = {}) {
+      const selected = await inventorySelectionFixture(database.runtime, scope, query);
+      return { ...selected, page: inventoryPresentation(selected.raw) };
+    },
   };
 }
 
-function fixture(base: CopilotPackageDetail[], overlays: { native_id: string; package_data: CopilotPackageDetail | null }[],
-  controls: CopilotPackageDetail[] = []) {
-  const exactCount = overlays.filter(row => row.package_data).length;
-  const query = vi.spyOn(pool, "query").mockRejectedValue(new Error("Unexpected unified package query."));
-  query.mockResolvedValueOnce({ ...emptyResult, rows: [{ ...broad, observed_count: base.length, total_records: base.length }] })
-    .mockResolvedValueOnce({ ...emptyResult, rows: base.map(package_data => ({ native_id: package_data.id, package_data })) })
-    .mockResolvedValueOnce({ ...emptyResult, rows: overlays.map(row => ({ ...exact, ...row })) })
-    .mockResolvedValueOnce(emptyResult)
-    .mockResolvedValueOnce({ ...emptyResult, rows: [
-      { id: broad.id, observed_count: base.length, total_records: base.length, stored_count: base.length, page_count: 1 },
-      ...(overlays.length ? [{ id: exact.snapshot_id, observed_count: exactCount, total_records: exactCount, stored_count: exactCount, page_count: 1 }] : []),
-    ] }).mockResolvedValueOnce({ ...emptyResult, rows: controls.map(controlRow) });
-  return { query, repository: new PackageInventoryRepository() };
-}
-
-afterEach(() => { vi.restoreAllMocks(); });
-
-describe("unified package observation keys", () => {
+describe("typed package observation identity and provenance", () => {
+  it("preserves immutable identity expiry through compaction and splits expired detail-only matches off GET", async () => {
+    const source = provider(), environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", botId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    await nativeInventoryFixture(database.runtime, source.scope, [{ nativeId: botId, environmentId,
+      identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }] }]);
+    source.exact.set("package", { ...packageValue("package"), version: "1",
+      elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity",
+        definition: JSON.stringify({ SourceIds: { EnvironmentId: environmentId, CdsBotId: botId } }) }] }] });
+    await source.exactPage(["package"], false, new Date(Date.now() - 3_600_000 + 2_500));
+    const before = await source.read();
+    expect(before.page.value).toHaveLength(1);
+    expect(before.page.value[0].presence).toBe("both");
+    const root = (await database.runtime.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
+      r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
+      WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.principal_id=$2`,
+    [source.scope.tenantId, source.scope.principalId])).rows[0];
+    const expiry = (await database.runtime.query(`SELECT generation_id,identity,identity_expires_at FROM unified_agent_rows
+      WHERE generation_id=$1`, [root.baselineId])).rows[0];
+    expect(expiry.identity_expires_at).toBeInstanceOf(Date);
+    await expect(database.operator.query(`UPDATE unified_agent_rows SET identity_expires_at=identity_expires_at+interval '1 hour'
+      WHERE generation_id=$1 AND identity=$2`, [expiry.generation_id, expiry.identity])).rejects.toThrow("data_record_immutable");
+    const input = inventoryInput(source.scope.principalId, "canonical");
+    input.scope.tenantId = source.scope.tenantId;
+    const compacted = await new InventoryGenerations(database.runtime).compact(input, root, { authorize: async () => {} });
+    expect((await database.runtime.query(`SELECT r.generation_id,r.identity,r.identity_expires_at FROM inventory_memberships m
+      JOIN unified_agent_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
+      WHERE m.baseline_id=$1`, [compacted.baselineId])).rows).toEqual([expiry]);
+    await expect.poll(() => Date.now() >= expiry.identity_expires_at.getTime(), { interval: 50, timeout: 3_000 }).toBe(true);
+    await expect(new LiveInventory(database.runtime).record(source.scope, before.page.value[0].id)).rejects.toMatchObject({ code: "agent_not_found" });
+    await reconcileInventoryFixture(database.runtime, source.scope);
+    const after = await source.read();
+    expect(after.page.counts.total).toBe(2);
+    expect(after.page.summary).toMatchObject({ linked: 0, graphOnly: 1, powerPlatformOnly: 1 });
+    expect(new Set(after.page.value.map(row => row.id)).size).toBe(2);
+    expect(after.page.value.filter(row => row.id === before.page.value[0].id)).toHaveLength(1);
+    expect(after.page.identityCollection?.pendingDetails.stale).toBe(1);
+    expect((await before.queries.page(before.selection.id, before.identity)).counts.total).toBe(1);
+  });
+  it("reports time-expired detail evidence as stale in a new selection while retaining its provider catalog", async () => {
+    const source = provider();
+    source.exact.set("package", { ...packageValue("package"), version: "1",
+      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] });
+    await source.exactPage(["package"], false, new Date(Date.now() - 3600_000 + 2500));
+    const before = await source.read();
+    expect(before.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 0 });
+    const revision = (await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
+      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
+    [source.scope.tenantId, source.scope.principalId])).rows[0].revision;
+    const expiresAt = Date.parse(before.page.value[0].packages[0].detailFreshness!.expiresAt!);
+    await expect.poll(() => Date.now() >= expiresAt, { interval: 100, timeout: 3500 }).toBe(true);
+    const after = await source.read();
+    expect(after.page.value).toHaveLength(1);
+    expect(after.page.identityCollection).toMatchObject({ checkedPackages: 0, pendingPackages: 1, pendingDetails: { stale: 1 } });
+    expect(after.page.value[0].packages[0]).toMatchObject({ detailFreshness: { state: "stale" } });
+    expect(after.page.value[0].packages[0]).not.toHaveProperty("identityDetailsCollected", true);
+    expect(after.page.freshness?.state).toBe("catching_up");
+    const live = new LiveInventory(database.runtime);
+    await expect(live.record(source.scope, before.page.value[0].id)).rejects.toMatchObject({ code: "agent_not_found" });
+    expect((await before.queries.page(before.selection.id, before.identity)).verificationCounts.checked_packages).toBe(1);
+    await reconcileInventoryFixture(database.runtime, source.scope);
+    const reconciled = await source.read();
+    expect(reconciled.page.value[0].id).toBe(before.page.value[0].id);
+    expect(reconciled.page.freshness?.state).toBe("idle");
+    await expect(live.record(source.scope, reconciled.page.value[0].id)).resolves.toMatchObject({ id: before.page.value[0].id });
+    expect((await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
+      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
+    [source.scope.tenantId, source.scope.principalId])).rows[0].revision).toBe(revision);
+    const generationCount = (await database.runtime.query("SELECT count(*)::int AS total FROM data_generations")).rows[0].total;
+    await reconcileInventoryFixture(database.runtime, source.scope);
+    expect((await database.runtime.query("SELECT count(*)::int AS total FROM data_generations")).rows[0].total).toBe(generationCount);
+  });
+  it("sorts by the displayed source observation rather than a common canonical reconciliation timestamp", async () => {
+    const source = provider();
+    await source.catalogPage([packageValue("older"), packageValue("newer")]);
+    source.exact.set("newer", packageValue("newer"));
+    await source.exactPage(["newer"]);
+    for (const sortDirection of ["asc", "desc"] as const) {
+      const { page } = await source.read({ sortBy: "observedAt", sortDirection });
+      expect(page.value.map(record => record.packages[0].id)).toEqual(sortDirection === "asc" ? ["older", "newer"] : ["newer", "older"]);
+      const times = page.value.map(record => Date.parse(record.observations.packageSnapshots[record.packages[0].id].observedAt));
+      expect(times[0] === times[1]).toBe(false);
+      expect(times[0] < times[1]).toBe(sortDirection === "asc");
+      expect(page.value.map(record => record.columns!.observedAt)).toEqual(times);
+    }
+  });
   it.each(["__proto__", "constructor", "toString", "ordinary-id"])(
-    "keeps exact-only observation metadata enumerable for native ID %s", async id => {
-      const value = packageValue(id);
-      const { query, repository } = fixture([], [{ native_id: id, package_data: value }]);
+    "retains exact-only enumerable observation metadata for opaque ID %s", async id => {
+      const source = provider();
+      source.exact.set(id, packageValue(id));
+      await source.exactPage([id]);
+      const { page } = await source.read();
+      expect(page.value).toHaveLength(1);
+      expect(page.value[0].packages[0].id).toBe(id);
+      const observations = page.value[0].observations.packageSnapshots;
+      expect(Object.keys(observations)).toEqual([id]);
+      expect(Object.hasOwn(observations, id)).toBe(true);
+      expect(observations[id]).toMatchObject({ snapshotId: expect.any(String), scopeKind: "exact", current: true });
+      expect(JSON.parse(JSON.stringify(observations))).toEqual(Object.fromEntries([[id, observations[id]]]));
+      expect(Object.getPrototypeOf(observations)).toBe(Object.prototype);
+    });
 
-      const result = await repository.readUnifiedSource(scope);
-
-      expect(result.packages).toEqual([{ ...value, detailFreshness: { state: "missing", observedAt: null, expiresAt: null } }]);
-      expect(Object.keys(result.observations)).toEqual([id]);
-      expect(Object.hasOwn(result.observations, id)).toBe(true);
-      expect(result.observations[id]).toEqual({
-        snapshotId: exact.snapshot_id, scopeKind: "exact",
-        observedAt: exact.observed_at.toISOString(), expiresAt: exact.expires_at.toISOString(),
-      });
-      expect(JSON.parse(JSON.stringify(result.observations))).toEqual(
-        Object.fromEntries([[id, result.observations[id]]]),
-      );
-      expect(Object.getPrototypeOf(result.observations)).toBe(Object.prototype);
-      expect(query).toHaveBeenCalledTimes(6);
-    },
-  );
-
-  it("preserves broad observations while replacing exact targets and removing confirmed absences", async () => {
-    const retained = packageValue("retained");
-    const replacement = packageValue("__proto__", true);
-    const { repository } = fixture([retained, packageValue("__proto__"), packageValue("removed")], [
-      { native_id: "__proto__", package_data: replacement },
-      { native_id: "removed", package_data: null },
-    ]);
-
-    const result = await repository.readUnifiedSource(scope);
-
-    expect(result.packages).toEqual([replacement, retained].map(value => ({
-      ...value, detailFreshness: { state: "missing", observedAt: null, expiresAt: null },
-    })));
-    expect(Object.keys(result.observations).sort()).toEqual(["__proto__", "retained"]);
-    expect(result.observations.retained).toMatchObject({ snapshotId: broad.id, scopeKind: "broad" });
-    expect(result.observations["__proto__"]).toMatchObject({ snapshotId: exact.snapshot_id, scopeKind: "exact" });
-    expect(Object.hasOwn(result.observations, "removed")).toBe(false);
+  it("preserves broad rows and their provenance while replacing exact targets and recording confirmed absences", async () => {
+    const source = provider(), baseline = await source.catalogPage([packageValue("retained"), packageValue("__proto__"), packageValue("removed")]);
+    source.exact.set("__proto__", packageValue("__proto__", true));
+    await source.exactPage(["__proto__", "removed"]);
+    const { page } = await source.read();
+    expect(page.counts.total).toBe(2);
+    const retained = page.value.find(row => row.packages[0].id === "retained")!;
+    const replaced = page.value.find(row => row.packages[0].id === "__proto__")!;
+    expect(retained.observations.packageSnapshots.retained).toMatchObject({ snapshotId: baseline.baselineId, scopeKind: "broad" });
+    expect(replaced.packages[0].isBlocked).toBe(true);
+    expect(replaced.observations.packageSnapshots["__proto__"]).toMatchObject({ scopeKind: "exact" });
+    expect(replaced.observations.packageSnapshots["__proto__"].snapshotId).not.toBe(baseline.baselineId);
+    expect(page.value.some(row => Object.hasOwn(row.observations.packageSnapshots, "removed"))).toBe(false);
   });
 
-  it("removes a confirmed absent prototype-named target without inventing observation metadata", async () => {
-    const { repository } = fixture([packageValue("__proto__")], [{ native_id: "__proto__", package_data: null }]);
-
-    const result = await repository.readUnifiedSource(scope);
-
-    expect(result.packages).toEqual([]);
-    expect(Object.entries(result.observations)).toEqual([]);
-    expect(Object.hasOwn(result.observations, "__proto__")).toBe(false);
-  });
-
-  it("still rejects a stored resource whose identity differs from its native key", async () => {
-    const { repository } = fixture([], [{ native_id: "requested", package_data: packageValue("different") }]);
-    await expect(repository.readUnifiedSource(scope)).rejects.toMatchObject({ code: "inventory_verification_failed" });
-  });
-
-  it.each(["broad", "exact"])("does not qualify uncollected %s catalog metadata as cached detail evidence", async kind => {
-    const value = { ...packageValue("package"), manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] };
-    const { repository } = fixture(kind === "broad" ? [value] : [], kind === "exact"
-      ? [{ native_id: value.id, package_data: value }] : []);
-    const result = await repository.readUnifiedSource(scope);
-    expect(result.packages[0]).toMatchObject({ detailFreshness: { state: "missing" } });
-    expect(result.packages[0]).not.toHaveProperty("elementDetails");
-    expect(result.packages[0]).not.toHaveProperty("identityDetailsCollected");
-    expect(result.observations[value.id]).not.toHaveProperty("identityDetails");
-    expect(resolvePackageAgentLinks(scope.tenantId, result.packages, [])[0]).not.toHaveProperty("grouping");
-  });
-
-  it.each(["unified", "detail", "batch", "list"] as const)(
-    "does not qualify control-only readbacks as collected identity in %s reads", async reader => {
-      const detail = allowlistedPackage({
-        id: "control-only", displayName: "Control-only package", isBlocked: true,
-        manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", elementTypes: ["DeclarativeCopilots"],
-        elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }],
-      });
-      expect(resolvePackageAgentLinks(scope.tenantId, [detail], [])[0]).toHaveProperty("grouping");
-      const { query, repository } = fixture([], [], [detail]);
-      const controls = { ...emptyResult, rows: [controlRow(detail)] };
-      let value: CopilotPackageDetail | null | undefined;
-      if (reader === "unified") {
-        value = (await repository.readUnifiedSource(scope)).packages[0];
-      } else {
-        query.mockReset().mockRejectedValue(new Error("Unexpected control-only package query."));
-        if (reader === "detail") {
-          query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(controls);
-          value = (await repository.get(scope, detail.id))?.package;
-        } else if (reader === "batch") {
-          query.mockResolvedValueOnce({ ...emptyResult, rows: [{
-            requested_id: detail.id, package_data: null, identity_data: null, read_started_at: null,
-          }] }).mockResolvedValueOnce(controls);
-          value = (await repository.getMany(scope, [detail.id]))[0].package;
-        } else {
-          query.mockResolvedValueOnce({ ...emptyResult, rows: [broad] })
-            .mockResolvedValueOnce({ ...emptyResult, rows: [{
-              native_id: detail.id, package_data: null, identity_data: null, read_started_at: broad.read_started_at,
-            }] }).mockResolvedValueOnce(controls)
-            .mockResolvedValueOnce({ ...emptyResult, rows: [{ total: 1, allowed: 0, blocked: 1 }] })
-            .mockResolvedValueOnce({ ...emptyResult, rows: [{ native_id: detail.id }] });
-          value = (await repository.list(scope)).value[0];
-        }
-      }
-      expect(value).toMatchObject({
-        id: detail.id, isBlocked: true, controlObservations: { block: { snapshotId: exact.snapshot_id } },
-        detailFreshness: { state: "missing", observedAt: null, expiresAt: null },
-      });
-      expect(value).not.toHaveProperty("elementDetails");
-      expect(value).not.toHaveProperty("identityDetailsCollected");
-      expect(resolvePackageAgentLinks(scope.tenantId, [value!], [])[0]).not.toHaveProperty("grouping");
-    },
-  );
-
-  it.each(["unified", "detail", "batch", "list"].flatMap(reader =>
-    ["identity", "access"].map(evidence => ({ reader, evidence })),
-  ))("preserves newer catalog $evidence evidence in $reader reads", async ({ reader, evidence }) => {
-    const now = Date.now();
-    const snapshot = { ...broad, catalog_only: true, observed_count: 1, total_records: 1,
-      observed_at: new Date(now - 15 * 60_000), read_started_at: new Date(now - 15 * 60_000) };
-    const summary = { ...packageValue("package"), version: "1", lastModifiedDateTime: "2026-09-22T00:00:00Z",
-      manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", availableTo: "some", deployedTo: "some" };
-    const cached = { ...summary, identityDetailsCollected: true as const,
-      allowedUsersAndGroups: [{ resourceId: "old-user", resourceType: "user" }],
-      acquireUsersAndGroups: [{ resourceId: "old-group", resourceType: "group" }],
-      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] };
-    const current: CopilotPackageDetail = { ...summary, ...(evidence === "identity"
-      ? { elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
-        SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-      }) }] }] }
-      : { allowedUsersAndGroups: [], acquireUsersAndGroups: [] }) };
-    const detail = {
-      native_id: current.id, package_data: cached, snapshot_id: exact.snapshot_id, from_cache: true,
-      observed_at: new Date(now - 30 * 60_000), expires_at: new Date(now + 30 * 60_000),
+  it("retains compatible exact identity children, invalidates changed provider revisions and isolates application observations", async () => {
+    const source = provider();
+    const original = { ...packageValue("new"), lastModifiedDateTime: "2026-09-10T10:00:00.000Z", version: "1",
+      appId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: '{"fixture":"synthetic"}' }] }] };
+    await source.catalogPage([packageValue("retain"), packageValue("delete")]);
+    source.exact.set("new", original);
+    await source.exactPage(["delete", "new"]);
+    const application = inventoryInput(source.scope.principalId);
+    application.scope.tenantId = source.scope.tenantId;
+    application.scope.tokenMode = "application";
+    const graph = new GraphPackagesClient(async () => Response.json({ value: [packageValue("application-only")], "@odata.count": 1 }),
+      { minimumReadIntervalMs: 0, maxAttempts: 1 });
+    await new StreamedInventory(database.runtime, graph).graphCatalog(application, "synthetic", { authorize: async () => {} });
+    const readNew = async () => {
+      const read = await source.read();
+      expect(read.page.value.map(row => row.packages[0].id)).toEqual(["new", "retain"]);
+      const detail = await read.queries.packageDetail(read.selection.id, read.identity, "new");
+      const { recordId, sourceScopeId, sourceIdentity } = detail.selectedSource;
+      const children = await read.queries.children(read.selection.id, read.identity, recordId,
+        { sourceScopeId, sourceIdentity, kind: "element", limit: 50 });
+      return { read, detail, children };
     };
-    const row = { ...snapshot, native_id: current.id, requested_id: current.id, package_data: current,
-      identity_data: cached, identity_snapshot_id: detail.snapshot_id,
-      identity_observed_at: detail.observed_at, identity_expires_at: detail.expires_at };
-    const query = vi.spyOn(pool, "query").mockRejectedValue(new Error("Unexpected detail projection query."));
-    const repository = new PackageInventoryRepository();
-    let value: CopilotPackageDetail | null | undefined;
-    if (reader === "unified") {
-      query.mockResolvedValueOnce({ ...emptyResult, rows: [snapshot] })
-        .mockResolvedValueOnce({ ...emptyResult, rows: [{ native_id: current.id, package_data: current }] })
-        .mockResolvedValueOnce(emptyResult)
-        .mockResolvedValueOnce({ ...emptyResult, rows: [detail] })
-        .mockResolvedValueOnce({ ...emptyResult, rows: [{ ...snapshot, stored_count: 1 }] })
-        .mockResolvedValueOnce(emptyResult);
-      const result = await repository.readUnifiedSource(scope);
-      value = result.packages[0];
-      if (evidence === "identity") expect(result.observations[current.id]).not.toHaveProperty("identityDetails");
-    } else if (reader === "list") {
-      query.mockResolvedValueOnce({ ...emptyResult, rows: [snapshot] })
-        .mockResolvedValueOnce({ ...emptyResult, rows: [row] })
-        .mockResolvedValueOnce(emptyResult)
-        .mockResolvedValueOnce({ ...emptyResult, rows: [{ total: 1, allowed: 1, blocked: 0 }] })
-        .mockResolvedValueOnce({ ...emptyResult, rows: [{ native_id: current.id }] });
-      value = (await repository.list(scope)).value[0];
-    } else {
-      query.mockResolvedValueOnce({ ...emptyResult, rows: [row] }).mockResolvedValueOnce(emptyResult);
-      value = reader === "detail" ? (await repository.get(scope, current.id))?.package
-        : (await repository.getMany(scope, [current.id]))[0].package;
-    }
-    if (evidence === "identity") {
-      expect(value).toMatchObject({ detailFreshness: { state: "invalidated" }, identityRevalidationRequired: true });
-      expect(value).not.toHaveProperty("elementDetails");
-      expect(value).not.toHaveProperty("identityDetailsCollected");
-      expect(resolvePackageAgentLinks(scope.tenantId, [value!], [])[0]).not.toHaveProperty("grouping");
-    } else {
-      expect(value).toMatchObject({
-        allowedUsersAndGroups: [], acquireUsersAndGroups: [], detailFreshness: { state: "fresh" },
-      });
-    }
+    const { elementDetails: _details, ...catalog } = original;
+    await source.catalogPage([packageValue("retain"), { ...catalog, isBlocked: true }]);
+    const compatible = await readNew();
+    expect(compatible.detail).toMatchObject({ isBlocked: true, identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+    expect(compatible.children).toMatchObject({ total: 1, value: [{ payload: { elementType: "AgentMetadatas" } }] });
+    expect(compatible.read.page.value[0].observations.packageSnapshots.new.scopeKind).toBe("broad");
+
+    await source.catalogPage([packageValue("retain"), { ...catalog, isBlocked: false,
+      lastModifiedDateTime: "2026-09-11T10:00:00.000Z", version: "2", appId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }]);
+    const changed = await readNew();
+    expect(changed.detail).toMatchObject({ detailFreshness: { state: "invalidated" } });
+    expect(changed.detail).not.toHaveProperty("identityDetailsCollected", true);
+    expect(changed.children).toMatchObject({ total: 0, value: [] });
+
+    source.exact.set("new", { ...original, elementDetails: [] });
+    await source.exactPage(["new"]);
+    const empty = await readNew();
+    expect(empty.detail).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+    expect(empty.children).toMatchObject({ total: 0, value: [] });
+    expect(empty.read.page.value[0].observations.packageSnapshots.new.scopeKind).toBe("exact");
+    source.exact.delete("new");
+    await source.exactPage(["new"]);
+    expect((await source.read()).page.value.map(row => row.packages[0].id)).toEqual(["retain"]);
   });
+
+  it("removes a confirmed absent prototype-named target without inventing a row or an observation", async () => {
+    const source = provider();
+    await source.catalogPage([packageValue("__proto__")]);
+    await source.exactPage(["__proto__"]);
+    const { page } = await source.read();
+    expect(page.value).toEqual([]);
+    expect(page.counts.total).toBe(0);
+  });
+
+  it("rejects an exact provider response with a different opaque identity before publication", async () => {
+    const source = provider();
+    await source.catalogPage([packageValue("requested")]);
+    const before = await source.read();
+    source.exact.set("requested", packageValue("different"));
+    await expect(source.exactPage(["requested"])).rejects.toMatchObject({ code: "target_mismatch" });
+    const after = await source.read();
+    expect(after.page.value).toEqual(before.page.value);
+    expect(after.page.value[0].packages[0].id).toBe("requested");
+  });
+
+  it("does not promote catalog-only manifest fields to collected identity evidence", async () => {
+    const source = provider();
+    await source.catalogPage([{ ...packageValue("package"), manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] }]);
+    const selected = await source.read();
+    expect(selected.page.value[0].packages[0]).toMatchObject({ detailFreshness: { state: "missing" } });
+    expect(selected.page.value[0].packages[0]).not.toHaveProperty("elementDetails");
+    expect(selected.page.identityCollection?.checkedPackages).toBe(0);
+    expect(selected.page.identityCollection?.pendingPackages).toBe(1);
+    const detail = await selected.queries.packageDetail(selected.selection.id, selected.identity, "package");
+    expect(detail).toMatchObject({ detailFreshness: { state: "missing" } });
+    expect(detail).not.toHaveProperty("identityDetailsCollected", true);
+  });
+
+  it.each(["canonical", "source", "detail"] as const)("keeps control-only readbacks separate from identity collection in the %s reader", async reader => {
+    const source = provider(), value = { ...packageValue("package"), manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      elementTypes: ["DeclarativeCopilots"],
+      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] };
+    await source.catalogPage([value]);
+    await dataConnections(database.runtime).run(async client => {
+      await publishPackageReadback(source.scope, { ...value, isBlocked: true }, client,
+        await readPackageInventoryGeneration(source.scope, client), { kind: "block", isBlocked: true });
+    });
+    await reconcileInventoryFixture(database.runtime, source.scope);
+    const selected = await source.read();
+    const actual = reader === "canonical" ? selected.page.value[0].packages[0]
+      : reader === "source" ? (await inventorySelectionFixture(database.runtime, source.scope, {}, "packages")).raw.value[0].residual
+        : await selected.queries.packageDetail(selected.selection.id, selected.identity, value.id);
+    expect(actual).toMatchObject({ id: value.id, isBlocked: true, detailFreshness: { state: "missing" } });
+    expect(actual).not.toHaveProperty("identityDetailsCollected", true);
+    expect(actual).not.toHaveProperty("elementDetails");
+    expect(selected.page.identityCollection?.checkedPackages).toBe(0);
+  });
+
+  it("does not resurrect absent membership from a surviving verified control observation", async () => {
+    const source = provider();
+    await source.catalogPage([]);
+    await dataConnections(database.runtime).run(async client => {
+      await publishPackageReadback(source.scope, packageValue("absent", true), client,
+        await readPackageInventoryGeneration(source.scope, client), { kind: "block", isBlocked: true });
+    });
+    await reconcileInventoryFixture(database.runtime, source.scope);
+    expect((await source.read()).page.counts.total).toBe(0);
+    await expect(new LiveInventory(database.runtime).record(source.scope, unifiedAgentRecordId({ source: "graph_packages", packageId: "absent" })))
+      .rejects.toMatchObject({ code: "agent_not_found" });
+  });
+
+  it.each(["canonical", "source", "detail"].flatMap(reader =>
+    ["identity", "access"].map(evidence => ({ reader, evidence })) ))(
+    "preserves newer catalog $evidence evidence in selected $reader reads", async ({ reader, evidence }) => {
+      const source = provider(), summary = { ...packageValue("package"), version: "1",
+        lastModifiedDateTime: "2026-09-22T00:00:00Z", manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        availableTo: "some", deployedTo: "some" };
+      await source.catalogPage([summary]);
+      source.exact.set("package", { ...summary,
+        allowedUsersAndGroups: [{ resourceId: "old-user", resourceType: "user" }],
+        acquireUsersAndGroups: [{ resourceId: "old-group", resourceType: "group" }],
+        elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] });
+      await source.exactPage(["package"], true);
+      expect((await source.read()).page.identityCollection?.checkedPackages).toBe(1);
+      await source.catalogPage([{ ...summary, ...(evidence === "identity"
+        ? { elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
+          SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+        }) }] }] } : { allowedUsersAndGroups: [], acquireUsersAndGroups: [] }) }]);
+      const selected = await source.read();
+      const detail = await selected.queries.packageDetail(selected.selection.id, selected.identity, summary.id);
+      const value = reader === "canonical" ? selected.page.value[0].packages[0]
+        : reader === "source" ? (await inventorySelectionFixture(database.runtime, source.scope, {}, "packages")).raw.value[0].residual : detail;
+      if (evidence === "identity") {
+        expect(value).toMatchObject({ detailFreshness: { state: "invalidated" }, identityRevalidationRequired: true });
+        expect(value).not.toHaveProperty("identityDetailsCollected", true);
+        expect(selected.page.identityCollection?.checkedPackages).toBe(0);
+      } else {
+        expect(value).toMatchObject({ detailFreshness: { state: "fresh" } });
+        expect(detail).toMatchObject({ allowedUsersAndGroups: [], acquireUsersAndGroups: [] });
+        expect(selected.page.identityCollection?.checkedPackages).toBe(1);
+      }
+      expect(value).not.toHaveProperty("elementDetails");
+    });
 });

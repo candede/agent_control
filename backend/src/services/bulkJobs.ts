@@ -19,7 +19,7 @@ const reconciliationDeadlineMs = 30_000;
 const work = new Map<Promise<void>, { jobId: string; controller: AbortController; scope: DataScope }>();
 type BulkJobExecutionRepository = Pick<JobRepository,
   "get" | "waitForAuthorization" | "claim" | "pauseForAuthorization" | "beginItem" |
-  "withTargetLock" | "markSent" | "finishItem" | "pauseItemForAuthorization" | "release"
+  "withTargetLock" | "settleInventoryControls" | "markSent" | "finishItem" | "pauseItemForAuthorization" | "release"
 >;
 
 export function requireWorkerCapacity() {
@@ -130,6 +130,7 @@ export async function runBulkJob(
       };
       let sent = false;
       try {
+        await repository.settleInventoryControls(lease, item.id, signal, async () => { await authorizeJob(scope, job.capability); });
         await capabilities.observeOperation(job.capability, principal, () => repository.withTargetLock(lease, item, async () => {
           const readOptions = { correlationId: item.correlation_id!, signal };
           const before = await getPackageDetails(accessToken, item.target_id, readOptions);
@@ -227,46 +228,55 @@ export async function reconcileBulkJob(
   assertAccountSessionValidation(validation);
   if (!summary) throw new AppError(404, "not_found", "Job was not found.");
   if (summary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "Package reconciliation requires the original delegated authorization mode.");
-  const context = await repository.reconciliationContext(id, scope);
+  let context = await repository.reconciliationContext(id, scope);
   assertAccountSessionValidation(validation);
   if (!context) throw new AppError(404, "not_found", "Job was not found.");
   const errors: Array<{ id: string; message: string }> = [];
-  for (const item of context.items) {
-    requireProviderAdmissions();
-    assertAccountSessionValidation(validation);
-    try {
-      const token = await authorize(scope, "graph.package.read.delegated");
+  let attempted = 0, failed = 0;
+  while (context.items.length) {
+    const after = context.items.at(-1)!.ordinal;
+    const action = context.job.action, accessUpdate = context.job.access_update;
+    for (const item of context.items) {
+      attempted += 1;
+      requireProviderAdmissions();
       assertAccountSessionValidation(validation);
-      const signal = AbortSignal.timeout(reconciliationDeadlineMs);
-      await repository.withReconciliationLock(scope, item, async () => {
-        const action = context.job.action;
-        if (action === "reassign") throw new AppError(409, "reassign_verification_unavailable", "Reassign owner cannot be reconciled because Microsoft Graph does not expose owner state.");
-        const inventoryGeneration = await repository.inventoryGeneration(scope);
-        requireProviderAdmissions();
+      try {
+        const token = await authorize(scope, "graph.package.read.delegated");
         assertAccountSessionValidation(validation);
-        const details = await provider.getPackageDetails(token, item.target_id, { correlationId: item.correlation_id ?? randomUUID(), signal });
-        if (details.id !== item.target_id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
-        const observed = capturePackageMutationState(details, action);
-        const expected = expectedPackageMutationState(item.prestate, action, context.job.access_update ?? undefined);
-        requireProviderAdmissions();
-        assertAccountSessionValidation(validation);
-        await authorize(scope, "graph.package.read.delegated");
-        signal.throwIfAborted();
-        await commitAccountSessionValidation(validation, async () => {
-          signal.throwIfAborted();
+        const signal = AbortSignal.timeout(reconciliationDeadlineMs);
+        await repository.withReconciliationLock(scope, item, async () => {
+          if (action === "reassign") throw new AppError(409, "reassign_verification_unavailable", "Reassign owner cannot be reconciled because Microsoft Graph does not expose owner state.");
+          const inventoryGeneration = await repository.inventoryGeneration(scope);
           requireProviderAdmissions();
-          if (packageMutationStatesEqual(observed, expected)) {
-            await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.", { details, inventoryGeneration });
-          } else if (packageMutationStatesEqual(observed, item.prestate)) {
-            await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.", { details, inventoryGeneration });
-          } else {
-            await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.", { details, inventoryGeneration });
-          }
+          assertAccountSessionValidation(validation);
+          const details = await provider.getPackageDetails(token, item.target_id, { correlationId: item.correlation_id ?? randomUUID(), signal });
+          if (details.id !== item.target_id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
+          const observed = capturePackageMutationState(details, action);
+          const expected = expectedPackageMutationState(item.prestate, action, accessUpdate ?? undefined);
+          requireProviderAdmissions();
+          assertAccountSessionValidation(validation);
+          await authorize(scope, "graph.package.read.delegated");
+          signal.throwIfAborted();
+          await commitAccountSessionValidation(validation, async () => {
+            signal.throwIfAborted();
+            requireProviderAdmissions();
+            if (packageMutationStatesEqual(observed, expected)) {
+              await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.", { details, inventoryGeneration });
+            } else if (packageMutationStatesEqual(observed, item.prestate)) {
+              await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.", { details, inventoryGeneration });
+            } else {
+              await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.", { details, inventoryGeneration });
+            }
+          });
         });
-      });
-    } catch (error) {
-      errors.push({ id: item.target_id, message: "Reconciliation could not be completed; no provider state was published." });
+      } catch {
+        failed += 1;
+        if (errors.length < 20) errors.push({ id: item.target_id, message: "Reconciliation could not be completed; no provider state was published." });
+      }
     }
+    if (!context.hasMore) break;
+    context = await repository.reconciliationContext(id, scope, after);
+    if (!context) throw new AppError(404, "not_found", "Job was not found.");
   }
   requireProviderAdmissions();
   await authorize(scope, "graph.package.read.delegated");
@@ -275,7 +285,7 @@ export async function reconcileBulkJob(
   requireProviderAdmissions();
   assertAccountSessionValidation(validation);
   if (!current) throw new AppError(404, "not_found", "Job was not found.");
-  return { ...current, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
+  return { ...current, reconciliation: { attempted, failed, errors } };
 }
 
 async function releaseIfOwned(repository: BulkJobExecutionRepository, lease: Lease) {

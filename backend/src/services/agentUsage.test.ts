@@ -1,517 +1,277 @@
-import type pg from "pg";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  AgentUsageRepository, type AgentUsageSnapshot, type AuthorizedAgentUsageSource, type StoredAgentUsageAssociation,
-} from "../db/agentUsage.js";
-import * as inventoryRevision from "../db/unifiedInventoryRevision.js";
-import type { AgentUsageAssociationInput } from "../types/agentUsage.js";
-import type { AuditEvent } from "../types/audit.js";
-import type { ParsedOfficialUsageReport, PublishedOfficialUsage } from "../types/officialUsage.js";
-import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
-import { AgentUsageService, buildAgentUsageContext, buildAgentUsageProjection, combineAgentInventoryRevision } from "./agentUsage.js";
-import { agentUsageAssociationInput, agentUsageAssociationRemoval, agentUsageCandidateQuery } from "./agentUsageValidation.js";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { awaitUsageInventoryExpiry, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope } from "../db/agentUsageTestSupport.js";
+import type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { AuditLog } from "./auditLog.js";
+import { OfficialAgentUsage } from "./officialAgentUsage.js";
+import { officialAgentUsageMutation } from "./officialAgentUsageInput.js";
+import { parseRecordId } from "./agentUsageIdentity.js";
+import { LargeTenantUsersReports, reportQuery } from "./largeTenantUsersReports.js";
 import * as maintenance from "./maintenance.js";
-import { allowlistedPackage } from "./packageObservation.js";
 
-const scope = { tenantId: "tenant-a", principalId: "principal-a" };
-const firstId = "11111111-1111-4111-8111-111111111111";
-const secondId = "22222222-2222-4222-8222-222222222222";
-const setId = "33333333-3333-4333-8333-333333333333";
-const observedAt = "2026-09-18T00:00:00.000Z";
-const snapshotAt = "2026-09-19T00:00:00.000Z";
-const expiresAt = "2035-01-01T00:00:00.000Z";
-const observation = { id: firstId, snapshotId: firstId, observedAt, expiresAt, current: true as const };
-const reportBase = {
-  parserVersion: "test-parser", schemaVersion: "test-schema",
-  reportingPeriod: { startDate: "2026-09-15", endDate: "2026-09-18", days: 4, provenance: "activity_range" as const },
-  sourceAsOfProvenance: "absent" as const, sourceFreshness: "unknown" as const, warnings: ["Observed activity is not a report window."],
-};
+let fixture: Awaited<ReturnType<typeof testDatabase>>;
+let reports: LargeTenantUsersReports, usage: OfficialAgentUsage;
+beforeAll(async () => {
+  fixture = await testDatabase();
+  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-selected-agent-usage-secret", 35);
+  usage = new OfficialAgentUsage(reports);
+});
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+afterAll(async () => { await fixture?.close(); });
 
-afterEach(() => vi.restoreAllMocks());
+async function read(scope: AgentUsageScope, ids: readonly string[]) {
+  const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+  return usage.summaries(selection.id, identity, ids);
+}
+async function inventory(scope: AgentUsageScope, ids: readonly string[]) {
+  return reports.history.connections.selectedRead(async client => usage.inventorySummaries(client, await reports.currentInventoryData(client, scope), ids));
+}
+async function mutate(scope: AgentUsageScope, recordId: string, input: CandidateAgentUsageMutation) {
+  return usage.mutate(await usageIdentity(fixture.runtime, scope), recordId, input, usageAudit(scope).actor);
+}
+async function count(scope: AgentUsageScope) {
+  return (await fixture.runtime.query("SELECT count(*)::int AS n FROM agent_usage_associations WHERE tenant_id=$1", [scope.tenantId])).rows[0].n;
+}
 
-describe("report-backed inventory usage", () => {
-  beforeEach(() => {
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(snapshotAt));
+describe("native report-backed exact inventory usage", () => {
+  it.each(["name", "guid-fragment", "prefix", "case", "manifest", "app", "asset"] as const)("does not infer an exact package identity from %s", async kind => {
+    const scope = newUsageScope(), guid = "11111111-1111-4111-8111-111111111111", packageId = `T_${guid}`;
+    const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: [packageId],
+      packageFields: { manifestId: guid, appId: guid, assetId: guid } }]);
+    const alias = kind === "name" ? `Inventory ${packageId}` : kind === "prefix" ? `P_${guid}` : kind === "case" ? packageId.toLowerCase() : guid;
+    await publishUsageReports(fixture.runtime, scope, 10, (_kind, content) => content.replaceAll("Report-A", alias));
+    expect((await read(scope, [records[0].id]))[0]).toMatchObject({ status: "unlinked", responses: null, activeUsers: null, associationCount: 0 });
   });
 
-  it("returns explicit unavailable nulls for every record without an accepted report", () => {
-    const fixture = data();
-    fixture.snapshot.published = { ...fixture.snapshot.published, activeSet: null, reports: {}, retainedCompleteSets: 0, hasImportHistory: false };
-    const result = project(fixture);
-    expect(result.context.availability).toBe("never_imported");
-    for (const summary of result.summaries.values()) expect(summary).toEqual({
-      status: "unavailable", reportSetId: null, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
-    });
+  it.each(["missing", "snapshot", "expired"] as const)("requires current authorized source membership, not %s evidence", async mismatch => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }],
+      mismatch === "expired" ? { expiresAt: new Date(Date.now() + 3000) } : {});
+    await publishUsageReports(fixture.runtime, scope);
+    if (mismatch === "missing") await saveUsageInventory(fixture.runtime, scope, []);
+    else if (mismatch === "snapshot") await fixture.operator.query(`UPDATE data_scope_epochs SET epoch=epoch+1
+      WHERE tenant_id=$1 AND source='inventory_packages'`, [scope.tenantId]);
+    else await awaitUsageInventoryExpiry(fixture.runtime, scope);
+    expect((await inventory(scope, [records[0].id]))[0]).toMatchObject({ status: "unlinked", responses: null });
+    await expect(read(scope, [records[0].id])).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
-  it("matches full report/package IDs without names or manual writes and deduplicates merged-agent users", () => {
-    const fixture = automaticData();
-    const before = structuredClone(fixture);
-    fixture.sources.push(fixture.sources[0]);
-    const summary = project(fixture).summaries.get(fixture.records[0].id)!;
-    expect(summary).toMatchObject({
-      status: "linked", reportSetId: setId, responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z",
-    });
-    expect(summary.associations).toEqual(fixture.records[0].packages.map((value, index) => ({
-      reportAgentId: value.id, reportAgentName: index ? "Report B" : "Report A",
-      target: { source: "graph_packages", packageId: value.id }, basis: "exact_package_id",
-    })));
-    expect(fixture.records).toEqual(before.records);
-    expect(fixture.snapshot).toEqual(before.snapshot);
-    expect(summary.associations.every(value => !("reviewedAt" in value))).toBe(true);
-  });
-
-  it.each(["name", "guid-fragment", "prefix", "case", "manifest", "app", "asset"] as const)(
-    "does not infer a package identity from a matching %s",
-    kind => {
-      const fixture = automaticData();
-      const value = fixture.records[0].packages[0];
-      value.manifestId = value.appId = value.assetId = firstId;
-      const row = fixture.snapshot.published.reports.agents!.rows[0];
-      row.agentName = fixture.records[0].displayName;
-      row.agentId = kind === "name" ? value.displayName
-        : kind === "prefix" ? value.id.replace(/^T_/, "P_")
-          : kind === "case" ? value.id.toLowerCase() : firstId;
-      fixture.snapshot.published.reports.agents!.rows = [row];
-      expect(project(fixture).summaries.get(fixture.records[0].id)).toEqual({
-        status: "unlinked", reportSetId: setId, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
-      });
-    },
-  );
-
-  it.each(["missing", "snapshot", "expired"] as const)("requires a current authorized package membership, not %s evidence", mismatch => {
-    const fixture = automaticData();
-    fixture.snapshot.published.reports.agents!.rows = fixture.snapshot.published.reports.agents!.rows.slice(0, 1);
-    if (mismatch === "missing") fixture.sources = [];
-    if (mismatch === "snapshot") fixture.sources[0].package_snapshot_id = secondId;
-    if (mismatch === "expired") fixture.sources[0].expires_at = new Date("2026-09-01");
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      status: "unlinked", responses: null, activeUsers: null, associations: [],
-    });
-  });
-
-  it("preserves automatic explicit zero and leaves absent companion evidence unknown", () => {
-    const fixture = automaticData();
-    const row = fixture.snapshot.published.reports.agents!.rows[0];
-    row.responsesSentToUsers = 0;
-    delete row.lastActivityDateUtc;
-    fixture.snapshot.published.reports.agents!.rows = [row];
-    fixture.snapshot.published.reports.userAgents!.rows = [{
-      agentId: row.agentId, agentName: row.agentName, creatorType: row.creatorType, username: "zero", responsesSentToUsers: 0,
-    }];
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      status: "linked", responses: 0, activeUsers: 0, lastActivityDateUtc: null,
-    });
-    delete fixture.snapshot.published.reports.userAgents;
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      status: "linked", responses: 0, activeUsers: null, lastActivityDateUtc: null,
-    });
-  });
-
-  it("recomputes matches for a new selected report without summing overlapping snapshot totals", () => {
-    const fixture = automaticData();
-    const row = fixture.snapshot.published.reports.agents!.rows[0];
-    row.responsesSentToUsers = 179;
-    fixture.snapshot.published.reports.agents!.rows = [row];
-    const previous = project(fixture);
-    expect(previous.summaries.get(fixture.records[0].id)?.responses).toBe(179);
-    fixture.snapshot.published.activeSet!.id = secondId;
-    fixture.snapshot.published.activeRevision += 1;
-    row.responsesSentToUsers = 181;
-    const next = project(fixture);
-    expect(next.summaries.get(fixture.records[0].id)).toMatchObject({
-      reportSetId: secondId, status: "linked", responses: 181,
-      associations: [{ basis: "exact_package_id" }],
-    });
-    expect(next.context.revision).not.toBe(previous.context.revision);
-    expect(fixture.snapshot.associations).toEqual([]);
-  });
-
-  it.each([true, false])("preserves a reviewed override without automatic reassignment (target authorized: %s)", authorized => {
-    const fixture = automaticData();
-    fixture.snapshot.associations = [{
-      ...fixture.sources[2], report_agent_id: fixture.records[0].packages[0].id, reviewed_at: new Date(observedAt),
-    }];
-    if (!authorized) fixture.sources = fixture.sources.slice(0, 2);
-    const result = project(fixture);
-    expect(result.summaries.get(fixture.records[0].id)).toMatchObject({ responses: 20, associations: [{ basis: "exact_package_id" }] });
-    expect(result.summaries.get(fixture.records[1].id)).toMatchObject(authorized
-      ? { responses: 10, associations: [{ basis: "admin_reviewed" }] }
-      : { status: "unlinked", responses: null, associations: [] });
-  });
-
-  it("fails explicitly rather than choosing between conflicting canonical owners of one package", () => {
-    const fixture = automaticData();
-    const packageId = fixture.records[0].packages[0].id;
-    fixture.records[1].packages.push(fixture.records[0].packages[0]);
-    fixture.records[1].observations.packageSnapshots[packageId] = fixture.records[0].observations.packageSnapshots[packageId];
-    fixture.sources.push({ ...fixture.sources[0], agent_id: secondId });
-    expect(() => project(fixture)).toThrow("belongs to multiple agents");
-    fixture.sources.reverse();
-    expect(() => project(fixture)).toThrow("belongs to multiple agents");
-  });
-
-  it("deduplicates report IDs and positive-response user identities across a merged logical agent", () => {
-    const fixture = data();
-    fixture.snapshot.associations.push(fixture.snapshot.associations[0]);
-    const before = structuredClone(fixture.records);
-    const result = project(fixture).summaries.get(fixture.records[0].id)!;
-    expect(result).toMatchObject({
-      status: "linked", reportSetId: setId, responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z",
-    });
-    expect(result.associations.map(value => value.reportAgentId)).toEqual(["Report-A", "Report-B"]);
-    expect(result.associations.every(value => value.basis === "admin_reviewed")).toBe(true);
-    expect(fixture.records).toEqual(before);
-  });
-
-  it("uses Agents response/activity authority rather than Users or companion response totals", () => {
-    const fixture = data();
-    fixture.snapshot.published.reports.userAgents!.rows[0].responsesSentToUsers = 50_000;
-    fixture.snapshot.published.reports.userAgents!.rows[0].lastActivityDateUtc = "2030-01-01T00:00:00.000Z";
-    fixture.snapshot.published.reports.users!.rows[0].agentResponsesReceived = 70_000;
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z",
-    });
-  });
-
-  it.each(["one", "all"])("keeps missing %s companion evidence null rather than using category counts or zero", missing => {
-    const fixture = data();
-    if (missing === "all") delete fixture.snapshot.published.reports.userAgents;
-    else fixture.snapshot.published.reports.userAgents!.rows = fixture.snapshot.published.reports.userAgents!.rows.filter(row => row.agentId !== "Report-B");
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({ status: "linked", responses: 30, activeUsers: null });
-  });
-
-  it("preserves explicit zero while ignoring bridge-only reported identities", () => {
-    const fixture = data();
-    fixture.snapshot.associations = fixture.snapshot.associations.slice(0, 1);
-    fixture.snapshot.published.reports.agents!.rows[0].responsesSentToUsers = 0;
-    delete fixture.snapshot.published.reports.agents!.rows[0].lastActivityDateUtc;
-    fixture.snapshot.published.reports.userAgents!.rows = [
-      { agentId: "Report-A", agentName: "A", creatorType: "Your org", username: "zero", responsesSentToUsers: 0 },
-      { agentId: "bridge-only", agentName: "A", creatorType: "Your org", username: "other", responsesSentToUsers: 99 },
-    ];
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      status: "linked", responses: 0, activeUsers: 0, lastActivityDateUtc: null,
-    });
-  });
-
-  it("resolves tenant associations through another viewer's exact source, never their private canonical UUID", () => {
-    const fixture = data();
-    const records = [structuredClone(fixture.records[0])];
-    records[0].id = `agent:${setId}`;
-    const sources = fixture.sources.map(source => ({ ...source, agent_id: setId }));
-    const otherViewer = { ...scope, principalId: "different-principal" };
-    expect(buildAgentUsageProjection(otherViewer, records, sources, fixture.snapshot).summaries.get(records[0].id))
-      .toMatchObject({ status: "linked", responses: 30 });
-    expect(buildAgentUsageProjection(otherViewer, records, [], fixture.snapshot).summaries.get(records[0].id))
-      .toMatchObject({ status: "unlinked", responses: null });
-  });
-
-  it.each(["package-case", "source", "snapshot", "expired"])("does not resolve a %s mismatch", mismatch => {
-    const fixture = data();
-    fixture.snapshot.associations = fixture.snapshot.associations.slice(0, 1);
-    if (mismatch === "package-case") fixture.snapshot.associations[0].normalized_native_id = "package-a";
-    if (mismatch === "source") fixture.snapshot.associations[0].source = "power_platform";
-    if (mismatch === "snapshot") fixture.sources[0].package_snapshot_id = secondId;
-    if (mismatch === "expired") fixture.sources[0].expires_at = new Date("2026-09-01");
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({ status: "unlinked", responses: null });
-  });
-
-  it("retains stale activity-range and unknown source-freshness lineage", () => {
-    const fixture = data();
-    fixture.snapshot.now = new Date("2027-01-01T00:00:00Z");
-    const context = project(fixture).context;
-    expect(context).toMatchObject({ availability: "stale", reportSet: { reportingPeriod: { provenance: "activity_range" } } });
-    expect(context.lineages).toHaveLength(3);
-    expect(context.lineages.every(value => value.sourceFreshness === "unknown" && value.sourceAsOfProvenance === "absent")).toBe(true);
-    expect(context.lineages[0].warnings).toEqual(reportBase.warnings);
-  });
-
-  it("fails explicitly on inconsistent association evidence or inexact response totals", () => {
-    const fixture = data();
-    fixture.snapshot.published.reports.agents!.rows = [];
-    expect(() => project(fixture)).toThrow("immutable Agents");
-    const overflow = data();
-    overflow.snapshot.published.reports.agents!.rows[0].responsesSentToUsers = Number.MAX_SAFE_INTEGER;
-    expect(() => project(overflow)).toThrow("numeric range");
-  });
-
-  it("fences active set/content, freshness changes and association ABA cycles in deterministic revisions", () => {
-    const fixture = data();
-    const context = buildAgentUsageContext(scope, fixture.snapshot);
-    expect(buildAgentUsageContext({ ...scope, principalId: "other" }, fixture.snapshot).revision).toBe(context.revision);
-    expect(buildAgentUsageContext({ ...scope, tenantId: "other" }, fixture.snapshot).revision).not.toBe(context.revision);
-    for (const change of [
-      (value: AgentUsageSnapshot) => { value.associationRevision = "2"; },
-      (value: AgentUsageSnapshot) => { value.published.activeRevision += 1; },
-      (value: AgentUsageSnapshot) => { value.published.activeSet!.id = secondId; },
-      (value: AgentUsageSnapshot) => { value.published.reports.agents!.lineage.contentHash = "c".repeat(64); },
-      (value: AgentUsageSnapshot) => { value.now = new Date("2030-01-01"); },
-      (value: AgentUsageSnapshot) => { value.expiresAt = new Date("2035-01-01"); },
-    ]) {
-      const changed = structuredClone(fixture.snapshot);
-      change(changed);
-      expect(buildAgentUsageContext(scope, changed).revision).not.toBe(context.revision);
-    }
-    const combined = combineAgentInventoryRevision("a".repeat(64), context.revision);
-    expect(combined).toMatch(/^[a-f0-9]{64}$/);
-    expect(combineAgentInventoryRevision("a".repeat(64), context.revision)).toBe(combined);
-    expect(combineAgentInventoryRevision(context.revision, "a".repeat(64))).not.toBe(combined);
-  });
-
-  it("takes each source/report lock once in the caller's existing transaction", async () => {
-    const fixture = data();
-    const query = vi.fn().mockResolvedValue({ rows: [] });
-    const client = { query } as unknown as pg.PoolClient;
-    vi.spyOn(AgentUsageRepository.prototype, "readSources").mockResolvedValue(fixture.sources);
-    vi.spyOn(AgentUsageRepository.prototype, "read").mockResolvedValue(fixture.snapshot);
-    const service = new AgentUsageService({ connect: vi.fn().mockRejectedValue(new Error("Must reuse caller")) } as unknown as pg.Pool);
-    await service.project(scope, fixture.records, client);
-    expect(query.mock.calls.map(call => call[1])).toEqual([
-      ["package-refresh:tenant-a:principal-a"], ["power-platform:tenant-a:principal-a"], ["official-usage:tenant-a"],
+  it.each([true, false])("preserves reviewed overrides without automatic reassignment (authorized target: %s)", async authorized => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }, { packages: ["Package-C"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    await mutate(scope, records[1].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Package-C" }));
+    if (!authorized) await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    expect(await inventory(scope, records.map(record => record.id))).toMatchObject([
+      { responses: 20, associationCount: 1 }, authorized ? { responses: 10, associationCount: 1 } : { status: "unlinked", responses: null },
     ]);
+    expect(await count(scope)).toBe(1);
   });
 
-  it("does not turn database errors into a successful empty projection or revision", async () => {
-    const error = new Error("Database unavailable");
-    const service = new AgentUsageService({ connect: vi.fn().mockRejectedValue(error) } as unknown as pg.Pool);
-    await expect(service.project(scope, data().records)).rejects.toBe(error);
-    await expect(service.revision(scope)).rejects.toBe(error);
+  it("rejects conflicting persisted canonical owners and duplicate exact read IDs", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    const target = parseRecordId(records[1].id);
+    if (target.source !== "canonical") throw new Error("Expected a canonical fixture.");
+    await expect(fixture.runtime.query(`INSERT INTO unified_agent_memberships(generation_id,scope_id,tenant_id,identity,schema_version,
+      source_scope_id,source_identity,source_generation_id,evidence)
+      SELECT generation_id,scope_id,tenant_id,$2,1,source_scope_id,source_identity,source_generation_id,evidence
+      FROM unified_agent_memberships WHERE tenant_id=$1 AND source_identity='Package-A' LIMIT 1`,
+    [scope.tenantId, target.agentId])).rejects.toMatchObject({ code: "P0001", message: "data_writer_fenced" });
+    await expect(read(scope, [records[0].id, records[0].id])).rejects.toMatchObject({ code: "data_exact_ids_limit" });
   });
 
-  it("rejects publication if a locked report expires after its rows were read", async () => {
-    const fixture = data();
-    fixture.snapshot.expiresAt = new Date(Date.now() + 1_000);
-    const client = { query: vi.fn().mockResolvedValue({ rows: [] }) } as unknown as pg.PoolClient;
-    vi.spyOn(AgentUsageRepository.prototype, "readSources").mockResolvedValue(fixture.sources);
-    vi.spyOn(AgentUsageRepository.prototype, "read").mockResolvedValue(fixture.snapshot);
-    vi.spyOn(Date, "now").mockReturnValue(fixture.snapshot.expiresAt.getTime() + 1);
-    const service = new AgentUsageService({} as pg.Pool);
-    await expect(service.project(scope, fixture.records, client)).rejects.toMatchObject({ code: "agent_usage_changed" });
-    await expect(service.revision(scope, client)).rejects.toMatchObject({ code: "agent_usage_changed" });
+  it("deduplicates exact report IDs and case-sensitive positive users across merged memberships", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Report-A" }));
+    expect((await read(scope, [records[0].id]))[0]).toMatchObject({ responses: 30, activeUsers: 3, associationCount: 2 });
+  });
+
+  it("uses Agents response/activity authority rather than Users and bridge response totals", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    await publishUsageReports(fixture.runtime, scope, 10, (kind, content) => kind === "userAgents"
+      ? content.replace("CaseUser,4,2026-09-16", "CaseUser,50000,2030-01-01")
+      : kind === "users" ? content.replace("CaseUser,One,1,4", "CaseUser,One,1,70000") : content);
+    expect((await read(scope, [records[0].id]))[0]).toMatchObject({ responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z" });
+  });
+
+  it.each(["one", "all"])("keeps missing %s companion evidence unknown rather than substituting license-category counts", async missing => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    await publishUsageReports(fixture.runtime, scope, 10, (kind, content) => kind !== "userAgents" ? content
+      : content.split("\n").filter((row, index) => index === 0 || missing !== "all" && !row.startsWith("Report-B,")).join("\n"));
+    expect((await read(scope, [records[0].id]))[0]).toMatchObject({ status: "linked", responses: 30, activeUsers: null });
+  });
+
+  it("preserves explicit zero and ignores bridge-only identities", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-Zero", "Bridge-Only"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    expect((await read(scope, [records[0].id]))[0]).toMatchObject({ status: "linked", responses: 0, activeUsers: 0, lastActivityDateUtc: null, associationCount: 1 });
+  });
+
+  it.each(["package-case", "source", "snapshot", "expired"] as const)("does not resolve a reviewed %s mismatch", async mismatch => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    await publishUsageReports(fixture.runtime, scope);
+    await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const viewer = { ...scope, principalId: `viewer-${mismatch}` };
+    const viewed = await saveUsageInventory(fixture.runtime, viewer, [mismatch === "source"
+      ? { packages: [], native: { nativeId: "Package-A", environmentId: null } } : { packages: [mismatch === "package-case" ? "package-a" : "Package-A"] }],
+    mismatch === "expired" ? { expiresAt: new Date(Date.now() + 3000) } : {});
+    if (mismatch === "snapshot") await fixture.operator.query(`UPDATE data_scope_epochs SET epoch=epoch+1
+      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages'`, [scope.tenantId, viewer.principalId]);
+    if (mismatch === "expired") await awaitUsageInventoryExpiry(fixture.runtime, viewer);
+    expect((await inventory(viewer, viewed.map(record => record.id)))[0]).toMatchObject({ status: "unlinked", responses: null });
+  });
+
+  it("retains stale activity-range provenance and unknown freshness without treating imports as source metadata", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    const date = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+    await publishUsageReports(fixture.runtime, scope, 10, (_kind, content) => content.replace(/2026-09-\d{2}/g, date));
+    const [summary] = await read(scope, [records[0].id]);
+    expect(summary.context.reports).toMatchObject({ availability: "stale", reportingPeriod: { provenance: "activity_range" } });
+    expect(summary.context.reports.lineages).toHaveLength(3);
+    expect(summary.context.reports.lineages.every(row => row.sourceFreshness === "unknown" && row.sourceAsOfProvenance === "absent")).toBe(true);
+  });
+
+  it("rejects inexact totals rather than silently rounding a merged logical agent", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    await expect((async () => {
+      await publishUsageReports(fixture.runtime, scope, Number.MAX_SAFE_INTEGER);
+      await read(scope, records.map(record => record.id));
+    })()).rejects.toMatchObject({ code: "numeric_overflow" });
+  });
+
+  it("fences association ABA cycles and keeps deterministic ordered inventory revision composition", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    await publishUsageReports(fixture.runtime, scope);
+    const before = await usageIntent(fixture.runtime, scope);
+    await mutate(scope, records[0].id, before);
+    const after = await usageIntent(fixture.runtime, scope), { target: _target, ...remove } = after;
+    await mutate(scope, records[0].id, remove);
+    const restored = await usageIntent(fixture.runtime, scope);
+    expect(restored.usageRevision).not.toBe(before.usageRevision);
+    expect(restored.usageRevision).not.toBe(after.usageRevision);
+    expect(restored.inventoryRevision).toBe(before.inventoryRevision);
+  });
+
+  it("does not turn read database failures into an empty successful summary", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope), identity = await usageIdentity(fixture.runtime, scope);
+    const selection = await reports.capture(identity, "delegated", "official_agents"), error = new Error("Database unavailable");
+    vi.spyOn(reports.history.connections, "selectedRead").mockRejectedValue(error);
+    await expect(usage.summaries(selection.id, identity, [records[0].id])).rejects.toBe(error);
+  });
+
+  it("revalidates selection expiry after rows are read without replaying the read callback", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    const accepted = await publishUsageReports(fixture.runtime, scope);
+    await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()+interval '1 second' WHERE id=$1", [accepted.setId]);
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const callback = vi.fn(async (client: import("pg").PoolClient) => {
+      await client.query("SELECT pg_sleep(1.05)");
+      return records[0].id;
+    });
+    await expect(reports.read(selection.id, identity, callback)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect(callback).toHaveBeenCalledOnce();
   });
 });
 
-describe("reviewed usage mutation publication", () => {
-  beforeEach(() => {
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(snapshotAt));
-    vi.spyOn(maintenance, "requireAdmissions").mockImplementation(() => undefined);
+describe("native reviewed mutation publication", () => {
+  it.each(["attach", "remove"] as const)("commits %s with the same valid report and its durable success receipt", async action => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    await publishUsageReports(fixture.runtime, scope);
+    if (action === "remove") await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const input = await usageIntent(fixture.runtime, scope), { target: _target, ...removal } = input;
+    const result = await mutate(scope, records[0].id, action === "remove" ? removal : input);
+    expect(result.reportSetId).toBe(input.reportSetId);
+    expect(result.usageRevision).not.toBe(input.usageRevision);
+    expect(await count(scope)).toBe(action === "attach" ? 1 : 0);
+    expect((await new AuditLog(scope, fixture.runtime).listEvents({
+      action: action === "attach" ? "associate-agent-usage" : "remove-agent-usage-association",
+    })).map(row => row.status)).toEqual(["succeeded"]);
   });
 
-  it.each(["attach", "remove"] as const)("rolls back %s when the report disappears from the expiry-aware reread", async action => {
-    const fixture = mutation(action);
-    fixture.read.mockReset().mockResolvedValueOnce(fixture.snapshot).mockResolvedValueOnce({
-      ...fixture.updated,
-      published: { ...fixture.updated.published, activeSet: null, reports: {}, activeSelectionIncomplete: true },
-      associations: [], now: new Date(fixture.snapshot.expiresAt!), expiresAt: null,
+  it.each([["attach", "before"], ["remove", "before"], ["attach", "after"], ["remove", "after"]] as const)(
+    "rolls back %s when its report expires %s success-audit persistence", async (action, moment) => {
+      const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+      await publishUsageReports(fixture.runtime, scope);
+      if (action === "remove") await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+      const input = await usageIntent(fixture.runtime, scope), { target: _target, ...removal } = input, complete = AuditLog.prototype.completeEvent;
+      const expire = () => fixture.operator.query("UPDATE official_usage_artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND kind='agents'", [scope.tenantId]);
+      vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
+        if (update.status === "succeeded" && moment === "before") await expire();
+        const result = await complete.call(this, id, update);
+        if (update.status === "succeeded" && moment === "after") await expire();
+        return result;
+      });
+      await expect(mutate(scope, records[0].id, action === "remove" ? removal : input)).rejects.toMatchObject({ code: "selection_invalidated" });
+      expect(await count(scope)).toBe(action === "attach" ? 0 : 1);
+      expect((await new AuditLog(scope, fixture.runtime).listEvents({
+        action: action === "attach" ? "associate-agent-usage" : "remove-agent-usage-association",
+      })).map(row => row.status)).toEqual(["failed"]);
     });
 
-    await expect(fixture.run()).rejects.toMatchObject({ code: "agent_usage_changed" });
-    expect(fixture.query).toHaveBeenCalledWith("ROLLBACK");
-    expect(fixture.query).not.toHaveBeenCalledWith("COMMIT");
-    expect(fixture.complete).toHaveBeenCalledExactlyOnceWith(setId, { status: "failed", errorCode: "agent_usage_changed" });
-    expect(fixture.release).toHaveBeenCalledOnce();
-  });
-
-  it.each(["attach", "remove"] as const)("rolls back %s and its success receipt if expiry passes during audit persistence", async action => {
-    const fixture = mutation(action);
-    fixture.complete.mockImplementation(async (_id, update) => {
-      if (update.status === "succeeded") vi.mocked(Date.now).mockReturnValue(fixture.snapshot.expiresAt!.getTime());
-      return { ...fixture.event, ...update };
-    });
-
-    await expect(fixture.run()).rejects.toMatchObject({ code: "agent_usage_changed" });
-    expect(fixture.query).toHaveBeenCalledWith("ROLLBACK");
-    expect(fixture.query).not.toHaveBeenCalledWith("COMMIT");
-    expect(fixture.complete).toHaveBeenLastCalledWith(setId, { status: "failed", errorCode: "agent_usage_changed" });
-  });
-
-  it.each(["attach", "remove"] as const)("commits %s with the same valid report and its success receipt", async action => {
-    const fixture = mutation(action);
-    await expect(fixture.run()).resolves.toMatchObject({
-      context: { reportSet: { id: setId }, revision: buildAgentUsageContext(scope, fixture.updated).revision },
-    });
-    expect(fixture.query).toHaveBeenCalledWith("COMMIT");
-    expect(fixture.query).not.toHaveBeenCalledWith("ROLLBACK");
-    expect(fixture.complete).toHaveBeenCalledExactlyOnceWith(setId, expect.objectContaining({ status: "succeeded" }));
-    expect(fixture.release).toHaveBeenCalledOnce();
+  it("keeps maintenance admission and actor ownership checks ahead of any audit or mutation", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    await publishUsageReports(fixture.runtime, scope);
+    const input = await usageIntent(fixture.runtime, scope), identity = await usageIdentity(fixture.runtime, scope);
+    await expect(usage.mutate(identity, records[0].id, input, usageAudit({ ...scope, principalId: "other" }).actor)).rejects.toMatchObject({ status: 401 });
+    const error = new Error("Maintenance fixture");
+    vi.spyOn(maintenance, "requireAdmissions").mockImplementation(() => { throw error; });
+    await expect(mutate(scope, records[0].id, input)).rejects.toBe(error);
+    expect(await new AuditLog(scope, fixture.runtime).listEvents()).toEqual([]);
   });
 });
 
-describe("strict usage association contracts", () => {
-  const input = (): AgentUsageAssociationInput => ({
-    reportSetId: setId, reportAgentId: "Report-A", target: { source: "graph_packages", packageId: "Package-A" },
-    expectedInventoryRevision: "a".repeat(64), expectedUsageRevision: "b".repeat(64), confirmed: true,
-  });
+describe("strict native association contracts", () => {
+  const input = (): CandidateAgentUsageMutation => ({ selectionId: randomUUID(), reportSetId: randomUUID(),
+    usageRevision: "a".repeat(64), inventoryRevision: "b".repeat(64), reportAgentId: "Report-A",
+    target: { source: "graph_packages", packageId: "Package-A" }, confirmed: true });
 
   it("accepts only exact source-qualified targets and explicit confirmation", () => {
-    expect(agentUsageAssociationInput(input())).toEqual(input());
-    expect(agentUsageAssociationInput({ ...input(), target: { source: "power_platform", nativeId: "Opaque-ID", environmentId: null } }).target)
+    const value = input();
+    expect(officialAgentUsageMutation(value)).toEqual(value);
+    expect(officialAgentUsageMutation({ ...value, target: { source: "power_platform", nativeId: "Opaque-ID", environmentId: null } }).target)
       .toEqual({ source: "power_platform", nativeId: "Opaque-ID", environmentId: null });
-    const { target: _target, ...removal } = input();
-    expect(agentUsageAssociationRemoval(removal)).toEqual(removal);
-    expect(agentUsageCandidateQuery({ search: " Agent ", limit: "250", offset: "100000" })).toEqual({ search: "Agent", limit: 250, offset: 100000 });
+    const { target: _target, ...remove } = value;
+    expect(officialAgentUsageMutation(remove)).toEqual(remove);
+    expect(reportQuery("official_agents", { search: " Agent " }).search).toBe("agent");
   });
 
-  it.each(["Agent-\u{1f916}", "Agent-\ufffd", "Élan-代理"])("preserves well-formed Unicode text %j exactly", text => {
-    const graph = { ...input(), reportAgentId: text, target: { source: "graph_packages", packageId: text } };
-    const native = { ...input(), reportAgentId: text, target: { source: "power_platform", nativeId: text, environmentId: text } };
-    expect(agentUsageAssociationInput(graph)).toEqual(graph);
-    expect(agentUsageAssociationInput(native)).toEqual(native);
-    const { target: _target, ...removal } = graph;
-    expect(agentUsageAssociationRemoval(removal)).toEqual(removal);
-    expect(agentUsageCandidateQuery({ search: text })).toEqual({ search: text, offset: 0, limit: 50 });
+  it.each(["Agent-\u{1f916}", "Agent-\ufffd", "Élan-代理"])("preserves well-formed exact Unicode identifiers %j", text => {
+    for (const target of [{ source: "graph_packages" as const, packageId: text },
+      { source: "power_platform" as const, nativeId: text, environmentId: text }]) {
+      const value = { ...input(), reportAgentId: text, target };
+      expect(officialAgentUsageMutation(value)).toEqual(value);
+      expect(parseRecordId(unifiedAgentRecordId(target))).toEqual(target);
+    }
+    expect(reportQuery("official_agents", { search: text }).search).toBe(text.normalize("NFKC").toLowerCase());
   });
 
-  it.each(["\ud800", "\udfff", "\udfff\ud800", "\u0080", "\u0085", "\u009f"])(
-    "rejects malformed Unicode and control characters %j in every text field",
-    character => {
-      const text = `Agent-${character}-ID`;
-      const error = expect.objectContaining({ status: 400, code: "invalid_agent_usage_input" });
-      for (const changes of [
-        { reportAgentId: text },
-        { target: { source: "graph_packages", packageId: text } },
-        { target: { source: "power_platform", nativeId: text, environmentId: null } },
-        { target: { source: "power_platform", nativeId: "Bot-A", environmentId: text } },
-      ]) expect(() => agentUsageAssociationInput({ ...input(), ...changes })).toThrowError(error);
-      const { target: _target, ...removal } = input();
-      expect(() => agentUsageAssociationRemoval({ ...removal, reportAgentId: text })).toThrowError(error);
-      expect(() => agentUsageCandidateQuery({ search: text })).toThrowError(error);
-    },
-  );
+  it.each(["\ud800", "\udfff", "\udfff\ud800", "\u0080", "\u0085", "\u009f"])("rejects malformed Unicode and controls %j", character => {
+    const text = `Agent-${character}-ID`;
+    for (const changes of [{ reportAgentId: text }, { target: { source: "graph_packages", packageId: text } },
+      { target: { source: "power_platform", nativeId: text, environmentId: null } },
+      { target: { source: "power_platform", nativeId: "Bot-A", environmentId: text } }]) {
+      expect(() => officialAgentUsageMutation({ ...input(), ...changes })).toThrow();
+    }
+    expect(() => reportQuery("official_agents", { search: text })).toThrow();
+    expect(() => parseRecordId(`graph:${text}`)).toThrow();
+  });
 
-  it.each([
-    null, [], {}, { confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { confirmed: undefined },
-    { reportSetId: "not-a-uuid" }, { reportAgentId: "" }, { reportAgentId: "a\nb" }, { reportAgentId: "a".repeat(513) },
-    { expectedInventoryRevision: "old" }, { expectedUsageRevision: "g".repeat(64) }, { unexpected: true },
-    { target: { source: "canonical", agentId: firstId } }, { target: { source: "graph_packages", packageId: "Package-A", appId: "forged" } },
+  it.each([null, [], {}, { confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { confirmed: undefined },
+    { selectionId: "not-a-uuid" }, { reportSetId: "not-a-uuid" }, { reportAgentId: "" }, { reportAgentId: "a\nb" }, { reportAgentId: "a".repeat(513) },
+    { inventoryRevision: "old" }, { usageRevision: "g".repeat(64) }, { unexpected: true }, { reports: {} }, { target: null },
+    { target: { source: "canonical", agentId: randomUUID() } }, { target: { source: "graph_packages", packageId: "Package-A", appId: "forged" } },
     { target: { source: "graph_packages", packageId: "" } }, { target: { source: "graph_packages", packageId: " leading-space" } },
     { target: { source: "power_platform", nativeId: "bot" } }, { target: { source: "power_platform", nativeId: "bot", environmentId: "" } },
     { target: { source: "power_platform", nativeId: "bot", environmentId: null, packageId: "smuggled" } },
-  ])("rejects malformed or extended input %j", value => {
-    const candidate = value === null || Array.isArray(value) || value && Object.keys(value).length === 0 ? value : { ...input(), ...value };
-    expect(() => agentUsageAssociationInput(candidate)).toThrow();
+  ])("rejects malformed or extended inputs %j", value => {
+    const candidate = value === null || Array.isArray(value) || !Object.keys(value).length ? value : { ...input(), ...value };
+    expect(() => officialAgentUsageMutation(candidate)).toThrow();
   });
 
-  it("does not accept a target or other extension on removal", () => {
-    expect(() => agentUsageAssociationRemoval(input())).toThrow();
-  });
-
-  it.each([
-    { limit: "0" }, { limit: "251" }, { limit: "-1" }, { limit: "1.5" }, { limit: ["1", "2"] }, { limit: 1 },
-    { offset: "-1" }, { offset: "100001" }, { offset: "1e2" }, { search: ["a", "b"] }, { search: "a".repeat(257) },
-    { search: "a\u0000b" }, { automatic: "true" },
-  ])("rejects invalid candidate parameters %j", query => {
-    expect(() => agentUsageCandidateQuery(query)).toThrow();
-  });
+  it.each([["offset", 0], ["offset", 100000], ["limit", 250], ["expectedUsageRevision", "a".repeat(64)],
+    ["search", ["one", "two"]], ["search", 1], ["search", "a".repeat(257)], ["search", "a\nb"]])(
+    "rejects removed or invalid candidate query %s=%j", (key, value) => {
+      expect(() => reportQuery("official_agents", { [key]: value })).toThrow();
+    });
 });
-
-function data(packageIds = ["Package-A", "Package-B", "Package-C"]) {
-  const records: UnifiedAgentRecord[] = [firstId, secondId].map((id, index) => ({
-    id: `agent:${id}`, displayName: "Same visible name", presence: "graph_packages", environmentId: null,
-    packages: (index ? packageIds.slice(2) : packageIds.slice(0, 2))
-      .map(id => allowlistedPackage({ id, displayName: "Same visible name", isBlocked: false })),
-    powerPlatformResource: null, identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: null },
-    observations: {
-      graphPackages: { ...observation, tokenMode: "delegated", scopeKind: "broad", observedCount: 3, totalRecords: 3 },
-      packageSnapshots: Object.fromEntries((index ? packageIds.slice(2) : packageIds.slice(0, 2)).map(id => [id, {
-        ...observation, scopeKind: "broad", identityDetails: null,
-      }])), powerPlatform: null,
-    },
-  }));
-  const sources: AuthorizedAgentUsageSource[] = records.flatMap(record => record.packages.map(value => ({
-    source: "graph_packages", native_id: value.id, normalized_native_id: value.id, environment_id: "", normalized_environment_id: "",
-    agent_id: record.id.slice(6), package_snapshot_id: firstId, power_platform_snapshot_id: null, expires_at: new Date(expiresAt),
-  })));
-  const associations: StoredAgentUsageAssociation[] = sources.slice(0, 2).map((source, index) => ({
-    ...source, report_agent_id: index ? "Report-B" : "Report-A", reviewed_at: new Date(observedAt),
-  }));
-  const agents = { ...reportBase, kind: "agents" as const, rows: [
-    { agentId: "Report-A", agentName: "Report A", creatorType: "Your org", activeUsersLicensed: 99, activeUsersUnlicensed: 99, responsesSentToUsers: 10, lastActivityDateUtc: "2026-09-16T00:00:00.000Z" },
-    { agentId: "Report-B", agentName: "Report B", creatorType: "Your org", activeUsersLicensed: 99, activeUsersUnlicensed: 99, responsesSentToUsers: 20, lastActivityDateUtc: "2026-09-18T00:00:00.000Z" },
-  ] };
-  const userAgents = { ...reportBase, kind: "userAgents" as const, rows: [
-    { agentId: "Report-A", agentName: "A", creatorType: "Your org", username: "CaseUser", responsesSentToUsers: 1 },
-    { agentId: "Report-A", agentName: "A", creatorType: "Your org", username: "shared", responsesSentToUsers: 2 },
-    { agentId: "Report-B", agentName: "B", creatorType: "Your org", username: "caseuser", responsesSentToUsers: 3 },
-    { agentId: "Report-B", agentName: "B", creatorType: "Your org", username: "shared", responsesSentToUsers: 4 },
-    { agentId: "Report-B", agentName: "B", creatorType: "Your org", username: "zero", responsesSentToUsers: 0 },
-  ] };
-  const users = { ...reportBase, kind: "users" as const, rows: [
-    { username: "shared", displayName: "Shared", numberOfAgentsUsed: 2, agentResponsesReceived: 6 },
-  ] };
-  const published: PublishedOfficialUsage = {
-    activeRevision: 1, activeSet: {
-      id: setId, bundleId: setId, contentHash: "a".repeat(64), reportingPeriod: reportBase.reportingPeriod,
-      supersedesSetId: null, complete: true, kinds: ["agents", "userAgents", "users"], acceptedAt: observedAt,
-      deletedAt: null, createdAt: observedAt, expiresAt: null,
-    }, reports: { agents: accepted(agents), userAgents: accepted(userAgents), users: accepted(users) },
-    retainedCompleteSets: 1, retainedIncompleteSets: 0, hasImportHistory: true, activeSelectionIncomplete: false,
-  };
-  const snapshot: AgentUsageSnapshot = { published, associations, associationRevision: "1",
-    now: new Date(snapshotAt), expiresAt: null };
-  return { records, sources, snapshot };
-}
-
-function accepted<T extends ParsedOfficialUsageReport>(report: T) {
-  return { ...report, lineage: {
-    ...reportBase, kind: report.kind, versionId: `${report.kind}-version`, contentHash: "a".repeat(64),
-    fileHash: "b".repeat(64), acceptedAt: observedAt, rowCount: report.rows.length, reconciliation: {}, supersedesVersionId: null,
-  } };
-}
-
-function project(fixture: ReturnType<typeof data>) {
-  return buildAgentUsageProjection(scope, fixture.records, fixture.sources, fixture.snapshot);
-}
-
-function automaticData() {
-  const fixture = data([`T_${firstId}`, `P_${secondId}`, "Package-C"]);
-  fixture.snapshot.associations = [];
-  for (const report of [fixture.snapshot.published.reports.agents, fixture.snapshot.published.reports.userAgents]) {
-    for (const row of report!.rows) row.agentId = fixture.records[0].packages[row.agentId === "Report-A" ? 0 : 1].id;
-  }
-  return fixture;
-}
-
-function mutation(action: "attach" | "remove") {
-  const fixture = data();
-  const association = fixture.snapshot.associations[0];
-  fixture.snapshot.associations = action === "attach" ? [] : [association];
-  fixture.snapshot.expiresAt = new Date(Date.now() + 1_000);
-  const updated: AgentUsageSnapshot = {
-    ...structuredClone(fixture.snapshot), associationRevision: "2", associations: action === "attach" ? [association] : [],
-  };
-  const query = vi.fn().mockResolvedValue({ rows: [] });
-  const release = vi.fn();
-  const client = { query, release } as unknown as pg.PoolClient;
-  const database = { connect: vi.fn().mockResolvedValue(client) } as unknown as pg.Pool;
-  const service = new AgentUsageService(database);
-  vi.spyOn(AgentUsageRepository.prototype, "resolveRecord").mockResolvedValue({
-    id: fixture.records[0].id, sources: fixture.sources.slice(0, 2),
-  });
-  const read = vi.spyOn(AgentUsageRepository.prototype, "read")
-    .mockResolvedValueOnce(fixture.snapshot).mockResolvedValue(updated);
-  vi.spyOn(AgentUsageRepository.prototype, "insert").mockResolvedValue();
-  vi.spyOn(AgentUsageRepository.prototype, "remove").mockResolvedValue();
-  vi.spyOn(inventoryRevision, "readUnifiedInventoryRevision").mockResolvedValue("a".repeat(64));
-  const event: AuditEvent = {
-    id: setId, operationId: "usage-test", scope: "single",
-    action: action === "attach" ? "associate-agent-usage" : "remove-agent-usage-association",
-    agentId: fixture.records[0].id, status: "started", startedAt: snapshotAt, requestPath: "/usage-associations",
-    actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "admin@example.invalid", displayName: "Admin" },
-  };
-  vi.spyOn(AuditLog.prototype, "startEvent").mockResolvedValue(event);
-  vi.spyOn(AuditLog.prototype, "getEvent").mockResolvedValue(event);
-  const complete = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async (_id, update) => ({ ...event, ...update }));
-  const usageRevision = buildAgentUsageContext(scope, fixture.snapshot).revision;
-  const input = {
-    reportSetId: setId, reportAgentId: association.report_agent_id, confirmed: true as const,
-    expectedUsageRevision: usageRevision, expectedInventoryRevision: combineAgentInventoryRevision("a".repeat(64), usageRevision),
-  };
-  const audit = { actor: event.actor, requestPath: event.requestPath };
-  const run = () => action === "attach"
-    ? service.attach(scope, fixture.records[0].id, { ...input, target: { source: "graph_packages", packageId: "Package-A" } }, audit)
-    : service.remove(scope, fixture.records[0].id, input, audit);
-  return { ...fixture, updated, query, release, read, event, complete, run };
-}

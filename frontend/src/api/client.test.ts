@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
 import { createUnifiedVerification } from "../test/inventoryVerification";
+import { createReportExport, reportExportStatus, reportExportDownload, reportPages, readReportDetail, readAgentReportSummary, readAgentReportCandidates, mutateAgentReportAssociation, stageReport } from "./reportData";
 
 import {
   ApiError,
   blockAgent,
   cancelDataSyncRun,
   cancelInventoryRefresh,
-  cancelPackageRefreshJob,
   cancelPurviewAuditSearch,
   cancelDefenderHunt,
   checkCapabilities,
@@ -22,28 +22,16 @@ import {
   getAgentPurviewRecords,
   getCurrentUser,
   getUnifiedAgents,
-  getAgentUsageCandidates,
+  getUnifiedAgentDetail,
   getAuditEvents,
-  associateAgentUsage,
-  removeAgentUsageAssociation,
-  downloadUnifiedAgentInventoryCsv,
-  downloadPackageInventoryCsv,
-  downloadInventoryCsv,
   downloadPurviewAuditCsv,
   downloadDefenderHuntingCsv,
   downloadAdministrativeAuditCsv,
-  downloadOfficialUsageCsv,
   deletePurviewAuditSearch,
   deleteDefenderHunt,
   approvePurviewAuditQualification,
   approveDefenderHuntingQualification,
   getPackageRefreshJob,
-  getOfficialUsageAggregate,
-  getOfficialUsageAgentDetail,
-  getOfficialUsageHistory,
-  getOfficialUsageOverview,
-  getOfficialUsageUsers,
-  getCopilotUsageUsers,
   getDataSyncRun,
   getDataSyncState,
   getDefenderHuntingCatalog,
@@ -58,7 +46,6 @@ import {
   previewQuarantine,
   previewPackageMutation,
   reconcileBulkActionJob,
-  retryDataSyncRun,
   resumePurviewAuditSearch,
   resumeDefenderHunt,
   revokeDefenderHuntingRetainedScope,
@@ -68,7 +55,6 @@ import {
   resolveAgentPeople,
   startExactPackageRefresh,
   startPackageRefresh,
-  stageOfficialUsageReport,
   signOut,
   startSignIn,
   startDataSync,
@@ -260,12 +246,12 @@ describe("access API client", () => {
   it("serializes cumulative activity filters with cancellation and no implicit snapshot selection", async () => {
     const fetchMock = mockJsonResponse({});
     const controller = new AbortController();
-    await getOfficialUsageOverview({
+    await reportPages.overview({
       search: "June & July", startDate: "2026-06-01", endDate: "2026-07-15",
-      sortBy: "lastActivity", sortDirection: "asc", limit: 25, offset: 50,
-    }, { signal: controller.signal });
+      sort: "lastActivity", order: "asc", limit: 25, cursor: "next",
+    }, controller.signal);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/official-usage/overview?search=June+%26+July&startDate=2026-06-01&endDate=2026-07-15&sortBy=lastActivity&sortDirection=asc&limit=25&offset=50",
+      "/api/official-usage/overview?search=June+%26+July&startDate=2026-06-01&endDate=2026-07-15&sort=lastActivity&order=asc&limit=25&cursor=next",
       expect.objectContaining({ signal: controller.signal, credentials: "include" }),
     );
   });
@@ -304,57 +290,68 @@ describe("access API client", () => {
     expect(result.value[0]).not.toHaveProperty("targetBlockedState");
   });
 
-  it.each(["aggregate", "users"] as const)("passes cancellation through the %s official-usage CSV request", async kind => {
-    const fetchMock = vi.fn(async () => new Response("selected-report-csv", { headers: { "Content-Type": "text/csv" } }));
-    vi.stubGlobal("fetch", fetchMock);
+  it.each(["official_agents", "official_users"] as const)("passes cancellation through %s durable export admission", async kind => {
+    const fetchMock = mockJsonResponse({ id: "export-id" });
     const controller = new AbortController();
-    const setId = "11111111-1111-4111-8111-111111111111";
-    const blob = await downloadOfficialUsageCsv(kind, { setId }, controller.signal);
-    expect(fetchMock).toHaveBeenCalledWith(`/api/official-usage/${kind}.csv?setId=${setId}`, {
-      credentials: "include", signal: controller.signal, headers: { Accept: "text/csv" },
-    });
-    expect(await blob.text()).toBe("selected-report-csv");
+    const selectionId = "11111111-1111-4111-8111-111111111111";
+    const idempotencyKey = crypto.randomUUID();
+    expect(await createReportExport({ kind, selectionId, idempotencyKey }, controller.signal)).toEqual({ id: "export-id" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/data-exports", expect.objectContaining({
+      credentials: "include", signal: controller.signal, method: "POST", body: JSON.stringify({ kind, selectionId, idempotencyKey }),
+      headers: expect.objectContaining({ "Content-Type": "application/json" }),
+    }));
+    expect(reportExportDownload("export-id")).toBe("/api/data-exports/export-id/download");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("serializes the nonpaid license cohort with pinned user CSV filters", async () => {
-    const fetchMock = vi.fn(async () => new Response("cohort-csv", { headers: { "Content-Type": "text/csv" } }));
-    vi.stubGlobal("fetch", fetchMock);
+    const fetchMock = mockJsonResponse({ id: "export-id" });
     const controller = new AbortController();
-    await downloadOfficialUsageCsv("users", {
+    const idempotencyKey = crypto.randomUUID();
+    await reportPages.reportedUsers({
       licenseCohort: "active_without_paid", setId: "saved-set", agentId: "report/agent", search: "A & B",
-      cohort: "zero", sortBy: "responses", sortDirection: "asc",
+      cohort: "zero", sort: "responses", order: "asc", selectionId: "saved-selection",
     }, controller.signal);
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-      "/api/official-usage/users.csv?licenseCohort=active_without_paid&setId=saved-set&agentId=report%2Fagent&search=A+%26+B&cohort=zero&sortBy=responses&sortDirection=asc",
-      { credentials: "include", signal: controller.signal, headers: { Accept: "text/csv" } },
+    await createReportExport({ kind: "official_users", selectionId: "saved-selection", idempotencyKey }, controller.signal);
+    expect(fetchMock).toHaveBeenNthCalledWith(1,
+      "/api/official-usage/users?licenseCohort=active_without_paid&setId=saved-set&agentId=report%2Fagent&search=A+%26+B&cohort=zero&sort=responses&order=asc&selectionId=saved-selection",
+      expect.objectContaining({ credentials: "include", signal: controller.signal }),
     );
+    expect(fetchMock.mock.calls[1][1]?.body).toBe(JSON.stringify({ kind: "official_users", selectionId: "saved-selection", idempotencyKey }));
   });
 
-  it.each([false, true])("preserves pinned Power Platform CSV filters with cancellation supplied: %s", async cancellable => {
-    const fetchMock = vi.fn(async () => new Response("selected-inventory-csv", { headers: { "Content-Type": "text/csv" } }));
+  it.each([false, true])("creates a pinned Power Platform export with cancellation supplied: %s", async cancellable => {
+    const fetchMock = vi.fn(async () => Response.json({ id: "export" }));
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
     const signal = cancellable ? controller.signal : undefined;
-    const blob = await downloadInventoryCsv({
-      snapshotId: "snapshot / saved", environmentId: "env & one",
-      search: "Agent & bot", sortBy: "displayName", sortDirection: "asc",
-    }, signal);
+    const idempotencyKey = crypto.randomUUID();
+    const result = await createReportExport({ kind: "power_platform_agents", selectionId: "saved-selection", idempotencyKey }, signal);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-      "/api/inventory/export.csv?snapshotId=snapshot+%2F+saved&environmentId=env+%26+one&search=Agent+%26+bot&sortBy=displayName&sortDirection=asc",
-      { credentials: "include", signal, headers: { Accept: "text/csv" } },
+      "/api/data-exports",
+      expect.objectContaining({ credentials: "include", signal, body: JSON.stringify({ kind: "power_platform_agents", selectionId: "saved-selection", idempotencyKey }) }),
     );
-    expect(await blob.text()).toBe("selected-inventory-csv");
+    expect(result.id).toBe("export");
   });
 
-  it("rejects a late Power Platform CSV result after its export owner cancels", async () => {
+  it("rejects late inventory export metadata after its owner cancels", async () => {
     const pending = deferredResponse();
     vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
     const controller = new AbortController();
-    const result = downloadInventoryCsv({ snapshotId: "snapshot-one" }, controller.signal);
+    const result = createReportExport({ kind: "power_platform_agents", selectionId: "saved-selection" }, controller.signal);
     const cancelled = expect(result).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
     controller.abort();
-    pending.resolve(new Response("superseded-inventory-csv"));
+    pending.resolve(Response.json({ id: "superseded-export" }));
     await cancelled;
+  });
+
+  it("revalidates exact inventory summary under the same historical set and selected evidence", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    await readAgentReportSummary("graph_packages:package%2Fone", { selectionId: "pinned-selection", setId: "retained-set" }, controller.signal);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "/api/agent-inventory/graph_packages%3Apackage%252Fone/usage?selectionId=pinned-selection&setId=retained-set",
+      expect.objectContaining({ signal: controller.signal, credentials: "include" }));
   });
 
   it("encodes agent usage reads and sends confirmed, CSRF-protected association changes", async () => {
@@ -362,15 +359,15 @@ describe("access API client", () => {
     await getCurrentUser();
     const controller = new AbortController();
     const id = "graph_packages:package%2Fone";
-    await getAgentUsageCandidates(id, { search: "Report & agent", limit: 20, offset: 40 }, { signal: controller.signal });
+    await readAgentReportCandidates(id, { search: "Report & agent", limit: 20, cursor: "next" }, controller.signal);
     const common = {
       reportSetId: "11111111-1111-4111-8111-111111111111", reportAgentId: "report/Upper:1",
-      expectedInventoryRevision: "a".repeat(64), expectedUsageRevision: "b".repeat(64), confirmed: true as const,
+      selectionId: "22222222-2222-4222-8222-222222222222", inventoryRevision: "a".repeat(64), usageRevision: "b".repeat(64), confirmed: true as const,
     };
-    await associateAgentUsage(id, { ...common, target: { source: "graph_packages", packageId: "package/one" } });
-    await removeAgentUsageAssociation(id, common);
+    await mutateAgentReportAssociation(id, { ...common, target: { source: "graph_packages", packageId: "package/one" } }, "associate");
+    await mutateAgentReportAssociation(id, common, "remove");
     expect(fetchMock.mock.calls[1]).toEqual([
-      "/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-candidates?search=Report+%26+agent&limit=20&offset=40",
+      "/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-candidates?search=Report+%26+agent&limit=20&cursor=next",
       expect.objectContaining({ signal: controller.signal }),
     ]);
     for (const [index, method] of [[2, "POST"], [3, "DELETE"]] as const) {
@@ -390,7 +387,6 @@ describe("access API client", () => {
     await startDataSync({ mode: "initial" });
     await startDataSync({ mode: "incremental", sources: ["users"] });
     await startDataSync({ mode: "full", clearSavedData: true });
-    await retryDataSyncRun("run/one", ["users", "usage_reports"]);
     await cancelDataSyncRun("run/one");
 
     expect(fetchMock.mock.calls[0]).toEqual([
@@ -409,15 +405,14 @@ describe("access API client", () => {
       ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "initial" })],
       ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "incremental", sources: ["users"] })],
       ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "full", clearSavedData: true })],
-      ["/api/data-sync/runs/run%2Fone/retry", "POST", JSON.stringify({ sources: ["users", "usage_reports"] })],
       ["/api/data-sync/runs/run%2Fone/cancel", "POST", undefined],
     ]);
   });
 
   it("loads the Copilot service usage snapshot with a cancellable read-only request", async () => {
-    const fetchMock = mockJsonResponse({ users: [] });
+    const fetchMock = mockJsonResponse({ value: [] });
     const controller = new AbortController();
-    await getCopilotUsageUsers({ signal: controller.signal });
+    await reportPages.users({}, controller.signal);
     const [path, init] = fetchMock.mock.calls[0];
     expect(path).toBe("/api/copilot-usage/users");
     expect(init?.signal).toBe(controller.signal);
@@ -427,32 +422,31 @@ describe("access API client", () => {
   it("uploads official usage without requesting dates or inventing a download timestamp", async () => {
     const fetchMock = mockJsonResponse({ id: "staging-id" });
     const file = new File(["Username,Display name"], "users.csv", { type: "text/csv" });
-    await stageOfficialUsageReport(file, { bundleId: "bundle-id" });
+    await stageReport(file, { bundleId: "bundle-id" }, {});
     const [path, init] = fetchMock.mock.calls[0];
-    expect(path).toBe("/api/official-usage/staging");
+    expect(path).toBe("/api/official-usage/staging?bundleId=bundle-id");
     expect(init?.method).toBe("POST");
     const form = init?.body;
     expect(form).toBeInstanceOf(FormData);
     if (!(form instanceof FormData)) throw new Error("Expected multipart upload");
-    expect([...form.keys()]).toEqual(["file", "bundleId"]);
+    expect([...form.keys()]).toEqual(["file"]);
     expect(form.get("file")).toBe(file);
-    expect(form.get("bundleId")).toBe("bundle-id");
+    expect(form.get("bundleId")).toBeNull();
   });
 
   it("forwards cancellation to the CSV upload transport", async () => {
     const fetchMock = mockJsonResponse({ id: "staging-id" });
     const controller = new AbortController();
-    await stageOfficialUsageReport(new File(["report"], "agents.csv"), { bundleId: "bundle-id", rejectDuplicateKind: true }, { signal: controller.signal });
+    await stageReport(new File(["report"], "agents.csv"), { bundleId: "bundle-id", rejectDuplicateKind: true }, {}, controller.signal);
     const signal = fetchMock.mock.calls[0][1]?.signal;
     expect(signal?.aborted).toBe(false);
     controller.abort();
     expect(signal?.aborted).toBe(true);
   });
 
-  it("preserves explicitly supplied legacy import metadata", async () => {
+  it("preserves explicitly supplied source metadata without moving immutable intent into multipart fields", async () => {
     const fetchMock = mockJsonResponse({ id: "staging-id" });
-    await stageOfficialUsageReport(new File(["report"], "agents.csv"), {
-      bundleId: "bundle-id",
+    await stageReport(new File(["report"], "agents.csv"), { bundleId: "bundle-id" }, {
       reportingStart: "2026-08-14",
       reportingEnd: "2026-09-12",
       periodProvenance: "operator_asserted",
@@ -469,19 +463,19 @@ describe("access API client", () => {
 
   it("encodes official usage dashboard filters, thresholds, sorting, and paging", async () => {
     const fetchMock = mockJsonResponse({});
-    await getOfficialUsageAggregate({
+    await reportPages.agents({
       setId: "11111111-1111-4111-8111-111111111111",
       search: "Agent & one",
       creatorType: "Agent built by your org",
       startDate: "2026-01-01",
       endDate: "2026-09-12",
-      sortBy: "unlicensedUsers",
-      sortDirection: "asc",
+      sort: "unlicensedUsers",
+      order: "asc",
       limit: 100,
-      offset: 200,
+      cursor: "agent-next",
     });
 
-    await getOfficialUsageUsers({
+    await reportPages.reportedUsers({
       setId: "11111111-1111-4111-8111-111111111111",
       licenseCohort: "active_without_paid",
       search: "User + one",
@@ -491,22 +485,22 @@ describe("access API client", () => {
       lowResponseThreshold: 5,
       startDate: "2026-01-01",
       endDate: "2026-09-12",
-      sortBy: "responses",
-      sortDirection: "desc",
+      sort: "responses",
+      order: "desc",
       limit: 100,
-      offset: 100,
+      cursor: "user-next",
     });
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?setId=11111111-1111-4111-8111-111111111111&search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&licenseCohort=active_without_paid&search=User+%2B+one&company=Contoso+%26+Co&department=Research+%2B+Development&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?setId=11111111-1111-4111-8111-111111111111&search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sort=unlicensedUsers&order=asc&limit=100&cursor=agent-next");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&licenseCohort=active_without_paid&search=User+%2B+one&company=%7Estring%3AContoso+%26+Co&department=%7Estring%3AResearch+%2B+Development&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sort=responses&order=desc&limit=100&cursor=user-next");
   });
 
   it("loads paginated cumulative official usage history without changing active selection", async () => {
     const fetchMock = mockJsonResponse({});
     const controller = new AbortController();
-    await getOfficialUsageHistory({ limit: 25, offset: 50 }, { signal: controller.signal });
+    await reportPages.history({ limit: 25, cursor: "history-next" }, controller.signal);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/official-usage/history?limit=25&offset=50",
+      "/api/official-usage/history?limit=25&cursor=history-next",
       expect.objectContaining({ signal: controller.signal, credentials: "include" }),
     );
     expect(fetchMock.mock.calls[0][1]?.method ?? "GET").toBe("GET");
@@ -518,11 +512,9 @@ describe("access API client", () => {
     const controller = new AbortController();
     const agentId = "Report/Upper%Case:1";
     const setId = "11111111-1111-4111-8111-111111111111";
-    await getOfficialUsageAgentDetail(agentId, {
-      setId, search: "User + one", sortBy: "displayName", sortDirection: "asc", limit: 20, offset: 40,
-    }, { signal: controller.signal });
-    await getOfficialUsageUsers({ agentId, setId }, { signal: controller.signal });
-    expect(fetchMock.mock.calls[0][0]).toBe(`/api/official-usage/agents/Report%2FUpper%25Case%3A1?setId=${setId}&search=User+%2B+one&sortBy=displayName&sortDirection=asc&limit=20&offset=40`);
+    await readReportDetail(`official-usage/agents/${encodeURIComponent(agentId)}`, "exact-selection", controller.signal);
+    await reportPages.reportedUsers({ agentId, setId }, controller.signal);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/agents/Report%2FUpper%25Case%3A1?selectionId=exact-selection");
     expect(fetchMock.mock.calls[1][0]).toBe(`/api/official-usage/users?agentId=Report%2FUpper%25Case%3A1&setId=${setId}`);
     for (const [, options] of fetchMock.mock.calls) {
       expect(options).toMatchObject({ credentials: "include", signal: controller.signal });
@@ -586,8 +578,14 @@ describe("access API client", () => {
 
   it("loads saved package data without a provider refresh", async () => {
     const fetchMock = mockJsonResponse({ value: [], count: 0, snapshot: null });
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "package-selection" }));
     await getAgents();
-    expect(fetchMock).toHaveBeenCalledWith("/api/agents", expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/selections", expect.objectContaining({
+      credentials: "include", method: "POST", body: JSON.stringify({ query: {}, mode: "delegated" }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents?selectionId=package-selection&limit=50",
+      expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("notifies session owners for session auth failures and internal role loss, but not provider authorization failures", async () => {
@@ -629,14 +627,15 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=delegated", expect.objectContaining({ credentials: "include" }));
   });
 
-  it.each(["delegated", "application"] as const)("cancels an exact %s package refresh through the existing CSRF-protected endpoint", async mode => {
+  it("cancels an exact data-sync run through the CSRF-protected endpoint with a cancellable request", async () => {
     const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf", roleAssignmentRequired: false });
     await getCurrentUser();
     fetchMock.mockResolvedValue(Response.json({ id: "job/one", status: "cancelled" }));
-    await cancelPackageRefreshJob("job/one", mode);
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/agents/refresh-jobs/job%2Fone/cancel", expect.objectContaining({
-      method: "POST", credentials: "include", body: JSON.stringify({ mode }),
-      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "cancel-csrf" }),
+    const controller = new AbortController();
+    await cancelDataSyncRun("job/one", { signal: controller.signal });
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/data-sync/runs/job%2Fone/cancel", expect.objectContaining({
+      method: "POST", credentials: "include", signal: controller.signal,
+      headers: expect.objectContaining({ "X-CSRF-Token": "cancel-csrf" }),
     }));
   });
 
@@ -667,6 +666,7 @@ describe("access API client", () => {
       value: [],
       verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
     });
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "selected-root" }));
     await getUnifiedAgents({
       view: "third_party",
       endUserAccess: "available",
@@ -678,29 +678,122 @@ describe("access API client", () => {
       linkState: "matched",
       environmentId: "environment/one",
       blocked: true,
-      publisher: "__unknown__",
-      availableTo: "__some_or_all__",
+      publisher: null,
+      availableTo: { kind: "some-or-all" },
       host: "__unknown_host__",
       platform: "Copilot Studio",
       createdWithinDays: 30,
       limit: 50,
-      offset: 100,
     });
-    await refreshPackageIdentityDetails(["package-1", "package-2"]);
+    await refreshPackageIdentityDetails({ selectionId: "selected-root", ids: ["package-1", "package-2"] });
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "/api/agent-inventory?view=third_party&endUserAccess=available&reportedUsage=used&management=organization_managed&relevance=organization&search=Builder+%26+one&source=both&linkState=matched&environmentId=environment%2Fone&blocked=true&publisher=__unknown__&availableTo=__some_or_all__&host=__unknown_host__&platform=Copilot+Studio&createdWithinDays=30&limit=50&offset=100",
-      expect.objectContaining({ credentials: "include" }),
+      "/api/agent-inventory/selections",
+      expect.objectContaining({ credentials: "include", method: "POST", body: JSON.stringify({ query: {
+        view: "third_party", endUserAccess: "available", reportedUsage: "used", management: "organization_managed",
+        relevance: "organization", search: "Builder & one", source: "both", linkState: "matched",
+        environmentId: "~string:environment/one", blocked: "true", publisher: "~null", availableTo: "~some-or-all",
+        host: "~string:__unknown_host__", platform: "~string:Copilot Studio", createdWithinDays: "30",
+      } }) }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "/api/agents/refresh-jobs",
+      "/api/agent-inventory?selectionId=selected-root&limit=50",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/agents/refresh-selection",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ ids: ["package-1", "package-2"], mode: "delegated" }),
+        body: JSON.stringify({ selectionId: "selected-root", ids: ["package-1", "package-2"] }),
       }),
     );
+  });
+
+  it.each(["not_collected", "preparing"])("returns explicit %s inventory availability without reading a nonexistent selection", async state => {
+    const unavailable = { state, message: "Inventory is not ready yet." };
+    const fetchMock = mockJsonResponse(unavailable);
+    await expect(getUnifiedAgents()).resolves.toEqual(unavailable);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-inventory/selections");
+  });
+
+  it.each([{ state: "unknown", message: "Invalid" }, { state: "preparing" }])("rejects malformed inventory availability: %j", async response => {
+    const fetchMock = mockJsonResponse(response);
+    await expect(getUnifiedAgents()).rejects.toMatchObject({ code: "invalid_inventory_availability" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("captures maximum-width Unicode criteria in a body and continues with bounded selection URLs", async () => {
+    const publisher = "界".repeat(4096), controller = new AbortController();
+    const fetchMock = mockJsonResponse({ value: [] });
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "wide-selection" }));
+    await getUnifiedAgents({ publisher, inventoryScope: "catalog", limit: 50 }, { signal: controller.signal });
+    const [path, capture] = fetchMock.mock.calls[0];
+    expect(path).toBe("/api/agent-inventory/selections");
+    expect(JSON.parse(String(capture?.body))).toEqual({ query: { publisher: `~string:${publisher}`, inventoryScope: "catalog" } });
+    expect(capture?.signal).toBe(controller.signal);
+    await getUnifiedAgents({ publisher, inventoryScope: "catalog", selectionId: "wide-selection", cursor: "next" },
+      { signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.slice(1).map(([url]) => url)).toEqual([
+      "/api/agent-inventory?selectionId=wide-selection&limit=50",
+      "/api/agent-inventory?selectionId=wide-selection&limit=50&cursor=next",
+    ]);
+    expect(fetchMock.mock.calls.every(([, request]) => request?.signal === controller.signal)).toBe(true);
+  });
+
+  it.each(["delegated", "application"] as const)("captures wide %s package criteria without including them in read URLs", async mode => {
+    const publisher = "界".repeat(4096), controller = new AbortController();
+    const fetchMock = mockJsonResponse({ value: [] });
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "package-selection" }));
+    await getAgents({ publisher, mode, limit: 25 }, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/selections", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ query: { publisher: `~string:${publisher}` }, mode }), signal: controller.signal,
+    }));
+    await getAgents({ publisher, mode, selectionId: "package-selection", cursor: "next", limit: 25 }, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.slice(1).map(([url]) => url)).toEqual([
+      `/api/agents?selectionId=package-selection&limit=25&mode=${mode}`,
+      `/api/agents?selectionId=package-selection&limit=25&mode=${mode}&cursor=next`,
+    ]);
+    expect(fetchMock.mock.calls.every(([, request]) => request?.signal === controller.signal)).toBe(true);
+  });
+
+  it.each([
+    { path: "/api/agents/selections", read: () => getAgents() },
+    { path: "/api/agent-inventory/selections", read: () => getUnifiedAgents() },
+  ])("fences $path when the principal changes between capture and its first selected read", async ({ path, read }) => {
+    let replacement: Promise<unknown> | undefined;
+    const selection = Object.defineProperty({}, "id", { get() {
+      replacement = getCurrentUser();
+      return "captured-selection";
+    } });
+    const response = Response.json({});
+    response.json = async () => selection;
+    const fetchMock = vi.fn().mockResolvedValueOnce(response)
+      .mockResolvedValueOnce(Response.json({ user: { tenantId: "replacement" }, csrfToken: "replacement-csrf" }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(read()).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+    await replacement;
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([path, "/api/me"]);
+  });
+
+  it("stages a server-filtered refresh and separately reauthorizes its start without downloading targets", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({
+      id: "selected-refresh", status: "waiting_authorization", tokenMode: "delegated", targetCount: 5000,
+    })).mockResolvedValueOnce(Response.json({ id: "selected-refresh", status: "running", tokenMode: "delegated", targetCount: 5000 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    expect(await refreshPackageIdentityDetails({ selectionId: "selected-root" }, { signal: controller.signal }))
+      .toMatchObject({ status: "running", targetCount: 5000 });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-selection",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ selectionId: "selected-root" }), signal: controller.signal }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/refresh-jobs/selected-refresh/resume",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }), signal: controller.signal }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("resolves canonical and exact source aliases through the unified endpoint without rewriting package targets", async () => {
@@ -718,41 +811,30 @@ describe("access API client", () => {
         warnings: [{ code: "source_specific_agent_identity", message: "Source-specific identity IDs differ without a native resource conflict." }],
       },
     };
-    const inventory = {
-      value: [record], count: 1, identityCollection: { checkedPackages: 2, pendingPackages: 0, invalidPackages: 1 },
-      verification: createUnifiedVerification({ graphPackageCount: 2, powerPlatformAgentCount: 1, logicalAgentCount: 1 }, { packageMetadata: false }),
-    };
-    const fetchMock = mockJsonResponse(inventory);
+    const fetchMock = mockJsonResponse(record);
     const controller = new AbortController();
     for (const recordId of [record.id, "graph_packages:package%2Fa", "power_platform:environment-a:native%2Fa"]) {
-      const response = await getUnifiedAgents({ recordId }, { signal: controller.signal });
-      expect(response).toEqual(inventory);
+      const response = await getUnifiedAgentDetail("selected-root", recordId, { signal: controller.signal });
+      expect(response).toEqual(record);
       expect(fetchMock).toHaveBeenLastCalledWith(
-        `/api/agent-inventory?${new URLSearchParams({ recordId })}`,
+        `/api/agent-inventory/${encodeURIComponent(recordId)}/detail?selectionId=selected-root`,
         expect.objectContaining({ signal: controller.signal, credentials: "include" }),
       );
     }
   });
 
-  it("downloads revision-bound unified CSV with cookies and the current CSRF token", async () => {
-    const csv = "agentId,packageIds,inventoryPartial\r\nagent-one,\"package-one;package-two\",true\r\n";
+  it("creates selected unified exports with cookies and the current CSRF token", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ user: { roles: ["AgentControl.Viewer"] }, csrfToken: "csv-csrf" }))
-      .mockResolvedValueOnce(new Response(csv, { headers: { "Content-Type": "text/csv" } }));
+      .mockResolvedValueOnce(Response.json({ id: "selected-export" }));
     vi.stubGlobal("fetch", fetchMock);
     await getCurrentUser();
-    const input = { revision: "a".repeat(64), query: {
-      view: "third_party" as const, endUserAccess: "available" as const, reportedUsage: "used" as const,
-      management: "organization_managed" as const, relevance: "organization" as const,
-      environmentId: "env/one", search: "Agent & one", sortBy: "lastModifiedAt" as const, sortDirection: "desc" as const,
-    } };
-    const blob = await downloadUnifiedAgentInventoryCsv(input);
-    expect(await blob.text()).toBe(csv);
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/export.csv", {
-      method: "POST", credentials: "include",
-      headers: { Accept: "text/csv", "Content-Type": "application/json", "X-CSRF-Token": "csv-csrf" },
+    const input = { kind: "unified_agents" as const, selectionId: "saved-selection", idempotencyKey: crypto.randomUUID() };
+    expect(await createReportExport(input)).toEqual({ id: "selected-export" });
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/data-exports", expect.objectContaining({
+      method: "POST", credentials: "include", headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "csv-csrf" }),
       body: JSON.stringify(input),
-    });
+    }));
   });
 
   it("preserves exact selected references and reports invalidation without a source-export fallback", async () => {
@@ -761,12 +843,12 @@ describe("access API client", () => {
     }, { status: 409 }));
     vi.stubGlobal("fetch", fetchMock);
     const input = {
-      revision: "b".repeat(64),
-      recordIds: ["agent:11111111-1111-4111-8111-111111111111", "graph_packages:opaque%2Fid"],
-      query: { sortBy: "displayName" as const, sortDirection: "asc" as const },
+      kind: "unified_agents" as const, selectionId: "saved-selection",
+      ids: ["agent:11111111-1111-4111-8111-111111111111", "graph_packages:opaque%2Fid"],
+      idempotencyKey: crypto.randomUUID(),
     };
-    await expect(downloadUnifiedAgentInventoryCsv(input)).rejects.toMatchObject({ status: 409, code: "agent_inventory_changed" });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/agent-inventory/export.csv", expect.objectContaining({
+    await expect(createReportExport(input)).rejects.toMatchObject({ status: 409, code: "agent_inventory_changed" });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/data-exports", expect.objectContaining({
       method: "POST", body: JSON.stringify(input),
     }));
   });
@@ -774,8 +856,9 @@ describe("access API client", () => {
   it("preserves separate opaque package targets in detail reads, exact refreshes and mutation previews", async () => {
     const fetchMock = mockJsonResponse({});
     for (const id of ["opaque/legacy%target", "opaque:anchor/target"]) {
-      await getAgentDetails(id);
-      expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}`, expect.objectContaining({ credentials: "include" }));
+      await getAgentDetails("selected-root", id);
+      expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}/detail?selectionId=selected-root`,
+        expect.objectContaining({ credentials: "include" }));
       await startExactPackageRefresh(id);
       expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}/refresh-jobs`, expect.objectContaining({
         method: "POST", body: JSON.stringify({ mode: "delegated" }),
@@ -1024,7 +1107,7 @@ describe("API response failures", () => {
   describe.each(["JSON", "CSV"] as const)("logout completion ownership (%s)", format => {
     const csv = "saved,private,csv";
     const response = () => format === "JSON" ? Response.json({ value: [] }) : new Response(csv);
-    const send = () => format === "JSON" ? getAgents() : downloadInventoryCsv({ snapshotId: "snapshot-one" });
+    const send = () => format === "JSON" ? getAgents({ selectionId: "transport-selection" }) : downloadPurviewAuditCsv("saved-job");
     const expected = format === "JSON" ? { value: [] } : { size: csv.length };
 
     it.each((["before", "during"] as const).flatMap(timing =>
@@ -1123,7 +1206,7 @@ describe("API response failures", () => {
     const pending = deferredResponse();
     const fetchMock = mockJsonResponse({});
     fetchMock.mockReturnValueOnce(pending.promise);
-    const result = format === "JSON" ? getAgents() : downloadInventoryCsv({ snapshotId: "snapshot-one" });
+    const result = format === "JSON" ? getAgents() : downloadPurviewAuditCsv("saved-job");
     const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
     fetchMock.mockResolvedValueOnce(Response.json({ code: "unauthorized" }, { status: 401 }));
     await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "unauthorized" });
@@ -1200,12 +1283,10 @@ describe("API response failures", () => {
 
   const requests = [
     { name: "JSON", send: () => getAgents(), body: "json" },
-    { name: "unified inventory CSV", send: () => downloadUnifiedAgentInventoryCsv({ revision: "a".repeat(64) }), body: "blob" },
-    { name: "package inventory CSV", send: () => downloadPackageInventoryCsv({ snapshotId: "snapshot-one" }), body: "blob" },
-    { name: "Power Platform CSV", send: () => downloadInventoryCsv({ snapshotId: "snapshot-one" }), body: "blob" },
+    { name: "inventory export metadata", send: () => createReportExport({ kind: "unified_agents", selectionId: "saved-selection" }), body: "json" },
     { name: "Purview CSV", send: () => downloadPurviewAuditCsv("job/one"), body: "blob" },
     { name: "Defender CSV", send: () => downloadDefenderHuntingCsv("job/one"), body: "blob" },
-    { name: "official usage CSV", send: () => downloadOfficialUsageCsv("aggregate"), body: "blob" },
+    { name: "official export metadata", send: () => reportExportStatus("export-id"), body: "json" },
     { name: "administrative audit CSV", send: () => downloadAdministrativeAuditCsv(["event-one"]), body: "blob" },
   ] as const;
 
@@ -1222,14 +1303,21 @@ describe("API response failures", () => {
     });
 
     it.each(["fetch", "body"] as const)("normalizes connection loss during %s", async phase => {
+      vi.useFakeTimers();
       const cause = new TypeError("Connection interrupted");
       const response = Response.json({});
       if (phase === "body") vi.spyOn(response, body).mockRejectedValue(cause);
       vi.stubGlobal("fetch", phase === "fetch" ? vi.fn().mockRejectedValue(cause) : vi.fn().mockResolvedValue(response));
 
-      const result = send();
-      await expect(result).rejects.toBeInstanceOf(ApiError);
-      await expect(result).rejects.toMatchObject({ status: 0, code: "network_error", kind: "network" });
+      try {
+        const result = send();
+        const rejected = Promise.all([
+          expect(result).rejects.toBeInstanceOf(ApiError),
+          expect(result).rejects.toMatchObject({ status: 0, code: "network_error", kind: "network" }),
+        ]);
+        await vi.advanceTimersByTimeAsync(6000);
+        await rejected;
+      } finally { vi.useRealTimers(); }
     });
 
     it("preserves HTTP errors without treating provider authorization as session expiry", async () => {
@@ -1251,8 +1339,8 @@ describe("API response failures", () => {
 
   describe.each([
     { name: "JSON", send: (signal: AbortSignal) => getAgents({}, { signal }), body: "json" },
-    { name: "Power Platform CSV", send: (signal: AbortSignal) => downloadInventoryCsv({ snapshotId: "snapshot-one" }, signal), body: "blob" },
-    { name: "official usage CSV", send: (signal: AbortSignal) => downloadOfficialUsageCsv("aggregate", {}, signal), body: "blob" },
+    { name: "inventory export metadata", send: (signal: AbortSignal) => createReportExport({ kind: "unified_agents", selectionId: "saved-selection" }, signal), body: "json" },
+    { name: "official export metadata", send: (signal: AbortSignal) => reportExportStatus("export-id", signal), body: "json" },
     { name: "administrative audit CSV", send: (signal: AbortSignal) => downloadAdministrativeAuditCsv(["event-one"], signal), body: "blob" },
   ] as const)("$name cancellation signal", ({ send, body }) => {
     it.each(["fetch", "body", "problem body"] as const)("recognizes a custom abort reason during %s", async phase => {
@@ -1320,7 +1408,7 @@ describe("API response failures", () => {
     const unsubscribe = subscribeSessionRevalidationRequired(listener);
     try {
       fetchMock.mockResolvedValueOnce(Response.json({ code: "session_invalidated" }, { status: 401 }));
-      await expect(downloadInventoryCsv({ snapshotId: "snapshot-one" })).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
+      await expect(createReportExport({ kind: "unified_agents", selectionId: "saved-selection" })).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
       expect(listener).toHaveBeenCalledOnce();
       await checkCapabilities();
       expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");

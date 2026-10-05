@@ -6,6 +6,7 @@ export class AppError extends Error {
   status: number;
   code: string;
   details?: unknown;
+  retryAfterSeconds?: number;
 
   constructor(
     status: number,
@@ -35,6 +36,9 @@ export const errorHandler: ErrorRequestHandler = (
   _next,
 ) => {
   const appError = normalizeError(error);
+  if (Number.isSafeInteger(appError.retryAfterSeconds) && appError.retryAfterSeconds! > 0) {
+    response.setHeader("Retry-After", String(appError.retryAfterSeconds));
+  }
   response.locals.errorCode = appError.code;
   const event = appError.code === "provider_throttled" ? "provider_throttled"
     : appError.status >= 500 ? "request_error" : "request_rejected";

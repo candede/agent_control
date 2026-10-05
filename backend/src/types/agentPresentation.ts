@@ -1,6 +1,6 @@
 import { formatAgentAuthoringTool, formatPackageFacetLabel, normalizePackageAuthoringTool, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
 import { powerPlatformAuthoringTool } from "./powerPlatformInventory.js";
-import type { SavedAgentPerson, UnifiedAgentInventoryQuery, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
+import type { SavedAgentPerson, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
 
 export type AgentRelevanceReason = "organization_created" | "organization_shared" | "microsoft" | "deployed" | "reported_usage";
 export type AgentColumnValue = string | number | null;
@@ -54,16 +54,6 @@ export function agentManagement(record: UnifiedAgentRecord): "user_managed" | "o
   return "unknown";
 }
 
-export function matchesAgentFilters(record: UnifiedAgentRecord,
-  query: Pick<UnifiedAgentInventoryQuery, "type" | "view" | "endUserAccess" | "reportedUsage" | "management" | "relevance">): boolean {
-  return (query.type === undefined || record.packages.some(item => item.type === query.type))
-    && matchesAgentView(record, query.view)
-    && (!query.endUserAccess || query.endUserAccess === "all" || agentUserAvailability(record) === query.endUserAccess)
-    && (!query.reportedUsage || query.reportedUsage === "all" || matchesAgentView(record, "used"))
-    && (!query.management || query.management === "all" || agentManagement(record) === query.management)
-    && (!query.relevance || query.relevance === "all" || matchesAgentView(record, query.relevance));
-}
-
 function hasAuthoringTool(record: UnifiedAgentRecord, tool: string) {
   return agentAuthoringToolLabels(record).some(label => normalizePackageAuthoringTool(label) === tool);
 }
@@ -81,7 +71,7 @@ export function agentUserAvailability(record: UnifiedAgentRecord): "available" |
   return "unknown";
 }
 
-export function agentUserAvailabilityLabel(record: UnifiedAgentRecord): string | null {
+function agentUserAvailabilityLabel(record: UnifiedAgentRecord): string | null {
   const availability = agentUserAvailability(record);
   if (availability === "unknown") return null;
   if (availability === "unavailable") return "Not available";
@@ -89,27 +79,7 @@ export function agentUserAvailabilityLabel(record: UnifiedAgentRecord): string |
     ? "All users" : "Specific users or groups";
 }
 
-export function summarizeAgentAvailability(records: readonly UnifiedAgentRecord[]) {
-  let availableToUsers = 0;
-  let organizationCreated = 0;
-  let teamsAvailable = 0;
-  let createdOrAvailable = 0;
-  for (const record of records) {
-    if (agentUserAvailability(record) === "available") availableToUsers += 1;
-    const created = agentRelevanceReasons(record).includes("organization_created");
-    const available = record.packages.some(item => {
-      const availability = normalizePackageStatus(item.availableTo);
-      return item.isBlocked === false && (availability === "all" || availability === "some")
-        && item.supportedHosts?.some(host => host.trim().toLowerCase() === "teams");
-    });
-    if (created) organizationCreated += 1;
-    if (available) teamsAvailable += 1;
-    if (created || available) createdOrAvailable += 1;
-  }
-  return { availableToUsers, organizationCreated, teamsAvailable, createdOrAvailable };
-}
-
-export function agentAccessLabel(value: string | undefined): string | null {
+function agentAccessLabel(value: string | undefined): string | null {
   switch (normalizePackageStatus(value)) {
     case "all": return "All users";
     case "some": return "Specific users or groups";
@@ -119,12 +89,18 @@ export function agentAccessLabel(value: string | undefined): string | null {
 }
 
 export function agentAccessSummary(record: UnifiedAgentRecord, target: "availableTo" | "deployedTo") {
+  if (target === "deployedTo" && record.columns && "deployment" in record.columns) {
+    return typeof record.columns.deployment === "string" ? record.columns.deployment : null;
+  }
   const values = [...new Set(record.packages.map(item => agentAccessLabel(item[target])))];
   return values.length === 0 ? null : values.length === 1 ? values[0]
     : values.includes(null) ? "Partially known" : "Varies by package";
 }
 
 export function agentStatusLabels(record: UnifiedAgentRecord): string[] {
+  if (record.columns && "status" in record.columns) {
+    return typeof record.columns.status === "string" && record.columns.status ? [record.columns.status] : [];
+  }
   const states = record.packages.map(item => item.isBlocked === true ? "Blocked" : item.isBlocked === false ? "Not blocked" : "Block status unknown");
   const distinct = [...new Set(states)];
   const blockStatus = distinct.length === 1 ? distinct[0] : distinct.length > 1
@@ -158,6 +134,7 @@ export function agentPersonLabel(person: SavedAgentPerson | undefined, nativeId:
 }
 
 export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgentSort, environmentNames: Readonly<Record<string, string>> = {}): AgentColumnValue {
+  if (record.columns && column in record.columns) return record.columns[column] ?? null;
   const resource = record.powerPlatformResource;
   const details = resource?.details;
   switch (column) {

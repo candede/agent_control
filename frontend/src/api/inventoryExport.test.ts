@@ -1,44 +1,46 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { downloadInventoryCsv, getInventoryRefreshJobs, getInventoryRefreshJob, getInventoryQuarantineSelection, subscribeSessionRevalidationRequired } from "./client";
+import { getInventoryRefreshJobs, getInventoryRefreshJob, getUnifiedAgentDetail, subscribeSessionRevalidationRequired } from "./client";
+import { createReportExport } from "./reportData";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-describe("inventory CSV request contract", () => {
-  it("forwards cancellation with the exact saved scope and server sort, without paging", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response("nativeId\nresource-a", { headers: { "Content-Type": "text/csv" } }));
+describe("durable inventory export request contract", () => {
+  it("forwards cancellation and only the pinned selection, without resending filters or paging", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ id: "export" }));
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
-    await downloadInventoryCsv({
-      snapshotId: "saved-snapshot", search: "Agent & bot",
-      sortBy: "environmentId", sortDirection: "desc",
-    }, controller.signal);
+    await createReportExport({ kind: "power_platform_agents", selectionId: "saved-selection" }, controller.signal);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-      "/api/inventory/export.csv?snapshotId=saved-snapshot&search=Agent+%26+bot&sortBy=environmentId&sortDirection=desc",
-      { signal: controller.signal, credentials: "include", headers: { Accept: "text/csv" } },
+      "/api/data-exports",
+      expect.objectContaining({ signal: controller.signal, credentials: "include",
+        body: expect.any(String) }),
     );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      kind: "power_platform_agents", selectionId: "saved-selection", idempotencyKey: expect.stringMatching(/^[a-f0-9-]{36}$/),
+    });
   });
 
-  it("rejects a delayed CSV body after caller cancellation even when the transport ignores abort", async () => {
-    let resolve!: (value: Blob) => void;
-    const response = new Response("", { headers: { "Content-Type": "text/csv" } });
-    vi.spyOn(response, "blob").mockImplementation(() => new Promise<Blob>(done => { resolve = done; }));
+  it("rejects delayed export metadata after cancellation even when the transport ignores abort", async () => {
+    let resolve!: (value: { id: string }) => void;
+    const response = Response.json({});
+    vi.spyOn(response, "json").mockImplementation(() => new Promise<{ id: string }>(done => { resolve = done; }));
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
     const controller = new AbortController();
-    const pending = downloadInventoryCsv({ snapshotId: "saved-snapshot" }, controller.signal);
+    const pending = createReportExport({ kind: "power_platform_agents", selectionId: "saved-selection" }, controller.signal);
     const rejected = expect(pending).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
-    await vi.waitFor(() => expect(response.blob).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(response.json).toHaveBeenCalledOnce());
     controller.abort();
-    resolve(new Blob(["obsolete"]));
+    resolve({ id: "obsolete" });
     await rejected;
   });
 
-  it("does not start an already-cancelled CSV request", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response("csv"));
+  it("does not start already-cancelled export creation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ id: "export" }));
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
     controller.abort();
-    await expect(downloadInventoryCsv({ snapshotId: "saved-snapshot" }, controller.signal)).rejects.toMatchObject({ code: "request_aborted" });
+    await expect(createReportExport({ kind: "power_platform_agents", selectionId: "saved-selection" }, controller.signal)).rejects.toMatchObject({ code: "request_aborted" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -64,7 +66,7 @@ describe("inventory saved-read authorization boundaries", () => {
     const unsubscribe = subscribeSessionRevalidationRequired(onSessionDenied);
     try {
       const resourceRead = () => readSavedQuery(client, ["inventory-selection"], signal =>
-        getInventoryQuarantineSelection("saved-snapshot", ["agent-a"], { signal }), new AbortController().signal);
+        getUnifiedAgentDetail("saved-selection", "agent-a", { signal }), new AbortController().signal);
       const outcomes = Promise.allSettled([
         resourceRead(), resourceRead(),
         readSavedQuery(client, ["inventory-exact-job"], signal =>
@@ -74,10 +76,10 @@ describe("inventory saved-read authorization boundaries", () => {
       ]);
       expect(fetchMock).toHaveBeenCalledTimes(3);
       const signals = fetchMock.mock.calls.map(([, options]) => (options as RequestInit).signal);
-      await expect(downloadInventoryCsv({ snapshotId: "saved-snapshot" })).rejects.toMatchObject({ status, code });
+      await expect(createReportExport({ kind: "unified_agents", selectionId: "saved-selection" })).rejects.toMatchObject({ status, code });
       expect(onSessionDenied).toHaveBeenCalledTimes(revokeSession ? 1 : 0);
       expect(signals.every(signal => signal?.aborted === revokeSession)).toBe(true);
-      complete[0](Response.json({ value: [], snapshot: null }));
+      complete[0](Response.json({ id: "agent-a" }));
       complete[1](Response.json({ value: [] }));
       complete[2](Response.json({ value: [], lastAttemptAt: null, lastSuccessAt: null }));
       const results = await outcomes;

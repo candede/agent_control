@@ -1,97 +1,37 @@
-import { useMemo, useState } from "react";
-import type { SortingState } from "@tanstack/react-table";
-import type { OfficialUsageUserSummary, OfficialUsageUserView } from "../api/client";
-import { useListTable, type ListColumn } from "../listTable";
+import { useState } from "react";
+import type { ReportQuery, ReportRelationship } from "../../../backend/src/types/officialReportData";
+import { useReportPage } from "../useReportPage";
 import { usageCount, usageDate } from "../usageInsights";
-import { ListTableHead } from "./ListTableHead";
+import { ReportReadStatus, ReportPageControls } from "./ReportPageControls";
+import { ReportSortHeading } from "./ReportSortHeading";
 
-export type UserRelationshipFilters = Pick<OfficialUsageUserView["filters"], "agentId" | "creatorType" | "responsesOnly">;
-const pageSize = 50;
-
-export function ReportedUserAgents({ user, filters, onFocusAgent }: {
-  user: OfficialUsageUserSummary;
-  filters?: UserRelationshipFilters;
-  onFocusAgent?: (agentId: string, reportSetId: string) => void;
+export type UserRelationshipFilters = Pick<ReportQuery, "agentId" | "creatorType" | "responsesOnly">;
+export function ReportedUserAgents({ path, selectionId, filters, onFocusAgent, onRestartSelection }: {
+  path: string; selectionId: string; filters?: UserRelationshipFilters; onFocusAgent?: (agentId: string, reportSetId: string) => void;
+  onRestartSelection?: () => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [page, setPage] = useState(0);
-  const [showAll, setShowAll] = useState(false);
-  const [sorting, setSorting] = useState<SortingState>([{ id: "responses", desc: true }]);
-  const constrained = Boolean(filters?.agentId || filters?.creatorType || filters?.responsesOnly);
-  const rows = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return user.rows.filter(row => {
-      if (!showAll && filters) {
-        if (filters.agentId !== undefined && row.agentId !== filters.agentId) return false;
-        if (filters.creatorType && row.creatorType !== filters.creatorType) return false;
-        if (filters.responsesOnly && !row.hasResponses) return false;
-      }
-      return !query || [row.displayAgentName, row.agentId, row.creatorType].some(value => value.toLowerCase().includes(query));
-    });
-  }, [filters, search, showAll, user.rows]);
-  const columns = useMemo<ListColumn<OfficialUsageUserSummary["rows"][number]>[]>(() => [
-    { id: "agent", header: "Agent", accessorFn: row => row.displayAgentName || row.agentId },
-    { id: "creator", header: "Creator", accessorFn: row => row.creatorType || undefined },
-    { id: "responses", header: "Responses to this user", accessorFn: row => row.responsesSentToUsers, sortDescFirst: true },
-    { id: "activity", header: "Agent-wide last activity", accessorFn: row => row.lastActivityDateUtc, sortDescFirst: true },
-  ], []);
-  const table = useListTable({
-    data: rows,
-    columns,
-    sorting,
-    getRowId: row => row.agentId,
-    onSortingChange: update => {
-      setSorting(previous => typeof update === "function" ? update(previous) : update);
-      setPage(0);
-    },
-  });
-  const sortedRows = table.getRowModel().rows;
-  const lastPage = Math.max(0, Math.ceil(rows.length / pageSize) - 1);
-  const currentPage = Math.min(page, lastPage);
-  const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
-  const reportSetId = user.datasetScope.reportSetId;
-  const hasCompanion = Boolean(user.datasetScope.userAgentsVersionId);
-
-  return <section className="reported-user-agents" aria-label="Reported agent relationships">
-    <h3>Reported agents</h3>
-    <div className="copilot-users-toolbar">
-      <label><span>Search this user&apos;s agents</span><input type="search" value={search} maxLength={256} placeholder="Agent name, exact ID or creator" onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
-      {constrained ? <button type="button" className="secondary" onClick={() => { setShowAll(value => !value); setPage(0); }}>
-        {showAll ? "Show matching relationships" : "Show all this user's agents"}
-      </button> : null}
-      {search ? <button type="button" className="secondary" onClick={() => { setSearch(""); setPage(0); }}>Clear agent search</button> : null}
-    </div>
-    {constrained ? <p className="reported-users-note">{showAll
-      ? "Showing all reported agents for this user."
-      : "Showing agents matching the selected filters."}</p> : null}
-    {visible.length ? <>
-      <div className="copilot-users-table-shell" role="region" aria-label="User agent breakdown" tabIndex={0}>
-        <table className="copilot-users-table reported-agent-table">
-          <ListTableHead table={table} />
-          <tbody>{visible.map(tableRow => {
-            const row = tableRow.original;
-            return <tr key={tableRow.id}>
-            <td>{reportSetId && onFocusAgent ? <button type="button" className="reported-agent-button"
-              aria-label={`${row.displayAgentName || row.agentId}: active users without paid Copilot`}
-              title={`Show active users without paid Copilot for report agent ${row.agentId}`}
-              onClick={() => onFocusAgent(row.agentId, reportSetId)}>{row.displayAgentName || row.agentId}</button> : row.displayAgentName || row.agentId}<small>{row.agentId}</small></td>
-            <td>{row.creatorType || "Unknown"}</td>
-            <td data-numeric>{usageCount(row.responsesSentToUsers)}</td>
-            <td>{usageDate(row.lastActivityDateUtc)}</td>
-          </tr>;
-          })}</tbody>
-        </table>
-      </div>
-      <div className="copilot-users-pagination" aria-label="User agent pages">
-        <span>{(currentPage * pageSize + 1).toLocaleString()}-{Math.min((currentPage + 1) * pageSize, rows.length).toLocaleString()} of {rows.length.toLocaleString()} agents</span>
-        <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous agents</button>
-        <button type="button" className="secondary" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>Next agents</button>
-      </div>
-    </> : <div className="reported-users-empty">
-      <h4>{user.rows.length ? "No agent relationships match" : hasCompanion ? "No agent relationships reported" : "Agent relationships unavailable"}</h4>
-      <p>{user.rows.length ? "Clear the agent search or show all this user's agents."
-        : hasCompanion ? "No agents are listed for this user in the selected report."
-          : "Add the Users & agents CSV in Sync to see this user's agents."}</p>
-    </div>}
+  const [search, setSearch] = useState(""), [showAll, setShowAll] = useState(false);
+  const [sort, setSort] = useState<ReportQuery["sort"]>("responses"), [order, setOrder] = useState<ReportQuery["order"]>("desc");
+  const read = useReportPage<ReportRelationship>(path, { selectionId, ...(showAll ? {} : filters), search: search || undefined, sort, order }, 0, true, onRestartSelection);
+  const data = read.data;
+  return <section className="reported-user-agents" aria-label="Reported agent relationships"><h3>Reported agents</h3>
+    <div className="copilot-users-toolbar"><label>Search this user's agents<input type="search" maxLength={256} value={search} onChange={event => setSearch(event.target.value)} /></label>
+      <label>Sort relationships<select value={sort} onChange={event => setSort(event.target.value as ReportQuery["sort"])}>
+        <option value="responses">Responses to this user</option><option value="name">Agent</option><option value="creatorType">Creator</option><option value="lastActivity">Agent-wide last activity</option></select></label>
+      <label>Order<select value={order} onChange={event => setOrder(event.target.value as ReportQuery["order"])}><option value="desc">Descending</option><option value="asc">Ascending</option></select></label>
+      {filters ? <button type="button" onClick={() => setShowAll(value => !value)}>{showAll ? "Show matching relationships" : "Show all this user's agents"}</button> : null}
+      {search ? <button type="button" onClick={() => setSearch("")}>Clear agent search</button> : null}</div>
+    <ReportReadStatus read={read} />
+    <div className="copilot-users-table-shell" role="region" aria-label="User agent breakdown" tabIndex={0}><table className="copilot-users-table reported-agent-table"><thead><tr>
+      {([["Agent", "name"], ["Creator", "creatorType"], ["Responses to this user", "responses"], ["Agent-wide last activity", "lastActivity"]] as const).map(([label, column]) =>
+        <ReportSortHeading key={column} label={label} sort={column} query={{ sort, order }} onChange={query => { setSort(query.sort); setOrder(query.order); }} />)}</tr></thead>
+      <tbody>{data?.value.map(row => <tr key={row.id}><td>{onFocusAgent && data.reports.setId ? <button type="button" className="reported-agent-button"
+        aria-label={`${row.agentName || row.agentId}: active users without paid Copilot`} title={`Show active users without paid Copilot for report agent ${row.agentId}`}
+        onClick={() => onFocusAgent(row.agentId, data.reports.setId!)}>{row.agentName || row.agentId}</button> : row.agentName || row.agentId}<small>{row.agentId}</small></td>
+        <td>{row.creatorType || "Unknown"}</td><td>{usageCount(row.responses)}</td><td>{usageDate(row.lastActivityDateUtc)}</td></tr>)}</tbody></table></div>
+    {data ? <>
+      {!data.value.length ? <p>{data.counts.filtered > 0 ? "No relationships on this page. Continue to the next page."
+        : data.reports.lineages.some(lineage => lineage.kind === "userAgents") ? "No agent relationships match." : "Agent relationships unavailable. Import Users & agents in Sync."}</p> : null}
+      <ReportPageControls {...read} label="agents" /></> : null}
   </section>;
 }

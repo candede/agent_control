@@ -5,10 +5,19 @@ $repositoryRoot=Split-Path $PSScriptRoot -Parent
 $scratchRoot=Join-Path $repositoryRoot 'artifacts/test-scratch'
 $testRoot=Join-Path $scratchRoot "agent control tests $([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory($testRoot) | Out-Null
+foreach ($file in @('Dockerfile','compose.yaml','compose.large-tenant-test.yaml')) {
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot $file) -Destination (Join-Path $testRoot $file)
+}
 $script:Calls=[Collections.Generic.List[string]]::new()
 $script:Failure=''
+$script:DockerExit=0
 $script:Volumes=[Collections.Generic.HashSet[string]]::new()
 $script:ComposeVersion='2.30.0'
+$script:EngineIdentity='fixture-engine/29.7.2/arm64/linux'
+$script:OperatorImage='sha256:' + ('a' * 64)
+$script:PostgresImage='sha256:' + ('b' * 64)
+$script:HealthCalls=0
+$script:ChangedFixtureInput=''
 $script:NoDocker=$false
 $script:Checks=0
 $script:AuthConfigured=$true
@@ -17,6 +26,12 @@ $script:Prompts=[Collections.Generic.List[string]]::new()
 $script:Answers=[Collections.Generic.Queue[string]]::new()
 $script:WizardTrace=[Collections.Generic.List[string]]::new()
 $script:FixtureCalls=[Collections.Generic.List[object]]::new()
+$script:FixtureContainers=@{}
+$script:AppContainers=@{}
+$script:WorkloadExit=0
+$script:WorkloadRunningReads=1
+$script:FixtureLog='synthetic diagnostics'
+$script:UnsafeFixtureMount=$false
 $script:MonitoredMarker=''
 $script:MarkerCalls=[Collections.Generic.List[object]]::new()
 function Read-Host {
@@ -46,6 +61,10 @@ function Get-Command {
     if ($Name -eq 'docker') { if (-not $script:NoDocker) { return @{Name='docker'} }; return }
     Microsoft.PowerShell.Core\Get-Command $Name -ErrorAction $ErrorAction
 }
+function git {
+    $global:LASTEXITCODE=0
+    return "Dockerfile`0compose.yaml`0compose.large-tenant-test.yaml`0"
+}
 function Invoke-TestDocker {
     param([string[]]$Arguments,[switch]$Capture)
     $line=$Arguments -join '|'; $script:Calls.Add($line)
@@ -66,9 +85,92 @@ function Invoke-TestDocker {
         })
     }
     if ($script:Failure -and $line -match $script:Failure) { throw 'Simulated Docker failure (redacted).' }
-    if ($Arguments[0] -eq 'info') { return '29.7.2' }
+    if ($Arguments[0] -eq 'build') {
+        [IO.File]::WriteAllText($Arguments[[Array]::IndexOf($Arguments,'--iidfile')+1],$script:OperatorImage)
+        return
+    }
+    if ($Arguments[0] -eq 'run' -and $Arguments -contains 'backend/scripts/database.ts' -and ($Arguments -contains 'preflight' -or $Arguments -contains 'preflight-reset')) {
+        return (@{state='current';currentFingerprint=('1'*64);targetFingerprint=('1'*64)} | ConvertTo-Json -Compress)
+    }
+    if ($Arguments[0] -eq 'stop') { $script:AppContainers[$Arguments[-1]].running=$false; return }
+    if ($projectIndex -ge 0 -and $Arguments[$projectIndex+1] -notmatch '^agent-control-check-') {
+        $project=$Arguments[$projectIndex+1]
+        $app=@($script:AppContainers.Values | Where-Object { $_.project -ceq $project }) | Select-Object -First 1
+        if ($Arguments -contains 'up' -and $Arguments[-1] -eq 'app') {
+            if (-not $app) {
+                $app=@{project=$project;root=$Arguments[[Array]::IndexOf($Arguments,'--project-directory')+1];running=$true}
+                $script:AppContainers[([Guid]::NewGuid().ToString('N') + ('0' * 32))]=$app
+            }
+            $app.running=$true
+        }
+        if ($app -and $Arguments -contains 'stop') { $app.running=$false }
+    }
+    if ($projectIndex -ge 0 -and $Arguments[$projectIndex+1] -match '^agent-control-check-([a-f0-9]{32})$') {
+        $project=$Arguments[$projectIndex+1]
+        $suffix=$Matches[1]
+        if ($Arguments -contains 'up') { $script:FixtureContainers["a$suffix"]=@{project=$project;service='test-postgres';reads=0} }
+        if ($Arguments -contains 'run') {
+            if ($script:ChangedFixtureInput) { [IO.File]::AppendAllText($script:ChangedFixtureInput,"`n# changed during qualification`n") }
+            $id="b$suffix"
+            $evidence=($Arguments[[Array]::IndexOf($Arguments,'-v')+1] -replace ':/evidence$','')
+            $script:FixtureContainers[$id]=@{project=$project;service='test-db';reads=0;evidence=$evidence}
+            return $id
+        }
+        if ($Arguments -contains 'down') {
+            foreach ($id in @($script:FixtureContainers.Keys)) {
+                if ($script:FixtureContainers[$id].project -eq $project) { $script:FixtureContainers.Remove($id) }
+            }
+        }
+    }
+    if ($Arguments[0] -eq 'ps') {
+        if ($Arguments[-1].StartsWith('volume=')) {
+            $volume=($Arguments[-1] -split '=')[-1]
+            return (@($script:FixtureContainers.Keys | Where-Object { $_.PadRight(64,'0') -eq $volume }) -join "`n")
+        }
+        $project=($Arguments[-1] -split '=')[-1]
+        return ((@($script:FixtureContainers.Keys | Where-Object { $script:FixtureContainers[$_].project -eq $project }) +
+            @($script:AppContainers.Keys | Where-Object { $script:AppContainers[$_].project -eq $project })) -join "`n")
+    }
+    if ($Arguments[0] -eq 'inspect') {
+        if ($script:AppContainers.ContainsKey($Arguments[-1])) {
+            $app=$script:AppContainers[$Arguments[-1]]
+            if ($Arguments[2] -eq '{{json .Config.Labels}}') { return (@{'com.docker.compose.project'=$app.project;'com.docker.compose.project.working_dir'=$app.root;'com.docker.compose.service'='app'} | ConvertTo-Json -Compress) }
+            if ($Arguments[2] -eq '{{.Image}}') { return $script:OperatorImage }
+            if ($Arguments[2] -eq '{{json .State}}') { return (@{Running=$app.running;Health=@{Status='healthy'}} | ConvertTo-Json -Compress) }
+            throw 'Unknown application inspection.'
+        }
+        $container=$script:FixtureContainers[$Arguments[-1]]
+        if (-not $container) { throw 'Unknown fixture container.' }
+        if ($Arguments[2] -match 'compose.project') { return $container.project }
+        if ($Arguments[2] -match 'compose.service') { return $container.service }
+        if ($Arguments[2] -eq '{{.Image}}') { return $script:PostgresImage }
+        if ($Arguments[2] -match 'Mounts') {
+            if ($script:UnsafeFixtureMount) { return '[{"Destination":"/run/secrets/protected","Source":"/protected-sentinel","Type":"bind"}]' }
+            if ($container.service -eq 'test-db') {
+                return (@(@{Destination='/var/lib/postgresql/data';Type='volume';Name=$Arguments[-1].PadRight(64,'0')},
+                    @{Destination='/evidence';Type='bind';Source=$container.evidence}) | ConvertTo-Json -Compress -AsArray)
+            }
+            return (@(@{Destination='/var/lib/postgresql/data';Type='volume';Name="$($container.project)_large-tenant-data"}) | ConvertTo-Json -Compress -AsArray)
+        }
+        if ($Arguments[2] -match 'State') {
+            $container.reads++
+            return (@{Running=($container.service -eq 'test-postgres' -or $container.reads -le $script:WorkloadRunningReads);ExitCode=$script:WorkloadExit;OOMKilled=($script:WorkloadExit -eq 137)} | ConvertTo-Json -Compress)
+        }
+    }
+    if ($Arguments[0] -eq 'exec') { return 'memory.peak unavailable' }
+    if ($Arguments[0] -eq 'logs') {
+        if ($Arguments[2] -eq 'all') { return $script:FixtureLog }
+        return (($script:FixtureLog -split "`n" | Select-Object -Last ([int]$Arguments[2])) -join "`n")
+    }
+    if ($Arguments[0] -eq 'rm') { $script:FixtureContainers.Remove($Arguments[-1]); return }
+    if ($Arguments[0] -eq 'image' -and $Arguments[1] -eq 'inspect') { return $script:OperatorImage }
+    if ($Arguments[0] -eq 'info') { return $script:EngineIdentity }
     if ($line -eq 'compose|version|--short') { return $script:ComposeVersion }
-    if ($Arguments[0] -eq 'volume') { return ($script:Volumes -join "`n") }
+    if ($Arguments[0] -eq 'volume') {
+        if ($Arguments -contains 'inspect' -and $Arguments -contains '{{json .Labels}}') { return '{"com.docker.volume.anonymous":""}' }
+        if ($Arguments -contains '--filter') { return '' }
+        return ($script:Volumes -join "`n")
+    }
     if ($line -match '\|postgres$') {
         $projectIndex=[Array]::IndexOf($Arguments,'-p')
         if ($projectIndex -ge 0) { $script:Volumes.Add("$($Arguments[$projectIndex+1])_data") | Out-Null }
@@ -76,22 +178,32 @@ function Invoke-TestDocker {
 }
 function docker {
     param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
-    $global:LASTEXITCODE=0
+    $global:LASTEXITCODE=$script:DockerExit
     Invoke-TestDocker $Arguments
 }
 function Invoke-RestMethod {
     param([string]$Uri,[int]$TimeoutSec)
     if ($Uri.EndsWith('/api/ready')) { return @{ok=$true} }
-    if ($Uri.EndsWith('/api/auth/status')) { return @{authConfigured=$script:AuthConfigured} }
+    if ($Uri.EndsWith('/api/auth/status')) { $script:HealthCalls++; return @{authConfigured=$script:AuthConfigured} }
     throw 'Unexpected readiness URL.'
 }
 function Get-LocalHealth {
     param([string]$Url)
+    $script:HealthCalls++
     Assert-True ($Url -match '^http://localhost:\d+$') 'Deployment health must not depend on tunnel reachability.'
     return @{authConfigured=$script:AuthConfigured;callback="$Url/api/auth/callback"}
 }
 function Assert-True { param([bool]$Condition,[string]$Message) if (-not $Condition) { throw $Message }; $script:Checks++ }
 function Assert-Fails { param([scriptblock]$Command,[string]$Pattern) try { & $Command; throw 'Expected failure did not occur' } catch { Assert-True ($_.Exception.Message -match $Pattern) "Unexpected failure: $($_.Exception.Message)" } }
+function Assert-QualificationWorkloads {
+    param($Context,[int]$Expected,[switch]$ForceChecks)
+    $offset=$script:Calls.Count
+    $messages=@(Invoke-LocalSoftwareChecks $Context -ForceChecks:$ForceChecks 6>&1)
+    $calls=@($script:Calls | Select-Object -Skip $offset)
+    Assert-True (@($calls | Where-Object { $_ -match 'backend/scripts/test-all\.ts$' }).Count -eq $Expected) "Expected $Expected expensive qualification workloads."
+    Assert-True (@($calls | Where-Object { $_ -match '\|down\|--volumes\|--remove-orphans$' }).Count -eq 1) 'Explicit qualification bypassed fresh fixture cleanup.'
+    Assert-True (-not ($messages -join "`n").Contains('REUSED')) 'Explicit qualification reused a previous run.'
+}
 function Get-UniqueCallIndex {
     param([string[]]$Calls,[string]$Pattern)
     $indices=@(for ($index=0; $index -lt $Calls.Count; $index++) { if ($Calls[$index] -match $Pattern) { $index } })
@@ -102,10 +214,13 @@ function New-FixtureContext {
     param([string]$Name,[int]$Port=14391)
     $fixture=New-LocalContext $testRoot $Name
     [IO.Directory]::CreateDirectory($fixture.State) | Out-Null
-    [IO.File]::WriteAllText((Join-Path $fixture.State 'settings.json'),(@{port=$Port;tenantId='';clientId=''} | ConvertTo-Json))
+    [IO.File]::WriteAllText((Join-Path $fixture.State 'settings.json'),(@{port=$Port} | ConvertTo-Json))
     [IO.Directory]::CreateDirectory((Join-Path $fixture.State 'secrets')) | Out-Null
-    [IO.File]::WriteAllText((Join-Path $fixture.State 'secrets/client-secret'),'')
-    return New-LocalContext $testRoot $Name
+    $fixture=New-LocalContext $testRoot $Name
+    $fixture.RuntimeImageId=$script:OperatorImage
+    Write-LocalText (Join-Path $fixture.State 'deployment.json') (@{version=1;runtimeImage=$script:OperatorImage;configuration=('A'*64);database=('A'*64)} | ConvertTo-Json)
+    $script:AppContainers[([Guid]::NewGuid().ToString('N') + ('0' * 32))]=@{project=$fixture.Project;root=$fixture.Root;running=$true}
+    return $fixture
 }
 function Get-ConfigSnapshot {
     param($Context)
@@ -126,6 +241,80 @@ function Assert-ConfigUnchanged {
     }
 }
 try {
+    Assert-True (@(Get-FixtureFailureMessages $null).Count -eq 0) 'Successful fixture receipt contains a failure.'
+    $primary=[Exception]::new('Fixture workload failed: exit=17, OOMKilled=False.')
+    Assert-True (@(Get-FixtureFailureMessages $primary)[0] -ceq $primary.Message) 'Fixture receipt lost its primary failure.'
+    $combined=[AggregateException]::new('combined',[Exception[]]@(
+        [AggregateException]::new('nested',[Exception[]]@($primary,[Exception]::new('capture failed'))),
+        [Exception]::new('cleanup failed')))
+    $failureMessages=@(Get-FixtureFailureMessages $combined)
+    Assert-True ($failureMessages.Count -eq 3 -and $failureMessages -contains $primary.Message -and $failureMessages -contains 'capture failed' -and $failureMessages -contains 'cleanup failed') 'Fixture receipt lost combined failures.'
+    $script:FixtureLog="PASSWORD 'synthetic-dont-print'`nauthorization: Bearer synthetic-bearer`n`"token`":`"synthetic-token`"`nPGPASSWORD=isolated-fixture-admin-password-never-production-01"
+    $sanitized=Get-RedactedFixtureLog 'synthetic-id' '200'
+    Assert-True (-not ($sanitized -match 'synthetic-dont-print|synthetic-bearer|synthetic-token|isolated-fixture-admin-password')) 'Fixture diagnostics exposed credentials.'
+    try {
+        $script:DockerExit=1
+        $script:FixtureLog="Logging driver cannot read logs`npassword=synthetic-capture-secret"
+        $captureFailure=$null
+        try { Get-RedactedFixtureLog 'synthetic-id' 'all' } catch { $captureFailure=$_.Exception }
+        Assert-True ($null -ne $captureFailure -and $captureFailure.Message.Contains('Logging driver cannot read logs') -and
+            $captureFailure.Message.Contains('[redacted]') -and -not $captureFailure.Message.Contains('synthetic-capture-secret')) 'Captured Docker failure hid its cause or exposed its secret.'
+    } finally { $script:DockerExit=0 }
+    $phaseState=@{Phases=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);Preview=''}
+    $phaseLog="[AUTOMATED CHECKS 1/5] RUN Backend tests`nCommand: npm run test --workspace backend`n" +
+        ((1..2500 | ForEach-Object { '{"measurement":' + $_ + '}' }) -join "`n") +
+        "`nbackend tests are progressing"
+    $phaseMessages=@(Write-FixtureProgress $phaseLog $phaseState 6>&1)
+    Assert-True ($phaseMessages.Count -eq 2 -and $phaseMessages[0].ToString().Contains('RUN Backend tests') -and
+        $phaseMessages[1].ToString().Contains('backend tests are progressing')) 'Busy test logs hid a phase or flooded the terminal with measurement JSON.'
+    Assert-True (@(Write-FixtureProgress $phaseLog $phaseState 6>&1).Count -eq 0) 'Unchanged logs replayed stale progress.'
+    $phaseMessages=@(Write-FixtureProgress "$phaseLog`n[AUTOMATED CHECKS 1/5] PASS Backend tests`n[AUTOMATED CHECKS 2/5] RUN Frontend tests" $phaseState 6>&1)
+    Assert-True ($phaseMessages.Count -eq 2 -and $phaseMessages[0].ToString().Contains('PASS Backend tests') -and
+        $phaseMessages[1].ToString().Contains('RUN Frontend tests')) 'Fast phase transitions were lost or replayed old log previews.'
+    $script:FixtureLog='synthetic diagnostics'
+    $mountIdentity=[Guid]::NewGuid().ToString('N')
+    $mountProject="agent-control-check-$mountIdentity"
+    $mountContainer="b$mountIdentity"
+    $mountEvidence=Join-Path $testRoot $mountIdentity
+    $script:FixtureContainers[$mountContainer]=@{project=$mountProject;service='test-db';reads=0;evidence=$mountEvidence}
+    try {
+        $script:UnsafeFixtureMount=$true
+        $beforeMountCheck=$script:Calls.Count
+        Assert-Fails { Remove-OwnedFixture @('compose') $mountProject $mountEvidence } 'Unexpected mount'
+        $script:UnsafeFixtureMount=$false
+        $script:FixtureContainers[$mountContainer].evidence=Join-Path $testRoot "unexpected/$mountIdentity"
+        Assert-Fails { Remove-OwnedFixture @('compose') $mountProject $mountEvidence } 'Unexpected mount'
+        $script:FixtureContainers[$mountContainer].evidence=$mountEvidence
+        $mountCalls=@($script:Calls | Select-Object -Skip $beforeMountCheck)
+        Assert-True (@($mountCalls | Where-Object { $_ -match '^rm\||\|down\|' }).Count -eq 0) 'Unsafe fixture mount reached destructive cleanup.'
+        $script:UnsafeFixtureMount=$false
+        Remove-OwnedFixture @('compose') $mountProject $mountEvidence
+        Assert-True ($script:Calls -contains "rm|-f|-v|$mountContainer") 'Disposable worker anonymous volumes were not removed with their verified owner.'
+    } finally {
+        $script:UnsafeFixtureMount=$false
+        $script:FixtureContainers.Remove($mountContainer)
+    }
+    $timeoutId=[Guid]::NewGuid().ToString('N')
+    $timeoutProject="agent-control-check-$timeoutId"
+    $timeoutEvidence=Join-Path $testRoot $timeoutId
+    $timeoutScratch=Join-Path $testRoot "timeout-$timeoutId"
+    [IO.Directory]::CreateDirectory($timeoutEvidence) | Out-Null
+    [IO.Directory]::CreateDirectory($timeoutScratch) | Out-Null
+    $timeoutEnvironment=Join-Path $timeoutScratch 'compose.env'
+    [IO.File]::WriteAllText($timeoutEnvironment,'')
+    $timeoutCompose=@('compose','--env-file',$timeoutEnvironment,'-p',$timeoutProject)
+    try {
+        $script:WorkloadRunningReads=[int]::MaxValue
+        $script:FixtureLog='deadline diagnostic evidence'
+        Assert-Fails { Invoke-OwnedFixtureWorkload $timeoutCompose $timeoutProject $timeoutEvidence @('synthetic-command') -TimeoutSeconds 1 6>$null } 'exceeded the 00:01 deadline'
+        Assert-True ([IO.File]::ReadAllText((Join-Path $timeoutEvidence "b$timeoutId.log")).Contains('deadline diagnostic evidence')) 'Timeout lost its final logs.'
+        $finalCapture=Get-Content -LiteralPath (Join-Path $timeoutEvidence 'capture.jsonl') -Tail 1 | ConvertFrom-Json
+        Assert-True $finalCapture.final 'Timeout did not capture final container diagnostics.'
+    } finally {
+        $script:WorkloadRunningReads=1
+        $script:FixtureLog='synthetic diagnostics'
+        Remove-OwnedFixture $timeoutCompose $timeoutProject $timeoutEvidence
+    }
     $guidance=(Show-LocalRegistrationGuidance 6>&1) -join "`n"
     foreach ($permission in @('openid','profile','offline_access','CopilotPackages.Read.All','CopilotPackages.ReadWrite.All','User.ReadBasic.All','Group.Read.All','User.Read.All','LicenseAssignment.Read.All','Reports.Read.All','AgentIdentity.Read.All','AuditLogsQuery.Read.All','ThreatHunting.Read.All','ResourceQuery.Resources.Read','CopilotStudio.AdminActions.Invoke')) {
         Assert-True ($guidance.Contains($permission)) "Registration guidance omitted permission $permission."
@@ -151,7 +340,14 @@ try {
     Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
     Assert-True ($entry.Parameters['DbReset'].Aliases -contains 'db-reset') 'The db-reset spelling must select the same switch.'
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 3) 'Entry point must expose only Command, Project and DbReset.'
+    Assert-True ($entry.Parameters['ForceChecks'].ParameterType -eq [Management.Automation.SwitchParameter]) 'ForceChecks must be an opt-in switch.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 4) 'Entry point must expose only Command, Project, DbReset and ForceChecks.'
+    foreach ($contract in @(
+        @{file='large-tenant-tests.ps1';call='Invoke-LocalSoftwareChecks @{Root=$root;Operator=$image} -ForceChecks'},
+        @{file='persistence.tests.ps1';call="Invoke-LocalDeployment `$context 'Deploy' -ForceChecks"}
+    )) {
+        Assert-True ([IO.File]::ReadAllText((Join-Path $PSScriptRoot $contract.file)).Contains($contract.call)) "Explicit validation runner $($contract.file) must force fresh qualification."
+    }
     Assert-True ($entry.Parameters['Command'].Aliases -contains 'Action') 'Entry point must accept -Action as an alias for Command.'
     $defaultProject=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Project' }).DefaultValue.Value
     Assert-True ($defaultProject -ceq 'agent-control') 'Default project changed.'
@@ -196,7 +392,8 @@ try {
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try { Assert-Fails { Assert-LocalPort $listener.LocalEndpoint.Port } 'occupied' } finally { $listener.Stop() }
     foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
-    foreach ($failure in @('^build\|','\|migrate$','\|--wait-timeout\|90\|postgres$','\|--wait-timeout\|90\|app$')) {
+    Initialize-LocalState $context $false -Onboard 6>$null
+    foreach ($failure in @('^build\|','\|initialize$','\|--wait-timeout\|90\|postgres$','\|--wait-timeout\|90\|app$')) {
         $script:Failure=$failure
         Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Simulated'
     }
@@ -261,72 +458,73 @@ try {
     Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'settings.json')).Contains($tenant)) 'Another project changed the original identity.'
     Assert-True ([IO.File]::ReadAllText((Join-Path $customerContext.State 'secrets/postgres-app')) -cne $before) 'Projects shared generated database credentials.'
 
-    $migrated=New-FixtureContext 'legacy-tenant-upgrade'
-    Initialize-LocalState $migrated $false
-    $legacySettings=Join-Path $migrated.State 'settings.json'
-    [IO.File]::WriteAllText($legacySettings,(@{port=14391;publicUrl='https://legacy.example.com';tenantId=$tenant;clientId=$client;note='retained legacy settings'} | ConvertTo-Json))
-    $legacySecret=Join-Path $migrated.State 'secrets/client-secret'
-    [IO.File]::WriteAllText($legacySecret," $clientSecret`n")
-    $legacySnapshot=Get-ConfigSnapshot $migrated
-    $script:Volumes.Add($migrated.Volume) | Out-Null
+    $registryContext=New-FixtureContext 'current-tenant-registry'
+    Initialize-LocalState $registryContext $false
+    $registrySettingsPath=Join-Path $registryContext.State 'settings.json'
+    [IO.File]::WriteAllText($registrySettingsPath,(@{port=14391;publicUrl='https://registry.example.com';note='retained settings'} | ConvertTo-Json))
+    $legacySecret=Join-Path $registryContext.State 'secrets/client-secret'
+    [IO.File]::WriteAllText($legacySecret,'unused-standalone-credential')
+    $registryPath=Join-Path $registryContext.State 'secrets/tenants.json'
+    [IO.File]::WriteAllText($registryPath,(ConvertTo-Json -InputObject @(@{tenantId=$tenant;clientId=$client;clientSecret=$clientSecret;domains=@('contoso.com','contoso.onmicrosoft.com')}) -Depth 6))
+    $registrySnapshot=Get-ConfigSnapshot $registryContext
+    $script:Volumes.Add($registryContext.Volume) | Out-Null
     $promptCount=$script:Prompts.Count
     $callCount=$script:Calls.Count
-    $script:Answers.Enqueue('Contoso.com,contoso.onmicrosoft.com')
-    Initialize-LocalState $migrated $true -Onboard 6>$null
-    Assert-True ($script:Prompts.Count -eq $promptCount+1 -and $script:Prompts[$promptCount].StartsWith('Accepted username domains')) 'Legacy upgrade prompted for something other than newly required domains.'
-    Assert-True ($script:Calls.Count -eq $callCount) 'Tenant migration issued a container/database mutation.'
-    Assert-ConfigUnchanged $migrated $legacySnapshot @('settings.json','compose.env')
-    $migratedSettings=Read-LocalSettings $migrated.State
-    $migratedProfiles=Read-FixtureRegistry $migrated
-    Assert-True ($migratedProfiles.Count -eq 1 -and $migratedProfiles[0].tenantId -ceq $tenant -and $migratedProfiles[0].clientId -ceq $client -and $migratedProfiles[0].clientSecret -ceq $clientSecret) 'Migration lost the original identity or credential.'
-    Assert-True (($migratedProfiles[0].domains -join ',') -ceq 'contoso.com,contoso.onmicrosoft.com') 'Migration did not save explicit normalized domains.'
-    Assert-True ($migratedSettings.port -eq 14391 -and $migratedSettings.publicUrl -ceq 'https://legacy.example.com' -and $migratedSettings.note -ceq 'retained legacy settings') 'Migration lost port, public URL or unrelated saved settings.'
-    $snapshot=Get-ConfigSnapshot $migrated
-    Initialize-LocalState $migrated $true -Onboard 6>$null
-    Assert-True ($script:Prompts.Count -eq $promptCount+1) 'Registry migration prompted more than once.'
-    Assert-ConfigUnchanged $migrated $snapshot
+    Initialize-LocalState $registryContext $true -Onboard 6>$null
+    Assert-True ($script:Prompts.Count -eq $promptCount) 'Current registry unnecessarily prompted for credentials or domains.'
+    Assert-True ($script:Calls.Count -eq $callCount) 'Registry validation issued a container/database mutation.'
+    Assert-ConfigUnchanged $registryContext $registrySnapshot @('settings.json','compose.env')
+    $registrySettings=Read-LocalSettings $registryContext.State
+    $registryProfiles=Read-FixtureRegistry $registryContext
+    Assert-True ($registryProfiles.Count -eq 1 -and $registryProfiles[0].tenantId -ceq $tenant -and $registryProfiles[0].clientId -ceq $client -and $registryProfiles[0].clientSecret -ceq $clientSecret) 'Registry validation lost the original identity or credential.'
+    Assert-True (($registryProfiles[0].domains -join ',') -ceq 'contoso.com,contoso.onmicrosoft.com') 'Registry validation changed accepted domains.'
+    Assert-True ($registrySettings.port -eq 14391 -and $registrySettings.publicUrl -ceq 'https://registry.example.com' -and $registrySettings.note -ceq 'retained settings') 'Registry validation lost unrelated saved settings.'
+    $snapshot=Get-ConfigSnapshot $registryContext
+    Initialize-LocalState $registryContext $true -Onboard 6>$null
+    Assert-True ($script:Prompts.Count -eq $promptCount) 'Current registry prompted on rerun.'
+    Assert-ConfigUnchanged $registryContext $snapshot
 
     $secondSecret='second-tenant-hidden-credential'
     foreach ($answer in @('','','','','','y',$otherTenant,$otherClient,$secondSecret,'fabrikam.com','Fabrikam','','','')) { $script:Answers.Enqueue($answer) }
-    $messages=Invoke-LocalDeployment $migrated 'EditConfig' 6>&1
-    $added=Read-FixtureRegistry $migrated
+    $messages=Invoke-LocalDeployment $registryContext 'EditConfig' 6>&1
+    $added=Read-FixtureRegistry $registryContext
     Assert-True ($added.Count -eq 2 -and $added[0].clientSecret -ceq $clientSecret -and $added[1].tenantId -ceq $otherTenant -and $added[1].displayName -ceq 'Fabrikam') 'Adding a tenant replaced or lost a saved tenant.'
-    Assert-ConfigUnchanged $migrated $snapshot @('settings.json','secrets/tenants.json')
+    Assert-ConfigUnchanged $registryContext $snapshot @('settings.json','secrets/tenants.json')
     Assert-True (-not ($messages -join "`n").Contains($secondSecret) -and -not ($script:Calls -join "`n").Contains($secondSecret)) 'Added tenant credential leaked to messages or command arguments.'
     foreach ($file in @('settings.json','compose.env')) {
-        Assert-True (-not [IO.File]::ReadAllText((Join-Path $migrated.State $file)).Contains($secondSecret)) 'Tenant credential leaked to public configuration.'
+        Assert-True (-not [IO.File]::ReadAllText((Join-Path $registryContext.State $file)).Contains($secondSecret)) 'Tenant credential leaked to public configuration.'
     }
-    $snapshot=Get-ConfigSnapshot $migrated
+    $snapshot=Get-ConfigSnapshot $registryContext
     $callCount=$script:Calls.Count
     foreach ($answer in @('','','','','','','','','','','','','')) { $script:Answers.Enqueue($answer) }
-    Invoke-LocalDeployment $migrated 'EditConfig' 6>$null
-    Assert-ConfigUnchanged $migrated $snapshot
+    Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null
+    Assert-ConfigUnchanged $registryContext $snapshot
     Assert-True ($script:Calls.Count -eq $callCount+3) 'No-op edit of multiple named tenants stopped the app.'
     foreach ($answer in @('','','','','','','','','CONTOSO.com','','','','')) { $script:Answers.Enqueue($answer) }
-    Assert-Fails { Invoke-LocalDeployment $migrated 'EditConfig' 6>$null } 'duplicate accepted domain'
-    Assert-ConfigUnchanged $migrated $snapshot
+    Assert-Fails { Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null } 'duplicate accepted domain'
+    Assert-ConfigUnchanged $registryContext $snapshot
     foreach ($answer in @('','','','','','','','updated-second-secret','fabrikam.com,login.fabrikam.com','','','','')) { $script:Answers.Enqueue($answer) }
-    Invoke-LocalDeployment $migrated 'EditConfig' 6>$null
-    $updatedProfiles=Read-FixtureRegistry $migrated
+    Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null
+    $updatedProfiles=Read-FixtureRegistry $registryContext
     Assert-True ($updatedProfiles[0].clientSecret -ceq $clientSecret -and $updatedProfiles[1].clientSecret -ceq 'updated-second-secret' -and $updatedProfiles[1].domains.Count -eq 2) 'Editing the second tenant affected the wrong credential or domains.'
-    Assert-True (Test-Path -LiteralPath (Join-Path $migrated.State 'control/reauthenticate')) 'Domain edits did not schedule reauthentication.'
-    $snapshot=Get-ConfigSnapshot $migrated
-    Invoke-LocalDeployment $migrated 'Deploy' -DbReset 3>$null 6>$null
-    Assert-ConfigUnchanged $migrated $snapshot
-    Assert-True ((Read-FixtureRegistry $migrated).Count -eq 2) 'Explicit database reset discarded tenant profiles.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $registryContext.State 'control/reauthenticate')) 'Domain edits did not schedule reauthentication.'
+    $snapshot=Get-ConfigSnapshot $registryContext
+    Invoke-LocalDeployment $registryContext 'Deploy' -DbReset 3>$null 6>$null
+    Assert-ConfigUnchanged $registryContext $snapshot
+    Assert-True ((Read-FixtureRegistry $registryContext).Count -eq 2) 'Explicit database reset discarded tenant profiles.'
 
-    $registryFile=Join-Path $migrated.State 'secrets/tenants.json'
+    $registryFile=Join-Path $registryContext.State 'secrets/tenants.json'
     $registryText=[IO.File]::ReadAllText($registryFile)
     foreach ($invalid in @(
         '[]','{}',"[`"$secondSecret`"", '[{"tenantId":"invalid"}]',
         (ConvertTo-Json -InputObject @($updatedProfiles[0],$updatedProfiles[0]) -Depth 20)
     )) {
         [IO.File]::WriteAllText($registryFile,$invalid)
-        try { Initialize-LocalState $migrated $true -Onboard; throw 'Expected registry rejection.' }
+        try { Initialize-LocalState $registryContext $true -Onboard; throw 'Expected registry rejection.' }
         catch { Assert-True ($_.Exception.Message -match 'Tenant registry|tenantId' -and -not $_.Exception.Message.Contains($secondSecret)) 'Malformed registry was accepted or leaked credentials in errors.' }
     }
     Remove-Item -LiteralPath $registryFile
-    Assert-Fails { Initialize-LocalState $migrated $true -Onboard } 'registry is missing'
+    Assert-Fails { Initialize-LocalState $registryContext $true -Onboard } 'registry is missing'
     [IO.File]::WriteAllText($registryFile,$registryText)
     Protect-LocalPath $registryFile
 
@@ -485,19 +683,13 @@ try {
     Assert-True (-not $script:Volumes.Contains($unstarted.Volume)) 'Edit-config provisioned a database.'
     Assert-True ((New-LocalContext $testRoot 'unstarted-project').PublicUrl -ceq $tunnelUrl) 'New project did not retain its public URL.'
 
-    foreach ($variant in @('empty','null','absent','whitespace')) {
+    foreach ($variant in @('unconfigured')) {
         $portOnly=New-FixtureContext "port-only-$variant"
         Initialize-LocalState $portOnly $false
         $script:Volumes.Add($portOnly.Volume) | Out-Null
         $settingsPath=Join-Path $portOnly.State 'settings.json'
         $secretPath=Join-Path $portOnly.State 'secrets/client-secret'
-        $original=@{port=14391;tenantId='';clientId='';note='keep this'}
-        if ($variant -eq 'null') { $original.tenantId=$null; $original.clientId=$null }
-        if ($variant -eq 'absent') { $original.Remove('tenantId'); $original.Remove('clientId'); Remove-Item -LiteralPath $secretPath }
-        if ($variant -eq 'whitespace') {
-            $original.tenantId='  '; $original.clientId=' '
-            [IO.File]::WriteAllText($secretPath," `n ")
-        }
+        $original=@{port=14391;note='keep this'}
         [IO.File]::WriteAllText($settingsPath,($original | ConvertTo-Json))
         $unchanged=@{}
         foreach ($relative in @('secrets/client-secret','secrets/postgres-admin','secrets/postgres-app','secrets/session')) {
@@ -517,7 +709,7 @@ try {
             $path=Join-Path $portOnly.State $relative
             Assert-True ((Get-FileHash -LiteralPath $path).Hash -ceq $unchanged[$relative].hash -and (Get-Item -LiteralPath $path).LastWriteTimeUtc.Ticks -eq $unchanged[$relative].modified) "Port-only edit rewrote $relative."
         }
-        if ($variant -eq 'absent') { Assert-True (-not (Test-Path -LiteralPath $secretPath)) 'Skipping an absent secret created a secret file.' }
+        Assert-True (-not (Test-Path -LiteralPath $secretPath)) 'Skipping identity setup created a standalone secret file.'
         Assert-True (($messages -join "`n").Contains('Identity configuration is incomplete')) 'Partial configuration was incorrectly reported as complete.'
         $settingsBefore=[IO.File]::ReadAllText($settingsPath)
         $modified=(Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc.Ticks
@@ -540,13 +732,11 @@ try {
 
     $partialDomains=New-LocalContext $testRoot 'partial-domain-settings'
     Add-EditAnswers @('','','','14395','') -Domains 'contoso.com' -DisplayName 'Contoso'
+    Assert-Fails { Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null } 'Complete every tenant profile'
+    Assert-True (-not (Test-Path -LiteralPath $partialDomains.State)) 'Incomplete identity editing saved a legacy partial profile.'
+    Add-EditAnswers @($tenant,$client,$clientSecret,'14395','') -Domains 'contoso.com' -DisplayName 'Contoso'
     Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null
-    $pendingSettings=Read-LocalSettings $partialDomains.State
-    Assert-True (($pendingSettings.tenantDomains -join ',') -ceq 'contoso.com' -and $pendingSettings.tenantDisplayName -ceq 'Contoso') 'Incomplete identity editing discarded entered domains or display name.'
-    $promptCount=$script:Prompts.Count
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
-    Invoke-LocalDeployment $partialDomains 'Deploy' 6>$null
-    Assert-True ($script:Prompts.Count -eq $promptCount+3 -and (Read-FixtureRegistry $partialDomains)[0].displayName -ceq 'Contoso') 'Completing a partial profile discarded or reprompted saved domain settings.'
+    Assert-True ((Read-FixtureRegistry $partialDomains)[0].displayName -ceq 'Contoso') 'Complete registry did not preserve its display name.'
     Assert-True (-not (Get-ChildItem -LiteralPath $partialDomains.State -Recurse -File -Filter '*.pending-*')) 'Atomic configuration writes left pending credential files.'
     Add-EditAnswers @('','','','','') -DisplayName '2026-09-26T00:00:00.000Z'
     Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null
@@ -594,35 +784,22 @@ try {
         }
     }
 
-    foreach ($missing in @('tenant','client','secret-empty','secret-absent','secret-whitespace','port','all')) {
-        $partial=New-FixtureContext "partial-$missing"
+    foreach ($field in @('tenantId','clientId','tenantDomains','tenantDisplayName','client-secret')) {
+        $partial=New-FixtureContext "unsupported-$($field.ToLowerInvariant())"
         Initialize-LocalState $partial $false
         $partialSettings=Join-Path $partial.State 'settings.json'
         $partialSecret=Join-Path $partial.State 'secrets/client-secret'
-        $savedTenant=if ($missing -in @('tenant','all')) { '' } else { $tenant }
-        $savedClient=if ($missing -in @('client','all')) { '' } else { $client }
-        $partialValues=@{port=14391;tenantId=$savedTenant;clientId=$savedClient}
-        if ($missing -in @('port','all')) { $partialValues.Remove('port') }
+        $partialValues=@{port=14391}
+        if ($field -eq 'client-secret') { [IO.File]::WriteAllText($partialSecret,'unused-standalone-credential') }
+        else { $partialValues[$field]=$null }
         [IO.File]::WriteAllText($partialSettings,($partialValues | ConvertTo-Json))
-        if ($missing -in @('tenant','client','port')) { [IO.File]::WriteAllText($partialSecret,$clientSecret) }
-        if ($missing -eq 'secret-whitespace') { [IO.File]::WriteAllText($partialSecret," `r`n ") }
-        if ($missing -eq 'secret-absent') { Remove-Item -LiteralPath $partialSecret }
-        $hashes=@{}
-        foreach ($name in @('postgres-admin','postgres-app','session')) { $hashes[$name]=(Get-FileHash -LiteralPath (Join-Path $partial.State "secrets/$name")).Hash }
+        $snapshot=Get-ConfigSnapshot $partial
         $promptCount=$script:Prompts.Count
-        if (-not $savedTenant) { $script:Answers.Enqueue($tenant) }
-        if (-not $savedClient) { $script:Answers.Enqueue($client) }
-        if ($missing -notin @('tenant','client','port')) { $script:Answers.Enqueue($clientSecret) }
-        $script:Answers.Enqueue('contoso.com')
-        if ($missing -in @('port','all')) { $script:Answers.Enqueue('14391') }
-        Initialize-LocalState $partial $true -Onboard 6>$null
-        $expected=if ($missing -eq 'all') { 5 } else { 2 }
-        Assert-True ($script:Prompts.Count -eq $promptCount+$expected) "Partial project $missing prompted for already saved values."
-        $updated=Get-Content -LiteralPath $partialSettings -Raw | ConvertFrom-Json
-        Assert-True ($updated.tenants[0].tenantId -ceq $tenant -and $updated.tenants[0].clientId -ceq $client -and (Read-FixtureRegistry $partial)[0].clientSecret -ceq $clientSecret) "Partial project $missing was not completed."
-        foreach ($name in $hashes.Keys) {
-            Assert-True ((Get-FileHash -LiteralPath (Join-Path $partial.State "secrets/$name")).Hash -ceq $hashes[$name]) "Onboarding rotated $name."
-        }
+        $callCount=$script:Calls.Count
+        Assert-Fails { Initialize-LocalState $partial $true -Onboard 6>$null } 'no longer supported.*TENANTS_JSON'
+        Assert-True ($script:Prompts.Count -eq $promptCount -and $script:Calls.Count -eq $callCount) 'Unsupported standalone settings prompted or mutated services.'
+        Assert-ConfigUnchanged $partial $snapshot
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $partial.State 'secrets/tenants.json'))) 'Unsupported standalone configuration was converted.'
     }
 
     $invalidContext=New-LocalContext $testRoot 'invalid-input'
@@ -639,7 +816,7 @@ try {
     }
     $invalidSettings=Join-Path $invalidContext.State 'settings.json'
     [IO.File]::WriteAllText($invalidSettings,(@{port=3001;tenantId='corrupt';clientId=$client} | ConvertTo-Json))
-    Assert-Fails { Initialize-LocalState $invalidContext $true -Onboard } 'Saved tenant and client identifiers'
+    Assert-Fails { Initialize-LocalState $invalidContext $true -Onboard } 'Standalone tenant settings'
     foreach ($invalidPort in @('3001',1023,65536,3001.5,$null)) {
         [IO.File]::WriteAllText($invalidSettings,(@{port=$invalidPort;tenantId=$tenant;clientId=$client} | ConvertTo-Json))
         Assert-Fails { New-LocalContext $testRoot 'invalid-input' } 'Saved project port'
@@ -662,9 +839,14 @@ try {
 
     $entryRoot=Join-Path $testRoot 'entrypoint'
     [IO.Directory]::CreateDirectory((Join-Path $entryRoot 'scripts')) | Out-Null
+    foreach ($file in @('Dockerfile','compose.yaml','compose.large-tenant-test.yaml')) {
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot $file) -Destination (Join-Path $entryRoot $file)
+    }
     Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $entryRoot 'deploy-local.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/local-deployment.ps1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-runtime.ps1') -Destination (Join-Path $entryRoot 'scripts/local-runtime.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'tenant-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/tenant-deployment.ps1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1') -Destination (Join-Path $entryRoot 'scripts/fixture-diagnostics.ps1')
     $entryPath=Join-Path $entryRoot 'deploy-local.ps1'
     $entryState=Join-Path $entryRoot '.local'
     $retainedContext=$context
@@ -680,6 +862,12 @@ try {
         $messages=. $entryPath start @projectArguments 6>&1
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Configured start unnecessarily repeated onboarding guidance.'
         Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Public entry point did not reuse saved onboarding values.'
+        Assert-True (($messages -join "`n").Contains('ALREADY RUNNING')) 'Unchanged public start did not recognize an already healthy deployment.'
+        $forceOffset=$script:Calls.Count
+        $messages=. $entryPath start @projectArguments -ForceChecks 6>&1
+        $forceCalls=@($script:Calls | Select-Object -Skip $forceOffset)
+        Assert-True (@($forceCalls | Where-Object { $_ -match 'backend/scripts/test-all\.ts$' }).Count -eq 1) 'Public ForceChecks did not execute full qualification.'
+        Assert-True (($messages -join "`n").Contains('[AUTOMATED CHECKS] PASSED:') -and -not ($messages -join "`n").Contains('[AUTOMATED CHECKS] REUSED:')) 'Forced public start misreported qualification reuse.'
         $projectName=if ($projectArguments.Project) { 'newcustomer' } else { 'agent-control' }
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/settings.json")) 'Entry point did not save the selected project folder.'
         $messages=. $entryPath stop @projectArguments 6>&1
@@ -713,9 +901,11 @@ try {
         $callCount=$script:Calls.Count
         Assert-Fails { . $entryPath $invalidResetCommand -DbReset } 'DbReset.*only with start'
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public DbReset combination invoked Docker.'
+        Assert-Fails { . $entryPath $invalidResetCommand -ForceChecks } 'ForceChecks.*only with start'
+        Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public ForceChecks combination invoked Docker.'
     }
     $context=$retainedContext
-    $script:Failure='database\.ts\|migrate$'
+    $script:Failure='database\.ts\|initialize$'
     try {
         Assert-Fails { . $entryPath start -Project newcustomer -DbReset 6>$null 3>$null } 'explicit database reset began; data may already have been deleted'
     } finally { $script:Failure='' }
@@ -729,16 +919,95 @@ try {
     $script:MonitoredMarker=Join-Path $qualification.State 'control/maintenance'
     $pendingReauthentication=Join-Path $qualification.State 'control/reauthenticate'
     [IO.File]::WriteAllText($pendingReauthentication,'pending-before-software-checks')
+    foreach ($scenario in @('success','quiet','long-log','oom','capture','combined')) {
+        $offset=$script:Calls.Count
+        $script:WorkloadExit=if ($scenario -in @('oom','combined')) { 137 } else { 0 }
+        $script:WorkloadRunningReads=if ($scenario -in @('success','quiet')) { 5 } else { 1 }
+        $script:FixtureLog=if ($scenario -eq 'quiet') { '' } elseif ($scenario -eq 'long-log') {
+            "early diagnostic evidence`n" + ((1..2500 | ForEach-Object { "output line $_" }) -join "`n")
+        } else {
+            "older fixture output`n$('x' * 600)`npassword=synthetic-live-secret`nbackend tests are progressing"
+        }
+        $script:Failure=if ($scenario -eq 'capture') { '^exec\|' } elseif ($scenario -eq 'combined') { '^exec\||\|down\|--volumes' } else { '' }
+        $caughtError=$null
+        $progress=[Collections.Generic.List[object]]::new()
+        try {
+            Invoke-LocalSoftwareChecks $qualification -ForceChecks 6>&1 | ForEach-Object {
+                Assert-True ($_ -is [Management.Automation.InformationRecord]) 'Fixture diagnostics polluted the success output stream.'
+                if ([string]$_ -match '^\[FIXTURE(?: LOG)?\]') {
+                    Assert-True ($_ -is [Management.Automation.InformationRecord]) 'Fixture progress polluted the success output stream.'
+                    $progress.Add(@{message=[string]$_;calls=$script:Calls.Count-$offset})
+                }
+            }
+        }
+        catch { $caughtError=$_.Exception }
+        finally {
+            $script:Failure=''; $script:WorkloadExit=0; $script:WorkloadRunningReads=1
+            $script:FixtureLog='synthetic diagnostics'
+        }
+        $scenarioCalls=@($script:Calls | Select-Object -Skip $offset)
+        Assert-True (@($scenarioCalls | Where-Object { $_ -match '\|compose\.large-tenant-test\.yaml\|' -or $_ -match '[/\\]compose\.large-tenant-test\.yaml\|' }).Count -gt 0) 'Software gate did not use the owned disk fixture override.'
+        $run=Get-UniqueCallIndex $scenarioCalls '\|run\|-d\|.*backend/scripts/test-all\.ts$'
+        $remove=Get-UniqueCallIndex $scenarioCalls '^rm\|-f\|'
+        $down=Get-UniqueCallIndex $scenarioCalls '\|down\|--volumes\|--remove-orphans$'
+        $capture=@(for ($i=0;$i -lt $scenarioCalls.Count;$i++) { if ($scenarioCalls[$i] -match '^logs\|--tail\|all\|') { $i } })
+        Assert-True ($capture.Count -ge 6 -and $run -lt $capture[0] -and ($capture | Measure-Object -Maximum).Maximum -lt $remove -and $remove -lt $down) 'Complete diagnostics did not precede exact workload removal and PostgreSQL teardown.'
+        $mountChecks=@(for ($i=0;$i -lt $scenarioCalls.Count;$i++) { if ($scenarioCalls[$i] -match 'json \.Mounts') { $i } })
+        Assert-True (@($mountChecks | Where-Object { $_ -lt $run }).Count -eq 1) 'Software gate did not verify exact PGDATA before starting work.'
+        $lastCapture=($capture | Measure-Object -Maximum).Maximum
+        Assert-True (@($mountChecks | Where-Object { $_ -gt $lastCapture -and $_ -lt $remove }).Count -eq 2) 'Cleanup did not independently reverify both owned container mount boundaries.'
+        Assert-True ($scenarioCalls[$remove] -match '^rm\|-f\|-v\|') 'Owned worker cleanup leaked anonymous volumes.'
+        Assert-True (-not ($scenarioCalls[$run] -match '\|--rm\|')) 'Gate workload removed itself before capture.'
+        if ($scenario -in @('success','quiet')) {
+            Assert-True ($null -eq $caughtError) "Successful fixture unexpectedly failed: $caughtError"
+            $heartbeats=@($progress | Where-Object { $_.message -match 'still running; elapsed \d{2}:\d{2} / 35:00' })
+            Assert-True ($heartbeats.Count -eq 1) 'Fixture must report liveness immediately without repeating it on every poll.'
+            Assert-True ($heartbeats[0].calls -lt $capture[2]) 'Fixture progress was buffered until the workload finished.'
+            Assert-True ($capture.Count -eq 8) 'Full diagnostics ran on every state poll instead of once per heartbeat and completion.'
+            $liveLogs=@($progress | Where-Object { $_.message.StartsWith('[FIXTURE LOG]') })
+            if ($scenario -eq 'quiet') {
+                Assert-True ($liveLogs.Count -eq 0) 'A silent workload produced invented log output.'
+            } else {
+                Assert-True ($liveLogs.Count -eq 3) 'Fixture progress did not show exactly the latest three log lines.'
+                Assert-True (@($liveLogs | Where-Object { $_.message.Length -gt 332 -or $_.calls -gt $capture[3]+1 }).Count -eq 0) 'Live fixture output was unbounded or delayed until completion.'
+                $liveText=$liveLogs.message -join "`n"
+                Assert-True ($liveText.Contains('[redacted]') -and $liveText.Contains('[truncated]') -and $liveText.Contains('backend tests are progressing')) 'Live fixture output lost redaction, truncation or current progress.'
+                Assert-True ($liveText -notmatch 'synthetic-live-secret|older fixture output') 'Live fixture output exposed credentials or replayed stale output.'
+            }
+        }
+        elseif ($scenario -eq 'long-log') { Assert-True ($null -eq $caughtError) "Long fixture log unexpectedly failed: $caughtError" }
+        else { Assert-True ($null -ne $caughtError) 'Diagnostic/workload failure was suppressed.' }
+        if ($scenario -eq 'combined') {
+            $messages=$caughtError.ToString()
+            Assert-True ($messages.Contains('exit=137') -and $messages.Contains('capture failed') -and $messages.Contains('Cleanup failed')) 'Combined test/capture/cleanup exceptions were lost.'
+        }
+        $fixture=@($script:FixtureCalls | Where-Object { $_.command -eq $scenarioCalls[$run] })[0]
+        $checkId=$fixture.project.Replace('agent-control-check-','')
+        $evidence=Join-Path $qualification.Root "artifacts/software-checks/$checkId"
+        Assert-True (Test-Path -LiteralPath (Join-Path $evidence 'result.json')) 'Evidence did not survive scratch deletion.'
+        Assert-True (@($progress | Where-Object { $_.message.Contains("Redacted diagnostics: $evidence") }).Count -eq 1) 'Fixture monitoring did not announce the retained diagnostics directory.'
+        if ($scenario -eq 'success') {
+            Assert-True ([IO.File]::ReadAllText((Join-Path $evidence "b$checkId.log")).Contains(('x' * 600))) 'Terminal truncation removed diagnostic evidence.'
+        }
+        if ($scenario -eq 'long-log') {
+            $savedLog=[IO.File]::ReadAllText((Join-Path $evidence "b$checkId.log"))
+            Assert-True ($savedLog.StartsWith('early diagnostic evidence') -and $savedLog.Contains('output line 2500')) 'Final capture truncated early or final diagnostic evidence.'
+        }
+        foreach ($prefix in @('a','b')) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $evidence "$prefix$checkId-mounts.json")) 'Verified per-container mount evidence was not retained.'
+        }
+        Assert-True (-not (Test-Path -LiteralPath $fixture.file)) 'Disposable scratch was retained.'
+    }
     try {
         foreach ($hadMaintenance in @($false,$true)) {
-            foreach ($failurePattern in @('^build\|--target\|operator\|','\|--wait-timeout\|90\|test-postgres$','backend/scripts/test-all\.ts$','\|down\|--volumes','^build\|--target\|runtime\|')) {
+            foreach ($failurePattern in @('^build\|--target\|operator\|','^build\|--target\|qualification\|','\|--wait-timeout\|90\|test-postgres$','backend/scripts/test-all\.ts$','\|down\|--volumes','^build\|--target\|runtime\|')) {
                 if ($hadMaintenance) { [IO.File]::WriteAllText($script:MonitoredMarker,'prior-maintenance-state') }
                 elseif (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
                 $callOffset=$script:Calls.Count
                 $fixtureOffset=$script:FixtureCalls.Count
                 $messages=[Collections.Generic.List[string]]::new()
                 $script:Failure=$failurePattern
-                Assert-Fails { Invoke-LocalDeployment $qualification 'Deploy' 6>&1 | ForEach-Object { $messages.Add([string]$_) } } 'Simulated'
+                Assert-Fails { Invoke-LocalDeployment $qualification 'Deploy' -ForceChecks 6>&1 | ForEach-Object { $messages.Add([string]$_) } } 'Simulated'
                 $script:Failure=''
                 Assert-ConfigUnchanged $qualification $snapshot
                 Assert-True ((Test-Path -LiteralPath $script:MonitoredMarker) -eq $hadMaintenance) 'Preflight failure changed maintenance admissions.'
@@ -747,10 +1016,10 @@ try {
                 }
                 Assert-True ([IO.File]::ReadAllText($pendingReauthentication) -ceq 'pending-before-software-checks') 'Preflight failure consumed pending reauthentication.'
                 $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
-                Assert-True (-not (($deploymentCalls -join "`n") -match '\|stop\||backend/scripts/database\.ts|\|--wait-timeout\|90\|(?:app|postgres)$|DELETE FROM')) 'Preflight failure stopped the app or touched its database.'
+                Assert-True (-not (($deploymentCalls -join "`n") -match '(?m)\|stop\||backend/scripts/database\.ts\|(initialize|reset)|\|--wait-timeout\|90\|app$|DELETE FROM')) 'Preflight failure stopped the app or mutated its database.'
                 Assert-True (-not (($messages -join "`n") -match 'Deployment verification summary|\[LOCAL READINESS\] PASSED')) 'Preflight failure announced deployment readiness.'
                 $preflightCalls=@($script:FixtureCalls | Select-Object -Skip $fixtureOffset)
-                $expectedCleanup=if ($failurePattern -match 'operator') { 0 } else { 1 }
+                $expectedCleanup=if ($failurePattern -match 'build') { 0 } else { 1 }
                 Assert-True (@($preflightCalls | Where-Object { $_.command -match '\|down\|--volumes\|--remove-orphans$' }).Count -eq $expectedCleanup) "Fixture cleanup count differed from $expectedCleanup after $failurePattern."
                 foreach ($call in $preflightCalls) {
                     Assert-True ($call.project -cne $qualification.Project -and $call.command.Contains('|--profile|test-db|')) 'Fixture commands targeted the application project.'
@@ -758,7 +1027,7 @@ try {
                     foreach ($value in @($tenant,$client,$clientSecret,[IO.File]::ReadAllText((Join-Path $qualification.State 'secrets/postgres-admin')))) {
                         Assert-True (-not $call.environment.Contains($value)) 'Fixture environment contained an application identity or secret.'
                     }
-                    Assert-True ($call.environment.Contains("LOCAL_TEST_IMAGE=$($qualification.Operator)")) 'Fixture run did not select the qualified operator image.'
+                    Assert-True ($call.environment.Contains("LOCAL_TEST_IMAGE=$($script:OperatorImage)")) 'Fixture run did not pin the qualified immutable operator image.'
                     Assert-True (-not (Test-Path -LiteralPath $call.file)) 'Owned fixture configuration survived cleanup.'
                 }
             }
@@ -778,24 +1047,24 @@ try {
                 }
                 Assert-True ([IO.File]::ReadAllText($pendingReauthentication) -ceq 'pending-before-software-checks') 'Database preflight consumed pending reauthentication.'
                 $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
-                Assert-True (-not (($deploymentCalls -join "`n") -match '\|stop\||backend/scripts/database\.ts\|migrate$|\|--wait-timeout\|90\|app$')) 'Database preflight failure stopped, migrated or started the application.'
+                Assert-True (-not (($deploymentCalls -join "`n") -match '\|stop\||backend/scripts/database\.ts\|initialize$|\|--wait-timeout\|90\|app$')) 'Database preflight failure stopped, migrated or started the application.'
                 Assert-True (-not (($deploymentCalls -join "`n").Contains("|-p|$($qualification.Project)|down"))) 'Database preflight reset the application project.'
             }
         }
         Remove-Item -LiteralPath $script:MonitoredMarker
         $callOffset=$script:Calls.Count
         $script:MarkerCalls.Clear()
-        $messages=Invoke-LocalDeployment $qualification 'Deploy' 6>&1
+        $messages=Invoke-LocalDeployment $qualification 'Deploy' -ForceChecks 6>&1
         $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
         $tests=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/test-all\.ts$'
         $cleanup=Get-UniqueCallIndex $deploymentCalls '\|down\|--volumes\|--remove-orphans$'
         $runtime=Get-UniqueCallIndex $deploymentCalls '^build\|--target\|runtime\|'
         $databasePreflight=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|preflight$'
         $stop=Get-UniqueCallIndex $deploymentCalls '\|stop\|--timeout\|130\|app$'
-        $migration=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|migrate$'
+        $initialization=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|initialize$'
         $start=Get-UniqueCallIndex $deploymentCalls '\|--wait-timeout\|90\|app$'
-        Assert-True ($tests -lt $cleanup -and $cleanup -lt $runtime -and $runtime -lt $stop -and $stop -lt $migration -and $migration -lt $start) 'Software checks and cleanup must finish before runtime build, shutdown, migration and app start.'
-        Assert-True ($runtime -lt $databasePreflight -and $databasePreflight -lt $stop) 'Database compatibility must be checked before stopping the app.'
+        Assert-True ($runtime -lt $tests -and $tests -lt $cleanup -and $cleanup -lt $stop -and $stop -lt $initialization -and $initialization -lt $start) 'Compilation must be reused by software checks, which finish before shutdown, initialization and app start.'
+        Assert-True ($databasePreflight -lt $runtime -and $runtime -lt $stop) 'Database compatibility must be checked before runtime compilation and app shutdown.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'backend/scripts/database\.ts\|preflight$' -and $_.maintenance }).Count -eq 0) 'Database preflight entered maintenance.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'backend/scripts/test-all\.ts$|^build\|' -and $_.maintenance }).Count -eq 0) 'Maintenance began before software/build qualification finished.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match '\|stop\|--timeout\|130\|app$' -and $_.maintenance }).Count -eq 1) 'Deployment did not close admissions before stopping the app.'
@@ -810,7 +1079,7 @@ try {
 
         $script:Failure='backend/scripts/test-all\.ts$|\|down\|--volumes'
         try {
-            Invoke-LocalSoftwareChecks $qualification 6>$null
+            Invoke-LocalSoftwareChecks $qualification -ForceChecks 6>$null
             throw 'Expected both the test and cleanup failures.'
         } catch {
             Assert-True ($_.Exception -is [AggregateException] -and $_.Exception.InnerExceptions.Count -eq 2) 'Cleanup failure hid the original software failure.'
@@ -833,16 +1102,17 @@ try {
     try {
         $callOffset=$script:Calls.Count
         $script:MarkerCalls.Clear()
-        $messages=Invoke-LocalDeployment $resetContext 'Deploy' -DbReset 3>&1 6>&1
+        $messages=Invoke-LocalDeployment $resetContext 'Deploy' -DbReset -ForceChecks 3>&1 6>&1
         $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
         $tests=Get-UniqueCallIndex $resetCalls 'backend/scripts/test-all\.ts$'
         $preflight=Get-UniqueCallIndex $resetCalls 'database\.ts\|preflight-reset\|agentcontrol$'
         $stop=Get-UniqueCallIndex $resetCalls '\|stop\|--timeout\|130\|app$'
         $reset=Get-UniqueCallIndex $resetCalls 'database\.ts\|reset\|agentcontrol$'
-        $migrate=Get-UniqueCallIndex $resetCalls 'database\.ts\|migrate$'
+        $initialize=Get-UniqueCallIndex $resetCalls 'database\.ts\|initialize$'
         $start=Get-UniqueCallIndex $resetCalls '\|--wait-timeout\|90\|app$'
-        Assert-True ($tests -lt $preflight -and $preflight -lt $stop -and $stop -lt $reset -and $reset -lt $migrate -and $migrate -lt $start) 'DbReset did not qualify, validate, drain, reset, initialize and start in order.'
+        Assert-True ($preflight -lt $tests -and $tests -lt $stop -and $stop -lt $reset -and $reset -lt $initialize -and $initialize -lt $start) 'DbReset did not preflight, qualify, drain, reset, initialize and start in order.'
         Assert-True (-not (($resetCalls -join "`n") -match 'database\.ts\|preflight$')) 'Explicit reset checked compatibility with the schema it is replacing.'
+        Assert-True (-not (($resetCalls -join "`n") -match 'backup\.ts|pg_dump')) 'Explicit reset required a pre-reset backup.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'database\.ts\|reset\|agentcontrol$' -and $_.maintenance }).Count -eq 1) 'DbReset ran without maintenance.'
         Assert-True (($messages -join "`n").Contains('All saved application data')) 'DbReset omitted the destructive-data warning.'
         Assert-ConfigUnchanged $resetContext $resetSnapshot
@@ -853,13 +1123,13 @@ try {
             @{pattern='database\.ts\|preflight-reset\|agentcontrol$';maintenance=$false;started=$false},
             @{pattern='\|stop\|--timeout\|130\|app$';maintenance=$true;started=$false},
             @{pattern='database\.ts\|reset\|agentcontrol$';maintenance=$true;started=$true},
-            @{pattern='database\.ts\|migrate$';maintenance=$true;started=$true},
+            @{pattern='database\.ts\|initialize$';maintenance=$true;started=$true},
             @{pattern='\|--wait-timeout\|90\|app$';maintenance=$true;started=$true}
         )) {
             if (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
             $callOffset=$script:Calls.Count
             $script:Failure=$resetFailure.pattern
-            Assert-Fails { Invoke-LocalDeployment $resetContext 'Deploy' -DbReset 6>$null } 'Simulated'
+            Assert-Fails { Invoke-LocalDeployment $resetContext 'Deploy' -DbReset -ForceChecks 6>$null } 'Simulated'
             $script:Failure=''
             Assert-True ((Test-Path -LiteralPath $script:MonitoredMarker) -eq $resetFailure.maintenance) "Failed DbReset deployment left incorrect maintenance state after $($resetFailure.pattern)."
             Assert-True ($resetContext.DbResetStarted -eq $resetFailure.started) 'Failed deployment misreported whether reset began.'
@@ -892,16 +1162,44 @@ try {
                 $dump=Join-Path $backups "fixture-$age.dump"
                 [IO.File]::WriteAllText($dump,'fixture')
                 $created=[DateTime]::UtcNow.AddDays(-$age)
-                [IO.File]::WriteAllText("$dump.json",(@{version=3;sha256=('a'*64);snapshotAt=$created.AddSeconds(-1).ToString('o');createdAt=$created.ToString('o')} | ConvertTo-Json))
+                [IO.File]::WriteAllText("$dump.json",(@{format='agent-control-backup-v1';fingerprintAlgorithm='sha256-pg-row-json-pkey-utf8-v1';schemaFingerprint=('b'*64);sha256=('a'*64);snapshotAt=$created.AddSeconds(-1).ToString('o');createdAt=$created.ToString('o')} | ConvertTo-Json))
             }
             Remove-ExpiredLocalBackups $backups
             Assert-True (Test-Path -LiteralPath (Join-Path $backups 'fixture-1.dump')) "Retention removed a current backup under $culture."
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $backups 'fixture-8.dump'))) "Retention left an expired dump under $culture."
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $backups 'fixture-8.dump.json'))) "Retention left an expired receipt under $culture."
         }
+        $retiredDump=Join-Path $backups 'retired-fixture.dump'
+        [IO.File]::WriteAllText($retiredDump,'synthetic-retired-backup')
+        foreach ($version in @(1,2,3,4)) {
+            [IO.File]::WriteAllText("$retiredDump.json",(@{version=$version;schemaVersion=92;sha256=('a'*64);createdAt=[DateTime]::UtcNow.AddDays(-8).ToString('o')} | ConvertTo-Json))
+            Assert-Fails { Remove-ExpiredLocalBackups $backups } 'retired backup receipt'
+            Assert-True ((Test-Path -LiteralPath $retiredDump) -and (Test-Path -LiteralPath "$retiredDump.json")) 'Retention deleted an unsupported saved backup.'
+        }
+        foreach ($mutation in @(
+            {param($r) $r.schemaFingerprint='invalid'},
+            {param($r) $r.fingerprintAlgorithm='retired-algorithm'},
+            {param($r) $r.snapshotAt=[DateTime]::UtcNow.ToString('o')}
+        )) {
+            $metadata=@{format='agent-control-backup-v1';fingerprintAlgorithm='sha256-pg-row-json-pkey-utf8-v1';schemaFingerprint=('b'*64);sha256=('a'*64);snapshotAt=[DateTime]::UtcNow.AddDays(-9).ToString('o');createdAt=[DateTime]::UtcNow.AddDays(-8).ToString('o')}
+            & $mutation $metadata
+            [IO.File]::WriteAllText("$retiredDump.json",($metadata | ConvertTo-Json))
+            Assert-Fails { Remove-ExpiredLocalBackups $backups } 'Invalid'
+            Assert-True ((Test-Path -LiteralPath $retiredDump) -and (Test-Path -LiteralPath "$retiredDump.json")) 'Retention deleted an invalid saved backup.'
+        }
     } finally {
         [Threading.Thread]::CurrentThread.CurrentCulture=$originalCulture
     }
+
+    $explicitContext=New-LocalContext $testRoot 'explicit-checks'
+    Assert-QualificationWorkloads $explicitContext 1
+    Assert-QualificationWorkloads $explicitContext 1
+    Assert-QualificationWorkloads $explicitContext 1 -ForceChecks
+    $originalOperator=$script:OperatorImage
+    try {
+        $script:OperatorImage='not-an-immutable-image'
+        Assert-Fails { Invoke-LocalSoftwareChecks $explicitContext 6>$null } 'immutable built image'
+    } finally { $script:OperatorImage=$originalOperator }
     [IO.File]::WriteAllText($secret,'corrupt')
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'corrupt'
     [IO.File]::WriteAllText($secret,$before)

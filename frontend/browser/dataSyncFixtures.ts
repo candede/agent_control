@@ -1,8 +1,9 @@
 import type { Page, Route } from "@playwright/test";
 import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncState, type StartDataSyncInput } from "../src/api/client";
-import { mockLayoutApi } from "./layoutFixtures";
+import { mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { createUnifiedVerification } from "../src/test/inventoryVerification";
+import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 const sourceIds: DataSyncSourceId[] = ["users", "graph_packages", "power_platform", "usage_reports"];
 export const initial: DataSyncState = {
@@ -25,18 +26,18 @@ export async function mockSync(page: Page, firstState: DataSyncState, retainedRu
     unexpected.push(`${route.request().method()} ${url.pathname}${url.search}`);
     return route.fulfill({ status: 501, json: { error: "Unexpected sync fixture request" } });
   };
-  await page.route("**/api/agent-inventory?*", route => route.request().method() !== "GET" ? rejectRequest(route) : route.fulfill({ json: {
-    revision: "a".repeat(64),
+  await page.route("**/api/agent-inventory?*", route => route.request().method() !== "GET" ? rejectRequest(route) : fulfillInventoryPage(route, {
+    ...unifiedAgents,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
-    value: [], count: 0, offset: 0, limit: 50,
+    value: [], counts: { total: 0, scoped: 0, filtered: 0, packageTargets: 0 },
     summary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
     filteredSummary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
     sources: {
-      graphPackages: { state: "unavailable", observation: null, error: null },
-      powerPlatform: { state: "unavailable", observation: null, error: null },
+      graphPackages: { state: "unavailable", observation: null, error: { source: "graph_packages", code: "snapshot_unavailable", message: "No completed Graph source." } },
+      powerPlatform: { state: "unavailable", observation: null, error: { source: "power_platform", code: "snapshot_unavailable", message: "No completed Power Platform source." } },
     },
     partial: false, errors: [],
-  } }));
+  }));
   await page.route("**/api/data-sync/**", route => {
     const url = new URL(route.request().url());
     const path = url.pathname;

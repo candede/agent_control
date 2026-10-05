@@ -13,8 +13,10 @@ vi.mock("../db/pool.js", () => ({
   pool: {},
   secretValue: vi.fn((name: string) => {
     const settings: Record<string, string> = {
-      TENANT_ID: "11111111-1111-4111-8111-111111111111", CLIENT_ID: "22222222-2222-4222-8222-222222222222",
-      CLIENT_SECRET: "synthetic-route-test-secret", TENANT_DOMAINS: "example.invalid",
+      TENANTS_JSON: JSON.stringify([{
+        tenantId: "11111111-1111-4111-8111-111111111111", clientId: "22222222-2222-4222-8222-222222222222",
+        clientSecret: "synthetic-route-test-secret", domains: ["example.invalid"],
+      }]),
     };
     return settings[name];
   }),

@@ -7,9 +7,11 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { DefenderHuntingService } from "./defenderHunting.js";
 import { GraphHuntingClient, expectedHuntingSchema } from "./graphHunting.js";
 
-vi.mock("../config.js", () => ({ config: { nodeEnv: "test" }, authConfigured: false, loginScopes: ["openid", "profile"] }));
+vi.mock("../config.js", () => ({ config: {
+  nodeEnv: "test", officialUsageStaleDays: 30, sessionSecret: "synthetic-defender-unit-session-secret",
+}, authConfigured: false, loginScopes: ["openid", "profile"] }));
 vi.mock("../db/pool.js", () => ({
-  pool: {},
+  pool: { options: { max: 4 } },
   transaction: vi.fn(() => { throw new Error("Database access is outside the worker unit-test boundary."); }),
 }));
 

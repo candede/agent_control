@@ -13,11 +13,16 @@ import { authConfigured, config } from "./config.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./db/copilotStudioQuarantine.js";
 import { DefenderHuntingRepository } from "./db/defenderHunting.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./db/jobs.js";
-import { PackageInventoryRepository } from "./db/packageInventory.js";
+import { PackageRefreshJobs } from "./db/packageRefreshJobs.js";
+import { NativeInventory } from "./db/nativeInventory.js";
+import { readPackageControls } from "./db/packageControls.js";
+import { encodeInventoryFacet } from "./types/inventoryFacets.js";
 import { pool } from "./db/pool.js";
-import { PowerPlatformInventoryRepository } from "./db/powerPlatformInventory.js";
+import { PowerPlatformRefreshJobs } from "./db/powerPlatformRefreshJobs.js";
+import { refreshInventoryFixture } from "../scripts/inventoryFixtures.js";
+import { packageInventoryRecord, powerPlatformInventoryRecord } from "./services/inventoryRecordProjection.js";
 import { PurviewAuditRepository } from "./db/purviewAudit.js";
-import { migrations } from "./db/schema.js";
+import { schemaFingerprint } from "./db/schema.js";
 import { AppError } from "./errors.js";
 import { AuditLog } from "./services/auditLog.js";
 import { CopilotStudioQuarantineClient } from "./services/copilotStudioQuarantine.js";
@@ -29,17 +34,23 @@ import { PurviewAuditService, purviewAudit } from "./services/purviewAudit.js";
 import { launchBulkJob, runBulkJob } from "./services/bulkJobs.js";
 import type { AppRole } from "./types/capability.js";
 import type { PowerPlatformResource, PowerPlatformResourceType } from "./types/powerPlatformInventory.js";
+import type { CopilotPackageDetail } from "./types/copilotPackage.js";
 import { clearAdmissionForTest } from "./middleware/admission.js";
 import { AgentPeopleRepository } from "./db/agentPeople.js";
 import { dataSync } from "./services/dataSync.js";
+import { reportRuntime } from "./services/reportExportDispatcher.js";
+import { reportIdentity } from "./services/reportIdentity.js";
+import { OfficialReportImports } from "./db/officialReportImports.js";
+import { DataGenerations, type GenerationLease } from "./db/dataGenerations.js";
+import { generationInput } from "../scripts/largeTenantFixtures.js";
+import type { OfficialReportAccepted, OfficialReportBundlePreview, OfficialReportExportStatus, OfficialReportPreview } from "./types/officialReportApi.js";
+import type { ReportAgent, ReportHistorySet, ReportPage, ReportRelationship, ReportUser } from "./types/officialReportData.js";
 
 vi.hoisted(() => {
-  process.env.TENANT_ID="11111111-1111-1111-1111-111111111111";
-  process.env.CLIENT_ID="99999999-9999-4999-8999-999999999999";
-  process.env.CLIENT_SECRET="synthetic-app-test-secret";
-  process.env.TENANT_DOMAINS="example.invalid";
+  delete process.env.TENANTS_JSON_FILE;
   process.env.TENANTS_JSON=JSON.stringify([
-    {tenantId:process.env.TENANT_ID,clientId:process.env.CLIENT_ID,clientSecret:process.env.CLIENT_SECRET,domains:["example.invalid"]},
+    {tenantId:"11111111-1111-1111-1111-111111111111",clientId:"99999999-9999-4999-8999-999999999999",
+      clientSecret:"synthetic-app-test-secret",domains:["example.invalid"]},
     {tenantId:"33333333-3333-4333-8333-333333333333",clientId:"44444444-4444-4444-8444-444444444444",
       clientSecret:"synthetic-other-app-test-secret",domains:["other.example.invalid"]},
   ]);
@@ -80,9 +91,10 @@ vi.mock("./services/capabilities.js", () => ({ capabilities: {
   quarantineApprovalAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
 } }));
 vi.mock("./services/powerPlatformResourceQuery.js", async original => ({ ...await original<typeof import("./services/powerPlatformResourceQuery.js")>(), PowerPlatformResourceQueryClient: class {
-  async query(_token: string, queriedTypes: PowerPlatformResourceType[], options: { environmentId?: string } = {}) {
+  async *pages(_token: string, _queriedTypes: PowerPlatformResourceType[], options: { visit?: (token: string) => Promise<void> } = {}) {
     inventoryProviderFixture.queries += 1;
-    return {resources:[],queriedTypes,environmentScope:options.environmentId ?? null,totalRecords:0,pages:1,unknownFieldCount:0};
+    await options.visit?.("initial");
+    yield { token: "initial", nextToken: null, records: [], rawCount: 0, expectedCount: 0, page: 1, omittedFieldCount: 0 };
   }
 } }));
 vi.mock("./services/bulkJobs.js", async original => ({ ...await original<typeof import("./services/bulkJobs.js")>(), launchBulkJob: vi.fn() }));
@@ -114,7 +126,11 @@ beforeAll(async () => {
   application = createApp(fixture.runtime,directory);
   await new Promise<void>(resolve => { server=application.app.listen(0,"127.0.0.1",resolve); });
   base=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
-  vi.spyOn(GraphPackagesClient.prototype,"listCopilotAgents").mockResolvedValue([{id:"package-1",displayName:"Fixture",isBlocked:false}]);
+  vi.spyOn(GraphPackagesClient.prototype,"catalogPages").mockImplementation(async function* (_token, options = {}) {
+    await options.visit?.("initial");
+    yield { token: "initial", nextToken: null, records: [{ id: "package-1", displayName: "Fixture", isBlocked: false }],
+      rawCount: 1, expectedCount: 1, page: 1 };
+  });
   vi.spyOn(GraphPackagesClient.prototype,"getPackageDetails").mockResolvedValue({id:"package-1",displayName:"Fixture",isBlocked:false,allowedUsersAndGroups:[{resourceType:"user",resourceId:"sensitive-user"}],acquireUsersAndGroups:[]});
   vi.spyOn(GraphPackagesClient.prototype,"blockPackage").mockResolvedValue();
   vi.spyOn(GraphPackagesClient.prototype,"unblockPackage").mockResolvedValue();
@@ -125,8 +141,9 @@ beforeAll(async () => {
   await publishPackageSnapshot("operator", ["package-1"]);
 });
 afterAll(async () => {
+  if (fixture) await reportRuntime(fixture.runtime).drain();
   application?.store.close();
-  if (server) await new Promise<void>(resolve => server.close(() => resolve()));
+  if (server) { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
   await pool.end(); await fixture?.close(); rmSync(directory,{recursive:true,force:true});
 });
 function request(path: string, options: RequestInit = {}) {
@@ -142,8 +159,9 @@ async function roleCookie(principalId: string, roles: AppRole[], rolesValidatedA
   await new Promise<void>((resolve,reject) => application.store.set(sid,{cookie:new session.Cookie({maxAge:60000}),tenantId:tenant.tenantId,clientId:tenant.clientId,accountId:principalId,csrfToken,rolesValidatedAt,user:{tenantId:tenant.tenantId,homeAccountId:principalId,username:`${principalId}@${tenant.domains[0]}`,displayName:principalId,roles}},error => error ? reject(error) : resolve()));
   return signedSessionCookie(sid);
 }
-async function publishPackageSnapshot(principalId: string, requestedIds?: string[], tenantId = config.tenants[0].tenantId, displayName = "Fixture") {
-  const repository = new PackageInventoryRepository(fixture.runtime);
+async function publishPackageSnapshot(principalId: string, requestedIds?: string[], tenantId = config.tenants[0].tenantId,
+  displayName = "Fixture", changes: Partial<CopilotPackageDetail> | null = {}) {
+  const repository = new PackageRefreshJobs(fixture.runtime);
   const scope = { tenantId, principalId };
   const job = await repository.submit(scope, {
     authorizationPrincipalId: principalId,
@@ -152,8 +170,8 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
     requestedIds,
   });
   await repository.markRunning(scope, job.id);
-  await repository.publish(scope, job.id, {
-    packages: [{
+  await refreshInventoryFixture(fixture.runtime, scope, job.id, "packages", changes === null ? [] : [
+    packageInventoryRecord({
       id: "package-1",
       displayName,
       isBlocked: false,
@@ -166,34 +184,53 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
       lifecycle: "unknown",
       identityConfidence: "exact_native",
       provenance: {},
-    }],
-    totalRecords: 1,
-    pages: 1,
-  });
+      ...changes,
+    }),
+  ], undefined, { exactTargets: requestedIds });
   return (await repository.getJob(scope, job.id))!.snapshotId!;
 }
 async function publishQuarantineInventory(principalId: string, ownerId?: string) {
-  const repository = new PowerPlatformInventoryRepository(fixture.runtime);
+  const repository = new PowerPlatformRefreshJobs(fixture.runtime);
   const scope = { tenantId: config.tenants[0].tenantId!, principalId };
   const job = await repository.submit(scope, { idempotencyKey: `quarantine-inventory-${principalId}-${randomUUID()}`, roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"] });
   await repository.markRunning(scope, job.id);
-  await repository.publish(scope, job.id, { resources: [{ tenantId: config.tenants[0].tenantId!, nativeId: "native-agent", type: "microsoft.copilotstudio/agents",
+  await refreshInventoryFixture(fixture.runtime, scope, job.id, "power_platform", [powerPlatformInventoryRecord({ tenantId: config.tenants[0].tenantId!, nativeId: "native-agent", type: "microsoft.copilotstudio/agents",
     location: null, displayName: "Exact agent", environmentId: "11111111-1111-4111-8111-111111111111", createdAt: null, createdBy: null,
     lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
     lifecycle: "published", identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "native-agent" },
       { kind: "environment_id", value: "11111111-1111-4111-8111-111111111111" }, { kind: "cds_bot_id", value: "22222222-2222-4222-8222-222222222222" }],
-    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z", ...(ownerId ? { ownerId } : {}) }, unknownFieldCount: 0 }],
-    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z", ...(ownerId ? { ownerId } : {}) }, unknownFieldCount: 0 })],
+  ["microsoft.copilotstudio/agents"], { roleScope: "unknown" });
   return (await repository.getJob(scope, job.id))!.snapshotId!;
 }
-async function mutationPreview(action: "block" | "unblock", ids: string[], mutationScope: "single" | "bulk") {
+async function mutationPreview(action: "block" | "unblock", ids: string[], mutationScope: "single" | "bulk", allMatching = false) {
+  const selectionId = allMatching ? (await inventoryPage()).selection.id : undefined;
   const response = await request("/api/agents/mutation-preview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ids, mutationScope }),
+    body: JSON.stringify({ action, ...allMatching ? { selectionId } : { ids }, mutationScope }),
   });
   expect(response.status).toBe(200);
-  return response.json() as Promise<{ confirmationHash: string }>;
+  return response.json() as Promise<{ confirmationHash: string; selectionId: string }>;
+}
+async function inventoryPage(selectedCookie = cookie, query = "") {
+  const response = await request(`/api/agent-inventory${query ? `?${query}` : ""}`, { headers: { Cookie: selectedCookie } });
+  expect(response.status, await response.clone().text()).toBe(200);
+  return response.json();
+}
+async function createInventoryExport(selectedCookie: string, selectionId: string,
+  kind: "graph_packages" | "power_platform_agents" | "unified_agents", ids?: string[]) {
+  const created = await request("/api/data-exports", { method: "POST",
+    headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify({ kind, selectionId, ids }) });
+  expect(created.status, await created.clone().text()).toBe(202);
+  const { id } = await created.json();
+  await expect.poll(async () => (await (await request(`/api/data-exports/${id}`, { headers: { Cookie: selectedCookie } })).json()).status).toBe("ready");
+  return id as string;
+}
+async function inventoryExport(selectedCookie: string, selectionId: string,
+  kind: "graph_packages" | "power_platform_agents" | "unified_agents", ids?: string[]) {
+  const id = await createInventoryExport(selectedCookie, selectionId, kind, ids);
+  return request(`/api/data-exports/${id}/download`, { headers: { Cookie: selectedCookie } });
 }
 
 describe.sequential("packaged API/session contracts", () => {
@@ -813,7 +850,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect(confirmedBlock).toMatchObject({ summary: { risk: true } });
     const single=await request("/api/agents/package-1/block",{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(confirmedBlock)});
     expect(single.status).toBe(202); const job=await single.json();
-    await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=true,package_data=jsonb_set(package_data,'{isBlocked}','true'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
+    await publishPackageSnapshot("fixture-principal", undefined, config.tenants[0].tenantId, "Fixture", { isBlocked: true });
     try {
       expect((await (await request("/api/agents/package-1/block",{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(confirmedBlock)})).json()).id).toBe(job.id);
       for (const changed of [
@@ -824,23 +861,23 @@ describe.sequential("packaged API/session contracts", () => {
         expect((await request(changed[0],{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(changed[1])})).status).toBe(409);
       }
     } finally {
-      await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=false,package_data=jsonb_set(package_data,'{isBlocked}','false'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
+      await publishPackageSnapshot("fixture-principal");
     }
     expect((await request(`/api/agents/bulk-jobs/${job.id}`)).status).toBe(200);
     await request(`/api/agents/bulk-jobs/${job.id}/cancel`,{method:"POST"});
     for (const endpoint of ["block","unblock","block-all","unblock-all"]) {
       const action = endpoint.startsWith("unblock") ? "unblock" : "block";
-      const preview = await mutationPreview(action, ["package-1"], "bulk");
+      const preview = await mutationPreview(action, ["package-1"], "bulk", endpoint.endsWith("-all"));
       const bulkKey=randomUUID();
       const headers={"Idempotency-Key":bulkKey,"Content-Type":"application/json"};
-      const body=JSON.stringify(endpoint.endsWith("-all") ? { confirmationHash: preview.confirmationHash } : {ids:["package-1"],...preview});
+      const body=JSON.stringify(endpoint.endsWith("-all") ? { selectionId: preview.selectionId, confirmationHash: preview.confirmationHash } : {ids:["package-1"],...preview});
       const response=await request(`/api/agents/${endpoint}`,{method:"POST",headers,body});
       expect(response.status).toBe(202);
       const created=await response.json();
       expect(created.status).toBe("queued");
       const launches = vi.mocked(launchBulkJob).mock.calls.length;
       if (endpoint === "block-all") {
-        await fixture.operator.query("DELETE FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal'", [config.tenants[0].tenantId]);
+        await publishPackageSnapshot("fixture-principal", undefined, config.tenants[0].tenantId, "Fixture", null);
         expect((await request("/api/agents/block-all", { method: "POST", headers, body: JSON.stringify({ ids: ["different-package"], ...preview }) })).status).toBe(400);
       }
       expect((await (await request(`/api/agents/${endpoint}`,{method:"POST",headers,body})).json()).id).toBe(created.id);
@@ -858,9 +895,8 @@ describe.sequential("packaged API/session contracts", () => {
     expect(launchBulkJob).toHaveBeenCalled();
   });
   it("admits confirmed access intent while preserving role, CSRF and exact confirmation guards", async () => {
-    const prior = await fixture.operator.query("SELECT snapshot_id,package_data FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
     try {
-      await fixture.operator.query("UPDATE package_inventory_resources SET package_data=package_data || $2::jsonb WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId, { availableTo: "some", deployedTo: "none" }]);
+      await publishPackageSnapshot("fixture-principal", undefined, config.tenants[0].tenantId, "Fixture", { availableTo: "some", deployedTo: "none" });
       const intent = { action: "update-availability", ids: ["package-1"], mutationScope: "single", target: "availability", mode: "replace", scope: "none", principals: [] };
       const preview = await request("/api/agents/mutation-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(intent) });
       expect(preview.status).toBe(200);
@@ -877,7 +913,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(job).toMatchObject({ status: "queued", action: "update-availability" });
       await request(`/api/agents/bulk-jobs/${job.id}/cancel`, { method: "POST" });
     } finally {
-      for (const row of prior.rows) await fixture.operator.query("UPDATE package_inventory_resources SET package_data=$2 WHERE snapshot_id=$1 AND native_id='package-1'", [row.snapshot_id, row.package_data]);
+      await publishPackageSnapshot("fixture-principal");
     }
   });
 
@@ -917,9 +953,10 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs WHERE id=ANY($1::uuid[])", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_items WHERE job_id=ANY($1::uuid[]) AND status='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_attempts WHERE job_id=ANY($1::uuid[]) AND outcome='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
-      const saved = new PackageInventoryRepository(fixture.runtime);
-      expect((await saved.get({ tenantId: config.tenants[0].tenantId!, principalId: "operator" }, "package-canary"))?.package.isBlocked).toBe(false);
-      expect(await saved.get({ tenantId: config.tenants[0].tenantId!, principalId: "another-operator" }, "package-canary")).toBeUndefined();
+      expect(await readPackageControls(fixture.runtime, { tenantId: config.tenants[0].tenantId!, principalId: "operator" },
+        ["package-canary"])).toEqual([expect.objectContaining({ detail: expect.objectContaining({ id: "package-canary", isBlocked: false }) })]);
+      expect(await readPackageControls(fixture.runtime, { tenantId: config.tenants[0].tenantId!, principalId: "another-operator" },
+        ["package-canary"])).toEqual([]);
       expect((await request(`/api/agents/mutation-canaries/${approval.id}/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, restorationApprovalId: restorationApproval.id }) })).status).toBe(409);
       expect(GraphPackagesClient.prototype.blockPackage).toHaveBeenCalledTimes(1);
       expect(GraphPackagesClient.prototype.unblockPackage).toHaveBeenCalledTimes(1);
@@ -981,7 +1018,9 @@ describe.sequential("packaged API/session contracts", () => {
     authFixture.revalidatedUser = { ...authFixture.user, roles: ["AgentControl.Viewer"] };
     try {
       expect((await request(`/api/agents/bulk-jobs/${job.id}/reconcile`, { method: "POST" })).status).toBe(403);
-      expect(await repository.get(job.id, owner)).toMatchObject({ results: [{ reconciliationStatus: "required" }] });
+      expect(await repository.get(job.id, owner)).toMatchObject({ inconclusive: 1, reconciliationRequired: 1 });
+      const outcome = await fixture.runtime.query("SELECT reconciliation_status FROM job_items WHERE job_id=$1", [job.id]);
+      expect(outcome.rows).toEqual([{ reconciliation_status: "required" }]);
     } finally {
       authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
     }
@@ -995,9 +1034,18 @@ describe.sequential("packaged API/session contracts", () => {
     const mine=await request("/api/agents/bulk-jobs?limit=20");
     expect(mine.status).toBe(200);
     expect(await mine.json()).toMatchObject({value:expect.arrayContaining([expect.objectContaining({id:job.id})])});
+    const metadata = await (await request(`/api/agents/bulk-jobs/${job.id}`)).json();
+    expect(metadata).not.toHaveProperty("results");
+    expect(metadata).not.toHaveProperty("result");
+    const items = await request(`/api/agents/bulk-jobs/${job.id}/items?limit=1`);
+    expect(items.status).toBe(200);
+    expect(items.headers.get("cache-control")).toBe("private, no-store");
+    expect(await items.json()).toMatchObject({ value: [{ id: "package-1" }], counts: { total: 1, filtered: 1 },
+      revision: expect.any(String), page: { limit: 1, nextCursor: null, previousCursor: null } });
     const others=await request("/api/agents/bulk-jobs?limit=20",{headers:{Cookie:otherCookie}});
     expect(await others.json()).toEqual({value:[]});
     expect((await request(`/api/agents/bulk-jobs/${job.id}`,{headers:{Cookie:otherCookie}})).status).toBe(404);
+    expect((await request(`/api/agents/bulk-jobs/${job.id}/items`,{headers:{Cookie:otherCookie}})).status).toBe(404);
     expect((await request(`/api/agents/bulk-jobs/${job.id}/cancel`,{method:"POST",headers:{Cookie:otherCookie}})).status).toBe(404);
   });
   it("returns one role-scoped minimized job projection without staged previews or item results", async () => {
@@ -1017,12 +1065,13 @@ describe.sequential("packaged API/session contracts", () => {
   it("requires CSRF, gives Admin all Viewer reads, and denies unassigned users", async () => {
     expect((await request("/api/agents/package-1/block",{method:"POST",headers:{"x-csrf-token":"wrong"}})).status).toBe(403);
     const administratorCookie=await roleCookie("administrator",["AgentControl.Admin"]);
+    await publishPackageSnapshot("administrator");
     expect((await request("/api/agents",{headers:{Cookie:administratorCookie}})).status).toBe(200);
     expect((await request("/api/audit/events",{headers:{Cookie:administratorCookie}})).status).toBe(200);
     const diagnostics=await request("/api/diagnostics",{headers:{Cookie:administratorCookie}});
     expect(diagnostics.status).toBe(200);
     expect(await diagnostics.json()).toEqual({
-      authConfigured,maintenance:false,providerWorkEnabled:true,schemaVersion:migrations.length,
+      authConfigured,maintenance:false,providerWorkEnabled:true,schemaFingerprint,
       limits:{databasePool:4,requestBodyBytes:524288,exportDeadlineSeconds:15},
     });
     const noRoleCookie=await roleCookie("unassigned",[]);
@@ -1061,13 +1110,18 @@ describe.sequential("packaged API/session contracts", () => {
   it("allows Viewer and inherited Admin package reads including exact targets", async () => {
     const readerCookie=await roleCookie("reader",["AgentControl.Viewer"]);
     const operatorCookie=await roleCookie("operator",["AgentControl.Admin"]);
-    expect((await request("/api/agents",{headers:{Cookie:readerCookie}})).status).toBe(200);
-    expect((await request("/api/agents",{headers:{Cookie:operatorCookie}})).status).toBe(200);
-    expect((await request("/api/agents/details",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"]})})).status).toBe(200);
-    const viewerExact = await request("/api/agents/package-1",{headers:{Cookie:readerCookie}});
+    await publishPackageSnapshot("reader");
+    await publishPackageSnapshot("operator");
+    const reader = await (await request("/api/agents",{headers:{Cookie:readerCookie}})).json();
+    const operator = await (await request("/api/agents",{headers:{Cookie:operatorCookie}})).json();
+    expect(reader.counts.total).toBe(1);
+    expect(operator.counts.total).toBe(1);
+    expect((await request("/api/agents/details",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},
+      body:JSON.stringify({ids:["package-1"]})})).status).toBe(404);
+    const viewerExact = await request(`/api/agents/package-1/detail?selectionId=${reader.selection.id}`,{headers:{Cookie:readerCookie}});
     expect(viewerExact.status).toBe(200);
     expect(await viewerExact.json()).toMatchObject({id:"package-1",allowedUsersAndGroups:[{resourceId:"sensitive-user"}]});
-    const exact=await request("/api/agents/package-1",{headers:{Cookie:operatorCookie}});
+    const exact=await request(`/api/agents/package-1/detail?selectionId=${operator.selection.id}`,{headers:{Cookie:operatorCookie}});
     expect(exact.status).toBe(200);
     expect(await exact.json()).toMatchObject({id:"package-1",allowedUsersAndGroups:[{resourceId:"sensitive-user"}]});
   });
@@ -1091,20 +1145,22 @@ describe.sequential("packaged API/session contracts", () => {
     for (const [tenantCookie, name, event] of [
       [cookieA, "Tenant A only", events[0]], [cookieB, "Tenant B only", events[1]],
     ] as const) {
-      const exact = await request("/api/agents/package-1", { headers: { Cookie: tenantCookie } });
+      const selected = await inventoryPage(tenantCookie);
+      const exact = await request(`/api/agents/package-1/detail?selectionId=${selected.selection.id}`, { headers: { Cookie: tenantCookie } });
       expect(exact.status).toBe(200);
       expect(await exact.json()).toMatchObject({ id: "package-1", displayName: name });
       const listed = await request("/api/agents", { headers: { Cookie: tenantCookie } });
-      expect(await listed.json()).toMatchObject({ count: 1, value: [{ id: "package-1", displayName: name }] });
+      expect(await listed.json()).toMatchObject({ counts: { total: 1 }, value: [{ id: "package-1", displayName: name }] });
       const audit = await request("/api/audit/events?agentId=package-1", { headers: { Cookie: tenantCookie } });
       expect(await audit.json()).toMatchObject({ count: 1, value: [{ id: event.id }] });
     }
-    const foreignSnapshot = await request("/api/agents/export.csv", {
+    const foreignSelection = await inventoryPage(cookieB);
+    const foreignSnapshot = await request("/api/data-exports", {
       method: "POST", headers: { Cookie: cookieA, "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: ["package-1"], snapshotId: snapshotB }),
+      body: JSON.stringify({ kind: "graph_packages", selectionId: foreignSelection.selection.id }),
     });
-    expect(foreignSnapshot.status).toBe(404);
-    expect(await foreignSnapshot.json()).toMatchObject({ code: "not_found" });
+    expect(foreignSnapshot.status).toBe(409);
+    expect(await foreignSnapshot.json()).toMatchObject({ code: "selection_invalidated" });
     expect(snapshotA).not.toBe(snapshotB);
     const foreignAudit = await request("/api/audit/events/export.csv", {
       method: "POST", headers: { Cookie: cookieB, "Content-Type": "application/json" },
@@ -1120,30 +1176,31 @@ describe.sequential("packaged API/session contracts", () => {
   it("exports only exact authorized package rows with snapshot provenance, formula safety and row-free audit", async () => {
     const principalId="package-export-reader";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
-    const snapshotId=await publishPackageSnapshot(principalId);
-    await fixture.operator.query(`UPDATE package_inventory_resources
-      SET publisher='=formula',package_data=jsonb_set(package_data,'{publisher}',to_jsonb('=formula'::text))
-      WHERE tenant_id=$1 AND principal_id=$2 AND snapshot_id=$3`,[config.tenants[0].tenantId,principalId,snapshotId]);
-    const response=await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})});
+    const snapshotId=await publishPackageSnapshot(principalId, undefined, config.tenants[0].tenantId, "Fixture", { publisher: "=formula" });
+    const selected = await inventoryPage(readerCookie);
+    const response=await inventoryExport(readerCookie, selected.selection.id, "graph_packages", ["package-1"]);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/csv");
-    expect(response.headers.get("content-disposition")).toBe("attachment; filename=package-inventory.csv");
+    expect(response.headers.get("content-disposition")).toContain("attachment;");
     expect(response.headers.get("cache-control")).toContain("no-store");
     const rows=parseCsv(await response.text(),{bom:true,columns:true});
-    expect(rows).toEqual([expect.objectContaining({id:"package-1",publisher:"'=formula",sourceSystem:"graph_packages",snapshotId})]);
+    expect(rows.filter((row: Record<string, string>) => row.recordType === "source"))
+      .toEqual([expect.objectContaining({id:"package-1",publisher:"'=formula",sourceSystem:"graph_packages",snapshotId})]);
     expect(JSON.stringify(rows)).not.toContain("sensitive-user");
-    const securityCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
-    const audit=await request("/api/audit/events?action=export-package-inventory",{headers:{Cookie:securityCookie}});
+    const audit=await request("/api/audit/events?action=export-package-inventory",{headers:{Cookie:readerCookie}});
     expect(audit.status).toBe(200);
     const auditBody=await audit.json() as {value:Array<{action:string;metadata?:Record<string,unknown>}>};
-    expect(auditBody.value).toEqual([expect.objectContaining({action:"export-package-inventory",metadata:expect.objectContaining({source:"graph_packages",snapshotId,resultingCount:1})})]);
+    expect(auditBody.value.length).toBeGreaterThanOrEqual(1);
+    expect(auditBody.value.every(event => event.action === "export-package-inventory")).toBe(true);
     expect(JSON.stringify(auditBody)).not.toContain("=formula");
+    expect(JSON.stringify(auditBody)).not.toContain("sensitive-user");
     const operatorCookie=await roleCookie(principalId,["AgentControl.Admin"]);
-    expect((await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})})).status).toBe(200);
+    const adminSelection = await inventoryPage(operatorCookie);
+    expect((await inventoryExport(operatorCookie, adminSelection.selection.id, "graph_packages", ["package-1"])).status).toBe(200);
     await publishPackageSnapshot(principalId);
-    const stale = await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})});
-    expect(stale.status).toBe(409);
-    await expect(stale.json()).resolves.toMatchObject({ code: "snapshot_invalidated" });
+    const pinned = await inventoryExport(readerCookie, selected.selection.id, "graph_packages", ["package-1"]);
+    expect(pinned.status).toBe(200);
+    expect(await pinned.text()).toContain("'=formula");
   });
   it("reads private responsibility with Viewer access, outside paid rosters, without provider reads or ownership-based authority", async () => {
     const principalId = "responsibility-reader";
@@ -1159,18 +1216,20 @@ describe.sequential("packaged API/session contracts", () => {
     const tokenReads = vi.mocked(acquireDelegatedToken).mock.calls.length;
     const response = await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: readerCookie } });
     expect(response.status).toBe(200);
-    const result = await response.json() as { selected: { agents: Array<{ id: string }> } };
+    const result = await response.json() as { selection: { id: string }; selected: { agents: Array<{ id: string }> } };
     expect(result).toMatchObject({ selected: { person: { evidence: { displayName: "Responsibility only" } },
       count: 1, agents: [{ roles: ["owner"], presence: "power_platform" }] } });
     expect(result.selected.agents[0].id).toMatch(/^agent:/);
-    const exact = await request(`/api/agent-inventory?recordId=${encodeURIComponent(result.selected.agents[0].id)}`, { headers: { Cookie: readerCookie } });
+    const exact = await request(`/api/agent-inventory/${encodeURIComponent(result.selected.agents[0].id)}/detail?selectionId=${result.selection.id}`, { headers: { Cookie: readerCookie } });
     expect(exact.status).toBe(200);
-    expect(await exact.json()).toMatchObject({ count: 1 });
+    expect(await exact.json()).toMatchObject({ id: result.selected.agents[0].id });
     expect(inventoryProviderFixture.queries).toBe(platformReads);
     expect(GraphPackagesClient.prototype.getPackageDetails).toHaveBeenCalledTimes(graphReads);
     expect(acquireDelegatedToken).toHaveBeenCalledTimes(tokenReads);
     const other = await roleCookie("responsibility-other", ["AgentControl.Viewer"]);
-    expect((await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: other } })).status).toBe(404);
+    const otherResult = await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: other } });
+    expect(otherResult.status).toBe(409);
+    expect(await otherResult.json()).toMatchObject({ code: "inventory_unavailable" });
     expect((await request("/api/agent-responsibility?principalId=responsibility-reader", { headers: { Cookie: other } })).status).toBe(400);
     const unassigned = await roleCookie(principalId, []);
     expect((await request("/api/agent-responsibility", { headers: { Cookie: unassigned } })).status).toBe(403);
@@ -1185,8 +1244,8 @@ describe.sequential("packaged API/session contracts", () => {
     const platformReads = inventoryProviderFixture.queries;
     const saved = await request("/api/agent-inventory?limit=1", { headers: { Cookie: readerCookie } });
     expect(saved.status).toBe(200);
-    const page = await saved.json() as { count: number; revision: string; value: Array<{ id: string }> };
-    expect(page.count).toBe(2);
+    const page = await saved.json();
+    expect(page.counts.total).toBe(2);
     expect(page).toMatchObject({
       partial: false,
       sources: { powerPlatform: { state: "available", observation: { roleScope: "unknown", verification: { status: "verified", storedCount: 1 } } } },
@@ -1197,181 +1256,123 @@ describe.sequential("packaged API/session contracts", () => {
       },
     });
     expect(page.value).toHaveLength(1);
-    expect(page.revision).toMatch(/^[a-f0-9]{64}$/);
-    const exportRequest = (body: unknown, selectedCookie = readerCookie) => request("/api/agent-inventory/export.csv", {
-      method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify(body),
+    expect(page.selection.id).toMatch(/^[a-f0-9-]{36}$/);
+    const exportRequest = (body: unknown, selectedCookie = readerCookie) => request("/api/data-exports", {
+      method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "unified_agents", selectionId: page.selection.id, ...body as object }),
     });
-    const all = await exportRequest({ revision: page.revision });
+    const all = await inventoryExport(readerCookie, page.selection.id, "unified_agents");
     expect(all.status).toBe(200);
-    expect(all.headers.get("content-disposition")).toBe("attachment; filename=agents.csv");
+    expect(all.headers.get("content-disposition")).toContain("attachment;");
     expect(all.headers.get("cache-control")).toContain("no-store");
     const allRows = parseCsv(await all.text(), { bom: true, columns: true });
-    expect(allRows).toHaveLength(2);
-    expect(allRows.every((row: Record<string, string>) => row.inventoryVerificationStatus === "details_pending"
+    const agents = allRows.filter((row: Record<string, string>) => row.recordType === "agent");
+    expect(agents).toHaveLength(2);
+    expect(agents.every((row: Record<string, string>) => row.inventoryVerificationStatus === "details_pending"
       && row.inventorySourceCount === "2" && row.inventoryUniqueSourceCount === "2")).toBe(true);
     expect(JSON.stringify(allRows)).not.toContain("sensitive-user");
-    const filtered = await exportRequest({ revision: page.revision, query: { environmentId: "11111111-1111-4111-8111-111111111111" } });
+    const filteredPage = await inventoryPage(readerCookie, new URLSearchParams({
+      environmentId: encodeInventoryFacet("11111111-1111-4111-8111-111111111111"),
+    }).toString());
+    const filtered = await inventoryExport(readerCookie, filteredPage.selection.id, "unified_agents");
     expect(filtered.status).toBe(200);
-    expect(parseCsv(await filtered.text(), { bom: true, columns: true })).toEqual([
+    expect(parseCsv(await filtered.text(), { bom: true, columns: true }).filter((row: Record<string, string>) => row.recordType === "agent")).toEqual([
       expect.objectContaining({ nativeResourceId: "native-agent", packageIds: "[]" }),
     ]);
-    const selected = await exportRequest({ revision: page.revision, recordIds: ["graph_packages:package-1", "graph_packages:package-1"] });
+    const exact = await (await request(`/api/agent-inventory/graph_packages:package-1/detail?selectionId=${page.selection.id}`,
+      { headers: { Cookie: readerCookie } })).json();
+    const selected = await inventoryExport(readerCookie, page.selection.id, "unified_agents", ["graph_packages:package-1", exact.id]);
     expect(selected.status).toBe(200);
-    expect(parseCsv(await selected.text(), { bom: true, columns: true })).toEqual([
-      expect.objectContaining({ packageIds: '["package-1"]', inventoryRevision: page.revision }),
+    expect(parseCsv(await selected.text(), { bom: true, columns: true }).filter((row: Record<string, string>) => row.recordType === "agent")).toEqual([
+      expect.objectContaining({ packageIds: '["package-1"]', inventoryRevision: page.selection.revision }),
     ]);
-    const missing = await exportRequest({ revision: page.revision, recordIds: ["graph_packages:absent"] });
+    const missing = await exportRequest({ ids: ["graph_packages:absent"] });
     expect(missing.status).toBe(409);
     expect(await missing.json()).toMatchObject({ code: "export_selection_changed" });
     const foreignCookie = await roleCookie("unified-export-foreign", ["AgentControl.Viewer"]);
-    expect((await exportRequest({ revision: page.revision }, foreignCookie)).status).toBe(409);
+    expect((await exportRequest({}, foreignCookie)).status).toBe(409);
     const audit = await request("/api/audit/events?action=export-agent-inventory", { headers: { Cookie: readerCookie } });
     expect(audit.status).toBe(200);
     const events = await audit.json() as { value: Array<{ status: string; metadata: Record<string, unknown> }> };
-    expect(events.value.filter(event => event.status === "succeeded")).toHaveLength(3);
+    expect(events.value.filter(event => event.status === "succeeded")).toHaveLength(6);
     expect(JSON.stringify(events)).not.toContain("sensitive-user");
-    expect(events.value.some(event => event.metadata.resultingCount === 2)).toBe(true);
+    expect(events.value.every(event => Number(event.metadata.rowCount) >= 1)).toBe(true);
     expect(vi.mocked(GraphPackagesClient.prototype.getPackageDetails).mock.calls.length).toBe(graphReads);
     expect(inventoryProviderFixture.queries).toBe(platformReads);
-    expect((await request("/api/agent-inventory/export.csv", {
+    expect((await request("/api/data-exports", {
       method: "POST", headers: { Cookie: readerCookie, "x-csrf-token": "wrong", "Content-Type": "application/json" },
-      body: JSON.stringify({ revision: page.revision }),
+      body: JSON.stringify({ kind: "unified_agents", selectionId: page.selection.id }),
     })).status).toBe(403);
     const unassigned = await roleCookie("unified-export-unassigned", []);
-    expect((await exportRequest({ revision: page.revision }, unassigned)).status).toBe(403);
-    expect((await exportRequest({ revision: page.revision }, "")).status).toBe(401);
+    expect((await exportRequest({}, unassigned)).status).toBe(403);
+    expect((await exportRequest({}, "")).status).toBe(401);
   });
 
-  it.each(["role", "session", "expiry", "deletion", "exact-overlay", "environment", "filter-source"] as const)(
-    "fences unified CSV publication when %s changes after selection", async change => {
+  it.each(["role", "session", "expiry", "cancelled", "exact-overlay", "environment", "filter-source"] as const)(
+    "revalidates durable download after %s changes without confusing safe refresh with authority loss", async change => {
       const principalId = `unified-export-race-${change}`;
       const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-      const snapshotId = await publishPackageSnapshot(principalId);
+      await publishPackageSnapshot(principalId);
       const scope = { tenantId: config.tenants[0].tenantId!, principalId };
       if (change === "filter-source") await new AuditLog(scope, fixture.runtime).startEvent({
         operationId: "abcd1234-source", scope: "bulk", action: "block", targetBlockedState: true, agentId: "package-1",
         actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
         requestPath: "/fixture",
       });
-      const saved = await request("/api/agent-inventory", { headers: { Cookie: readerCookie } });
-      expect(saved.status).toBe(200);
-      const { revision } = await saved.json() as { revision: string };
-      const complete = AuditLog.prototype.completeEvent;
-      const completing = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
-        const completed = await complete.call(this, id, update);
-        if (completed.action === "export-agent-inventory" && completed.status === "succeeded") {
-          if (change === "role") await fixture.operator.query(
-            "UPDATE sessions SET sess=jsonb_set(sess::jsonb,'{user,roles}','[]'::jsonb) WHERE principal_id=$1", [principalId]);
-          else if (change === "session") await fixture.operator.query("DELETE FROM sessions WHERE principal_id=$1", [principalId]);
-          else if (change === "expiry") await fixture.operator.query(
-            "UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [snapshotId]);
-          else if (change === "deletion") await fixture.operator.query("DELETE FROM package_inventory_snapshots WHERE id=$1", [snapshotId]);
-          else if (change === "exact-overlay") await publishPackageSnapshot(principalId, ["package-1"]);
-          else if (change === "filter-source") await fixture.operator.query("DELETE FROM audit_events WHERE principal_id=$1 AND action='block'", [principalId]);
-          else {
-            const repository = new PowerPlatformInventoryRepository(fixture.runtime);
-            const job = await repository.submit(scope, {
-              idempotencyKey: `environment-${randomUUID()}`, roleScope: "full", requestedTypes: ["microsoft.powerplatform/environments"],
-            });
-            await repository.markRunning(scope, job.id);
-            await repository.publish(scope, job.id, {
-              resources: [{
-                tenantId: scope.tenantId, nativeId: "11111111-1111-4111-8111-111111111111", type: "microsoft.powerplatform/environments",
-                environmentId: null, displayName: "Renamed environment", location: null, createdAt: null, createdBy: null,
-                lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "not_agent",
-                lifecycle: "unknown", identityConfidence: "exact_native",
-                identifiers: [{ kind: "power_platform_resource_id", value: "11111111-1111-4111-8111-111111111111" }],
-                provenance: {}, details: {}, unknownFieldCount: 0,
-              }], totalRecords: 1, pages: 1, unknownFieldCount: 0,
-            });
-          }
-        }
-        return completed;
-      });
-      try {
-        const exported = await request("/api/agent-inventory/export.csv", {
-          method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
-          body: JSON.stringify({ revision, ...(change === "filter-source" ? { query: { operationIdPrefix: "abcd1234" } } : {}) }),
-        });
-        expect(exported.status).toBe(change === "role" || change === "session" ? 401 : 409);
+      const page = await inventoryPage(readerCookie, change === "filter-source" ? "operationIdPrefix=abcd1234" : "");
+      const id = await createInventoryExport(readerCookie, page.selection.id, "unified_agents");
+      if (change === "role") await fixture.operator.query(
+        "UPDATE sessions SET sess=jsonb_set(sess::jsonb,'{user,roles}','[]'::jsonb) WHERE principal_id=$1", [principalId]);
+      else if (change === "session") await fixture.operator.query("DELETE FROM sessions WHERE principal_id=$1", [principalId]);
+      else if (change === "expiry") await fixture.operator.query(
+        "UPDATE data_exports SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [id]);
+      else if (change === "cancelled") expect((await request(`/api/data-exports/${id}`, { method: "DELETE", headers: { Cookie: readerCookie } })).status).toBe(204);
+      else if (change === "exact-overlay") await publishPackageSnapshot(principalId, ["package-1"], scope.tenantId, "Newer provider name");
+      else if (change === "filter-source") await fixture.operator.query("DELETE FROM audit_events WHERE principal_id=$1 AND action='block'", [principalId]);
+      else await publishQuarantineInventory(principalId);
+      const exported = await request(`/api/data-exports/${id}/download`, { headers: { Cookie: readerCookie } });
+      if (change === "exact-overlay" || change === "environment") {
+        expect(exported.status).toBe(200);
+        const rows = parseCsv(await exported.text(), { columns: true, bom: true });
+        expect(rows.filter((row: Record<string, string>) => row.recordType === "agent"))
+          .toMatchObject([{ displayName: "Fixture", packageIds: '["package-1"]' }]);
+      } else {
+        expect(exported.status).toBe(change === "role" ? 403 : change === "session" ? 401 : 409);
         expect(exported.headers.get("content-type")).toContain("application/problem+json");
         expect(await exported.text()).not.toContain("package-1");
-        expect(await new AuditLog(scope, fixture.runtime).listEvents({ action: "export-agent-inventory" })).toEqual([
-          expect.objectContaining({ status: "failed", metadata: expect.objectContaining({ source: "unified_agents", revision }) }),
-        ]);
-      } finally {
-        completing.mockRestore();
       }
     });
 
-  it.each(["role", "session", "expiry", "deletion", "application-scope", "filter-source"] as const)(
-    "denies export when %s changes during final audit without releasing rows", async change => {
-      const principalId = `export-race-${change}`;
-      const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-      const ownerId = change === "application-scope" ? config.tenants[0].clientId! : principalId;
-      const snapshotId = await publishPackageSnapshot(ownerId);
-      if (change === "filter-source") {
-        await new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime).startEvent({
-          operationId: "abcd1234-race", scope: "bulk", action: "block", targetBlockedState: true, agentId: "package-1",
-          actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
-          requestPath: "/fixture",
-        });
-      }
-      const complete = AuditLog.prototype.completeEvent;
-      const applicationScope = vi.mocked(capabilities.requireApplicationDataScope);
-      const previousScopeImplementation = applicationScope.getMockImplementation()!;
-      const completing = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
-        const completed = await complete.call(this, id, update);
-        if (completed.action === "export-package-inventory" && completed.status === "succeeded") {
-          if (change === "role") await fixture.operator.query(
-            "UPDATE sessions SET sess=jsonb_set(sess::jsonb,'{user,roles}','[]'::jsonb) WHERE principal_id=$1", [principalId]);
-          else if (change === "session") await fixture.operator.query("DELETE FROM sessions WHERE principal_id=$1", [principalId]);
-          else if (change === "expiry") await fixture.operator.query(
-            "UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [snapshotId]);
-          else if (change === "deletion") await fixture.operator.query("DELETE FROM package_inventory_snapshots WHERE id=$1", [snapshotId]);
-          else if (change === "filter-source") await fixture.operator.query("DELETE FROM audit_events WHERE principal_id=$1 AND action='block'", [principalId]);
-          else applicationScope.mockRejectedValue(new AppError(403, "scope_revoked", "Application scope revoked."));
-        }
-        return completed;
-      });
-      try {
-        const exported = await request(`/api/agents/export.csv${change === "application-scope" ? "?mode=application" : ""}`, {
-          method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
-          body: JSON.stringify({ ...(change === "filter-source" ? { filters: { operationIdPrefix: "abcd1234" } } : { ids: ["package-1"] }), snapshotId }),
-        });
-        expect(exported.status).toBe(change === "expiry" || change === "filter-source" ? 409 : change === "deletion" ? 404 : change === "application-scope" ? 403 : 401);
-        expect(exported.headers.get("content-type")).toContain("application/problem+json");
-        const body = await exported.text();
-        expect(body).not.toContain("package-1");
-        const audit = new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime);
-        expect(await audit.listEvents({ action: "export-package-inventory" })).toEqual([
-          expect.objectContaining({ status: "failed", metadata: expect.objectContaining({ source: "graph_packages", snapshotId }) }),
-        ]);
-      } finally {
-        completing.mockRestore();
-        applicationScope.mockImplementation(previousScopeImplementation);
-      }
-    });
+  it.each(["agents", "inventory", "agent-inventory"])("does not restore retired %s CSV routes or create an export from them", async source => {
+    const before = (await fixture.runtime.query("SELECT count(*)::int AS count FROM data_exports")).rows[0].count;
+    for (const method of ["GET", "POST"]) {
+      const result = await request(`/api/${source}/export.csv`, { method,
+        ...method === "POST" ? { headers: { "Content-Type": "application/json" }, body: "{}" } : {} });
+      expect(result.status).toBe(404);
+      expect(result.headers.get("content-type")).not.toContain("text/csv");
+      expect(await result.text()).not.toContain("package-1");
+    }
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_exports")).rows[0].count).toBe(before);
+  });
 
   it("allows Viewer audit-reference filters while preserving principal scope", async () => {
     const principalId = "inventory-audit-filter";
     const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-    const snapshotId = await publishPackageSnapshot(principalId);
+    await publishPackageSnapshot(principalId);
     const audit = new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime);
     await audit.startEvent({ operationId: "abcd1234-own-action", scope: "bulk", action: "block", targetBlockedState: true,
       agentId: "package-1", actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
       requestPath: "/fixture" });
     expect((await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } })).status).toBe(200);
-    const exportRequest = { method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
-      body: JSON.stringify({ snapshotId, filters: { operationIdPrefix: "abcd1234" } }) };
-    expect((await request("/api/agents/export.csv", exportRequest)).status).toBe(200);
+    const selection = await inventoryPage(readerCookie, "operationIdPrefix=abcd1234");
+    expect((await inventoryExport(readerCookie, selection.selection.id, "graph_packages")).status).toBe(200);
     const result = await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } });
-    expect(await result.json()).toMatchObject({ count: 1, value: [{ id: "package-1" }] });
+    expect(await result.json()).toMatchObject({ counts: { total: 1, filtered: 1 }, value: [{ id: "package-1" }] });
     const otherId = "inventory-audit-filter-other";
     await publishPackageSnapshot(otherId);
     const otherCookie = await roleCookie(otherId, ["AgentControl.Viewer"]);
     expect(await (await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: otherCookie } })).json())
-      .toMatchObject({ count: 0, value: [] });
+      .toMatchObject({ counts: { total: 1, filtered: 0 }, value: [] });
   });
 
   it("exports only current scoped administrative events and rechecks deletion before publication", async () => {
@@ -1441,7 +1442,7 @@ describe.sequential("packaged API/session contracts", () => {
       security: { status: "unmatched" },
     });
     const otherReader = await roleCookie("source-detail-other", ["AgentControl.Viewer"]);
-    expect((await request(path, { headers: { Cookie: otherReader } })).status).toBe(404);
+    expect((await request(path, { headers: { Cookie: otherReader } })).status).toBe(409);
   });
   it("reads authorized saved audit data during provider outage", async () => {
     const securityReaderCookie=await roleCookie("security-reader",["AgentControl.Viewer"]);
@@ -1455,7 +1456,7 @@ describe.sequential("packaged API/session contracts", () => {
   it("enforces inventory role, CSRF and private job/snapshot/export scope without live GET reads", async () => {
     const principalId="inventory-reader";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
-    const repository=new PowerPlatformInventoryRepository(fixture.runtime);
+    const repository=new PowerPlatformRefreshJobs(fixture.runtime);
     const inventoryScope={tenantId:config.tenants[0].tenantId!,principalId};
     const job=await repository.submit(inventoryScope,{idempotencyKey:"route-inventory",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
     await repository.markRunning(inventoryScope,job.id);
@@ -1473,7 +1474,8 @@ describe.sequential("packaged API/session contracts", () => {
         }]}],
       },unknownFieldCount:0,
     };
-    await repository.publish(inventoryScope,job.id,{resources:[malicious],queriedTypes:["microsoft.copilotstudio/agents"],environmentScope:null,totalRecords:1,pages:1,unknownFieldCount:0});
+    await refreshInventoryFixture(fixture.runtime, inventoryScope, job.id, "power_platform",
+      [powerPlatformInventoryRecord(malicious)], ["microsoft.copilotstudio/agents"]);
     const snapshotId=(await repository.getJob(inventoryScope,job.id))!.snapshotId!;
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(new AppError(502,"provider_error","provider unavailable"));
     try {
@@ -1481,24 +1483,23 @@ describe.sequential("packaged API/session contracts", () => {
         expect((await request(path,{headers:{Cookie:readerCookie}})).status).toBe(404);
       }
       expect((await request("/api/inventory/refresh-jobs",{headers:{Cookie:readerCookie}})).status).toBe(200);
-      expect((await request("/api/inventory/export.csv",{headers:{Cookie:readerCookie}})).status).toBe(400);
+      expect((await request("/api/inventory/export.csv",{headers:{Cookie:readerCookie}})).status).toBe(404);
       const resources=await (await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:readerCookie}})).json();
       expect(resources).toMatchObject({value:[{nativeId:"@native"}],snapshot:{id:snapshotId}});
-      for (const filter of ["type=microsoft.powerplatform%2Fenvironments", "excludeAgents=true"]) {
-        expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}&${filter}`,{headers:{Cookie:readerCookie}})).status).toBe(400);
-      }
-      const csv=await (await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`,{headers:{Cookie:readerCookie}})).text();
+      const selection = await inventoryPage(readerCookie);
+      const csv=await (await inventoryExport(readerCookie, selection.selection.id, "power_platform_agents")).text();
       expect(csv.split("\r\n")[0]).toContain("sourceSystem");
       expect(csv).toContain("\"power_platform\"");
       expect(csv).toContain("\"'@native\"");
       expect(csv).toContain("\"'=SUM(1,1)\"");
-      const exported = parseCsv(csv, { columns: true, bom: true })[0];
+      const exportedRows = parseCsv(csv, { columns: true, bom: true }) as Array<Record<string, string>>;
+      const exported = exportedRows.find(row => row.recordType === "source");
       expect(exported).toMatchObject({
         ownerId: "owner-id", lastModifiedBy: "modifier-id", connectorDetailsStatus: "partial",
         reportedConnectorTotal: "1", reportedOperationTotal: "2", savedConnectorDetails: "1", savedOperationDetails: "1",
         invokedFlowContext: "unavailable_from_synced_sources",
       });
-      expect(JSON.parse(exported.configuredConnectors)[0].operations[0]).toMatchObject({
+      expect(JSON.parse(exportedRows.find(row => row.childKind === "connectorOperation")!.childData).payload).toMatchObject({
         isEnabled: false, requiresEndUserConsent: false, createdBy: "52bff06b-5db5-42cd-9919-28f95e3c07af",
       });
       expect(csv).not.toMatch(/private-connection|private.invalid/);
@@ -1506,14 +1507,18 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await request("/api/inventory/refresh-jobs",{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong","Content-Type":"application/json"},body:"{}"})).status).toBe(403);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}/resume`,{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong"}})).status).toBe(403);
       const adminReader = await roleCookie(principalId, ["AgentControl.Admin"]);
-      expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`, { headers: { Cookie: adminReader } })).status).toBe(200);
+      const adminSelection = await inventoryPage(adminReader);
+      expect((await inventoryExport(adminReader, adminSelection.selection.id, "power_platform_agents")).status).toBe(200);
       const unassigned = await roleCookie("inventory-unassigned", []);
-      for (const path of ["/api/inventory/quarantine-selection","/api/inventory/refresh-jobs","/api/inventory/export.csv"]) expect((await request(path,{headers:{Cookie:unassigned}})).status).toBe(403);
+      for (const path of ["/api/inventory/quarantine-selection","/api/inventory/refresh-jobs"]) expect((await request(path,{headers:{Cookie:unassigned}})).status).toBe(403);
+      expect((await request("/api/data-exports", { method: "POST", headers: { Cookie: unassigned, "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "power_platform_agents", selectionId: selection.selection.id }) })).status).toBe(403);
 
       const otherReader=await roleCookie("inventory-other",["AgentControl.Viewer"]);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}`,{headers:{Cookie:otherReader}})).status).toBe(404);
-      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:otherReader}})).status).toBe(404);
-      expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`,{headers:{Cookie:otherReader}})).status).toBe(404);
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:otherReader}})).status).toBe(409);
+      expect((await request("/api/data-exports", { method: "POST", headers: { Cookie: otherReader, "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "power_platform_agents", selectionId: selection.selection.id }) })).status).toBe(409);
       expect(await (await request("/api/inventory/refresh-jobs",{headers:{Cookie:otherReader}})).json()).toMatchObject({value:[]});
     } finally { vi.mocked(capabilities.requireAvailable).mockResolvedValue(undefined); }
   });
@@ -1522,7 +1527,6 @@ describe.sequential("packaged API/session contracts", () => {
     const principalId = "quarantine-operator";
     const operatorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const snapshotId = await publishQuarantineInventory(principalId);
-    const readerCookie = await roleCookie("quarantine-reader", ["AgentControl.Viewer"]);
     const otherOperatorCookie = await roleCookie("quarantine-other", ["AgentControl.Admin"]);
     const administratorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const securityReaderCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
@@ -1533,7 +1537,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(targetList.status).toBe(200);
       const targetPage = await targetList.json();
       expect(targetPage).toMatchObject({ snapshot: { id: snapshotId }, value: [{ nativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111" }] });
-      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: otherOperatorCookie } })).status).toBe(404);
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: otherOperatorCookie } })).status).toBe(409);
       expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads);
       expect((await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/status?snapshotId=not-a-uuid&nativeId=native-agent", { headers: { Cookie: operatorCookie } })).status).toBe(400);
@@ -1545,7 +1549,7 @@ describe.sequential("packaged API/session contracts", () => {
         direct: { isBotQuarantined: false, providerUpdatedAt: "2026-09-09T10:00:00.123Z" }, inventory: { isQuarantined: true, snapshotId }, disagreesWithInventory: true });
       const isolated = await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: otherOperatorCookie } });
       expect(isolated.status).toBe(409);
-      expect(await isolated.json()).toMatchObject({ code: "quarantine_inventory_unavailable" });
+      expect(await isolated.json()).toMatchObject({ code: "quarantine_target_unavailable" });
 
       expect((await request("/api/quarantine/preview", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], packageId: "must-not-be-a-target" }) })).status).toBe(400);
@@ -1565,7 +1569,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(await submit.json()).toMatchObject({ status: "queued", action: "quarantine" });
 
       const quarantineRepository = new CopilotStudioQuarantineRepository(fixture.runtime);
-      const inventoryTarget = (await new PowerPlatformInventoryRepository(fixture.runtime).resolveQuarantineTargets({ tenantId: config.tenants[0].tenantId!, principalId }, snapshotId, ["native-agent"]))[0];
+      const inventoryTarget = (await new NativeInventory(fixture.runtime).resolveQuarantineTargets({ tenantId: config.tenants[0].tenantId!, principalId }, snapshotId, ["native-agent"]))[0];
       const frozenTarget = { ...inventoryTarget, directStatus: { environmentId: inventoryTarget.environmentId, botId: inventoryTarget.botId, isBotQuarantined: false,
         lastUpdateTimeUtc: "2026-09-09T10:00:00.123Z", observedAt: new Date().toISOString(), correlationId: randomUUID() } };
       const durableInput = { action: "quarantine" as const, targets: [frozenTarget], actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId,
@@ -1604,7 +1608,7 @@ describe.sequential("packaged API/session contracts", () => {
       const job=await response.json();
       expect(job).toMatchObject({status:"waiting_authorization",environmentScope:"environment-a",requestedTypes:["microsoft.copilotstudio/agents"],snapshotId:null});
       expect(inventoryProviderFixture.queries).toBe(0);
-      const persisted=await new PowerPlatformInventoryRepository(fixture.runtime).getJob({tenantId:config.tenants[0].tenantId!,principalId},job.id);
+      const persisted=await new PowerPlatformRefreshJobs(fixture.runtime).getJob({tenantId:config.tenants[0].tenantId!,principalId},job.id);
       expect(persisted).toMatchObject({status:"waiting_authorization",snapshotId:null});
     } finally {
       authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
@@ -1620,21 +1624,23 @@ describe.sequential("packaged API/session contracts", () => {
       ["userAgents", "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nusage-agent,=Formula agent,Declarative,@pseudonym,4,2026-07-06\nbridge-agent,Bridge only,Custom,@bridge-only,2,2026-07-05"],
       ["users", "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\n@pseudonym,+Formula user,1,4,2026-07-06\n@users-only,Users only,1,3,2026-07-04"],
     ] as const;
+    const previews: OfficialReportPreview[] = [];
     for (const [kind, csv] of reports) {
       const form = new FormData();
-      form.append("bundleId", bundleId);
       form.append("file", new Blob([csv], { type: "application/octet-stream" }), `private-${kind}.not-trusted`);
-      const response = await request("/api/official-usage/staging", { method: "POST", headers: { Cookie: administratorCookie }, body: form });
+      const response = await request(`/api/official-usage/staging?bundleId=${bundleId}`, { method: "POST", headers: { Cookie: administratorCookie }, body: form });
       expect(response.status).toBe(201);
+      previews.push(await response.json() as OfficialReportPreview);
       if (kind === "userAgents") {
-        const adminState = await (await request("/api/official-usage/admin", { headers: { Cookie: administratorCookie } })).json();
-        expect(adminState.staging).toEqual(expect.arrayContaining(reports.slice(0, 2).map(([stagedKind]) => expect.objectContaining({ kind: stagedKind, bundleId }))));
+        expect(previews).toEqual(expect.arrayContaining(reports.slice(0, 2).map(([stagedKind]) => expect.objectContaining({ kind: stagedKind, bundleId }))));
+        expect((await request("/api/official-usage/admin", { headers: { Cookie: administratorCookie } })).status).toBe(404);
         const incompleteResponse = await request(`/api/official-usage/bundles/${bundleId}/preview`, {
           method: "POST", headers: { Cookie: administratorCookie },
         });
         expect(incompleteResponse.status).toBe(200);
-        const incomplete = await incompleteResponse.json();
-        expect(incomplete).toMatchObject({ missingKinds: ["users"], staging: expect.any(Array) });
+        const incomplete = await incompleteResponse.json() as OfficialReportBundlePreview;
+        expect(incomplete).toMatchObject({ complete: false });
+        expect(incomplete.stages.map(stage => stage.kind)).toEqual(["agents", "userAgents"]);
         expect((await request(`/api/official-usage/bundles/${bundleId}/accept`, {
           method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
           body: JSON.stringify({ bundleHash: incomplete.bundleHash, expectedActiveRevision: incomplete.expectedActiveRevision }),
@@ -1643,10 +1649,9 @@ describe.sequential("packaged API/session contracts", () => {
     }
 
     const partialMetadata = new FormData();
-    partialMetadata.append("bundleId", randomUUID());
     partialMetadata.append("reportingStart", "2026-06-07");
     partialMetadata.append("file", new Blob([reports[0][1]]), "partial-metadata.csv");
-    const partialMetadataResponse = await request("/api/official-usage/staging", {
+    const partialMetadataResponse = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
       method: "POST", headers: { Cookie: administratorCookie }, body: partialMetadata,
     });
     expect(partialMetadataResponse.status).toBe(400);
@@ -1658,25 +1663,27 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/api/official-usage/aggregate", { headers: { Cookie: administratorCookie } })).status).toBe(200);
     expect((await request("/api/official-usage/users", { headers: { Cookie: readerCookie } })).status).toBe(200);
     const otherAdministratorCookie = await roleCookie("usage-other-administrator", ["AgentControl.Admin"]);
-    expect((await request(`/api/official-usage/bundles/${bundleId}/preview`, {
+    const foreignBundle = await request(`/api/official-usage/bundles/${bundleId}/preview`, {
       method: "POST", headers: { Cookie: otherAdministratorCookie },
-    })).status).toBe(404);
+    });
+    expect(foreignBundle.status).toBe(200);
+    expect(await foreignBundle.json()).toMatchObject({ complete: false, stages: [] });
 
     const bundlePreviewResponse = await request(`/api/official-usage/bundles/${bundleId}/preview`, {
       method: "POST", headers: { Cookie: administratorCookie },
     });
     expect(bundlePreviewResponse.status).toBe(200);
-    const bundlePreview = await bundlePreviewResponse.json();
-    expect(bundlePreview).toMatchObject({ bundleId, missingKinds: [], staging: expect.arrayContaining(reports.map(([kind]) => expect.objectContaining({ kind }))) });
-    expect(bundlePreview.staging.map((item: { reportingPeriod: unknown }) => item.reportingPeriod)).toEqual(expect.arrayContaining([
+    const bundlePreview = await bundlePreviewResponse.json() as OfficialReportBundlePreview;
+    expect(bundlePreview).toMatchObject({ bundleId, complete: true, stages: expect.arrayContaining(reports.map(([kind]) => expect.objectContaining({ kind }))) });
+    expect(previews.map(item => item.reportingPeriod)).toEqual(expect.arrayContaining([
       expect.objectContaining({ startDate: "2026-07-06", endDate: "2026-07-06", provenance: "activity_range" }),
       expect.objectContaining({ startDate: "2026-07-05", endDate: "2026-07-06", provenance: "activity_range" }),
       expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-06", provenance: "activity_range" }),
     ]));
-    expect((await request(`/api/official-usage/staging/${bundlePreview.staging[0].id}/accept`, {
+    expect((await request(`/api/official-usage/staging/${previews[0].id}/accept`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
-      body: JSON.stringify({ stagingRevision: 1, fileHash: bundlePreview.staging[0].fileHash, expectedActiveRevision: 1 }),
-    })).status).toBe(404);
+      body: JSON.stringify({ stagingRevision: 1, fileHash: previews[0].fileHash, expectedActiveRevision: 1 }),
+    })).status).toBe(400);
     expect((await request(`/api/official-usage/bundles/${bundleId}/accept`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
       body: JSON.stringify({ bundleHash: "b".repeat(64), expectedActiveRevision: bundlePreview.expectedActiveRevision }),
@@ -1686,16 +1693,16 @@ describe.sequential("packaged API/session contracts", () => {
       body: JSON.stringify({ bundleHash: bundlePreview.bundleHash, expectedActiveRevision: bundlePreview.expectedActiveRevision }),
     });
     expect(accepted.status).toBe(200);
-    const acceptedBody = await accepted.json();
+    const acceptedBody = await accepted.json() as OfficialReportAccepted;
     expect(acceptedBody).toMatchObject({ complete: true });
-    const acceptedAdminState = await (await request("/api/official-usage/admin", {
+    const acceptedHistory = await (await request("/api/official-usage/history", {
       headers: { Cookie: administratorCookie },
-    })).json();
-    expect(acceptedAdminState.activeSetId).toBe(acceptedBody.setId);
-    expect(acceptedAdminState.sets).toEqual(expect.arrayContaining([
+    })).json() as ReportPage<ReportHistorySet>;
+    expect(acceptedHistory.reports.activeSetId).toBe(acceptedBody.setId);
+    expect(acceptedHistory.value).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: acceptedBody.setId,
-        reportingPeriod: expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-06", provenance: "activity_range" }),
+        reportingStart: "2026-07-04", reportingEnd: "2026-07-06", periodProvenance: "activity_range",
       }),
     ]));
     const exactRetry = await request(`/api/official-usage/bundles/${bundleId}/accept`, {
@@ -1729,35 +1736,56 @@ describe.sequential("packaged API/session contracts", () => {
 
     const aggregate = await request("/api/official-usage/aggregate", { headers: { Cookie: readerCookie } });
     expect(aggregate.status).toBe(200);
-    const aggregateBody = await aggregate.json();
-    expect(aggregateBody).toMatchObject({ availability: "stale", authority: expect.stringContaining("Microsoft 365 admin center"), agents: { count: 2 } });
-    expect(aggregateBody.agents.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({ agentId: "usage-agent", creatorTypeSource: "agents_report", identityStatus: "unresolved" }),
-      expect.objectContaining({ agentId: "bridge-agent", creatorTypeSource: "users_and_agents_report", identityStatus: "unresolved" }),
+    const aggregateBody = await aggregate.json() as ReportPage<ReportAgent>;
+    expect(aggregateBody).toMatchObject({ reports: { availability: "stale" }, counts: { total: 2, filtered: 2 } });
+    expect(aggregateBody.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "usage-agent", responseSource: "agents", identityStatus: "unresolved" }),
+      expect.objectContaining({ agentId: "bridge-agent", responseSource: "userAgents", identityStatus: "unresolved" }),
     ]));
     expect(JSON.stringify(aggregateBody)).not.toContain("@pseudonym");
 
     const users = await request("/api/official-usage/users", { headers: { Cookie: securityReaderCookie } });
     expect(users.status).toBe(200);
-    const usersBody = await users.json();
-    expect(usersBody).toMatchObject({ counts: { users: 3, accessRows: 2 } });
-    expect(usersBody.users.value).toEqual(expect.arrayContaining([expect.objectContaining({
-      username: "@pseudonym",
-      datasetScope: { reportSetId: expect.any(String), usersVersionId: expect.any(String), userAgentsVersionId: expect.any(String) },
-      rows: [expect.objectContaining({ creatorTypeSource: "users_and_agents_report", identityStatus: "unresolved" })],
+    const usersBody = await users.json() as ReportPage<ReportUser>;
+    expect(usersBody).toMatchObject({ counts: { total: 3, filtered: 3 }, reports: { setId: acceptedBody.setId } });
+    expect(usersBody.value).toEqual(expect.arrayContaining([expect.objectContaining({
+      username: "@pseudonym", relationshipCount: 1,
     })]));
-    const filteredUsers = await request("/api/official-usage/users?startDate=2026-07-04&endDate=2026-07-04&cohort=low&lowResponseThreshold=3&sortBy=responses&sortDirection=asc", { headers: { Cookie: securityReaderCookie } });
+    const relationships = await request(`/api/official-usage/users/${encodeURIComponent("@pseudonym")}/agents?selectionId=${usersBody.selection.id}`, { headers: { Cookie: securityReaderCookie } });
+    const relationshipPage = await relationships.json() as ReportPage<ReportRelationship>;
+    expect(relationshipPage).toMatchObject({ counts: { total: 1, filtered: 1 }, value: [expect.objectContaining({ agentId: "usage-agent", identityStatus: "unresolved" })] });
+    const filteredUsers = await request("/api/official-usage/users?startDate=2026-07-04&endDate=2026-07-04&cohort=low&lowResponseThreshold=3&sort=responses&order=asc", { headers: { Cookie: securityReaderCookie } });
     expect(filteredUsers.status).toBe(200);
     expect(await filteredUsers.json()).toMatchObject({
       filters: { startDate: "2026-07-04", endDate: "2026-07-04", cohort: "low", lowResponseThreshold: 3 },
-      users: { count: 1, value: [expect.objectContaining({ username: "@users-only", reviewCohort: "low_responses", licenseAssignmentStatus: "unavailable", rows: [] })] },
+      counts: { filtered: 1 }, value: [expect.objectContaining({ username: "@users-only", reviewCohort: "low", entitlement: null, relationshipCount: 0 })],
     });
     expect((await request("/api/official-usage/users?startDate=2026-02-30", { headers: { Cookie: securityReaderCookie } })).status).toBe(400);
-    const filteredAgents = await request("/api/official-usage/aggregate?startDate=2026-07-05&endDate=2026-07-05&sortBy=responses&sortDirection=asc", { headers: { Cookie: readerCookie } });
-    expect(await filteredAgents.json()).toMatchObject({ agents: { count: 1, value: [expect.objectContaining({ agentId: "bridge-agent" })] } });
-    const aggregateCsv = await (await request("/api/official-usage/aggregate.csv", { headers: { Cookie: readerCookie } })).text();
-    const usersCsv = await (await request("/api/official-usage/users.csv?search=pseudonym&creatorType=Declarative&responsesOnly=true", { headers: { Cookie: securityReaderCookie } })).text();
-    const allUsersCsv = await (await request("/api/official-usage/users.csv", { headers: { Cookie: securityReaderCookie } })).text();
+    const filteredAgents = await request("/api/official-usage/aggregate?startDate=2026-07-05&endDate=2026-07-05&sort=responses&order=asc", { headers: { Cookie: readerCookie } });
+    expect(await filteredAgents.json()).toMatchObject({ counts: { filtered: 1 }, value: [expect.objectContaining({ agentId: "bridge-agent" })] });
+    for (const removed of ["/api/official-usage/aggregate.csv", "/api/official-usage/users.csv"]) {
+      expect((await request(removed, { headers: { Cookie: readerCookie } })).status).toBe(404);
+    }
+    async function download(selectionId: string, kind: "official_agents" | "official_users", selectedCookie: string) {
+      const queued = await request("/api/data-exports", { method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ selectionId, kind }) });
+      expect(queued.status).toBe(202);
+      const job = await queued.json() as { id: string };
+      await vi.waitFor(async () => {
+        const status = await (await request(`/api/data-exports/${job.id}`, { headers: { Cookie: selectedCookie } })).json() as OfficialReportExportStatus;
+        expect(status.status).toBe("ready");
+        expect(status.bytes).toBeLessThan(16384);
+      });
+      const result = await request(`/api/data-exports/${job.id}/download`, { headers: { Cookie: selectedCookie } });
+      expect(result.status).toBe(200);
+      expect(result.headers.get("content-type")).toContain("text/csv");
+      return result.text();
+    }
+    const filteredExportUsers = await (await request("/api/official-usage/users?search=pseudonym&creatorType=Declarative&responsesOnly=true",
+      { headers: { Cookie: securityReaderCookie } })).json() as ReportPage<ReportUser>;
+    const aggregateCsv = await download(aggregateBody.selection.id, "official_agents", readerCookie);
+    const usersCsv = await download(filteredExportUsers.selection.id, "official_users", securityReaderCookie);
+    const allUsersCsv = await download(usersBody.selection.id, "official_users", securityReaderCookie);
     const [aggregateHeader, ...aggregateRows] = parseCsv(aggregateCsv, { bom: true }) as string[][];
     const aggregateRow = aggregateRows.find(row => row[aggregateHeader.indexOf("agentId")] === "usage-agent")!;
     const exportedAgent = Object.fromEntries(aggregateHeader.map((column, index) => [column, aggregateRow[index]]));
@@ -1765,11 +1793,12 @@ describe.sequential("packaged API/session contracts", () => {
       activeUsersTotal: "1",
       activeUsersTotalBasis: "userAgents_distinct_identity",
       activeUsersIdentityCount: "1",
+      lastActivityDateUtc: "2026-07-06T00:00:00.000Z",
       agentsPeriodProvenance: "activity_range",
       agentsSourceFreshness: "unknown",
       userAgentsPeriodProvenance: "activity_range",
       userAgentsSourceFreshness: "unknown",
-      reportSetId: aggregateBody.activeSet.id,
+      reportSetId: aggregateBody.reports.setId,
     });
     const bridgeAgentRow = aggregateRows.find(row => row[aggregateHeader.indexOf("agentId")] === "bridge-agent")!;
     expect(Object.fromEntries(aggregateHeader.map((column, index) => [column, bridgeAgentRow[index]]))).toMatchObject({
@@ -1787,7 +1816,7 @@ describe.sequential("packaged API/session contracts", () => {
       usersSourceFreshness: "unknown",
       userAgentsPeriodProvenance: "activity_range",
       userAgentsSourceFreshness: "unknown",
-      reportSetId: aggregateBody.activeSet.id,
+      reportSetId: aggregateBody.reports.setId,
     });
     const [allUsersHeader, ...allUsersRows] = parseCsv(allUsersCsv, { bom: true }) as string[][];
     const exportedUsersOnly = Object.fromEntries(allUsersHeader.map((column, index) => [column,
@@ -1816,17 +1845,16 @@ describe.sequential("packaged API/session contracts", () => {
     expect(usersCsv).toContain("\"'@pseudonym\"");
     expect(usersCsv).toContain("\"'+Formula user\"");
 
-    const activeSetId = aggregateBody.activeSet.id;
+    const activeSetId = aggregateBody.reports.setId;
     const malformed = new FormData();
-    malformed.append("bundleId", randomUUID());
     malformed.append("reportingStart", "2026-06-07");
     malformed.append("reportingEnd", "2026-07-06");
     malformed.append("periodProvenance", "operator_asserted");
     malformed.append("file", new Blob(["private row contents"]), "secret-filename.csv");
-    const rejected = await request("/api/official-usage/staging", { method: "POST", headers: { Cookie: administratorCookie }, body: malformed });
+    const rejected = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, { method: "POST", headers: { Cookie: administratorCookie }, body: malformed });
     expect(rejected.status).toBe(400);
     expect(JSON.stringify(await rejected.json())).not.toContain("secret-filename");
-    expect(await (await request("/api/official-usage/aggregate", { headers: { Cookie: readerCookie } })).json()).toMatchObject({ activeSet: { id: activeSetId } });
+    expect(await (await request("/api/official-usage/aggregate", { headers: { Cookie: readerCookie } })).json()).toMatchObject({ reports: { activeSetId } });
 
     const confirmationResponse = await request(`/api/official-usage/sets/${activeSetId}/preview`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
@@ -1840,17 +1868,23 @@ describe.sequential("packaged API/session contracts", () => {
     });
     expect(scalarIdentifier.status).toBe(400);
 
+    const auditCount = async () => (await fixture.runtime.query(
+      "SELECT count(*)::int AS count FROM official_usage_audit WHERE actor_principal_id='usage-administrator'",
+    )).rows[0].count;
+    const auditBefore = await auditCount();
     expect((await request("/api/official-usage/legacy-cleanup-acknowledgements", {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" }, body: JSON.stringify({ disposition: "reimported" }),
-    })).status).toBe(204);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_audit WHERE action='legacy_cleanup_acknowledged' AND actor_principal_id='usage-administrator'")).rows[0].count).toBe(1);
+    })).status).toBe(404);
+    expect(await auditCount()).toBe(auditBefore);
   });
-  it("caps simultaneous official usage uploads and releases disconnected reservations", async () => {
-    const administratorCookie = await roleCookie("usage-admission-administrator", ["AgentControl.Admin"]);
+  it.each(["before_file", "in_file"] as const)("caps simultaneous official usage uploads %s and releases disconnected reservations", async stage => {
+    const principalId = `usage-admission-${stage}`;
+    const administratorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const heldRequests: ClientRequest[] = [];
+    const timer = vi.spyOn(globalThis, "setTimeout");
     const openHeldUpload = async () => {
       const boundary = `held-${randomUUID()}`;
-      const held = httpRequest(`${base}/api/official-usage/staging`, {
+      const held = httpRequest(`${base}/api/official-usage/staging?bundleId=${randomUUID()}`, {
         method: "POST",
         headers: {
           Cookie: administratorCookie,
@@ -1861,39 +1895,44 @@ describe.sequential("packaged API/session contracts", () => {
       });
       held.on("response", response => response.resume());
       held.on("error", () => undefined);
+      const prefix = stage === "before_file" ? `--${boundary}\r\nContent-Disposition: form-data; name="file"`
+        : `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="held.csv"\r\nContent-Type: text/csv\r\n\r\nAgent ID`;
       await new Promise<void>((resolve, reject) => held.write(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="held.csv"\r\nContent-Type: text/csv\r\n\r\nAgent ID`,
+        prefix,
         error => error ? reject(error) : resolve(),
       ));
       heldRequests.push(held);
     };
 
-    await openHeldUpload();
-    await openHeldUpload();
-    await new Promise(resolve => setTimeout(resolve, 50));
-
-    const denied = new FormData();
-    denied.append("file", new Blob(["not retained"]), "denied.csv");
-    const deniedResponse = await request("/api/official-usage/staging", {
-      method: "POST",
-      headers: { Cookie: administratorCookie },
-      body: denied,
+    try {
+      await openHeldUpload();
+      await openHeldUpload();
+      await vi.waitFor(() => expect(timer.mock.calls.filter(([, delay]) => delay === 30 * 60_000)).toHaveLength(2));
+      await vi.waitFor(async () => {
+        expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_ingestions
+          WHERE principal_id=$1 AND state='streaming'`, [principalId])).rows[0].count).toBe(stage === "in_file" ? 2 : 0);
+      });
+      const denied = new FormData();
+      denied.append("file", new Blob(["not retained"]), "denied.csv");
+      const deniedResponse = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
+        method: "POST", headers: { Cookie: administratorCookie }, body: denied, signal: AbortSignal.timeout(1500),
+      });
+      expect(deniedResponse.status).toBe(429);
+      expect(await deniedResponse.json()).toMatchObject({ code: "upload_admission_full" });
+    } finally { for (const held of heldRequests) held.destroy(); timer.mockRestore(); }
+    await vi.waitFor(async () => {
+      expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_ingestions
+        WHERE principal_id=$1 AND state IN ('streaming','validating')`, [principalId])).rows[0].count).toBe(0);
     });
-    expect(deniedResponse.status).toBe(429);
-    expect(await deniedResponse.json()).toMatchObject({ code: "upload_admission_full" });
-
-    for (const held of heldRequests) held.destroy();
-    await new Promise(resolve => setTimeout(resolve, 50));
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE actor_principal_id='usage-admission-administrator'")).rows[0].count).toBe(0);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE actor_principal_id=$1", [principalId])).rows[0].count).toBe(0);
 
     const recoveredBundleId = randomUUID();
     const recovered = new FormData();
-    recovered.append("bundleId", recoveredBundleId);
     recovered.append("reportingStart", "2026-06-07");
     recovered.append("reportingEnd", "2026-07-06");
     recovered.append("periodProvenance", "operator_asserted");
     recovered.append("file", new Blob(["Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nrecovered-agent,Recovered,Declarative,1,0,1,2026-07-06"]), "recovered.csv");
-    const recoveredResponse = await request("/api/official-usage/staging", {
+    const recoveredResponse = await request(`/api/official-usage/staging?bundleId=${recoveredBundleId}`, {
       method: "POST",
       headers: { Cookie: administratorCookie },
       body: recovered,
@@ -1905,34 +1944,34 @@ describe.sequential("packaged API/session contracts", () => {
       headers: { Cookie: administratorCookie },
     })).status).toBe(204);
   });
-  it("releases upload admission after a Multer limit failure without retaining staging", async () => {
+  it("releases upload admission after a multipart field-limit failure without retaining staging", async () => {
     const administratorCookie = await roleCookie("usage-multer-administrator", ["AgentControl.Admin"]);
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const missingFile = new FormData();
-      missingFile.append("bundleId", randomUUID());
-      const missing = await request("/api/official-usage/staging", {
+      missingFile.append("sourceAsOf", "2026-07-06T00:00:00.000Z");
+      const missing = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
         method: "POST", headers: { Cookie: administratorCookie }, body: missingFile,
       });
       expect(missing.status).toBe(400);
       expect(await missing.json()).toMatchObject({ code: "missing_report" });
     }
     const oversized = new FormData();
-    oversized.append("file", new Blob([Buffer.alloc(8 * 1024 * 1024 + 1)]), "oversized.csv");
-    const rejected = await request("/api/official-usage/staging", {
+    oversized.append("file", new Blob(["Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nfield-limit,Bounded,Declarative,1,0,1,2026-07-06"]), "field-limit.csv");
+    oversized.append("reportingStart", "x".repeat(4097));
+    const rejected = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
       method: "POST", headers: { Cookie: administratorCookie }, body: oversized,
     });
-    expect(rejected.status).toBe(413);
-    expect(await rejected.json()).toMatchObject({ code: "report_too_large" });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({ code: "invalid_multipart" });
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE actor_principal_id='usage-multer-administrator'")).rows[0].count).toBe(0);
 
     const bundleId = randomUUID();
     const recovered = new FormData();
-    recovered.append("bundleId", bundleId);
     recovered.append("reportingStart", "2026-06-07");
     recovered.append("reportingEnd", "2026-07-06");
     recovered.append("periodProvenance", "operator_asserted");
     recovered.append("file", new Blob(["Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nrecovered-multer,Recovered,Declarative,1,0,1,2026-07-06"]), "recovered.csv");
-    const accepted = await request("/api/official-usage/staging", {
+    const accepted = await request(`/api/official-usage/staging?bundleId=${bundleId}`, {
       method: "POST", headers: { Cookie: administratorCookie }, body: recovered,
     });
     expect(accepted.status).toBe(201);
@@ -1950,12 +1989,11 @@ describe.sequential("packaged API/session contracts", () => {
     try {
       await lockClient.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [`official-usage:${config.tenants[0].tenantId}`]);
       const form = new FormData();
-      form.append("bundleId", randomUUID());
       form.append("reportingStart", "2026-06-07");
       form.append("reportingEnd", "2026-07-06");
       form.append("periodProvenance", "operator_asserted");
       form.append("file", new Blob(["Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nheld-work,Work,Declarative,1,0,1,2026-07-06"]), "held-work.csv");
-      const heldWork = request("/api/official-usage/staging", {
+      const heldWork = request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
         method: "POST", headers: { Cookie: administratorCookie }, body: form, signal: controller.signal,
       }).catch(() => undefined);
       await vi.waitFor(async () => {
@@ -1968,7 +2006,7 @@ describe.sequential("packaged API/session contracts", () => {
       await heldWork;
 
       const boundary = `held-parser-${randomUUID()}`;
-      secondUpload = httpRequest(`${base}/api/official-usage/staging`, {
+      secondUpload = httpRequest(`${base}/api/official-usage/staging?bundleId=${randomUUID()}`, {
         method: "POST",
         headers: {
           Cookie: administratorCookie,
@@ -1987,8 +2025,8 @@ describe.sequential("packaged API/session contracts", () => {
 
       const denied = new FormData();
       denied.append("file", new Blob(["not retained"]), "denied.csv");
-      const deniedResponse = await request("/api/official-usage/staging", {
-        method: "POST", headers: { Cookie: administratorCookie }, body: denied,
+      const deniedResponse = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
+        method: "POST", headers: { Cookie: administratorCookie }, body: denied, signal: AbortSignal.timeout(1500),
       });
       expect(deniedResponse.status).toBe(429);
       expect(await deniedResponse.json()).toMatchObject({ code: "upload_admission_full" });
@@ -2002,7 +2040,17 @@ describe.sequential("packaged API/session contracts", () => {
           WHERE datname=current_database() AND usename='agentcontrol_app' AND query LIKE 'SELECT pg_advisory_xact_lock%'`);
         expect(waiting.rows[0].count).toBe(0);
       });
-      await new Promise(resolve => setImmediate(resolve));
+      const recovered = await vi.waitFor(async () => {
+        const response = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
+          method: "POST", headers: { Cookie: administratorCookie }, body: form,
+        });
+        const preview = await response.json() as OfficialReportPreview;
+        expect(response.status).toBe(201);
+        return preview;
+      });
+      expect((await request(`/api/official-usage/staging/${recovered.id}`, {
+        method: "DELETE", headers: { Cookie: administratorCookie },
+      })).status).toBe(204);
     } finally {
       controller.abort();
       secondUpload?.destroy();
@@ -2010,24 +2058,78 @@ describe.sequential("packaged API/session contracts", () => {
       lockClient.release();
     }
   });
-  it("times out a never-ending multipart body when the wall-clock timer advances", async () => {
+  it("emits the managed value-free alert when rejected-upload cleanup fails", async () => {
+    const principalId = "usage-cleanup-failure-administrator", tenantId = config.tenants[0].tenantId;
+    const administratorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
+    const cleanup = vi.spyOn(OfficialReportImports.prototype, "cancel").mockRejectedValueOnce(new Error("private-cleanup-connection-detail"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const form = new FormData();
+      form.append("file", new Blob(["Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\ncleanup,Fixture,Declarative,1,0,1,2026-07-06"]), "private-cleanup.csv");
+      form.append("reportingStart", "2026-07-06");
+      const result = await request(`/api/official-usage/staging?bundleId=${randomUUID()}`, {
+        method: "POST", headers: { Cookie: administratorCookie }, body: form,
+      });
+      expect(result.status).toBe(400);
+      expect(await result.json()).toMatchObject({ code: "invalid_metadata" });
+      await vi.waitFor(() => expect(log.mock.calls.some(([line]) => String(line).includes('"event":"official_usage_upload_cleanup_failed"'))).toBe(true));
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(/private-cleanup|connection-detail/);
+      expect(cleanup).toHaveBeenCalledOnce();
+    } finally {
+      cleanup.mockRestore(); log.mockRestore();
+      const pending = (await fixture.runtime.query<{ id: string }>(`SELECT id FROM official_usage_ingestions
+        WHERE tenant_id=$1 AND principal_id=$2 AND state='streaming' ORDER BY id LIMIT 2`, [tenantId, principalId])).rows;
+      expect(pending).toHaveLength(1);
+      const identity = await reportIdentity(fixture.runtime, { tenantId, homeAccountId: principalId,
+        username: `${principalId}@example.invalid`, displayName: principalId, roles: ["AgentControl.Admin"] });
+      for (const row of pending) await new OfficialReportImports(fixture.runtime).cancel(identity, row.id);
+    }
+  });
+  it("rejects shared source admission without waiting for an unfinished multipart body", async () => {
+    const administratorCookie = await roleCookie("usage-shared-admission-administrator", ["AgentControl.Admin"]);
+    const generations = new DataGenerations(fixture.runtime), leases: GenerationLease[] = [];
+    let pending: ClientRequest | undefined;
+    let outcome: { status: number; body: string } | undefined;
+    try {
+      for (const source of ["directory", "app_activity"]) leases.push(await generations.begin(generationInput({
+        scope: { ...generationInput().scope, tenantId: config.tenants[0].tenantId, principalId: "held-source-admission", source },
+      })));
+      const boundary = `shared-source-${randomUUID()}`;
+      pending = httpRequest(`${base}/api/official-usage/staging?bundleId=${randomUUID()}`, {
+        method: "POST", headers: { Cookie: administratorCookie, Origin: config.frontendOrigin,
+          "X-CSRF-Token": csrfToken, "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      }, response => {
+        let body = "";
+        response.on("data", chunk => { body += String(chunk); });
+        response.on("end", () => { outcome = { status: response.statusCode ?? 0, body }; });
+      });
+      pending.on("error", () => undefined);
+      pending.write(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="waiting.csv"\r\nContent-Type: text/csv\r\n\r\nAgent ID`);
+      await vi.waitFor(() => expect(outcome).toMatchObject({ status: 429, body: expect.stringContaining('"code":"upload_admission_full"') }));
+    } finally {
+      pending?.destroy();
+      for (const lease of leases) await generations.abort(lease);
+    }
+  });
+  it.each(["before_file", "in_file"] as const)("times out a never-ending multipart body %s at the frozen upload deadline", async stage => {
     const administratorCookie = await roleCookie("usage-deadline-administrator", ["AgentControl.Admin"]);
     const boundary = `deadline-${randomUUID()}`;
     const bundleId = randomUUID();
     const csv = "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\ndeadline-agent,Deadline,Declarative,1,0,1,2026-07-06";
     const fields = [
-      ["bundleId", bundleId],
       ["reportingStart", "2026-06-07"],
       ["reportingEnd", "2026-07-06"],
       ["periodProvenance", "operator_asserted"],
     ].map(([name, value]) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`).join("");
-    const prefix = `${fields}--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="deadline.csv"\r\nContent-Type: text/csv\r\n\r\n${csv}`;
+    const prefix = stage === "before_file" ? `--${boundary}\r\nContent-Disposition: form-data; name="file"`
+      : `${fields}--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="deadline.csv"\r\nContent-Type: text/csv\r\n\r\n${csv}`;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timer = vi.spyOn(globalThis, "setTimeout");
     let pending: ClientRequest | undefined;
     let response: Promise<{ status: number; body: string }> | undefined;
     try {
       response = new Promise<{ status: number; body: string }>((resolve, reject) => {
-        pending = httpRequest(`${base}/api/official-usage/staging`, {
+        pending = httpRequest(`${base}/api/official-usage/staging?bundleId=${bundleId}`, {
           method: "POST",
           headers: {
             Cookie: administratorCookie,
@@ -2044,11 +2146,11 @@ describe.sequential("packaged API/session contracts", () => {
         pending.on("error", reject);
         pending.write(prefix);
       });
-      for (let attempt = 0; attempt < 1_000 && vi.getTimerCount() === 0; attempt += 1) {
-        await new Promise(resolve => setImmediate(resolve));
-      }
-      expect(vi.getTimerCount()).toBeGreaterThan(0);
-      await vi.advanceTimersByTimeAsync(15_001);
+      await vi.waitFor(() => expect(timer).toHaveBeenCalledWith(expect.any(Function), 30 * 60_000));
+      let responseSettled = false;
+      void response.then(() => { responseSettled = true; }, () => { responseSettled = true; });
+      await vi.advanceTimersByTimeAsync(30 * 60_000 + 1);
+      await vi.waitFor(() => expect(responseSettled).toBe(true));
       await expect(response).resolves.toMatchObject({
         status: 408,
         body: expect.stringContaining('"code":"upload_deadline"'),
@@ -2056,6 +2158,7 @@ describe.sequential("packaged API/session contracts", () => {
     } finally {
       pending?.destroy();
       await response?.catch(() => undefined);
+      timer.mockRestore();
       vi.useRealTimers();
     }
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE actor_principal_id='usage-deadline-administrator' OR bundle_id=$1", [bundleId])).rows[0].count).toBe(0);
@@ -2081,6 +2184,7 @@ describe.sequential("packaged API/session contracts", () => {
     try {
       authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "demoted-principal", displayName: "Demoted", username: "demoted@example.invalid", roles: ["AgentControl.Viewer"] };
       const adminSession = await roleCookie("demoted-principal", ["AgentControl.Admin"], 0);
+      await publishPackageSnapshot("demoted-principal");
       expect((await request("/api/agents", { headers: { Cookie: adminSession } })).status).toBe(200);
       expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: adminSession, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
 
@@ -2140,8 +2244,12 @@ describe.sequential("packaged API/session contracts", () => {
     } finally {
       await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=true");
     }
-    await fixture.operator.query("UPDATE schema_migrations SET checksum='modified' WHERE version=2");
-    expect((await request("/api/ready")).status).toBe(503);
-    expect(await (await request("/api/health")).json()).toEqual({ok:true});
+    await fixture.operator.query("UPDATE app_schema SET fingerprint=$1 WHERE singleton", ["0".repeat(64)]);
+    try {
+      expect((await request("/api/ready")).status).toBe(503);
+      expect(await (await request("/api/health")).json()).toEqual({ok:true});
+    } finally {
+      await fixture.operator.query("UPDATE app_schema SET fingerprint=$1 WHERE singleton", [schemaFingerprint]);
+    }
   });
 });

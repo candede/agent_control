@@ -3,7 +3,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { createJobConfirmation, JobRepository, type JobInput, type JobIntentInput } from "./jobs.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
+import { readPackageControls } from "./packageControls.js";
+import { usageIdentity } from "./agentUsageTestSupport.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: JobRepository;
@@ -16,6 +17,29 @@ beforeAll(async () => { fixture = await testDatabase(); jobs = new JobRepository
 afterAll(async () => { await fixture?.close(); });
 
 describe("Durable scoped jobs", () => {
+  it("recovers large metadata over byte-bounded slices and eventually settles every item", async () => {
+    const job = await jobs.submit(scope, input(Array.from({ length: 140 }, (_, index) => `recovery-${index}`)));
+    await fixture.operator.query("UPDATE jobs SET attempts=10 WHERE id=$1", [job.id]);
+    await fixture.operator.query(`UPDATE job_items SET poststate=jsonb_build_object('kind','block','notes',repeat('x',60000)),
+      poststate_hash=repeat('a',64) WHERE job_id=$1`, [job.id]);
+    const snapshot = async () => (await fixture.runtime.query(`SELECT count(*)::int AS rows,
+      coalesce(sum(octet_length(row_to_json(i)::text)),0)::int AS bytes FROM job_items i WHERE job_id=$1 AND status='queued'`, [job.id])).rows[0];
+    let previous = await snapshot(), slices = 0;
+    while (previous.rows && slices < 30) {
+      const started = performance.now();
+      expect(await jobs.recover(scope.tenantId, false, job.id)).toBeGreaterThan(0);
+      const current = await snapshot();
+      expect(previous.rows - current.rows).toBeGreaterThan(0);
+      expect(previous.rows - current.rows).toBeLessThanOrEqual(64);
+      expect(previous.bytes - current.bytes).toBeLessThanOrEqual(786432);
+      expect(performance.now() - started).toBeLessThan(5000);
+      previous = current; slices++;
+    }
+    expect(slices).toBeGreaterThan(3);
+    expect(previous.rows).toBe(0);
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "failed", failed: 140, canResume: false });
+    expect(await jobs.recover(scope.tenantId, false, job.id)).toBe(0);
+  });
   it("persists immutable scoped idempotency without leaking across tenants/principals", async () => {
     const request = input(); const job = await jobs.submit(scope, request);
     expect((await jobs.submit(scope, request)).id).toBe(job.id);
@@ -73,12 +97,12 @@ describe("Durable scoped jobs", () => {
     const lease = claims.find(Boolean)!; const work = (await jobs.beginItem(lease))!;
     await jobs.markSent(lease, work.item.id, work.item.prestate_hash);
     await fixture.operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
-    const revision = await readUnifiedInventoryRevision(scope, fixture.runtime);
+    const controls = await readPackageControls(fixture.runtime, scope, [work.item.target_id]);
     await expect(jobs.finishItem(lease, work.item.id, "succeeded", {
       poststate: { kind: "block", isBlocked: true }, readbackCount: 1, inventoryGeneration: null,
       readback: allowlistedPackage({ id: work.item.target_id, displayName: "Expired result", isBlocked: true }),
     })).rejects.toMatchObject({ code: "lease_lost" });
-    expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).toBe(revision);
+    expect(await readPackageControls(fixture.runtime, scope, [work.item.target_id])).toEqual(controls);
     await jobs.recover(scope.tenantId);
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1, canResume: false });
     expect(await jobs.claim(job.id, scope, randomUUID(), true)).toBeUndefined();
@@ -88,7 +112,7 @@ describe("Durable scoped jobs", () => {
     const job = await jobs.submit(scope, input(["verified-target"]));
     const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
     const work = (await jobs.beginItem(lease))!;
-    const revision = await readUnifiedInventoryRevision(scope, fixture.runtime);
+    const controls = await readPackageControls(fixture.runtime, scope, [work.item.target_id]);
     for (const detail of [
       { id: "another-target", displayName: "Other target", isBlocked: true },
       { id: "verified-target", displayName: "Wrong state", isBlocked: false },
@@ -96,7 +120,7 @@ describe("Durable scoped jobs", () => {
       await expect(jobs.finishItem(lease, work.item.id, "succeeded", {
         poststate: { kind: "block", isBlocked: true }, readbackCount: 1, readback: allowlistedPackage(detail), inventoryGeneration: null,
       })).rejects.toMatchObject({ code: "mutation_readback_mismatch" });
-      expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).toBe(revision);
+      expect(await readPackageControls(fixture.runtime, scope, [work.item.target_id])).toEqual(controls);
       expect((await fixture.runtime.query("SELECT status FROM job_items WHERE id=$1", [work.item.id])).rows[0].status).toBe("running");
     }
     await jobs.finishItem(lease, work.item.id, "cancelled");
@@ -147,8 +171,10 @@ describe("Durable scoped jobs", () => {
 
     expect(await jobs.get(job.id, scope)).toMatchObject({
       status, completed: 1, canResume: pending,
-      results: [{ id: "first", status: outcome, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required" }],
+      reconciliationRequired: outcome === "inconclusive" ? 1 : 0,
     });
+    expect((await jobs.items(job.id, await usageIdentity(fixture.runtime, scope))).value[0])
+      .toMatchObject({ id: "first", status: outcome, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required" });
     expect((await fixture.runtime.query("SELECT lease_owner,lease_until FROM jobs WHERE id=$1", [job.id])).rows[0])
       .toEqual({ lease_owner: null, lease_until: null });
     await expect(jobs.release(lease)).rejects.toMatchObject({ code: "lease_lost" });
@@ -168,8 +194,10 @@ describe("Durable scoped jobs", () => {
 
     expect(await jobs.get(job.id, scope)).toMatchObject({
       status: "partial", completed: 1, inconclusive: 1, canResume: true,
-      results: [{ id: "first", reconciliationStatus: "required", retryEligible: false }],
+      reconciliationRequired: 1, retryEligible: 0,
     });
+    expect((await jobs.items(job.id, await usageIdentity(fixture.runtime, scope))).value[0])
+      .toMatchObject({ id: "first", reconciliationStatus: "required", retryEligible: false });
     expect((await fixture.runtime.query("SELECT status,sent_at FROM job_items WHERE id=$1", [second.item.id])).rows[0])
       .toEqual({ status: "queued", sent_at: null });
     expect((await fixture.runtime.query("SELECT outcome,finished_at FROM job_attempts WHERE item_id=$1", [second.item.id])).rows[0])

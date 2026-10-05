@@ -1,106 +1,62 @@
 import type pg from "pg";
-import { DataSyncRepository, type DataSyncScope, type SavedCopilotUsageSource } from "../db/dataSync.js";
-import { AppError } from "../errors.js";
+import { pool } from "../db/pool.js";
+import { config } from "../config.js";
+import { dataConnections } from "../db/dataConnections.js";
+import { UserSourcesRepository, userSourceObjectIds, userSourcePeopleInRead } from "../db/userSources.js";
+import type { DataSyncScope } from "../db/dataSync.js";
 import type { SavedAgentPerson, UnifiedAgentRecord } from "../types/unifiedAgents.js";
-import { AgentPeopleRepository } from "../db/agentPeople.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
-import { isCopilotServiceSummaryState } from "../types/copilotUsage.js";
+import { AppError } from "../errors.js";
 
 export class SavedAgentPeopleService {
-  constructor(
-    private readonly repository: Pick<DataSyncRepository, "getDirectorySource"> = new DataSyncRepository(),
-    private readonly cache: Pick<AgentPeopleRepository, "read"> = new AgentPeopleRepository(),
-  ) {}
-
-  async project(scope: DataSyncScope, records: readonly UnifiedAgentRecord[], database?: pg.PoolClient): Promise<UnifiedAgentRecord[]> {
-    const ids = [...new Set(records.flatMap(record => [
-      record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
-      record.powerPlatformResource?.details.lastModifiedBy,
-    ]).filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id)).map(id => id.toLowerCase()))];
-    const people = await this.read(scope, ids, database);
-    return records.map(record => {
-      const resource = record.powerPlatformResource;
-      if (resource && resource.tenantId !== scope.tenantId) {
-        throw new AppError(403, "scope_mismatch", "Saved agent people require inventory from the same tenant.");
-      }
-      const { people: _previousPeople, ...inventory } = record;
-      const lookup = (id: string | null | undefined) => {
-        const key = objectId(id);
-        return key ? people.get(key) : undefined;
-      };
-      const owner = lookup(resource?.details.ownerId);
-      const createdBy = lookup(resource?.createdBy);
-      const lastModifiedBy = lookup(resource?.details.lastModifiedBy);
-      return {
-        ...inventory,
-        ...(owner || createdBy || lastModifiedBy ? { people: {
-          ...(owner ? { owner } : {}),
-          ...(createdBy ? { createdBy } : {}),
-          ...(lastModifiedBy ? { lastModifiedBy } : {}),
-        } } : {}),
-      };
-    });
+  private readonly sources: UserSourcesRepository;
+  constructor(private readonly database: pg.Pool = pool) {
+    this.sources = new UserSourcesRepository(database, config.sessionSecret);
   }
-
   async read(scope: DataSyncScope, ids: readonly string[], database?: pg.PoolClient): Promise<Map<string, SavedAgentPerson>> {
-    const source = await this.repository.getDirectorySource(scope, database);
-    const people = directoryPeople(source);
-    for (const { lastConclusiveAt, ...cached } of await this.cache.read(scope, ids, database)) {
-      const saved = people.get(cached.objectId);
-      if (saved && Date.parse(saved.observedAt) > Date.parse(cached.checkedAt ?? cached.observedAt)) continue;
-      const identity = cached.status === "lookup_failed" && saved
-        && (lastConclusiveAt === null || Date.parse(saved.observedAt) > Date.parse(lastConclusiveAt)) ? saved : cached;
-      people.set(cached.objectId, { ...identity, status: cached.status, checkedAt: cached.checkedAt,
-        expiresAt: cached.expiresAt, ...(cached.errorCode ? { errorCode: cached.errorCode } : {}) });
+    return this.readIds(scope, userSourceObjectIds(ids), database);
+  }
+  private async readIds(scope: DataSyncScope, ids: readonly string[], database?: pg.PoolClient): Promise<Map<string, SavedAgentPerson>> {
+    if (!ids.length) return new Map<string, SavedAgentPerson>();
+    const read = async (client: pg.PoolClient) => {
+      const boundary = (await client.query("SELECT current_setting('transaction_isolation') AS isolation,clock_timestamp() AS now")).rows[0];
+      if (boundary.isolation !== "repeatable read") throw new Error("people_selected_snapshot_required");
+      const selectedScope = { ...scope, tokenMode: "delegated" as const };
+      const source = (await this.sources.metadataInRead(client, selectedScope, boundary.now)).directory;
+      const directory = source.generationId ? { generationId: source.generationId, observedAt: new Date(source.observedAt!) } : null;
+      const people = new Map<string, SavedAgentPerson>();
+      for (let offset = 0; offset < ids.length; offset += 100) {
+        for (const person of await userSourcePeopleInRead(client, selectedScope, directory, ids.slice(offset, offset + 100), boundary.now)) {
+          people.set(person.objectId, person);
+        }
+      }
+      return people;
+    };
+    return database ? read(database) : dataConnections(this.database).selectedRead(read);
+  }
+  async project(scope: DataSyncScope, records: readonly UnifiedAgentRecord[], database?: pg.PoolClient): Promise<UnifiedAgentRecord[]> {
+    if (records.length > 100) throw new AppError(400, "data_page_limit", "Project at most 100 caller records.");
+    const ids = new Set<string>();
+    for (const record of records) {
+      const resource = record.powerPlatformResource;
+      if (resource && resource.tenantId !== scope.tenantId) throw new AppError(403, "scope_mismatch", "Inventory belongs to another tenant.");
+      for (const id of [resource?.createdBy, resource?.details.ownerId, resource?.details.lastModifiedBy]) {
+        if (typeof id === "string" && isDirectoryObjectId(id)) ids.add(id.toLowerCase());
+      }
     }
-    return new Map(ids.flatMap(id => {
-      const person = people.get(id.toLowerCase());
-      return person ? [[id.toLowerCase(), person]] : [];
-    }));
+    const people = await this.readIds(scope, [...ids], database);
+    return projectSavedAgentPeople(records, people);
   }
 }
-
-export const savedAgentPeople = new SavedAgentPeopleService();
-
-export function directoryPeople(source: SavedCopilotUsageSource<unknown>): Map<string, SavedAgentPerson> {
-  if (source.source !== "directory") throw invalidDirectory();
-  if (source.value === null && source.observedAt === null) return new Map();
-  if (!source.observedAt || !Number.isFinite(Date.parse(source.observedAt)) || !Array.isArray(source.value)) throw invalidDirectory();
-  if (source.value.length > 100_000 || Buffer.byteLength(JSON.stringify(source.value), "utf8") > 32 * 1024 * 1024) {
-    throw new AppError(413, "copilot_usage_snapshot_limit", "Saved directory data exceeded the bounded snapshot limit.");
-  }
-  if (source.rowCount !== source.value.length) throw invalidDirectory();
-  const people = new Map<string, SavedAgentPerson>();
-  for (const row of source.value) {
-    if (!isObject(row) || !isObject(row.identity) || !Array.isArray(row.servicePlans)
-      || row.serviceEvidenceVersion !== 1 || !isCopilotServiceSummaryState(row.copilotServiceState)) throw invalidDirectory();
-    const identity = row.identity;
-    const { displayName, userPrincipalName } = identity;
-    const id = objectId(identity.objectId);
-    if (!id || people.has(id) || !text(userPrincipalName, 320)
-      || (displayName !== null && !text(displayName, 512))) throw invalidDirectory();
-    people.set(id, {
-      objectId: id,
-      displayName,
-      userPrincipalName,
-      observedAt: source.observedAt,
-    });
-  }
-  return people;
-}
-
-function objectId(value: unknown): string | null {
-  return typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value) ? value.toLowerCase() : null;
-}
-
-function text(value: unknown, maximumLength: number): value is string {
-  return typeof value === "string" && Boolean(value.trim()) && value.length <= maximumLength && !/[\r\n\0]/.test(value);
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function invalidDirectory() {
-  return new AppError(409, "copilot_usage_snapshot_invalid", "Saved directory data is invalid or ambiguous. Refresh Users before retrying agent inventory.");
+function projectSavedAgentPeople(records: readonly UnifiedAgentRecord[], people: ReadonlyMap<string, SavedAgentPerson>): UnifiedAgentRecord[] {
+  if (records.length > 100) throw new AppError(400, "data_page_limit", "Project at most 100 caller records.");
+  return records.map(record => {
+    const { people: _previous, ...inventory } = record, resource = record.powerPlatformResource;
+    const owner = people.get(resource?.details.ownerId?.toLowerCase() ?? "");
+    const createdBy = people.get(resource?.createdBy?.toLowerCase() ?? "");
+    const lastModifiedBy = people.get(resource?.details.lastModifiedBy?.toLowerCase() ?? "");
+    return { ...inventory, ...(owner || createdBy || lastModifiedBy ? { people: {
+      ...(owner ? { owner } : {}), ...(createdBy ? { createdBy } : {}), ...(lastModifiedBy ? { lastModifiedBy } : {}),
+    } } : {}) };
+  });
 }

@@ -1,278 +1,198 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parse as parseCsv } from "csv-parse/sync";
-import pg from "pg";
-import { AppError } from "../errors.js";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { parse } from "csv-parse/sync";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { seedSelectedInventory, selectedInventoryCsv } from "../../scripts/selectedInventoryFixture.js";
+import { fixtureDirectoryUser } from "../../scripts/userSourceFixture.js";
+import type { InventoryQuery } from "../db/inventoryQueries.js";
+import { inventoryPresentation } from "./inventoryPresentation.js";
+import { allowlistedPackage } from "./packageObservation.js";
+import { agentColumnValue } from "../types/agentPresentation.js";
+import { unifiedAgentSortKeys, unifiedAgentInventoryScopes, unifiedAgentRecordId,
+  type UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import type { InventorySnapshot, PowerPlatformResource } from "../types/powerPlatformInventory.js";
-import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
-import { projectPackageDetails } from "./packageDetailProjection.js";
-import { projectPackageControl } from "./packageControlProjection.js";
-import { capturePackageMutationState } from "./packageMutationState.js";
-import { unifiedAgentRecordId, unifiedAgentInventoryScopes } from "../types/unifiedAgents.js";
-import type { UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../types/unifiedAgents.js";
-import type { AgentUsageContext, AgentUsageSummary } from "../types/agentUsage.js";
-import { agentColumnValue, agentStatusLabels } from "../types/agentPresentation.js";
-import { combineAgentInventoryRevision } from "./agentUsage.js";
-import { UnifiedAgentsService, type UnifiedAgentDependencies } from "./unifiedAgents.js";
-import { buildUnifiedAgentCsv } from "./unifiedAgentExport.js";
-import { SavedAgentPeopleService } from "./savedAgentPeople.js";
-import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
-import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
+import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 
-const tenantId = "tenant-unified";
 const environmentA = "11111111-1111-4111-8111-111111111111";
 const environmentB = "22222222-2222-4222-8222-222222222222";
 const botA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const usageContext: AgentUsageContext = { availability: "never_imported", reportSet: null, lineages: [], revision: "c".repeat(64) };
-const inventoryRevision = combineAgentInventoryRevision("a".repeat(64), usageContext.revision);
-
-function packageValue(id: string, displayName: string, linked = false): CopilotPackageDetail {
-  return {
-    id,
-    displayName,
-    isBlocked: id.endsWith("blocked"),
-    availableTo: "unknownFutureValue",
-    deployedTo: "allowedForNoOne",
-    sourceSystem: "graph_packages",
-    authoringTool: "Copilot Studio",
-    creatorType: "unknown",
-    agentKind: "copilot_package",
-    lifecycle: "unknown",
-    identityConfidence: "exact_native",
-    provenance: {},
-    allowedUsersAndGroups: [{ resourceId: "secret-principal", resourceType: "user" }],
-    elementDetails: linked ? [{
-      elementType: "AgentMetadatas",
-      elements: [{
-        id: "metadata",
-        definition: JSON.stringify({ SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } }),
-      }],
-    }] : undefined,
-  };
+const ownerA = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const ownerB = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+type Scenario = Awaited<ReturnType<typeof seedSelectedInventory>>;
+let database: Awaited<ReturnType<typeof testDatabase>>;
+let scoped: Scenario, quick: Scenario, sortable: Scenario;
+const identify = (record: UnifiedAgentRecord) => record.packages[0]?.id ?? record.powerPlatformResource!.nativeId;
+function packageValue(id: string, displayName = id, linked = false): CopilotPackageDetail {
+  return { ...allowlistedPackage({
+    id, displayName, isBlocked: id.endsWith("blocked"), availableTo: "unknownFutureValue", deployedTo: "allowedForNoOne",
+    platform: "Copilot Studio",
+    ...(linked ? { elementDetails: [{ elementType: "AgentMetadatas", elements: [{
+      id: "metadata", definition: JSON.stringify({ SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } }),
+    }] }] } : {}),
+  }), identityDetailsCollected: true };
 }
-
-function resource(environmentId: string, nativeId = "shared-native"): PowerPlatformResource {
+function resource(environmentId: string | null, nativeId = "shared-native"): PowerPlatformResource {
   return {
-    tenantId,
-    nativeId,
-    type: "microsoft.copilotstudio/agents",
-    location: "unitedstates",
-    displayName: "Same displayed name",
-    environmentId,
-    createdAt: "2026-09-01T00:00:00.000Z",
-    createdBy: null,
-    lastPublishedAt: null,
-    sourceSystem: "power_platform",
-    authoringTool: "Copilot Studio",
-    creatorType: "unknown",
-    agentKind: "copilot_studio_agent",
-    lifecycle: "published",
-    identityConfidence: "exact_native",
-    identifiers: [
-      { kind: "environment_id", value: environmentId },
+    tenantId: "fixture", nativeId, type: "microsoft.copilotstudio/agents", environmentId, location: "unitedstates",
+    displayName: "Same displayed name", createdAt: "2026-09-01T00:00:00Z", createdBy: null, lastPublishedAt: null,
+    sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
+    lifecycle: "published", identityConfidence: "exact_native", provenance: {}, details: {}, unknownFieldCount: 0,
+    identifiers: [...(environmentId ? [{ kind: "environment_id" as const, value: environmentId }] : []),
       { kind: "power_platform_resource_id", value: nativeId },
-      ...(environmentId === environmentA ? [{ kind: "cds_bot_id" as const, value: botA }] : []),
-    ],
-    provenance: {},
-    details: { description: "Provider metadata" },
-    unknownFieldCount: 0,
+      ...(environmentId === environmentA ? [{ kind: "cds_bot_id" as const, value: botA }] : [])],
   };
 }
-
-function powerPlatformSnapshot(coverage: "covered" | "unknown" = "covered"): InventorySnapshot {
-  return {
-    id: "22222222-2222-4222-8222-222222222220",
-    roleScope: coverage === "covered" ? "full" : "unknown",
-    environmentScope: null,
-    requestedTypes: ["microsoft.copilotstudio/agents"],
-    coverage: [{ type: "microsoft.copilotstudio/agents", status: coverage, count: coverage === "covered" ? 2 : null }],
-    observedCount: 2,
-    totalRecords: 2,
-    pageCount: 1,
-    unknownFieldCount: 0,
-    observedAt: "2026-09-15T00:00:00.000Z",
-    expiresAt: "2026-09-22T00:00:00.000Z",
-    verification: {
-      status: "verified", scope: "authorized_query", basis: "provider_total_and_saved_rows",
-      checkedAt: "2026-09-15T00:00:00.000Z", storedCount: 2, uniqueIdentityCount: 2, queriedTypes: ["microsoft.copilotstudio/agents"],
-    },
-  };
+function environment(id: string, name: string): PowerPlatformResource {
+  return { ...resource(null, id), type: "microsoft.powerplatform/environments", displayName: name, identifiers: [] };
+}
+async function csvRows(scenario: Scenario, selected: Awaited<ReturnType<Scenario["select"]>>) {
+  return parse((await selectedInventoryCsv(database.runtime, scenario, selected.selection)).csv,
+    { bom: true, columns: true }) as Record<string, string>[];
+}
+async function pages(scenario: Scenario, selected: Awaited<ReturnType<Scenario["select"]>>, limit = 2) {
+  const values = [...selected.page!.value];
+  let previous = selected.raw, cursor = previous.page.nextCursor;
+  while (cursor) {
+    const next = await scenario.queries.page(selected.selection.id, scenario.identity, { limit, cursor });
+    if (next.page.previousCursor) {
+      const back = await scenario.queries.page(selected.selection.id, scenario.identity, { limit, cursor: next.page.previousCursor });
+      expect(back.value).toEqual(previous.value);
+    }
+    values.push(...inventoryPresentation(next).value);
+    previous = next;
+    cursor = next.page.nextCursor;
+    if (values.length > 1000) throw new Error("tiny_oracle_page_limit");
+  }
+  expect(values).toHaveLength(selected.raw.counts.filtered);
+  return values;
 }
 
-function dependencies(options: {
-  packages?: CopilotPackageDetail[];
-  resources?: PowerPlatformResource[];
-  environmentNames?: Record<string, string>;
-  packageSnapshot?: boolean;
-  observedAt?: string;
-  powerPlatformSnapshot?: InventorySnapshot | null;
-  directory?: CopilotDirectoryUser[];
-} = {}): UnifiedAgentDependencies {
-  return {
-    packages: {
-      readUnifiedSource: vi.fn(async () => ({
-        packages: options.packages ?? [],
-        observations: Object.fromEntries((options.packages ?? []).map(value => [value.id, {
-          snapshotId: "11111111-1111-4111-8111-111111111110",
-          scopeKind: "broad" as const,
-          observedAt: options.observedAt ?? "2026-09-15T00:00:00.000Z",
-          expiresAt: "2026-09-22T00:00:00.000Z",
-        }])),
-        snapshot: options.packageSnapshot === false ? null : {
-          id: "11111111-1111-4111-8111-111111111110",
-          tokenMode: "delegated" as const,
-          scopeKind: "broad" as const,
-          requestedIds: [],
-          observedCount: options.packages?.length ?? 0,
-          totalRecords: options.packages?.length ?? 0,
-          pageCount: 1,
-          observedAt: "2026-09-15T00:00:00.000Z",
-          expiresAt: "2026-09-22T00:00:00.000Z",
-        },
-      })),
-    },
-    powerPlatform: {
-      readAgentEnvironments: vi.fn(async (_scope, ids) => Object.fromEntries(ids.flatMap(id => {
-        const name = options.environmentNames?.[id.toLowerCase()];
-        return name ? [[id.toLowerCase(), {
-          id, displayName: name, region: "europe", environmentType: "Production", isManaged: false,
-          groupName: null, groupId: null, provenance: {},
-          observation: { id: "environment-snapshot", snapshotId: "environment-snapshot", current: true as const,
-            observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-21T00:00:00.000Z" },
-        }]] : [];
-      }))),
-      readUnifiedSource: vi.fn(async () => ({
-        resources: options.resources ?? [],
-        snapshot: options.powerPlatformSnapshot === undefined ? powerPlatformSnapshot() : options.powerPlatformSnapshot,
-      })),
-    },
-    resolveLinks: resolvePackageAgentLinks,
-    operationPackageIds: vi.fn(async () => []),
-    readRevision: vi.fn(async () => "a".repeat(64)),
-    people: new SavedAgentPeopleService({
-      getDirectorySource: vi.fn(async () => ({
-        source: "directory", attemptStatus: options.directory ? "available" : null, message: null,
-        attemptedAt: null, lastSuccessAt: null, rowCount: options.directory?.length ?? null,
-        observedAt: options.directory ? "2026-09-15T10:00:00.000Z" : null, value: options.directory ?? null,
-      })),
-    }, { read: vi.fn(async () => []) }),
-    usage: {
-      project: vi.fn(async (_scope: { tenantId: string; principalId: string }, records: readonly UnifiedAgentRecord[]) => ({
-        context: usageContext,
-        summaries: new Map(records.map(record => [record.id, {
-          status: "unavailable" as const, reportSetId: null, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
-        }])),
-      })),
-      revision: vi.fn(async () => usageContext.revision),
-    },
-  };
-}
-
-function inventoryScopeDependencies() {
-  return dependencies({
+beforeAll(async () => {
+  database = await testDatabase();
+  scoped = await seedSelectedInventory(database.runtime, {
     packages: [
       { ...packageValue("linked-a", "Catalog linked", true), availableTo: "all", supportedHosts: ["Teams"] },
       packageValue("linked-b-blocked", "Catalog linked", true),
-      { ...packageValue("available", "Catalog available"), availableTo: "some", authoringTool: "Microsoft 365 Copilot Agent Builder" },
-      { ...packageValue("unavailable", "Catalog unavailable"), availableTo: "none", authoringTool: "Microsoft 365 Copilot Agent Builder" },
-    ].map(value => ({ ...value, identityDetailsCollected: true })),
-    resources: [
-      { ...resource(environmentA), displayName: "Catalog linked" },
-      { ...resource(environmentB), displayName: "Native only", authoringTool: "Zebra SDK" },
+      { ...packageValue("available", "Catalog available"), availableTo: "some", platform: "Microsoft 365 Copilot Agent Builder" },
+      { ...packageValue("unavailable", "Catalog unavailable"), availableTo: "none", platform: "Microsoft 365 Copilot Agent Builder" },
     ],
-    environmentNames: { [environmentA]: "Catalog environment", [environmentB]: "Native environment" },
+    resources: [{ ...resource(environmentA), displayName: "Catalog linked" },
+      { ...resource(environmentB), displayName: "Native only", authoringTool: "Zebra SDK" },
+      environment(environmentA, "Catalog environment"), environment(environmentB, "Native environment")],
   });
-}
-
-function quickViewDependencies() {
-  const packages: CopilotPackageDetail[] = [
-    { ...packageValue("first", "First"), type: "microsoft", authoringTool: null, availableTo: "all" },
-    { ...packageValue("vendor", "Vendor"), type: "external", authoringTool: null, availableTo: "some" },
-    { ...packageValue("personal", "Personal"), type: "custom", authoringTool: "Copilot Studio Lite", availableTo: "none", deployedTo: "none" },
-    ...["studio-low", "studio-high", "admin-blocked"].map(id => {
-      const item = {
-        ...packageValue(id, id), type: "external", availableTo: "all", deployedTo: "none",
-        publisher: "Vendor", supportedHosts: ["Teams"], allowedUsersAndGroups: [], acquireUsersAndGroups: [],
-      };
-      return projectPackageControl(item, {
-        detail: item, state: capturePackageMutationState(item, "update-availability"),
-        observation: { snapshotId: "admin-control", observedAt: "2026-09-15T10:00:00.000Z", expiresAt: "2026-09-22T00:00:00.000Z" },
-      });
-    }),
-    { ...packageValue("generic", "Generic"), type: "external", availableTo: "some", deployedTo: "all",
-      acquireUsersAndGroups: [{ resourceId: "installation-group", resourceType: "group" }] },
-    { ...packageValue("unknown", "Unknown"), authoringTool: null },
-    { ...packageValue("zero", "Zero"), type: "external", availableTo: "some" },
-  ];
-  const deps = dependencies({
-    packages: packages.reverse(),
+  const control = { snapshotId: "synthetic-control", observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString() };
+  quick = await seedSelectedInventory(database.runtime, {
+    packages: [
+      { ...packageValue("first", "First"), type: "microsoft", platform: undefined, authoringTool: null, availableTo: "all" },
+      { ...packageValue("vendor", "Vendor"), type: "external", platform: undefined, authoringTool: null, availableTo: "some" },
+      { ...packageValue("personal", "Personal"), type: "custom", platform: "Copilot Studio Lite", availableTo: "none", deployedTo: "none" },
+      ...["studio-low", "studio-high", "admin-blocked"].map(id => ({
+        ...packageValue(id), type: "external", availableTo: "all", deployedTo: "none", publisher: "Vendor",
+        supportedHosts: ["Teams"], controlObservations: { access: control },
+      })),
+      { ...packageValue("generic", "Generic"), type: "external", availableTo: "some", deployedTo: "all",
+        acquireUsersAndGroups: [{ resourceId: "installation-group", resourceType: "group" }] },
+      { ...packageValue("unknown", "Unknown"), platform: undefined, authoringTool: null },
+      { ...packageValue("zero", "Zero"), type: "external", availableTo: "some" },
+    ],
     resources: [{ ...resource(environmentB, "native"), authoringTool: null }],
+    usage: [["vendor", 6], ["personal", 2], ["studio-low", 2], ["studio-high", 10], ["admin-blocked", 3], ["zero", 0]]
+      .map(([id, responses]) => ({ id: String(id), responses: Number(responses) })),
   });
-  const counts = new Map([["vendor", 6], ["personal", 2], ["studio-low", 2], ["studio-high", 10], ["admin-blocked", 3], ["zero", 0]]);
-  deps.usage.project = vi.fn(async (_scope, records) => ({
-    context: usageContext,
-    summaries: new Map(records.map(record => {
-      const id = record.packages[0]?.id;
-      const responses = id ? counts.get(id) : undefined;
-      return [record.id, {
-        status: responses !== undefined ? "linked" : id === "generic" ? "unlinked" : "unavailable",
-        reportSetId: "report", responses: responses ?? (id === "generic" ? 99 : null),
-        activeUsers: 100, lastActivityDateUtc: "2026-09-15", associations: [],
-      } satisfies AgentUsageSummary];
-    })),
-  }));
-  return deps;
-}
+  sortable = await seedSelectedInventory(database.runtime, {
+    observedAt: new Date(Date.now() - 60_000),
+    packages: [
+      { ...packageValue("sort-a", "Ålpha"), type: "firstParty", publisher: "Beta", platform: "Custom SDK",
+        version: "3", supportedHosts: ["Teams"], availableTo: "all", lastModifiedDateTime: "2026-09-16T02:00:00+04:00" },
+      { ...packageValue("sort-b", "ＡLPHA"), type: "thirdParty", publisher: "Alpha", version: "1", availableTo: "none",
+        supportedHosts: ["Outlook"], lastModifiedDateTime: "2026-09-15T22:00:00Z" },
+      { ...packageValue("sort-null", "Ω unknown"), platform: undefined, authoringTool: null },
+    ],
+    resources: [
+      { ...resource(environmentA, "sort-native-a"), displayName: "Native A", createdBy: ownerA, lastPublishedAt: "2026-09-18T00:00:00Z",
+        details: { ownerId: ownerA, model: "Model Z", authentication: "none", channels: ["Teams"],
+          isQuarantined: false, isManaged: true, isWebSearchEnabledForKnowledge: true, orchestration: "generative" } },
+      { ...resource(environmentB, "sort-native-b"), displayName: "Native B", createdBy: ownerB, authoringTool: "Copilot Studio Lite",
+        details: { ownerId: ownerB, model: "Model A", authentication: "aad", channels: [], isQuarantined: true, isManaged: false } },
+      { ...resource(null, "sort-native-null"), displayName: "Native unknown", authoringTool: null, lifecycle: "unknown", createdAt: null, location: null },
+      environment(environmentA, "Zebra environment"), environment(environmentB, "Alpha environment"),
+    ],
+    directory: [fixtureDirectoryUser(ownerA, "Zebra Person", "zebra@example.invalid"), fixtureDirectoryUser(ownerB, "Alpha Person", "alpha@example.invalid")],
+    usage: [{ id: "sort-a", responses: 10, users: 2 }, { id: "sort-b", responses: 2, users: 1 }, { id: "sort-null", responses: 0, users: 0 }],
+  });
+}, 30_000);
+afterAll(async () => { await database?.close(); });
+afterEach(async () => {
+  for (const scenario of [scoped, quick, sortable]) await scenario?.releaseSelections();
+});
 
-describe("UnifiedAgentsService", () => {
+describe("selected canonical inventory SQL parity", () => {
+  it.each(["displayName", "publisher", "versions"] as const)(
+    "preserves the existing English base-sensitivity and numeric-version comparator for %s", async sortBy => {
+      const scenario = await seedSelectedInventory(database.runtime, { packages: [
+        { ...packageValue("accent-a", "éclair"), publisher: "alpha", version: "2" },
+        { ...packageValue("accent-b", "zebra"), publisher: "Beta", version: "10" },
+      ] });
+      for (const sortDirection of ["asc", "desc"] as const) {
+        const selected = await scenario.select({ sortBy, sortDirection }, 1);
+        expect((await pages(scenario, selected, 1)).map(identify))
+          .toEqual(sortDirection === "asc" ? ["accent-a", "accent-b"] : ["accent-b", "accent-a"]);
+      }
+    });
   it.each(["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", "__proto__"])(
-    "uses raw Graph type %s for facets, counts, paging and export without inferring categories", async type => {
+    "preserves raw Graph type %s through SQL counts, keysets, facets and durable CSV", async type => {
       const types = ["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", "__proto__"];
-      const packages = types.flatMap(type => [0, 1].map(index => ({
-        ...packageValue(`${type}-${index}`, `Analyst ${index}`), type,
-        publisher: "Microsoft Corporation", availableTo: index === 0 ? "all" : "none",
-      })));
-      const service = new UnifiedAgentsService(dependencies({
-        packages: [...packages, { ...packageValue("missing-type", "Analyst"), publisher: "Microsoft Corporation" }],
-        resources: [resource(environmentA)],
-      }));
-      const scope = { tenantId, principalId: "viewer" };
-      const page = await service.list(scope, { type, inventoryScope: "catalog", limit: 1, offset: 1 });
-      expect(page.count).toBe(2);
-      expect(page.filteredSummary.total).toBe(2);
-      expect(page.value.map(record => record.packages[0].id)).toEqual([`${type}-1`]);
-      expect(page.facets.types.map(option => option.value).sort()).toEqual([...types].sort());
-      expect(page.facets.types).toContainEqual({ value: "lob", label: "Built by your org" });
-      const exported = await service.forExport(scope, page.revision!, { type, inventoryScope: "catalog" });
-      expect(exported.count).toBe(2);
-      expect(exported.value.flatMap(record => record.packages.map(item => item.type))).toEqual([type, type]);
-      const csv = buildUnifiedAgentCsv(exported, Date.now() + 15_000);
-      const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
+      const scenario = await seedSelectedInventory(database.runtime, {
+        packages: [...types.flatMap(type => [0, 1].map(index => ({
+          ...packageValue(`${type}-${index}`, `Analyst ${index}`), type, publisher: "Microsoft Corporation", availableTo: index ? "none" : "all",
+        }))), packageValue("missing-type")], resources: [resource(environmentB)],
+      });
+      const selected = await scenario.select({ type, inventoryScope: "catalog" }, 1);
+      expect(selected.raw.counts).toMatchObject({ total: 20, scoped: 19, filtered: 2 });
+      expect(selected.page!.value.map(identify)).toEqual([`${type}-0`]);
+      expect((await pages(scenario, selected, 1)).map(identify)).toEqual([`${type}-0`, `${type}-1`]);
+      const facets = await scenario.queries.facets(selected.selection.id, scenario.identity, "type");
+      expect(facets.value.map(option => option.value)).toEqual(expect.arrayContaining([...types, null]));
+      const rows = (await csvRows(scenario, selected)).filter(row => row.recordType === "agent");
       expect(rows.map(row => row.origin)).toEqual([type, type]);
-      expect(rows.map(row => JSON.parse(row.packageStates)[0].type)).toEqual([type, type]);
-      const available = await service.list(scope, { type, endUserAccess: "available" });
-      expect(available.value.map(record => record.packages[0].id)).toEqual([`${type}-0`]);
-      const nativeOnly = await service.list(scope, { type, inventoryScope: "power_platform_only" });
-      expect(nativeOnly.count).toBe(0);
-      expect(nativeOnly.facets.types).toEqual([]);
-      expect((await service.list(scope, { type: type.toUpperCase() })).count).toBe(0);
-    },
-  );
+      expect((await scenario.select({ type, endUserAccess: "available" })).page!.value.map(identify)).toEqual([`${type}-0`]);
+      expect((await scenario.select({ type: type.toUpperCase() })).raw.counts.filtered).toBe(0);
+      expect((await scenario.select({ type, inventoryScope: "power_platform_only" })).raw.counts.filtered).toBe(0);
+    });
 
-  it("matches a grouped agent by its actual package types without replacing conflicting or missing values", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [
-        { ...packageValue("first", "First", true), type: "firstParty" },
-        { ...packageValue("shared", "Shared", true), type: "shared" },
-        packageValue("missing", "Missing", true),
-      ],
-      resources: [resource(environmentA)],
-    }));
-    for (const type of ["firstParty", "shared"]) {
-      const page = await service.list({ tenantId, principalId: "viewer" }, { type });
-      expect(page.count).toBe(1);
-      expect(page.value[0].packages).toHaveLength(3);
-      expect(agentColumnValue(page.value[0], "origin")).toBe("firstParty / shared / Unknown");
+  it.each([
+    { inventoryScope: "catalog", total: 3, linked: 1, graphOnly: 2, powerPlatformOnly: 0, environments: [environmentA],
+      overview: { availableToUsers: 2, organizationCreated: 1, teamsAvailable: 1, createdOrAvailable: 1 } },
+    { inventoryScope: "power_platform_only", total: 1, linked: 0, graphOnly: 0, powerPlatformOnly: 1, environments: [environmentB],
+      overview: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 } },
+    { inventoryScope: "all", total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1, environments: [environmentA, environmentB],
+      overview: { availableToUsers: 2, organizationCreated: 2, teamsAvailable: 1, createdOrAvailable: 2 } },
+  ] as const)("keeps global, $inventoryScope, filtered and source counts distinct", async expected => {
+    const selected = await scoped.select({ inventoryScope: expected.inventoryScope }, 1);
+    expect(selected.raw.counts).toMatchObject({ total: 4, scoped: expected.total, filtered: expected.total });
+    expect(selected.page).toMatchObject({
+      summary: { total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1 },
+      scopeSummary: { total: expected.total, linked: expected.linked, graphOnly: expected.graphOnly, powerPlatformOnly: expected.powerPlatformOnly },
+      inventoryOverview: expected.overview, identityCollection: { checkedPackages: 4, pendingPackages: 0 },
+      verification: { status: "verified", graphPackageCount: 4, powerPlatformAgentCount: 2, representedSourceCount: 6, uniqueSourceCount: 6 },
+    });
+    expect(selected.raw.value).toHaveLength(1);
+    const facets = await scoped.queries.facets(selected.selection.id, scoped.identity, "environmentId");
+    expect(facets.value.map(value => value.value).filter(value => value !== null)).toEqual(expected.environments);
+    const filtered = await scoped.select({ inventoryScope: expected.inventoryScope, search: "does not exist" });
+    expect(filtered.raw.counts).toMatchObject({ total: 4, scoped: expected.total, filtered: 0 });
+    expect(filtered.page!.inventoryOverview).toEqual(selected.page!.inventoryOverview);
+    expect(filtered.page!.summary).toEqual(selected.page!.summary);
+    expect(filtered.page!.sources).toEqual(selected.page!.sources);
+  });
+
+  it.each(unifiedAgentInventoryScopes)("composes %s with every source filter and durable export", async inventoryScope => {
+    const counts = inventoryScope === "catalog" ? [3, 3, 1, 1] : inventoryScope === "power_platform_only" ? [1, 0, 1, 0] : [4, 3, 2, 1];
+    for (const [index, source] of (["all", "graph_packages", "power_platform", "both"] as const).entries()) {
+      const selected = await scoped.select({ inventoryScope, source, sortDirection: "desc" }, 1);
+      expect(selected.raw.counts).toMatchObject({ total: 4, scoped: counts[0], filtered: counts[index] });
+      const all = await pages(scoped, selected, 1);
+      const rows = (await csvRows(scoped, selected)).filter(row => row.recordType === "agent");
+      expect(rows.map(row => row.agentId)).toEqual(all.map(row => row.id));
     }
   });
 
@@ -280,8 +200,7 @@ describe("UnifiedAgentsService", () => {
     { query: { view: "first_party", endUserAccess: "available", management: "unknown" }, expected: ["first"] },
     { query: { view: "third_party", reportedUsage: "used", management: "unknown" }, expected: ["vendor"] },
     { query: { view: "user_managed", endUserAccess: "unavailable", reportedUsage: "used", relevance: "organization" }, expected: ["personal"] },
-    { query: { view: "copilot_studio", endUserAccess: "available", reportedUsage: "used", management: "organization_managed", relevance: "organization" },
-      expected: ["studio-high", "studio-low"] },
+    { query: { view: "copilot_studio", endUserAccess: "available", reportedUsage: "used", management: "organization_managed", relevance: "organization" }, expected: ["studio-high", "studio-low"] },
     { query: { view: "organization_managed", endUserAccess: "unavailable", reportedUsage: "used" }, expected: ["admin-blocked"] },
     { query: { view: "all", endUserAccess: "unknown", management: "unknown" }, expected: ["native", "unknown"] },
     { query: { view: "all", management: "unknown", relevance: "unknown" }, expected: ["zero", "unknown"] },
@@ -291,1653 +210,131 @@ describe("UnifiedAgentsService", () => {
     { query: { view: "available", management: "user_managed" }, expected: [] },
     { query: { view: "unavailable", endUserAccess: "available" }, expected: [] },
     { query: { view: "organization", endUserAccess: "unavailable", reportedUsage: "used" }, expected: ["admin-blocked", "personal"] },
-    { query: { view: "copilot_studio", reportedUsage: "used", management: "organization_managed", publisher: "Vendor",
-      host: "Teams", platform: "Copilot Studio", blocked: false, source: "graph_packages", inventoryScope: "catalog" },
-      expected: ["studio-high", "studio-low"] },
+    { query: { view: "copilot_studio", reportedUsage: "used", management: "organization_managed", publisher: "Vendor", host: "Teams",
+      platform: "Copilot Studio", blocked: false, source: "graph_packages", inventoryScope: "catalog" }, expected: ["studio-high", "studio-low"] },
     { query: { view: "copilot_studio", management: "unknown", search: "Generic" }, expected: ["generic"] },
     { query: { view: "organization_managed", search: "Generic" }, expected: [] },
     { query: { view: "copilot_studio", source: "power_platform" }, expected: [] },
-  ] satisfies Array<{ query: UnifiedAgentInventoryQuery; expected: string[] }>)(
-    "intersects quick views and filters before counts, numeric ordering, paging and CSV: $query", async ({ query, expected }) => {
-      const deps = quickViewDependencies();
-      const service = new UnifiedAgentsService(deps);
-      const scope = { tenantId, principalId: "viewer" };
-      const selection = { ...query, sortBy: "responses" as const, sortDirection: "desc" as const, offset: expected.length > 1 ? 1 : 0, limit: 1 };
-      const identify = (record: UnifiedAgentRecord) => record.packages[0]?.id ?? record.powerPlatformResource!.nativeId;
-      const page = await service.list(scope, selection);
-      expect(page).toMatchObject({
-        count: expected.length, summary: { total: 10 }, filteredSummary: { total: expected.length },
-        scopeSummary: { total: query.inventoryScope === "catalog" ? 9 : 10 }, revision: inventoryRevision,
+  ] satisfies { query: InventoryQuery; expected: string[] }[])(
+    "intersects independent quick-view criteria before counts, numeric paging and CSV: $query", async ({ query, expected }) => {
+      const selected = await quick.select({ ...query, sortBy: "responses", sortDirection: "desc" }, 1);
+      expect(selected.raw.counts).toMatchObject({ total: 10, scoped: query.inventoryScope === "catalog" ? 9 : 10, filtered: expected.length });
+      const full = (await quick.select()).page!.value;
+      const ordered = full.filter(record => expected.includes(identify(record))).sort((left, right) => {
+        const a = left.usage!.responses, b = right.usage!.responses;
+        if (a === null || b === null) return a === b ? -Buffer.compare(Buffer.from(left.id), Buffer.from(right.id)) : a === null ? 1 : -1;
+        return b - a || -Buffer.compare(Buffer.from(left.id), Buffer.from(right.id));
       });
-      expect(page.value.map(identify)).toEqual(expected.slice(selection.offset, selection.offset + 1));
-      expect(vi.mocked(deps.usage.project).mock.calls[0][1]).toHaveLength(10);
-      expect(deps.packages.readUnifiedSource).toHaveBeenCalledWith(scope);
-      expect(deps.powerPlatform.readUnifiedSource).toHaveBeenCalledWith(scope);
-      const exported = await service.forExport(scope, page.revision!, selection);
-      expect(exported.count).toBe(expected.length);
-      expect(exported.value.map(identify)).toEqual(expected);
-      expect(exported.filteredSummary).toEqual(page.filteredSummary);
-      const csv = buildUnifiedAgentCsv(exported, Date.now() + 15_000);
-      const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-      expect(csv.rowCount).toBe(expected.length);
-      expect(rows.map(row => row.agentId)).toEqual(exported.value.map(record => record.id));
-      expect(rows.map(row => row.responses)).toEqual(exported.value.map(record => String(record.usage?.responses ?? "")));
-    },
-  );
-
-  it("classifies linked packages together and preserves positive admin controls without using generic group acquisition", async () => {
-    const deps = dependencies({
-      packages: [
-        { ...packageValue("microsoft", "First", true), type: "microsoft", availableTo: "all",
-          acquireUsersAndGroups: [{ resourceId: "group", resourceType: "group" }] },
-        { ...packageValue("external", "Third", true), type: "external", availableTo: "some", deployedTo: "all",
-          controlObservations: { access: {
-            snapshotId: "admin-control", observedAt: "2026-09-15T00:00:00.000Z", expiresAt: "2026-09-22T00:00:00.000Z",
-          } } },
-      ],
-      resources: [{ ...resource(environmentA), details: { isQuarantined: true } }],
+      expect((await pages(quick, selected, 1)).map(identify)).toEqual(ordered.map(identify));
+      const rows = (await csvRows(quick, selected)).filter(row => row.recordType === "agent");
+      expect(rows).toHaveLength(expected.length);
+      expect(rows.map(row => row.agentId)).toEqual((await pages(quick, selected, 1)).map(record => record.id));
     });
-    const service = new UnifiedAgentsService(deps);
-    const scope = { tenantId, principalId: "viewer" };
-    expect((await service.list(scope, { view: "first_party" })).count).toBe(0);
-    expect((await service.list(scope, { view: "third_party" })).count).toBe(0);
-    const query = { view: "copilot_studio" as const, management: "organization_managed" as const, endUserAccess: "unavailable" as const };
-    const page = await service.list(scope, query);
-    expect(page).toMatchObject({ count: 1, filteredSummary: { total: 1, linked: 1 }, summary: { total: 1 } });
-    expect(page.value[0].packages).toHaveLength(2);
-    expect(page.value[0].packages.find(item => item.id === "external")?.controlObservations?.access?.snapshotId).toBe("admin-control");
-    expect((await service.forExport(scope, page.revision!, query)).value).toEqual(page.value);
-    expect((await service.list(scope, { ...query, endUserAccess: "available" })).count).toBe(0);
-  });
 
-  it.each([
-    { inventoryScope: "catalog", total: 3, linked: 1, graphOnly: 2, powerPlatformOnly: 0,
-      overview: { availableToUsers: 2, organizationCreated: 1, teamsAvailable: 1, createdOrAvailable: 1 },
-      environments: [environmentA], platforms: ["Copilot Studio", "Microsoft 365 Copilot Agent Builder"] },
-    { inventoryScope: "power_platform_only", total: 1, linked: 0, graphOnly: 0, powerPlatformOnly: 1,
-      overview: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 },
-      environments: [environmentB], platforms: ["Zebra SDK"] },
-    { inventoryScope: "all", total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1,
-      overview: { availableToUsers: 2, organizationCreated: 2, teamsAvailable: 1, createdOrAvailable: 2 },
-      environments: [environmentA, environmentB], platforms: ["Copilot Studio", "Microsoft 365 Copilot Agent Builder", "Zebra SDK"] },
-  ] as const)("applies $inventoryScope after complete reconciliation and enrichment, before summaries and paging", async expected => {
-    const scope = { tenantId, principalId: "viewer" };
-    const deps = inventoryScopeDependencies();
-    const client = Object.assign(new pg.Client(), { release: vi.fn() });
-    deps.resolveLinks = vi.fn(resolvePackageAgentLinks);
-    deps.registry = {
-      withSnapshot: (_scope, work) => work(client),
-      reconcile: vi.fn(async (_client, _scope, records) => records.map((record, index) => ({
-        ...record, id: `agent:aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
-      }))),
-    };
-    const people = vi.spyOn(deps.people!, "project");
-    const service = new UnifiedAgentsService(deps);
-    const page = await service.list(scope, { inventoryScope: expected.inventoryScope, limit: 1 });
-    const summary = { total: expected.total, linked: expected.linked, graphOnly: expected.graphOnly,
-      powerPlatformOnly: expected.powerPlatformOnly, ambiguous: 0, conflicting: 0 };
-    expect(page).toMatchObject({
-      count: expected.total, summary: { total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1 },
-      inventoryScope: expected.inventoryScope, scopeSummary: summary, filteredSummary: summary, inventoryOverview: expected.overview,
-      identityCollection: { checkedPackages: 4, pendingPackages: 0 }, partial: false,
-      verification: { status: "verified", logicalAgentCount: 4, graphPackageCount: 4, powerPlatformAgentCount: 2,
-        representedSourceCount: 6, uniqueSourceCount: 6, checks: { sourceMemberships: true } },
-      sources: { graphPackages: { state: "available" }, powerPlatform: { state: "available" } },
+  it.each(unifiedAgentSortKeys.flatMap(sortBy => (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection }))))(
+    "matches displayed $sortBy values in $sortDirection first/middle/last/previous pages and CSV", async query => {
+      const full = (await sortable.select()).page!.value.map(record => ({ ...record,
+        packages: record.packages.map(item => allowlistedPackage(sortable.input.packages!.find(value => value.id === item.id)!)),
+        powerPlatformResource: record.powerPlatformResource
+          ? sortable.input.resources!.find(value => value.nativeId === record.powerPlatformResource!.nativeId)! : null,
+      }));
+      const environments = { [environmentA]: "Zebra environment", [environmentB]: "Alpha environment" };
+      const compare = (left: UnifiedAgentRecord, right: UnifiedAgentRecord) => {
+        const a = agentColumnValue(left, query.sortBy, environments), b = agentColumnValue(right, query.sortBy, environments);
+        const tie = Buffer.compare(Buffer.from(left.id), Buffer.from(right.id)) * (query.sortDirection === "desc" ? -1 : 1);
+        if (a === null || b === null) return a === b ? tie : a === null ? 1 : -1;
+        const value = typeof a === "number" && typeof b === "number" ? a - b
+          : String(a).localeCompare(String(b), "en-US", { sensitivity: "base", numeric: query.sortBy === "versions" });
+        return (query.sortDirection === "desc" ? -value : value) || tie;
+      };
+      const expected = [...full].sort(compare), selected = await sortable.select(query, 2);
+      expect((await pages(sortable, selected)).map(record => record.id)).toEqual(expected.map(record => record.id));
+      const rows = (await csvRows(sortable, selected)).filter(row => row.recordType === "agent");
+      expect(rows.map(row => row.agentId)).toEqual(expected.map(record => record.id));
     });
-    expect(page.value).toHaveLength(1);
-    expect(page.value[0].id).toMatch(/^agent:/);
-    expect(page.facets.environments.map(value => value.value)).toEqual(expected.environments);
-    expect(page.facets.platforms.map(value => value.value)).toEqual(expected.platforms);
-    expect(vi.mocked(deps.resolveLinks).mock.calls[0][1]).toHaveLength(4);
-    expect(vi.mocked(deps.resolveLinks).mock.calls[0][2]).toHaveLength(2);
-    expect(vi.mocked(deps.registry.reconcile).mock.calls[0][2]).toHaveLength(4);
-    expect(vi.mocked(deps.usage.project).mock.calls[0][1]).toHaveLength(4);
-    expect(people.mock.calls[0][1]).toHaveLength(4);
-    expect(deps.powerPlatform.readAgentEnvironments).toHaveBeenCalledWith(scope, [environmentA, environmentB], client);
 
-    const filtered = await service.list(scope, { inventoryScope: expected.inventoryScope, search: "does not exist", offset: 1, limit: 1 });
-    expect(filtered).toMatchObject({ inventoryScope: expected.inventoryScope, count: 0, value: [], scopeSummary: summary, filteredSummary: { total: 0 } });
-    expect(filtered.inventoryOverview).toEqual(page.inventoryOverview);
-    expect(filtered.facets).toEqual(page.facets);
-    expect(filtered.summary).toEqual(page.summary);
-    expect(filtered.sources).toEqual(page.sources);
-  });
-
-  it.each(unifiedAgentInventoryScopes)("composes source filters and filtered exports with %s inventory scope", async inventoryScope => {
-    const scope = { tenantId, principalId: "viewer" };
-    const service = new UnifiedAgentsService(inventoryScopeDependencies());
-    const expected = inventoryScope === "catalog" ? [3, 3, 1, 1]
-      : inventoryScope === "power_platform_only" ? [1, 0, 1, 0] : [4, 3, 2, 1];
-    for (const [index, source] of (["all", "graph_packages", "power_platform", "both"] as const).entries()) {
-      const query = { inventoryScope, source, sortBy: "displayName" as const, sortDirection: "desc" as const };
-      const page = await service.list(scope, { ...query, limit: 1 });
-      expect(page.inventoryScope).toBe(inventoryScope);
-      expect(page.count, source).toBe(expected[index]);
-      expect(page.filteredSummary.total, source).toBe(expected[index]);
-      expect(page.scopeSummary.total).toBe(expected[0]);
-      expect(page.summary.total).toBe(4);
-      const exported = await service.forExport(scope, page.revision!, query);
-      expect(exported.inventoryScope).toBe(inventoryScope);
-      expect(exported.count, source).toBe(expected[index]);
-      expect(exported.value).toHaveLength(expected[index]);
-      expect(exported.value.slice(0, 1)).toEqual(page.value);
-      expect(exported.scopeSummary).toEqual(page.scopeSummary);
-      const csv = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true });
-      expect(csv).toHaveLength(expected[index]);
+  it("uses captured environment names and resolved people for exact filtering and source-preserving CSV", async () => {
+    for (const search of ["Alpha Person", "alpha@example.invalid", ownerB, "Alpha environment"]) {
+      const selected = await sortable.select({ search });
+      expect(selected.page!.value.map(identify)).toEqual(["sort-native-b"]);
+      const row = (await csvRows(sortable, selected)).find(row => row.recordType === "agent")!;
+      expect(row).toMatchObject({ owner: ownerB, createdBy: ownerB, ownerDisplayName: "Alpha Person", createdByDisplayName: "Alpha Person" });
     }
+    const selected = await sortable.select({ search: "no matching row", environmentId: environmentB });
+    expect(selected.raw.counts.filtered).toBe(0);
+    expect(await sortable.queries.facets(selected.selection.id, sortable.identity, "environmentId", { selected: true }))
+      .toEqual({ value: [{ value: environmentB, label: "Alpha environment" }], total: 1, nextCursor: null });
   });
 
-  it("keeps catalog counts logical rather than package counts and filters before paging", async () => {
-    const service = new UnifiedAgentsService(inventoryScopeDependencies());
-    const scope = { tenantId, principalId: "viewer" };
-    const page = await service.list(scope, { inventoryScope: "catalog", view: "available", offset: 1, limit: 1 });
-    expect(page).toMatchObject({ count: 2, summary: { total: 4 }, scopeSummary: { total: 3 },
-      filteredSummary: { total: 2 }, inventoryOverview: { availableToUsers: 2 } });
-    expect(page.value).toHaveLength(1);
-    expect(page.value[0].packages.map(value => value.id)).toEqual(["linked-a", "linked-b-blocked"]);
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe("shared-native");
-    expect(page.value[0].environment?.displayName).toBe("Catalog environment");
-  });
-
-  it("defaults omitted scope to all for exact reads and keeps exact exports independent of inventory scope", async () => {
-    const service = new UnifiedAgentsService(inventoryScopeDependencies());
-    const scope = { tenantId, principalId: "viewer" };
-    const complete = await service.list(scope);
-    expect(complete.inventoryScope).toBe("all");
-    expect(complete.scopeSummary).toEqual(complete.summary);
-    expect((await service.list(scope, { inventoryScope: "all" })).value).toEqual(complete.value);
-    const native = complete.value.find(record => !record.packages.length)!;
-    expect((await service.list(scope, { recordId: native.id })).value).toEqual([native]);
-    expect((await service.list(scope, { inventoryScope: "catalog", recordId: native.id })).value).toEqual([]);
-    for (const inventoryScope of unifiedAgentInventoryScopes) {
-      const exported = await service.forExport(scope, complete.revision!, { inventoryScope }, [native.id]);
-      expect(exported.inventoryScope).toBe("all");
-      expect(exported.value).toEqual([native]);
-      expect(exported.scopeSummary).toEqual(complete.summary);
+  it("uses exact canonical/package/native identity independently of page position without crossing the captured scope", async () => {
+    const full = await scoped.select(), linked = full.page!.value.find(record => record.presence === "both")!;
+    for (const recordId of [linked.id, unifiedAgentRecordId({ source: "graph_packages", packageId: "linked-a" }),
+      unifiedAgentRecordId({ source: "graph_packages", packageId: "linked-b-blocked" }),
+      unifiedAgentRecordId({ source: "power_platform", nativeId: "shared-native", environmentId: environmentA })]) {
+      const raw = await scoped.queries.page(full.selection.id, scoped.identity, { recordId, limit: 1 });
+      expect(inventoryPresentation(raw).value.map(record => record.id)).toEqual([linked.id]);
     }
+    const native = full.page!.value.find(record => record.presence === "power_platform")!;
+    expect((await scoped.select({ inventoryScope: "catalog", recordId: native.id })).raw.counts.filtered).toBe(0);
+    const captured = await scoped.select({ inventoryScope: "catalog" });
+    await expect(scoped.queries.page(captured.selection.id, { ...scoped.identity, principalId: "another-reader" })).rejects.toMatchObject({ code: "selection_invalidated" });
   });
 
-  it("projects all responsible people before paging, including agents beyond the normal 250-row clamp", async () => {
-    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const resources = Array.from({ length: 301 }, (_, index) => ({
-      ...resource(environmentB, `native-${index}`), displayName: `Agent ${String(index).padStart(3, "0")}`,
-      createdBy: owner, details: { ownerId: index === 300 ? owner : other, lastModifiedBy: other },
-    }));
-    const deps = dependencies({ resources });
-    const service = new UnifiedAgentsService(deps);
-    const result = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: owner, offset: 300, limit: 1 });
-    expect(result.selected?.count).toBe(301);
-    expect(result.selected?.agents[0]).toMatchObject({ displayName: "Agent 300", roles: ["owner", "createdBy"] });
-    expect(result.selected?.person.evidence).toBeNull();
-    expect(deps.powerPlatform.readUnifiedSource).toHaveBeenCalledTimes(1);
-  });
-
-  it("pages the full responsibility people cohort rather than the first 250 source agents", async () => {
-    const id = (index: number) => `dddddddd-dddd-4ddd-8ddd-${String(index).padStart(12, "0")}`;
-    const deps = dependencies({ resources: Array.from({ length: 301 }, (_, index) => ({
-      ...resource(environmentB, `native-${index}`), details: { ownerId: id(index) },
-    })) });
-    const service = new UnifiedAgentsService(deps);
-    const page = await service.responsibility({ tenantId, principalId: "viewer" }, { offset: 250, limit: 50 });
-    expect(page.count).toBe(301);
-    expect(page.people).toHaveLength(50);
-    expect(page.people[0].objectId).toBe(id(250));
-    expect((await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: id(300) })).selected)
-      .toMatchObject({ person: { objectId: id(300) }, count: 1, agents: [{ roles: ["owner"] }] });
-  });
-
-  it("keeps owner, creator and modifier distinct, preserves PP-only/shared agents, and ignores operation creators and names", async () => {
-    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const creator = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const modifier = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-    const operationCreator = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-    const deps = dependencies({ packages: [packageValue("same-name", "Same displayed name")], resources: [
-      { ...resource(environmentA), createdBy: creator.toUpperCase(),
-        details: { ownerId: owner, lastModifiedBy: modifier, connectors: [{ connectorId: "shared", operations: [{ operationId: "op", createdBy: operationCreator }] }] } },
-      { ...resource(environmentB), createdBy: owner, details: { ownerId: creator, lastModifiedBy: owner } },
-      { ...resource(environmentB, "invalid"), details: { ownerId: "Same displayed name", lastModifiedBy: "aaaaaaaa" } },
-    ] });
-    const service = new UnifiedAgentsService(deps);
-    const result = await service.responsibility({ tenantId, principalId: "viewer" });
-    expect(result.people.map(person => person.objectId).sort()).toEqual([owner, creator, modifier]);
-    expect(result.people.find(person => person.objectId === owner)).toMatchObject({ agentCount: 2, roles: ["owner", "createdBy", "lastModifiedBy"], evidence: null });
-    expect(result.coverage).toBe("partial");
-    expect(result.unknownAgentCount).toBe(2);
-    expect(result.invalidReferenceCount).toBe(2);
-    const selected = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: creator });
-    expect(selected.selected?.agents).toHaveLength(2);
-    expect(selected.selected?.agents.map(agent => agent.roles)).toEqual([["createdBy"], ["owner"]]);
-    expect(selected.selected?.agents.every(agent => agent.presence === "power_platform")).toBe(true);
-    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId: operationCreator }))
-      .rejects.toMatchObject({ code: "responsibility_person_unavailable" });
-    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId: "Same displayed name" }))
-      .rejects.toMatchObject({ code: "invalid_responsibility_person" });
-  });
-
-  it.each(["not_found", "lookup_failed", "resolved"] as const)("preserves saved %s people outside the paid/report roster", async status => {
-    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const deps = dependencies({ resources: [{ ...resource(environmentA), details: { ownerId: owner } }] });
-    const evidence = { objectId: owner, displayName: status === "resolved" ? "Responsible only" : null, userPrincipalName: null,
-      observedAt: "2026-09-15T00:00:00Z", status, ...(status === "lookup_failed" ? { errorCode: "provider_error" } : {}) };
-    deps.people = new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => ({
-      source: "directory", value: null, observedAt: null, rowCount: null, attemptStatus: null, message: null, attemptedAt: null, lastSuccessAt: null,
-    })) }, { read: vi.fn(async (_scope, ids) => ids.includes(owner) ? [{ ...evidence, lastConclusiveAt: null }] : []) });
-    const service = new UnifiedAgentsService(deps);
-    const selected = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: owner });
-    expect(selected.selected?.person.evidence).toMatchObject(evidence);
-    expect(selected.selected?.count).toBe(1);
-    expect(selected.selected?.agents[0].roles).toEqual(["owner"]);
-  });
-
-  it("distinguishes unavailable, no-reported and unknown responsibility and rejects a changed revision", async () => {
-    const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const evidence = { objectId, displayName: "Same displayed name", userPrincipalName: "saved@example.invalid", observedAt: "2026-09-15T00:00:00Z" };
-    const deps = dependencies({ resources: [], powerPlatformSnapshot: null });
-    deps.people!.read = vi.fn(async () => new Map([[objectId, evidence]]));
-    let service = new UnifiedAgentsService(deps);
-    expect((await service.responsibility({ tenantId, principalId: "viewer" }, { objectId })).selected?.state).toBe("unavailable");
-    const known = dependencies({ resources: [] });
-    known.people!.read = vi.fn(async () => new Map([[objectId, evidence]]));
-    service = new UnifiedAgentsService(known);
-    const result = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId });
-    expect(result.coverage).toBe("available");
-    expect(result.selected).toMatchObject({ state: "no_reported_relationships", count: 0, agents: [] });
-    vi.mocked(known.readRevision).mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("a".repeat(64))
-      .mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
-    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId })).rejects.toMatchObject({ code: "inventory_changed" });
-  });
-  beforeEach(() => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-09-16T12:00:00.000Z"));
-  });
-
-  afterEach(() => vi.useRealTimers());
-
-  it.each((["owner", "createdBy"] as const).flatMap(sortBy =>
-    (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection })),
-  ))("enriches linked and native people before $sortBy $sortDirection sort, search, paging and CSV while retaining source IDs", async query => {
-    const ownerA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const ownerB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const directory = [
-      { objectId: ownerA.toUpperCase(), displayName: "Zebra Person", userPrincipalName: "zebra@example.com" },
-      { objectId: ownerB, displayName: "Alpha Person", userPrincipalName: "alpha@example.com" },
-    ].map((identity): CopilotDirectoryUser => ({
-      identity: { ...identity, accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null },
-      serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
-    }));
-    const resources = [resource(environmentA), resource(environmentB, "native-only")].map((value, index) => ({
-      ...value, createdBy: directory[index].identity.objectId,
-      details: { ...value.details, ownerId: directory[index].identity.objectId, lastModifiedBy: directory[index].identity.objectId },
-    }));
-    const deps = dependencies({ packages: [packageValue("linked", "Linked", true)], resources, directory });
-    const service = new UnifiedAgentsService(deps);
-    const scope = { tenantId, principalId: "viewer" };
-    const expected = query.sortDirection === "asc" ? ["native-only", "shared-native"] : ["shared-native", "native-only"];
-    const page = await service.list(scope, { ...query, offset: 1, limit: 1 });
-    expect(page).toMatchObject({ count: 2, summary: { total: 2, linked: 1, powerPlatformOnly: 1 } });
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe(expected[1]);
-    expect(page.verification.checks.sourceMemberships).toBe(true);
-    const exported = await service.forExport(scope, page.revision!, query);
-    expect(exported.value.map(value => value.powerPlatformResource?.nativeId)).toEqual(expected);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    for (const [index, value] of exported.value.entries()) {
-      const saved = directory.find(person => person.identity.objectId === value.powerPlatformResource?.createdBy)!;
-      expect(value.people?.owner).toEqual({
-        objectId: saved.identity.objectId.toLowerCase(), displayName: saved.identity.displayName,
-        userPrincipalName: saved.identity.userPrincipalName, observedAt: "2026-09-15T10:00:00.000Z",
-      });
-      expect(value.people?.owner).toEqual(value.people?.createdBy);
-      expect(value.people?.owner).toEqual(value.people?.lastModifiedBy);
-      expect(agentColumnValue(value, query.sortBy)).toBe(`${saved.identity.displayName} (${saved.identity.userPrincipalName})`);
-      expect(rows[index]).toMatchObject({
-        owner: saved.identity.objectId, createdBy: saved.identity.objectId, lastModifiedBy: saved.identity.objectId,
-        ownerDisplayName: saved.identity.displayName, ownerUserPrincipalName: saved.identity.userPrincipalName,
-        ownerObservedAt: "2026-09-15T10:00:00.000Z",
-        ownerResolutionStatus: "resolved", createdByResolutionStatus: "resolved", lastModifiedByResolutionStatus: "resolved",
-        createdByDisplayName: saved.identity.displayName, createdByUserPrincipalName: saved.identity.userPrincipalName,
-        lastModifiedByDisplayName: saved.identity.displayName, lastModifiedByUserPrincipalName: saved.identity.userPrincipalName,
-      });
-    }
-    const searched = await service.list(scope, { search: "alpha@example.com" });
-    expect(searched.count).toBe(1);
-    expect(searched.value[0].powerPlatformResource?.nativeId).toBe("native-only");
-    expect((await service.list(scope, { search: "Zebra Person" })).count).toBe(1);
-    expect((await service.list(scope, { search: ownerA })).count).toBe(1);
-  });
-
-  it("uses raw native people IDs without a directory observation and never hides a failed saved-source read", async () => {
-    const native = { ...resource(environmentA), createdBy: botA, details: { ownerId: botA, lastModifiedBy: botA } };
-    const deps = dependencies({ resources: [native] });
-    const service = new UnifiedAgentsService(deps);
-    const [record] = (await service.list({ tenantId, principalId: "viewer" })).value;
-    expect(record.people).toBeUndefined();
-    expect(agentColumnValue(record, "owner")).toBe(botA);
-    expect(agentColumnValue(record, "createdBy")).toBe(botA);
-    deps.people = { project: vi.fn().mockRejectedValue(new AppError(409, "copilot_usage_snapshot_invalid", "Invalid saved directory.")) };
-    await expect(service.list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "copilot_usage_snapshot_invalid" });
-  });
-
-  it("fences saved directory replacements, expiry and replacement during a read using the shared opaque revision", async () => {
-    const database = new pg.Pool();
-    let directorySnapshot: string | null = environmentA;
-    const query = vi.spyOn(database, "query").mockImplementation(async () => ({
-      rows: directorySnapshot ? [{
-        source: "directory", id: directorySnapshot,
-        observed_at: new Date("2026-09-15T10:00:00.000Z"), expires_at: new Date("2026-10-15T10:00:00.000Z"),
-      }] : [],
-      rowCount: directorySnapshot ? 1 : 0, fields: [], command: "SELECT", oid: 0,
-    }));
-    try {
-      const deps = dependencies({ resources: [resource(environmentA)] });
-      deps.readRevision = scope => readUnifiedInventoryRevision(scope, database);
-      const service = new UnifiedAgentsService(deps);
-      const scope = { tenantId, principalId: "viewer" };
-      const before = await service.list(scope);
-      const sql = String(query.mock.calls[0][0]);
-      for (const predicate of [
-        "snapshot.id=state.current_snapshot_id", "snapshot.tenant_id=state.tenant_id",
-        "snapshot.principal_id=state.principal_id", "snapshot.source_id=state.source_id",
-        "snapshot.is_current", "snapshot.expires_at>clock_timestamp()", "state.source_id='directory'",
-        "state.tenant_id=$1", "state.principal_id=$2",
-      ]) expect(sql).toContain(predicate);
-      await expect(service.assertRevision(scope, before.revision!)).resolves.toBeUndefined();
-      directorySnapshot = environmentB;
-      await expect(service.assertRevision(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-      await expect(service.forExport(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-      const replacement = await service.list(scope);
-      expect(replacement.revision).not.toBe(before.revision);
-      expect(replacement.value.map(value => value.id)).toEqual(before.value.map(value => value.id));
-      directorySnapshot = null;
-      await expect(service.assertRevision(scope, replacement.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-      directorySnapshot = environmentA;
-      deps.people = { project: vi.fn(async (_scope, records) => {
-        directorySnapshot = environmentB;
-        return [...records];
-      }) };
-      await expect(service.list(scope)).rejects.toMatchObject({ code: "inventory_changed" });
-    } finally {
-      query.mockRestore();
-      await database.end();
-    }
-  });
-
-  it("agrees on legacy Power Platform Lite display, facets, filtering, sorting and CSV", async () => {
-    const service = new UnifiedAgentsService(dependencies({ resources: [
-      { ...resource(environmentB, "lite"), authoringTool: null, details: { createdIn: "Copilot Studio Lite" } },
-      { ...resource(environmentB, "studio"), authoringTool: "Copilot Studio" },
-      { ...resource(environmentB, "zebra"), authoringTool: "Zebra SDK" },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const label = "Microsoft 365 Copilot Agent Builder";
-    const page = await service.list(scope, { sortBy: "builtWith", offset: 1, limit: 1 });
-    expect(page.facets.platforms).toEqual([
-      { value: "Copilot Studio", label: "Copilot Studio" }, { value: label, label }, { value: "Zebra SDK", label: "Zebra SDK" },
-    ]);
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe("lite");
-    expect(agentColumnValue(page.value[0], "builtWith")).toBe(label);
-    const filtered = await service.list(scope, { platform: label });
-    expect(filtered.count).toBe(1);
-    expect(filtered.value[0].powerPlatformResource?.nativeId).toBe("lite");
-    expect((await service.list(scope, { platform: "Copilot Studio Lite" })).count).toBe(1);
-    const exported = await service.forExport(scope, page.revision!, { sortBy: "builtWith" });
-    expect(exported.value.map(value => value.powerPlatformResource?.nativeId)).toEqual(["studio", "lite", "zebra"]);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.builtWith)).toEqual(["Copilot Studio", label, "Zebra SDK"]);
-  });
-
-  it("keeps inventory dashboard counts global before search and pagination", async () => {
-    const deps = dependencies({ packages: [
-      { ...packageValue("created", "Created"), type: "custom", availableTo: "all", supportedHosts: ["Teams"], isBlocked: false },
-      { ...packageValue("available", "Available"), type: "external", availableTo: "some", supportedHosts: ["Teams"], isBlocked: false },
-      { ...packageValue("other", "Other"), type: "external", availableTo: "none", supportedHosts: ["Teams"], isBlocked: false },
-    ] });
-    const page = await new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" }, { search: "Other", limit: 1 });
-    expect(page.count).toBe(1);
-    expect(page.summary.total).toBe(3);
-    expect(page.inventoryOverview).toEqual({ availableToUsers: 2, organizationCreated: 1, teamsAvailable: 2, createdOrAvailable: 2 });
-  });
-
-  it("matches repository availability counts to filtered lists, pagination and exports across hosts", async () => {
-    const service = new UnifiedAgentsService(dependencies({ packages: [
-      { ...packageValue("available-a", "A"), availableTo: "all", supportedHosts: ["Teams"] },
-      { ...packageValue("available-b", "B"), availableTo: "some", supportedHosts: ["Copilot"] },
-      { ...packageValue("vendor", "Vendor"), type: "external", availableTo: "none" },
-      { ...packageValue("created-blocked", "Created"), type: "custom", availableTo: "all" },
-      { ...packageValue("unknown", "Unknown"), type: "microsoft", deployedTo: "all" },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const page = await service.list(scope, { view: "available", offset: 1, limit: 1 });
-    expect(page).toMatchObject({
-      count: 2, summary: { total: 5 }, filteredSummary: { total: 2 }, inventoryOverview: { availableToUsers: 2 },
-    });
-    expect(page.value.map(value => value.packages[0].id)).toEqual(["available-b"]);
-    const unavailable = await service.list(scope, { view: "unavailable" });
-    expect(unavailable.value.map(value => value.packages[0].id)).toEqual(["created-blocked", "vendor"]);
-    expect((await service.list(scope, { view: "availability_unknown" })).value.map(value => value.packages[0].id)).toEqual(["unknown"]);
-    const exported = await service.forExport(scope, page.revision!, { view: "available" });
-    expect(exported.value.map(value => value.packages[0].id)).toEqual(["available-a", "available-b"]);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.availability)).toEqual(["All users", "Specific users or groups"]);
-  });
-
-  it("projects usage once across canonical records before organization filtering, numeric sorting, paging and export", async () => {
-    const scope = { tenantId, principalId: "viewer" };
-    const deps = dependencies({ packages: ["low", "high", "zero", "unknown"].map(id => ({
-      ...packageValue(id, id), type: "external",
-    })) });
-    const counts = new Map([["low", 2], ["high", 10], ["zero", 0]]);
-    deps.usage.project = vi.fn(async (_scope, records) => ({
-      context: usageContext,
-      summaries: new Map(records.map(record => {
-        const responses = counts.get(record.packages[0].id) ?? null;
-        return [record.id, {
-          status: responses === null ? "unlinked" : "linked", reportSetId: "report-set",
-          responses, activeUsers: responses === 2 ? 10 : responses === 10 ? 2 : responses,
-          lastActivityDateUtc: null, associations: [],
-        } satisfies AgentUsageSummary];
+  it.each(["typed_bot", "schema_native"])("keeps conflicting schemas separate before paging: %s", async matchKind => {
+    const scenario = await seedSelectedInventory(database.runtime, {
+      packages: ["cr_agent", "cr_other"].map((SchemaName, index) => ({
+        ...packageValue(`conflict-${index}`), elementDetails: [{ elementType: "AgentMetadatas", elements: [{
+          id: "metadata", definition: JSON.stringify({ SourceIds: { EnvironmentId: environmentA, CdsBotId: botA, SchemaName } }),
+        }] }],
       })),
-    }));
-    const service = new UnifiedAgentsService(deps);
-    const used = await service.list(scope, { view: "used", sortBy: "responses", sortDirection: "asc", offset: 1, limit: 1 });
-    expect(used).toMatchObject({ count: 2, summary: { total: 4 }, filteredSummary: { total: 2 }, usageContext });
-    expect(used.value.map(record => record.packages[0].id)).toEqual(["high"]);
-    expect(deps.usage.project).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(deps.usage.project).mock.calls[0][1]).toHaveLength(4);
-    expect((await service.list(scope, { sortBy: "responses", sortDirection: "desc" })).value.map(record => record.usage?.responses))
-      .toEqual([10, 2, 0, null]);
-    expect((await service.list(scope, { sortBy: "responses", sortDirection: "asc" })).value.map(record => record.usage?.responses))
-      .toEqual([0, 2, 10, null]);
-    expect((await service.list(scope, { sortBy: "activeUsers", sortDirection: "desc", limit: 1 })).value[0].packages[0].id).toBe("low");
-    expect((await service.list(scope, { view: "organization" })).count).toBe(2);
-    expect((await service.list(scope, { view: "unknown" })).count).toBe(2);
-    const exported = await service.forExport(scope, inventoryRevision, { view: "used", sortBy: "responses", sortDirection: "desc" });
-    expect(exported.value.map(record => record.usage?.responses)).toEqual([10, 2]);
-  });
-
-  it("uses one locked client for usage projection and the final composite export-revision check", async () => {
-    const scope = { tenantId, principalId: "viewer" };
-    const client = Object.assign(new pg.Client(), { release: vi.fn() });
-    const deps = dependencies({ packages: [packageValue("one", "One")] });
-    deps.registry = {
-      withSnapshot: (_scope, work) => work(client),
-      reconcile: async (_client, _scope, records) => [...records],
-    };
-    const service = new UnifiedAgentsService(deps);
-    const page = await service.list(scope);
-    expect(page.revision).toBe(inventoryRevision);
-    expect(deps.usage.project).toHaveBeenCalledWith(scope, expect.any(Array), client);
-    await service.assertRevision(scope, inventoryRevision);
-    expect(deps.usage.revision).toHaveBeenCalledWith(scope, client);
-    expect(vi.mocked(deps.readRevision).mock.calls.every(([owner, database]) => owner === scope && database === client)).toBe(true);
-    deps.usage.revision = vi.fn(async () => "d".repeat(64));
-    await expect(service.assertRevision(scope, inventoryRevision)).rejects.toMatchObject({ code: "inventory_changed" });
-  });
-
-  it.each([
-    ["list", "validation"], ["forExport", "validation"], ["list", "commit"], ["forExport", "commit"],
-  ] as const)("rejects %s when usage expires after projection during final %s", async (method, phase) => {
-    const now = Date.parse("2026-09-20T12:00:00.000Z");
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    const deps = dependencies({ packages: [packageValue("one", "One")] });
-    const projection = deps.usage.project;
-    deps.usage.project = vi.fn<UnifiedAgentDependencies["usage"]["project"]>(async (...args) => {
-      const result = await projection(...args);
-      return { ...result, context: { ...result.context, availability: "active", expiresAt: new Date(now + 1_000).toISOString(),
-        reportSet: {
-          id: "report-set", bundleId: "bundle", complete: true, kinds: ["agents", "userAgents", "users"],
-          contentHash: "b".repeat(64), reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
-          supersedesSetId: null, acceptedAt: null, deletedAt: null, createdAt: new Date(now).toISOString(), expiresAt: null,
-        },
-      } satisfies AgentUsageContext };
+      resources: [matchKind === "typed_bot" ? resource(environmentA) : { ...resource(environmentA, botA), identifiers: [], details: { schemaName: "cr_agent" } }],
     });
-    if (phase === "validation") {
-      deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockImplementation(async () => {
-        clock.mockReturnValue(now + 1_000);
-        return "a".repeat(64);
-      });
-    } else {
-      const client = Object.assign(new pg.Client(), { release: vi.fn() });
-      deps.registry = {
-        withSnapshot: async (_scope, work) => {
-          const result = await work(client);
-          clock.mockReturnValue(now + 1_000);
-          return result;
-        },
-        reconcile: async (_client, _scope, records) => [...records],
-      };
-    }
-    const service = new UnifiedAgentsService(deps);
-    const scope = { tenantId, principalId: "viewer" };
-    await expect(method === "list" ? service.list(scope) : service.forExport(scope, inventoryRevision))
-      .rejects.toMatchObject({ code: "agent_usage_changed" });
+    const selected = await scenario.select({}, 1);
+    expect(selected.page!.summary).toMatchObject({ total: 3, linked: 0, graphOnly: 2, powerPlatformOnly: 1, conflicting: 2 });
+    expect(await pages(scenario, selected, 1)).toHaveLength(3);
   });
 
-  it("rejects export publication when usage expires during the final composite revision check", async () => {
-    const now = Date.parse("2026-09-20T12:00:00.000Z");
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    const deps = dependencies();
-    deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockImplementation(async () => {
-      clock.mockReturnValue(now + 1_000);
-      return "a".repeat(64);
-    });
-    await expect(new UnifiedAgentsService(deps).assertRevision(
-      { tenantId, principalId: "viewer" }, inventoryRevision, new Date(now + 1_000).toISOString(),
-    )).rejects.toMatchObject({ code: "agent_usage_changed" });
+  it.each(["stale", "invalidated"] as const)("does not authorize canonical matching with %s identity details", async state => {
+    const value = packageValue("withdrawn", "Same displayed name", true);
+    const scenario = await seedSelectedInventory(database.runtime, { packages: [{ ...value,
+      detailFreshness: { state, observedAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() - 1).toISOString() },
+      ...(state === "invalidated" ? { identityRevalidationRequired: true } : {}) }], resources: [resource(environmentA)] });
+    const selected = await scenario.select();
+    expect(selected.page!.summary).toMatchObject({ total: 2, linked: 0, graphOnly: 1, powerPlatformOnly: 1 });
+    expect(selected.page!.identityCollection).toMatchObject({ checkedPackages: 0, pendingPackages: 1 });
   });
 
-  it("propagates usage storage failures and rejects incomplete projections instead of fabricating unused agents", async () => {
-    const deps = dependencies({ packages: [packageValue("one", "One")] });
-    const service = new UnifiedAgentsService(deps);
-    deps.usage.project = vi.fn(async () => { throw new Error("usage database unavailable"); });
-    await expect(service.list({ tenantId, principalId: "viewer" })).rejects.toThrow("usage database unavailable");
-    deps.usage.project = vi.fn(async () => ({ context: usageContext, summaries: new Map() }));
-    await expect(service.list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "agent_usage_projection_incomplete" });
+  it.each(["full", "ai", "unknown"] as const)("uses proven agent-query coverage rather than the %s role hint", async roleScope => {
+    const scenario = await seedSelectedInventory(database.runtime, { resources: [resource(environmentA)], roleScope,
+      resourceTypes: ["microsoft.copilotstudio/agents"] });
+    expect((await scenario.select()).page).toMatchObject({ partial: false, sources: { powerPlatform: { state: "available" } }, verification: { status: "verified" } });
   });
 
-  it("filters organization agents before counts, pagination and export without treating availability as deployment", async () => {
-    const packages = [
-      { ...packageValue("catalog", "A catalog-only"), type: "external", availableTo: "all", deployedTo: "none" },
-      { ...packageValue("microsoft", "B Microsoft"), type: "microsoft" },
-      { ...packageValue("shared", "C User shared"), type: "shared" },
-      { ...packageValue("custom", "D Organization"), type: "custom" },
-      { ...packageValue("deployed", "E Vendor deployed"), type: "external", deployedTo: "deployedToSome" },
-    ];
-    const service = new UnifiedAgentsService(dependencies({ packages, resources: [resource(environmentA)] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const page = await service.list(scope, { view: "organization", limit: 2, offset: 2 });
-    expect(page.summary.total).toBe(6);
-    expect(page.count).toBe(5);
-    expect(page.value.map(value => value.displayName)).toEqual(["D Organization", "E Vendor deployed"]);
-    const exported = await service.forExport(scope, inventoryRevision, { view: "organization" });
-    expect(exported.value).toHaveLength(5);
-    expect(exported.value.some(value => value.packages.some(item => item.id === "catalog"))).toBe(false);
-    expect((await service.list(scope, { view: "used" })).count).toBe(0);
-    expect((await service.list(scope, { view: "unknown" })).value[0].packages[0].id).toBe("catalog");
+  it("keeps environment-only, unavailable and valid empty sources distinguishable", async () => {
+    const partial = await seedSelectedInventory(database.runtime, { resources: [environment(environmentA, "Environment")],
+      resourceTypes: ["microsoft.powerplatform/environments"] });
+    expect((await partial.select()).page).toMatchObject({ partial: true, counts: { total: 0 }, sources: { powerPlatform: { state: "partial" } } });
+    const missing = await seedSelectedInventory(database.runtime, { omitPackages: true, resources: [resource(environmentA)] });
+    expect((await missing.select()).page).toMatchObject({ partial: true, counts: { total: 1 }, sources: { graphPackages: { state: "unavailable" } } });
+    const empty = await seedSelectedInventory(database.runtime);
+    expect((await empty.select()).page).toMatchObject({ partial: false, counts: { total: 0 }, verification: { status: "verified" } });
   });
 
-  it("sorts newly exposed columns across all rows and orders environments by their displayed names", async () => {
-    const packages = [
-      { ...packageValue("a", "A"), supportedHosts: ["Teams"] },
-      { ...packageValue("b", "B"), supportedHosts: ["Copilot"] },
-      packageValue("c", "C"),
-    ];
-    const service = new UnifiedAgentsService(dependencies({
-      packages, resources: [resource(environmentA), resource(environmentB)],
-      environmentNames: { [environmentA]: "Zebra", [environmentB]: "Alpha" },
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-    const page = await service.list(scope, { sortBy: "hosts", limit: 1 });
-    expect(page.value[0].packages[0].id).toBe("b");
-    expect((await service.list(scope, { sortBy: "environment", limit: 1 })).value[0].environmentId).toBe(environmentB);
-    expect((await service.list(scope, { sortBy: "hosts", sortDirection: "desc", limit: 1 })).value[0].packages[0].id).toBe("a");
+  it("rejects invalid timestamps before source publication instead of accepting a false sort tie", async () => {
+    await expect(seedSelectedInventory(database.runtime, { packages: [{ ...packageValue("invalid"), lastModifiedDateTime: "not-a-date" }] })).rejects.toThrow();
   });
 
-  it.each(["asc", "desc"] as const)("keeps displayed environment labels consistent with %s sorting, paging and CSV", async sortDirection => {
-    const mixedCaseEnvironment = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("unscoped", "Unscoped")],
-      resources: [
-        resource(environmentA, "zebra"),
-        resource(mixedCaseEnvironment, "alpha"),
-        resource(environmentB, "unlabelled"),
-        resource(mixedCaseEnvironment, "alpha-tie"),
-      ],
-      environmentNames: { [environmentA]: "Zebra", [mixedCaseEnvironment.toLowerCase()]: "Alpha" },
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-    const query = { sortBy: "environment" as const, sortDirection };
-    const expected = sortDirection === "asc"
-      ? ["unlabelled", "alpha", "alpha-tie", "zebra", "unscoped"]
-      : ["zebra", "alpha-tie", "alpha", "unlabelled", "unscoped"];
-    const page = await service.list(scope, { ...query, limit: 1, offset: 2 });
-    expect(page.count).toBe(5);
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe(expected[2]);
-    expect(page.facets.environments).toEqual([
-      { value: environmentB, label: environmentB },
-      { value: mixedCaseEnvironment, label: "Alpha" },
-      { value: environmentA, label: "Zebra" },
-    ]);
-    const environmentNames = Object.fromEntries(page.facets.environments.map(item => [item.value.toLowerCase(), item.label]));
-    const exported = await service.forExport(scope, inventoryRevision, query);
-    expect(exported.value.map(item => item.powerPlatformResource?.nativeId ?? item.packages[0].id)).toEqual(expected);
-    const displayed = exported.value.map(item => agentColumnValue(item, "environment", environmentNames));
-    expect(displayed).toEqual(sortDirection === "asc"
-      ? [environmentB, "Alpha", "Alpha", "Zebra", null]
-      : ["Zebra", "Alpha", "Alpha", environmentB, null]);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.environmentName || row.environmentId)).toEqual(displayed.map(value => value ?? ""));
-    expect(rows.find(row => row.environmentId === environmentB)?.environmentName).toBe("");
-    expect(rows.find(row => row.environmentId === environmentB)?.environmentContextStatus).toBe("saved_metadata_unavailable");
+  it("keeps legal maximum-width Unicode values and literal reserved names intact", async () => {
+    const publisher = "界".repeat(4096);
+    const scenario = await seedSelectedInventory(database.runtime, { packages: [
+      { ...packageValue("__proto__", "Ａgent"), publisher }, { ...packageValue("constructor", "Agent"), publisher: "~null" },
+      { ...packageValue("toString", "Ω"), publisher: "=untrusted" },
+    ] });
+    const selected = await scenario.select({ publisher });
+    expect(selected.page!.value.map(identify)).toEqual(["__proto__"]);
+    expect(Buffer.byteLength(JSON.stringify(selected.raw))).toBeLessThan(1024 * 1024);
+    const exported = await scenario.select({ publisher: "=untrusted" });
+    expect((await csvRows(scenario, exported)).find(row => row.recordType === "agent")!.publisher).toBe("'=untrusted");
+    expect((await scenario.select({ publisher: "~null" })).page!.value.map(identify)).toEqual(["constructor"]);
   });
-
-  it.each(["asc", "desc"] as const)("keeps reported-empty channels distinct from missing data in %s display, sort and CSV", async sortDirection => {
-    const service = new UnifiedAgentsService(dependencies({ resources: [
-      resource(environmentB, "missing"),
-      { ...resource(environmentB, "configured"), details: { channels: ["Teams"] } },
-      { ...resource(environmentB, "empty"), details: { channels: [] } },
-      { ...resource(environmentB, "blank"), details: { channels: ["", " "] } },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const query = { sortBy: "channels" as const, sortDirection };
-    const expected = sortDirection === "asc" ? ["empty", "configured", "blank", "missing"] : ["configured", "empty", "missing", "blank"];
-    const page = await service.list(scope, { ...query, limit: 1 });
-    expect(page.count).toBe(4);
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe(expected[0]);
-    const exported = await service.forExport(scope, inventoryRevision, query);
-    expect(exported.value.map(item => item.powerPlatformResource?.nativeId)).toEqual(expected);
-    const displayed = exported.value.map(item => agentColumnValue(item, "channels"));
-    expect(displayed).toEqual(sortDirection === "asc" ? ["None reported", "Teams", null, null] : ["Teams", "None reported", null, null]);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.channels)).toEqual(displayed.map(value => value ?? ""));
-  });
-
-  it.each((["origin", "versions"] as const).flatMap(sortBy =>
-    (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection })),
-  ))("sorts entirely unknown $sortBy last in $sortDirection pages and CSV without changing its displayed meaning", async query => {
-    const service = new UnifiedAgentsService(dependencies({ packages: [
-      packageValue("unknown", "Unknown"),
-      { ...packageValue("known-a", "Known A"), type: "custom", version: "2" },
-      { ...packageValue("known-b", "Known B"), type: "microsoft", version: "10" },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const known = ["known-a", "known-b"];
-    if (query.sortDirection === "desc") known.reverse();
-    const page = await service.list(scope, { ...query, limit: 1, offset: 1 });
-    expect(page.count).toBe(3);
-    expect(page.value[0].packages[0].id).toBe(known[1]);
-    const exported = await service.forExport(scope, inventoryRevision, query);
-    expect(exported.value.map(item => item.packages[0].id)).toEqual([...known, "unknown"]);
-    expect(agentColumnValue(exported.value[2], query.sortBy)).toBeNull();
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row[query.sortBy])).toEqual(exported.value.map(item => agentColumnValue(item, query.sortBy) ?? ""));
-  });
-
-  it.each(["asc", "desc"] as const)("sorts entirely unknown native control status last in %s order without hiding its status labels", async sortDirection => {
-    const service = new UnifiedAgentsService(dependencies({ resources: [
-      { ...resource(environmentB, "unknown"), lifecycle: "unknown" },
-      { ...resource(environmentB, "draft"), lifecycle: "draft" },
-      resource(environmentB, "published"),
-      { ...resource(environmentB, "quarantine-only"), lifecycle: "unknown", details: { isQuarantined: false } },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const query = { sortBy: "status" as const, sortDirection };
-    const expected = sortDirection === "asc"
-      ? ["draft", "quarantine-only", "published", "unknown"]
-      : ["published", "quarantine-only", "draft", "unknown"];
-    const page = await service.list(scope, { ...query, limit: 1, offset: 1 });
-    expect(page.count).toBe(4);
-    expect(page.value[0].powerPlatformResource?.nativeId).toBe(expected[1]);
-    const exported = await service.forExport(scope, inventoryRevision, query);
-    expect(exported.value.map(item => item.powerPlatformResource?.nativeId)).toEqual(expected);
-    expect(agentColumnValue(exported.value[3], "status")).toBeNull();
-    expect(agentStatusLabels(exported.value[3])).toEqual(["Publication status unknown", "Quarantine status unknown"]);
-  });
-
-  it("uses the same saved authoring fallbacks for full-inventory sorting, display values and export", async () => {
-    const service = new UnifiedAgentsService(dependencies({ packages: [
-      { ...packageValue("a-platform", "Platform"), authoringTool: null, platform: "CopilotStudio" },
-      { ...packageValue("b-hint", "Hint"), authoringTool: null, shortDescription: "Built using Agent Builder." },
-      { ...packageValue("c-known", "Known"), authoringTool: "Zebra SDK" },
-      { ...packageValue("z-unknown", "Unknown"), authoringTool: null },
-    ] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const query = { sortBy: "builtWith" as const };
-    const page = await service.list(scope, { ...query, limit: 1 });
-    expect(page.count).toBe(4);
-    expect(page.value[0].packages[0].id).toBe("b-hint");
-    const exported = await service.forExport(scope, inventoryRevision, query);
-    expect(exported.value.map(value => value.packages[0].id)).toEqual(["b-hint", "a-platform", "c-known", "z-unknown"]);
-    const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.builtWith)).toEqual(["Agent Builder", "Copilot Studio", "Zebra SDK", ""]);
-    expect((await service.list(scope, { view: "organization" })).count).toBe(0);
-  });
-
-  it("projects only reconciled canonical IDs after both private source reads and membership verification", async () => {
-    const scope = { tenantId, principalId: "viewer" };
-    const client = Object.assign(new pg.Client(), { release: vi.fn() });
-    const deps = dependencies({ packages: [packageValue("linked", "Linked", true)], resources: [resource(environmentA)] });
-    const canonicalId = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    deps.registry = {
-      withSnapshot: (_scope, work) => work(client),
-      reconcile: vi.fn(async (_client, _scope, records) => records.map(record => ({ ...record, id: canonicalId }))),
-    };
-    deps.usage.project = vi.fn(async (owner, records, database) => {
-      expect(owner).toEqual(scope);
-      expect(database).toBe(client);
-      expect(deps.packages.readUnifiedSource).toHaveBeenCalledWith(scope, client);
-      expect(deps.powerPlatform.readUnifiedSource).toHaveBeenCalledWith(scope, client);
-      expect(deps.registry!.reconcile).toHaveBeenCalledOnce();
-      expect(records.map(record => record.id)).toEqual([canonicalId]);
-      expect(records[0].packages.map(item => item.id)).toEqual(["linked"]);
-      return {
-        context: usageContext,
-        summaries: new Map([[canonicalId, {
-          status: "linked", reportSetId: "report", responses: 2, activeUsers: 1, lastActivityDateUtc: null, associations: [],
-        } satisfies AgentUsageSummary]]),
-      };
-    });
-    const page = await new UnifiedAgentsService(deps).list(scope, { view: "used", recordId: canonicalId, sortBy: "responses", limit: 1 });
-    expect(page).toMatchObject({ count: 1, value: [{ id: canonicalId, usage: { responses: 2 } }] });
-  });
-
-  it("exports every matching logical row rather than just the visible page", async () => {
-    const packages = Array.from({ length: 301 }, (_, index) => packageValue(`package-${index}`, `Package ${index}`));
-    const service = new UnifiedAgentsService(dependencies({ packages, powerPlatformSnapshot: null }));
-    const scope = { tenantId, principalId: "viewer" };
-    expect((await service.list(scope, { limit: 10 })).value).toHaveLength(10);
-    const exported = await service.forExport(scope, inventoryRevision);
-    expect(exported.value).toHaveLength(301);
-    expect(exported.count).toBe(301);
-    expect(exported.revision).toBe(inventoryRevision);
-  });
-
-  it("exports grouped capabilities with the unified environment filter and formula-safe labels", async () => {
-    const packages = [
-      { ...packageValue("linked-a", "Package", true), version: "1.0" },
-      { ...packageValue("linked-b-blocked", "Package", true), version: "2.0" },
-      packageValue("unrelated", "Other"),
-    ];
-    const service = new UnifiedAgentsService(dependencies({
-      packages, resources: [{ ...resource(environmentA), displayName: "=formula" }, resource(environmentB)],
-      environmentNames: { [environmentA]: "Production environment" },
-    }));
-    const inventory = await service.forExport({ tenantId, principalId: "viewer" }, inventoryRevision, { environmentId: environmentA });
-    expect(inventory.count).toBe(1);
-    const csv = buildUnifiedAgentCsv(inventory, Date.now() + 15_000);
-    expect(csv.rowCount).toBe(1);
-    const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows[0]).toMatchObject({
-      displayName: "'=formula", environmentId: environmentA, environmentName: "Production environment", nativeResourceId: "shared-native",
-    });
-    expect(JSON.parse(rows[0].packageIds)).toEqual(["linked-a", "linked-b-blocked"]);
-    expect(JSON.parse(rows[0].packageStates)).toMatchObject([
-      { packageId: "linked-a", version: "1.0", isBlocked: false }, { packageId: "linked-b-blocked", version: "2.0", isBlocked: true },
-    ]);
-    expect(csv.buffer.toString("utf8")).not.toContain("secret-principal");
-    expect(csv.buffer.toString("utf8")).not.toContain("Provider metadata");
-  });
-
-  it("deduplicates exact aliases into one export row and rejects absent selections or changed revisions", async () => {
-    const deps = dependencies({
-      packages: [packageValue("linked-a", "Package", true), packageValue("linked-b", "Package", true)],
-      resources: [resource(environmentA)],
-    });
-    const service = new UnifiedAgentsService(deps);
-    const scope = { tenantId, principalId: "viewer" };
-    const selected = await service.forExport(scope, inventoryRevision, {}, [
-      "graph_packages:linked-a", "graph_packages:linked-b",
-      unifiedAgentRecordId({ source: "power_platform", environmentId: environmentA.toUpperCase(), nativeId: "shared-native" }),
-    ]);
-    expect(selected.count).toBe(1);
-    expect(selected.value[0].packages).toHaveLength(2);
-    await expect(service.forExport(scope, inventoryRevision, {}, ["graph_packages:absent"])).rejects.toMatchObject({ code: "export_selection_changed" });
-    await expect(service.forExport(scope, "b".repeat(64))).rejects.toMatchObject({ code: "inventory_changed" });
-    await service.assertRevision(scope, inventoryRevision);
-    deps.readRevision = vi.fn(async () => "b".repeat(64));
-    await expect(service.assertRevision(scope, inventoryRevision)).rejects.toMatchObject({ code: "inventory_changed" });
-  });
-
-  it("exports selectable metadata and period-scoped usage without converting unknown counts to zero", async () => {
-    const inventory = await new UnifiedAgentsService(dependencies({ packages: [
-      { ...packageValue("a", "A"), type: "custom", supportedHosts: ["Teams"], publisher: "=untrusted", version: "2.1", createdDateTime: "2026-09-01T00:00:00Z" },
-      packageValue("b", "B"),
-    ] })).list({ tenantId, principalId: "viewer" });
-    const reportSetId = "33333333-3333-4333-8333-333333333333";
-    inventory.usageContext = {
-      availability: "stale", revision: "c".repeat(64), lineages: [],
-      reportSet: {
-        id: reportSetId, bundleId: "44444444-4444-4444-8444-444444444444", complete: true, kinds: ["agents", "users", "userAgents"],
-        reportingPeriod: { startDate: "2026-09-01", endDate: "2026-09-15", provenance: "activity_range" },
-        supersedesSetId: null, acceptedAt: "2026-09-15T12:00:00Z", deletedAt: null, createdAt: "2026-09-15T12:00:00Z", expiresAt: null,
-      },
-    };
-    inventory.value[0].usage = {
-      status: "linked", reportSetId, responses: 0, activeUsers: 0, lastActivityDateUtc: null,
-      associations: [{
-        reportAgentId: "report/a", reportAgentName: "=reported name", target: { source: "graph_packages", packageId: "a" },
-        basis: "admin_reviewed", reviewedAt: "2026-09-15T12:00:00Z",
-      }],
-    };
-    inventory.value[1].usage = { status: "unlinked", reportSetId, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [] };
-    const csv = buildUnifiedAgentCsv(inventory, Date.now() + 15_000);
-    const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows[0]).toMatchObject({
-      hosts: "Teams", publisher: "'=untrusted", versions: "2.1", createdAt: "2026-09-01T00:00:00.000Z",
-      usageStatus: "linked", responses: "0", activeUsers: "0", lastActivityDateUtc: "", usageReportSetId: reportSetId,
-      usageAvailability: "stale", usageReportPeriodProvenance: "activity_range", usageReportPeriodStart: "2026-09-01",
-      usageReportPeriodEnd: "2026-09-15", usageRevision: "c".repeat(64),
-    });
-    expect(JSON.parse(rows[0].usageAssociations)).toMatchObject([{ basis: "admin_reviewed", target: { source: "graph_packages", packageId: "a" } }]);
-    expect(rows[1]).toMatchObject({ usageStatus: "unlinked", responses: "", activeUsers: "", lastActivityDateUtc: "", usageAssociations: "[]" });
-    expect(JSON.parse(rows[1].packageStates)).toMatchObject([{ packageId: "b", version: null }]);
-  });
-
-  it("rejects row and byte limit overflow instead of exporting a successful partial inventory", async () => {
-    const resources = Array.from({ length: 2_001 }, (_, index) => ({
-      ...resource(environmentA, `native-${index}`),
-      identifiers: [{ kind: "power_platform_resource_id" as const, value: `native-${index}` }],
-    }));
-    const service = new UnifiedAgentsService(dependencies({
-      packages: Array.from({ length: 3_000 }, (_, index) => packageValue(`package-${index}`, "Package")), resources,
-    }));
-    await expect(service.forExport({ tenantId, principalId: "viewer" }, inventoryRevision)).rejects.toMatchObject({ code: "export_row_limit" });
-    const large = await new UnifiedAgentsService(dependencies({
-      packages: [{ ...packageValue("large", "Large"), publisher: "x".repeat(8_000_001) }],
-    })).list({ tenantId, principalId: "viewer" });
-    expect(() => buildUnifiedAgentCsv(large, Date.now() + 15_000)).toThrowError(expect.objectContaining({ code: "export_byte_limit" }));
-  });
-
-  it("never stamps expiring observations with the revision of a later source set", async () => {
-    const deps = dependencies({ packages: [packageValue("old-observation", "Old observation")] });
-    deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockResolvedValue("b".repeat(64));
-    await expect(new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "inventory_changed" });
-  });
-
-  it("does not export absent inventory as a successful empty collection", async () => {
-    const service = new UnifiedAgentsService(dependencies({ packageSnapshot: false, powerPlatformSnapshot: null }));
-    await expect(service.forExport({ tenantId, principalId: "viewer" }, inventoryRevision)).rejects.toMatchObject({ code: "snapshot_unavailable" });
-  });
-
-  it.each(["fresh", "stale"] as const)("merges production-shaped source records with %s control evidence before counts and paging while keeping identical names separate", async freshness => {
-    const published = {
-      ...packageValue("package-a", "Clinical Treatment Plan"),
-      identityDetailsCollected: true as const,
-      elementDetails: [{
-        elementType: "AgentMetadatas",
-        elements: [{ id: "metadata", definition: JSON.stringify({
-          SourceIds: { EnvironmentId: environmentA, SchemaName: "cr123_clinical", CdsBotId: botA },
-        }) }],
-      }],
-    };
-    const observed = {
-      ...resource(environmentA, botA), displayName: published.displayName,
-      identifiers: [{ kind: "environment_id" as const, value: environmentA }, { kind: "power_platform_resource_id" as const, value: botA }],
-      details: { schemaName: "cr123_clinical", isQuarantined: false },
-    };
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [published, { ...published, id: "package-b" }, packageValue("unproven", published.displayName)],
-      resources: [observed, { ...resource(environmentB, botA), displayName: published.displayName }],
-      observedAt: new Date(Date.now() - (freshness === "stale" ? 25 * 60 * 60_000 : 0)).toISOString(),
-    }));
-    const full = await service.list({ tenantId, principalId: "viewer" });
-    expect(full).toMatchObject({
-      count: 3, summary: { total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1 },
-      identityCollection: { checkedPackages: 2, pendingPackages: 1 },
-    });
-    const merged = full.value.find(value => value.presence === "both")!;
-    expect(merged.packages.map(value => value.id)).toEqual(["package-a", "package-b"]);
-    const controlIdentity = { kind: "cds_bot_id", value: botA };
-    if (freshness === "fresh") expect(merged.powerPlatformResource?.identifiers).toContainEqual(controlIdentity);
-    else expect(merged.powerPlatformResource?.identifiers).not.toContainEqual(controlIdentity);
-    expect(observed.identifiers).not.toContainEqual(controlIdentity);
-    expect(merged.packages[0]).not.toHaveProperty("identityDetailsCollected");
-    expect(merged.packages[0]).not.toHaveProperty("elementDetails");
-    const paged = await service.list({ tenantId, principalId: "viewer" }, { limit: 1, offset: 1 });
-    expect(paged.count).toBe(3);
-    expect(paged.value).toHaveLength(1);
-    const exact = await service.list({ tenantId, principalId: "viewer" }, { recordId: "graph_packages:package-a" });
-    expect(exact.value.map(value => value.id)).toEqual([merged.id]);
-    const filtered = await service.list({ tenantId, principalId: "viewer" }, { search: "does not exist" });
-    expect(filtered).toMatchObject({ count: 0, identityCollection: { checkedPackages: 2, pendingPackages: 1 } });
-  });
-
-  it.each(["typed_bot", "schema_native"] as const)("keeps schema conflicts separate before counts and pagination (%s)", async matchKind => {
-    const packages = ["cr123_agent", "cr123_other"].map((SchemaName, index) => ({
-      ...packageValue(`package-${index}`, "Same displayed name"),
-      elementDetails: [{
-        elementType: "AgentMetadatas",
-        elements: [{ id: "metadata", definition: JSON.stringify({
-          SourceIds: { EnvironmentId: environmentA, CdsBotId: botA, SchemaName },
-        }) }],
-      }],
-    }));
-    const saved = matchKind === "typed_bot" ? resource(environmentA) : {
-      ...resource(environmentA, botA), identifiers: [], details: { schemaName: "cr123_agent" },
-    };
-    const service = new UnifiedAgentsService(dependencies({ packages, resources: [saved] }));
-    const full = await service.list({ tenantId, principalId: "viewer" });
-    expect(full).toMatchObject({
-      count: 3,
-      summary: { total: 3, linked: 0, graphOnly: 2, powerPlatformOnly: 1, conflicting: 2 },
-    });
-    expect(full.value.filter(value => value.presence === "graph_packages").map(value => value.identity.state))
-      .toEqual(["conflicting", "conflicting"]);
-    const paged = await service.list({ tenantId, principalId: "viewer" }, { limit: 1, offset: 1 });
-    expect(paged.count).toBe(3);
-    expect(paged.summary).toEqual(full.summary);
-    expect(paged.value).toHaveLength(1);
-  });
-
-  it("keeps source-only declarative manifests in their declared environments before filtering and counts", async () => {
-    const packages = [environmentA, environmentB].map((EnvironmentId, index) => ({
-      ...packageValue(`package-${index}`, "Same displayed name"),
-      manifestId: botA, elementTypes: ["DeclarativeCopilots"],
-      elementDetails: [{
-        elementType: "AgentMetadatas",
-        elements: [{ id: "metadata", definition: JSON.stringify({ SourceIds: { EnvironmentId } }) }],
-      }],
-    }));
-    for (const ordered of [packages, [...packages].reverse()]) {
-      const service = new UnifiedAgentsService(dependencies({ packages: ordered, powerPlatformSnapshot: null }));
-      const scope = { tenantId, principalId: "viewer" };
-      const full = await service.list(scope);
-      expect(full).toMatchObject({ count: 2, summary: { total: 2, graphOnly: 2, linked: 0 } });
-      expect(full.value.map(value => value.environmentId).sort()).toEqual([environmentA, environmentB].sort());
-      const filtered = await service.list(scope, { environmentId: environmentB });
-      expect(filtered.count).toBe(1);
-      expect(filtered.value[0].packages.map(value => value.id)).toEqual(["package-1"]);
-    }
-  });
-
-  it("keeps ambiguous custom-engine aliases separate from all independently matched agents", async () => {
-    const botApplicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const packages = [
-      { id: "native", metadata: { SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } } },
-      { id: "secondary", metadata: { SourceIds: { EnvironmentId: environmentA, EntraApplicationId: botApplicationId } } },
-      { id: "legacy", metadata: {} },
-    ].map(({ id, metadata }) => ({
-      ...packageValue(id, "Same displayed name"),
-      elementDetails: [
-        { elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }] },
-        { elementType: "Bots", elements: [{ id: "bot", definition: JSON.stringify({ botId: botApplicationId }) }] },
-        { elementType: "CustomEngineCopilots", elements: [{ id: "engine", definition: JSON.stringify({ type: "bot", id: botApplicationId }) }] },
-      ],
-    }));
-    const secondary: PowerPlatformResource = {
-      ...resource(environmentA, "other-native"),
-      identifiers: [{ kind: "entra_app_id", value: botApplicationId }],
-    };
-    for (const ordered of [packages, [...packages].reverse()]) {
-      const service = new UnifiedAgentsService(dependencies({
-        packages: ordered, resources: [resource(environmentA), secondary],
-      }));
-      const scope = { tenantId, principalId: "viewer" };
-      const full = await service.list(scope);
-      expect(full).toMatchObject({
-        count: 3, summary: { total: 3, linked: 2, graphOnly: 1, ambiguous: 1 },
-        verification: { representedSourceCount: 5, uniqueSourceCount: 5, checks: { identityLinks: false, sourceMemberships: true } },
-      });
-      const exact = await service.list(scope, { recordId: "graph_packages:legacy" });
-      expect(exact.value).toMatchObject([{
-        presence: "graph_packages", packages: [{ id: "legacy" }],
-        powerPlatformResource: null, identity: { state: "ambiguous" },
-      }]);
-      const paged = await service.list(scope, { limit: 1, offset: 1 });
-      expect(paged.count).toBe(3);
-      expect(paged.summary).toEqual(full.summary);
-      expect(paged.value).toHaveLength(1);
-    }
-  });
-
-  it.each([
-    { reason: "expired" },
-    { reason: "readback_changed" },
-    { reason: "new_environment", elementType: "AgentMetadatas", definition: { SourceIds: { EnvironmentId: environmentB } } },
-    { reason: "new_schema", elementType: "AgentMetadatas", definition: { SourceIds: { SchemaName: "cr_other" } } },
-    { reason: "partial_bot_readback", elementType: "Bots", definition: { botId: environmentB } },
-    { reason: "partial_engine_readback", elementType: "CustomEngineCopilots", definition: { type: "bot", id: environmentB } },
-  ])(
-    "keeps custom-engine details rejected by $reason projection out of canonical memberships",
-    async ({ reason, elementType, definition }) => {
-      const botApplicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-      const [native, alias] = [
-        { id: "native", metadata: { SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } } },
-        { id: "alias", metadata: {} },
-      ].map(({ id, metadata }) => ({
-        ...packageValue(id, "Same displayed name"),
-        identityDetailsCollected: true as const,
-        elementDetails: [
-          { elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }] },
-          { elementType: "Bots", elements: [{ id: "bot", definition: JSON.stringify({ botId: botApplicationId }) }] },
-          { elementType: "CustomEngineCopilots", elements: [{ id: "engine", definition: JSON.stringify({ type: "bot", id: botApplicationId }) }] },
-        ],
-      }));
-      const rejected = reason === "expired" ? projectPackageDetails(alias, {
-        package: alias, observedAt: "2026-09-16T10:00:00.000Z", expiresAt: "2026-09-16T11:00:00.000Z",
-      }, true) : projectPackageControl(alias, {
-        detail: {
-          ...alias, isBlocked: true,
-          ...(elementType ? { elementDetails: [{ elementType, elements: [{ id: "changed", definition: JSON.stringify(definition) }] }] } : {}),
-        },
-        state: { kind: "block", isBlocked: true },
-        observation: {
-          snapshotId: "readback", observedAt: "2026-09-16T11:00:00.000Z", expiresAt: "2026-09-17T11:00:00.000Z",
-        },
-        ...(reason === "readback_changed" ? { identityRevalidationRequired: true } : {}),
-      });
-      expect(rejected.elementDetails).toEqual(alias.elementDetails);
-      if (reason === "expired") expect(rejected.detailFreshness?.state).toBe("stale");
-      else expect(rejected.identityRevalidationRequired).toBe(true);
-      for (const resources of [[], [resource(environmentA)]]) {
-        const service = new UnifiedAgentsService(dependencies({ packages: [native, rejected], resources }));
-        const scope = { tenantId, principalId: "viewer" };
-        const full = await service.list(scope);
-        expect(full.count).toBe(2);
-        expect(full.verification).toMatchObject({
-          representedSourceCount: resources.length + 2, uniqueSourceCount: resources.length + 2,
-          checks: { sourceMemberships: true },
-        });
-        const exact = await service.list(scope, { recordId: "graph_packages:alias" });
-        expect(exact.value).toMatchObject([{
-          presence: "graph_packages", packages: [{ id: "alias" }],
-          powerPlatformResource: null, identity: { state: "unmatched" },
-        }]);
-        expect(exact.value[0].packages).toHaveLength(1);
-      }
-    },
-  );
-
-  it.each(["new_manifest", "new_element_types", "new_declarative_details", "multiple_declarative_agents"])(
-    "withdraws old canonical memberships when a control readback supplies %s", async reason => {
-      const metadata = {
-        elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
-          SourceIds: { EnvironmentId: environmentA, EntraApplicationId: botA,
-            ManifestId: reason === "multiple_declarative_agents" ? botA : environmentB },
-        }) }],
-      };
-      const declarative = { elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] };
-      const current: CopilotPackageDetail = {
-        ...packageValue("package", "Package"), identityDetailsCollected: true,
-        manifestId: reason === "new_manifest" ? undefined : botA,
-        elementTypes: ["new_manifest", "multiple_declarative_agents"].includes(reason) ? ["DeclarativeCopilots"] : undefined,
-        elementDetails: [metadata, ...(reason === "multiple_declarative_agents" ? [declarative] : [])],
-      };
-      const saved: PowerPlatformResource = {
-        ...resource(environmentA), identifiers: [{ kind: "entra_app_id", value: botA }],
-      };
-      const detail: CopilotPackageDetail = {
-        ...current, isBlocked: true,
-        ...(reason === "new_manifest" ? { manifestId: botA } : {}),
-        ...(reason === "new_element_types" ? { elementTypes: ["DeclarativeCopilots"] } : {}),
-        ...(reason === "new_declarative_details" ? { elementDetails: [metadata, declarative] } : {}),
-        ...(reason === "multiple_declarative_agents" ? { elementDetails: [metadata, {
-          ...declarative, elements: [...declarative.elements, { id: "second-agent", definition: "{}" }],
-        }] } : {}),
-      };
-      expect(resolvePackageAgentLinks(tenantId, [current], [saved])[0].status).toBe("matched");
-      expect(resolvePackageAgentLinks(tenantId, [detail], [saved])[0].status)
-        .toBe(reason === "multiple_declarative_agents" ? "ambiguous" : "conflicting");
-      const projected = projectPackageControl(current, {
-        detail, state: { kind: "block", isBlocked: true },
-        observation: { snapshotId: "readback", observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-10-16T11:00:00Z" },
-      });
-      const result = await new UnifiedAgentsService(dependencies({ packages: [projected], resources: [saved] }))
-        .list({ tenantId, principalId: "viewer" });
-      expect(result).toMatchObject({
-        count: 2, summary: { linked: 0, graphOnly: 1, powerPlatformOnly: 1 },
-        identityCollection: { checkedPackages: 0, pendingPackages: 1 },
-      });
-      expect(result.value.find(value => value.presence === "graph_packages")).toMatchObject({
-        packages: [{ id: current.id, isBlocked: true }], identity: { state: "unmatched" },
-      });
-    },
-  );
-
-  it("retains canonical membership through an empty optional metadata control readback", async () => {
-    const current = { ...packageValue("package", "Package", true), identityDetailsCollected: true as const };
-    const projected = projectPackageControl(current, {
-      detail: { ...current, isBlocked: true, elementDetails: [{ elementType: "AgentMetadatas", elements: [] }] },
-      state: { kind: "block", isBlocked: true },
-      observation: { snapshotId: "readback", observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-10-16T11:00:00Z" },
-    });
-    const result = await new UnifiedAgentsService(dependencies({ packages: [projected], resources: [resource(environmentA)] }))
-      .list({ tenantId, principalId: "viewer" });
-    expect(result).toMatchObject({
-      count: 1, summary: { linked: 1 }, identityCollection: { checkedPackages: 1, pendingPackages: 0 },
-      value: [{ presence: "both", packages: [{ id: current.id, isBlocked: true }], identity: { state: "matched" } }],
-    });
-  });
-
-  it("returns all authorized environment and authoring choices independently of filtering and pagination", async () => {
-    const pkg = { ...packageValue("custom", "Custom agent"), authoringTool: "CustomSDK" };
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [pkg],
-      resources: [resource(environmentA, "first"), resource(environmentA, "second"), resource(environmentB)],
-      environmentNames: { [environmentA]: "Finance production" },
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, { environmentId: environmentB, search: "absent", offset: 50, limit: 1 });
-    expect(result.value).toEqual([]);
-    expect(result.facets.environments).toEqual(expect.arrayContaining([
-      { value: environmentA, label: "Finance production" },
-      { value: environmentB, label: environmentB },
-    ]));
-    expect(result.facets.environments).toHaveLength(2);
-    expect(result.facets.platforms).toEqual([
-      { value: "Copilot Studio", label: "Copilot Studio" },
-      { value: "Custom SDK", label: "Custom SDK" },
-    ]);
-    const unavailable = await new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)], environmentNames: { [environmentA]: "Must not be exposed" }, powerPlatformSnapshot: null,
-    })).list({ tenantId, principalId: "viewer" });
-    expect(unavailable.facets).toEqual({ environments: [], platforms: [], types: [] });
-  });
-
-  it.each(["filtered", "paged"] as const)("retains the independent environment deadline when its agents are %s out", async mode => {
-    const service = new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)],
-      environmentNames: { [environmentA]: "Saved environment" },
-    }));
-    const page = await service.list({ tenantId, principalId: "viewer" },
-      mode === "filtered" ? { search: "absent" } : { offset: 1 });
-    expect(page.value).toEqual([]);
-    expect(page.facets.environments).toEqual([{ value: environmentA, label: "Saved environment" }]);
-    expect(page.sources.powerPlatform.observation?.expiresAt).toBe("2026-09-22T00:00:00.000Z");
-    expect(page).toHaveProperty("expiresAt", "2026-09-21T00:00:00.000Z");
-  });
-
-  it.each(["package", "identity", "details", "people", "usage"] as const)(
-    "bounds the whole page by off-page %s evidence", async evidence => {
-      const expiresAt = "2026-09-16T12:00:05.000Z";
-      const scope = { tenantId, principalId: "viewer" };
-      const deps = dependencies({ packages: [packageValue("package", "Package")], resources: [
-        { ...resource(environmentA), details: { ownerId: botA } },
-      ] });
-      const source = await deps.packages.readUnifiedSource(scope);
-      const observation = source.observations.package;
-      if (evidence === "package") observation.expiresAt = expiresAt;
-      if (evidence === "identity") observation.identityDetails = {
-        snapshotId: observation.snapshotId, observedAt: observation.observedAt, expiresAt,
-      };
-      if (evidence === "details") source.packages[0].detailFreshness = {
-        state: "fresh", observedAt: observation.observedAt, expiresAt,
-      };
-      deps.packages.readUnifiedSource = vi.fn(async () => source);
-      if (evidence === "people") deps.people!.project = vi.fn(async (_scope, records) => records.map(record => ({
-        ...record, ...(record.powerPlatformResource ? { people: { owner: {
-          objectId: botA, displayName: "Saved person", userPrincipalName: null,
-          observedAt: observation.observedAt, expiresAt,
-        } } } : {}),
-      })));
-      if (evidence === "usage") {
-        const project = deps.usage.project;
-        deps.usage.project = vi.fn<UnifiedAgentDependencies["usage"]["project"]>(async (...args) => {
-          const projected = await project(...args);
-          return { ...projected, context: { ...projected.context, expiresAt } };
-        });
-      }
-      const page = await new UnifiedAgentsService(deps).list(scope, { search: "absent" });
-      expect(page.value).toEqual([]);
-      expect(page.expiresAt).toBe(expiresAt);
-    },
-  );
-
-  it("does not treat already stale details as current page evidence", async () => {
-    const page = await new UnifiedAgentsService(dependencies({ packages: [{
-      ...packageValue("package", "Package"),
-      detailFreshness: { state: "stale", observedAt: "2026-09-15T00:00:00Z", expiresAt: "2026-09-15T01:00:00Z" },
-    }] })).list({ tenantId, principalId: "viewer" });
-    expect(page.expiresAt).toBe("2026-09-22T00:00:00.000Z");
-    expect(page.value[0].packages[0].detailFreshness?.state).toBe("stale");
-  });
-
-  it.each(["list", "forExport"] as const)("rejects %s when environment context expires during transaction commit", async method => {
-    const scope = { tenantId, principalId: "viewer" };
-    const client = Object.assign(new pg.Client(), { release: vi.fn() });
-    const deps = dependencies({ resources: [resource(environmentA)], environmentNames: { [environmentA]: "Saved environment" } });
-    deps.registry = {
-      withSnapshot: async (_scope, work) => {
-        const result = await work(client);
-        vi.setSystemTime(new Date("2026-09-21T00:00:00.000Z"));
-        return result;
-      },
-      reconcile: async (_client, _scope, records) => [...records],
-    };
-    const service = new UnifiedAgentsService(deps);
-    await expect(method === "list" ? service.list(scope) : service.forExport(scope, inventoryRevision))
-      .rejects.toMatchObject({ code: "inventory_changed" });
-  });
-
-  it.each([
-    { authoringTool: "MicrosoftCopilotStudio" },
-    { authoringTool: null, platform: "Microsoft Copilot Studio" },
-    { authoringTool: null, shortDescription: "Built using Microsoft Copilot Studio." },
-  ])("round-trips canonical authoring facets for %j", async fields => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [{ ...packageValue("studio", "Studio package"), ...fields }],
-      resources: [resource(environmentA)],
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-    const unfiltered = await service.list(scope);
-    expect(unfiltered.facets.platforms).toEqual([{ value: "Copilot Studio", label: "Copilot Studio" }]);
-    for (const platform of ["Copilot Studio", "MicrosoftCopilotStudio"]) {
-      const filtered = await service.list(scope, { platform });
-      expect(filtered.count).toBe(2);
-      expect(filtered.value.map(value => value.id)).toEqual(unfiltered.value.map(value => value.id));
-    }
-  });
-
-  it.each([
-    ["UTC offsets", "2026-09-16T01:00:00+04:00", "2026-09-15T22:00:00.000Z"],
-    ["fractional seconds", "2026-09-15T22:00:00Z", "2026-09-15T22:00:00.500Z"],
-  ])("sorts modification times chronologically across %s before paging", async (_case, older, newer) => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [
-        { ...packageValue("older", "Z"), lastModifiedDateTime: older },
-        { ...packageValue("newer", "A"), lastModifiedDateTime: newer },
-        packageValue("undated", "Undated"),
-      ],
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-    for (const sortDirection of ["asc", "desc"] as const) {
-      const expected = sortDirection === "asc" ? ["undated", "older", "newer"] : ["newer", "older", "undated"];
-      const query = { sortBy: "lastModifiedAt" as const, sortDirection };
-      const result = await service.list(scope, query);
-      expect(result.value.map(value => value.packages[0].id)).toEqual(expected);
-      const paged = await service.list(scope, { ...query, offset: 1, limit: 1 });
-      expect(paged.count).toBe(3);
-      expect(paged.value.map(value => value.packages[0].id)).toEqual(expected.slice(1, 2));
-    }
-  });
-
-  it("uses exact record IDs to break ties between equivalent modification instants", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [
-        { ...packageValue("b", "First name"), lastModifiedDateTime: "2026-09-15T22:00:00.000Z" },
-        { ...packageValue("a", "Last name"), lastModifiedDateTime: "2026-09-16T02:00:00+04:00" },
-      ],
-    }));
-    for (const sortDirection of ["asc", "desc"] as const) {
-      const result = await service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt", sortDirection });
-      expect(result.value.map(value => value.packages[0].id)).toEqual(sortDirection === "asc" ? ["a", "b"] : ["b", "a"]);
-    }
-  });
-
-  it("sorts grouped rows using the latest instant across both saved sources", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [
-        { ...packageValue("linked-old", "Linked older package", true), lastModifiedDateTime: "2026-09-16T01:00:00+04:00" },
-        { ...packageValue("linked-older", "Linked oldest package", true), lastModifiedDateTime: "2026-09-15T20:00:00Z" },
-        { ...packageValue("graph-newer", "Newer standalone package"), lastModifiedDateTime: "2026-09-15T23:00:00Z" },
-      ],
-      resources: [
-        { ...resource(environmentA), lastPublishedAt: "2026-09-15T22:00:00.000Z" },
-        { ...resource(environmentB), createdAt: "2026-09-15T21:30:00.000Z" },
-      ],
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt", sortDirection: "desc" });
-    expect(result.value.map(value => value.presence)).toEqual(["graph_packages", "both", "power_platform"]);
-    expect(result.value[1].packages).toHaveLength(2);
-  });
-
-  it("keeps undated modification ties deterministic without changing name sorting", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("a", "Z"), packageValue("b", "A")],
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-    expect((await service.list(scope)).value.map(value => value.packages[0].id)).toEqual(["b", "a"]);
-    for (const sortDirection of ["asc", "desc"] as const) {
-      const result = await service.list(scope, { sortBy: "lastModifiedAt", sortDirection });
-      expect(result.value.map(value => value.packages[0].id)).toEqual(sortDirection === "asc" ? ["a", "b"] : ["b", "a"]);
-    }
-  });
-
-  it("surfaces invalid saved modification timestamps instead of treating them as a sort tie", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [
-        { ...packageValue("invalid", "Invalid date"), lastModifiedDateTime: "invalid-date" },
-        { ...packageValue("valid", "Valid date"), lastModifiedDateTime: "2026-09-15T22:00:00.000Z" },
-      ],
-    }));
-    await expect(service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt" }))
-      .rejects.toMatchObject({ code: "saved_source_invalid" });
-  });
-
-  it.each(["exact", "retained"] as const)("uses %s detail evidence consistently for collection counts and missing-metadata explanations", async evidence => {
-    const pkg = packageValue("legacy-detail", "Legacy collected package");
-    if (evidence === "retained") pkg.elementDetails = [{
-      elementType: "DeclarativeAgents", elements: [{ id: "declarative", definition: "{}" }],
-    }];
-    const scope = { tenantId, principalId: "viewer" };
-    const deps = dependencies({ packages: [pkg] });
-    const source = await deps.packages.readUnifiedSource(scope);
-    const observation = source.observations[pkg.id];
-    if (evidence === "exact") observation.scopeKind = "exact";
-    else observation.identityDetails = {
-      snapshotId: observation.snapshotId,
-      observedAt: observation.observedAt,
-      expiresAt: observation.expiresAt,
-    };
-    deps.packages.readUnifiedSource = vi.fn(async () => source);
-
-    const result = await new UnifiedAgentsService(deps).list(scope);
-    expect(result.identityCollection).toEqual({
-      checkedPackages: 1, pendingPackages: 0, pendingDetails: { missing: 0, stale: 0, invalidated: 0 },
-    });
-    expect(result.value[0].identity.reason).toContain("Package details were collected");
-    expect(result.value[0].identity.reason).not.toContain("Refresh package details");
-    expect(pkg.identityDetailsCollected).toBeUndefined();
-  });
-
-  it("filters Copilot Studio-only agents by saved authoring tool and creation age without inventing package properties", async () => {
-    const recent = { ...resource(environmentA, "recent"), createdAt: new Date(Date.now() - 2 * 86_400_000).toISOString() };
-    const old = { ...resource(environmentB, "old"), createdAt: new Date(Date.now() - 31 * 86_400_000).toISOString() };
-    const undated = { ...resource(environmentB, "undated"), createdAt: null, authoringTool: null };
-    const service = new UnifiedAgentsService(dependencies({ resources: [recent, old, undated] }));
-    const scope = { tenantId, principalId: "viewer" };
-    const result = await service.list(scope, { platform: "Copilot Studio", createdWithinDays: 30 });
-    expect(result.value.map(value => value.powerPlatformResource?.nativeId)).toEqual(["recent"]);
-    expect((await service.list(scope, { platform: "copilotstudio" })).count).toBe(2);
-    expect((await service.list(scope, { createdWithinDays: 1 })).count).toBe(0);
-    for (const filter of [{ availableTo: "some" }, { host: "Teams" }, { blocked: false }]) {
-      expect((await service.list(scope, filter)).count).toBe(0);
-    }
-  });
-
-  it("applies authorized operation references to grouped rows before pagination", async () => {
-    const deps = dependencies({
-      packages: [
-        packageValue("grouped-a", "Another package for the same resource", true),
-        packageValue("matched", "Unrelated display label", true),
-        packageValue("not-matched", "Reference-like name"),
-      ],
-      resources: [resource(environmentA), resource(environmentB)],
-    });
-    deps.operationPackageIds = vi.fn(async () => ["matched"]);
-    const result = await new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" }, { operationIdPrefix: "a5331a93", limit: 1 });
-    expect(result.count).toBe(1);
-    expect(result.value[0]).toMatchObject({ presence: "both", packages: [{ id: "grouped-a" }, { id: "matched" }] });
-    expect(deps.operationPackageIds).toHaveBeenCalledWith({ tenantId, principalId: "viewer" }, ["grouped-a", "matched", "not-matched"], "a5331a93", undefined);
-    deps.operationPackageIds = vi.fn(async () => []);
-    expect(await new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" }, { operationIdPrefix: "unmatched" })).toMatchObject({
-      count: 0,
-      value: [],
-    });
-  });
-
-  it("resolves an exact row independently of pagination, including grouped package and environment-qualified links", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("linked-a", "Package", true), ...Array.from({ length: 60 }, (_, index) => packageValue(`package-${index}`, `A ${index}`))],
-      resources: [resource(environmentA), resource(environmentB)],
-    }));
-    const owner = { tenantId, principalId: "viewer" };
-    const packageLink = await service.list(owner, { recordId: unifiedAgentRecordId({ source: "graph_packages", packageId: "linked-a" }) });
-    expect(packageLink.count).toBe(1);
-    expect(packageLink.value[0]).toMatchObject({ presence: "both", environmentId: environmentA, packages: [{ id: "linked-a" }] });
-    const resourceLink = await service.list(owner, { recordId: unifiedAgentRecordId({ source: "power_platform", environmentId: environmentB, nativeId: "shared-native" }) });
-    expect(resourceLink.count).toBe(1);
-    expect(resourceLink.value[0]).toMatchObject({ presence: "power_platform", environmentId: environmentB });
-    expect((await service.list(owner, { recordId: "graph_packages:absent" })).count).toBe(0);
-  });
-
-  it("groups every verified package with one resource and paginates only after grouping", async () => {
-    const packages = [
-      packageValue("linked-a", "Same displayed name", true),
-      packageValue("linked-b-blocked", "Same displayed name", true),
-      packageValue("graph-only", "Same displayed name"),
-    ];
-    const service = new UnifiedAgentsService(dependencies({
-      packages,
-      resources: [resource(environmentA), resource(environmentB)],
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, { limit: 1, offset: 0 });
-
-    expect(result.summary).toEqual({
-      total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0,
-    });
-    expect(result.count).toBe(3);
-    expect(result.value).toHaveLength(1);
-    const linked = (await service.list({ tenantId, principalId: "viewer" }, { source: "both" })).value[0];
-    expect(linked.environmentId).toBe(environmentA);
-    expect(linked.packages.map(value => value.id)).toEqual(["linked-a", "linked-b-blocked"]);
-    expect(linked.packages[1]).toMatchObject({
-      isBlocked: true,
-      availableTo: "unknownFutureValue",
-      deployedTo: "allowedForNoOne",
-    });
-    expect(linked.packages[0]).not.toHaveProperty("elementDetails");
-    expect(linked.packages[0]).not.toHaveProperty("allowedUsersAndGroups");
-    expect(linked.powerPlatformResource?.details.description).toBe("Provider metadata");
-    expect(linked.packages).toHaveLength(2);
-    expect(linked.identity.evidence[0]).toMatchObject({
-      basis: "source_declared_metadata",
-      elementIds: ["metadata"],
-    });
-    expect(linked.identity.packageEvidence.map(value => value.packageId)).toEqual([
-      "linked-a",
-      "linked-b-blocked",
-    ]);
-    expect(linked.observations.packageSnapshots["linked-a"]).toMatchObject({
-      scopeKind: "broad",
-      current: true,
-    });
-  });
-
-  it.each([
-    ["!first", "__proto__"],
-    ["__proto__", "!first"],
-  ])("preserves observation keys while grouping Graph-only versions %s and %s", async (firstId, secondId) => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue(firstId, "Version one", true), packageValue(secondId, "Version two", true)],
-    }));
-
-    const result = await service.list({ tenantId, principalId: "viewer" });
-
-    expect(result.count).toBe(1);
-    expect(result.value[0].packages.map(value => value.id)).toEqual(["!first", "__proto__"]);
-    const observations = result.value[0].observations.packageSnapshots;
-    expect(Object.keys(observations).sort()).toEqual(["!first", "__proto__"]);
-    expect(Object.hasOwn(observations, "__proto__")).toBe(true);
-    expect(observations["__proto__"]).toMatchObject({ scopeKind: "broad", current: true });
-    expect(Object.keys(JSON.parse(JSON.stringify(observations))).sort()).toEqual(["!first", "__proto__"]);
-    expect(Object.getPrototypeOf(observations)).toBe(Object.prototype);
-  });
-
-  it("preserves environment-separated and same-name source-only rows without deduplication", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("graph-a", "Duplicate"), packageValue("graph-b", "Duplicate")],
-      resources: [resource(environmentA), resource(environmentB)],
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, { search: "duplicate" });
-    expect(result.count).toBe(2);
-    expect(result.value.map(value => value.packages[0].id)).toEqual(["graph-a", "graph-b"]);
-    const powerOnly = await service.list({ tenantId, principalId: "viewer" }, { source: "power_platform" });
-    expect(powerOnly.value.map(value => value.environmentId).sort()).toEqual([environmentA, environmentB]);
-  });
-
-  it("reports expected missing or incomplete sources explicitly while returning the other source", async () => {
-    const missingGraph = new UnifiedAgentsService(dependencies({
-      packageSnapshot: false,
-      resources: [resource(environmentA)],
-    }));
-    const result = await missingGraph.list({ tenantId, principalId: "viewer" });
-    expect(result).toMatchObject({
-      partial: true,
-      count: 1,
-      sources: { graphPackages: { state: "unavailable", error: { code: "snapshot_unavailable" } } },
-    });
-
-    const incompletePowerPlatform = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("graph-only", "Graph")],
-      resources: [resource(environmentA)],
-      powerPlatformSnapshot: powerPlatformSnapshot("unknown"),
-    }));
-    const partial = await incompletePowerPlatform.list({ tenantId, principalId: "viewer" });
-    expect(partial.sources.powerPlatform).toMatchObject({ state: "partial", error: { code: "coverage_unknown" } });
-    expect(partial.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
-    expect(partial.errors[0].message).not.toContain("wids");
-    expect(partial.count).toBe(2);
-  });
-
-  it.each(["full", "ai", "unknown"] as const)("accepts verified agent query evidence for %s role hints without requiring every resource type", async roleScope => {
-    const result = await new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)],
-      powerPlatformSnapshot: { ...powerPlatformSnapshot(), roleScope },
-    })).list({ tenantId, principalId: "viewer" });
-    expect(result.partial).toBe(false);
-    expect(result.sources.powerPlatform).toMatchObject({ state: "available", error: null });
-    expect(result.verification).toMatchObject({
-      status: "verified", representedSourceCount: 1, uniqueSourceCount: 1, logicalAgentCount: 1,
-    });
-    expect(result.count).toBe(1);
-  });
-
-  it("keeps an environment-only snapshot partial even with proven type coverage", async () => {
-    const result = await new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)],
-      powerPlatformSnapshot: { ...powerPlatformSnapshot(), environmentScope: environmentA },
-    })).list({ tenantId, principalId: "viewer" });
-    expect(result.partial).toBe(true);
-    expect(result.errors[0].code).toBe("environment_scope_limited");
-    expect(result.errors[0].message).toContain("restricted to one environment");
-    expect(result.errors[0].message).not.toContain("wids");
-    expect(result.count).toBe(1);
-  });
-
-  it("reports environment restriction and missing query evidence independently of role hints", async () => {
-    const result = await new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)],
-      powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), environmentScope: environmentA },
-    })).list({ tenantId, principalId: "viewer" });
-    expect(result.partial).toBe(true);
-    expect(result.errors[0].message).toContain("restricted to one environment");
-    expect(result.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
-    expect(result.verification.status).toBe("needs_attention");
-  });
-
-  it("does not misdiagnose unknown type coverage as missing role evidence when the role is known", async () => {
-    const result = await new UnifiedAgentsService(dependencies({
-      resources: [resource(environmentA)],
-      powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), roleScope: "full" },
-    })).list({ tenantId, principalId: "viewer" });
-    expect(result.partial).toBe(true);
-    expect(result.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
-    expect(result.errors[0].message).not.toContain("wids");
-  });
-
-  it("verifies every source target before filtering and flags pending identity metadata separately", async () => {
-    const packages = [packageValue("linked-a", "Package", true), packageValue("linked-b", "Package", true), packageValue("other", "Other")];
-    const result = await new UnifiedAgentsService(dependencies({
-      packages, resources: [resource(environmentA), resource(environmentB)],
-    })).list({ tenantId, principalId: "viewer" }, { environmentId: environmentA, limit: 1 });
-    expect(result).toMatchObject({
-      count: 1, partial: false,
-      verification: {
-        status: "details_pending", graphPackageCount: 3, powerPlatformAgentCount: 2,
-        representedSourceCount: 5, uniqueSourceCount: 5, logicalAgentCount: 3,
-        checks: { sourceScopes: true, sourceMemberships: true, packageMetadata: false, identityLinks: true },
-      },
-    });
-    const csv = parseCsv(buildUnifiedAgentCsv(result, Date.now() + 15_000).buffer, { bom: true, columns: true });
-    expect(csv[0]).toMatchObject({
-      inventoryVerificationStatus: "details_pending", inventorySourceCount: "5",
-      inventoryUniqueSourceCount: "5", inventoryLogicalAgentCount: "3",
-    });
-  });
-
-  it("separates missing, expired and invalidated details from actionable inventory failures", async () => {
-    const packages: CopilotPackageDetail[] = [
-      { ...packageValue("checked", "No native metadata"), identityDetailsCollected: true },
-      packageValue("missing", "Not collected"),
-      { ...packageValue("stale", "Already collected"), detailFreshness: {
-        state: "stale", observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-14T01:00:00.000Z",
-      } },
-      { ...packageValue("changed", "Needs compatibility recheck"), identityRevalidationRequired: true,
-        detailFreshness: { state: "invalidated", observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-14T01:00:00.000Z" } },
-    ];
-    const result = await new UnifiedAgentsService(dependencies({ packages }))
-      .list({ tenantId, principalId: "viewer" }, { limit: 1 });
-    expect(result).toMatchObject({
-      count: 4, partial: false,
-      identityCollection: {
-        checkedPackages: 1, pendingPackages: 3, pendingDetails: { missing: 1, stale: 1, invalidated: 1 },
-      },
-      verification: { status: "details_pending", checks: {
-        sourceScopes: true, sourceMemberships: true, packageMetadata: false, identityLinks: true,
-      } },
-    });
-    const checked = await new UnifiedAgentsService(dependencies({ packages: [packages[0]] }))
-      .list({ tenantId, principalId: "viewer" });
-    expect(checked.verification.status).toBe("verified");
-    expect(checked.summary.graphOnly).toBe(1);
-  });
-
-  it("rejects repeated source identities instead of reporting a successful reconciliation", async () => {
-    const repeated = packageValue("repeated", "Agent");
-    await expect(new UnifiedAgentsService(dependencies({ packages: [repeated, repeated] }))
-      .list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "saved_source_invalid" });
-    await expect(new UnifiedAgentsService(dependencies({ resources: [resource(environmentA, botA), resource(environmentA.toUpperCase(), botA.toUpperCase())] }))
-      .list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "saved_source_invalid" });
-  });
-
-  it("converts only bounded source-limit errors and propagates unexpected repository failures", async () => {
-    const limited = dependencies({ resources: [resource(environmentA)] });
-    limited.packages.readUnifiedSource = vi.fn(async () => {
-      throw new AppError(409, "source_result_limit", "Too many packages.");
-    });
-    const partial = await new UnifiedAgentsService(limited).list({ tenantId, principalId: "viewer" });
-    expect(partial.errors).toEqual([{ source: "graph_packages", code: "source_result_limit", message: "Too many packages." }]);
-
-    const failed = dependencies();
-    failed.packages.readUnifiedSource = vi.fn(async () => { throw new Error("database unavailable"); });
-    await expect(new UnifiedAgentsService(failed).list({ tenantId, principalId: "viewer" })).rejects.toThrow("database unavailable");
-  });
-
-  it("reports global and filtered counts independently", async () => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [packageValue("alpha", "Alpha"), packageValue("beta", "Beta")],
-      resources: [resource(environmentA)],
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, {
-      source: "graph_packages", linkState: "unmatched", search: "alpha",
-    });
-    expect(result.summary.total).toBe(3);
-    expect(result.filteredSummary).toMatchObject({ total: 1, graphOnly: 1 });
-    expect(result.count).toBe(1);
-  });
-
-  it("matches retained package filters against any package in a grouped row", async () => {
-    const allowed = packageValue("linked-allowed", "Grouped", true);
-    allowed.publisher = "Publisher";
-    allowed.availableTo = "some";
-    allowed.supportedHosts = ["Teams"];
-    allowed.platform = "CopilotStudio";
-    allowed.createdDateTime = new Date().toISOString();
-    const blocked = packageValue("linked-blocked", "Grouped", true);
-    blocked.isBlocked = true;
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [allowed, blocked],
-      resources: [resource(environmentA)],
-    }));
-    const scope = { tenantId, principalId: "viewer" };
-
-    for (const query of [
-      { blocked: true },
-      { blocked: false },
-      { publisher: "Publisher" },
-      { availableTo: "__some_or_all__" },
-      { host: "Teams" },
-      { platform: "Copilot Studio" },
-      { createdWithinDays: 1 },
-    ]) {
-      const result = await service.list(scope, { source: "both", ...query });
-      expect(result.count, JSON.stringify(query)).toBe(1);
-      expect(result.value[0].packages).toHaveLength(2);
-    }
-  });
-
-  it.each([
-    "all", "everyone", "allowedForAll", "availableToAll", "deployedToAll", "installedForAll",
-    "some", "allowedForSome", "availableToSome", "deployedToSome", "installedForSome",
-    " ALLOWED_FOR-ALL ", "AVAILABLE TO SOME",
-  ])("matches the combined availability filter for %s", async availableTo => {
-    const service = new UnifiedAgentsService(dependencies({
-      packages: [{ ...packageValue("package", "Package"), availableTo }],
-    }));
-    const result = await service.list({ tenantId, principalId: "viewer" }, { availableTo: "__some_or_all__" });
-    expect(result.count).toBe(1);
-    expect(result.filteredSummary.total).toBe(1);
-    expect(result.value[0].packages[0].availableTo).toBe(availableTo);
-  });
-
-  it.each([undefined, "", "none", "allowedForNoOne", "deployedToNone", "unknownFutureValue", "futureStatus"])(
-    "excludes status %s from combined availability without changing exact filters", async availableTo => {
-      const service = new UnifiedAgentsService(dependencies({
-        packages: [{ ...packageValue("package", "Package"), availableTo }],
-      }));
-      const scope = { tenantId, principalId: "viewer" };
-      expect((await service.list(scope, { availableTo: "__some_or_all__" })).count).toBe(0);
-      expect((await service.list(scope, { availableTo: `available:${availableTo ?? "__unknown__"}` })).count).toBe(1);
-    },
-  );
 });

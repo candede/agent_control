@@ -432,6 +432,12 @@ async function sendMsalRequest<T>(url: string, method: "GET" | "POST", options: 
   }
 }
 
+export function isRetryableIdentityProviderError(error: unknown): boolean {
+  return error instanceof AppError && error.code === "identity_provider_error" && error.status >= 500
+    && error.details !== null && typeof error.details === "object"
+    && "retryable" in error.details && error.details.retryable === true;
+}
+
 function normalizeTokenError(error: unknown) {
   if (error instanceof AppError) return error;
   const fields = error !== null && typeof error === "object" ? error : {};

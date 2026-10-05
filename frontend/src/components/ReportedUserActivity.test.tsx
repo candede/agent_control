@@ -1,1027 +1,378 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildOfficialUsageUserView } from "../../../backend/src/services/officialUsageViews";
-import * as api from "../api/client";
-import { downloadBlob } from "../agentExport";
+import type { CombinedUser, ReportPage, ReportQuery, ReportRelationship, ReportUser } from "../../../backend/src/types/officialReportData";
+import type { UserSourcePlan } from "../../../backend/src/types/userSources";
+import { ApiError, getAgentResponsibility } from "../api/client";
+import * as api from "../api/reportData";
+import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
+import { combinedUser, reportPage, reportSetId, reportUser, selectionId } from "../test/reportDataFixture";
+import { responsibilityFixture } from "../test/agentResponsibilityFixture";
+import { deferred } from "../test/deferred";
+import { mockNativeDialogs } from "../test/dialog";
 import type { UsersRouteState } from "../workbenchRouting";
-import { copilotUsageFixture } from "../test/copilotUsageFixture";
-import { reportLicenseDirectory, usageFixtureNow, usageFixtureSetId, usageInsightsPublished } from "../test/usageInsightsFixture";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { SavedQueryProvider } from "./SavedQueryProvider";
-import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 
-vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
-
-const initialRoute: UsersRouteState = { view: "activity", search: "", page: 0 };
-const nonPaidPublished = structuredClone(usageInsightsPublished);
-for (const row of nonPaidPublished.reports.users!.rows) {
-  if (row.username === "concealed-user") {
-    row.username = "bridge@example.invalid";
-    row.displayName = "Bridge report user";
-  }
+vi.mock("../api/client", async original => ({
+  ...await original<typeof import("../api/client")>(), getAgentResponsibility: vi.fn(),
+}));
+vi.mock("../api/reportData", async original => ({
+  ...await original<typeof import("../api/reportData")>(), readReportPage: vi.fn(), readReportDetail: vi.fn(),
+  readReportFacet: vi.fn(), createReportExport: vi.fn(), reportExportStatus: vi.fn(), cancelReportExport: vi.fn(),
+}));
+mockNativeDialogs();
+const initial: UsersRouteState = { view: "activity", search: "", page: 0 };
+const ada = reportUser(1, { displayName: "Ada", reportedResponses: 215, bridgeResponses: 220 });
+const ben = reportUser(2, { displayName: "Ben", reportedResponses: 0, bridgeResponses: 3 });
+const bridge = reportUser(3, { displayName: "Bridge only", reportedResponses: null, reportedAgentsUsed: null, missingUserReport: true });
+const assignment: UserSourcePlan = { servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97", service: "M365_COPILOT_APPS",
+  displayName: "Microsoft 365 Copilot in Productivity Apps", state: "disabled", capabilityStatus: "Enabled", assignedDateTime: null };
+const relationship: ReportRelationship = { id: "relationship-1", username: ada.username, agentId: "agent-1", agentName: "Researcher",
+  creatorType: "Your org", responses: 0, lastActivityDateUtc: "2026-01-31", identityStatus: "unresolved" };
+const viewer: ReturnType<typeof useCapabilityContext> = { user: { tenantId: "tenant", homeAccountId: "principal", displayName: "Viewer",
+  username: "viewer@example.invalid", roles: ["AgentControl.Viewer"] }, loading: false, pending: false, error: undefined,
+  now: Date.now(), views: [], reload: vi.fn(async () => {}), openPermissions: vi.fn() };
+function page(overrides: Partial<ReportPage<ReportUser>> = {}) { return reportPage([ada, ben, bridge], overrides); }
+function directory(overrides: Partial<CombinedUser> = {}): CombinedUser {
+  const value = combinedUser(1);
+  return { ...value, directory: { ...value.directory, displayName: "Ada" }, entitlement: "no_paid", copilotServiceState: "disabled", ...overrides };
 }
-for (const row of nonPaidPublished.reports.userAgents!.rows) {
-  if (row.username === "concealed-user") row.username = "bridge@example.invalid";
-}
-nonPaidPublished.reports.userAgents!.rows.push({
-  ...nonPaidPublished.reports.userAgents!.rows[0], username: "ben@example.invalid", agentId: "positive-bridge", agentName: "Positive bridge", responsesSentToUsers: 3,
-});
-
-function usageUsersFixture(query: Parameters<typeof buildOfficialUsageUserView>[1] = { staleAfterDays: 35 }) {
-  return buildNonPaidView(nonPaidPublished, query);
-}
-
-function buildNonPaidView(published: typeof nonPaidPublished, query: Parameters<typeof buildOfficialUsageUserView>[1]) {
-  return buildOfficialUsageUserView(structuredClone(published), {
-    now: usageFixtureNow, ...query, licenseCohort: "active_without_paid", licenseDirectory: reportLicenseDirectory(published),
-  });
-}
-
-function directoryFixture() {
-  const data = structuredClone(copilotUsageFixture);
-  data.users = data.users.map(user => ({
-    ...user,
-    copilotServiceState: "disabled",
-    servicePlans: user.servicePlans.map(plan => ({ ...plan, state: "disabled" })),
-    importedUsage: usageUsersFixture().users.value.find(row => row.username === user.directory.userPrincipalName) ?? null,
+function details(user = ada, saved = directory(), evidence = page()) {
+  vi.mocked(api.readReportDetail).mockImplementation(async path => ({
+    value: path.endsWith("/directory") ? saved : user, selection: evidence.selection, reports: evidence.reports, sources: evidence.sources,
   }));
-  return data;
 }
-
-function renderActivity(route = initialRoute, directoryData = directoryFixture()) {
+function renderActivity(route = initial) {
   const changed = vi.fn();
-  const denied = vi.fn();
   function Harness() {
     const [current, setCurrent] = useState(route);
-    return <ReportedUserActivity route={current} directoryData={directoryData} onAccessDenied={denied}
-      onRouteChange={(next, replace) => { setCurrent(next); changed(next, replace); }} />;
+    return <ReportedUserActivity route={current} onRouteChange={next => { changed(next); setCurrent(next); }} />;
   }
-  return { ...render(<Harness />), changed, denied };
+  return { ...render(<Harness />), changed };
 }
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: Error) => void;
-  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
-  return { promise, resolve, reject };
+function assertQuery(query: Partial<ReportQuery> & { selectionId?: string; cursor?: string }) {
+  expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/users", expect.objectContaining(query), expect.any(AbortSignal));
 }
-
-function reportedRows() {
-  return within(screen.getByRole("region", { name: "Active users without paid Copilot" })).getAllByRole("row").slice(1);
-}
-
-async function openUser(name: string) {
-  const trigger = await screen.findByRole("button", { name: `View reported details for ${name}` });
-  await userEvent.click(trigger);
-  return { trigger, dialog: screen.getByRole("dialog", { name }) };
-}
-
-async function openFilters() {
-  if (!screen.queryByRole("dialog", { name: "Filter users" })) {
-    await userEvent.click(screen.getByRole("button", { name: /^Filters/ }));
-  }
+async function filters() {
+  if (!screen.queryByRole("dialog", { name: "Filter users" })) await userEvent.click(screen.getByRole("button", { name: /^Filters/ }));
   return within(screen.getByRole("dialog", { name: "Filter users" }));
 }
-
-async function selectSort(value: string) {
-  const filters = await openFilters();
-  await userEvent.selectOptions(filters.getByLabelText("Sort"), value);
-  await userEvent.click(filters.getByRole("button", { name: "Close filters" }));
+async function open(name = "Ada") {
+  const trigger = await screen.findByRole("button", { name });
+  await userEvent.click(trigger);
+  return { trigger, dialog: await screen.findByRole("dialog", { name }), modal: within(await screen.findByRole("dialog", { name })) };
 }
-
 beforeEach(() => {
-  vi.spyOn(api, "getAgentResponsibility").mockImplementation(async query => responsibilityFixture(query?.objectId));
-  vi.spyOn(api, "getOfficialUsageUsers").mockImplementation(async query => usageUsersFixture({
-    staleAfterDays: 35, ...query, userSortBy: query?.sortBy,
+  vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/service-plans") ? reportPage([assignment])
+    : path.endsWith("/agents") ? reportPage([relationship]) : page());
+  vi.mocked(api.readReportFacet).mockImplementation(async (_path, _selection, field) => ({
+    value: (field === "company" ? ["Contoso", "Fabrikam", null] : ["Engineering", "Sales", null]).map(value => ({ value, count: 1000 })),
+    selection: page().selection, counts: { total: 10000, filtered: 10000 }, page: { limit: 50, nextCursor: "facet-next", previousCursor: null },
   }));
-  vi.spyOn(api, "downloadOfficialUsageCsv").mockResolvedValue(new Blob(["users"]));
-  HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
-  HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
+  vi.mocked(getAgentResponsibility).mockImplementation(async query => responsibilityFixture(query?.objectId));
+  details();
 });
-afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-describe("reported user activity", () => {
-  it("isolates a new data revision from a saved read kept alive by another observer", async () => {
-    const previous = deferred<api.OfficialUsageUserView>();
-    const previousData = usageUsersFixture();
-    previousData.users.value[0].displayName = "Previous report identity";
-    const currentData = usageUsersFixture();
-    currentData.users.value[0].displayName = "Current report identity";
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(previous.promise).mockResolvedValue(currentData);
+describe("selected active users without paid Copilot", () => {
+  it("renders bounded server membership in the original six columns without eagerly reading detail", async () => {
+    renderActivity();
+    await screen.findByRole("button", { name: "Bridge only" });
+    const table = screen.getByRole("region", { name: "Reported user activity" });
+    expect(within(table).getAllByRole("columnheader")).toHaveLength(6);
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
+    expect(within(table).getByRole("row", { name: /Bridge only/ })).toHaveTextContent("Users report metric unknown");
+    expect(within(table).getByRole("row", { name: /Ben/ })).toHaveTextContent("0");
+    assertQuery({ licenseCohort: "active_without_paid", cohort: "all", sort: "responses", order: "desc", lowResponseThreshold: 5 });
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("50,000");
+    expect(api.readReportDetail).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+  it("keeps global unverified identity coverage beside filtered results, without calling unknown identities unpaid", async () => {
+    vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [], counts: { total: 100000, filtered: 0 } }));
+    renderActivity();
+    expect(await screen.findByText(/50 active report users need a license check/)).toHaveTextContent("Run Users sync");
+    expect(screen.getByText(/No matching reported users/)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("0");
+  });
+  it("makes unavailable directory verification explicit and disables export until a new valid revision", async () => {
+    const missing = page();
+    missing.value = [];
+    missing.sources.directory = { ...missing.sources.directory, state: "unavailable", generationId: null, message: "Verification failed." };
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(missing).mockResolvedValue(page());
+    const view = render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
+    expect(await screen.findByText(/License data unavailable/)).toHaveTextContent("Verification failed.");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    view.rerender(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} dataRevision={1} />);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+  });
+  it("retains keyboard filter dismissal, source provenance and bounded full-cohort facets on empty matches", async () => {
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    const trigger = screen.getByRole("button", { name: /^Filters/ });
+    const controls = await filters();
+    await controls.findByRole("option", { name: /Fabrikam/ });
+    await userEvent.selectOptions(controls.getByLabelText("Sort"), "name:desc");
+    await userEvent.selectOptions(controls.getByLabelText("Company"), "~string:Contoso");
+    await userEvent.selectOptions(controls.getByLabelText("Department"), "~string:Sales");
+    assertQuery({ company: "Contoso", department: "Sales", sort: "name", order: "desc" });
+    expect(api.readReportFacet).toHaveBeenCalledWith("official-usage/users", selectionId, "company", expect.anything());
+    await userEvent.click(controls.getByRole("button", { name: "Reset filters" }));
+    await waitFor(() => assertQuery({ sort: "name", order: "desc" }));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.company).toBeUndefined();
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.department).toBeUndefined();
+    await userEvent.keyboard("{Escape}");
+    expect(trigger).toHaveFocus();
+    fireEvent.click(screen.getByText("Report sources", { selector: "summary" }));
+    expect(screen.getByRole("region", { name: "Report provenance" })).toHaveTextContent("Import time does not establish source freshness");
+  });
+  it.each(["responses", "agentsUsed", "lastActivity", "name"] as const)("delegates both %s orders to the server instead of sorting this page", async sort => {
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    const controls = await filters();
+    for (const order of ["asc", "desc"]) {
+      await userEvent.selectOptions(controls.getByLabelText("Sort"), `${sort}:${order}`);
+      await waitFor(() => assertQuery({ sort, order: order as ReportQuery["order"] }));
+    }
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
+  it("keeps threshold validation out of server queries and export while retaining the last valid threshold", async () => {
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    const controls = await filters(), input = controls.getByLabelText("Low-response threshold");
+    const before = vi.mocked(api.readReportPage).mock.calls.length;
+    fireEvent.change(input, { target: { value: "1.5" } });
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(api.readReportPage).toHaveBeenCalledTimes(before);
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    fireEvent.change(input, { target: { value: "8" } });
+    await waitFor(() => assertQuery({ lowResponseThreshold: 8 }));
+    await userEvent.selectOptions(controls.getByLabelText("Agent responses"), "low");
+    await waitFor(() => assertQuery({ cohort: "low", lowResponseThreshold: 8 }));
+    expect(controls.getByLabelText("Agent responses")).toHaveValue("low");
+  });
+  it.each([0, 1])("follows a cursor from a byte-short page of %i rows rather than relying on page length", async count => {
+    vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [ada].slice(0, count), page: { limit: 50, nextCursor: "next", previousCursor: null } }));
+    renderActivity();
+    const next = await screen.findByRole("button", { name: "Next users" });
+    await waitFor(() => expect(next).toBeEnabled());
+    fireEvent.click(next);
+    await waitFor(() => assertQuery({ selectionId, cursor: "next" }));
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "cross-page-agent" } });
+    await waitFor(() => assertQuery({ search: "cross-page-agent" }));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.cursor).toBeUndefined();
+  });
+  it.each(["button", "Escape in a nonempty search"])("reads an exact detail, bounded licenses and relationships, then restores its trigger through %s", async close => {
+    renderActivity();
+    const { trigger, modal } = await open();
+    expect(api.readReportDetail).toHaveBeenCalledWith(`official-usage/users/${encodeURIComponent(ada.username)}`, selectionId, expect.any(AbortSignal));
+    await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledTimes(2));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    await userEvent.click(modal.getByRole("tab", { name: "Licenses" }));
+    expect(await modal.findByText(assignment.displayName)).toBeVisible();
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringMatching(/\/service-plans$/), expect.objectContaining({ selectionId, limit: 50 }), expect.any(AbortSignal));
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    expect(await modal.findByText("Researcher")).toBeVisible();
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringMatching(/\/agents$/), expect.objectContaining({ selectionId, limit: 50 }), expect.any(AbortSignal));
+    expect(modal.getByRole("row", { name: /Researcher/ })).toHaveTextContent("0");
+    if (close === "button") await userEvent.click(modal.getByRole("button", { name: "Close reported user details" }));
+    else {
+      await userEvent.type(modal.getByRole("searchbox", { name: "Search this user's agents" }), "Researcher");
+      await userEvent.keyboard("{Escape}");
+    }
+    expect(trigger).toHaveFocus();
+  });
+  it.each(["disabled", "suspended", "locked_out"] as const)("preserves %s feature state independently of account enablement and active licensing", async state => {
+    const saved = directory({ copilotServiceState: state });
+    saved.directory.accountEnabled = false;
+    details(ada, saved);
+    renderActivity();
+    const { modal } = await open();
+    expect(await modal.findByText("Account disabled")).toBeVisible();
+    expect(modal.getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
+    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("215");
+    expect(modal.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
+  });
+  it("does not substitute bridge totals for missing Users metrics or infer paid services from positive activity", async () => {
+    const saved = directory({ reportedResponses: null, reportedAgentsUsed: null, bridgeResponses: 220, servicePlanCount: 0 });
+    details({ ...ada, reportedResponses: null, reportedAgentsUsed: null, bridgeResponses: 220, missingUserReport: true }, saved);
+    vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/service-plans")
+      ? reportPage([], { counts: { total: 0, filtered: 0 } }) : page());
+    renderActivity();
+    const { modal } = await open();
+    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
+    expect(modal.getByText("Agents used").parentElement).toHaveTextContent("Unknown");
+    expect(modal.getByText(/Responses across reported agents:/)).toHaveTextContent("220");
+    await userEvent.click(modal.getByRole("tab", { name: "Licenses" }));
+    expect(await modal.findByText("No paid Copilot services are assigned.")).toBeVisible();
+  });
+  it("uses the exact selected report identity for lazy responsibility and withholds it when no exact directory identity exists", async () => {
+    details({ ...ada, objectId: null });
+    renderActivity();
+    const { modal } = await open();
+    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    await userEvent.click(modal.getByRole("tab", { name: "Responsibility" }));
+    expect(modal.getByText(/Link this user to a directory identity/)).toBeVisible();
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
+    await userEvent.click(modal.getByRole("button", { name: "Close reported user details" }));
+    details();
+    const opened = await open();
+    await userEvent.click(opened.modal.getByRole("tab", { name: "Responsibility" }));
+    await opened.modal.findByText("Responsible agent");
+    expect(getAgentResponsibility).toHaveBeenCalledWith(expect.objectContaining({ objectId: ada.objectId }), expect.anything());
+  });
+  it.each(["stale", "partial", "unavailable"] as const)("does not authorize exact responsibility from %s directory evidence", async state => {
+    const data = page(); data.sources.directory.state = state;
+    details(ada, directory(), data);
+    renderActivity();
+    const { modal } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Responsibility" }));
+    expect(modal.getByText(/Link this user to a directory identity/)).toBeVisible();
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
+  });
+  it("preserves exact focused-agent filters in independently paged detail and can switch to all relationships", async () => {
+    renderActivity({ ...initial, agentId: "agent-1", reportSetId });
+    const { modal } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    await modal.findByText("Researcher");
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringMatching(/\/agents$/), expect.objectContaining({ agentId: "agent-1", selectionId }), expect.any(AbortSignal));
+    await userEvent.click(modal.getByRole("button", { name: "Show all this user's agents" }));
+    await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.agentId).toBeUndefined());
+  });
+  it("pins a durable export to the displayed selection, never serializes page rows, and aborts its obsolete request", async () => {
+    const pending = deferred<{ id: string }>(); vi.mocked(api.createReportExport).mockReturnValue(pending.promise);
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    expect(api.createReportExport).toHaveBeenCalledWith({ kind: "official_users", selectionId, ids: undefined }, expect.any(AbortSignal));
+    const signal = vi.mocked(api.createReportExport).mock.calls[0][1];
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Ben" } });
+    expect(signal?.aborted).toBe(true);
+    await act(async () => pending.resolve({ id: "obsolete" }));
+    expect(api.reportExportStatus).not.toHaveBeenCalled();
+    expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
+  });
+  it("surfaces durable export admission errors locally without fabricating a browser CSV", async () => {
+    vi.mocked(api.createReportExport).mockRejectedValue(new ApiError(409, "selection_invalidated", "Expired selection"));
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Restart the selection before exporting");
+    expect(api.reportExportStatus).not.toHaveBeenCalled();
+  });
+  it("isolates revision readers while retaining same-selection controls and details until revalidation finishes", async () => {
+    const pending = deferred<ReportPage<ReportUser>>();
+    const view = render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
+    const { modal } = await open();
+    vi.mocked(api.readReportPage).mockReturnValue(pending.promise);
+    view.rerender(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} dataRevision={1} />);
+    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("215");
+    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+    await act(async () => pending.reject(new ApiError(403, "role_required", "Viewer revoked")));
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+  });
+  it("does not replace another observer's revision with its delayed predecessor", async () => {
+    const pending = deferred<ReportPage<ReportUser>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockResolvedValue(page({ value: [reportUser(1, { displayName: "Current" })] }));
     const panels = (revision: number) => <SavedQueryProvider>
-      <section aria-label="Previous reader"><ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} dataRevision={0} /></section>
-      <section aria-label="Current reader"><ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} dataRevision={revision} /></section>
+      <section aria-label="Previous"><ReportedUserActivity route={initial} onRouteChange={vi.fn()} /></section>
+      <section aria-label="Current"><ReportedUserActivity route={initial} onRouteChange={vi.fn()} dataRevision={revision} /></section>
     </SavedQueryProvider>;
     const view = render(panels(0));
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenCalledOnce());
-    const previousSignal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]?.signal;
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledOnce());
+    const signal = vi.mocked(api.readReportPage).mock.calls[0][2];
     view.rerender(panels(1));
-    const current = within(screen.getByRole("region", { name: "Current reader" }));
-    expect(await current.findByRole("button", { name: "View reported details for Current report identity" })).toBeVisible();
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(2);
-    expect(previousSignal?.aborted).toBe(false);
-    await act(async () => previous.resolve(previousData));
-    expect(await within(screen.getByRole("region", { name: "Previous reader" }))
-      .findByRole("button", { name: "View reported details for Previous report identity" })).toBeVisible();
-    expect(current.queryByRole("button", { name: "View reported details for Previous report identity" })).not.toBeInTheDocument();
+    await within(screen.getByRole("region", { name: "Current" })).findByRole("button", { name: "Current" });
+    expect(signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(page()));
+    await within(screen.getByRole("region", { name: "Previous" })).findByRole("button", { name: "Ada" });
+    expect(within(screen.getByRole("region", { name: "Current" })).queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
   });
-
-  it("shows server-filtered active nonpaid users in a six-field table without automatic details", async () => {
-    renderActivity();
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(table).getAllByRole("columnheader")).toHaveLength(6);
-    expect(reportedRows()).toHaveLength(4);
-    expect(within(table).getByRole("columnheader", { name: "Company" })).toBeVisible();
-    expect(within(table).getByRole("columnheader", { name: "Department" })).toBeVisible();
-    expect(within(table).queryByText("No active M365 Copilot license")).not.toBeInTheDocument();
-    expect(within(table).getByRole("row", { name: /Ben/ })).toHaveTextContent("0");
-    expect(within(table).queryByText(/Sep 12/)).not.toBeInTheDocument();
+  it("retires pending detail and exports through historical A-B-A navigation even when transports ignore cancellation", async () => {
+    const pending = deferred<{ id: string }>(); vi.mocked(api.createReportExport).mockReturnValue(pending.promise);
+    const view = render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    const signal = vi.mocked(api.createReportExport).mock.calls[0][1];
+    const second = deferred<ReportPage<ReportUser>>(); vi.mocked(api.readReportPage).mockReturnValueOnce(second.promise).mockResolvedValue(page());
+    view.rerender(<ReportedUserActivity route={{ ...initial, reportSetId: "another" }} onRouteChange={vi.fn()} />);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "User agent breakdown" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.getByText(/Microsoft 365 admin center Copilot Agents usage exports/)).not.toBeVisible();
-    expect(screen.queryByText(/Top users by responses|Least active users/)).not.toBeInTheDocument();
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledWith(expect.objectContaining({ licenseCohort: "active_without_paid" }), expect.anything());
-  });
-
-  it("keeps filters in a keyboard popup and source coverage free of explanatory notices", async () => {
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("4 matching users");
-    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
-    const trigger = screen.getByRole("button", { name: "Filters" });
-    trigger.focus();
-    await userEvent.keyboard("{Enter}");
-    const filters = within(screen.getByRole("dialog", { name: "Filter users" }));
-    expect(filters.getAllByRole("combobox")).toHaveLength(4);
-    expect(filters.getByLabelText("Company")).toHaveFocus();
-    expect(filters.getByLabelText("Department")).toBeVisible();
-    expect(filters.getByLabelText("Low-response threshold")).toBeVisible();
-    for (const obsolete of ["Relationship creator", "User recency", "User activity start (UTC)", "User activity end (UTC)", "Require a response-producing relationship"]) {
-      expect(screen.queryByLabelText(obsolete)).not.toBeInTheDocument();
-    }
-    await userEvent.keyboard("{Escape}");
-    expect(trigger).toHaveFocus();
+    expect(signal?.aborted).toBe(true);
+    view.rerender(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
+    await act(async () => { pending.resolve({ id: "old-export" }); second.resolve(page({ value: [reportUser(9, { displayName: "Obsolete" })] })); });
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("button", { name: "Obsolete" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await userEvent.click(trigger);
-    await userEvent.click(screen.getByRole("searchbox"));
+    expect(api.reportExportStatus).not.toHaveBeenCalled();
+  });
+  it("rejects an envelope for a different explicitly requested report instead of adopting it silently", async () => {
+    renderActivity({ ...initial, reportSetId: "a-different-set" });
+    expect(await screen.findByRole("alert")).toHaveTextContent(/selection/i);
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart selection" })).toBeVisible();
+  });
+  it("offers an explicit parent restart after exact detail selection invalidation", async () => {
+    vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(409, "selection_invalidated", "Selection expired"));
+    renderActivity();
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const dialog = screen.getByRole("dialog");
+    await within(dialog).findByRole("alert");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Restart selection" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByText("Report sources"));
-    const sources = screen.getByText("Report sources").closest("details")!;
-    expect(sources).toHaveAttribute("open");
-    expect(sources.textContent!.trim().split(/\s+/).length).toBeLessThan(70);
-    expect(sources).toHaveTextContent("Users: 4 rows");
-    expect(sources).toHaveTextContent("Users & agents: 5 rows");
-    expect(document.body).not.toHaveTextContent(/Membership uses|do not sum|never a substituted|does not establish|do not establish|before reassignment|Advanced user filters/);
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
-
-  it("keeps full-cohort organization dropdowns usable on empty results and resets without changing sort", async () => {
-    const directory = reportLicenseDirectory(nonPaidPublished);
-    for (const user of directory.value) {
-      user.identity.companyName = user.identity.userPrincipalName === "ada@example.invalid" ? "Contoso" : "Fabrikam";
-      user.identity.department = user.identity.userPrincipalName === "ada@example.invalid" ? "Engineering" : "Sales";
-    }
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildOfficialUsageUserView(nonPaidPublished, {
-      ...query, staleAfterDays: 35, now: usageFixtureNow, userSortBy: query?.sortBy, licenseDirectory: directory,
-    }));
+  it("does not combine a returned directory identity with a different exact report identity", async () => {
+    details(ada, combinedUser(99));
     renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await selectSort("name-desc");
-    const filters = await openFilters();
-    await userEvent.selectOptions(filters.getByLabelText("Company"), "Contoso");
-    await userEvent.selectOptions(filters.getByLabelText("Department"), "Sales");
-    await screen.findByRole("heading", { name: "No reported users match" });
-    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("0 matching users");
-    expect(within(filters.getByLabelText("Company")).getByRole("option", { name: "Fabrikam" })).toBeInTheDocument();
-    expect(within(filters.getByLabelText("Department")).getByRole("option", { name: "Engineering" })).toBeInTheDocument();
-    await userEvent.click(filters.getByRole("button", { name: "Reset filters" }));
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(reportedRows()).toHaveLength(4);
-    expect(filters.getByLabelText("Company")).toHaveFocus();
-    expect(filters.getByLabelText("Sort")).toHaveValue("name-desc");
-    expect(screen.queryByLabelText("Active filters")).not.toBeInTheDocument();
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({
-      company: undefined, department: undefined, sortBy: "displayName", sortDirection: "desc", offset: 0,
-    }), expect.anything());
+    const { modal } = await open();
+    expect(await modal.findByText(/directory evidence does not match/i)).toBeVisible();
+    expect(modal.queryByText("User 99")).not.toBeInTheDocument();
+    await userEvent.click(modal.getByRole("tab", { name: "Responsibility" }));
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
   });
-
-  it("excludes paid and unknown identities and reports pre-filter license coverage compactly", async () => {
-    const published = structuredClone(usageInsightsPublished);
-    const directory = reportLicenseDirectory(published, ["ada@example.invalid"]);
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildOfficialUsageUserView(published, {
-      staleAfterDays: 35, now: usageFixtureNow, ...query, licenseDirectory: directory,
-    }));
-    renderActivity();
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(reportedRows()).toHaveLength(1);
-    expect(table).toHaveTextContent("Cleo");
-    expect(table).not.toHaveTextContent(/Ada|Ben|Concealed/);
-    const notice = screen.getByText(/1 user needs a license check/);
-    expect(notice).toHaveTextContent("Run Users sync");
-    await userEvent.type(screen.getByRole("searchbox", { name: "Search reported users or agents" }), "missing");
-    await screen.findByRole("heading", { name: "No reported users match" });
-    expect(screen.getByText(/1 user needs a license check/)).toBeVisible();
-  });
-
-  it("blocks export and hides rows when current license coverage is unavailable, then recovers on revision", async () => {
-    const unavailable = usageUsersFixture();
-    unavailable.licenseCoverage = {
-      state: "unavailable", observedAt: null, activeReportUsers: 4, paidUsers: 0, unpaidUsers: 0, unknownUsers: 4,
-      message: "Saved directory verification failed.",
-    };
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(unavailable);
-    const props = { route: initialRoute, onRouteChange: vi.fn() };
-    const view = render(<ReportedUserActivity {...props} dataRevision={0} />);
-    const notice = await screen.findByText(/License data unavailable/);
-    expect(notice).toHaveTextContent("Saved directory verification failed.");
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(api.downloadOfficialUsageCsv).not.toHaveBeenCalled();
-    view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
-    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
-    expect(screen.queryByText(/License data unavailable/)).not.toBeInTheDocument();
-  });
-
-  it.each([
-    ["disabled", "Not enabled", "attention", "No active M365 Copilot license"],
-    ["suspended", "Suspended", "attention", "No active M365 Copilot license"],
-    ["locked_out", "Locked out", "attention", "No active M365 Copilot license"],
-  ] as const)("keeps effective licensing from %s paid features in details without repeating it in each row", async (state, label, tone, license) => {
-    const directory = directoryFixture();
-    const ada = directory.users[0];
-    ada.copilotServiceState = state;
-    ada.servicePlans[0].state = state;
-    renderActivity(initialRoute, directory);
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(table).queryByRole("columnheader", { name: "M365 Copilot license" })).not.toBeInTheDocument();
-    const detail = (await openUser("Ada")).dialog;
-    const summary = within(detail).getByText("M365 Copilot license").parentElement!;
-    expect(summary).toHaveTextContent(license);
-    expect(within(summary).queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
-    expect(within(summary).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
-    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
-    const services = within(detail).getByRole("list", { name: "Paid feature states" });
-    expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
-    expect(within(services).getByText(label)).toBeVisible();
-    expect(within(detail).queryByText(/^Raw capability status:/)).not.toBeInTheDocument();
-    expect(detail.querySelector("details")).toBeNull();
-    await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
-    expect(within(summary).getByText(label)).toBeVisible();
-    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
-    expect(within(services).getByText(label)).toBeVisible();
-  });
-
-  it("keeps account disablement separate and ignores injected legacy package state in activity details", async () => {
-    const directory = directoryFixture();
-    directory.users[0].directory.accountEnabled = false;
-    Object.assign(directory.users[0], {
-      licenses: [{
-        skuId: "legacy-package-id", skuPartNumber: "Microsoft_365_E7", state: "disabled",
-        disabledPlanIds: ["legacy-disabled-plan-id"],
-        assignmentStates: [{ state: "Error", error: "legacy-package-error", assignedByGroup: "legacy-group-id" }],
-      }],
+  it.each(["selection", "set", "users-version", "bridge-hash", "directory-generation", "directory-scope", "app-generation", "app-revision"] as const)(
+    "withholds detailed directory and responsibility evidence for a mismatched %s boundary", async changed => {
+      const evidence = page(), wrong = structuredClone(evidence);
+      if (changed === "selection") wrong.selection.id = "other-selection";
+      if (changed === "set") wrong.reports.setId = "other-set";
+      if (changed === "users-version") wrong.reports.lineages[0].versionId = "other-version";
+      if (changed === "bridge-hash") wrong.reports.lineages[2].contentHash = "b".repeat(64);
+      if (changed === "directory-generation") wrong.sources.directory.generationId = "other-generation";
+      if (changed === "directory-scope") wrong.sources.directory.scopeId = "other-scope";
+      if (changed === "app-generation") wrong.sources.app_activity.generationId = "other-generation";
+      if (changed === "app-revision") wrong.sources.app_activity.revision = "99";
+      vi.mocked(api.readReportDetail).mockImplementation(async path => {
+        const selected = path.endsWith("/directory") ? wrong : evidence;
+        return { value: path.endsWith("/directory") ? directory() : ada, selection: selected.selection, reports: selected.reports, sources: selected.sources };
+      });
+      renderActivity();
+      const { modal } = await open();
+      expect(await modal.findByText(/directory evidence does not match/i)).toBeVisible();
+      await userEvent.click(modal.getByRole("tab", { name: "Licenses" }));
+      expect(modal.getByText("Detailed license assignments are unavailable for this report identity.")).toBeVisible();
+      await userEvent.click(modal.getByRole("tab", { name: "Responsibility" }));
+      expect(getAgentResponsibility).not.toHaveBeenCalled();
     });
-    renderActivity(initialRoute, directory);
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    const row = within(table).getByRole("row", { name: /Ada/ });
-    expect(row).toHaveTextContent("Account disabled");
-    expect(within(row).queryByText("No active M365 Copilot license")).not.toBeInTheDocument();
-    const detail = (await openUser("Ada")).dialog;
-    expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Not enabled");
-    expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
-    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
-    expect(within(detail).getByRole("list", { name: "Paid feature states" })).toBeVisible();
-    expect(within(detail).queryByText(/Service-plan ID:/)).not.toBeInTheDocument();
-    expect(document.body).not.toHaveTextContent(/E7|SKU|legacy-package|legacy-disabled|legacy-group|Group assignment|Direct assignment|Disabled plans/i);
-  });
-
-  it("opens details only on explicit action and restores keyboard focus on close or Escape", async () => {
-    renderActivity();
-    const trigger = await screen.findByRole("button", { name: "View reported details for Ada" });
-    trigger.focus();
-    await userEvent.keyboard("{Enter}");
-    const detail = screen.getByRole("dialog", { name: "Ada" });
-    expect(within(detail).getByRole("button", { name: "Close reported user details" })).toHaveFocus();
-    expect(within(detail).queryByRole("link")).not.toBeInTheDocument();
-    fireEvent(detail, new Event("cancel", { cancelable: true }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(trigger).toHaveFocus();
-    await userEvent.keyboard("{Enter}");
-    await userEvent.click(screen.getByRole("button", { name: "Close reported user details" }));
-    expect(trigger).toHaveFocus();
-    await userEvent.keyboard("{Enter}");
-    await userEvent.click(screen.getByRole("tab", { name: "Usage & agents" }));
-    await userEvent.type(screen.getByRole("searchbox", { name: "Search this user's agents" }), "research");
-    await userEvent.keyboard("{Escape}");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(trigger).toHaveFocus();
-  });
-
-  it("keeps discrepant totals separate and never substitutes bridge responses for unknown Users metrics", async () => {
-    const data = usageUsersFixture();
-    const ada = data.users.value.find(user => user.displayName === "Ada")!;
-    ada.reportedResponsesReceived = 999;
-    ada.hasReportMismatch = true;
-    const concealed = data.users.value.find(user => user.username === "bridge@example.invalid")!;
-    concealed.missingUserReport = true;
-    concealed.reportedResponsesReceived = 0;
-    concealed.reportedAgentsUsed = 0;
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity();
-    const { dialog } = await openUser("Ada");
-    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("999");
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(dialog).getByText(/^Responses across reported agents:/)).toHaveTextContent("215");
-    expect(within(dialog).getByText(/Report totals differ. Users total: 999; agent breakdown: 215/)).toBeVisible();
-    await userEvent.click(within(dialog).getByRole("button", { name: "Close reported user details" }));
-    const row = within(screen.getByRole("region", { name: "Active users without paid Copilot" })).getByRole("row", { name: /Bridge report user/ });
-    expect(within(row).getAllByRole("cell").slice(0, 2).map(cell => cell.textContent)).toEqual(["Unknown", "Unknown"]);
-    const bridgeDetail = (await openUser("Bridge report user")).dialog;
-    expect(within(bridgeDetail).getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
-    expect(within(bridgeDetail).getByText("Agents used").parentElement).toHaveTextContent("Unknown");
-    expect(within(bridgeDetail).getByRole("region", { name: "User reported activity" })).toHaveTextContent("Not reported");
-    await userEvent.click(within(bridgeDetail).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(bridgeDetail).getByText(/^Responses across reported agents:/)).toHaveTextContent("12");
-  });
-
-  it("preserves zero relationships but describes absent rows as not reported", async () => {
-    const data = usageUsersFixture();
-    const cleo = data.users.value.find(user => user.displayName === "Cleo")!;
-    cleo.rows = [];
-    cleo.bridgeResponsesSentToUsers = 0;
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity();
-    const ben = (await openUser("Ben")).dialog;
-    expect(within(ben).getByRole("region", { name: "User reported activity" })).toHaveTextContent("Not reported");
-    await userEvent.click(within(ben).getByRole("tab", { name: "Usage & agents" }));
-    const row = within(ben).getByRole("row", { name: /Researcher/ });
-    expect(within(row).getAllByRole("cell")[2]).toHaveTextContent(/^0$/);
-    expect(within(ben).getByRole("columnheader", { name: "Agent-wide last activity" })).toBeVisible();
-    await userEvent.click(within(ben).getByRole("button", { name: "Close reported user details" }));
-    const cleoDetail = (await openUser("Cleo")).dialog;
-    expect(within(cleoDetail).getByText("Agent responses").parentElement).toHaveTextContent("40");
-    await userEvent.click(within(cleoDetail).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(cleoDetail).getByRole("heading", { name: "No agent relationships reported" })).toBeVisible();
-    expect(within(cleoDetail).getByText("No agents are listed for this user in the selected report.")).toBeVisible();
-    expect(within(cleoDetail).getByText(/^Responses across reported agents:/)).toHaveTextContent("Not reported");
-    expect(within(cleoDetail).queryByText(/Import and activate/)).not.toBeInTheDocument();
-  });
-
-  it("shows verified no-service assignments for a bridge-only user without substituting Users totals", async () => {
-    const published = structuredClone(nonPaidPublished);
-    published.reports.users!.rows = published.reports.users!.rows.filter(user => user.username !== "ada@example.invalid");
-    const data = buildNonPaidView(published, { staleAfterDays: 35 });
-    const directory = directoryFixture();
-    directory.users[0].servicePlans = [];
-    directory.users[0].importedUsage = data.users.value.find(user => user.username === "ada@example.invalid")!;
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity(initialRoute, directory);
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    const row = within(table).getByRole("row", { name: /ada@example.invalid/ });
-    expect(within(row).getAllByRole("cell").slice(0, 2).map(cell => cell.textContent)).toEqual(["Unknown", "Unknown"]);
-    const { dialog } = await openUser("ada@example.invalid");
-    expect(within(dialog).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
-    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
-    expect(within(dialog).getByText("Agents used").parentElement).toHaveTextContent("Unknown");
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
-    const features = within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" });
-    expect(features).toHaveTextContent("No paid Copilot services are assigned.");
-    expect(features).not.toHaveTextContent(/unverified|evidence not reported|Run Users Sync/);
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(dialog).getByText(/^Responses across reported agents:/)).toHaveTextContent("215");
-  });
-
-  it("excludes unknown assignments even when no service plans are returned and activity is positive", async () => {
-    const directory = reportLicenseDirectory(nonPaidPublished);
-    const licenses = {
-      ...directory,
-      value: directory.value.map(user => user.identity.userPrincipalName === "ada@example.invalid"
-        ? { ...user, copilotServiceState: "unknown" as const, servicePlans: [] }
-        : user),
-    };
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(buildOfficialUsageUserView(nonPaidPublished, {
-      now: usageFixtureNow, staleAfterDays: 35, licenseCohort: "active_without_paid", licenseDirectory: licenses,
-    }));
-    renderActivity();
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(table).queryByRole("row", { name: /Ada/ })).not.toBeInTheDocument();
-    expect(screen.getByText(/1 user needs a license check/)).toBeVisible();
-  });
-
-  it("does not describe a missing companion as a report containing no relationship rows", async () => {
-    const published = structuredClone(nonPaidPublished);
-    published.reports.userAgents = undefined;
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(buildNonPaidView(published, { staleAfterDays: 35, now: usageFixtureNow }));
-    renderActivity();
-    const detail = (await openUser("Ada")).dialog;
-    await userEvent.click(within(detail).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(detail).getByRole("heading", { name: "Agent relationships unavailable" })).toBeVisible();
-    expect(within(detail).queryByText(/contains no agent rows/)).not.toBeInTheDocument();
-    expect(within(detail).queryByText(/Report totals differ/)).not.toBeInTheDocument();
-    expect(within(detail).getByText(/^Responses across reported agents:/)).toHaveTextContent("Not reported");
-  });
-
-  it("loads responsibility only for an already-established exact directory/report identity", async () => {
-    const directory = directoryFixture();
-    renderActivity(initialRoute, directory);
-    const detail = (await openUser("Ada")).dialog;
-    expect(within(detail).getByText("Agent responses").parentElement).toHaveTextContent("215");
-    expect(api.getAgentResponsibility).not.toHaveBeenCalled();
-    await userEvent.click(within(detail).getByRole("tab", { name: "Responsibility" }));
-    expect(await within(detail).findByText("Responsible agent")).toBeVisible();
-    expect(api.getAgentResponsibility).toHaveBeenCalledOnce();
-    expect(api.getAgentResponsibility).toHaveBeenCalledWith(
-      expect.objectContaining({ objectId: directory.users[0].directory.objectId }), expect.anything(),
-    );
-  });
-
-  it.each(["set", "missing-set", "users-version", "bridge-version", "case", "ambiguous", "unmatched", "unavailable", "partial", "stale"])(
-    "preserves current nonpaid membership but withholds detailed directory evidence for a %s link", async scenario => {
-      const directory = directoryFixture();
-      const ada = directory.users[0];
-      if (scenario === "set") ada.importedUsage!.datasetScope.reportSetId = "older-set";
-      if (scenario === "missing-set") ada.importedUsage!.datasetScope.reportSetId = null;
-      if (scenario === "users-version") ada.importedUsage!.datasetScope.usersVersionId = "older-users";
-      if (scenario === "bridge-version") ada.importedUsage!.datasetScope.userAgentsVersionId = "older-bridge";
-      if (scenario === "case") ada.importedUsage!.username = "ADA@example.invalid";
-      if (scenario === "ambiguous") directory.users.push({ ...ada, directory: { ...ada.directory, objectId: "other-directory-user" } });
-      if (scenario === "unmatched") ada.importedUsage = null;
-      if (scenario === "unavailable") directory.sources.directory.state = "unavailable";
-      if (scenario === "partial") directory.sources.directory.state = "partial";
-      if (scenario === "stale") directory.sources.directory.state = "stale";
-      renderActivity(initialRoute, directory);
-      const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-      const row = within(table).getByRole("row", { name: /Ada/ });
-      expect(row).toBeVisible();
-      expect(row).not.toHaveTextContent(/M365 Copilot licensed|Basic|Disabled|Unlicensed/);
-      const detail = (await openUser("Ada")).dialog;
-      expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
-      expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|M365 Copilot licensed|License not verified)$/)).not.toBeInTheDocument();
-      expect(within(detail).getByText("Organization details are unavailable for this report identity.")).toBeVisible();
-      await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
-      expect(within(detail).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
-      expect(within(detail).getByText("Detailed license assignments are unavailable for this report identity.")).toBeVisible();
-      await userEvent.click(within(detail).getByRole("tab", { name: "Responsibility" }));
-      expect(within(detail).getByText(/Link this user to a directory identity/)).toBeVisible();
-      expect(api.getAgentResponsibility).not.toHaveBeenCalled();
-    },
-  );
-
-  it("keeps case-distinct pseudonyms separate and reports identities when directory data is unavailable", async () => {
-    const data = usageUsersFixture();
-    data.users.value = [data.users.value[0], { ...data.users.value[0], username: "ADA@example.invalid", displayName: "ADA" }];
-    data.users.count = 2;
-    const directory = directoryFixture();
-    directory.sources.directory.state = "unavailable";
-    directory.users = [];
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity(initialRoute, directory);
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(table).getByText("ada@example.invalid", { exact: true })).toBeVisible();
-    expect(within(table).getByText("ADA@example.invalid", { exact: true })).toBeVisible();
-    expect(reportedRows()).toHaveLength(2);
-    expect((await openUser("ADA")).dialog).toHaveTextContent("No active M365 Copilot license");
-  });
-
-  it("uses current server-verified licensing for historical activity without inventing historical directory details", async () => {
-    const data = usageUsersFixture();
-    data.activeSet = {
-      ...data.activeSet!, id: "retained-set",
-      reportingPeriod: { ...data.activeSet!.reportingPeriod, startDate: "2024-01-01", endDate: "2024-01-31" },
-    };
-    data.availability = "stale";
-    data.users.value = data.users.value.map(user => ({
-      ...user, datasetScope: { ...user.datasetScope, reportSetId: "retained-set" },
-    }));
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity({ ...initialRoute, reportSetId: "retained-set" });
-    const table = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(table).getByRole("row", { name: /Ada/ })).toBeVisible();
-    expect(within(table).queryByText("License not verified")).not.toBeInTheDocument();
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledWith(
-      expect.objectContaining({ setId: "retained-set", licenseCohort: "active_without_paid" }), expect.anything(),
-    );
-    const { dialog } = await openUser("Ada");
-    expect(within(dialog).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
-    expect(within(dialog).getByText("Organization details are unavailable for this report identity.")).toBeVisible();
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
-    expect(within(dialog).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
-  });
-
-  it("searches over 2,000 report users before paging, including agents not on the current page", async () => {
-    const published = structuredClone(nonPaidPublished);
-    published.reports.users!.rows = Array.from({ length: 2_053 }, (_, index) => ({
-      username: `person${index}@example.invalid`, displayName: `Person${String(index).padStart(4, "0")}`,
-      numberOfAgentsUsed: 1, agentResponsesReceived: 2_100 - index,
-    }));
-    published.reports.userAgents!.rows = published.reports.users!.rows.map((user, index) => ({
-      username: user.username, agentId: `agent-${index}`, agentName: `Specialist${index}`, creatorType: "Your org",
-      responsesSentToUsers: user.agentResponsesReceived,
-    }));
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildNonPaidView(published, {
-      ...query, staleAfterDays: 35, now: usageFixtureNow, userSortBy: query?.sortBy,
-    }));
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(reportedRows()).toHaveLength(50);
-    expect(screen.getByLabelText("Reported user pages")).toHaveTextContent("1-50 of 2,053");
-    await userEvent.click(screen.getByRole("button", { name: "Next users" }));
-    await waitFor(() => expect(screen.getByLabelText("Reported user pages")).toHaveTextContent("51-100 of 2,053"));
-    expect(reportedRows()).toHaveLength(50);
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ limit: 50, offset: 50, setId: usageFixtureSetId }), expect.anything());
-    await userEvent.type(screen.getByRole("searchbox", { name: "Search reported users or agents" }), "Specialist2052");
-    await waitFor(() => expect(reportedRows()).toHaveLength(1));
-    expect(reportedRows()[0]).toHaveTextContent("Person2052");
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ search: "Specialist2052", limit: 50, offset: 0 }), expect.anything());
-  });
-
-  it("bounds a 1,005-agent detail to 50 rows and searches all its agents", async () => {
-    const data = usageUsersFixture();
-    const user = data.users.value[0];
-    user.rows = Array.from({ length: 1_005 }, (_, index) => ({
-      ...user.rows[0], agentId: `agent-${index}`, displayAgentName: `Agent${String(index).padStart(4, "0")}`, responsesSentToUsers: 2_000 - index,
-    }));
-    data.users.value = [user];
-    data.users.count = 1;
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(screen.queryByRole("region", { name: "User agent breakdown" })).not.toBeInTheDocument();
-    const { dialog } = await openUser("Ada");
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
-    const breakdown = within(dialog).getByRole("region", { name: "User agent breakdown" });
-    expect(within(breakdown).getAllByRole("row")).toHaveLength(51);
-    expect(within(dialog).getByLabelText("User agent pages")).toHaveTextContent("1-50 of 1,005");
-    await userEvent.click(within(dialog).getByRole("button", { name: "Next agents" }));
-    expect(within(dialog).getByLabelText("User agent pages")).toHaveTextContent("51-100 of 1,005");
-    await userEvent.type(within(dialog).getByRole("searchbox", { name: "Search this user's agents" }), "agent-1004");
-    expect(within(breakdown).getAllByRole("row")).toHaveLength(2);
-    expect(within(breakdown).getByRole("button", { name: "Agent1004: active users without paid Copilot" })).toBeVisible();
-  });
-
-  it("supports exact focused agents, shows selected relationship responses, and can explore every other agent", async () => {
-    const { changed } = renderActivity({ ...initialRoute, agentId: "helpdesk/report:2", reportSetId: usageFixtureSetId });
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(reportedRows()).toHaveLength(2);
-    expect(screen.getByRole("button", { name: "Remove agent filter" })).toHaveAttribute("title", "Agent: Helpdesk");
-    const { dialog } = await openUser("Ada");
-    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("215");
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
-    expect(within(dialog).getByRole("row", { name: /Helpdesk/ })).toHaveTextContent("15");
-    expect(within(dialog).queryByRole("button", { name: "Researcher: active users without paid Copilot" })).not.toBeInTheDocument();
-    await userEvent.click(within(dialog).getByRole("button", { name: "Show all this user's agents" }));
-    await userEvent.click(within(dialog).getByRole("button", { name: "Researcher: active users without paid Copilot" }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(changed).toHaveBeenLastCalledWith(expect.objectContaining({ agentId: "synthetic-researcher", reportSetId: usageFixtureSetId, page: 0 }), undefined);
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({
-      agentId: "synthetic-researcher", setId: usageFixtureSetId, limit: 50, offset: 0,
-    }), expect.anything()));
-  });
-
-  it("applies organization dropdowns immediately and exports the server-applied filters without paging", async () => {
-    const fullUserCsv = new Blob(["User,Agent,All-agent responses,Relationship responses\nAda,helpdesk/report:2,215,15\nAda,synthetic-researcher,215,200\n"]);
-    vi.mocked(api.downloadOfficialUsageCsv).mockResolvedValueOnce(fullUserCsv);
-    const directory = reportLicenseDirectory(nonPaidPublished);
-    directory.value.forEach(user => {
-      user.identity.companyName = user.identity.userPrincipalName === "ada@example.invalid" ? "Contoso" : "Fabrikam";
-      user.identity.department = user.identity.userPrincipalName === "ada@example.invalid" ? "Engineering" : "Sales";
-    });
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildOfficialUsageUserView(nonPaidPublished, {
-      staleAfterDays: 35, now: usageFixtureNow, ...query, userSortBy: query?.sortBy, licenseDirectory: directory,
-    }));
-    const { changed } = renderActivity({ ...initialRoute, reportSetId: usageFixtureSetId, agentId: "helpdesk/report:2", search: "Ada", page: 2 });
-    await screen.findByRole("heading", { name: "No reported users on this page" });
-    const filters = await openFilters();
-    expect(filters.getByLabelText("Company")).toHaveFocus();
-    expect(within(filters.getByLabelText("Company")).getAllByRole("option").map(option => option.textContent))
-      .toEqual(["All companies", "Contoso", "Fabrikam"]);
-    await userEvent.selectOptions(filters.getByLabelText("Company"), "Contoso");
-    await userEvent.selectOptions(filters.getByLabelText("Department"), "Engineering");
-    await userEvent.selectOptions(filters.getByLabelText("Agent responses"), "low");
-    fireEvent.change(screen.getByLabelText("Low-response threshold"), { target: { value: "250" } });
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(reportedRows()[0]).toHaveTextContent("215");
-    expect(reportedRows()[0]).toHaveTextContent("Contoso");
-    expect(reportedRows()[0]).toHaveTextContent("Engineering");
-    expect(changed).toHaveBeenLastCalledWith(expect.objectContaining({ page: 0 }), undefined);
-    await selectSort("responses-asc");
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ sortBy: "responses", sortDirection: "asc" }), expect.anything()));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled());
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(api.downloadOfficialUsageCsv).toHaveBeenCalledExactlyOnceWith("users", {
-      licenseCohort: "active_without_paid",
-      setId: usageFixtureSetId, agentId: "helpdesk/report:2", search: "Ada", company: "Contoso", department: "Engineering",
-      lowResponseThreshold: 250, cohort: "low", sortBy: "responses", sortDirection: "asc",
-    }, expect.any(AbortSignal));
-    expect(downloadBlob).toHaveBeenCalledWith("reported-user-activity.csv", fullUserCsv);
-    expect(screen.getByText("User CSV downloaded.")).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Remove company filter" }));
-    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveFocus();
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({
-      company: undefined, department: "Engineering", offset: 0,
-    }), expect.anything()));
-  });
-
-  it.each([
-    ["responses-desc", "responses", "desc"],
-    ["responses-asc", "responses", "asc"],
-    ["agents-desc", "agentsUsed", "desc"],
-    ["agents-asc", "agentsUsed", "asc"],
-    ["activity-desc", "lastActivity", "desc"],
-    ["activity-asc", "lastActivity", "asc"],
-    ["name", "displayName", "asc"],
-    ["name-desc", "displayName", "desc"],
-  ])("requests the %s ordering across all users", async (value, sortBy, sortDirection) => {
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await selectSort(value);
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ sortBy, sortDirection, offset: 0, limit: 50 }), expect.anything()));
-  });
-
-  it.each([
-    ["Agent responses", "responses-asc", "responses", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
-    ["Agents used", "agents-asc", "agentsUsed", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
-    ["Last activity", "activity-asc", "lastActivity", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
-    ["Reported user", "name", "displayName", ["u0", "u10", "u2", "unknown"], ["unknown", "u2", "u10", "u0"]],
-  ] as const)("honors backend %s comparisons in both directions and exports the same ordering", async (header, order, sortBy, ascending, descending) => {
-    const published = structuredClone(nonPaidPublished);
-    published.reports.users!.rows = [
-      { username: "u10", displayName: "User10", numberOfAgentsUsed: 10, agentResponsesReceived: 10, lastActivityDateUtc: "2026-10-01T00:00:00.000Z" },
-      { username: "u2", displayName: "User2", numberOfAgentsUsed: 2, agentResponsesReceived: 2, lastActivityDateUtc: "2026-01-02T00:00:00.000Z" },
-      { username: "u0", displayName: "User0", numberOfAgentsUsed: 0, agentResponsesReceived: 0, lastActivityDateUtc: "2025-12-31T00:00:00.000Z" },
-    ];
-    published.reports.userAgents!.rows = [
-      { ...published.reports.userAgents!.rows[0], username: "unknown", responsesSentToUsers: 999 },
-      { ...published.reports.userAgents!.rows[0], username: "u0", responsesSentToUsers: 1 },
-    ];
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildNonPaidView(published, {
-      ...query, staleAfterDays: 35, now: usageFixtureNow, userSortBy: query?.sortBy,
-    }));
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    const usernames = () => reportedRows().map(row => within(row).getByRole("rowheader").querySelector("small")?.textContent);
-    await selectSort(order);
-    await waitFor(() => expect(usernames()).toEqual(ascending));
-    const sortButton = screen.getByRole("button", { name: `Sort by ${header}` });
-    sortButton.focus();
-    await userEvent.keyboard("{Enter}");
-    await waitFor(() => expect(usernames()).toEqual(descending));
-    expect(screen.getByRole("columnheader", { name: header })).toHaveAttribute("aria-sort", "descending");
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(
-      expect.objectContaining({ sortBy, sortDirection: "desc", offset: 0, limit: 50 }), expect.anything(),
-    );
-    const unknown = reportedRows().find(row => within(row).getByRole("rowheader").querySelector("small")?.textContent === "unknown")!;
-    expect(within(unknown).getAllByRole("cell")[0]).toHaveTextContent(/^Unknown$/);
-    expect(within(unknown).getAllByRole("cell")[1]).toHaveTextContent(/^Unknown$/);
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(api.downloadOfficialUsageCsv).toHaveBeenLastCalledWith(
-      "users", expect.objectContaining({ setId: usageFixtureSetId, sortBy, sortDirection: "desc" }), expect.any(AbortSignal),
-    );
-  });
-
-  it("leaves focus in the search input after a delayed server sort finishes", async () => {
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    const pending = deferred<api.OfficialUsageUserView>();
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
-    await userEvent.click(screen.getByRole("button", { name: "Sort by Reported user" }));
-    const search = screen.getByRole("searchbox", { name: "Search reported users or agents" });
-    search.focus();
-    await act(async () => pending.resolve(usageUsersFixture({ staleAfterDays: 35, userSortBy: "displayName", sortDirection: "asc" })));
-    expect(screen.getByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    expect(search).toHaveFocus();
-  });
-
-  it("survives root Strict Mode replay without reviving its first saved read", async () => {
-    const pending = deferred<api.OfficialUsageUserView>();
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
-    render(<ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} />, { reactStrictMode: true });
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]?.signal?.aborted).toBe(true);
-    const old = usageUsersFixture();
-    old.users.value[0].displayName = "Obsolete user";
-    await act(async () => pending.resolve(old));
-    expect(screen.queryByRole("row", { name: /Obsolete user/ })).not.toBeInTheDocument();
-    expect(reportedRows()).toHaveLength(4);
-  });
-
-  it.each(["responses-desc", "responses-asc", "agents-desc", "agents-asc"])("keeps missing Users-report metrics last for %s", async order => {
-    const published = structuredClone(nonPaidPublished);
-    published.reports.users!.rows = published.reports.users!.rows.filter(user => user.username !== "bridge@example.invalid");
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildNonPaidView(published, {
-      ...query, staleAfterDays: 35, now: usageFixtureNow, userSortBy: query?.sortBy,
-    }));
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await selectSort(order);
-    await waitFor(() => expect(reportedRows().at(-1)).toHaveTextContent("bridge@example.invalid"));
-    const cells = within(reportedRows().at(-1)!).getAllByRole("cell");
-    expect(cells[0]).toHaveTextContent(/^Unknown$/);
-    expect(cells[1]).toHaveTextContent(/^Unknown$/);
-  });
-
-  it("keeps invalid thresholds out of queries and exports until corrected or reset", async () => {
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await openFilters();
-    fireEvent.change(screen.getByLabelText("Low-response threshold"), { target: { value: "0" } });
-    expect(screen.getByRole("alert")).toHaveTextContent(/whole-number threshold/);
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledOnce();
-    await userEvent.click(screen.getByRole("button", { name: "Reset filters" }));
-    expect(screen.getByLabelText("Low-response threshold")).toHaveValue(5);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled());
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  });
-
-  it("pins pagination and export to the displayed active set even if the tenant selection changes", async () => {
-    let currentId = usageFixtureSetId;
-    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => {
-      const data = usageUsersFixture({ ...query, staleAfterDays: 35 });
-      data.activeSet = { ...data.activeSet!, id: query?.setId ?? currentId };
-      data.users.count = 101;
-      return data;
-    });
-    const { changed } = renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    currentId = "33333333-3333-4333-8333-333333333333";
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(api.downloadOfficialUsageCsv).toHaveBeenLastCalledWith("users", expect.objectContaining({ setId: usageFixtureSetId }), expect.anything());
-    await userEvent.click(screen.getByRole("button", { name: "Next users" }));
-    expect(changed).toHaveBeenLastCalledWith(expect.objectContaining({ reportSetId: usageFixtureSetId, page: 1 }), undefined);
-    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ setId: usageFixtureSetId, offset: 50 }), expect.anything()));
-  });
-
-  it("aborts outdated requests and prevents a late result from replacing a newer query", async () => {
-    const late = deferred<api.OfficialUsageUserView>();
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(late.promise);
-    renderActivity();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    const firstSignal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]!.signal!;
-    await userEvent.type(screen.getByRole("searchbox", { name: "Search reported users or agents" }), "Cleo");
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(firstSignal.aborted).toBe(true);
-    expect(reportedRows()).toHaveLength(1);
-    await act(async () => late.resolve(usageUsersFixture()));
-    expect(reportedRows()).toHaveLength(1);
-    expect(reportedRows()[0]).toHaveTextContent("Cleo");
-  });
-
-  it("does not revive an earlier read, detail or export during A-B-A snapshot navigation", async () => {
-    const middle = deferred<api.OfficialUsageUserView>();
-    const current = deferred<api.OfficialUsageUserView>();
-    const exportResult = deferred<Blob>();
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(usageUsersFixture())
-      .mockReturnValueOnce(middle.promise).mockReturnValueOnce(current.promise);
-    vi.mocked(api.downloadOfficialUsageCsv).mockReturnValueOnce(exportResult.promise);
-    const props = { onRouteChange: vi.fn(), directoryData: directoryFixture() };
-    const route = { ...initialRoute, reportSetId: usageFixtureSetId };
-    const view = render(<ReportedUserActivity {...props} route={route} />);
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    await openUser("Ada");
-    view.rerender(<ReportedUserActivity {...props} route={{ ...route, reportSetId: "other-set" }} />);
-    view.rerender(<ReportedUserActivity {...props} route={route} />);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    await act(async () => {
-      middle.resolve(usageUsersFixture());
-      exportResult.resolve(new Blob(["obsolete"]));
-    });
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(downloadBlob).not.toHaveBeenCalled();
-    await act(async () => current.resolve(usageUsersFixture()));
-    expect(screen.getByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
-  });
-
-  it("aborts pending exports on query change and ignores their late downloads", async () => {
-    const late = deferred<Blob>();
-    vi.mocked(api.downloadOfficialUsageCsv).mockReturnValue(late.promise);
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(screen.getByRole("button", { name: "Exporting users…" })).toBeDisabled();
-    const signal = vi.mocked(api.downloadOfficialUsageCsv).mock.calls[0][2]!;
-    await userEvent.type(screen.getByRole("searchbox", { name: "Search reported users or agents" }), "Ben");
-    expect(signal.aborted).toBe(true);
-    await act(async () => late.resolve(new Blob(["old result"])));
-    expect(downloadBlob).not.toHaveBeenCalled();
-    expect(screen.queryByText(/User CSV downloaded/)).not.toBeInTheDocument();
-  });
-
-  it("aborts pending exports on unmount without downloading late content", async () => {
-    const late = deferred<Blob>();
-    vi.mocked(api.downloadOfficialUsageCsv).mockReturnValue(late.promise);
-    const view = renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    const exportSignal = vi.mocked(api.downloadOfficialUsageCsv).mock.calls[0][2]!;
+  it("aborts on unmount and Strict Mode replay without allowing an earlier completed transport to reappear", async () => {
+    const pending = deferred<ReportPage<ReportUser>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockResolvedValue(page());
+    const view = render(<StrictMode><ReportedUserActivity route={initial} onRouteChange={vi.fn()} /></StrictMode>);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(vi.mocked(api.readReportPage).mock.calls[0][2]?.aborted).toBe(true);
+    await act(async () => pending.resolve(page({ value: [reportUser(4, { displayName: "Obsolete" })] })));
+    expect(screen.queryByRole("button", { name: "Obsolete" })).not.toBeInTheDocument();
     view.unmount();
-    expect(exportSignal.aborted).toBe(true);
-    await act(async () => late.resolve(new Blob(["old"])));
-    expect(downloadBlob).not.toHaveBeenCalled();
   });
-
-  it("aborts an in-flight reported-user read on unmount", () => {
-    const pending = deferred<api.OfficialUsageUserView>();
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
-    const view = renderActivity();
-    const signal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]!.signal!;
-    view.unmount();
-    expect(signal.aborted).toBe(true);
-  });
-
-  it("does not revive an aborted export when draft filters are reset to their previous values", async () => {
-    const late = deferred<Blob>();
-    vi.mocked(api.downloadOfficialUsageCsv).mockReturnValue(late.promise);
-    renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    const signal = vi.mocked(api.downloadOfficialUsageCsv).mock.calls[0][2]!;
-    await openFilters();
-    fireEvent.change(screen.getByLabelText("Low-response threshold"), { target: { value: "10" } });
-    expect(signal.aborted).toBe(true);
-    await userEvent.click(screen.getByRole("button", { name: "Reset filters" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled());
-    await act(async () => late.resolve(new Blob(["aborted"])));
-    expect(downloadBlob).not.toHaveBeenCalled();
-  });
-
-  it("aborts exports when switching snapshots and never lets a late download use a newer report label", async () => {
-    const late = deferred<Blob>();
-    vi.mocked(api.downloadOfficialUsageCsv).mockReturnValue(late.promise);
-    renderActivity({ ...initialRoute, reportSetId: usageFixtureSetId });
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    const signal = vi.mocked(api.downloadOfficialUsageCsv).mock.calls[0][2]!;
-    await userEvent.click(screen.getByRole("button", { name: "Use current reports" }));
-    expect(signal.aborted).toBe(true);
-    await act(async () => late.resolve(new Blob(["old snapshot"])));
-    expect(downloadBlob).not.toHaveBeenCalled();
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ setId: undefined, offset: 0 }), expect.anything());
-  });
-
-  it("surfaces export failure with a local retry and clears private rows after authorization failure", async () => {
-    vi.mocked(api.downloadOfficialUsageCsv).mockRejectedValueOnce(new Error("Export unavailable"))
-      .mockRejectedValueOnce(new api.ApiError(403, "forbidden", "User access revoked"));
-    const { denied } = renderActivity();
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Export unavailable");
-    expect(reportedRows()).toHaveLength(4);
-    await userEvent.click(screen.getByRole("button", { name: "Retry user export" }));
-    await waitFor(() => expect(denied).toHaveBeenCalledWith("User access revoked"));
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    expect(downloadBlob).not.toHaveBeenCalled();
-  });
-
-  it("keeps retained snapshot failures explicit and retries locally without falling back", async () => {
-    vi.mocked(api.getOfficialUsageUsers).mockRejectedValueOnce(new Error("Retained report unavailable"));
-    renderActivity({ ...initialRoute, reportSetId: usageFixtureSetId });
-    expect(await screen.findByRole("alert")).toHaveTextContent("Retained report unavailable");
-    expect(screen.queryByText(/Loading reported user activity/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    expect(api.getOfficialUsageUsers).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ setId: usageFixtureSetId }), expect.anything());
-    await userEvent.click(screen.getByRole("button", { name: "Retry reported activity" }));
-    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ setId: usageFixtureSetId }), expect.anything());
-  });
-
-  it("keeps rows, controls and open details intact until a background revision finishes", async () => {
-    const pending = deferred<api.OfficialUsageUserView>();
-    const props = { route: { ...initialRoute, search: "Ada" }, onRouteChange: vi.fn(), directoryData: directoryFixture() };
-    const view = render(<ReportedUserActivity {...props} />);
-    const { dialog } = await openUser("Ada");
-    const table = screen.getByRole("region", { name: "Active users without paid Copilot" });
-    const original = table.textContent;
-    const close = within(dialog).getByRole("button", { name: "Close reported user details" });
-    expect(close).toHaveFocus();
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
-    close.focus();
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
-    view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={0} />);
-    expect(table).toHaveTextContent(original!);
-    expect(dialog).toBeVisible();
-    expect(close).toHaveFocus();
-    expect(screen.getByRole("region", { name: "Non-paid user activity" })).toHaveAttribute("aria-busy", "false");
-    expect(screen.queryByText(/Loading reported user activity/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
-    expect(screen.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
-    expect(within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();
-    const updated = usageUsersFixture({ staleAfterDays: 35, search: "Ada" });
-    updated.users.value[0].reportedResponsesReceived = 202;
-    await act(async () => pending.resolve(updated));
-    expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
-    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("202");
-    expect(within(dialog).getByRole("tab", { name: "Licenses" })).toHaveAttribute("aria-selected", "true");
-    expect(within(dialog).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
-    view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={1} />);
-    expect(within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();
-  });
-
-  it("closes details and removes retained data when a background read actually loses authorization", async () => {
-    const denied = vi.fn();
-    const props = { route: initialRoute, onRouteChange: vi.fn(), onAccessDenied: denied };
-    const view = render(<ReportedUserActivity {...props} dataRevision={0} />);
-    await openUser("Ada");
-    vi.mocked(api.getOfficialUsageUsers).mockRejectedValueOnce(new api.ApiError(401, "expired", "Sign in again"));
-    view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
-    expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Sign in again");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(denied).toHaveBeenCalledWith("Sign in again");
-    await userEvent.click(screen.getByRole("button", { name: "Retry reported activity" }));
-    await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("clears retained report rows and details after a non-authorization refresh failure without resetting filters", async () => {
-    const pending = deferred<api.OfficialUsageUserView>();
-    const props = { route: { ...initialRoute, search: "Ada" }, onRouteChange: vi.fn() };
-    const view = render(<ReportedUserActivity {...props} />);
-    const { dialog } = await openUser("Ada");
-    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
-    view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
-    expect(dialog).toBeVisible();
-    expect(screen.getByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    await act(async () => pending.reject(new Error("Saved report read failed")));
-    expect(screen.getByRole("alert")).toHaveTextContent("Saved report read failed");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(screen.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
-    await userEvent.click(screen.getByRole("button", { name: "Retry reported activity" }));
-    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ search: "Ada" }), expect.anything());
-  });
-
-  it.each(["reportSetId", "usersVersionId", "userAgentsVersionId"] as const)(
-    "does not transfer an open report identity to a refreshed %s or revive it later", async field => {
-      const props = { route: initialRoute, onRouteChange: vi.fn() };
-      const view = render(<ReportedUserActivity {...props} />);
-      await openUser("Ada");
-      const changed = usageUsersFixture();
-      if (field === "reportSetId") changed.activeSet = { ...changed.activeSet!, id: "replacement-snapshot" };
-      changed.users.value = changed.users.value.map(user => ({
-        ...user, datasetScope: { ...user.datasetScope, [field]: "replacement-snapshot" },
-      }));
-      vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(changed);
-      view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
-      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-      expect(screen.getByText("The selected user is no longer present in this report selection.")).toBeVisible();
-      view.rerender(<ReportedUserActivity {...props} dataRevision={2} />);
-      await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(3));
-      expect(screen.getByRole("button", { name: "View reported details for Ada" })).toBeVisible();
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      expect(screen.queryByText("The selected user is no longer present in this report selection.")).not.toBeInTheDocument();
-    },
-  );
-
-  it("rejects a saved response for another explicitly selected report", async () => {
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(usageUsersFixture());
-    renderActivity({ ...initialRoute, reportSetId: "different-saved-report" });
-    expect(await screen.findByRole("alert")).toHaveTextContent("did not match the selected report");
-    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-  });
-
-  it("distinguishes missing reports, missing companions, empty matches and out-of-range pages", async () => {
-    const empty = usageUsersFixture();
-    empty.activeSet = null;
-    empty.availability = "incomplete";
-    empty.lineages = [];
-    empty.users = { value: [], count: 0, limit: 50, offset: 0 };
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(empty);
-    const first = renderActivity();
-    expect(await screen.findByRole("heading", { name: "No selected user reports" })).toBeVisible();
-    expect(screen.getByText(/Report set is incomplete/)).toBeVisible();
-    expect(screen.queryByText(/Loading reported user activity/)).not.toBeInTheDocument();
-    first.unmount();
-    const missingBridge = usageUsersFixture();
-    missingBridge.lineages = missingBridge.lineages.filter(lineage => lineage.kind !== "userAgents");
-    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(missingBridge);
-    const second = renderActivity();
-    expect(await screen.findByText(/Users & agents report missing/)).toBeVisible();
-    second.unmount();
-    const third = renderActivity({ ...initialRoute, search: "no-such-user" });
-    expect(await screen.findByRole("heading", { name: "No reported users match" })).toBeVisible();
-    expect(screen.getByRole("searchbox", { name: "Search reported users or agents" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
-    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
-    third.unmount();
-    renderActivity({ ...initialRoute, page: 1 });
-    expect(await screen.findByRole("heading", { name: "No reported users on this page" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "First user page" }));
-    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
+  it("enforces current Viewer access without issuing a page request", () => {
+    render(<CapabilityContext.Provider value={{ ...viewer, user: { ...viewer.user!, roles: [] } }}>
+      <ReportedUserActivity route={initial} onRouteChange={vi.fn()} /></CapabilityContext.Provider>);
+    expect(screen.getByRole("alert")).toHaveTextContent("Current Viewer access");
+    expect(api.readReportPage).not.toHaveBeenCalled();
   });
 });

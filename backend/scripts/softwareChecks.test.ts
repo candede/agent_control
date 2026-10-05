@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SpawnSyncReturns } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { runSoftwareChecks } from "./softwareChecks.js";
 
 const mocks = vi.hoisted(() => ({
@@ -7,9 +8,14 @@ const mocks = vi.hoisted(() => ({
   end: vi.fn(async () => undefined),
   Pool: vi.fn(),
   spawnSync: vi.fn(),
+  existsSync: vi.fn(),
 }));
 vi.mock("pg", () => ({ default: { Pool: mocks.Pool } }));
 vi.mock("node:child_process", () => ({ spawnSync: mocks.spawnSync }));
+vi.mock("node:fs", async importOriginal => ({
+  ...await importOriginal<typeof import("node:fs")>(),
+  existsSync: mocks.existsSync,
+}));
 
 const fixtureEnvironment = {
   AGENT_CONTROL_ISOLATED_TESTS: "1",
@@ -38,6 +44,7 @@ beforeEach(() => {
   mocks.end.mockReset().mockResolvedValue(undefined);
   mocks.Pool.mockReset().mockImplementation(function () { return { query: mocks.query, end: mocks.end }; });
   mocks.spawnSync.mockReset().mockReturnValue(result());
+  mocks.existsSync.mockReset().mockReturnValue(true);
   vi.spyOn(console, "log").mockImplementation(() => undefined);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
@@ -51,22 +58,40 @@ function messages() {
 }
 
 describe("isolated aggregate software qualification", () => {
-  it("labels all five commands and reports only software qualification", async () => {
+  it("runs static checks before regression tests without rebuilding compiled artifacts", async () => {
     await runSoftwareChecks();
     expect(mocks.spawnSync.mock.calls.map(call => call.slice(0, 2))).toEqual([
+      ["npm", ["run", "lint", "--workspace", "frontend"]],
+      ["npm", ["run", "typecheck", "--workspace", "frontend"]],
       ["npm", ["run", "test", "--workspace", "backend"]],
       ["npm", ["run", "test", "--workspace", "frontend"]],
-      ["npm", ["run", "typecheck", "--workspace", "backend"]],
-      ["npm", ["run", "lint", "--workspace", "frontend"]],
-      ["npm", ["run", "build"]],
     ]);
-    for (const [index, name] of ["Backend tests", "Frontend tests", "Backend typecheck", "Frontend lint", "Production build"].entries()) {
-      expect(messages()).toContain(`[AUTOMATED CHECKS ${index + 1}/5] RUN ${name}`);
-      expect(messages()).toContain(`[AUTOMATED CHECKS ${index + 1}/5] PASS ${name}`);
+    for (const [index, name] of ["Frontend lint", "Frontend typecheck", "Backend tests", "Frontend tests"].entries()) {
+      expect(messages()).toContain(`[AUTOMATED CHECKS ${index + 1}/4] RUN ${name}`);
+      expect(messages()).toContain(`[AUTOMATED CHECKS ${index + 1}/4] PASS ${name}`);
     }
-    expect(messages()).toContain("[AUTOMATED CHECKS] PASSED: 5/5 steps passed; isolated database cleanup completed.");
+    expect(messages()).toContain("[AUTOMATED CHECKS] PASSED: 4/4 steps passed; isolated database cleanup completed.");
     expect(messages()).not.toMatch(/LOCAL READINESS|MICROSOFT|Permissions/);
     expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("refuses missing compiled artifacts before creating test infrastructure", async () => {
+    mocks.existsSync.mockReturnValue(false);
+    await expect(runSoftwareChecks()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ message: expect.stringContaining("Build the qualification image first") })],
+    });
+    expect(mocks.Pool).not.toHaveBeenCalled();
+    expect(mocks.spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("fits all command budgets plus cleanup inside the enclosing local workload deadline", async () => {
+    await runSoftwareChecks();
+    const script = readFileSync(new URL("../../scripts/local-deployment.ps1", import.meta.url), "utf8");
+    const deadline = /Invoke-OwnedFixtureWorkload[^\n]+backend\/scripts\/test-all\.ts[^\n]+-TimeoutSeconds (\d+)/.exec(script);
+    expect(deadline).not.toBeNull();
+    const combinedBudget = mocks.spawnSync.mock.calls.reduce((total, call) => total + call[2].timeout, 0);
+    expect(combinedBudget).toBe(1_740_000);
+    expect(Number(deadline?.[1]) * 1_000).toBeGreaterThanOrEqual(combinedBudget + 120_000);
   });
 
   it("uses a new database with fixture-only settings and never forwards application secrets", async () => {
@@ -82,9 +107,11 @@ describe("isolated aggregate software qualification", () => {
       host: "127.0.0.1", database: "agentcontrol_test_control", user: "agentcontrol_admin",
       password: fixtureEnvironment.PGPASSWORD, ssl: false,
     }));
-    for (const call of mocks.spawnSync.mock.calls) {
+    for (const [index, call] of mocks.spawnSync.mock.calls.entries()) {
       expect(call[2]).toMatchObject({
-        stdio: "inherit", timeout: 180_000, env: { ...fixtureEnvironment, PGDATABASE: name },
+        stdio: "inherit", timeout: index === 2 ? 1_200_000 : 180_000, env: { ...fixtureEnvironment, PGDATABASE: name,
+          NODE_OPTIONS: "--max-old-space-size=768", DEBUG_PRINT_LIMIT: "1200",
+          NPM_CONFIG_REGISTRY: "https://packagefeedproxy.microsoft.io/npm/" },
       });
       expect(Object.values(call[2].env)).not.toContain("real-application-setting-must-not-reach-fixtures");
     }
@@ -102,7 +129,7 @@ describe("isolated aggregate software qualification", () => {
     );
     expect(mocks.Pool).not.toHaveBeenCalled();
     expect(mocks.spawnSync).not.toHaveBeenCalled();
-    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 0/5");
+    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 0/4");
     expect(messages()).not.toContain("[AUTOMATED CHECKS] PASSED");
   });
 
@@ -116,12 +143,12 @@ describe("isolated aggregate software qualification", () => {
   it("stops on the first failed command, retains its cause, and still removes only its created database", async () => {
     mocks.spawnSync.mockReturnValueOnce(result()).mockReturnValueOnce(result({ status: 7 }));
     await expect(runSoftwareChecks()).rejects.toMatchObject({
-      errors: [expect.objectContaining({ message: expect.stringContaining("npm run test --workspace frontend exited with 7") })],
+      errors: [expect.objectContaining({ message: expect.stringContaining("npm run typecheck --workspace frontend exited with 7") })],
     });
     expect(mocks.spawnSync).toHaveBeenCalledTimes(2);
-    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 1/5 steps passed");
-    expect(messages()).not.toContain("PASS Frontend tests");
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Frontend tests"), expect.any(Error));
+    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 1/4 steps passed");
+    expect(messages()).not.toContain("PASS Frontend typecheck");
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Frontend typecheck"), expect.any(Error));
     expect(mocks.query).toHaveBeenLastCalledWith(expect.stringMatching(/^DROP DATABASE "agentcontrol_test_[a-f0-9]{32}" WITH \(FORCE\)$/));
     expect(mocks.end).toHaveBeenCalledOnce();
   });
@@ -130,11 +157,30 @@ describe("isolated aggregate software qualification", () => {
     const error = Object.assign(new Error(`spawn npm ${code}`), { code });
     mocks.spawnSync.mockReturnValue(result({ status: null, error }));
     await expect(runSoftwareChecks()).rejects.toMatchObject({
-      errors: [expect.objectContaining({ cause: error, message: expect.stringContaining("npm run test --workspace backend could not complete") })],
+      errors: [expect.objectContaining({ cause: error, message: expect.stringContaining("npm run lint --workspace frontend could not complete") })],
     });
     expect(mocks.spawnSync).toHaveBeenCalledOnce();
     expect(mocks.end).toHaveBeenCalledOnce();
-    expect(messages()).toContain("FAILED: 0/5");
+    expect(messages()).toContain("FAILED: 0/4");
+  });
+
+  it.each([
+    { index: 0, seconds: 180 },
+    { index: 1, seconds: 180 },
+    { index: 2, seconds: 1_200 },
+    { index: 3, seconds: 180 },
+  ])("fails closed at step $index with its exact $seconds-second budget", async ({ index, seconds }) => {
+    const error = Object.assign(new Error("spawn npm ETIMEDOUT"), { code: "ETIMEDOUT" });
+    for (let prior = 0; prior < index; prior += 1) mocks.spawnSync.mockReturnValueOnce(result());
+    mocks.spawnSync.mockReturnValueOnce(result({ status: null, error }));
+    await expect(runSoftwareChecks()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ cause: error, message: expect.stringContaining(`timeout limit ${seconds}s`) })],
+    });
+    expect(mocks.spawnSync).toHaveBeenCalledTimes(index + 1);
+    expect(mocks.spawnSync.mock.calls[index][2].timeout).toBe(seconds * 1_000);
+    expect(messages()).toContain(`FAILED: ${index}/4`);
+    expect(mocks.query).toHaveBeenLastCalledWith(expect.stringMatching(/^DROP DATABASE "agentcontrol_test_[a-f0-9]{32}" WITH \(FORCE\)$/));
+    expect(mocks.end).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -163,7 +209,7 @@ describe("isolated aggregate software qualification", () => {
     mocks.query.mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(error);
     await expect(runSoftwareChecks()).rejects.toMatchObject({ errors: [error] });
     expect(mocks.end).toHaveBeenCalledOnce();
-    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 5/5 steps passed; software is not qualified");
+    expect(messages()).toContain("[AUTOMATED CHECKS] FAILED: 4/4 steps passed; software is not qualified");
     expect(messages()).not.toContain("cleanup completed");
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining("cleanup of owned fixture database"), error);
   });

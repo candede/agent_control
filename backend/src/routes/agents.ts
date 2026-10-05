@@ -1,40 +1,34 @@
 import { Router, type Request, type Response } from "express";
+import type pg from "pg";
 import { randomUUID } from "node:crypto";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { getTenantConfiguration } from "../config.js";
-import { createJobConfirmation, type JobIntentInput } from "../db/jobs.js";
-import { PackageInventoryRepository, type PackageDataScope, type PackageListQuery } from "../db/packageInventory.js";
+import { createJobConfirmation, JobRepository, type JobIntentInput } from "../db/jobs.js";
+import { PackageRefreshJobs, type PackageDataScope } from "../db/packageRefreshJobs.js";
 import { packageCanaryMutation, PackageMutationQualificationRepository } from "../db/packageMutationQualifications.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
-import { bulkJobs, launchBulkJob, reconcileBulkJob, requireWorkerCapacity, runTrackedBulkJob } from "../services/bulkJobs.js";
+import { bulkJobs, launchBulkJob, reconcileBulkJob, runTrackedBulkJob } from "../services/bulkJobs.js";
 import { capabilities } from "../services/capabilities.js";
-import { getAuditLog } from "../services/auditLog.js";
-import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
 import { packageInventory } from "../services/packageInventory.js";
-import { capturePackageMutationState } from "../services/packageMutationState.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { operationalLog } from "../services/telemetry.js";
-import type { CopilotPackageDetail, PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
+import type { PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 import type { AuditAction } from "../types/audit.js";
-import { isAuditOperationPrefix } from "../types/audit.js";
 import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
+import { reportIdentity } from "../services/reportIdentity.js";
+import { SelectionError } from "../services/dataSelections.js";
 
 export const agentsRouter = Router();
 const directory = new DirectoryPrincipalsClient();
-const packageRepository = new PackageInventoryRepository();
+const packageRepository = new PackageRefreshJobs();
 const mutationQualifications = new PackageMutationQualificationRepository();
 const graphPackages = new GraphPackagesClient();
 
-policyRoute(agentsRouter, "get", "/agents", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const query = authorizePackageFilters(request, packageListQuery(request.query));
-  const result = await packageRepository.list(await savedPackageScope(request, packageMode(firstQueryValue(request.query.mode))), query);
-  response.json({ ...result, value: result.value.map(inventoryPackageDetail) });
-});
 policyRoute(agentsRouter, "get", "/directory/principals", { access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], capabilityId: "graph.directory.read" }, async (request, response) => {
   const search = firstQueryValue(request.query.search) ?? "";
   const limit = parseDirectorySearchLimit(firstQueryValue(request.query.limit));
@@ -73,52 +67,48 @@ policyRoute(agentsRouter, "get", "/agents/refresh-jobs", { access: "authenticate
 policyRoute(agentsRouter, "get", "/agents/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await packageInventory.get(request.session.user!, jobId(request), packageMode(firstQueryValue(request.query.mode))));
 });
+export function createAgentRefreshTargetsRouter(database: pg.Pool) {
+  const router = Router(), repository = new PackageRefreshJobs(database);
+  policyRoute(router, "get", "/agents/refresh-jobs/:id/targets", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+    const mode = packageMode(firstQueryValue(request.query.mode));
+    if (Object.keys(request.query).some(key => !["mode", "limit", "revision", "cursor"].includes(key))
+      || request.query.limit !== undefined && (typeof request.query.limit !== "string" || !/^[1-9]\d{0,2}$/.test(request.query.limit))) throw new SelectionError("invalid_cursor");
+    response.json(await repository.targets(await savedPackageScope(request, mode), await reportIdentity(database, request.session.user!), jobId(request),
+      { limit: request.query.limit === undefined ? 50 : Number(request.query.limit), revision: firstQueryValue(request.query.revision), cursor: firstQueryValue(request.query.cursor) }));
+  });
+  return router;
+}
 policyRoute(agentsRouter, "post", "/agents/refresh-jobs/:id/resume", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   response.status(202).json(await startPackageRefreshOrWaiting(request, jobId(request), packageMode(request.body?.mode)));
 });
 policyRoute(agentsRouter, "post", "/agents/refresh-jobs/:id/cancel", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   response.json(await packageInventory.cancel(request.session.user!, jobId(request), packageMode(request.body?.mode)));
 });
-policyRoute(agentsRouter, "get", "/agents/snapshots", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await packageRepository.listSnapshots(await savedPackageScope(request, packageMode(firstQueryValue(request.query.mode))), positiveInteger(firstQueryValue(request.query.limit), 50, 50)));
-});
-policyRoute(agentsRouter, "get", "/agents/export.csv", { access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  await sendPackageExport(request, response, { ...packageListQuery(request.query), limit: 5_000, offset: 0 });
-});
-policyRoute(agentsRouter, "post", "/agents/export.csv", { access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  const ids = request.body?.ids === undefined ? undefined : parseIds(request.body.ids, 5_000);
-  const snapshotId = optionalUuid(typeof request.body?.snapshotId === "string" ? request.body.snapshotId : undefined);
-  if (!snapshotId) throw new AppError(400, "snapshot_required", "Package export requires the exact saved snapshot selection.");
-  const filters = request.body?.filters === undefined ? {} : packageListQueryBody(request.body.filters);
-  if (ids && Object.keys(filters).length) throw new AppError(400, "invalid_export_selection", "Export either exact package IDs or one filtered snapshot selection.");
-  await sendPackageExport(request, response, { snapshotId, ...(ids ? { ids } : filters), limit: 5_000, offset: 0 });
-});
-policyRoute(agentsRouter, "post", "/agents/details", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  const ids = parseIds(request.body?.ids, 100);
-  const scope = await savedPackageScope(request, packageMode(request.body?.mode));
-  const results = await Promise.all(ids.map(async id => {
-    const observed = await packageRepository.get(scope, id);
-    return observed?.package ? { id, status: "succeeded" as const, package: observed.package } : { id, status: "failed" as const, message: "The saved package target is absent or stale; run an explicit exact refresh." };
-  }));
-  response.json({
-    total: results.length,
-    succeeded: results.filter(item => item.status === "succeeded").length,
-    failed: results.filter(item => item.status === "failed").length,
-    results,
-  });
-});
-policyRoute(agentsRouter, "get", "/agents/bulk-jobs/:id", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+export function createAgentJobReadRouter(database: pg.Pool) {
+const router = Router(), repository = new JobRepository(database);
+policyRoute(router, "get", "/agents/bulk-jobs/:id", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const scope = requestScope(request);
-  await bulkJobs.recover(scope.tenantId);
-  const job = await bulkJobs.get(jobId(request), scope);
+  const job = await repository.get(jobId(request), scope);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   response.json(job);
 });
-policyRoute(agentsRouter, "get", "/agents/bulk-jobs", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const scope = requestScope(request);
-  await bulkJobs.recover(scope.tenantId);
-  response.json(await bulkJobs.list(scope, positiveInteger(firstQueryValue(request.query.limit), 20, 50)));
+policyRoute(router, "get", "/agents/bulk-jobs/:id/items", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (Object.keys(request.query).some(key => !["revision", "cursor", "limit"].includes(key))
+    || Object.values(request.query).some(value => typeof value !== "string")) throw new SelectionError("invalid_cursor");
+  const query = request.query as Record<string, string>;
+  if (query.limit !== undefined && !/^[1-9]\d*$/.test(query.limit)
+    || query.revision !== undefined && !/^\d+$/.test(query.revision)) throw new SelectionError("invalid_cursor");
+  response.json(await repository.items(jobId(request), await reportIdentity(database, request.session.user!), {
+    revision: query.revision, cursor: query.cursor, limit: query.limit === undefined ? 50 : Number(query.limit),
+  }));
 });
+policyRoute(router, "get", "/agents/bulk-jobs", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+  const scope = requestScope(request);
+  response.json(await repository.list(scope, positiveInteger(firstQueryValue(request.query.limit), 20, 50)));
+});
+return router;
+}
 policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/cancel", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const job = await bulkJobs.cancel(jobId(request), requestScope(request));
   if (!job) throw new AppError(404,"not_found","Job was not found.");
@@ -134,7 +124,7 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
   if (job.tokenMode !== "delegated") throw new AppError(409,"invalid_token_mode","This route can resume delegated jobs only.");
   await capabilities.requireAvailable(job.capabilityId, request.session.user!);
   await acquireDelegatedToken(scope.tenantId, scope.principalId, job.capabilityId);
-  await bulkJobs.recover(scope.tenantId, true);
+  await bulkJobs.recover(scope.tenantId, true, id);
   job = await bulkJobs.get(id, scope);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (!job.canResume) throw new AppError(409,"not_resumable","No authorized unsent work can be resumed.");
@@ -143,24 +133,6 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
 });
 policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/reconcile", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   response.json(await reconcileBulkJob(jobId(request), requestScope(request)));
-});
-policyRoute(agentsRouter, "get", "/agents/:id", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const id = exactId(String(request.params.id));
-  const observed = await packageRepository.get(await savedPackageScope(request, packageMode(firstQueryValue(request.query.mode))), id);
-  if (!observed?.package) throw new AppError(409, "package_target_stale_or_absent", "The exact native package target is absent from the selected saved observation. Refresh this target; another source ID will never be substituted.", observed);
-  response.json({
-    ...observed.package,
-    observation: { observedAt: observed.observedAt, expiresAt: observed.expiresAt, scopeKind: observed.scopeKind, source: "Microsoft Graph package catalog", apiMaturity: "v1.0 read; preview controls" },
-  });
-});
-
-policyRoute(agentsRouter, "post", "/agents/mutation-preview", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
-  const action = packageMutationAction(request.body?.action);
-  const ids = parseIds(request.body?.ids, action === "update-availability" || action === "update-installation" ? 100 : 5000);
-  const accessUpdate = action === "update-availability" || action === "update-installation" ? parsePackageAccessUpdate(request.body) : undefined;
-  const intent = await buildMutationIntent(request, action, ids, accessUpdate, parseMutationScope(request.body?.mutationScope));
-  const preview = createJobConfirmation(intent);
-  response.json({ confirmationHash: preview.confirmationHash, summary: preview.summary });
 });
 policyRoute(agentsRouter, "post", "/agents/mutation-canaries", { access: "authenticated", dataClass: "package_control_qualification", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const approval = parseCanaryApproval(request.body);
@@ -237,91 +209,7 @@ export function parseMutationScope(value: unknown): "single" | "bulk" {
   return value;
 }
 
-for (const action of ["block","unblock"] as const) {
-  policyRoute(agentsRouter, "post", `/agents/${action}-all`, { access: "authenticated", dataClass: "package_control", roles: ["AgentControl.Admin"], capabilityId: "graph.package.block.manage", csrf: true }, async (request, response) => {
-    const owner = requestScope(request);
-    const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-    requireExactBlockAllBody(request.body);
-    const confirmedHash = confirmationHash(request);
-    const existing = await existingMutationJob(request, action, confirmedHash, undefined, undefined, "bulk");
-    if (existing) return response.status(202).json(existing);
-    requireWorkerCapacity();
-    if (!hasAppRole(request.session.user!.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Block-all requires Viewer catalog scope in addition to Admin control authority.");
-    const packages = await packageRepository.list(owner, { limit: 5_000, offset: 0 });
-    assertAccountSessionValidation(validation);
-    if (!packages.value.length) throw new AppError(409,"no_targets","There is no current saved broad package snapshot to operate on.");
-    response.status(202).json(await submit(request, action, packages.value.map(item => item.id), undefined, "bulk", confirmedHash));
-  });
-  policyRoute(agentsRouter, "post", `/agents/${action}`, { access: "authenticated", dataClass: "package_control", roles: ["AgentControl.Admin"], capabilityId: "graph.package.block.manage", csrf: true }, async (request, response) => {
-    response.status(202).json(await submit(request, action, parseBulkActionIds(request.body), undefined, "bulk", confirmationHash(request)));
-  });
-  policyRoute(agentsRouter, "post", `/agents/:id/${action}`, { access: "authenticated", dataClass: "package_control", roles: ["AgentControl.Admin"], capabilityId: "graph.package.block.manage", csrf: true }, async (request, response) => {
-    response.status(202).json(await submit(request, action, [exactId(String(request.params.id))], undefined, "single", confirmationHash(request)));
-  });
-}
-policyRoute(agentsRouter, "post", "/agents/access", { access: "authenticated", dataClass: "package_control", roles: ["AgentControl.Admin"], capabilityId: "graph.package.access.manage", csrf: true }, async (request, response) => {
-  const update = parsePackageAccessUpdate(request.body);
-  response.status(202).json(await submit(request, update.target === "availability" ? "update-availability" : "update-installation", parseIds(request.body?.ids, 100), update, "bulk", confirmationHash(request)));
-});
-policyRoute(agentsRouter, "patch", "/agents/:id/access", { access: "authenticated", dataClass: "package_control", roles: ["AgentControl.Admin"], capabilityId: "graph.package.access.manage", csrf: true }, async (request, response) => {
-  const update = parsePackageAccessUpdate(request.body);
-  if (update.mode !== "replace") throw new AppError(400,"invalid_access_update","Single-agent access updates use replace mode.");
-  response.status(202).json(await submit(request, update.target === "availability" ? "update-availability" : "update-installation", [exactId(String(request.params.id))], update, "single", confirmationHash(request)));
-});
-
-async function submit(request: Request, action: AuditAction, ids: string[], accessUpdate: PackageAccessUpdate | undefined, scope: "single" | "bulk", confirmedHash: string) {
-  const owner = requestScope(request);
-  const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-  const existing = await existingMutationJob(request, action, confirmedHash, ids, accessUpdate, scope);
-  if (existing) return existing;
-  requireWorkerCapacity();
-  parseActionGroupId(request.get("x-agent-control-action-group-id"));
-  const capabilityId = action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage";
-  const intent = await buildMutationIntent(request, action, ids, accessUpdate, scope);
-  if (createJobConfirmation(intent).confirmationHash !== confirmedHash) throw new AppError(409, "confirmation_mismatch", "The confirmed package selection or current state changed. Review and confirm the mutation again.");
-  await acquireDelegatedToken(owner.tenantId, owner.principalId, capabilityId);
-  const job = await commitAccountSessionValidation(validation, () => bulkJobs.submit(owner, { ...intent, confirmationHash: confirmedHash, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() }));
-  if (job.status === "queued") await commitAccountSessionValidation(validation, async () => launchBulkJob(job.id, owner));
-  return job;
-}
-
-async function existingMutationJob(request: Request, action: AuditAction, confirmedHash: string, targetIds: string[] | undefined, accessUpdate: PackageAccessUpdate | undefined, scope: "single" | "bulk") {
-  const idempotencyKey = request.get("Idempotency-Key");
-  if (!idempotencyKey) return undefined;
-  const owner = requestScope(request);
-  const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-  const capabilityId = action === "block" || action === "unblock" ? "graph.package.block.manage"
-    : action === "reassign" ? "graph.package.reassign.manage" : "graph.package.access.manage";
-  const existing = await bulkJobs.getByIdempotency(owner, capabilityId, idempotencyKey, {
-    action,
-    accessUpdate,
-    requestPath: request.path,
-    scope,
-    targetIds,
-  });
-  assertAccountSessionValidation(validation);
-  if (existing && existing.confirmationHash !== confirmedHash) {
-    throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different request.");
-  }
-  if (existing?.status === "queued") await commitAccountSessionValidation(validation, async () => launchBulkJob(existing.id, owner));
-  return existing;
-}
-
-async function buildMutationIntent(request: Request, action: AuditAction, ids: string[], accessUpdate: PackageAccessUpdate | undefined, scope: "single" | "bulk"): Promise<JobIntentInput> {
-  const owner = requestScope(request);
-  const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-  if (accessUpdate) await requireResolvedPrincipals(request, accessUpdate);
-  assertAccountSessionValidation(validation);
-  const packages = await packageRepository.getMany(owner, ids);
-  assertAccountSessionValidation(validation);
-  const targets = packages.map(({ id, package: value }) => {
-    if (!value) throw new AppError(409, "package_target_stale_or_absent", "A selected native package target is absent from the current saved observation. Refresh that exact target; another source ID will never be substituted.", { id });
-    return { id, displayName: value.displayName, prestate: capturePackageMutationState(value, action) };
-  });
-  return { action, targets, accessUpdate, actor: request.session.user!, requestPath: request.path, scope };
-}
-
-async function requireResolvedPrincipals(request: Request, update: PackageAccessUpdate) {
+export async function requireResolvedPrincipals(request: Request, update: PackageAccessUpdate) {
   if (!update.principals.length) return;
   await withDirectoryRequest(request, request.res, async (token, signal, assertCurrent) => {
     const resolved = await directory.resolve(token, update.principals, signal, assertCurrent);
@@ -376,24 +264,19 @@ async function withDirectoryRequest(
   }
 }
 
-function confirmationHash(request: Request) {
+export function confirmationHash(request: Request) {
   const value = request.body?.confirmationHash;
   if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) throw new AppError(400, "confirmation_required", "Submit the confirmation hash from a current package mutation preview.");
   return value;
-}
-function requireExactBlockAllBody(value: unknown) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1 || !("confirmationHash" in value)) {
-    throw new AppError(400, "invalid_request", "Block-all accepts only the confirmation hash for the server-frozen catalog selection.");
-  }
 }
 function jobId(request: Request) {
   const value = String(request.params.id);
   if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400,"invalid_job_id","Invalid job ID.");
   return value;
 }
-function exactId(value: string) {
+export function exactId(value: string) {
   if (!value.trim() || value.length > 512) throw new AppError(400,"invalid_request","Each id must be a non-empty string of at most 512 characters.");
-  return value.trim();
+  return value;
 }
 function firstQueryValue(value: unknown) { return Array.isArray(value) ? typeof value[0] === "string" ? value[0] : undefined : typeof value === "string" ? value : undefined; }
 export function parseActionGroupId(value: string | undefined) {
@@ -408,8 +291,7 @@ export function parseDirectorySearchLimit(value: string | undefined) {
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new AppError(400,"invalid_directory_limit","Directory search limit must be a positive integer up to 50.");
   return limit;
 }
-export function parseBulkActionIds(body: unknown) { return parseIds((body as { ids?: unknown })?.ids, 5000); }
-function parseIds(value: unknown, limit: number) {
+export function parseIds(value: unknown, limit: number) {
   if (!Array.isArray(value) || !value.length || value.length > limit) throw new AppError(400,"invalid_request",`Expected 1-${limit} ids.`);
   const result = value.map(id => {
     if (typeof id !== "string") throw new AppError(400,"invalid_request","Each id must be a non-empty string.");
@@ -447,80 +329,21 @@ export function parsePackageAccessUpdate(body: unknown): PackageAccessUpdate {
   return { target, mode, scope, principals };
 }
 
-export function inventoryPackageDetail(detail: CopilotPackageDetail): CopilotPackageDetail {
-  const { allowedUsersAndGroups: _allowed, acquireUsersAndGroups: _acquire, ...inventory } = detail;
-  return inventory;
-}
-
 export function parsePackageRefreshIds(value: unknown) {
-  return value === undefined ? undefined : parseIds(value, 100);
+  return value === undefined ? undefined : parseIds(value, 5000);
 }
 
 async function savedPackageScope(request: Request, mode: "delegated" | "application"): Promise<PackageDataScope> {
   const owner = requestScope(request);
-  if (mode === "delegated") return owner;
+  if (mode === "delegated") return { ...owner, tokenMode: mode };
   await capabilities.requireApplicationDataScope("graph.package.read.application", request.session.user!);
-  return { tenantId: owner.tenantId, principalId: getTenantConfiguration(owner.tenantId).clientId };
+  return { tenantId: owner.tenantId, principalId: getTenantConfiguration(owner.tenantId).clientId, tokenMode: mode };
 }
 
 function packageMode(value: unknown) {
   if (value === undefined || value === null || value === "") return "delegated" as const;
   if (value !== "delegated" && value !== "application") throw new AppError(400, "invalid_token_mode", "Package read mode must be delegated or application.");
   return value;
-}
-
-function packageListQuery(query: Record<string, unknown>): PackageListQuery {
-  const blocked = firstQueryValue(query.blocked);
-  return {
-    snapshotId: optionalUuid(firstQueryValue(query.snapshotId)),
-    search: optionalText(firstQueryValue(query.search), 256),
-    operationIdPrefix: optionalOperationIdPrefix(firstQueryValue(query.operationIdPrefix)),
-    blocked: blocked === undefined ? undefined : blocked === "true" ? true : blocked === "false" ? false : invalidPackageQuery("blocked must be true or false"),
-    publisher: optionalText(firstQueryValue(query.publisher), 256),
-    availableTo: optionalText(firstQueryValue(query.availableTo), 128),
-    deployedTo: optionalText(firstQueryValue(query.deployedTo), 128),
-    host: optionalText(firstQueryValue(query.host), 256),
-    platform: optionalText(firstQueryValue(query.platform), 256),
-    createdWithinDays: optionalPositiveInteger(firstQueryValue(query.createdWithinDays), 3650),
-    sortBy: packageSort(firstQueryValue(query.sortBy)),
-    sortDirection: firstQueryValue(query.sortDirection) === "desc" ? "desc" : "asc",
-    limit: positiveInteger(firstQueryValue(query.limit), 50, 250),
-    offset: positiveInteger(firstQueryValue(query.offset), 0, 100_000, true),
-  };
-}
-
-function authorizePackageFilters(request: Request, query: PackageListQuery): PackageListQuery {
-  if (!query.operationIdPrefix) return query;
-  if (!request.session.user || !hasAppRole(request.session.user.roles, "AgentControl.Viewer")) {
-    throw new AppError(403, "missing_internal_role", "Viewer is required for audit operation reference filters.");
-  }
-  return { ...query, auditPrincipalId: requestScope(request).principalId };
-}
-
-function packageListQueryBody(value: unknown): PackageListQuery {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return invalidPackageQuery("export filters are invalid");
-  const input = value as Record<string, unknown>;
-  const allowed = new Set(["search", "operationIdPrefix", "blocked", "publisher", "availableTo", "deployedTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection"]);
-  if (Object.keys(input).some(key => !allowed.has(key))) return invalidPackageQuery("export filters contain an unsupported field");
-  const blocked = input.blocked;
-  return {
-    search: optionalText(input.search, 256),
-    operationIdPrefix: optionalOperationIdPrefix(typeof input.operationIdPrefix === "string" ? input.operationIdPrefix : undefined),
-    blocked: blocked === undefined ? undefined : typeof blocked === "boolean" ? blocked : invalidPackageQuery("blocked must be true or false"),
-    publisher: optionalText(input.publisher, 256),
-    availableTo: optionalText(input.availableTo, 128),
-    deployedTo: optionalText(input.deployedTo, 128),
-    host: optionalText(input.host, 256),
-    platform: optionalText(input.platform, 256),
-    createdWithinDays: input.createdWithinDays === undefined ? undefined : optionalPositiveInteger(String(input.createdWithinDays), 3650),
-    sortBy: packageSort(typeof input.sortBy === "string" ? input.sortBy : undefined),
-    sortDirection: input.sortDirection === "desc" ? "desc" : "asc",
-  };
-}
-
-function packageSort(value: string | undefined) {
-  const allowed = ["displayName", "publisher", "lastModifiedAt"] as const;
-  return allowed.includes(value as typeof allowed[number]) ? value as typeof allowed[number] : "displayName";
 }
 
 function positiveInteger(value: string | undefined, fallback: number, maximum: number, allowZero = false) {
@@ -530,34 +353,11 @@ function positiveInteger(value: string | undefined, fallback: number, maximum: n
   return parsed;
 }
 
-function optionalText(value: unknown, maximum: number) {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value !== "string" || value.length > maximum || /[\r\n\0]/.test(value)) return invalidPackageQuery("query text is invalid");
-  return value;
-}
-
-function optionalOperationIdPrefix(value: string | undefined) {
-  if (value === undefined) return undefined;
-  if (!isAuditOperationPrefix(value)) return invalidPackageQuery("operation reference is invalid");
-  return value;
-}
-
-function optionalPositiveInteger(value: string | undefined, maximum: number) {
-  if (value === undefined || value === "") return undefined;
-  return positiveInteger(value, 1, maximum);
-}
-
-function optionalUuid(value: string | undefined) {
-  if (value === undefined) return undefined;
-  if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) return invalidPackageQuery("snapshot ID is invalid");
-  return value;
-}
-
 function invalidPackageQuery(message: string): never {
   throw new AppError(400, "invalid_package_query", `Package ${message}.`);
 }
 
-function packageMutationAction(value: unknown): AuditAction {
+export function packageMutationAction(value: unknown): AuditAction {
   if (!["block", "unblock", "update-availability", "update-installation", "reassign"].includes(String(value))) throw new AppError(400, "invalid_mutation_action", "Package mutation action is invalid.");
   return value as AuditAction;
 }
@@ -675,79 +475,6 @@ export async function canaryFailureCompletion(scope: ReturnType<typeof requestSc
 function canaryId(value: string) {
   if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_qualification_id", "Canary qualification ID is invalid.");
   return value;
-}
-
-async function sendPackageExport(request: Request, response: Response, query: PackageListQuery) {
-  query = authorizePackageFilters(request, query);
-  if (!query.snapshotId) throw new AppError(400, "snapshot_required", "Package export requires the exact saved snapshot selection.");
-  const deadlineAt = Date.now() + 15_000;
-  const owner = requestScope(request);
-  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-  const validateAuditSession = query.operationIdPrefix ? createExportPublicationValidator(request, "AgentControl.Viewer") : undefined;
-  const mode = packageMode(firstQueryValue(request.query.mode));
-  const sourceScope = await savedPackageScope(request, mode);
-  let auditedSelection: string | undefined;
-  const validatePublication = () => validateSession(async () => {
-    await validateAuditSession?.();
-    const currentScope = await savedPackageScope(request, mode);
-    await packageRepository.assertSnapshotCurrent(currentScope, query.snapshotId!);
-    if (auditedSelection !== undefined) {
-      const current = await packageRepository.list(currentScope, query);
-      if (JSON.stringify(current.value.map(value => value.id)) !== auditedSelection) {
-        throw new AppError(409, "dataset_invalidated", "The authorized audit reference selection changed before export publication completed.");
-      }
-    }
-  });
-  const audit = getAuditLog(owner);
-  const event = await audit.startEvent({
-    operationId: `export-package-inventory:${randomUUID()}`,
-    scope: "bulk",
-    action: "export-package-inventory",
-    agentId: query.snapshotId ?? "current-package-inventory",
-    actor: request.session.user!,
-    requestPath: request.path,
-    metadata: { source: "graph_packages", snapshotId: query.snapshotId ?? "current" },
-  });
-  try {
-    await validatePublication();
-    const result = await packageRepository.list(sourceScope, query);
-    if (query.operationIdPrefix) auditedSelection = JSON.stringify(result.value.map(value => value.id));
-    if (!result.snapshot) throw new AppError(409, "snapshot_unavailable", "The exact package snapshot is no longer available.");
-    if (result.count > 5_000 || result.value.length !== result.count) {
-      throw new AppError(413, "export_row_limit", "The filtered package selection exceeds the 5,000 row export limit.");
-    }
-    if (query.ids && result.count !== query.ids.length) {
-      throw new AppError(409, "export_selection_changed", "One or more exact package export targets are no longer members of the selected snapshot.");
-    }
-    const columns = ["id", "displayName", "publisher", "isBlocked", "availableTo", "deployedTo", "lastModifiedDateTime", "sourceSystem", "snapshotId", "snapshotObservedAt", "snapshotExpiresAt"] as const;
-    const rows = result.value.map(value => ({
-      ...value,
-      snapshotId: result.snapshot!.id,
-      snapshotObservedAt: result.snapshot!.observedAt,
-      snapshotExpiresAt: result.snapshot!.expiresAt,
-    }));
-    const csv = buildBoundedCsv(columns, rows, { maximumRows: 5_000, maximumBytes: 8_000_000, deadlineAt });
-    await publishBoundedCsv(request, response, "package-inventory.csv", csv.buffer, {
-      deadlineAt, validate: validatePublication, beforeEnd: () => audit.completeEvent(event.id, {
-        status: "succeeded", metadata: {
-        source: "graph_packages",
-        snapshotId: result.snapshot?.id ?? null,
-        resultingCount: csv.rowCount,
-        resultingBytes: csv.byteCount,
-        },
-      }).then(() => undefined),
-    });
-  } catch (error) {
-    await audit.completeEvent(event.id, {
-      status: "failed",
-      errorCode: error instanceof AppError ? error.code : "package_export_failed",
-    });
-    if (response.headersSent) {
-      if (!response.destroyed) response.destroy();
-      return;
-    }
-    throw error;
-  }
 }
 
 async function startPackageRefreshOrWaiting(request: Request, id: string, tokenMode: "delegated" | "application") {

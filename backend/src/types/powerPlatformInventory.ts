@@ -88,6 +88,10 @@ export type PowerPlatformResource = {
   lifecycle: "draft" | "published" | "unknown" | "not_applicable";
   identityConfidence: "exact_native" | "partial";
   identifiers: InventoryIdentifier[];
+  identifierCount?: number;
+  identifiersComplete?: boolean;
+  connectorCounts?: { connectors: number; operations: number } | null;
+  quarantineIdentity?: { environmentId: string; botId: string } | null;
   provenance: Record<string, InventoryFieldProvenance>;
   details: PowerPlatformResourceDetails;
   unknownFieldCount: number;
@@ -106,15 +110,6 @@ export function derivePowerPlatformAuthoringTool(type: PowerPlatformResourceType
 export function powerPlatformAuthoringTool(resource: Pick<PowerPlatformResource, "type" | "authoringTool" | "details">): string | null {
   return resource.authoringTool?.trim() || derivePowerPlatformAuthoringTool(resource.type, resource.details.createdIn);
 }
-
-export type ResourceQueryResult = {
-  resources: PowerPlatformResource[];
-  queriedTypes: PowerPlatformResourceType[];
-  environmentScope: string | null;
-  totalRecords: number;
-  pages: number;
-  unknownFieldCount: number;
-};
 
 export type InventoryTypeCoverage = {
   type: PowerPlatformResourceType;
@@ -145,12 +140,6 @@ export type InventorySnapshot = {
   observedAt: string;
   expiresAt: string;
   verification: InventorySnapshotVerification;
-};
-
-export type InventoryResourcePage = {
-  value: PowerPlatformResource[];
-  count: number;
-  snapshot: InventorySnapshot | null;
 };
 
 export type InventoryRefreshJob = {

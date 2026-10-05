@@ -18,17 +18,16 @@ export type ResponsibilityAgent = Pick<UnifiedAgentRecord, "id" | "displayName" 
   observedAt: string;
 };
 
-export type AgentResponsibilityQuery = { objectId?: string; search?: string; offset?: number; limit?: number };
+export type AgentResponsibilityQuery = { objectId?: string; search?: string; selectionId?: string; cursor?: string; limit?: number };
 export type AgentResponsibilityPage = {
-  revision: string;
+  selection: { id: string; revision: string; evaluatedAt: string; expiresAt: string };
+  counts: { total: number; filtered: number };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   sources: UnifiedAgentInventoryPage["sources"];
   coverage: "available" | "partial" | "unavailable";
   unknownAgentCount: number;
   invalidReferenceCount: number;
   people: ResponsibilityPerson[];
-  count: number;
-  offset: number;
-  limit: number;
   selected: null | {
     person: ResponsibilityPerson;
     state: "reported" | "no_reported_relationships" | "unavailable";

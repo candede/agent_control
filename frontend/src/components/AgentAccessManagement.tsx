@@ -40,12 +40,13 @@ export function AgentAccessManagement({ agent, detail, canManage, canEditAccess,
       <div className="agent-block-control" role="group" aria-label={`Blocking for ${agent.id}`}>
         <strong>{isBlocked === true ? "Blocked" : isBlocked === false ? "Not blocked" : "Block status unknown"}</strong>
         {canManage && typeof isBlocked === "boolean" ? <WorkbenchActionGate actionId={isBlocked ? "packages.unblock" : "packages.block"} compact>
-          <button type="button" className={isBlocked ? "secondary" : "danger"} disabled={busy}
+          <button type="button" className={isBlocked ? "secondary" : "danger"} disabled={busy || !active || loading}
             aria-label={`${isBlocked ? "Unblock" : "Block"} ${agent.displayName} (${agent.id})`}
             onClick={() => onSetBlocked(agent, !isBlocked)}>{isBlocked ? "Unblock" : "Block"}</button>
         </WorkbenchActionGate> : null}
       </div>
     </div>
+    {detail?.accessReadError ? <p role="status">{detail.accessReadError} Access assignment editing is unavailable.</p> : null}
     {(["availability", "installation"] as const).map(setting => <div key={setting} hidden={target !== setting}>
       <AccessAssignmentEditor
         key={`${revision}:${initial ? "detail" : "summary"}:${readOnlyKey}:${reset[setting]}`}
@@ -53,7 +54,7 @@ export function AgentAccessManagement({ agent, detail, canManage, canEditAccess,
         initialStatus={setting === "availability" ? initial?.availableTo ?? agent.availableTo : initial?.deployedTo ?? agent.deployedTo}
         initialPrincipals={setting === "availability" ? initial?.allowedUsersAndGroups : initial?.acquireUsersAndGroups}
         active={active && target === setting}
-        readOnly={!canEditAccess || loading}
+        readOnly={!canEditAccess || loading || Boolean(detail?.accessReadError)}
         busy={busy}
         onTargetChange={setTarget}
         onCancel={() => setReset(current => ({ ...current, [setting]: current[setting] + 1 }))}

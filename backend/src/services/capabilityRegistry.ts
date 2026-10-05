@@ -139,7 +139,7 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "live_qualification", adapterRegistered: true, description: "Token readiness never runs hunting KQL; explicit Admin approval remains required for the bounded application-scope qualification lifecycle." },
   },
   {
-    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D30 per-user Microsoft 365 Copilot app activity report during Users sync.",
+    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D28 per-user Microsoft 365 Copilot app activity report during Users sync.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
     permissions: ["Reports.Read.All"], providerRoles: ["Company Administrator", "AI Administrator", "Exchange Administrator", "SharePoint Administrator", "Lync Administrator", "Teams Service Administrator", "Teams Communications Administrator", "Reports Reader"], licenses: [],
     configuration: ["Delegated consent", "Microsoft 365 usage report privacy settings can conceal user identities"],

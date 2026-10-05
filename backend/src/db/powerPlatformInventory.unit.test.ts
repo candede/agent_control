@@ -1,246 +1,142 @@
-import pg from "pg";
-import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
-import { powerPlatformResourceTypes, type InventoryRoleScope, type PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { nativeInventoryFixture, reconcileInventoryFixture, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
+import { LiveInventory } from "./liveInventory.js";
 
-const scope = { tenantId: "tenant-a", principalId: "reader-a" };
+let fixture: Awaited<ReturnType<typeof testDatabase>>;
+beforeAll(async () => { fixture = await testDatabase(); });
+afterAll(async () => { await fixture?.close(); });
 const agentType = "microsoft.copilotstudio/agents";
-const environmentType = "microsoft.powerplatform/environments";
-const snapshotId = "11111111-1111-4111-8111-111111111111";
-const botId = "22222222-2222-4222-8222-222222222222";
+const environmentId = "11111111-1111-4111-8111-111111111111";
+const nativeId = "native-a", botId = "22222222-2222-4222-8222-222222222222";
+const recordId = unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId });
+const owner = () => ({ tenantId: "native-current-contract", principalId: randomUUID() });
+const resource = (displayName = "Native agent") => ({
+  nativeId, environmentId, displayName, identifiers: [{ kind: "cds_bot_id" as const, value: botId }],
+});
 
-afterEach(() => vi.restoreAllMocks());
-
-function fixture() {
-  const database = new pg.Pool();
-  const snapshot = {
-    id: snapshotId, role_scope: "full", environment_scope: "", requested_types: [agentType], queried_types: [agentType],
-    observed_count: 1, total_records: 1, page_count: 1, unknown_field_count: 0,
-    observed_at: new Date(Date.now() - 1_000), expires_at: new Date(Date.now() + 60_000), selected_type: agentType,
-  };
-  const resource = { native_id: "native-a", resource_type: agentType, environment_id: "environment-a",
-    identifiers: [{ kind: "cds_bot_id", value: botId }] };
-  const state = { selected: [snapshot] };
-  const response = (rows: object[]) => ({ rows, rowCount: rows.length, command: "", oid: 0, fields: [] });
-  const query = vi.fn(async (text: unknown) => {
-    if (typeof text !== "string") throw new Error("Expected a SQL query.");
-    if (text.includes("SELECT DISTINCT ON (queried.type)")) return response(structuredClone(state.selected));
-    if (text.includes("SELECT DISTINCT native_id")) return response([resource]);
-    if (text.includes("AS unique_count")) return response([{
-      snapshot_id: snapshot.id, resource_type: agentType, count: 1, unique_count: 1, environment_matches: true,
-    }]);
-    throw new Error("Unexpected identity-read query.");
-  });
-  vi.spyOn(database, "query").mockImplementation(query);
-  return { database, repository: new PowerPlatformInventoryRepository(database), query, snapshot, state };
-}
-
-describe("current inventory identity candidates without a database", () => {
-  it("resolves verified current candidates and uses the supplied reader for every query", async () => {
-    const f = fixture();
-    const candidates = await new PowerPlatformInventoryRepository().readIdentityCandidates(scope, [agentType], f.database);
-    const source: InventoryIdentityRecord = { tenantId: scope.tenantId, nativeId: "audit-record",
-      environmentId: "environment-a", sourceSystem: "power_platform", resourceType: agentType,
-      identifiers: [{ kind: "cds_bot_id", value: botId }] };
-    expect(resolveExactInventoryIdentity(source, candidates)).toMatchObject({
-      status: "resolved", candidate: { nativeId: "native-a" }, matchedKind: "cds_bot_id",
+describe("current typed inventory identity reads", () => {
+  it("uses one repeatable-read client and evaluated time for exact membership and bounded identity candidates", async () => {
+    const scope = owner(), live = new LiveInventory(fixture.runtime);
+    await nativeInventoryFixture(fixture.runtime, scope, [resource()]);
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    await live.withRead(async read => {
+      expect((await read.client.query("SHOW transaction_isolation")).rows[0].transaction_isolation).toBe("repeatable read");
+      const record = await live.record(scope, recordId, read);
+      const candidates = await live.identityCandidates(scope, record, read);
+      expect(candidates).toEqual([expect.objectContaining({ tenantId: scope.tenantId, nativeId, environmentId,
+        identifiers: [{ kind: "cds_bot_id", value: botId }] })]);
+      expect(candidates.length).toBeLessThanOrEqual(6);
     });
-    expect(f.database.query).toHaveBeenCalledTimes(4);
-    for (const [, values] of vi.mocked(f.database.query).mock.calls) {
-      expect(values).toEqual(expect.arrayContaining([scope.tenantId, scope.principalId]));
-    }
+    await expect(live.record({ ...scope, principalId: randomUUID() }, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(live.record({ ...scope, tenantId: "other-tenant" }, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
-  it.each(["resource", "verification"] as const)("rejects replacement during the awaited %s read", async stage => {
-    const f = fixture();
-    const query = f.query.getMockImplementation()!;
-    f.query.mockImplementation(async text => {
-      const result = await query(text);
-      if (typeof text === "string" && text.includes(stage === "resource" ? "SELECT DISTINCT native_id" : "AS unique_count")) {
-        f.state.selected = [{ ...f.snapshot, id: "33333333-3333-4333-8333-333333333333" }];
-      }
-      return result;
+  it.each(["replace", "withdraw"] as const)("does not mix snapshots when another transaction performs a %s", async change => {
+    const scope = owner(), live = new LiveInventory(fixture.runtime);
+    await nativeInventoryFixture(fixture.runtime, scope, [resource("Before")]);
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    let release!: () => void, entered!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = live.withRead(async read => {
+      const first = await live.record(scope, recordId, read);
+      entered();
+      await barrier;
+      const second = await live.record(scope, recordId, read);
+      expect(second).toEqual(first);
+      return first;
     });
-    await expect(f.repository.readIdentityCandidates(scope, [agentType])).rejects.toMatchObject({
-      status: 409, code: "snapshot_invalidated",
-    });
+    await started;
+    try {
+      await nativeInventoryFixture(fixture.runtime, scope, change === "replace" ? [resource("After")] : [], { resourceTypes: [agentType] });
+      await reconcileInventoryFixture(fixture.runtime, scope);
+    } finally { release(); }
+    const before = await pending;
+    expect(before.displayName).toBe("Before");
+    if (change === "replace") expect((await live.record(scope, recordId)).displayName).toBe("After");
+    else await expect(live.record(scope, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(live.assertCurrent(scope, before.id, before.revision)).rejects.toMatchObject({ code: "inventory_changed" });
   });
 
-  it.each(["withdrawn", "additional type", "reassigned type"] as const)("rejects a %s selection after verification", async change => {
-    const f = fixture();
-    const query = f.query.getMockImplementation()!;
-    f.query.mockImplementation(async text => {
-      const result = await query(text);
-      if (typeof text === "string" && text.includes("AS unique_count")) {
-        f.state.selected = change === "withdrawn" ? []
-          : change === "additional type" ? [f.snapshot, { ...f.snapshot, selected_type: environmentType }]
-            : [{ ...f.snapshot, selected_type: environmentType }];
-      }
-      return result;
+  it("fences genuinely expired live authority even inside an already-open repeatable-read transaction", async () => {
+    const scope = owner(), live = new LiveInventory(fixture.runtime), expiresAt = new Date(Date.now() + 1500);
+    await nativeInventoryFixture(fixture.runtime, scope, [resource()], { expiresAt });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const before = await live.withRead(async read => {
+      const record = await live.record(scope, recordId, read);
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now()) + 20));
+      await expect(live.record(scope, recordId, read)).rejects.toMatchObject({ code: "agent_not_found" });
+      return record;
     });
-    await expect(f.repository.readIdentityCandidates(scope, [agentType, environmentType])).rejects.toMatchObject({
-      status: 409, code: "snapshot_invalidated",
-    });
+    await expect(live.record(scope, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(live.assertCurrent(scope, before.id, before.revision)).rejects.toMatchObject({ code: "inventory_changed" });
   });
 
-  it.each(["verification", "final selection"] as const)("rejects expiry during the awaited %s read", async stage => {
-    const f = fixture();
-    const query = f.query.getMockImplementation()!;
-    const clock = vi.spyOn(Date, "now");
-    let selections = 0;
-    f.query.mockImplementation(async text => {
-      const result = await query(text);
-      if (typeof text === "string") {
-        if (text.includes("SELECT DISTINCT ON (queried.type)")) selections += 1;
-        if (stage === "verification" && text.includes("AS unique_count") || stage === "final selection" && selections === 2) {
-          clock.mockReturnValue(f.snapshot.expires_at.getTime());
-        }
-      }
-      return result;
-    });
-    await expect(f.repository.readIdentityCandidates(scope, [agentType])).rejects.toMatchObject({
-      status: 409, code: "snapshot_invalidated",
-    });
-  });
-
-  it("does not mask failures in the final selection read", async () => {
-    const f = fixture();
-    const query = f.query.getMockImplementation()!;
-    const failure = new Error("Inventory selection failed.");
-    let selections = 0;
-    f.query.mockImplementation(async text => {
-      if (typeof text === "string" && text.includes("SELECT DISTINCT ON (queried.type)") && ++selections === 2) throw failure;
-      return query(text);
-    });
-    await expect(f.repository.readIdentityCandidates(scope, [agentType])).rejects.toBe(failure);
-  });
-
-  it("returns no candidates when no current authorized snapshot was selected", async () => {
-    const f = fixture();
-    f.state.selected = [];
-    await expect(f.repository.readIdentityCandidates(scope, [agentType])).resolves.toEqual([]);
-    expect(f.database.query).toHaveBeenCalledOnce();
+  it("propagates errors from the selected transaction without a secondary query or fallback", async () => {
+    const failure = new Error("synthetic-selected-read-failure");
+    await expect(new LiveInventory(fixture.runtime).withRead(async () => { throw failure; })).rejects.toBe(failure);
   });
 });
 
-function refreshFixture(roleScope: InventoryRoleScope = "full") {
-  const database = new pg.Pool();
-  const client = Object.assign(new pg.Client(), { release: vi.fn() });
-  const empty = { rows: [], rowCount: 0, command: "", oid: 0, fields: [] };
-  const job = {
-    id: "33333333-3333-4333-8333-333333333333", role_scope: roleScope, environment_scope: "",
-    requested_types: [...powerPlatformResourceTypes], status: "running",
-    page_count: 0, observed_count: 0, total_records: null, unknown_field_count: 0,
-    snapshot_id: null, error_code: null, message: null,
-    created_at: new Date(), attempted_at: new Date(), updated_at: new Date(), finished_at: null,
-    request_hash: createHash("sha256").update(JSON.stringify({
-      cloud: "global", roleScope, environmentScope: "", requestedTypes: powerPlatformResourceTypes,
-    })).digest("hex"),
-  };
-  const query = vi.spyOn(client, "query").mockRejectedValue(new Error("Unexpected refresh query."));
-  vi.spyOn(database, "connect").mockResolvedValue(client);
-  const read = vi.spyOn(database, "query").mockResolvedValue({ ...empty, rows: [job], rowCount: 1 });
-  return { job, client, query, read, empty, repository: new PowerPlatformInventoryRepository(database) };
-}
-
-describe("inventory request identity without a database", () => {
-  it.each(["full", "ai", "unknown"] as const)("replays a retained %s request after its optional role hint changes", async roleScope => {
-    const f = refreshFixture(roleScope);
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [f.job], rowCount: 1 }).mockResolvedValueOnce(f.empty);
-    await expect(f.repository.submit(scope, {
-      idempotencyKey: "retained", roleScope: roleScope === "unknown" ? "full" : "unknown",
-      requestedTypes: [...powerPlatformResourceTypes].reverse(),
-    })).resolves.toMatchObject({ id: f.job.id, roleScope });
-    expect(f.query.mock.calls.some(([sql]) => String(sql).includes("INSERT"))).toBe(false);
-    expect(f.query).toHaveBeenLastCalledWith("COMMIT");
+describe("active native refresh request identity", () => {
+  it.each(["full", "ai", "unknown"] as const)("replays a retained %s request without treating a new role hint as new query authority", async roleScope => {
+    const scope = owner(), jobs = new PowerPlatformRefreshJobs(fixture.runtime);
+    const first = await jobs.submit(scope, { idempotencyKey: "retained", roleScope, requestedTypes: powerPlatformResourceTypes });
+    const next = await jobs.submit(scope, { idempotencyKey: "retained", roleScope: roleScope === "full" ? "ai" : "full",
+      requestedTypes: [...powerPlatformResourceTypes].reverse() });
+    expect(next).toMatchObject({ id: first.id, roleScope });
+    expect((await jobs.listJobs(scope)).value).toHaveLength(1);
+    expect(await jobs.getJob({ ...scope, principalId: randomUUID() }, first.id)).toBeUndefined();
   });
 
   it.each([
-    { environmentScope: "environment-a", requestedTypes: powerPlatformResourceTypes },
-    { environmentScope: undefined, requestedTypes: [agentType] as PowerPlatformResourceType[] },
-  ])("still rejects a replay with different request scope: %j", async input => {
-    const f = refreshFixture();
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [f.job], rowCount: 1 }).mockResolvedValueOnce(f.empty);
-    await expect(f.repository.submit(scope, { idempotencyKey: "retained", roleScope: "full", ...input }))
+    { environmentScope: environmentId, requestedTypes: powerPlatformResourceTypes },
+    { requestedTypes: [agentType] as const },
+  ])("rejects an idempotent replay with a different executed scope: %j", async input => {
+    const scope = owner(), jobs = new PowerPlatformRefreshJobs(fixture.runtime);
+    await jobs.submit(scope, { idempotencyKey: "retained", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+    await expect(jobs.submit(scope, { idempotencyKey: "retained", roleScope: "unknown", ...input }))
       .rejects.toMatchObject({ code: "idempotency_mismatch" });
-    expect(f.read).not.toHaveBeenCalled();
-    expect(f.query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect((await jobs.listJobs(scope)).value).toHaveLength(1);
   });
 
-  it("rejects an expired replay rather than returning an undefined accepted job", async () => {
-    const f = refreshFixture();
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [f.job], rowCount: 1 }).mockResolvedValueOnce(f.empty);
-    f.read.mockResolvedValueOnce(f.empty);
-    await expect(f.repository.submit(scope, {
-      idempotencyKey: "expired", roleScope: "full", requestedTypes: powerPlatformResourceTypes,
-    })).rejects.toMatchObject({ status: 409, code: "inventory_job_expired" });
-    expect(f.query.mock.calls.some(([sql]) => String(sql).includes("INSERT"))).toBe(false);
+  it("refuses an expired retained job instead of returning an accepted undefined job", async () => {
+    const scope = owner(), jobs = new PowerPlatformRefreshJobs(fixture.runtime);
+    const job = await jobs.submit(scope, { idempotencyKey: "retained", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+    await fixture.operator.query(`UPDATE power_platform_refresh_jobs SET created_at=clock_timestamp()-interval '2 days',
+      expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, [job.id]);
+    await expect(jobs.submit(scope, { idempotencyKey: "retained", roleScope: "full", requestedTypes: powerPlatformResourceTypes }))
+      .rejects.toMatchObject({ code: "inventory_job_expired" });
   });
 
-  it.each(["full", "ai", "unknown"] as const)("uses one query hash when submitting a new %s request", async roleScope => {
-    const f = refreshFixture(roleScope);
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [{ count: 0 }], rowCount: 1 })
-      .mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty);
-    await f.repository.submit(scope, { idempotencyKey: "new", roleScope, requestedTypes: powerPlatformResourceTypes });
-    const hash = createHash("sha256").update(JSON.stringify({
-      cloud: "global", environmentScope: "", requestedTypes: powerPlatformResourceTypes,
-    })).digest("hex");
-    expect(f.query.mock.calls[4][1]).toEqual([
-      expect.any(String), scope.tenantId, scope.principalId, "new", hash, roleScope, "", JSON.stringify(powerPlatformResourceTypes),
-    ]);
+  it("uses one role-independent query hash for newly admitted equivalent requests", async () => {
+    const scope = owner(), jobs = new PowerPlatformRefreshJobs(fixture.runtime);
+    for (const roleScope of ["full", "ai", "unknown"] as const) {
+      await jobs.submit(scope, { idempotencyKey: roleScope, roleScope, requestedTypes: powerPlatformResourceTypes });
+    }
+    expect((await fixture.runtime.query(`SELECT request_hash FROM power_platform_refresh_jobs
+      WHERE tenant_id=$1 AND principal_id=$2 GROUP BY request_hash`, [scope.tenantId, scope.principalId])).rows).toHaveLength(1);
   });
 
-  it("checks newer work by requested types and environment, independent of retained role-derived hashes", async () => {
-    const f = refreshFixture();
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [f.job], rowCount: 1 })
-      .mockResolvedValueOnce({ ...f.empty, rows: [{ id: "newer-ai-hint-job" }], rowCount: 1 })
-      .mockResolvedValueOnce(f.empty);
-    await expect(f.repository.publish(scope, f.job.id, {
-      resources: [], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null,
-      totalRecords: 0, pages: 1, unknownFieldCount: 0,
-    })).rejects.toMatchObject({ code: "inventory_job_superseded" });
-    const [sql, values] = f.query.mock.calls[3];
-    expect(sql).toContain("environment_scope=$3");
-    expect(sql).toContain("requested_types=$4::jsonb");
-    expect(sql).toContain("status IN ('running','succeeded')");
-    expect(sql).not.toContain("request_hash=");
-    expect(sql).not.toContain("role_scope=");
-    expect(values).toEqual([scope.tenantId, scope.principalId, "", JSON.stringify(powerPlatformResourceTypes), f.job.id]);
-    expect(f.query).toHaveBeenLastCalledWith("ROLLBACK");
-    expect(f.read).not.toHaveBeenCalled();
-  });
-
-  it.each(["full", "ai", "unknown"] as const)("replaces equivalent snapshots across role hints when publishing a retained %s job", async roleScope => {
-    const f = refreshFixture(roleScope);
-    f.query.mockResolvedValueOnce(f.empty).mockResolvedValueOnce(f.empty)
-      .mockResolvedValueOnce({ ...f.empty, rows: [f.job], rowCount: 1 });
-    for (let index = 0; index < 5; index += 1) f.query.mockResolvedValueOnce(f.empty);
-    await f.repository.publish(scope, f.job.id, {
-      resources: [], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null,
-      totalRecords: 0, pages: 1, unknownFieldCount: 0,
-    });
-    const [sql, values] = f.query.mock.calls[4];
-    expect(sql).toContain("SET is_current=false");
-    expect(sql).toContain("environment_scope=$3");
-    expect(sql).toContain("requested_types=$4::jsonb");
-    expect(sql).not.toContain("query_hash=");
-    expect(sql).not.toContain("role_scope=");
-    expect(values).toEqual([scope.tenantId, scope.principalId, "", JSON.stringify(powerPlatformResourceTypes)]);
-    const hash = createHash("sha256").update(JSON.stringify({
-      cloud: "global", environmentScope: "", requestedTypes: powerPlatformResourceTypes,
-    })).digest("hex");
-    expect(f.query.mock.calls[5][1]).toEqual([
-      expect.any(String), f.job.id, scope.tenantId, scope.principalId, hash, roleScope, "",
-      JSON.stringify(powerPlatformResourceTypes), JSON.stringify(powerPlatformResourceTypes), 0, 0, 1, 0,
-    ]);
-    expect(f.query).toHaveBeenLastCalledWith("COMMIT");
-    expect(f.client.release).toHaveBeenCalledOnce();
+  it.each(["full", "ai", "unknown"] as const)("publishes one current root across %s role hints with atomic metadata-only jobs", async roleScope => {
+    const scope = owner(), jobs = new PowerPlatformRefreshJobs(fixture.runtime);
+    const first = await jobs.submit(scope, { idempotencyKey: "first", roleScope, requestedTypes: powerPlatformResourceTypes });
+    expect(await jobs.markRunning(scope, first.id)).toBe(true);
+    await refreshInventoryFixture(fixture.runtime, scope, first.id, "power_platform", [], [...powerPlatformResourceTypes]);
+    const second = await jobs.submit(scope, { idempotencyKey: "second", roleScope: "unknown", requestedTypes: powerPlatformResourceTypes });
+    expect(await jobs.markRunning(scope, second.id)).toBe(true);
+    const root = await refreshInventoryFixture(fixture.runtime, scope, second.id, "power_platform", [], [...powerPlatformResourceTypes]);
+    expect(await jobs.getJob(scope, second.id)).toMatchObject({ status: "succeeded", snapshotId: root.baselineId });
+    expect((await fixture.runtime.query(`SELECT r.baseline_id FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
+      WHERE r.current AND r.domain='power_platform' AND s.tenant_id=$1 AND s.principal_id=$2`, [scope.tenantId, scope.principalId])).rows)
+      .toEqual([{ baseline_id: root.baselineId }]);
+    const list = await jobs.listJobs(scope);
+    expect(list.value).toHaveLength(2);
+    expect(JSON.stringify(list)).not.toContain('"resources"');
+    expect(Buffer.byteLength(JSON.stringify(list))).toBeLessThan(4096);
   });
 });

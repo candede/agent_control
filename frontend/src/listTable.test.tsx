@@ -3,7 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { SortingState } from "@tanstack/react-table";
-import { restoreTableSortFocus, useListTable, type ListColumn } from "./listTable";
+import { useListTable, type ListColumn } from "./listTable";
 import { ListTableHead } from "./components/ListTableHead";
 
 type Item = { id: string; name: string; count?: number };
@@ -61,17 +61,5 @@ describe("shared list table", () => {
     await userEvent.click(screen.getByRole("button", { name: "Sort by Name" }));
     expect(onSort).toHaveBeenCalledWith([{ id: "name", desc: false }]);
     expect(names()).toEqual(["Unknown", "Ten", "Zero", "Two"]);
-  });
-
-  it("restores a removed header focus without stealing focus from another control", () => {
-    render(<><input aria-label="Search" /><Fixture /></>);
-    const table = screen.getByRole("table");
-    const heading = screen.getByRole("button", { name: "Sort by Name" });
-    restoreTableSortFocus(table, "Name");
-    expect(heading).toHaveFocus();
-    const input = screen.getByRole("textbox", { name: "Search" });
-    input.focus();
-    restoreTableSortFocus(table, "Name");
-    expect(input).toHaveFocus();
   });
 });

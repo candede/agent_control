@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseCsv } from "csv-parse/sync";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import { buildBoundedCsv, createExportPublicationValidator, csvValue, publishBoundedCsv } from "./csvExport.js";
+import { buildBoundedCsv, csvValue } from "./csvEncoding.js";
+import { createExportPublicationValidator, publishBoundedCsv } from "./csvExport.js";
 
 const storedSession = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("../db/pool.js", () => ({ pool: storedSession, secretValue: () => undefined }));
@@ -48,6 +49,28 @@ function transport() {
 }
 
 describe("bounded CSV publication", () => {
+  it.each([undefined, 3])("cleans listeners across many drain cycles and stops at disconnect %s", async disconnectAt => {
+    const { request, response } = transport();
+    const writes = vi.spyOn(response, "write").mockImplementation(chunk => {
+      response.writes.push(Buffer.from(chunk));
+      queueMicrotask(() => {
+        if (response.writes.length === disconnectAt) {
+          response.destroyed = true;
+          response.emit("close");
+        } else response.emit("drain");
+      });
+      return false;
+    });
+    const publication = publishBoundedCsv(request, response as unknown as Response, "fixture.csv", Buffer.alloc(52 * 1024), {
+      deadlineAt: Date.now() + 5000, chunkBytes: 1024, validate: async () => undefined,
+    });
+    if (disconnectAt) await expect(publication).rejects.toMatchObject({ code: "export_disconnected" });
+    else await publication;
+    expect(writes).toHaveBeenCalledTimes(disconnectAt ?? 52);
+    expect(response.writableFinished).toBe(!disconnectAt);
+    for (const event of ["drain", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+  });
+
   it("neutralizes formulas and quotes nonempty values", () => {
     expect(["=1", "+1", "-1", "@x", "\tcmd", "\rcmd", "−1"].map(csvValue)).toEqual([
       "\"'=1\"", "\"'+1\"", "\"'-1\"", "\"'@x\"", "\"'\tcmd\"", "\"'\rcmd\"", "\"'−1\"",

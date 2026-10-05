@@ -2,6 +2,7 @@ import session, { type SessionData } from "express-session";
 import type pg from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config, type TenantConfiguration } from "../config.js";
+import { DataGenerations } from "./dataGenerations.js";
 import { assertCurrentStoredSession, createSessionStore, getValidatedSessionIdentity, revokeAccountSessions } from "./sessions.js";
 
 vi.mock("connect-pg-simple", async () => {
@@ -18,7 +19,7 @@ const otherTenant: TenantConfiguration = {
   clientSecret: "fixture", domains: ["other.invalid"], displayName: "Second tenant",
 };
 const originalTenants = config.tenants;
-const database = { query: vi.fn(async () => ({ rowCount: 1, rows: [] })) } as unknown as pg.Pool;
+const database = { options: { max: 4 }, query: vi.fn(async () => ({ rowCount: 1, rows: [] })) } as unknown as pg.Pool;
 
 function data(selected = tenant): SessionData {
   return {
@@ -140,10 +141,20 @@ describe("configured tenant session persistence", () => {
   });
 
   it("revokes only the exact tenant and principal, even for a shared account ID", async () => {
+    const revoke = vi.spyOn(DataGenerations.prototype, "revokePrincipal").mockResolvedValueOnce("2");
     await revokeAccountSessions(database, otherTenant.tenantId, "same-account");
+    expect(revoke).toHaveBeenCalledExactlyOnceWith(otherTenant.tenantId, "same-account");
     expect(database.query).toHaveBeenCalledExactlyOnceWith(
       "DELETE FROM sessions WHERE tenant_id=$1 AND principal_id=$2", [otherTenant.tenantId, "same-account"],
     );
+    expect(revoke.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(database.query).mock.invocationCallOrder[0]);
+  });
+
+  it("does not remove sessions when durable principal revocation fails", async () => {
+    const failure = new Error("Principal epoch unavailable.");
+    vi.spyOn(DataGenerations.prototype, "revokePrincipal").mockRejectedValueOnce(failure);
+    await expect(revokeAccountSessions(database, otherTenant.tenantId, "same-account")).rejects.toBe(failure);
+    expect(database.query).not.toHaveBeenCalled();
   });
 
   it("binds current-session publication checks to the configured client and stored principal", async () => {

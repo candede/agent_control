@@ -3,7 +3,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { CopilotStudioQuarantineCanaryRepository } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository } from "../db/copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
+import { refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { powerPlatformInventoryRecord } from "./inventoryRecordProjection.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotStudioQuarantineCanaryService } from "./copilotStudioQuarantineCanaries.js";
 
@@ -32,16 +34,17 @@ async function approvals(administrator: AuthenticatedUser) {
 }
 
 async function seedOperatorInventory(operator: AuthenticatedUser) {
-  const inventory = new PowerPlatformInventoryRepository(fixture.runtime);
+  const inventory = new PowerPlatformRefreshJobs(fixture.runtime);
   const scope = { tenantId: operator.tenantId!, principalId: operator.homeAccountId };
   const job = await inventory.submit(scope, { idempotencyKey: `canary-operator-${randomUUID()}`, roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
   await inventory.markRunning(scope, job.id);
-  await inventory.publish(scope, job.id, { resources: [{ tenantId: operator.tenantId!, nativeId: target.resourceNativeId, type: "microsoft.copilotstudio/agents",
+  await refreshInventoryFixture(fixture.runtime, scope, job.id, "power_platform", [powerPlatformInventoryRecord({
+    tenantId: operator.tenantId!, nativeId: target.resourceNativeId, type: "microsoft.copilotstudio/agents",
     location: null, displayName: target.displayName, environmentId: target.environmentId, createdAt: null, createdBy: null, lastPublishedAt: null,
     sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published",
     identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: target.resourceNativeId },
-      { kind: "environment_id", value: target.environmentId }, { kind: "cds_bot_id", value: target.botId }], provenance: {}, details: {}, unknownFieldCount: 0 }],
-    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+      { kind: "environment_id", value: target.environmentId }, { kind: "cds_bot_id", value: target.botId }], provenance: {}, details: {}, unknownFieldCount: 0,
+  })], ["microsoft.copilotstudio/agents"]);
   return (await inventory.getJob(scope, job.id))!.snapshotId!;
 }
 

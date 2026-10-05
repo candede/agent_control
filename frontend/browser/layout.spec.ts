@@ -1,17 +1,18 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import { usageOverviewFixture } from "../src/test/usageInsightsFixture";
+import { selectedHistoryPage, selectedOverviewPage } from "../src/test/selectedUsageFixture";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { collectLayoutFailures } from "./layoutGeometry";
+import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 const viewports = [360, 768, 1280, 1920];
 const cases = [
   { name: "agents", path: "/agents", ready: ".agent-table-stack tbody tr",
     fields: [".agent-filter-fields"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
-    fields: [".copilot-users-toolbar"] },
-  { name: "report-snapshot", path: "/sync?reports=snapshot", ready: ".usage-agent-table tbody tr",
-    fields: [".usage-agent-filters"] },
+    fields: [".user-activity-controls .agent-query-bar"] },
+  { name: "report-snapshot", path: "/sync?reports=snapshot", ready: ".reporting-view tbody tr",
+    fields: [".report-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
   { name: "user-purview", path: "/users", ready: ".copilot-users-table tbody tr",
@@ -80,7 +81,7 @@ for (const scenario of cases) {
       await expect(page.getByRole("dialog")).toHaveCount(1);
       await expect(page.locator("dialog.official-usage-modal")).toBeVisible();
       await expect(page.locator("dialog.official-usage-modal").getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
-      await expect(page.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(2);
+      await expect(page.getByRole("region", { name: "Reported agent activity" }).locator("tbody tr")).toHaveCount(2);
       await expect(page.locator(".report-chart-panel")).toHaveCount(0);
     }
     if (scenario.name === "agents") {
@@ -137,10 +138,10 @@ for (const scenario of cases) {
             expect(second.x).toBeGreaterThanOrEqual(first.x + first.width);
           }
           const modal = page.locator("dialog.official-usage-modal");
-          await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport({ ratio: 1 });
+          await expect(modal.getByRole("button", { name: "Back to reports", exact: true })).toBeInViewport({ ratio: 1 });
           expect(await modal.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
           if (width >= 1280) {
-            const bounds = await page.getByRole("region", { name: "Report agent rows" }).boundingBox();
+            const bounds = await page.getByRole("region", { name: "Reported agent activity" }).boundingBox();
             expect(bounds!.y, `Source rows begin in the first viewport at ${width}px`).toBeLessThan(760);
           }
         }
@@ -206,22 +207,23 @@ test("Agents workspace places the real saved-inventory table within 330px on des
 
 test("the compact metric strip distinguishes unavailable sources and missing reports from zero", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
-  const reports = usageOverviewFixture();
-  await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
-    ...unifiedAgents, value: [], count: 0,
+  const reports = selectedOverviewPage();
+  const metadata = { ...reports.reports, setId: null, activeSetId: null, activeRevision: "0", availability: "never_imported" as const, lineages: [] };
+  await page.route("**/api/agent-inventory?*", route => fulfillInventoryPage(route, {
+    ...unifiedAgents, value: [], counts: { total: 0, scoped: 0, filtered: 0, packageTargets: 0 },
+    usageContext: { revision: "a".repeat(64), expiresAt: metadata.expiresAt, reports: metadata },
     sources: {
       ...unifiedAgents.sources,
       graphPackages: { state: "unavailable", observation: null, error: {
         source: "graph_packages", code: "snapshot_unavailable", message: "No saved package catalog is available.",
       } },
     },
-  } }));
+  }));
   await page.route("**/api/official-usage/overview?*", route => route.fulfill({ json: {
-    ...reports, summary: { ...reports.summary, retainedSets: 0, usedAgents: 0, activeAgents30Days: 0 },
+    ...reports, reports: metadata, value: [], counts: { total: 0, filtered: 0 },
+    analytics: { ...reports.analytics, overview: { ...reports.analytics.overview!, retainedSets: 0, usedAgents: 0, active30Days: 0 } },
   } }));
-  await page.route("**/api/official-usage/admin", route => route.fulfill({ json: {
-    activeSetId: null, activeRevision: 0, sets: [], staging: [],
-  } }));
+  await page.route("**/api/official-usage/history?*", route => route.fulfill({ json: { ...selectedHistoryPage([], null), reports: metadata } }));
   await page.goto("/agents");
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
   await expect(overview.locator(".metric")).toHaveCount(4);
@@ -242,10 +244,10 @@ test("the compact metric strip distinguishes unavailable sources and missing rep
 test("empty agent results keep the same toolbar and reachable filter dialog without document overflow", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));
-  await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
-    ...unifiedAgents, value: [], count: 0,
+  await page.route("**/api/agent-inventory?*", route => fulfillInventoryPage(route, {
+    ...unifiedAgents, value: [], counts: { ...unifiedAgents.counts, filtered: 0, packageTargets: 0 },
     filteredSummary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
-  } }));
+  }));
   await page.goto("/agents?q=no-matching-agent");
   const empty = page.getByRole("heading", { name: "No matching agents", exact: true });
   const toolbar = page.getByRole("region", { name: "Unified agents" }).locator(".agent-grid-toolbar");

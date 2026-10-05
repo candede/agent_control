@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, Info, Lock, LockOpen, ShieldCheck } fr
 import { columnVisibilityFeature, rowSortingFeature, tableFeatures, useTable, type CellContext, type ColumnDef, type ColumnVisibilityState } from "@tanstack/react-table";
 import { agentColumnValue, agentStatusLabels } from "../../../backend/src/types/agentPresentation";
 import type { UnifiedAgentSort, UnifiedAgentSortDirection } from "../../../backend/src/types/unifiedAgents";
-import type { AgentUsageContext } from "../../../backend/src/types/agentUsage";
+import type { InventoryReportContext } from "../../../backend/src/types/unifiedAgents";
 import type { UnifiedAgentRecord } from "../api/client";
 import { agentColumns, defaultAgentColumnVisibility, isAgentSort, loadAgentColumns, saveAgentColumns, type AgentColumnFormat } from "../agentColumns";
 import { quarantineTargetKey, quarantineTargetReason } from "../quarantineTarget";
@@ -19,9 +19,14 @@ const emptyEnvironmentNames: Record<string, string> = {};
 type Props = {
   records: UnifiedAgentRecord[];
   controls?: ReactNode;
+  selectionAction?: ReactNode;
   loading?: boolean;
+  emptyState?: ReactNode;
   busyPackageId?: string;
   selectedPackageIds: Set<string>;
+  selectedPackageCount: number;
+  allPackagesSelected: boolean;
+  selectedRecordIds?: ReadonlySet<string>;
   selectedPowerPlatformKeys: Set<string>;
   packageSelectionAllowed: boolean;
   packageOperationsAllowed: boolean;
@@ -34,7 +39,7 @@ type Props = {
   sortBy?: UnifiedAgentSort;
   sortDirection?: UnifiedAgentSortDirection;
   onSortChange?: (sortBy: UnifiedAgentSort, direction: UnifiedAgentSortDirection) => void;
-  usageContext?: AgentUsageContext;
+  usageContext?: InventoryReportContext;
   onToggleSelection: (record: UnifiedAgentRecord) => void;
   onViewDetails: (record: UnifiedAgentRecord) => void;
   onManageAccess: (record: UnifiedAgentRecord) => void;
@@ -50,7 +55,7 @@ type AgentRow = {
   quarantineReason: string | undefined;
 };
 
-type AgentTableActions = Pick<Props, "busyPackageId" | "packageOperationsAllowed" | "quarantineSelectionAllowed" | "quarantineSelectionRestoring" | "selectionDisabled" | "packageActionsDisabled" | "onToggleSelection" | "onViewDetails" | "onManageAccess" | "onSetBlocked">;
+type AgentTableActions = Pick<Props, "busyPackageId" | "packageOperationsAllowed" | "quarantineSelectionAllowed" | "quarantineSelectionRestoring" | "selectionDisabled" | "allPackagesSelected" | "packageActionsDisabled" | "onToggleSelection" | "onViewDetails" | "onManageAccess" | "onSetBlocked">;
 const AgentTableActionsContext = createContext<AgentTableActions | undefined>(undefined);
 
 // Stable cell components preserve focus and in-flight clicks when action state changes.
@@ -63,6 +68,7 @@ const columns: ColumnDef<typeof features, AgentRow>[] = [
       id, header: definition.label,
       accessorFn: row => {
         try {
+          if (row.record.columns && id in row.record.columns) return row.record.columns[id];
           if (definition.group === "Usage" && !row.usageMatchesReport) return null;
           return id === "environment" ? row.environmentName : agentColumnValue(row.record, id);
         } catch (error) {
@@ -82,9 +88,14 @@ const columns: ColumnDef<typeof features, AgentRow>[] = [
 export function UnifiedAgentTable({
   records,
   controls,
+  selectionAction,
   loading = false,
+  emptyState,
   busyPackageId,
   selectedPackageIds,
+  selectedPackageCount,
+  allPackagesSelected,
+  selectedRecordIds,
   selectedPowerPlatformKeys,
   packageSelectionAllowed,
   packageOperationsAllowed,
@@ -108,19 +119,22 @@ export function UnifiedAgentTable({
     setPreferences({ owner: columnPreferenceOwner, ...loadAgentColumns(columnPreferenceOwner) });
   }
   const rows = useMemo(() => records.map(record => {
-    const packageIds = packageSelectionAllowed ? [...new Set(record.packages.map(item => item.id))] : [];
+    const grouped = packageSelectionAllowed && record.packagesComplete === false;
+    const packageIds = packageSelectionAllowed && !grouped ? [...new Set(record.packages.map(item => item.id))] : [];
+    const packageCount = grouped ? record.packageCount! : packageIds.length;
     const quarantineReason = quarantineTargetReason(record.powerPlatformResource ?? undefined, record.observations.powerPlatform);
     const quarantineSelectable = quarantineSelectionAllowed && !quarantineReason;
-    const selectableCount = packageIds.length + Number(quarantineSelectable);
-    const selectedCount = packageIds.filter(id => selectedPackageIds.has(id)).length
+    const selectableCount = packageCount + Number(quarantineSelectable);
+    const selectedCount = (allPackagesSelected ? packageCount
+      : grouped ? selectedRecordIds?.has(record.id) ? packageCount : 0 : packageIds.filter(id => selectedPackageIds.has(id)).length)
       + Number(quarantineSelectable && record.powerPlatformResource !== null
         && selectedPowerPlatformKeys.has(quarantineTargetKey(record.powerPlatformResource)));
     const environmentName = record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : null;
-    const usageMatchesReport = Boolean(usageContext?.reportSet?.complete
-      && (usageContext.availability === "active" || usageContext.availability === "stale")
-      && record.usage?.reportSetId === usageContext.reportSet.id);
+    const usageMatchesReport = Boolean(usageContext?.reports.setId
+      && (usageContext.reports.availability === "active" || usageContext.reports.availability === "stale")
+      && record.usage?.reportSetId === usageContext.reports.setId);
     return { record, usageMatchesReport, environmentName, selectableCount, selectedCount, quarantineReason };
-  }), [records, usageContext, environmentNames, packageSelectionAllowed, quarantineSelectionAllowed, selectedPackageIds, selectedPowerPlatformKeys]);
+  }), [records, usageContext, environmentNames, packageSelectionAllowed, quarantineSelectionAllowed, selectedPackageIds, selectedRecordIds, selectedPowerPlatformKeys, allPackagesSelected]);
   const selectedAgents = rows.filter(row => row.selectedCount > 0).length;
   function changeVisibility(updater: ColumnVisibilityState | ((current: ColumnVisibilityState) => ColumnVisibilityState)) {
     const next = typeof updater === "function" ? updater(preferences.visibility) : updater;
@@ -152,11 +166,12 @@ export function UnifiedAgentTable({
   const showUsageContext = agentColumns.some(column => column.group === "Usage" && requiredColumn(column.id).getIsVisible());
 
   return (
-    <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, packageActionsDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
+    <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, allPackagesSelected, packageActionsDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
     <div className="agent-grid" role="region" aria-label="Unified agents">
       <div className="agent-grid-toolbar">
         <div className="agent-grid-tools">
         {controls}
+        {selectionAction}
         <AgentColumnPicker columns={agentColumns.map(definition => {
           const column = requiredColumn(definition.id);
           return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
@@ -166,18 +181,19 @@ export function UnifiedAgentTable({
           ? "Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero."
           : undefined}>
           {showUsageContext && usageContext
-            ? <>{usageCoverageLabel(usageContext.reportSet)}{usageContext.availability !== "active" ? ` · ${usageAvailabilityLabel(usageContext.availability)}` : ""}</>
+            ? <>{usageCoverageLabel(usageContext.reports)}{usageContext.reports.availability !== "active" ? ` · ${usageAvailabilityLabel(usageContext.reports.availability)}` : ""}</>
             : "Choose columns; sort using column headings."}
         </span> : null}
       </div>
       {preferences.error ? <p className="notice" role="status">{preferences.error}</p> : null}
-      {selectedAgents > 0 || packageSelectionAllowed && selectedPackageIds.size > 0 || quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <div className="selection-summary">
+      {selectedAgents > 0 || packageSelectionAllowed && selectedPackageCount > 0 || quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <div className="selection-summary">
         {selectedAgents > 0 ? <span>{selectedAgents} agent{selectedAgents === 1 ? "" : "s"} selected on this page</span> : null}
-        {packageSelectionAllowed && selectedPackageIds.size > 0 ? <span>{selectedPackageIds.size} published version{selectedPackageIds.size === 1 ? "" : "s"} selected</span> : null}
+        {packageSelectionAllowed && selectedPackageCount > 0 ? <span>{selectedPackageCount} published version{selectedPackageCount === 1 ? "" : "s"} selected</span> : null}
+        {packageSelectionAllowed && (selectedRecordIds?.size ?? 0) > 0 ? <span>{selectedRecordIds!.size} complete published-version groups selected</span> : null}
         {quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <span>{selectedPowerPlatformKeys.size} exact quarantine target{selectedPowerPlatformKeys.size === 1 ? "" : "s"} selected</span> : null}
       </div> : null}
       {loading ? <div className="screen-state" role="status">Loading Copilot agents...</div>
-        : records.length === 0 ? <div className="empty-state"><h2>No matching agents</h2><p>Try clearing the search or filters.</p></div> : <div className="table-shell">
+        : records.length === 0 ? <div className="empty-state">{emptyState ?? <><h2>No matching agents</h2><p>Try clearing the search or filters.</p></>}</div> : <div className="table-shell">
         <table className="agent-table unified-agent-table" style={{ minWidth: Math.max(520, table.getVisibleLeafColumns().length * 145) }}>
           <thead>{table.getHeaderGroups().map(group => <tr key={group.id}>{group.headers.map(header => {
             const sorted = header.column.getIsSorted();
@@ -213,19 +229,19 @@ function useAgentTableActions() {
 }
 
 function AgentSelectionCell({ row }: CellContext<typeof features, AgentRow>) {
-  const { quarantineSelectionRestoring, quarantineSelectionAllowed, selectionDisabled, onToggleSelection } = useAgentTableActions();
+  const { quarantineSelectionRestoring, quarantineSelectionAllowed, selectionDisabled, allPackagesSelected, onToggleSelection } = useAgentTableActions();
   const { record, selectableCount, selectedCount, quarantineReason } = row.original;
   const restoringSelection = quarantineSelectionRestoring && quarantineSelectionAllowed && !quarantineReason;
   return <SelectionCheckbox
     label={`Select ${record.displayName}`}
-    title={restoringSelection
+    title={allPackagesSelected ? "Clear the all-matching package selection before selecting individual agent targets." : restoringSelection
       ? "Restoring saved quarantine selections. Clear the saved selection to cancel."
       : selectableCount === 0
         ? (quarantineSelectionAllowed && record.powerPlatformResource ? quarantineReason : undefined) ?? "No selectable controls are available for this agent."
         : "Select this agent's available targets"}
     checked={selectableCount > 0 && selectedCount === selectableCount}
     indeterminate={selectedCount > 0 && selectedCount < selectableCount}
-    disabled={selectionDisabled || restoringSelection || selectableCount === 0}
+    disabled={selectionDisabled || allPackagesSelected || restoringSelection || selectableCount === 0}
     onChange={() => onToggleSelection(record)}
   />;
 }
@@ -261,10 +277,6 @@ function SelectionCheckbox({ label, title, checked, indeterminate, disabled, onC
     if (ref.current) ref.current.indeterminate = indeterminate;
   }, [indeterminate]);
   return <input ref={ref} type="checkbox" aria-label={label} title={title} checked={checked} disabled={disabled} onChange={disabled ? undefined : onChange} />;
-}
-
-export function AgentAuthoringTools({ record }: { record: UnifiedAgentRecord }) {
-  return <>{agentColumnValue(record, "builtWith") ?? "Unknown"}</>;
 }
 
 export function AgentAvailability({ record }: { record: UnifiedAgentRecord }) {

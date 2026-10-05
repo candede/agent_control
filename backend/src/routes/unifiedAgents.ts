@@ -1,9 +1,13 @@
 import { Router } from "express";
+import type pg from "pg";
 import { randomUUID } from "node:crypto";
 import { AppError } from "../errors.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { requestScope } from "../middleware/auth.js";
-import { unifiedAgents } from "../services/unifiedAgents.js";
+import { LiveInventory } from "../db/liveInventory.js";
+import { pool } from "../db/pool.js";
+import { AgentIdentityRepository } from "../db/agentIdentity.js";
+import { PurviewAuditRepository } from "../db/purviewAudit.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
 import {
   parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys, unifiedAgentViews,
@@ -11,20 +15,31 @@ import {
 } from "../types/unifiedAgents.js";
 import { isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
-import { getAuditLog } from "../services/auditLog.js";
-import { createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
-import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
-import { agentPeople } from "../services/agentPeople.js";
-import { savedAgentPeople } from "../services/savedAgentPeople.js";
+import { AuditLog } from "../services/auditLog.js";
+import { AgentPeopleService } from "../services/agentPeople.js";
+import { SavedAgentPeopleService } from "../services/savedAgentPeople.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
-import { agentInvestigations, investigationRecordId } from "../services/agentInvestigations.js";
-import { purviewAudit } from "../services/purviewAudit.js";
+import { AgentInvestigationsService, investigationRecordId } from "../services/agentInvestigations.js";
+import { PurviewAuditService } from "../services/purviewAudit.js";
 import { purviewAuditPresets } from "../types/purviewAudit.js";
 import type { AgentPurviewQuery } from "../types/agentInvestigations.js";
-import { agentIdentityResolution } from "../services/agentIdentityResolution.js";
+import { AgentIdentityResolutionService } from "../services/agentIdentityResolution.js";
+import { decodeInventoryFacet } from "../types/inventoryFacets.js";
 
-export const unifiedAgentsRouter = Router();
+export function createUnifiedAgentsRouter(database: pg.Pool = pool, dependencies: Partial<{
+  inventory: LiveInventory; investigations: Pick<AgentInvestigationsService, "resolve">;
+  identities: Pick<AgentIdentityResolutionService, "resolve">; people: Pick<AgentPeopleService, "generation" | "resolve">;
+  savedPeople: Pick<SavedAgentPeopleService, "read">; purview: Pick<PurviewAuditService, "agentRecords">;
+}> = {}) {
+const unifiedAgentsRouter = Router();
+const liveInventory = dependencies.inventory ?? new LiveInventory(database);
+const mappings = new AgentIdentityRepository(database);
+const agentInvestigations = dependencies.investigations ?? new AgentInvestigationsService(liveInventory, liveInventory, mappings);
+const agentIdentityResolution = dependencies.identities ?? new AgentIdentityResolutionService({ inventory: agentInvestigations, repository: mappings });
+const agentPeople = dependencies.people ?? new AgentPeopleService(database);
+const savedAgentPeople = dependencies.savedPeople ?? new SavedAgentPeopleService(database);
+const purviewAudit = dependencies.purview ?? new PurviewAuditService(new PurviewAuditRepository(database));
 
 policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/investigations/resolve", {
   access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], csrf: true,
@@ -56,65 +71,17 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview
 }, async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   const { recordId, query } = agentPurviewQuery(request.query);
-  const audit = getAuditLog(requestScope(request));
+  const audit = new AuditLog(requestScope(request), database);
   const event = await audit.startEvent({ operationId: `view-audit-search:${randomUUID()}`, scope: "single", action: "view-audit-search", agentId: recordId,
     actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
   try {
-    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query);
+    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query, agentInvestigations.resolve.bind(agentInvestigations));
     await audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } });
     response.json(result);
   } catch (error) {
     await audit.completeEvent(event.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_read_failed" });
     throw error;
   }
-});
-
-export function agentPurviewQuery(value: Record<string, unknown>): { recordId: string; query: AgentPurviewQuery } {
-  const invalid = () => new AppError(400, "invalid_agent_investigation", "Use bounded saved-agent Purview paging, search and operations.");
-  if (Object.keys(value).some(key => !["recordId", "limit", "offset", "search", "operation"].includes(key))) throw invalid();
-  const integer = (key: "limit" | "offset", fallback: number, maximum: number) => {
-    if (value[key] === undefined) return fallback;
-    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
-    const number = Number(value[key]);
-    if (!Number.isSafeInteger(number) || number > maximum || number < (key === "limit" ? 1 : 0)) throw invalid();
-    return number;
-  };
-  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
-  if (value.operation !== undefined && (typeof value.operation !== "string" || value.operation.length > 128
-    || !purviewAuditPresets.copilot_studio_admin.operationFilters.includes(value.operation))) throw invalid();
-  return { recordId: investigationRecordId(value.recordId), query: { limit: integer("limit", 50, 100), offset: integer("offset", 0, 100_000),
-    ...(typeof value.search === "string" && value.search.trim() ? { search: value.search.trim() } : {}),
-    ...(typeof value.operation === "string" ? { operation: value.operation } : {}) } };
-}
-
-policyRoute(unifiedAgentsRouter, "get", "/agent-responsibility", {
-  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
-}, async (request, response) => {
-  response.json(await unifiedAgents.responsibility(requestScope(request), agentResponsibilityQuery(request.query)));
-});
-
-export function agentResponsibilityQuery(value: Record<string, unknown>): AgentResponsibilityQuery {
-  const invalid = () => new AppError(400, "invalid_responsibility_query", "Use an exact directory object ID and bounded responsibility paging/search.");
-  if (Object.keys(value).some(key => !["objectId", "search", "offset", "limit"].includes(key))) throw invalid();
-  if (value.objectId !== undefined && (typeof value.objectId !== "string" || !isDirectoryObjectId(value.objectId))) throw invalid();
-  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
-  const integer = (key: string, maximum: number, fallback: number) => {
-    if (value[key] === undefined) return fallback;
-    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
-    const number = Number(value[key]);
-    if (!Number.isSafeInteger(number) || number > maximum || (key === "limit" && number < 1)) throw invalid();
-    return number;
-  };
-  return { objectId: typeof value.objectId === "string" ? value.objectId.toLowerCase() : undefined,
-    search: value.search as string | undefined, offset: integer("offset", 30_000, 0), limit: integer("limit", 100, 50) };
-}
-
-policyRoute(unifiedAgentsRouter, "get", "/agent-inventory", {
-  access: "authenticated",
-  dataClass: "private_inventory",
-  roles: ["AgentControl.Viewer"],
-}, async (request, response) => {
-  response.json(await unifiedAgents.list(requestScope(request), unifiedAgentInventoryQuery(request.query)));
 });
 
 policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
@@ -135,22 +102,64 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
     assertCurrent();
     const generation = await agentPeople.generation(scope);
     assertCurrent();
-    const page = await unifiedAgents.list(scope, { recordId: input.recordId, limit: 1 });
+    const record = await liveInventory.record(scope, input.recordId);
     assertCurrent();
-    if (page.count !== 1 || !page.value[0]) throw new AppError(404, "agent_not_found", "The saved agent is unavailable.");
-    const record = page.value[0];
-    const ids = [record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
-      record.powerPlatformResource?.details.lastModifiedBy]
+    const ids = Object.values(record.people)
       .filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id));
     const result = await agentPeople.resolve(request.session.user!, ids, { generation, force: input.force, signal: controller.signal });
     assertCurrent();
-    const [updated] = await savedAgentPeople.project(scope, [record]);
+    await liveInventory.assertCurrent(scope, record.id, record.revision);
+    const evidence = await savedAgentPeople.read(scope, ids);
     assertCurrent();
-    response.json({ people: updated.people, changed: result.changed });
+    response.json({ people: Object.fromEntries(Object.entries(record.people).flatMap(([role, objectId]) => {
+      const person = evidence.get(objectId.toLowerCase());
+      return person ? [[role, person]] : [];
+    })), changed: result.changed });
   } finally {
     response.off("close", disconnected);
   }
 });
+
+return unifiedAgentsRouter;
+}
+
+export function agentPurviewQuery(value: Record<string, unknown>): { recordId: string; query: AgentPurviewQuery } {
+  const invalid = () => new AppError(400, "invalid_agent_investigation", "Use bounded saved-agent Purview paging, search and operations.");
+  if (Object.keys(value).some(key => !["recordId", "limit", "offset", "search", "operation"].includes(key))) throw invalid();
+  const integer = (key: "limit" | "offset", fallback: number, maximum: number) => {
+    if (value[key] === undefined) return fallback;
+    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
+    const number = Number(value[key]);
+    if (!Number.isSafeInteger(number) || number > maximum || number < (key === "limit" ? 1 : 0)) throw invalid();
+    return number;
+  };
+  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
+  if (value.operation !== undefined && (typeof value.operation !== "string" || value.operation.length > 128
+    || !purviewAuditPresets.copilot_studio_admin.operationFilters.includes(value.operation))) throw invalid();
+  return { recordId: investigationRecordId(value.recordId), query: { limit: integer("limit", 50, 100), offset: integer("offset", 0, 100_000),
+    ...(typeof value.search === "string" && value.search.trim() ? { search: value.search.trim() } : {}),
+    ...(typeof value.operation === "string" ? { operation: value.operation } : {}) } };
+}
+
+export function agentResponsibilityQuery(value: Record<string, unknown>): AgentResponsibilityQuery {
+  const invalid = () => new AppError(400, "invalid_responsibility_query", "Use an exact directory object ID and bounded responsibility paging/search.");
+  if (Object.keys(value).some(key => !["objectId", "search", "selectionId", "cursor", "limit"].includes(key))) throw invalid();
+  if (value.objectId !== undefined && (typeof value.objectId !== "string" || !isDirectoryObjectId(value.objectId))) throw invalid();
+  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
+  if (value.selectionId !== undefined && (typeof value.selectionId !== "string" || !isDirectoryObjectId(value.selectionId))) throw invalid();
+  if (value.cursor !== undefined && (typeof value.cursor !== "string" || !value.cursor.length || value.cursor.length > 4096
+    || !value.selectionId || /[\0\r\n]/.test(value.cursor))) throw invalid();
+  const integer = (key: string, maximum: number, fallback: number) => {
+    if (value[key] === undefined) return fallback;
+    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
+    const number = Number(value[key]);
+    if (!Number.isSafeInteger(number) || number > maximum || (key === "limit" && number < 1)) throw invalid();
+    return number;
+  };
+  return { objectId: typeof value.objectId === "string" ? value.objectId.toLowerCase() : undefined,
+    search: value.search as string | undefined, selectionId: value.selectionId as string | undefined,
+    cursor: value.cursor as string | undefined, limit: integer("limit", 100, 50) };
+}
 
 export function agentPeopleResolveInput(value: unknown): { recordId: string; force: boolean } {
   if (!isRecord(value) || Object.keys(value).some(key => !["recordId", "force"].includes(key))
@@ -161,97 +170,15 @@ export function agentPeopleResolveInput(value: unknown): { recordId: string; for
   return { recordId: exactRecordId(value.recordId)!, force: value.force === true };
 }
 
-policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/export.csv", {
-  access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Viewer"], csrf: true,
-}, async (request, response) => {
-  const input = unifiedAgentExportInput(request.body);
-  const scope = requestScope(request);
-  const deadlineAt = Date.now() + 15_000;
-  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-  const audit = getAuditLog(scope);
-  const event = await audit.startEvent({
-    operationId: `export-agent-inventory:${randomUUID()}`, scope: "bulk", action: "export-agent-inventory",
-    agentId: "unified-agent-inventory", actor: request.session.user!, requestPath: request.path,
-    metadata: { source: "unified_agents", revision: input.revision, selection: input.recordIds ? "exact" : "filtered" },
-  });
-  try {
-    await validateSession();
-    const inventory = await unifiedAgents.forExport(scope, input.revision, input.query, input.recordIds);
-    const referenceSelection = input.query.operationIdPrefix ? JSON.stringify(inventory.value.map(record => record.id)) : undefined;
-    const validate = () => validateSession(async () => {
-      await unifiedAgents.assertRevision(scope, input.revision, inventory.usageContext?.expiresAt);
-      if (referenceSelection !== undefined) {
-        const current = await unifiedAgents.forExport(scope, input.revision, input.query, input.recordIds);
-        if (JSON.stringify(current.value.map(record => record.id)) !== referenceSelection) {
-          throw new AppError(409, "dataset_invalidated", "The authorized operation-reference selection changed before export publication.");
-        }
-      }
-    });
-    const csv = buildUnifiedAgentCsv(inventory, deadlineAt);
-    await publishBoundedCsv(request, response, "agents.csv", csv.buffer, {
-      deadlineAt, validate,
-      beforeEnd: () => audit.completeEvent(event.id, {
-        status: "succeeded", metadata: {
-          source: "unified_agents", revision: input.revision, resultingCount: csv.rowCount,
-          resultingBytes: csv.byteCount, partial: inventory.partial, selection: input.recordIds ? "exact" : "filtered",
-        },
-      }).then(() => undefined),
-    });
-  } catch (error) {
-    await audit.completeEvent(event.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "agent_export_failed" });
-    if (response.headersSent) {
-      if (!response.destroyed) response.destroy();
-      return;
-    }
-    throw error;
-  }
-});
-
-export function unifiedAgentExportInput(value: unknown): { revision: string; query: UnifiedAgentInventoryQuery; recordIds?: string[] } {
-  if (!isRecord(value) || Object.keys(value).some(key => !["revision", "query", "recordIds"].includes(key))) {
-    throw new AppError(400, "invalid_export_selection", "Agent export requires a saved revision and either filters or exact agent references.");
-  }
-  if (typeof value.revision !== "string" || value.revision.length !== 64 || !/^[a-f0-9]{64}$/i.test(value.revision)) {
-    throw new AppError(400, "invalid_export_selection", "Refresh Agents before exporting its exact saved revision.");
-  }
-  const query = value.query === undefined ? {} : value.query;
-  if (!isRecord(query)) throw new AppError(400, "invalid_export_selection", "Export filters must be an object.");
-  const allowed = new Set([
-    "recordId", "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher",
-    "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view", "inventoryScope",
-    "endUserAccess", "reportedUsage", "management", "relevance", "type",
-  ]);
-  const normalized: Record<string, unknown> = {};
-  for (const [key, field] of Object.entries(query)) {
-    if (!allowed.has(key)) throw new AppError(400, "invalid_export_selection", "Export filters contain an unsupported field.");
-    if (field === undefined) continue;
-    if (typeof field === "string" || key === "blocked" && typeof field === "boolean"
-      || key === "createdWithinDays" && typeof field === "number" && Number.isFinite(field)) {
-      normalized[key] = String(field);
-    } else throw new AppError(400, "invalid_export_selection", "Export filter values have invalid types.");
-  }
-  let recordIds: string[] | undefined;
-  if (value.recordIds !== undefined) {
-    if (!Array.isArray(value.recordIds) || !value.recordIds.length || value.recordIds.length > 5_000
-      || Object.keys(normalized).some(key => key !== "sortBy" && key !== "sortDirection")) {
-      throw new AppError(400, "invalid_export_selection", "Export either 1-5,000 exact agent references or one filtered inventory.");
-    }
-    recordIds = value.recordIds.map(value => {
-      if (typeof value !== "string" || !value || value.length > 10_000) {
-        throw new AppError(400, "invalid_export_selection", "Each agent reference must be an exact canonical or source-qualified identity.");
-      }
-      return exactRecordId(value)!;
-    });
-    recordIds = [...new Set(recordIds)];
-  }
-  return { revision: value.revision.toLowerCase(), query: unifiedAgentInventoryQuery(normalized), ...(recordIds ? { recordIds } : {}) };
-}
 
 export function unifiedAgentInventoryQuery(query: Record<string, unknown>): UnifiedAgentInventoryQuery {
+  if (Object.values(query).some(value => value !== undefined && typeof value !== "string")) {
+    return invalidQuery("Inventory query parameters must be single string values.");
+  }
   const blocked = first(query.blocked);
   return {
     inventoryScope: oneOf(first(query.inventoryScope), "inventoryScope", unifiedAgentInventoryScopes) ?? "all",
-    type: packageTypeFilter(query.type),
+    type: literalFacet(query.type, "type", 4096),
     view: filterValue(query.view, "view", unifiedAgentViews),
     endUserAccess: filterValue(query.endUserAccess, "endUserAccess", unifiedAgentAccessFilters),
     reportedUsage: filterValue(query.reportedUsage, "reportedUsage", unifiedAgentUsageFilters),
@@ -262,29 +189,32 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
     search: optionalText(first(query.search), "search", 256),
     source: oneOf(first(query.source), "source", ["all", "graph_packages", "power_platform", "both"] as const) ?? "all",
     linkState: oneOf(first(query.linkState), "linkState", ["matched", "unmatched", "ambiguous", "conflicting"] as const),
-    environmentId: optionalText(first(query.environmentId), "environmentId", 512),
+    environmentId: literalFacet(query.environmentId, "environmentId", 512),
     blocked: blocked === undefined || blocked === "" ? undefined
       : blocked === "true" ? true
         : blocked === "false" ? false
           : invalidQuery("blocked must be true or false."),
-    publisher: optionalText(first(query.publisher), "publisher", 256),
-    availableTo: optionalText(first(query.availableTo), "availableTo", 128),
-    host: optionalText(first(query.host), "host", 256),
-    platform: optionalText(first(query.platform), "platform", 256),
+    publisher: literalFacet(query.publisher, "publisher", 4096),
+    availableTo: query.availableTo === "~some-or-all" ? { kind: "some-or-all" } : literalFacet(query.availableTo, "availableTo", 4096),
+    host: literalFacet(query.host, "host", 4096),
+    platform: literalFacet(query.platform, "platform", 4096),
     createdWithinDays: optionalPositiveInteger(first(query.createdWithinDays), "createdWithinDays", 3650),
     sortBy: oneOf(first(query.sortBy), "sortBy", unifiedAgentSortKeys) ?? "displayName",
     sortDirection: oneOf(first(query.sortDirection), "sortDirection", ["asc", "desc"] as const) ?? "asc",
-    limit: positiveInteger(first(query.limit), "limit", 50, 250),
-    offset: positiveInteger(first(query.offset), "offset", 0, 100_000, true),
+    limit: positiveInteger(first(query.limit), "limit", 50, 100),
   };
 }
 
-function packageTypeFilter(value: unknown) {
+function literalFacet(value: unknown, field: string, maximum: number): string | null | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim() || value.length > 4096 || /[\r\n\0]/.test(value)) {
-    return invalidQuery("type must be a single non-empty Graph package type of at most 4096 characters.");
+  if (typeof value !== "string" || value.length > maximum + 8 || /[\r\n\0]/.test(value)) {
+    return invalidQuery(`${field} requires one bounded tagged facet value.`);
   }
-  return value;
+  try {
+    const decoded = decodeInventoryFacet(value);
+    if (decoded === null || typeof decoded === "string" && decoded.length > 0) return decoded;
+  } catch { /* Invalid wire tags are rejected, never treated as provider literals. */ }
+  return invalidQuery(`${field} requires a tagged string or unknown value.`);
 }
 
 function operationReference(value: unknown) {

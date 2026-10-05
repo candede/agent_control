@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import type { CapabilityId, CapabilityStatus, CapabilityView } from "./api/client";
-import { capabilityExplanation, capabilityNextStep, capabilityStatusLabel, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, operationAccessLabel, statusLabels, verificationLabel } from "./capabilityState";
+import { capabilityExplanation, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
 
 function view(status: CapabilityStatus): CapabilityView {
   return { definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
@@ -17,8 +17,6 @@ describe("capability UX decisions", () => {
     application.decision.evidence = { category };
     expect(capabilityExplanation(application)).toMatch(/administrator.*credentials/i);
     expect(capabilityExplanation(application)).not.toMatch(/Sign in again|reauthorize this delegated/);
-    expect(capabilityNextStep(application)).toMatchObject({ label: "Admin setup", href: "https://entra.microsoft.com/" });
-    expect(capabilityNextStep(application)?.text).toMatch(/application.*permissions/i);
   });
 
   function onDemandView(id: CapabilityId): CapabilityView {
@@ -39,13 +37,9 @@ describe("capability UX decisions", () => {
       expect(currentVerification(ready)).toBe("on_demand");
       expect(evidenceIsFresh(ready)).toBe(false);
       expect(evidenceIsStale(ready)).toBe(false);
-      expect(capabilityStatusLabel(ready)).toBe("Ready to try");
-      expect(verificationLabel(ready)).toBe("Ready to try; Microsoft validates permission on the actual operation");
       expect(operationAccessLabel(ready)).toBe("Microsoft validates permission when the operation is requested");
       expect(capabilityExplanation(ready)).toContain("Microsoft validates delegated permissions and provider roles on the actual operation");
       expect(capabilityExplanation(ready)).toContain("Review and confirm the exact targets");
-      expect(capabilityNextStep(ready)?.text).toContain(id === "powerPlatform.quarantine.manage" ? "Microsoft validates permission on each operation" : "CopilotPackages.ReadWrite.All");
-      expect(capabilityNextStep(ready)?.href).toBe("/agents");
     },
   );
   it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
@@ -55,12 +49,9 @@ describe("capability UX decisions", () => {
       expect(currentVerification(ready)).toBe("on_demand");
       expect(evidenceIsFresh(ready)).toBe(false);
       expect(evidenceIsStale(ready)).toBe(false);
-      expect(capabilityStatusLabel(ready)).toBe("Ready to try");
-      expect(verificationLabel(ready)).toBe("Ready to try; Microsoft validates permission on the actual operation");
       expect(operationAccessLabel(ready)).toBe("Microsoft validates permission when the operation is requested");
       expect(capabilityExplanation(ready)).toContain("Microsoft validates delegated permissions and provider roles on the actual operation");
       expect(capabilityExplanation(ready)).not.toMatch(/confirm|submitting a change|Not checked|provider request succeeded/);
-      expect(capabilityNextStep(ready)).toBeUndefined();
     },
   );
   it.each([
@@ -85,7 +76,6 @@ describe("capability UX decisions", () => {
       Object.assign(ready.decision, override);
       expect(providerActionAllowed(ready, true)).toBe(false);
       expect(currentVerification(ready)).toBeUndefined();
-      expect(capabilityNextStep(ready)).toBeUndefined();
     }
   });
   it("does not extend on-demand readiness to other probe kinds or modes", () => {
@@ -136,7 +126,6 @@ describe("capability UX decisions", () => {
         candidate.decision.verification = verification;
         expect(evidenceIsFresh(candidate, now)).toBe(false);
         expect(currentVerification(candidate, now)).toBeUndefined();
-        expect(capabilityStatusLabel(candidate, now)).not.toMatch(/^(Available|Ready to try)$/);
         for (const write of [undefined, false, true]) {
           expect(providerActionAllowed(candidate, write, now)).toBe(false);
         }
@@ -199,10 +188,7 @@ describe("capability UX decisions", () => {
         expect(providerActionAllowed(candidate, write)).toBe(false);
       }
       expect(currentVerification(candidate)).toBeUndefined();
-      expect(capabilityStatusLabel(candidate)).toBe("Verification unavailable");
-      expect(verificationLabel(candidate)).not.toMatch(/Provider-verified|Token acquired|Authorized by local policy/);
       expect(capabilityExplanation(candidate)).not.toMatch(/Token acquired|request succeeded|Authorized by current local/);
-      expect(capabilityNextStep(candidate)).toBeUndefined();
     },
   );
   it("names backend permissions and independent roles exactly", () => {
@@ -223,7 +209,6 @@ describe("capability UX decisions", () => {
   it.each(["token_acquisition", "provider_read"] as const)("identifies a %s timeout instead of implying a permission failure", phase => {
     const failed = view("provider_error");
     failed.decision.evidence = { category: "provider_timeout", phase, timeoutMs: 30_000 };
-    expect(capabilityStatusLabel(failed)).toBe("Check timed out");
     expect(capabilityExplanation(failed)).toContain(phase === "token_acquisition" ? "Microsoft token acquisition" : "bounded provider check");
     expect(capabilityExplanation(failed)).toContain("30 seconds");
     expect(capabilityExplanation(failed)).toContain("does not establish missing permissions");
@@ -247,9 +232,6 @@ describe("capability UX decisions", () => {
         unavailable.decision.status = status;
         expect(providerActionAllowed(unavailable, true)).toBe(false);
         expect(currentVerification(unavailable)).toBeUndefined();
-        expect(capabilityStatusLabel(unavailable)).toBe(statusLabels[status]);
-        if (status === "missing_permission") expect(capabilityNextStep(unavailable)).toMatchObject({ label: "Admin setup", href: "https://entra.microsoft.com/" });
-        else expect(capabilityNextStep(unavailable)).toBeUndefined();
       }
     },
   );
@@ -308,14 +290,10 @@ describe("capability UX decisions", () => {
 
     expect(providerActionAllowed(unsupported, true)).toBe(false);
     expect(currentVerification(unsupported)).toBeUndefined();
-    expect(capabilityStatusLabel(unsupported)).toBe("Verification unavailable");
-    expect(verificationLabel(unsupported)).toBe("Current verification unavailable");
     expect(capabilityExplanation(unsupported)).not.toContain("provider request succeeded");
-    expect(capabilityNextStep(unsupported)).toBeUndefined();
     unsupported.decision.status = "not_configured";
     unsupported.decision.authorized = false;
     expect(currentVerification(unsupported)).toBeUndefined();
-    expect(capabilityStatusLabel(unsupported)).toBe("Not configured");
   });
   it.each(Object.keys(statusLabels).filter(status => status !== "available") as CapabilityStatus[])(
     "does not turn %s provenance or historical success into current verification", status => {
@@ -324,7 +302,6 @@ describe("capability UX decisions", () => {
         failed.decision.verification = verification;
         failed.decision.lastSuccessAt = new Date(Date.now() - 30_000).toISOString();
         expect(currentVerification(failed)).toBeUndefined();
-        expect(verificationLabel(failed)).not.toMatch(/Provider-verified|Token acquired|Current independent/);
         expect(evidenceIsStale(failed)).toBe(false);
       }
     },
@@ -347,8 +324,6 @@ describe("capability UX decisions", () => {
       for (const verification of ["provider", "token", "qualification"] as const) {
         candidate.decision.verification = verification;
         expect(currentVerification(candidate)).toBeUndefined();
-        expect(verificationLabel(candidate)).not.toMatch(/Provider-verified|Token acquired|Current independent/);
-        expect(capabilityStatusLabel(candidate)).not.toMatch(/^(Available|Ready to try)$/);
         expect(capabilityExplanation(candidate)).not.toMatch(/Token acquired|request succeeded|qualification is valid/);
       }
     },
@@ -358,18 +333,20 @@ describe("capability UX decisions", () => {
     local.definition = capabilityDefinitions.find(item => item.mode === "local")!;
     local.decision = { ...local.decision, capabilityId: local.definition.id, verification: "local", checkedAt: undefined, expiresAt: undefined };
     expect(currentVerification(local)).toBe("local");
-    expect(verificationLabel(local)).toBe("Authorized by local policy; no provider check");
+    expect(capabilityExplanation(local)).toBe("Authorized by current local application policy.");
     local.decision.status = "missing_internal_role";
     local.decision.authorized = false;
     expect(currentVerification(local)).toBeUndefined();
-    expect(verificationLabel(local)).toBe("Local policy authorization not established");
+    expect(providerActionAllowed(local)).toBe(false);
+    expect(capabilityExplanation(local)).toContain("Requires");
   });
   it("does not call a fresh failed check stale", () => {
     const inconclusive = view("unknown");
     expect(capabilityExplanation(inconclusive)).toContain("check did not establish availability");
     expect(capabilityExplanation(inconclusive)).not.toContain("stale");
     inconclusive.decision.checkedAt = undefined;
-    expect(verificationLabel(inconclusive)).toBe("Not checked; no current verification");
+    expect(currentVerification(inconclusive)).toBeUndefined();
+    expect(capabilityExplanation(inconclusive)).toContain("Not checked yet");
   });
   it("does not treat quarantine status token readiness as provider verification", () => {
     const quarantine = view("available");
@@ -379,7 +356,6 @@ describe("capability UX decisions", () => {
     expect(currentVerification(quarantine)).toBe("token");
     expect(capabilityExplanation(quarantine)).toContain("provider role, license, and operation access have not been verified");
     expect(operationAccessLabel(quarantine)).toBe("No separate operation check");
-    expect(capabilityNextStep(quarantine)?.text).toContain("Microsoft validates permission on each operation");
   });
   it("does not label legacy qualification provenance as current provider verification", () => {
     const qualified = view("available");
@@ -388,8 +364,6 @@ describe("capability UX decisions", () => {
     qualified.decision.previewQualification = "qualified";
     qualified.decision.verification = "qualification";
     expect(currentVerification(qualified)).toBeUndefined();
-    expect(verificationLabel(qualified)).toBe("Current verification unavailable");
-    expect(capabilityStatusLabel(qualified)).toBe("Verification unavailable");
     expect(capabilityExplanation(qualified)).toContain("current verification evidence is missing or inconsistent");
     expect(operationAccessLabel(qualified)).toBe("Microsoft validates permission when the operation is requested");
     qualified.decision.status = "provider_error";
@@ -405,7 +379,6 @@ describe("capability UX decisions", () => {
     qualified.decision.previewQualification = "qualified";
     qualified.decision.verification = "qualification";
     qualified.decision.expiresAt = new Date(0).toISOString();
-    expect(capabilityStatusLabel(qualified)).toBe("Evidence stale");
     expect(capabilityExplanation(qualified)).toContain("Evidence is stale");
     expect(currentVerification(qualified)).toBeUndefined();
     expect(providerActionAllowed(qualified, true)).toBe(false);

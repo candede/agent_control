@@ -18,6 +18,7 @@ import { DataSyncPanel } from "./DataSyncPanel";
 import { mockNativeDialogs } from "../test/dialog";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 import { SavedQueryProvider } from "./SavedQueryProvider";
+import type { AutomaticRefreshStatus } from "../useAutomaticRefresh";
 
 mockNativeDialogs();
 
@@ -25,7 +26,6 @@ const api = vi.hoisted(() => ({
   cancel: vi.fn(),
   getRun: vi.fn(),
   getState: vi.fn(),
-  retry: vi.fn(),
   start: vi.fn(),
 }));
 
@@ -34,7 +34,6 @@ vi.mock("../api/client", async importOriginal => ({
   cancelDataSyncRun: api.cancel,
   getDataSyncRun: api.getRun,
   getDataSyncState: api.getState,
-  retryDataSyncRun: api.retry,
   startDataSync: api.start,
 }));
 
@@ -96,6 +95,8 @@ function renderPanel(options: {
   onOpenUsageImport?: () => void;
   onRequestedRunChange?: (runId: string | undefined) => void;
   onSetupRequiredChange?: (required: boolean) => void;
+  onOpenSync?: () => void;
+  automaticRefresh?: AutomaticRefreshStatus;
   onSourcesChanged?: (sources: DataSyncSourceId[]) => void;
   principalKey?: string;
   requestedRunId?: string;
@@ -111,6 +112,8 @@ function renderPanel(options: {
     onOpenUsageImport: options.onOpenUsageImport ?? vi.fn(),
     onRequestedRunChange: options.onRequestedRunChange ?? vi.fn(),
     onSetupRequiredChange: options.onSetupRequiredChange,
+    onOpenSync: options.onOpenSync,
+    automaticRefresh: options.automaticRefresh,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
   };
   const view = render(<DataSyncPanel {...props} />, { reactStrictMode: options.strictMode });
@@ -128,12 +131,10 @@ describe("DataSyncPanel", () => {
     api.cancel.mockReset();
     api.getRun.mockReset();
     api.getState.mockReset();
-    api.retry.mockReset();
     api.start.mockReset();
   });
 
   afterEach(() => {
-    expect(api.retry).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -147,25 +148,143 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
   });
 
-  it("loads onboarding while initially inactive and reports the setup hint without exposing UI", async () => {
+  it("shows first-sync setup outside Sync without a modal or starting duplicate work", async () => {
     api.getState.mockResolvedValue(syncState());
     const onSetupRequiredChange = vi.fn();
     const overflow = document.body.style.overflow;
-    const view = renderPanel({ active: false, onSetupRequiredChange });
+    const onOpenSync = vi.fn();
+    const view = renderPanel({ active: false, onSetupRequiredChange, onOpenSync });
 
     await waitFor(() => expect(onSetupRequiredChange).toHaveBeenLastCalledWith(true));
-    expect(view.container).toBeEmptyDOMElement();
+    expect(screen.getByRole("heading", { name: "Set up your workspace" })).toBeVisible();
+    expect(screen.getByRole("progressbar", { name: "First sync sources saved" })).toHaveAttribute("value", "0");
+    expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(document.body.style.overflow).toBe(overflow);
     expect(api.getState).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(api.start).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
+    expect(onOpenSync).toHaveBeenCalledOnce();
 
     await act(async () => { view.rerenderPanel({ active: true }); });
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeEnabled();
     expect(api.getState).toHaveBeenCalledTimes(2);
     expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("keeps live first-sync progress across navigation, hides after zero-record success, and returns after a reset", async () => {
+    const ref = createRef<DataSyncPanelHandle>();
+    const savedUsers = source("users", "succeeded", { count: 0, lastSuccessAt: "2026-09-15T10:01:00.000Z" });
+    const running = run("running", [
+      savedUsers, source("graph_packages", "running", { count: 650, message: "Reading the next page." }),
+      source("power_platform", "queued"),
+    ], { automatic: true, mode: "incremental" });
+    api.getState.mockResolvedValue(syncState({ run: running, sources: [savedUsers, ...syncState().sources.slice(1)] }));
+    const onSourcesChanged = vi.fn();
+    const view = renderPanel({ ref, active: false, onOpenSync: vi.fn(), onSourcesChanged });
+    expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
+    expect(screen.getByText("650 processed in this stage")).toBeVisible();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
+    expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
+    view.rerenderPanel({ active: true });
+    expect(await screen.findByRole("region", { name: "Data sync" })).toBeVisible();
+    view.rerenderPanel({ active: false });
+    expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
+
+    const completed = running.sources.map(value => ({ ...value, status: "succeeded" as const, count: 0, lastSuccessAt: "2026-09-15T10:01:00.000Z" }));
+    api.getState.mockResolvedValue(syncState({
+      onboardingRequired: false, usageImportRequired: true, sources: completed, run: run("completed", completed),
+    }));
+    await waitFor(() => expect(view.container).toBeEmptyDOMElement(), { timeout: 2_000 });
+    expect(onSourcesChanged).toHaveBeenCalledWith(["graph_packages", "power_platform"]);
+    expect(api.start).not.toHaveBeenCalled();
+
+    api.getState.mockResolvedValue(syncState());
+    await act(async () => { await ref.current!.refresh(); });
+    expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
+  });
+
+  it("surfaces status failures outside Sync and retries saved status without starting collection", async () => {
+    let resolveState!: (value: DataSyncState) => void;
+    api.getState.mockReturnValueOnce(new Promise<DataSyncState>(resolve => { resolveState = resolve; }));
+    renderPanel({ active: false, onOpenSync: vi.fn() });
+    expect(await screen.findByRole("heading", { name: "Checking workspace setup" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
+    await act(async () => resolveState(syncState({ run: run("running", [source("users", "running")]) })));
+    api.getState.mockRejectedValueOnce(new ApiError(503, "unavailable", "Status endpoint unavailable.", { requestId: "sync-status-request" }));
+    expect(await screen.findByRole("alert", {}, { timeout: 2_000 })).toHaveTextContent("Status endpoint unavailable.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Progress below is the last reported status.");
+    api.getState.mockResolvedValue(syncState());
+    await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
+    expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it.each(["failed", "cancelled", "permission_required", "waiting_authorization"] as const)(
+    "shows %s recovery and retries only sources without a saved success", async status => {
+      const savedUsers = source("users", "succeeded", { count: 42, lastSuccessAt: "2026-09-15T10:01:00.000Z" });
+      const incomplete = run(status === "cancelled" ? "cancelled" : "partial", [
+        source("graph_packages", status, { message: "Collection needs recovery.", canRetry: true }),
+        source("power_platform", "not_started"),
+      ]);
+      api.getState.mockResolvedValue(syncState({ sources: [savedUsers, ...syncState().sources.slice(1)], run: incomplete }));
+      api.start.mockResolvedValue(run("running", [source("graph_packages", "running"), source("power_platform", "queued")]));
+      renderPanel({ active: false, onOpenSync: vi.fn() });
+      expect(await screen.findByText("Collection needs recovery.")).toBeVisible();
+      expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
+      if (status === "permission_required") expect(screen.getByRole("link", { name: "Review permissions" })).toHaveAttribute("href", "/permissions");
+      if (status === "waiting_authorization") expect(screen.getByRole("link", { name: "Sign in again" })).toHaveAttribute("href", "/api/auth/login");
+      await userEvent.click(screen.getByRole("button", { name: "Retry incomplete sources" }));
+      expect(api.start).toHaveBeenCalledExactlyOnceWith(
+        { mode: "initial", sources: ["graph_packages", "power_platform"] }, expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    },
+  );
+
+  it("does not show first-sync onboarding for an established workspace or on recovery-only views", async () => {
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, usageImportRequired: true }));
+    const view = renderPanel({ active: false, onOpenSync: vi.fn() });
+    await waitFor(() => expect(api.getState).toHaveBeenCalledOnce());
+    expect(view.container).toBeEmptyDOMElement();
+    api.getState.mockResolvedValue(syncState());
+    view.rerenderPanel({ principalKey: "tenant:another-user:viewer", onOpenSync: undefined });
+    await waitFor(() => expect(api.getState).toHaveBeenCalledTimes(2));
+    expect(view.container).toBeEmptyDOMElement();
+  });
+
+  it.each([
+    { paused: true, online: true, message: "Automatic sync is paused for this session.", disabled: false },
+    { paused: false, online: false, message: "You are offline. Reconnect to continue syncing.", disabled: true },
+  ])("reports automatic availability without claiming collection is running: $message", async ({ paused, online, message, disabled }) => {
+    api.getState.mockResolvedValue(syncState());
+    renderPanel({ active: false, onOpenSync: vi.fn(), automaticRefresh: {
+      paused, online, visible: true, enabled: true, phase: "ready", checking: false,
+      message: undefined, checkedAt: undefined, setPaused: vi.fn(),
+    } });
+    expect(await screen.findByText(new RegExp(message))).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Your first sync is in progress" })).not.toBeInTheDocument();
+    const start = screen.getByRole("button", { name: "Start initial sync" });
+    if (disabled) expect(start).toBeDisabled();
+    else expect(start).toBeEnabled();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("clears first-sync source details after saved-status access is denied", async () => {
+    const ref = createRef<DataSyncPanelHandle>();
+    api.getState.mockResolvedValue(syncState({ run: run("running", [
+      source("graph_packages", "running", { message: "Private source progress." }),
+    ]) }));
+    renderPanel({ ref, active: false, onOpenSync: vi.fn() });
+    expect(await screen.findByText("Private source progress.")).toBeVisible();
+    api.getState.mockRejectedValue(new ApiError(403, "forbidden", "Saved status access was denied."));
+    await act(async () => { await ref.current!.refresh(); });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved status access was denied.");
+    expect(screen.queryByText("Private source progress.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "First sync sources" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
   });
 
   it("keeps the visible page loading until the saved status response makes setup available", async () => {
@@ -498,7 +617,6 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("button", { name: "Retry status check" })).not.toBeInTheDocument();
     expect(api.getState).toHaveBeenCalledTimes(2);
     expect(api.start).not.toHaveBeenCalled();
-    expect(api.retry).not.toHaveBeenCalled();
   });
 
   it.each([

@@ -1,8 +1,11 @@
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppError } from "../errors.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import { agentCapabilityExport } from "./agentContextExport.js";
 import { withTelemetryContext } from "./telemetry.js";
+import { measureNativePages, tinyNativePages } from "./inventoryProviderTestSupport.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
 
@@ -51,7 +54,7 @@ describe("PowerPlatformResourceQueryClient", () => {
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
   it("limits default collection to agents and contextual environments", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.queriedTypes).toEqual(["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"]);
     const query = JSON.stringify(JSON.parse(fetcher.mock.calls[0][1].body as string).Clauses);
     expect(query).toContain("microsoft.copilotstudio/agents");
@@ -61,7 +64,7 @@ describe("PowerPlatformResourceQueryClient", () => {
 
   it.each(["microsoft.powerapps/apps", "microsoft.powerautomate/cloudflows", "microsoft.powerplatformconnector/connectors", "microsoft.powerplatform/environmentgroups"])("rejects retired source type %s", async type => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, type }] }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).rejects.toMatchObject({
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token")).rejects.toMatchObject({
       code: "provider_schema", diagnostics: { reason: "invalid_resource_type" },
     });
   });
@@ -78,7 +81,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(JSON.parse(fetcher.mock.calls[0][1].body as string).Options.Top).toBe(1);
   });
 
-  it.each([5_001, Number.MAX_SAFE_INTEGER])("checks access without enumerating or applying the refresh ceiling to %i total environments", async totalRecords => {
+  it.each([5_001, 100_001, Number.MAX_SAFE_INTEGER])("checks access without enumerating or applying the refresh ceiling to %i total environments", async totalRecords => {
     const fetcher = vi.fn(async (_input: string | URL, _init?: RequestInit) => Response.json({
       totalRecords, count: 1, resultTruncated: 1, skipToken: "next",
       data: [{ ...resource, type: "microsoft.powerplatform/environments" }],
@@ -88,8 +91,11 @@ describe("PowerPlatformResourceQueryClient", () => {
     await expect(client.checkAccess("opaque-token")).resolves.toBeUndefined();
     expect(fetcher).toHaveBeenCalledOnce();
     expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).Options).toEqual({ Top: 1, Skip: 0 });
-    await expect(client.query("opaque-token", ["microsoft.powerplatform/environments"]))
-      .rejects.toMatchObject({ code: "provider_schema", diagnostics: { reason: "invalid_total" } });
+    const page = client.pages("opaque-token", ["microsoft.powerplatform/environments"], { visit: async () => {} });
+    if (totalRecords <= inventoryLimits.sourceRows) {
+      expect((await page.next()).value).toMatchObject({ rawCount: 1, expectedCount: totalRecords });
+      await page.return();
+    } else await expect(page.next()).rejects.toMatchObject({ code: "provider_result_limit" });
   });
 
   it("keeps the ten-second access-check deadline when a caller supplies a cancellation signal", async () => {
@@ -165,7 +171,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         capabilitiesCounts: { distinctPowerPlatformConnectors: 7 },
       },
     }] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0].details).toEqual({});
     expect(result.resources[0].unknownFieldCount).toBe(2);
     expect(JSON.stringify(result)).not.toContain("unsupported-connector");
@@ -179,7 +185,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         createdIn: "microsoft365CopilotAgentBuilder",
       },
     }] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       nativeId, authoringTool: "Microsoft 365 Copilot Agent Builder", agentKind: "agent_builder_agent",
       details: { schemaName: nativeId, createdIn: "microsoft365CopilotAgentBuilder" },
@@ -192,7 +198,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
       ...resource, properties: { createdIn: "Future authoring service" },
     }] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       authoringTool: null, agentKind: "agent", details: { createdIn: "Future authoring service" },
     });
@@ -202,7 +208,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
       ...resource, properties: { createdIn },
     }] }));
-    const parsed = (await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).resources[0];
+    const parsed = (await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token")).resources[0];
     expect(parsed).toMatchObject({
       authoringTool: "Microsoft 365 Copilot Agent Builder", agentKind: "agent_builder_agent",
       displayName: null, lifecycle: "unknown", details: { createdIn },
@@ -211,20 +217,18 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(parsed.identifiers.some(value => value.kind === "cds_bot_id")).toBe(false);
   });
 
-  it("rejects GUID casing aliases across pages but preserves distinct opaque native IDs", async () => {
+  it("rejects GUID casing aliases within a bounded page but preserves distinct opaque native IDs", async () => {
     const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const first = { ...resource, name: nativeId, properties: { environmentId: `Default-${resource.tenantId}` } };
     const second = { ...first, name: nativeId.toUpperCase(), properties: { environmentId: `default-${resource.tenantId}` } };
-    const duplicate = vi.fn()
-      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [first] }))
-      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [second] }));
-    await expect(new PowerPlatformResourceQueryClient(duplicate).query("opaque-token"))
+    const duplicate = vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [first, second] }));
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(duplicate), "opaque-token"))
       .rejects.toMatchObject({ code: "provider_schema", diagnostics: { reason: "duplicate_identity" } });
     const distinct = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 2, count: 2, resultTruncated: 0,
       data: [{ ...first, name: "Opaque-A" }, { ...second, name: "opaque-a" }],
     }));
-    expect((await new PowerPlatformResourceQueryClient(distinct).query("opaque-token")).resources).toHaveLength(2);
+    expect((await tinyNativePages(new PowerPlatformResourceQueryClient(distinct), "opaque-token")).resources).toHaveLength(2);
   });
 
   it("accepts case-equivalent GUID tenant and environment scope without broadening authorization", async () => {
@@ -233,7 +237,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
       ...resource, tenantId: tenantId.toUpperCase(), properties: { environmentId: environmentId.toLowerCase() },
     }] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"], {
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"], {
       expectedTenantId: tenantId, environmentId,
     });
     expect(result.resources[0]).toMatchObject({ tenantId, environmentId: environmentId.toLowerCase() });
@@ -246,7 +250,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [{ ...resource, name: "agent-b" }] }));
     const client = new PowerPlatformResourceQueryClient(fetcher);
 
-    const result = await client.query("opaque-token", ["microsoft.copilotstudio/agents"], { onProgress: value => { progress.push(value); } });
+    const result = await tinyNativePages(client, "opaque-token", ["microsoft.copilotstudio/agents"], { onProgress: value => { progress.push(value); } });
     expect(result).toMatchObject({
       totalRecords: 2,
       pages: 2,
@@ -274,17 +278,51 @@ describe("PowerPlatformResourceQueryClient", () => {
     ]);
   });
 
+  it("reacquires scoped authorization for each backpressured provider page", async () => {
+    const getAccessToken = vi.fn().mockResolvedValueOnce("first-page-token").mockResolvedValueOnce("second-page-token");
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: true, skipToken: "next", data: [resource] }))
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: false, data: [{ ...resource, name: "agent-b" }] }));
+    const pages = new PowerPlatformResourceQueryClient(fetcher).pages("unused-initial-token", ["microsoft.copilotstudio/agents"],
+      { visit: async () => {}, getAccessToken });
+    await pages.next();
+    expect(getAccessToken).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0][1].headers.Authorization.split(" ")).toEqual(["Bearer", "first-page-token"]);
+    await pages.next();
+    expect(getAccessToken).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1][1].headers.Authorization.split(" ")).toEqual(["Bearer", "second-page-token"]);
+    expect((await pages.next()).done).toBe(true);
+  });
+
+  it("stops a cancelled token renewal without waiting for it or dispatching a late provider read", async () => {
+    let release!: (value: string) => void;
+    const token = new Promise<string>(resolve => { release = resolve; });
+    const getAccessToken = vi.fn(() => token);
+    const fetcher = vi.fn(), controller = new AbortController();
+    const pages = new PowerPlatformResourceQueryClient(fetcher).pages("unused", ["microsoft.copilotstudio/agents"], {
+      signal: controller.signal, visit: async () => {}, getAccessToken,
+    });
+    const next = pages.next();
+    const stopped = expect(next).rejects.toMatchObject({ code: "read_job_cancelled" });
+    await vi.waitFor(() => expect(getAccessToken).toHaveBeenCalledOnce());
+    controller.abort(new AppError(409, "read_job_cancelled", "Cancelled before token renewal completed."));
+    await stopped;
+    release("late-synthetic-token");
+    await Promise.resolve();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it.each([101, 201, 4_008])("enumerates %i agents and environments when explicit Skip overrides the continuation offset", async totalRecords => {
-    const rows = Array.from({ length: totalRecords }, (_, index) => ({
+    const row = (index: number) => ({
       ...resource, name: `agent-${String(index).padStart(4, "0")}`, properties: {},
       ...(index % 2 ? { type: "microsoft.powerplatform/environments" } : {}),
-    }));
+    });
     const progress = vi.fn();
     const fetcher = vi.fn(async (_input: string | URL, init?: RequestInit) => {
       const { Options: options }: { Options: { Top: number; Skip?: number; SkipToken?: string } } = JSON.parse(String(init?.body));
       // Resource Query inherits Resource Graph's explicit Skip precedence over SkipToken.
       const offset = options.Skip ?? Number(options.SkipToken ?? 0);
-      const data = rows.slice(offset, offset + options.Top);
+      const data = Array.from({ length: Math.min(options.Top, totalRecords-offset) }, (_, index) => row(offset+index));
       const nextOffset = offset + data.length;
       const hasMore = nextOffset < totalRecords;
       return Response.json({
@@ -293,10 +331,12 @@ describe("PowerPlatformResourceQueryClient", () => {
       });
     });
 
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId, onProgress: progress });
-
-    expect(result.resources.map(item => item.nativeId)).toEqual(rows.map(item => item.name));
-    expect(result.resources.every(item => item.tenantId === resource.tenantId)).toBe(true);
+    const result = await measureNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined,
+      { expectedTenantId: resource.tenantId, onProgress: progress }, (records, offset) => {
+        expect(records.map(item => item.nativeId)).toEqual(records.map((_, index) => row(offset+index).name));
+        expect(records.every(item => item.tenantId === resource.tenantId)).toBe(true);
+      });
+    expect(result.observedCount).toBe(totalRecords);
     expect(result).toMatchObject({ totalRecords, pages: Math.ceil(totalRecords / 100) });
     expect(fetcher).toHaveBeenCalledTimes(Math.ceil(totalRecords / 100));
     expect(progress).toHaveBeenLastCalledWith({ pages: Math.ceil(totalRecords / 100), observedCount: totalRecords, totalRecords });
@@ -305,18 +345,22 @@ describe("PowerPlatformResourceQueryClient", () => {
     }
   });
 
-  it("rejects duplicate identities across continuation pages without reporting a complete result", async () => {
+  it("stops before advancing provider progress when the durable consumer rejects a continuation page", async () => {
     const progress = vi.fn();
     const fetcher = vi.fn()
       .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
       .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [resource] }));
 
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
-      .rejects.toMatchObject({ code: "provider_schema", message: "Power Platform inventory returned a duplicate resource identity." });
+    const producer = new PowerPlatformResourceQueryClient(fetcher).pages("opaque-token", ["microsoft.copilotstudio/agents"],
+      { onProgress: progress, visit: async () => {} });
+    expect((await producer.next()).value?.page).toBe(1);
+    expect((await producer.next()).value?.page).toBe(2);
+    const failure = new Error("durable duplicate identity");
+    await expect(producer.throw(failure)).rejects.toBe(failure);
     expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 1, totalRecords: 2 });
     expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
       event: "inventory_query_failed", page: 2, pages: 1, observedCount: 1,
-      reason: "duplicate_identity", resourceIndex: 1, firstSeenPage: 1, resourceType: resource.type,
+      stage: "save_page",
     }));
   });
 
@@ -332,18 +376,20 @@ describe("PowerPlatformResourceQueryClient", () => {
         data: Array.from({ length: count }, (_, index) => ({ ...resource, name: `agent-${offset + index}`, properties: {} })),
       });
     });
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress });
+    const result = await measureNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined,
+      { onProgress: progress }, (records, offset) => {
+        expect(records.map(item => item.nativeId)).toEqual(records.map((_, index) => `agent-${offset+index}`));
+      });
     const pages = Math.max(1, Math.ceil(totalRecords / 100));
     expect(result).toMatchObject({ totalRecords, pages });
-    expect(result.resources).toHaveLength(totalRecords);
-    expect(new Set(result.resources.map(item => item.nativeId)).size).toBe(totalRecords);
+    expect(result.observedCount).toBe(totalRecords);
     expect(fetcher).toHaveBeenCalledTimes(pages);
     expect(progress).toHaveBeenLastCalledWith({ pages, observedCount: totalRecords, totalRecords });
   });
 
   it.each([undefined, null, ""])("accepts a boolean terminal marker with absent continuation (%s) for both inventory and access checks", async skipToken => {
     const fetcher = vi.fn(async () => Response.json({ totalRecords: 1, count: 1, resultTruncated: true, skipToken, data: [resource] }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).resolves.toMatchObject({ totalRecords: 1, pages: 1 });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token")).resolves.toMatchObject({ totalRecords: 1, pages: 1 });
     const check = vi.fn(async () => Response.json({
       totalRecords: 1, count: 1, resultTruncated: true, skipToken,
       data: [{ ...resource, type: "microsoft.powerplatform/environments" }],
@@ -357,7 +403,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(Response.json({ totalRecords: 3, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
       .mockResolvedValueOnce(Response.json({ totalRecords: 3, count: 1, resultTruncated: 1, data: [{ ...resource, name: "agent-b" }] }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress: progress }))
       .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("without a continuation token") });
     expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 1, totalRecords: 3 });
     const check = vi.fn(async () => Response.json({
@@ -367,7 +413,6 @@ describe("PowerPlatformResourceQueryClient", () => {
   });
 
   it.each([
-    { totalRecords: 2, resultTruncated: 1, data: [resource] },
     { totalRecords: 2, resultTruncated: 1, skipToken: "unexpected", data: [{ ...resource, name: "agent-b" }] },
     { totalRecords: 1, resultTruncated: 1, data: [{ ...resource, name: "agent-b" }] },
     { totalRecords: 2, resultTruncated: 1, data: [{ ...resource, tenantId: "foreign-tenant", name: "agent-b" }] },
@@ -376,7 +421,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
       .mockResolvedValueOnce(Response.json({ count: 1, ...terminal }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: resource.tenantId }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: resource.tenantId }))
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
@@ -389,7 +434,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     }, { headers: { "x-ms-request-id": providerRequestId, "x-ms-correlation-request-id": "private-header" } }));
 
     await expect(withTelemetryContext({ requestId: "request-a", jobId: "job-a" }, () =>
-      new PowerPlatformResourceQueryClient(fetcher).query("private-access-token"))).rejects.toMatchObject({ code: "provider_schema" });
+      tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "private-access-token"))).rejects.toMatchObject({ code: "provider_schema" });
     const events = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls]
       .map(([entry]) => JSON.parse(entry));
     expect(events).toContainEqual(expect.objectContaining({
@@ -407,7 +452,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 2, count: 2, resultTruncated: 0, data: [resource, { ...resource, name: "agent-b" }],
     }));
-    await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     const warnings = vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry));
     expect(warnings).toEqual([expect.objectContaining({ event: "provider_schema_omission", page: 1, count: 2 })]);
     expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
@@ -418,7 +463,7 @@ describe("PowerPlatformResourceQueryClient", () => {
   it("identifies transport timeouts without logging exception messages", async () => {
     const timeout = new DOMException("private-network-details", "TimeoutError");
     const fetcher = vi.fn().mockRejectedValue(timeout);
-    await expect(new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }).query("opaque-token"))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }), "opaque-token"))
       .rejects.toMatchObject({ status: 504, code: "provider_timeout", message: expect.stringContaining("page request timed out") });
     expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
       event: "inventory_provider_failure", page: 1, attempt: 1, stage: "transport", errorKind: "timeout",
@@ -433,29 +478,37 @@ describe("PowerPlatformResourceQueryClient", () => {
     fakeDeadlineTimers();
     const fetcher = delayedInventoryFetcher(pageDelay);
     const progress = vi.fn();
-    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress })
+    const pending = measureNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress: progress })
       .then(result => ({ result }), error => ({ error }));
     await vi.advanceTimersByTimeAsync(41 * pageDelay);
     const outcome = await pending;
     expect(outcome).not.toHaveProperty("error");
     expect(outcome).toMatchObject({ result: { totalRecords: 4_008, pages: 41 } });
-    if ("result" in outcome) expect(outcome.result.resources).toHaveLength(4_008);
+    if ("result" in outcome) expect(outcome.result.observedCount).toBe(4_008);
     expect(progress).toHaveBeenLastCalledWith({ pages: 41, observedCount: 4_008, totalRecords: 4_008 });
     expect(fetcher).toHaveBeenCalledTimes(41);
   });
 
-  it("enforces the finite 120-second total deadline without returning partial inventory", async () => {
+  it("enforces the foundation's finite thirty-minute deadline without returning a partial result", async () => {
     fakeDeadlineTimers();
     const progress = vi.fn();
-    const pending = new PowerPlatformResourceQueryClient(delayedInventoryFetcher(3_000)).query("opaque-token", undefined, { onProgress: progress })
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false, data: [resource],
+    }));
+    const pending = tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, {
+      onProgress: async value => {
+        progress(value);
+        await new Promise<void>(resolve => setTimeout(resolve, inventoryLimits.powerPlatformDeadlineMs));
+      },
+    })
       .then(result => ({ result }), error => ({ error }));
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(inventoryLimits.powerPlatformDeadlineMs);
     expect(await pending).toMatchObject({
-      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("120-second enumeration limit") },
+      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("1800-second enumeration limit") },
     });
-    expect(progress).toHaveBeenLastCalledWith({ pages: 39, observedCount: 3_900, totalRecords: 4_008 });
+    expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 1, totalRecords: 1 });
     expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
-      event: "inventory_query_failed", errorCode: "provider_timeout", errorKind: "timeout", durationMs: 120_000,
+      event: "inventory_query_failed", errorCode: "provider_timeout", errorKind: "timeout", durationMs: inventoryLimits.powerPlatformDeadlineMs,
     }));
   });
 
@@ -464,14 +517,14 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [resource],
     }));
-    const onProgress = vi.fn(() => new Promise<void>(resolve => setTimeout(resolve, 120_001)));
-    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress })
+    const onProgress = vi.fn(() => new Promise<void>(resolve => setTimeout(resolve, inventoryLimits.powerPlatformDeadlineMs+1)));
+    const pending = tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress })
       .then(result => ({ result }), error => ({ error }));
 
-    await vi.advanceTimersByTimeAsync(120_001);
+    await vi.advanceTimersByTimeAsync(inventoryLimits.powerPlatformDeadlineMs+1);
 
     expect(await pending).toMatchObject({
-      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("120-second enumeration limit") },
+      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("1800-second enumeration limit") },
     });
     expect(onProgress).toHaveBeenCalledOnce();
     expect(fetcher).toHaveBeenCalledOnce();
@@ -491,7 +544,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       await new Promise<void>(resolve => { finishProgress = resolve; });
       if (fails) throw new Error("progress recording failed");
     });
-    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, {
+    const pending = tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, {
       signal: controller.signal, onProgress,
     }).then(result => ({ result }), error => ({ error }));
     const settled = vi.fn();
@@ -513,7 +566,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     }));
     const onProgress = vi.fn().mockRejectedValue(failure);
 
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress }))
       .rejects.toBe(failure);
     expect(fetcher).toHaveBeenCalledOnce();
     expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
@@ -525,7 +578,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const cancel = vi.fn();
     const body = new ReadableStream<Uint8Array>({ cancel });
     const fetcher = vi.fn().mockResolvedValue(new Response(body));
-    const pending = new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }).query("opaque-token")
+    const pending = tinyNativePages(new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }), "opaque-token")
       .then(result => ({ result }), error => ({ error }));
     await vi.advanceTimersByTimeAsync(10_000);
     expect(await pending).toMatchObject({ error: { status: 504, code: "provider_timeout" } });
@@ -537,10 +590,10 @@ describe("PowerPlatformResourceQueryClient", () => {
 
   it("rejects malformed and incomplete pages", async () => {
     const malformed = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 2, data: [resource] })));
-    await expect(malformed.query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(malformed, "opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
 
     const incomplete = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [resource] })));
-    await expect(incomplete.query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(incomplete, "opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it.each([
@@ -554,7 +607,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, [field]: value }],
     }));
 
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress: progress }))
       .rejects.toMatchObject({
         code: "provider_schema",
         message: `Power Platform inventory returned an ${reason} ${field} for ${resource.type} (length ${value.length}; expected 1-${maximumLength}).`,
@@ -568,7 +621,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, tenantId, name: nativeId }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({ tenantId, nativeId });
   });
 
@@ -579,7 +632,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, [field]: value }],
     }));
 
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { onProgress: progress }))
       .rejects.toMatchObject({ code: "provider_schema", diagnostics: { field } });
     expect(progress).not.toHaveBeenCalled();
     expect(fetcher).toHaveBeenCalledOnce();
@@ -589,7 +642,7 @@ describe("PowerPlatformResourceQueryClient", () => {
   it.each(["environmentId", "expectedTenantId"].flatMap(field => ["private\0scope", "private\uD83Dscope", "private\uDE00scope"]
     .map(value => ({ field, value }))))("rejects non-storable $field scope before dispatch ($value)", async ({ field, value }) => {
     const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { [field]: value }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { [field]: value }))
       .rejects.toMatchObject({ code: "invalid_inventory_scope" });
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -605,7 +658,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       ],
     };
     const fetcher = vi.fn(async () => Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }] }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       displayName: null, environmentId: null, createdBy: null,
       identifiers: [{ kind: "power_platform_resource_id", value: resource.name }],
@@ -631,7 +684,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn(async () => Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties: { channels } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0].details.channels).toEqual(expected);
     expect(result.resources[0].unknownFieldCount).toBe(omissions);
     if (expected === undefined) expect(result.resources[0].provenance).not.toHaveProperty("channels");
@@ -648,7 +701,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       totalRecords: 1, count: 1, resultTruncated: 0,
       data: [{ ...resource, name: nativeId, location: `${"x".repeat(255)}😀tail`, properties }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       nativeId, displayName: properties.displayName, environmentId: properties.environmentId,
       location: "x".repeat(255),
@@ -662,7 +715,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       const fetcher = vi.fn().mockResolvedValue(Response.json({
         totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, type, tenantId }],
       }));
-      await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+      await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { expectedTenantId: resource.tenantId }))
         .rejects.toMatchObject({ code: "provider_schema" });
     }
   });
@@ -672,17 +725,17 @@ describe("PowerPlatformResourceQueryClient", () => {
       totalRecords: 1, count: 1, resultTruncated: 0,
       data: [{ ...resource, type: "microsoft.powerplatform/environments", tenantId }],
     }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { expectedTenantId: resource.tenantId }))
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it("retains duplicate and environment-scope guards for environment context", async () => {
     const environment = { ...resource, type: "microsoft.powerplatform/environments" };
     const duplicate = vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [environment, environment] }));
-    await expect(new PowerPlatformResourceQueryClient(duplicate).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(duplicate), "opaque-token", undefined, { expectedTenantId: resource.tenantId }))
       .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("duplicate resource identity") });
     const outOfScope = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [environment] }));
-    await expect(new PowerPlatformResourceQueryClient(outOfScope).query("opaque-token", undefined, { expectedTenantId: resource.tenantId, environmentId: "environment-a" }))
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(outOfScope), "opaque-token", undefined, { expectedTenantId: resource.tenantId, environmentId: "environment-a" }))
       .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("outside the requested") });
   });
 
@@ -714,7 +767,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       }],
     }));
     const client = new PowerPlatformResourceQueryClient(fetcher);
-    const result = await client.query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(client, "opaque-token", ["microsoft.copilotstudio/agents"]);
 
     expect(result.resources[0]).toMatchObject({
       displayName: "Support agent",
@@ -745,7 +798,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         }] }],
       } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
     expect(result.resources[0].details).toMatchObject({
       connectorDetailsStatus: "complete",
       connectors: [{ connectorId: "shared_excelonlinebusiness", operations: [{
@@ -767,7 +820,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         connectorId: "shared_test", operations: [{ operationId: "read", ...invalid }],
       }] } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
     expect(result.resources[0].details.connectorDetailsStatus).toBe("partial");
     expect(result.resources[0].details.connectors?.[0].operations).toEqual([{ operationId: "read" }]);
   });
@@ -780,7 +833,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         capabilitiesCounts: { distinctPowerPlatformConnectors: 1, distinctPowerPlatformConnectorsOperations: total },
       } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
     expect(result.resources[0].details.connectorDetailsStatus).toBe(total === 200 ? "complete" : "partial");
     expect(result.resources[0].details.distinctPowerPlatformConnectorsOperations).toBe(total);
     expect(result.resources[0].details.connectors?.[0].operations).toHaveLength(200);
@@ -791,7 +844,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       totalRecords: 1, count: 1, resultTruncated: false,
       data: [{ ...resource, properties: { powerPlatformConnectors: [], capabilitiesCounts: { distinctPowerPlatformConnectors: count } } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
     expect(result.resources[0].details).toMatchObject({ connectorDetailsStatus: "partial", connectors: [] });
     expect(result.resources[0].details.distinctPowerPlatformConnectors).toBeUndefined();
   });
@@ -813,7 +866,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         },
       } }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
     const retained = result.resources[0];
     expect(retained.details.connectors?.at(-1)).toEqual({ connectorId: "unretained", operations: [] });
     expect(retained.details).toMatchObject({ connectorDetailsStatus: "partial", capabilityDetailsTruncated: true });
@@ -838,7 +891,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       ],
     }));
 
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
 
     expect(result.resources.map(({ nativeId, lifecycle }) => ({ nativeId, lifecycle }))).toEqual([
       { nativeId: "explicit-draft", lifecycle: "draft" },
@@ -856,7 +909,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn(async () => Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       createdAt: null, lastPublishedAt: null, lifecycle: "unknown", unknownFieldCount: 4,
     });
@@ -874,7 +927,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const fetcher = vi.fn(async () => Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
     expect(result.resources[0]).toMatchObject({
       createdAt: expected, lastPublishedAt: expected, lifecycle: "published", unknownFieldCount: 0,
       details: { lastModifiedAt: expected, quarantinedAt: expected },
@@ -892,7 +945,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         { ...resource, name: "environment", type: "microsoft.powerplatform/environments", properties: {} },
       ],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
 
     expect(result.resources.map(({ authoringTool, agentKind }) => ({ authoringTool, agentKind }))).toEqual([
       { authoringTool: "Copilot Studio", agentKind: "copilot_studio_agent" },
@@ -910,7 +963,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         { ...resource, name: "environment", type: "microsoft.powerplatform/environments", properties: { isManaged: true, environmentType: "Production", environmentGroupId: "group-a", isQuarantined: false, entraAgentId: "not-an-environment-identity" } },
       ],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
 
     expect(result.resources[0]).toMatchObject({ details: { isQuarantined: false, isManaged: true } });
     expect(result.resources[0].identifiers).toContainEqual({ kind: "entra_agent_id", value: "exact-agent-id" });
@@ -933,7 +986,7 @@ describe("PowerPlatformResourceQueryClient", () => {
         { ...resource, name: "malformed", properties: { powerPlatformConnectors: [{ connectorId: "shared_test", operations: "unknown" }] } },
       ],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"]);
 
     expect(result.resources[0].details).toMatchObject({ connectorDetailsStatus: "not_supplied", distinctPowerPlatformConnectors: 0, distinctPowerPlatformConnectorsOperations: 0 });
     expect(result.resources[0].details.connectors).toBeUndefined();
@@ -947,13 +1000,13 @@ describe("PowerPlatformResourceQueryClient", () => {
   it("rejects duplicate resources and retries throttled read-only POST queries within bounds", async () => {
     const delays: number[] = [];
     const duplicate = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [resource, resource] })));
-    await expect(duplicate.query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(duplicate, "opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
 
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response("", { status: 429, headers: { "retry-after": "2" } }))
       .mockResolvedValueOnce(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
     const client = new PowerPlatformResourceQueryClient(fetcher, { delay: async value => { delays.push(value); } });
-    await expect(client.query("opaque-token")).resolves.toMatchObject({ totalRecords: 0 });
+    await expect(tinyNativePages(client, "opaque-token")).resolves.toMatchObject({ totalRecords: 0 });
     expect(delays).toEqual([2_000]);
     expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
       event: "inventory_provider_retry", page: 1, attempt: 1, reason: "throttled", retryDelayMs: 2_000,
@@ -968,11 +1021,11 @@ describe("PowerPlatformResourceQueryClient", () => {
       { totalRecords: 0, count: 0, data: [] },
       { totalRecords: 0, count: 0, resultTruncated: 0, skipToken: "unexpected", data: [] },
     ]) {
-      await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json(body))).query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+      await expect(tinyNativePages(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json(body))), "opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
     }
-    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: "tenant-b" })).rejects.toMatchObject({ code: "provider_schema" });
-    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", ["microsoft.powerplatform/environments"])).rejects.toMatchObject({ code: "provider_schema" });
-    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", undefined, { environmentId: "environment-b" })).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))), "opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: "tenant-b" })).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))), "opaque-token", ["microsoft.powerplatform/environments"])).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))), "opaque-token", undefined, { environmentId: "environment-b" })).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it("retries stream failures, disposes failed responses and does not treat an absent Retry-After as zero", async () => {
@@ -986,19 +1039,19 @@ describe("PowerPlatformResourceQueryClient", () => {
       .mockResolvedValueOnce(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
     const client = new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 3, delay: async value => { delays.push(value); } });
 
-    await expect(client.query("opaque-token")).resolves.toMatchObject({ totalRecords: 0 });
+    await expect(tinyNativePages(client, "opaque-token")).resolves.toMatchObject({ totalRecords: 0 });
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(delays).toEqual([1_000, 2_000]);
   });
 
   it("rejects sovereign clouds and redirected responses before forwarding a bearer token", async () => {
     const fetcher = vi.fn();
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { cloud: "usgov" })).rejects.toMatchObject({ code: "unsupported_cloud" });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, { cloud: "usgov" })).rejects.toMatchObject({ code: "unsupported_cloud" });
     expect(fetcher).not.toHaveBeenCalled();
 
     const redirected = Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] });
     Object.defineProperties(redirected, { redirected: { value: true }, url: { value: "https://other.invalid/query" } });
-    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(redirected)).query("opaque-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(redirected)), "opaque-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
   });
 
   it("honors external cancellation without retrying the provider request", async () => {
@@ -1009,14 +1062,14 @@ describe("PowerPlatformResourceQueryClient", () => {
       controller.abort(new Error("shutdown"));
     }));
     const client = new PowerPlatformResourceQueryClient(fetcher);
-    await expect(client.query("opaque-token", undefined, { signal: controller.signal })).rejects.toThrow("shutdown");
+    await expect(tinyNativePages(client, "opaque-token", undefined, { signal: controller.signal })).rejects.toThrow("shutdown");
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("carries environment scope in a structured query clause", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
     const environmentId = "environment-a'\"\\); or true; //";
-    await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"], { environmentId });
+    await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", ["microsoft.copilotstudio/agents"], { environmentId });
     expect(JSON.parse(fetcher.mock.calls[0][1].body as string).Clauses[1]).toEqual({
       $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)],
     });

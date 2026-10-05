@@ -2,7 +2,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, downloadAdministrativeAuditCsv, getAuditEvents, type AuditEvent } from "../api/client";
-import { downloadBlob } from "../agentExport";
+import { downloadFile } from "../downloadFile";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { createSavedQueryClient } from "../savedQueries";
@@ -10,7 +10,7 @@ import { AuditLogView } from "./AuditLogView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 
 vi.mock("./CapabilityGate", () => ({ CapabilityGate: ({ children }: { children: React.ReactNode }) => children }));
-vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
+vi.mock("../downloadFile", () => ({ downloadFile: vi.fn() }));
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof import("../api/client")>(),
@@ -237,7 +237,7 @@ describe("AuditLogView routing", () => {
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Action" }), "remove-agent-usage-association");
     expect(signal.aborted).toBe(true);
     await act(async () => finish(new Blob(["obsolete"])));
-    expect(downloadBlob).not.toHaveBeenCalled();
+    expect(downloadFile).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeEnabled());
   });
 

@@ -5,25 +5,25 @@ import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bulkJobs, launchBulkJob, requireWorkerCapacity } from "../services/bulkJobs.js";
 import { acquireDelegatedToken } from "../auth/msal.js";
-import { PackageInventoryRepository } from "../db/packageInventory.js";
+import { InventoryMutationStages } from "../db/inventoryMutationStages.js";
 import { packageInventory } from "../services/packageInventory.js";
-import { createJobConfirmation } from "../db/jobs.js";
+import { createJobConfirmation, JobRepository } from "../db/jobs.js";
+import { createInventoryMutationsRouter } from "./inventoryMutations.js";
+import { reportIdentity } from "../services/reportIdentity.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { capabilities } from "../services/capabilities.js";
 import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
 import type { FetchLike } from "../services/graphPackages.js";
 import * as operationalState from "../services/operationalState.js";
-import { allowlistedPackage } from "../services/packageObservation.js";
 import type { RoutePolicy } from "./policy.js";
 import type { PackageAccessMutationState } from "../services/packageMutationState.js";
 import {
-  parseBulkActionIds,
+  parseIds,
   parseDirectorySearchLimit,
   parseActionGroupId,
   parsePackageAccessUpdate,
   parseMutationScope,
-  inventoryPackageDetail,
   parsePackageRefreshIds,
   submitCanaryJob,
   canaryFailureCompletion,
@@ -33,8 +33,11 @@ vi.mock("../db/pool.js", () => ({
   pool: {},
   secretValue: vi.fn((name: string) => {
     const settings: Record<string, string> = {
-      TENANT_ID: "11111111-1111-4111-8111-111111111111", CLIENT_ID: "22222222-2222-4222-8222-222222222222",
-      CLIENT_SECRET: "synthetic-route-test-secret", TENANT_DOMAINS: "example.invalid",
+      TENANTS_JSON: JSON.stringify([{
+        tenantId: "11111111-1111-4111-8111-111111111111", clientId: "22222222-2222-4222-8222-222222222222",
+        clientSecret: "synthetic-route-test-secret", domains: ["example.invalid"],
+      }]),
+      SESSION_SECRET: "synthetic-route-cursor-secret-at-least-32-bytes",
     };
     return settings[name];
   }),
@@ -55,6 +58,7 @@ vi.mock("../auth/msal.js", async original => ({
   ...await original<typeof import("../auth/msal.js")>(),
   acquireDelegatedToken: vi.fn(async () => "token"),
 }));
+vi.mock("../services/reportIdentity.js", () => ({ reportIdentity: vi.fn() }));
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -272,13 +276,13 @@ describe("package mutation worker admission", () => {
     targets: [{ id: "package", displayName: "Package", prestate: { kind: "block" as const, isBlocked: false } }],
   };
   const confirmed = createJobConfirmation(intent);
-  const savedPackage = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false });
+  const identity = { ...scope, sessionEpoch: 1, authorizationHash: "a".repeat(64) };
   const receipt: NonNullable<Awaited<ReturnType<typeof bulkJobs.get>>> = {
     id: "33333333-3333-4333-8333-333333333333", capabilityId: "graph.package.block.manage",
     tokenMode: "delegated", status: "queued", action: "block", targetBlockedState: true,
     confirmationHash: confirmed.confirmationHash, confirmation: confirmed.summary, confirmedAt: "2026-09-24T12:00:00.000Z",
     total: 1, completed: 0, succeeded: 0, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
-    results: [], result: undefined, currentAgentName: undefined,
+    currentAgentName: undefined,
     createdAt: "2026-09-24T12:00:00.000Z", updatedAt: "2026-09-24T12:00:00.000Z", canResume: false,
   };
   async function requestMutation(path = "/agents/block", body: unknown = { ids: ["package"], confirmationHash: confirmed.confirmationHash }) {
@@ -302,15 +306,16 @@ describe("package mutation worker admission", () => {
   }
 
   beforeEach(async () => {
+    createInventoryMutationsRouter({ options: { max: 4 } } as never);
     await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
     vi.mocked(launchBulkJob).mockReset();
     vi.mocked(requireWorkerCapacity).mockReset();
     vi.mocked(acquireDelegatedToken).mockReset().mockResolvedValue("token");
-    vi.spyOn(bulkJobs, "getByIdempotency").mockResolvedValue(undefined);
-    vi.spyOn(bulkJobs, "submit").mockResolvedValue(receipt);
-    vi.spyOn(PackageInventoryRepository.prototype, "getMany").mockResolvedValue([{
-      id: "package", package: savedPackage,
-    }]);
+    vi.spyOn(JobRepository.prototype, "getByIdempotency").mockResolvedValue(undefined);
+    vi.spyOn(InventoryMutationStages.prototype, "submit").mockResolvedValue(receipt);
+    vi.spyOn(InventoryMutationStages.prototype, "preview").mockResolvedValue({ ...confirmed.summary, confirmationHash: confirmed.confirmationHash });
+    vi.spyOn(InventoryMutationStages.prototype, "currentSelection").mockResolvedValue(groupId);
+    vi.mocked(reportIdentity).mockReset().mockResolvedValue(identity);
     vi.spyOn(capabilities, "requireAvailable").mockResolvedValue({
       capabilityId: receipt.capabilityId, status: "available", authorized: true, fresh: true,
       verification: "on_demand", previewQualification: "not_required", remediation: [],
@@ -322,38 +327,37 @@ describe("package mutation worker admission", () => {
       throw new AppError(429, "workers_busy", "Two jobs are already running.");
     });
     await expect(requestMutation()).rejects.toMatchObject({ code: "workers_busy" });
-    vi.mocked(bulkJobs.getByIdempotency).mockResolvedValue(receipt);
+    vi.mocked(JobRepository.prototype.getByIdempotency).mockResolvedValue(receipt);
 
     expect(await requestMutation()).toHaveBeenCalledWith(receipt);
     expect(launchBulkJob).toHaveBeenCalledTimes(2);
     expect(launchBulkJob).toHaveBeenLastCalledWith(receipt.id, scope);
-    expect(bulkJobs.submit).toHaveBeenCalledOnce();
-    expect(PackageInventoryRepository.prototype.getMany).toHaveBeenCalledOnce();
+    expect(InventoryMutationStages.prototype.submit).toHaveBeenCalledOnce();
   });
 
   it.each(["running", "waiting_authorization", "partial", "succeeded", "failed", "cancelled"] as const)(
     "returns an existing %s receipt without automatic replay", async status => {
-      vi.mocked(bulkJobs.getByIdempotency).mockResolvedValue({ ...receipt, status });
+      vi.mocked(JobRepository.prototype.getByIdempotency).mockResolvedValue({ ...receipt, status });
       expect(await requestMutation()).toHaveBeenCalledWith(expect.objectContaining({ status }));
       expect(launchBulkJob).not.toHaveBeenCalled();
-      expect(bulkJobs.submit).not.toHaveBeenCalled();
+      expect(InventoryMutationStages.prototype.submit).not.toHaveBeenCalled();
     },
   );
 
   it("does not relaunch an idempotent receipt with a different confirmation", async () => {
-    vi.mocked(bulkJobs.getByIdempotency).mockResolvedValue({ ...receipt, confirmationHash: "f".repeat(64) });
+    vi.mocked(JobRepository.prototype.getByIdempotency).mockResolvedValue({ ...receipt, confirmationHash: "f".repeat(64) });
     await expect(requestMutation()).rejects.toMatchObject({ code: "idempotency_mismatch" });
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
-  it.each(["lookup", "inventory", "token"] as const)("fences submission after session replacement during %s", async stage => {
-    if (stage === "lookup") vi.mocked(bulkJobs.getByIdempotency).mockImplementation(async () => {
+  it.each(["lookup", "identity", "token"] as const)("fences submission after session replacement during %s", async stage => {
+    if (stage === "lookup") vi.mocked(JobRepository.prototype.getByIdempotency).mockImplementation(async () => {
       await replaceSession();
       return receipt;
     });
-    if (stage === "inventory") vi.mocked(PackageInventoryRepository.prototype.getMany).mockImplementation(async () => {
+    if (stage === "identity") vi.mocked(reportIdentity).mockImplementation(async () => {
       await replaceSession();
-      return [{ id: "package", package: savedPackage }];
+      return identity;
     });
     if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementation(async () => {
       await replaceSession();
@@ -361,20 +365,20 @@ describe("package mutation worker admission", () => {
     });
 
     await expect(requestMutation()).rejects.toMatchObject({ code: "unauthorized" });
-    expect(bulkJobs.submit).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.submit).not.toHaveBeenCalled();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
   it("does not launch after session replacement during durable submission", async () => {
     let replacement: Promise<void> | undefined;
-    vi.mocked(bulkJobs.submit).mockImplementation(async () => {
+    vi.mocked(InventoryMutationStages.prototype.submit).mockImplementation(async () => {
       replacement = replaceSession();
       return receipt;
     });
 
     await expect(requestMutation()).rejects.toMatchObject({ code: "unauthorized" });
     await replacement;
-    expect(bulkJobs.submit).toHaveBeenCalledOnce();
+    expect(InventoryMutationStages.prototype.submit).toHaveBeenCalledOnce();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
@@ -401,8 +405,8 @@ describe("package mutation worker admission", () => {
       principals: [{ resourceType: "user", resourceId: userId }], mutationScope: "single",
     })).rejects.toMatchObject({ code: "unauthorized" });
     if (stage !== "lookup") expect(resolve).not.toHaveBeenCalled();
-    expect(PackageInventoryRepository.prototype.getMany).not.toHaveBeenCalled();
-    expect(bulkJobs.submit).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.preview).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.submit).not.toHaveBeenCalled();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
@@ -415,23 +419,19 @@ describe("package mutation worker admission", () => {
       action: "update-availability", ids: ["package"], target: "availability", mode: "replace", scope: "specific",
       principals: [{ resourceType: "user", resourceId: userId }], mutationScope: "single",
     })).rejects.toMatchObject({ code: "unresolved_principal" });
-    expect(PackageInventoryRepository.prototype.getMany).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.preview).not.toHaveBeenCalled();
   });
 
-  it("fences the block-all catalog read before rebuilding its target selection", async () => {
-    vi.spyOn(PackageInventoryRepository.prototype, "list").mockImplementation(async () => {
+  it("fences all-matching submission before consuming its reviewed server selection", async () => {
+    vi.mocked(reportIdentity).mockImplementation(async () => {
       await replaceSession();
-      return {
-        value: [savedPackage], count: 1, snapshot: null,
-        summary: { total: 1, allowed: 1, blocked: 0 }, filteredSummary: { total: 1, allowed: 1, blocked: 0 },
-        facets: { publishers: [], availability: [], hosts: [], platforms: [] },
-      };
+      return identity;
     });
 
-    await expect(requestMutation("/agents/block-all", { confirmationHash: confirmed.confirmationHash }))
+    await expect(requestMutation("/agents/block-all", { selectionId: groupId, confirmationHash: confirmed.confirmationHash }))
       .rejects.toMatchObject({ code: "unauthorized" });
-    expect(PackageInventoryRepository.prototype.getMany).not.toHaveBeenCalled();
-    expect(bulkJobs.submit).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.currentSelection).not.toHaveBeenCalled();
+    expect(InventoryMutationStages.prototype.submit).not.toHaveBeenCalled();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
@@ -551,7 +551,8 @@ describe("package identity refresh targets", () => {
   });
 
   it("rejects empty, duplicate, malformed and oversized selections", () => {
-    for (const input of [[], null, ["same", "same"], [1], Array.from({ length: 101 }, (_, index) => `package-${index}`)]) {
+    expect(parsePackageRefreshIds(Array.from({ length: 5000 }, (_, index) => `package-${index}`))).toHaveLength(5000);
+    for (const input of [[], null, ["same", "same"], [1], Array.from({ length: 5001 }, (_, index) => `package-${index}`)]) {
       expect(() => parsePackageRefreshIds(input)).toThrow();
     }
   });
@@ -629,19 +630,20 @@ describe("parsePackageAccessUpdate", () => {
   });
 });
 
-describe("parseBulkActionIds", () => {
-  it("trims unique string IDs", () => {
-    expect(parseBulkActionIds({ ids: [" P_1 ", "P_2"] })).toEqual(["P_1", "P_2"]);
+describe("parseIds", () => {
+  it("preserves opaque provider IDs verbatim", () => {
+    expect(parseIds([" P_1 ", "P_2"], 5000)).toEqual([" P_1 ", "P_2"]);
   });
 
-  it("rejects duplicate IDs after normalization", () => {
-    expect(() => parseBulkActionIds({ ids: [" P_1 ", "P_1"] })).toThrow(
+  it("rejects exact duplicates without folding distinct provider identities", () => {
+    expect(parseIds([" P_1 ", "P_1"], 5000)).toEqual([" P_1 ", "P_1"]);
+    expect(() => parseIds(["P_1", "P_1"], 5000)).toThrow(
       "Duplicate package IDs",
     );
   });
 
   it("rejects non-string IDs", () => {
-    expect(() => parseBulkActionIds({ ids: ["P_1", { id: "P_2" }] })).toThrow(
+    expect(() => parseIds(["P_1", { id: "P_2" }], 5000)).toThrow(
       "Each id must be a non-empty string",
     );
   });
@@ -687,15 +689,5 @@ describe("parseActionGroupId", () => {
     expect(() => parseActionGroupId("a".repeat(65))).toThrow(
       "Action group ID is invalid",
     );
-  });
-});
-
-describe("inventoryPackageDetail", () => {
-  it("removes exact assignment principals from Reader inventory", () => {
-    expect(inventoryPackageDetail(allowlistedPackage({
-      id: "package-1", displayName: "Fixture", isBlocked: false,
-      allowedUsersAndGroups: [{ resourceType: "user", resourceId: "sensitive-user" }],
-      acquireUsersAndGroups: [{ resourceType: "group", resourceId: "sensitive-group" }],
-    }))).toEqual(allowlistedPackage({ id: "package-1", displayName: "Fixture", isBlocked: false }));
   });
 });

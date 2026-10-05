@@ -1,35 +1,60 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { pool } from "./pool.js";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { inventoryInput } from "../../scripts/inventoryFixtures.js";
+import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
+import { InventoryQueries } from "./inventoryQueries.js";
+import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
+import { allowlistedPackage } from "../services/packageObservation.js";
 
-vi.mock("./pool.js", () => ({ pool: { query: vi.fn() }, secretValue: vi.fn(), transaction: vi.fn() }));
+describe("selected package inventory operation references", () => {
+  let fixture: Awaited<ReturnType<typeof testDatabase>>;
+  beforeAll(async () => { fixture = await testDatabase(); }, 30_000);
+  afterAll(async () => { await fixture?.close(); });
 
-const query = vi.mocked(pool.query);
-const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
-const scope = { tenantId: "tenant-package-audit", principalId: "inventory-reader" };
-const snapshot = {
-  id: "11111111-1111-4111-8111-111111111111", token_mode: "delegated", scope_kind: "broad", requested_ids: [],
-  observed_count: 0, total_records: 0, page_count: 1,
-  observed_at: new Date("2026-09-24T00:00:00Z"), expires_at: new Date("2026-10-24T00:00:00Z"),
-};
-
-beforeEach(() => {
-  query.mockReset().mockRejectedValue(new Error("Unexpected package audit database query."));
-});
-
-describe("package inventory operation references", () => {
-  it("uses only unexpired actor-scoped audit before counting and paging saved packages", async () => {
-    query.mockResolvedValueOnce({ ...emptyResult, rows: [snapshot] })
-      .mockResolvedValueOnce(emptyResult)
-      .mockResolvedValueOnce({ ...emptyResult, rows: [{ total: 0, allowed: 0, blocked: 0 }] })
-      .mockResolvedValueOnce(emptyResult);
-    await new PackageInventoryRepository().list(scope, { operationIdPrefix: "REF_CASE", auditPrincipalId: "audit-reader" });
-    expect(query).toHaveBeenCalledTimes(4);
-    for (const [statement, values] of query.mock.calls.slice(2)) {
-      expect(statement).toContain("audit.tenant_id=$2 AND audit.principal_id=$4");
-      expect(statement).toContain("audit.observed_at>clock_timestamp()-interval '90 days'");
-      expect(statement).toContain("audit.operation_id ILIKE $5 ESCAPE '\\'");
-      expect(values?.slice(0, 5)).toEqual([snapshot.id, scope.tenantId, scope.principalId, "audit-reader", "REF\\_CASE%"]);
-    }
+  it("applies literal, actor-scoped, retained bulk references before exact counting and keyset paging", async () => {
+    const input = inventoryInput(randomUUID());
+    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const store = new InventoryGenerations(fixture.runtime);
+    const ids = ["PKG", "pkg", "second", "other-principal", "other-tenant", "expired", "future", "single", "prefix-wildcard"];
+    const records = ids.map(id => packageInventoryRecord(allowlistedPackage({ id, displayName: id, isBlocked: false })));
+    const root = await store.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
+      await store.visit(lease, "complete");
+      await store.appendBounded(lease, records);
+      await store.acceptPage(lease, { token: "complete", nextToken: null, records, rawCount: records.length,
+        expectedCount: records.length, page: 1 }, records.length);
+    }, { authorize: async () => {} });
+    const now = Date.now();
+    const events = [
+      { id: "PKG", operation: "REF_CASE-first" },
+      { id: "PKG", operation: "ref_case-duplicate" },
+      { id: "second", operation: "ref_case-second" },
+      { id: "pkg", operation: "unrelated" },
+      { id: "other-principal", principal: "different-actor" },
+      { id: "other-tenant", tenant: "different-tenant" },
+      { id: "expired", at: new Date(now - 91 * 86_400_000) },
+      { id: "future", at: new Date(now + 86_400_000) },
+      { id: "single", scope: "single" },
+      { id: "prefix-wildcard", operation: "REFxCASE-wildcard" },
+      { id: "outside-inventory" },
+    ];
+    for (const event of events) await fixture.runtime.query(`INSERT INTO audit_events(
+      id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,agent_id,started_at,observed_at,completed_at,status,request_path,target_blocked_state)
+      VALUES($1,$2,$3,$4,$5,'actor@example.invalid','Synthetic actor',$6,'block',$7,$8,$8,$8,'succeeded','/api/agents/block',true)`,
+    [randomUUID(), randomUUID(), event.operation ?? "REF_CASE-excluded", event.tenant ?? identity.tenantId,
+      event.principal ?? identity.principalId, event.scope ?? "bulk", event.id, event.at ?? new Date(now)]);
+    const reader = new InventoryQueries(fixture.runtime, "synthetic-operation-reference-secret");
+    const selected = await reader.capture(identity, root.scopeId, { inventoryScope: "catalog", operationIdPrefix: "ref_case" });
+    const first = await reader.page(selected.id, identity, { limit: 1 });
+    expect(first.counts).toMatchObject({ total: ids.length, scoped: ids.length, filtered: 2 });
+    expect(first.value.map(value => value.id)).toEqual(["PKG"]);
+    expect(first.page.nextCursor).not.toBeNull();
+    const second = await reader.page(selected.id, identity, { limit: 1, cursor: first.page.nextCursor! });
+    expect(second.value.map(value => value.id)).toEqual(["second"]);
+    expect(second.counts.filtered).toBe(2);
+    expect(second.page.nextCursor).toBeNull();
+    await expect(reader.page(selected.id, { ...identity, principalId: "different-actor" }, { limit: 1 }))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
   });
 });

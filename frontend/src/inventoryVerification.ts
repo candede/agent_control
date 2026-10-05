@@ -56,12 +56,6 @@ export function inventoryCoverageLabel(status: InventoryCoverageStatus) {
   return labels[status];
 }
 
-export function inventoryCoverageValue(status: InventoryCoverageStatus, count: number | null) {
-  if (status === "covered") return count === null ? "Count not established" : count.toLocaleString();
-  if (status === "unknown" && count !== null) return `${count.toLocaleString()} observed; completeness not verified`;
-  return inventoryCoverageLabel(status);
-}
-
 export function savedInventoryTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "Invalid saved timestamp" : date.toLocaleString();

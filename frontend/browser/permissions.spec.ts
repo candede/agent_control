@@ -2,11 +2,15 @@ import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
-import type { AgentInvestigationContext, CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView, PackageRefreshJob, UnifiedAgentInventoryPage } from "../src/api/client";
+import type { AgentInvestigationContext, CapabilityView, PackageRefreshJob, UnifiedAgentInventoryPage } from "../src/api/client";
+import type { OfficialReportAccepted, OfficialReportPreview } from "../../backend/src/types/officialReportApi";
+import type { ReportAgent, ReportHistorySet, ReportPage, ReportUser } from "../../backend/src/types/officialReportData";
 import { capabilityViews, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
-import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { selectedFixtureRead, selectedUsersPage } from "../src/test/selectedUsageFixture";
+import { downloadedCsvRows } from "./usageCsvFixture";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
 import { isAutomaticRefreshRequest, mockAutomaticRefresh } from "./automaticRefreshFixtures";
+import { isInventorySelectionRequest } from "./selectedInventoryFixture";
 
 async function login(page: Page, scenario: string) {
   const checked = page.waitForResponse(response => response.request().method() === "POST"
@@ -40,6 +44,36 @@ async function collectSavedPackages(page: Page) {
     const current: PackageRefreshJob = await response.json();
     return current.status;
   }).toBe("succeeded");
+  await waitForCurrentInventory(page);
+  await page.reload();
+}
+
+async function waitForCurrentInventory(page: Page) {
+  await expect.poll(async () => {
+    const response = await page.request.get("/api/agent-inventory?limit=1");
+    if (!response.ok()) return `${response.status()}: ${await response.text()}`;
+    return (await response.json() as UnifiedAgentInventoryPage).freshness.state;
+  }).toBe("idle");
+}
+
+async function collectSavedNativeAgents(page: Page) {
+  if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser") throw new Error("Inventory collection requires synthetic providers.");
+  const job = await page.evaluate(async () => {
+    const session = await (await fetch("/api/me")).json();
+    const response = await fetch("/api/inventory/refresh-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": session.csrfToken, "Idempotency-Key": crypto.randomUUID() },
+      body: JSON.stringify({ types: ["microsoft.copilotstudio/agents"] }),
+    });
+    if (!response.ok) throw new Error(`Fixture native collection failed: ${response.status}`);
+    return await response.json() as { id: string };
+  });
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/inventory/refresh-jobs/${encodeURIComponent(job.id)}`);
+    expect(response.ok()).toBe(true);
+    return (await response.json() as { status: string }).status;
+  }).toBe("succeeded");
+  await waitForCurrentInventory(page);
   await page.reload();
 }
 function savedPackagePage(observedAt: string, expiresAt: string) {
@@ -64,7 +98,7 @@ test("signed-in user role guide maps actions to Microsoft access without app-rol
   const unexpected = await mockLayoutApi(page);
   const commands: string[] = [];
   page.on("request", request => {
-    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request) && !isInventorySelectionRequest(request)
       && new URL(request.url()).pathname !== "/api/capabilities/check") commands.push(new URL(request.url()).pathname);
   });
   await page.goto("/permissions");
@@ -101,7 +135,7 @@ test("log setup is concise and agent blockers link to manual setup without runni
   const unexpectedRequests = await mockLayoutApi(page);
   const commands: string[] = [];
   page.on("request", request => {
-    if (request.method() !== "GET") commands.push(new URL(request.url()).pathname);
+    if (request.method() !== "GET" && !isInventorySelectionRequest(request)) commands.push(new URL(request.url()).pathname);
   });
   await page.route("**/api/agent-inventory/investigations/context?**", route => route.fulfill({ json: {
     recordId: "graph_packages:layout-package-1", displayName: "Service desk assistant",
@@ -244,7 +278,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
   }
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
-    if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request())) posts.push(path);
+    if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request()) && !isInventorySelectionRequest(route.request())) posts.push(path);
     if (path === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic administrator", username: "fixture@example.invalid", homeAccountId: "consent-fixture", roles: ["AgentControl.Admin"] },
       csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
@@ -748,8 +782,9 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   const quarantineRequests: string[] = [];
   page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/quarantine/")) quarantineRequests.push(`${request.method()} ${url.pathname}`); });
   await login(page, "role-Admin");
+  await collectSavedNativeAgents(page);
   const targetResponse = await page.request.get("/api/agent-inventory");
-  expect(targetResponse.ok()).toBe(true);
+  expect(targetResponse.ok(), await targetResponse.text()).toBe(true);
   const targets: UnifiedAgentInventoryPage = await targetResponse.json();
   // Each viewport writes a different seeded target so neither depends on the other running first.
   const firstBotId = testInfo.project.name === "mobile" ? "cccccccc-cccc-cccc-cccc-cccccccccccc" : "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -783,6 +818,8 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   await expect(page.getByRole("region", { name: "Copilot Studio quarantine controls" })).toHaveCount(0);
   expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(0);
   await login(page, "role-Admin");
+  expect((await page.request.get(`/api/agent-inventory?selectionId=${encodeURIComponent(targets.selection.id)}`)).status()).toBe(409);
+  await collectSavedNativeAgents(page);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.getByRole("button", { name: "Additional Power Platform agents", exact: true }).click();
   await page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true }).check();
@@ -813,8 +850,8 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   await page.getByRole("button", { name: "Check direct status" }).click();
   await expect(page.getByRole("alert")).toContainText("Direct status unavailable: Synthetic direct status outage.");
   await page.getByRole("button", { name: "Check direct status" }).click();
-  await expect(page.getByText("Quarantined", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText("Direct and inventory states disagree.", { exact: true })).toBeVisible();
+  await expect(directStatusDialog.getByText("Quarantined", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("Direct and inventory states disagree.", { exact: true })).toHaveCount(0);
   expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(1);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
@@ -854,8 +891,8 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Cancel import", exact: true }).click();
   await login(page, "role-Viewer");
   for (const view of ["Agents", "Users", "Audit"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
@@ -867,9 +904,9 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await expect(page.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Manage reports", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Manage reports", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /^Delete retained set for / })).toHaveCount(0);
-  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Choose CSV files", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Delete report set", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Close reports", exact: true }).click();
   const beforeViewerView = providerRefreshes;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   expect(providerRefreshes).toBe(beforeViewerView);
@@ -922,13 +959,13 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   }
 
   await page.goto("/agents?q=synthetic&status=allowed&selected=synthetic-package");
-  await expect(page.getByPlaceholder("Name, publisher, ID, ref")).toHaveValue("synthetic");
+  await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("synthetic");
   await expect(page.getByRole("checkbox", { name: /Select Synthetic package/ })).toBeChecked();
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await expect(page).toHaveURL(/\/sync/);
   await page.goBack();
   await expect(page).toHaveURL(/\/agents\?q=synthetic&status=allowed&selected=synthetic-package$/);
-  await expect(page.getByPlaceholder("Name, publisher, ID, ref")).toHaveValue("synthetic");
+  await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("synthetic");
 
   await page.goto("/audit?q=saved-actor&action=block&status=failed");
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("saved-actor");
@@ -948,16 +985,21 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await initialReportRead;
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByLabel("Active in last")).toHaveCount(0);
-  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Back to reports", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Close reports", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.goBack();
   await expect(page).toHaveURL(/\/sync$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/\/sync\?reports=manage$/);
+  await expect(page.getByRole("dialog", { name: "Manage reports", exact: true })).toBeVisible();
   const restoredReportRead = scopedReportRequest();
   await page.goBack();
   await expect(page).toHaveURL(/\/sync\?reports=snapshot&window=90$/);
   await restoredReportRead;
-  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(page).toHaveURL(/\/sync$/);
 
   await page.goto("/security?template=agent_activity&operation=InvokeAgent&agentIds=saved-agent");
   await expect(page).toHaveURL(/\/agents$/);
@@ -980,7 +1022,7 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
     operations: ["CopilotInteraction"],
     startDateTime: new Date(now - 60 * 60_000).toISOString(),
     endDateTime: finishedAt,
-    userPrincipalNames: [copilotUsageFixture.users[0].directory.userPrincipalName],
+    userPrincipalNames: [selectedUsersPage().value[0].directory.userPrincipalName],
     ipAddresses: [],
     objectIds: [],
     administrativeUnitIds: [],
@@ -1030,7 +1072,11 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   };
   const providerCommands: string[] = [];
   const providerBodies: unknown[] = [];
-  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: copilotUsageFixture }));
+  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), route => {
+    const body = selectedFixtureRead(route.request().url());
+    expect(body).toBeDefined();
+    return route.fulfill({ json: body });
+  });
   await page.route("**/api/agent-responsibility?**", route => route.fulfill({ status: 404, json: { code: "not_found", detail: "No saved responsibility fixture." } }));
   await page.route(url => ["/api/capabilities", "/api/capabilities/check"].includes(url.pathname), async route => {
     await route.fulfill({ json: {
@@ -1376,99 +1422,99 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   const invalidCsv = "Username,Unexpected column\nUser@example.invalid,not-an-official-schema";
 
   await login(page, "available");
+  const before: ReportPage<ReportAgent> = await (await page.request.get("/api/official-usage/aggregate?limit=1")).json();
+  const historyBefore: ReportPage<ReportHistorySet> = await (await page.request.get("/api/official-usage/history?limit=1")).json();
   await page.evaluate(() => {
     localStorage.setItem("agent-control:usage-reports:v1", "untrusted legacy rows");
     localStorage.setItem("unrelated", "preserve me");
+    URL.createObjectURL = () => { throw new Error("Reports must use native persisted-export downloads"); };
   });
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   const modal = page.locator("dialog.official-usage-modal");
-  await expect(page.getByRole("dialog", { name: "Import CSV reports" })).toBeVisible();
-  await expect(modal.getByText(/Legacy browser report data is present/)).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Add CSV reports", exact: true })).toBeVisible();
+  await expect(modal.getByText(/Legacy browser report data is present/)).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: /Acknowledge re-import/ })).toHaveCount(0);
   await expect(modal.getByLabel("Reporting start")).toHaveCount(0);
   await expect(modal.getByLabel("Reporting end")).toHaveCount(0);
-  await page.getByLabel("Official usage CSV files").setInputFiles({ name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) });
-  await page.getByRole("button", { name: "Validate and stage" }).click();
-  let validation = modal.getByRole("region", { name: "Server validation" });
+  const firstUpload = page.waitForResponse(response => new URL(response.url()).pathname === "/api/official-usage/staging" && response.request().method() === "POST");
+  await page.getByLabel("CSV report files").setInputFiles({ name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) });
+  const first: OfficialReportPreview = await (await firstUpload).json();
+  expect(first).toMatchObject({ kind: "agents", rowCount: 1, status: "active", reportingPeriod: { provenance: "activity_range" } });
+  expect(first.examples).toHaveLength(1);
+  let validation = modal.getByRole("region", { name: "Confirm report import" });
   await expect(validation).toBeVisible();
-  await expect(validation.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
-  await expect(validation.getByText(/^Agents: 1 rows staged/)).toBeVisible();
-  await expect(modal.getByRole("button", { name: "Continue to review" })).toBeDisabled();
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
+  await expect(validation.getByText("Still needed: Users & agents, Users.", { exact: true })).toBeVisible();
+  await expect(modal.getByText("Agents - 1 row", { exact: true })).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
+  await expect(page).toHaveURL(new RegExp(`staging=${first.id}`));
 
   await page.reload();
-  await expect(page).toHaveURL(/\/sync\?reports=import$/);
+  await expect(page).toHaveURL(new RegExp(`/sync\\?reports=import&staging=${first.id}$`));
   await expect(modal).toBeVisible();
-  validation = modal.getByRole("region", { name: "Server validation" });
-  await expect(validation.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
-  const stagedState: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
-  expect(stagedState.staging.filter(stage => stage.status === "active")).toHaveLength(1);
-  expect(stagedState.staging.find(stage => stage.status === "active")?.reportingPeriod.provenance).toBe("activity_range");
-  await modal.getByRole("button", { name: "Back to files" }).click();
-  await page.getByLabel("Official usage CSV files").setInputFiles([
+  validation = modal.getByRole("region", { name: "Confirm report import" });
+  await expect(validation.getByText("Still needed: Users & agents, Users.", { exact: true })).toBeVisible();
+  const resumed: OfficialReportPreview = await (await page.request.get(`/api/official-usage/staging/${first.id}`)).json();
+  expect(resumed).toMatchObject({ id: first.id, bundleId: first.bundleId, contentHash: first.contentHash, revision: first.revision, status: "active" });
+  expect((await page.request.get("/api/official-usage/admin")).status()).toBe(404);
+  await page.getByLabel("CSV report files").setInputFiles([
     { name: "users-agents.csv", mimeType: "text/csv", buffer: Buffer.from(userAgentsCsv) },
     { name: "users.csv", mimeType: "text/csv", buffer: Buffer.from(usersCsv) },
   ]);
-  await page.getByRole("button", { name: "Validate and stage" }).click();
-  await expect(validation.getByText("All three report kinds are present", { exact: true })).toBeVisible();
-  await modal.getByRole("button", { name: "Continue to review" }).click();
-  const previews = modal.getByRole("region", { name: "Validated report previews" });
-  await expect(previews.getByRole("row")).toHaveCount(4);
-  await expect(previews.getByText("Bundle hash", { exact: true })).toBeHidden();
-  await previews.getByText("Technical validation details", { exact: true }).click();
-  await expect(previews.locator("pre")).toContainText('"agents": 9');
-  await expect(previews.locator("pre")).toContainText('"userAgents": 9');
-  await expect(previews.locator("pre")).toContainText('"users": 9');
-  await expect(previews.getByText(/Observed last-activity dates; reporting window unknown; freshness unknown/)).toHaveCount(3);
-  expect(await previews.locator(".table-shell").evaluate(element => element.scrollWidth >= element.clientWidth)).toBe(true);
-  if (test.info().project.name === "mobile") {
-    expect(await previews.locator(".table-shell").evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
-  }
-  await modal.getByRole("button", { name: "Accept reviewed bundle" }).click();
-  if (stagedState.activeSetId) {
-    await expect(modal.getByText(/upload exactly matched the current retained snapshot.*No new history entry was created/)).toBeVisible();
-    const reused: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
-    expect(reused.activeSetId).toBe(stagedState.activeSetId);
-    expect(reused.activeRevision).toBe(stagedState.activeRevision);
-    expect(reused.sets).toHaveLength(stagedState.sets.length);
-    expect(reused.sets.find(set => set.id === reused.activeSetId)?.acceptedAt)
-      .toBe(stagedState.sets.find(set => set.id === stagedState.activeSetId)?.acceptedAt);
-  } else {
-    await expect(modal.getByText(/three-file snapshot was added to cumulative history and is current/)).toBeVisible();
-  }
-  const accepted: OfficialUsageAggregateView = await (await page.request.get("/api/official-usage/aggregate")).json();
-  expect(accepted.summary.usage).toMatchObject({ totalResponses: 9, totalActiveUsers: 1 });
-  expect(accepted.lineages).toHaveLength(3);
-  expect(accepted.activeSet?.id).toEqual(expect.any(String));
-  expect(await page.evaluate(() => localStorage.getItem("agent-control:usage-reports:v1"))).toBe("untrusted legacy rows");
-  await page.getByRole("button", { name: /Acknowledge re-import and remove/i }).click();
-  await expect(page.getByText(/removed after explicit acknowledgement/i)).toBeVisible();
-  expect(await page.evaluate(() => ({ legacy: localStorage.getItem("agent-control:usage-reports:v1"), unrelated: localStorage.getItem("unrelated") }))).toEqual({ legacy: null, unrelated: "preserve me" });
-
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(validation.getByRole("heading", { name: "Ready to import" })).toBeVisible();
+  const previews = modal.getByRole("list", { name: "Selected CSV files" });
+  await expect(previews.getByRole("listitem")).toHaveCount(3);
+  await expect(previews.locator("span")).toHaveText(["Agents - 1 row", "Users & agents - 1 row", "Users - 1 row"]);
+  await expect(previews.locator("details, pre, button")).toHaveCount(0);
+  await expect(modal.getByRole("button")).toHaveText(["Cancel import", "Import reports"]);
+  expect(await modal.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const acceptance = page.waitForResponse(response => new URL(response.url()).pathname === `/api/official-usage/bundles/${first.bundleId}/accept`);
+  await modal.getByRole("button", { name: "Import reports", exact: true }).click();
+  const receipt: OfficialReportAccepted = await (await acceptance).json();
+  expect(receipt.complete).toBe(true);
+  await expect(modal.getByRole("heading", { name: "Reports imported" })).toBeVisible();
+  const accepted: ReportPage<ReportAgent> = await (await page.request.get(`/api/official-usage/aggregate?setId=${receipt.setId}&limit=1`)).json();
+  const historyAfter: ReportPage<ReportHistorySet> = await (await page.request.get("/api/official-usage/history?limit=1")).json();
+  expect(accepted.summary).toMatchObject({ reportedResponses: 9, distinctActiveReportUsers: 1 });
+  expect(accepted.reports.lineages).toHaveLength(3);
+  expect(accepted.reports.setId).toBe(receipt.setId);
+  if (before.reports.setId === receipt.setId) {
+    expect(accepted.reports.activeRevision).toBe(before.reports.activeRevision);
+    expect(accepted.reports.acceptedAt).toBe(before.reports.acceptedAt);
+    expect(historyAfter.counts.total).toBe(historyBefore.counts.total);
+  } else expect(historyAfter.counts.total).toBe(historyBefore.counts.total + 1);
+  expect(await page.evaluate(() => ({ legacy: localStorage.getItem("agent-control:usage-reports:v1"), unrelated: localStorage.getItem("unrelated") })))
+    .toEqual({ legacy: "untrusted legacy rows", unrelated: "preserve me" });
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Manage reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Retained activity summary" })).toHaveCount(0);
-  await modal.getByRole("button", { name: "View current snapshot", exact: true }).click();
-  await page.locator(".usage-report-details > summary").click();
-  await expect(page.getByText(/Microsoft 365 admin center Copilot Agents usage exports\. Source discrepancies/)).toBeVisible();
-  const lineage = page.locator(".usage-source-files");
-  await expect(lineage.locator(":scope > details")).toHaveCount(3);
+  const currentRow = modal.getByRole("region", { name: "Saved report sets" }).getByRole("row").filter({ hasText: receipt.setId });
+  await currentRow.getByRole("button", { name: "View report", exact: true }).click();
+  const lineage = modal.getByRole("region", { name: "Report provenance" });
+  await lineage.getByText("Report sources", { exact: true }).click();
+  await expect(lineage.locator("dt")).toHaveText(["agents", "userAgents", "users"]);
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Reported agent activity" }).locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("region", { name: "Agent activity report" }).getByRole("link")).toHaveCount(0);
-  for (const source of await lineage.locator(":scope > details").all()) {
-    await source.locator("summary").click();
-    await expect(source.getByText(/activity_range/)).toBeVisible();
-    await expect(source.getByText("unknown", { exact: true })).toBeVisible();
-    await expect(source.getByText("Not supplied", { exact: true })).toBeVisible();
-  }
+  await expect(lineage.getByText("Provenance: activity_range", { exact: true })).toBeVisible();
+  await expect(lineage.locator("dd").filter({ hasText: "source freshness unknown" })).toHaveCount(3);
   await expect(page.getByText(/Import time does not establish source freshness/)).toBeVisible();
+  const download = page.waitForEvent("download");
+  await modal.getByRole("button", { name: "Export agent CSV" }).click();
+  await modal.getByRole("link", { name: "Download CSV", exact: true }).click();
+  const file = await download;
+  expect(file.suggestedFilename()).toBe("official-agents.csv");
+  const csv = await downloadedCsvRows(file);
+  expect(csv).toHaveLength(1);
+  expect(csv[0]).toMatchObject({ agentId: "report-agent-1", agentName: "Support agent", responsesSentToUsers: "9" });
 
   await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
-  const activeSetRow = modal.getByRole("region", { name: "Retained official usage snapshots" }).getByRole("row").filter({ hasText: "Current" });
-  const deleteSet = activeSetRow.getByRole("button", { name: /^Delete retained set for / });
+  const activeSetRow = modal.getByRole("region", { name: "Saved report sets" }).getByRole("row").filter({ hasText: receipt.setId });
+  const deleteSet = activeSetRow.getByRole("button", { name: "Delete report set", exact: true });
   await deleteSet.click();
-  const dialog = page.getByRole("dialog", { name: "Confirm delete" });
+  const dialog = page.getByRole("dialog", { name: "Delete report set?" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
   await page.keyboard.press("Tab");
@@ -1477,69 +1523,71 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(dialog).not.toBeVisible();
   await expect(deleteSet).toBeFocused();
 
-  await modal.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  await modal.getByRole("button", { name: "Import another bundle", exact: true }).click();
-  await modal.getByRole("checkbox", { name: "This upload intentionally corrects the current snapshot." }).check();
-  await page.getByLabel("Official usage CSV files").setInputFiles([
+  await deleteSet.click();
+  await dialog.getByRole("button", { name: "Import correction instead" }).click();
+  await expect(modal.getByRole("status")).toContainText("This import replaces the saved report");
+  const correctionUpload = page.waitForResponse(response => new URL(response.url()).pathname === "/api/official-usage/staging" && response.status() < 300);
+  await page.getByLabel("CSV report files").setInputFiles([
     { name: "agents-correction.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv.replace("9,2026", "99,2026")) },
     { name: "invalid.csv", mimeType: "text/csv", buffer: Buffer.from(invalidCsv) },
   ]);
-  await page.getByRole("button", { name: "Validate and stage" }).click();
-  await expect(modal.getByText(/1 report type\(s\) staged; 1 file\(s\) rejected/)).toBeVisible();
-  await expect(modal.getByRole("region", { name: "Server validation" }).getByText(/^Agents: 1 rows staged/)).toBeVisible();
-  await expect(modal.getByRole("button", { name: "Continue to review" })).toBeDisabled();
-  await expect(modal.getByRole("region", { name: "Validated report previews" })).toHaveCount(0);
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
-  const unchanged: OfficialUsageAggregateView = await (await page.request.get("/api/official-usage/aggregate")).json();
-  expect(unchanged.activeSet?.id).toBe(accepted.activeSet?.id);
-  expect(unchanged.summary.usage).toMatchObject({ totalResponses: 9, totalActiveUsers: 1 });
-  await page.goto(`/sync?reports=snapshot&snapshot=${accepted.activeSet!.id}`);
+  const correction: OfficialReportPreview = await (await correctionUpload).json();
+  expect(correction.correctionOfSetId).toBe(receipt.setId);
+  await expect(modal.getByRole("alert")).toContainText("invalid.csv");
+  await expect(modal.getByText("Agents - 1 row", { exact: true })).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
+  const unchanged: ReportPage<ReportAgent> = await (await page.request.get("/api/official-usage/aggregate?limit=1")).json();
+  expect(unchanged.reports.setId).toBe(receipt.setId);
+  expect(unchanged.summary).toMatchObject({ reportedResponses: 9, distinctActiveReportUsers: 1 });
+  await modal.getByRole("button", { name: "Cancel import" }).click();
+  await modal.getByRole("alertdialog", { name: "Discard staged import" }).getByRole("button", { name: "Discard staged import" }).click();
+  await expect(modal).toBeHidden();
+  const discarded = await page.request.get(`/api/official-usage/staging/${correction.id}`);
+  expect(discarded.status()).toBe(409);
+  expect(await discarded.json()).toMatchObject({ code: "staging_unavailable" });
+  await page.goto(`/sync?reports=snapshot&snapshot=${receipt.setId}`);
   await expect(page.getByRole("region", { name: "Snapshot tenant totals" })).toContainText("9");
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
-  await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  await modal.getByRole("button", { name: "Discard staging" }).click();
-  await expect(modal.getByText("All staged rows were discarded.", { exact: true })).toBeVisible();
-  const discarded: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
-  expect(discarded.staging.filter(stage => stage.status === "active")).toEqual([]);
-
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Close reports", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
   const cohortRead = page.waitForResponse(response => {
     const url = new URL(response.url());
     return url.pathname === "/api/official-usage/users" && url.searchParams.get("licenseCohort") === "active_without_paid";
   });
   await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");
-  const cohortView: OfficialUsageUserView = await (await cohortRead).json();
-  expect(cohortView.licenseCoverage?.unknownUsers).toBeGreaterThan(0);
-  expect(cohortView.users.value).toEqual([]);
+  const cohortView: ReportPage<ReportUser> = await (await cohortRead).json();
+  expect(cohortView.summary.unknownLicenseActiveReportUsers).toBeGreaterThan(0);
+  expect(cohortView.value).toEqual([]);
   await expect(page.getByText(/Run Users sync/).first()).toBeVisible();
-  await expect(page.getByRole("button", { name: "View reported details for Example user" })).toHaveCount(0);
-  if (cohortView.licenseCoverage?.state === "unavailable") {
+  await expect(page.getByRole("button", { name: "Example user", exact: true })).toHaveCount(0);
+  if (cohortView.sources.directory.state === "unavailable") {
     await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
   }
 
   await page.evaluate(() => localStorage.setItem("agent-control:usage-reports:v1", "still-untrusted"));
   await login(page, "role-Viewer");
-  await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
+  await expect(page.getByText(/Legacy browser report data is present in this browser/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Manage reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
-  await modal.getByRole("button", { name: "View current snapshot", exact: true }).click();
+  await modal.getByRole("region", { name: "Saved report sets" }).getByRole("row").filter({ hasText: receipt.setId })
+    .getByRole("button", { name: "View report", exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
   const session = await (await page.request.get("/api/me")).json();
-  const deniedImport = await page.request.post("/api/official-usage/staging", {
+  const deniedImport = await page.request.post("/api/official-usage/staging?bundleId=dddddddd-dddd-4ddd-8ddd-dddddddddddd", {
     headers: { "X-CSRF-Token": session.csrfToken },
-    multipart: { bundleId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", file: { name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) } },
+    multipart: { file: { name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) } },
   });
   expect(deniedImport.status()).toBe(403);
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Close reports", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");
   await expect(page.getByText(/Run Users sync/).first()).toBeVisible();
-  await expect(page.getByRole("button", { name: "View reported details for Example user" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Example user", exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("official-usage.png"), fullPage: true });

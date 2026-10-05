@@ -3,7 +3,6 @@ import { isDirectoryObjectId } from "../../../backend/src/types/copilotPackage";
 import { responsibilityLabels, type ResponsibilityPerson } from "../../../backend/src/types/agentResponsibility";
 import { getAgentResponsibility, type AgentResponsibilityPage } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
-import { useSavedRead } from "../savedQueries";
 import { usageDate } from "../usageInsights";
 import type { UsersRouteState } from "../workbenchRouting";
 import { hasAppRole } from "../../../backend/src/types/capability";
@@ -24,34 +23,52 @@ export function UserAgentResponsibility({ compact = false, objectId, dataRevisio
   const scope = JSON.stringify([context?.user?.tenantId, context?.user?.homeAccountId, [...(context?.user?.roles ?? [])].sort()]);
   const [result, setResult] = useState<{ key: { query: object }; value?: AgentResponsibilityPage; error?: string }>();
   const [retry, setRetry] = useState(0);
-  const [localPage, setLocalPage] = useState(0);
-  const readSaved = useSavedRead();
-  const page = route?.page ?? localPage;
+  const [navigation, setNavigation] = useState<{ scope: string; page: number; selectionId: string; cursor: string }>();
   const personId = route?.personId ?? objectId;
   const search = route?.search ?? "";
   const valid = personId === undefined ? Boolean(route) : isDirectoryObjectId(personId);
-  const query = useMemo(() => ({ scope, personId, search, page, readSaved }), [scope, personId, search, page, readSaved]);
+  const boundary = JSON.stringify([scope, personId, search, dataRevision, agentInventoryRevision, retry]);
+  const [initialBoundary] = useState(boundary);
+  const [resolvedPin, setResolvedPin] = useState<{ boundary: string; id: string }>();
+  const local = navigation?.scope === boundary ? navigation : undefined;
+  const routeSelection = route?.selectionId, routeCursor = route?.cursor, routePage = route?.page;
+  const { selectionId, cursor, page } = useMemo(() => {
+    const known = resolvedPin?.boundary === boundary ? resolvedPin.id : undefined;
+    const routeUsable = Boolean(routeSelection && (initialBoundary === boundary || known === routeSelection));
+    return { selectionId: local?.selectionId ?? (routeUsable ? routeSelection : undefined),
+      cursor: local?.cursor ?? (routeUsable ? routeCursor : undefined),
+      page: local?.page ?? (routeUsable ? routePage ?? 0 : 0) };
+  }, [boundary, local, routeSelection, routeCursor, routePage, initialBoundary, resolvedPin]);
+  const query = useMemo(() => ({ scope, personId, search, page, selectionId, cursor }), [scope, personId, search, page, selectionId, cursor]);
   const key = useMemo(() => ({ query, dataRevision, agentInventoryRevision, retry }), [query, dataRevision, agentInventoryRevision, retry]);
   const scoped = result?.key === key ? result : undefined;
   useEffect(() => {
     if (!valid || !canRead) return;
     const controller = new AbortController();
-    void readSaved(["agent-responsibility", scope, personId, search, page, dataRevision, agentInventoryRevision, retry],
-      signal => getAgentResponsibility({ objectId: personId, search, offset: page * 50, limit: 50 }, { signal }), controller.signal)
+    void getAgentResponsibility({ objectId: personId, search, selectionId, cursor, limit: 50 }, { signal: controller.signal })
       .then(value => {
         if (controller.signal.aborted) return;
         if (personId && value.selected?.person.objectId !== personId.toLowerCase()) throw new Error("Saved responsibility did not match the exact requested user.");
+        setResolvedPin({ boundary, id: value.selection.id });
         setResult({ key, value });
       })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) setResult({ key, error: error instanceof Error ? error.message : "Saved responsibility could not be loaded." });
+        if (!controller.signal.aborted) {
+          setResult({ key, error: error instanceof Error ? error.message : "Saved responsibility could not be loaded." });
+        }
       });
     return () => controller.abort();
-  }, [valid, canRead, key, scope, personId, search, page, dataRevision, agentInventoryRevision, retry, readSaved]);
+  }, [valid, canRead, key, boundary, personId, search, selectionId, cursor]);
   const data = canRead && valid && result?.key.query === query ? result.value : undefined;
   const selected = data?.selected;
-  const count = selected?.count ?? data?.count ?? 0;
-  const changePage = (next: number) => route ? onRouteChange?.({ ...route, page: next }) : setLocalPage(next);
+  const count = selected?.count ?? data?.counts.filtered ?? 0;
+  const changePage = (direction: "next" | "previous") => {
+    const nextCursor = direction === "next" ? data?.page.nextCursor : data?.page.previousCursor;
+    if (!data || !nextCursor) return;
+    const next = { scope: boundary, page: page + (direction === "next" ? 1 : -1), selectionId: data.selection.id, cursor: nextCursor };
+    if (route) onRouteChange?.({ ...route, page: next.page, selectionId: next.selectionId, cursor: next.cursor });
+    else setNavigation(next);
+  };
   return <section className="user-responsibility" aria-label="Agent responsibility">
     <h3>Agent responsibility</h3>
     {!compact ? <p>Owner, Created by and Last modified by are explicit saved source relationships, not usage, access assignments or permission to manage agents. A last modifier is not necessarily a maintainer.</p> : null}
@@ -60,7 +77,7 @@ export function UserAgentResponsibility({ compact = false, objectId, dataRevisio
       : <>
         {route && personId ? <button type="button" className="secondary" onClick={() => onRouteChange?.({ view: "responsibility", search: "", page: 0 })}>All responsible people</button> : null}
         {route && !personId ? <label>Search responsible people<input aria-label="Search responsible people" value={search}
-          onChange={event => onRouteChange?.({ ...route, search: event.target.value, page: 0 })} /></label> : null}
+          onChange={event => onRouteChange?.({ ...route, search: event.target.value, page: 0, selectionId: undefined, cursor: undefined })} /></label> : null}
         {!scoped && !data ? <p role="status">Loading saved responsibility...</p> : null}
         {!scoped && data ? <p className="sr-only" role="status">Refreshing saved responsibility. Showing the last loaded relationships.</p> : null}
         {scoped?.error ? <p role="alert" className="error-banner">{scoped.error} <button type="button" className="secondary"
@@ -88,8 +105,8 @@ export function UserAgentResponsibility({ compact = false, objectId, dataRevisio
               {onOpenAgent ? <button type="button" className="secondary" onClick={() => onOpenAgent(agent.id)}>Open agent {agent.displayName}</button> : null}
             </li>)}</ul>
           </> : <>
-            {data.coverage !== "unavailable" ? <p>{data.count.toLocaleString()} responsible people. Includes identities outside paid-license and active-report cohorts.</p> : null}
-            {!data.count && data.coverage !== "unavailable" ? <p>No reported responsibility people match this saved-source selection.</p> : null}
+            {data.coverage !== "unavailable" ? <p>{data.counts.filtered.toLocaleString()} responsible people. Includes identities outside paid-license and active-report cohorts.</p> : null}
+            {!data.counts.filtered && data.coverage !== "unavailable" ? <p>No reported responsibility people match this saved-source selection.</p> : null}
             <ul className="responsibility-list">{data.people.map(person => <li key={person.objectId}>
               <ResponsibilityIdentity person={person} />
               <span>{person.agentCount} agents · {person.roles.map(role => responsibilityLabels[role]).join(" · ")}</span>
@@ -98,10 +115,10 @@ export function UserAgentResponsibility({ compact = false, objectId, dataRevisio
               </button>
             </li>)}</ul>
           </>}
-          {count > 50 || page > 0 ? <nav aria-label="Responsibility pages">
-            <button type="button" className="secondary" disabled={page === 0} onClick={() => changePage(page - 1)}>Previous</button>
-            <span> Page {page + 1} of {Math.max(1, Math.ceil(count / 50))} </span>
-            <button type="button" className="secondary" disabled={(page + 1) * 50 >= count} onClick={() => changePage(page + 1)}>Next</button>
+          {data.page.nextCursor || data.page.previousCursor ? <nav aria-label="Responsibility pages">
+            <button type="button" className="secondary" disabled={!data.page.previousCursor} onClick={() => changePage("previous")}>Previous</button>
+            <span> Page {page + 1} · {selected?.agents.length ?? data.people.length} of {count.toLocaleString()} relationships </span>
+            <button type="button" className="secondary" disabled={!data.page.nextCursor} onClick={() => changePage("next")}>Next</button>
           </nav> : null}
           {!compact ? <details><summary>Responsibility source coverage</summary>
             {Object.entries(data.sources).map(([source, status]) => <p key={source}>

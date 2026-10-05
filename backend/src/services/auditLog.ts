@@ -16,6 +16,7 @@ export function auditMetadata(value: Record<string, unknown> | undefined) {
     if (typeof entry === "string" && entry.length <= 128 || typeof entry === "number" && Number.isFinite(entry) || typeof entry === "boolean") {
       result[key] = entry as string | number | boolean;
     }
+    if (typeof value.checksum === "string" && /^[a-f0-9]{64}$/.test(value.checksum)) result.checksum = value.checksum;
   }
   return result;
 }

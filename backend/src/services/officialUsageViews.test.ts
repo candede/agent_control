@@ -1,1013 +1,484 @@
-import { describe, expect, it } from "vitest";
-import type { PublishedOfficialUsage } from "../types/officialUsage.js";
-import type { CopilotServiceSummaryState } from "../types/copilotUsage.js";
-import type { SavedCopilotUsageSource } from "../db/dataSync.js";
-import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
-import { buildOfficialUsageAgentDetailView, buildOfficialUsageAgentUsersView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
+import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
+import { parse } from "csv-parse";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { usageAudit } from "../db/agentUsageTestSupport.js";
+import { seedDisjointReportUnion, seedReportSet, seedUserFact } from "../../scripts/officialReportFixtures.js";
+import { OfficialReportImports } from "../db/officialReportImports.js";
+import { UserSourceStages } from "../db/userSourceStages.js";
+import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
+import { OfficialReportExports } from "./officialReportExports.js";
+import { schemaRegistry } from "./officialReportFields.js";
+import { reportExportColumns, type ReportAgent, type ReportPage, type ReportQuery, type ReportRelationship, type ReportUser } from "../types/officialReportData.js";
+import type { CopilotDirectoryUser, CopilotServiceSummaryState } from "../types/copilotUsage.js";
+import type { SelectionIdentity } from "./dataSelections.js";
+import type { ExportSource } from "./dataExports.js";
 
-const set = {
-  id: "11111111-1111-4111-8111-111111111111",
-  bundleId: "22222222-2222-4222-8222-222222222222",
-  reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06", provenance: "source_metadata" as const },
-  supersedesSetId: null,
-  complete: true,
-  kinds: ["agents", "userAgents", "users"] as const,
-  acceptedAt: "2026-07-08T12:00:00.000Z",
-  deletedAt: null,
-  createdAt: "2026-07-08T12:00:00.000Z",
-  expiresAt: "2027-01-04T12:00:00.000Z",
-};
-const common = {
-  parserVersion: "1",
-  schemaVersion: "observed-v1",
-  reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06", days: 30, provenance: "source_metadata" as const },
-  sourceAsOf: "2026-07-08T12:00:00.000Z",
-  sourceAsOfProvenance: "source_metadata" as const,
-  sourceFreshness: "known" as const,
-  warnings: [],
-};
-const lineage = (kind: "agents" | "userAgents" | "users", versionId: string, rowCount: number) => ({
-  kind,
-  versionId,
-  fileHash: "a".repeat(64),
-  parserVersion: common.parserVersion,
-  schemaVersion: common.schemaVersion,
-  reportingPeriod: common.reportingPeriod,
-  sourceAsOf: common.sourceAsOf,
-  sourceAsOfProvenance: common.sourceAsOfProvenance,
-  sourceFreshness: common.sourceFreshness,
-  acceptedAt: "2026-07-08T12:00:00.000Z",
-  rowCount,
-  warnings: [],
-  reconciliation: {},
-  supersedesVersionId: null,
+type Rows = Record<"agents" | "userAgents" | "users", string[]>;
+let fixture: Awaited<ReturnType<typeof testDatabase>>, imports: OfficialReportImports, reports: LargeTenantUsersReports, today: Date;
+const unionIdentity = { ...selectionIdentity, tenantId: `native-union-${randomUUID()}` };
+let unionSet: string;
+beforeAll(async () => {
+  fixture = await testDatabase(); imports = new OfficialReportImports(fixture.runtime);
+  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-native-view-semantics-secret", 35);
+  today = (await fixture.runtime.query("SELECT clock_timestamp() AS now")).rows[0].now;
+  unionSet = (await seedDisjointReportUnion(fixture.operator, unionIdentity.tenantId, 50000)).id;
+  await reports.history.ensure(unionIdentity.tenantId);
+  await reports.history.connections.run(client => reports.history.accepted(client, unionIdentity.tenantId, unionSet));
+}, 30_000);
+afterAll(async () => { await fixture?.close(); });
+const owner = (): SelectionIdentity => ({ ...selectionIdentity, tenantId: `native-views-${randomUUID()}` });
+const day = (offset = 0) => new Date(today.getTime() + offset * 86400000).toISOString().slice(0, 10);
+const baseline = (): Rows => ({
+  agents: [`usage-a,Agent A,Declarative,2,1,9,${day()}`, `usage-b,Agent B,Custom,1,0,4,${day(-35)}`],
+  userAgents: [`usage-a,Agent A,Declarative,CaseSensitiveUser,5,${day()}`, `usage-b,Agent B,Custom,CaseSensitiveUser,4,${day(-35)}`,
+    `usage-a,Agent A,Declarative,casesensitiveuser,4,${day(-1)}`, `usage-report-only,Report-only agent,Your Users,CaseSensitiveUser,2,${day()}`],
+  users: [`CaseSensitiveUser,Pseudonym A,2,9,${day()}`, `casesensitiveuser,Pseudonym B,1,4,${day(-1)}`],
 });
-
-function published(): PublishedOfficialUsage {
-  return {
-    activeRevision: 2,
-    activeSet: { ...set, kinds: [...set.kinds] },
-    retainedCompleteSets: 1,
-    retainedIncompleteSets: 0,
-    hasImportHistory: true,
-    activeSelectionIncomplete: false,
-    reports: {
-      agents: {
-        ...common,
-        kind: "agents",
-        lineage: lineage("agents", "33333333-3333-4333-8333-333333333333", 2),
-        rows: [
-          { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", activeUsersLicensed: 2, activeUsersUnlicensed: 1, responsesSentToUsers: 9, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-          { agentId: "usage-b", agentName: "Agent B", creatorType: "Custom", activeUsersLicensed: 1, activeUsersUnlicensed: 0, responsesSentToUsers: 4, lastActivityDateUtc: "2026-06-01T00:00:00.000Z" },
-        ],
-      },
-      userAgents: {
-        ...common,
-        kind: "userAgents",
-        lineage: lineage("userAgents", "44444444-4444-4444-8444-444444444444", 4),
-        rows: [
-          { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "CaseSensitiveUser", responsesSentToUsers: 5, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-          { agentId: "usage-b", agentName: "Agent B", creatorType: "Custom", username: "CaseSensitiveUser", responsesSentToUsers: 4, lastActivityDateUtc: "2026-06-01T00:00:00.000Z" },
-          { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "casesensitiveuser", responsesSentToUsers: 4, lastActivityDateUtc: "2026-07-05T00:00:00.000Z" },
-          { agentId: "usage-report-only", agentName: "Report-only agent", creatorType: "Your Users", username: "CaseSensitiveUser", responsesSentToUsers: 2, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-        ],
-      },
-      users: {
-        ...common,
-        kind: "users",
-        lineage: lineage("users", "55555555-5555-4555-8555-555555555555", 2),
-        rows: [
-          { username: "CaseSensitiveUser", displayName: "Pseudonym A", numberOfAgentsUsed: 2, agentResponsesReceived: 9, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-          { username: "casesensitiveuser", displayName: "Pseudonym B", numberOfAgentsUsed: 1, agentResponsesReceived: 4, lastActivityDateUtc: "2026-07-05T00:00:00.000Z" },
-        ],
-      },
-    },
-  };
+async function stage(identity: SelectionIdentity, kind: keyof Rows, rows: string[], bundleId: string) {
+  return imports.stage(identity, { bundleId }, (async function* () {
+    yield Buffer.from(schemaRegistry[kind].headers.join(",") + "\n");
+    for (const row of rows) yield Buffer.from(row + "\n");
+  })());
+}
+async function publish(identity: SelectionIdentity, rows = baseline()) {
+  const bundleId = randomUUID();
+  for (const kind of ["agents", "userAgents", "users"] as const) await stage(identity, kind, rows[kind], bundleId);
+  return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
+}
+async function users(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50) {
+  const selection = await reports.capture(identity, "delegated", "official_users", query);
+  return reports.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportUser>>;
+}
+async function agents(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50) {
+  const selection = await reports.capture(identity, "delegated", "official_agents", query);
+  return reports.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportAgent>>;
+}
+async function relationships(identity: SelectionIdentity, selectionId: string, child: string, limit = 50, childQuery?: ReportQuery) {
+  return reports.page(selectionId, identity, { endpoint: "relationships", child, limit, childQuery }) as Promise<ReportPage<ReportRelationship>>;
+}
+function directoryUser(index: number, upn: string, state: CopilotServiceSummaryState = "disabled", company: string | null = null, department: string | null = null): CopilotDirectoryUser {
+  return { serviceEvidenceVersion: 1, identity: { objectId: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
+    userPrincipalName: upn, displayName: upn, companyName: company?.trim() || null, department: department?.trim() || null,
+    employeeType: null, accountEnabled: true, userType: "Member" },
+  copilotServiceState: state, servicePlans: state === "disabled" ? [] : [{
+    servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97", service: "M365_COPILOT_APPS", displayName: "Copilot",
+    state: state === "partially_enabled" ? "enabled" : state, capabilityStatus: state === "enabled" ? "Enabled" : null, assignedDateTime: null,
+  }, ...(state === "partially_enabled" ? [{ servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS",
+    displayName: "Teams", state: "disabled" as const, capabilityStatus: null, assignedDateTime: null }] : [])] };
+}
+async function directory(identity: SelectionIdentity, rows: CopilotDirectoryUser[]) {
+  const stages = new UserSourceStages(fixture.runtime);
+  return stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+    const key = await stages.query(lease, "discovery", "synthetic:native-view-directory");
+    await stages.page(lease, key, "synthetic:native-view-directory", rows.length, rows.length);
+    for (let start = 0; start < rows.length; start += 250) await stages.directory(lease, key, rows.slice(start, start + 250));
+    await stages.finishQuery(lease, key);
+  }, { beforePublish: async () => {} });
 }
 
-describe("combined agent user list", () => {
-  it("deduplicates users and report IDs, sums only this agent's responses, and retains exact report names", () => {
-    const view = buildOfficialUsageAgentUsersView(published(), ["usage-a", "usage-b", "usage-a"], { staleAfterDays: 35 });
-    expect(view.agentIds).toEqual(["usage-a", "usage-b"]);
-    expect(view.users.count).toBe(2);
-    expect(view.users.value).toEqual([
-      { username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 9 },
-      { username: "casesensitiveuser", displayName: "Pseudonym B", responsesSentToUsers: 4 },
-    ]);
+describe("native report row semantics and exact children", () => {
+  it.each(["official_users", "official_agents"] as const)("preserves the disjoint 50k plus 50k %s union without materializing a tenant", async endpoint => {
+    const settingsSql = "SELECT current_setting('enable_nestloop') AS nested,current_setting('enable_mergejoin') AS merge,current_setting('jit') AS jit";
+    const settings = (await fixture.runtime.query(settingsSql)).rows;
+    const selection = await reports.capture(unionIdentity, "delegated", endpoint, { setId: unionSet });
+    await reports.read(selection.id, unionIdentity, async (client, context) => {
+      const first = await reports.pageInRead(client, context, { limit: 50 });
+      expect(first.counts).toEqual({ total: 100000, filtered: 100000 }); expect(first.value).toHaveLength(50);
+      expect(first.page.nextCursor).toEqual(expect.any(String)); expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(1048576);
+      expect((await client.query(settingsSql)).rows).toEqual([{ nested: "off", merge: "off", jit: "off" }]);
+      const tailIds = endpoint === "official_users" ? ["bridge-49999", "user-49999"] : ["agent-49999", "agents-report-49999"];
+      const tails = await reports.rowsInRead(client, context, { exactIds: tailIds, limit: 2 });
+      expect(tails.counts).toEqual({ total: 2, filtered: 2 }); expect(tails.value).toHaveLength(2);
+      for (const id of tailIds) expect(tails.value).toContainEqual(expect.objectContaining(
+        endpoint === "official_users" ? { username: id } : { agentId: id }));
+    });
+    expect((await fixture.runtime.query(settingsSql)).rows).toEqual(settings);
   });
-
-  it("searches before paging, excludes zero activity and does not invent identities or fall back to other agents", () => {
-    const data = published();
-    data.reports.userAgents!.rows.push({ ...data.reports.userAgents!.rows[0], username: "zero", responsesSentToUsers: 0 });
-    expect(buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35, search: "Pseudonym", limit: 1, offset: 1 }).users)
-      .toMatchObject({ count: 2, value: [{ username: "casesensitiveuser", responsesSentToUsers: 4 }] });
-    expect(buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35, search: "missing" }).users.count).toBe(0);
-    expect(() => buildOfficialUsageAgentUsersView(data, ["USAGE-A"], { staleAfterDays: 35 })).toThrow("not found");
-    delete data.reports.userAgents;
-    expect(() => buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35 })).toThrow("Users and agents CSV");
-  });
-});
-
-function drilldownPublished() {
-  const source = published();
-  source.reports.userAgents!.rows.push(
-    { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "zero-user", responsesSentToUsers: 0, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-    { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "bridge-only", responsesSentToUsers: 2, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-    { agentId: "usage-A", agentName: "Agent A", creatorType: "Declarative", username: "upper-only", responsesSentToUsers: 11, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
-  );
-  source.reports.users!.rows.push(
-    { username: "zero-user", displayName: "Zero User", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
-    { username: "users-only", displayName: "No bridge rows", numberOfAgentsUsed: 8, agentResponsesReceived: 900 },
-  );
-  return source;
-}
-
-function savedLicenses(entries: Array<[string, CopilotServiceSummaryState]>): SavedCopilotUsageSource<CopilotDirectoryUser[]> {
-  const observedAt = "2026-09-23T00:00:00.000Z";
-  return {
-    source: "directory", attemptStatus: "available", message: "Saved license evidence.",
-    attemptedAt: observedAt, lastSuccessAt: observedAt, observedAt, rowCount: entries.length,
-    value: entries.map(([userPrincipalName, copilotServiceState], index) => ({
-      serviceEvidenceVersion: 1, copilotServiceState, servicePlans: [],
-      identity: {
-        objectId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, userPrincipalName,
-        displayName: userPrincipalName, accountEnabled: true, userType: "Member", employeeType: null, companyName: null, department: null,
-      },
-    })),
-  };
-}
-
-function organizationFixture() {
-  const source = published();
-  const organizations = [
-    ["first", " Alpha ", " Engineering "],
-    ["second", "Alpha", "Sales"],
-    ["third", "Beta", "Engineering"],
-    ["fourth", "Alpha", "Engineering"],
-    ["fifth", "alpha", "engineering"],
-    ["missing", " \t ", null],
-    ["paid", "Paid only", "Paid department"],
-    ["unknown", "Unknown only", "Unknown department"],
-    ["inactive", "Inactive only", "Inactive department"],
-  ] as const;
-  source.reports.userAgents!.rows = [];
-  source.reports.users!.rows = organizations.map(([username], index) => ({
-    username, displayName: username, numberOfAgentsUsed: 1,
-    agentResponsesReceived: username === "inactive" ? 0 : 10 - index,
-  }));
-  const licenseDirectory = savedLicenses(organizations.map(([username]) => [
-    username, username === "paid" ? "enabled" : username === "unknown" ? "unknown" : "disabled",
-  ]));
-  licenseDirectory.value!.forEach((user, index) => {
-    user.identity.companyName = organizations[index][1];
-    user.identity.department = organizations[index][2];
-  });
-  return { source, options: { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory } };
-}
-
-describe("active unpaid organization filters", () => {
-  it("builds trimmed, unique, case-preserving facets only from the eligible cohort before all filters", () => {
-    const { source, options } = organizationFixture();
-    const baseline = buildOfficialUsageUserView(source, options);
-    expect(baseline.filters).toMatchObject({
-      companies: ["Alpha", "Beta", "alpha"], departments: ["Engineering", "Sales", "engineering"],
-    });
-    expect(baseline.users.value[0]).toMatchObject({ companyName: "Alpha", department: "Engineering" });
-    expect(baseline.users.value.find(user => user.username === "missing")).toMatchObject({ companyName: null, department: null });
-    const selected = buildOfficialUsageUserView(source, {
-      ...options, company: " Alpha ", department: " Engineering ", search: "first", limit: 1,
-    });
-    expect(selected.filters).toMatchObject({
-      companies: baseline.filters.companies, departments: baseline.filters.departments,
-      company: "Alpha", department: "Engineering",
-    });
-    expect(selected.users).toMatchObject({ count: 1, value: [{ username: "first" }] });
-    expect(selected.counts).toEqual({ ...baseline.counts, filteredUsers: 1 });
-    expect(selected.licenseCoverage).toEqual(baseline.licenseCoverage);
-    expect(selected.cohorts).toEqual(baseline.cohorts);
-    expect(buildOfficialUsageUserView(source, { ...options, search: "absent", startDate: "2026-01-01", cohort: "zero" }).filters)
-      .toMatchObject({ companies: baseline.filters.companies, departments: baseline.filters.departments });
-  });
-
-  it("includes organization options beyond the maximum API page and can select those users", () => {
-    const source = published();
-    source.reports.userAgents!.rows = [];
-    source.reports.users!.rows = Array.from({ length: 501 }, (_, index) => ({
-      username: `person-${index}`, displayName: `Person ${index}`, numberOfAgentsUsed: 1, agentResponsesReceived: 501 - index,
-    }));
-    const licenseDirectory = savedLicenses(source.reports.users!.rows.map(user => [user.username, "disabled"]));
-    licenseDirectory.value!.forEach((user, index) => {
-      user.identity.companyName = index === 500 ? "Tail company" : "First company";
-      user.identity.department = index === 500 ? "Tail department" : "First department";
-    });
-    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory, limit: 500 };
-    const firstPage = buildOfficialUsageUserView(source, options);
-    expect(firstPage.users.value).toHaveLength(500);
-    expect(firstPage.users.value.some(user => user.username === "person-500")).toBe(false);
-    expect(firstPage.filters).toMatchObject({
-      companies: ["First company", "Tail company"], departments: ["First department", "Tail department"],
-    });
-    const tail = buildOfficialUsageUserView(source, {
-      ...options, company: "Tail company", department: "Tail department", search: "person-500", limit: 1,
-    });
-    expect(tail.users).toMatchObject({ count: 1, value: [{ username: "person-500" }] });
-    expect(tail.filters.companies).toEqual(firstPage.filters.companies);
-  });
-
-  it.each([
-    [{ company: "Alpha" }, ["first", "second", "fourth"]],
-    [{ department: "Engineering" }, ["first", "third", "fourth"]],
-    [{ company: " Alpha ", department: " Engineering " }, ["first", "fourth"]],
-    [{ company: "Alpha", department: "engineering" }, []],
-    [{ company: "alpha", department: "engineering" }, ["fifth"]],
-    [{ company: "Al" }, []],
-    [{ department: "Missing" }, []],
-    [{ company: "Paid only" }, []],
-  ] as const)("matches exact organization values with AND semantics (%j)", (filters, usernames) => {
-    const { source, options } = organizationFixture();
-    const view = buildOfficialUsageUserView(source, { ...options, ...filters });
-    expect(view.users.value.map(user => user.username)).toEqual(usernames);
-    expect(view.topUsersByResponses.map(user => user.username)).toEqual(usernames);
-  });
-
-  it("keeps raw report users and other review cohorts unchanged without directory enrichment", () => {
-    const { source, options } = organizationFixture();
-    for (const cohort of ["all", "zero", "low", "review"] as const) {
-      const baseline = buildOfficialUsageUserView(source, { staleAfterDays: 35, cohort });
-      const result = buildOfficialUsageUserView(source, { staleAfterDays: 35, cohort, licenseDirectory: options.licenseDirectory });
-      expect(result).toEqual(baseline);
-      expect(result.filters).toMatchObject({ companies: [], departments: [] });
-      expect(result.licenseCoverage).toBeUndefined();
-      for (const user of result.users.value) {
-        expect(user).not.toHaveProperty("companyName");
-        expect(user).not.toHaveProperty("department");
-      }
-    }
-    for (const filters of [{ company: "Alpha" }, { department: "Engineering" }]) {
-      expect(() => buildOfficialUsageUserView(source, { staleAfterDays: 35, ...filters }))
-        .toThrow("require the active_without_paid license cohort");
-    }
-  });
-
-  it("does not infer directory identities from names or use non-unique directory object IDs", () => {
-    const { source, options } = organizationFixture();
-    const users = options.licenseDirectory.value!;
-    users[1].identity.objectId = users[0].identity.objectId;
-    users[1].identity.userPrincipalName = "not-in-report";
-    users[2].identity.displayName = "Report-only name";
-    source.reports.users!.rows.push({
-      username: "Report-only name", displayName: "third", numberOfAgentsUsed: 1, agentResponsesReceived: 100,
-    });
-    const view = buildOfficialUsageUserView(source, options);
-    expect(view.users.value.map(user => user.username)).toEqual(["third", "fourth", "fifth", "missing"]);
-    expect(view.filters).toMatchObject({
-      companies: ["Alpha", "Beta", "alpha"], departments: ["Engineering", "engineering"],
-    });
-    expect(view.licenseCoverage).toMatchObject({ paidUsers: 1, unpaidUsers: 4, unknownUsers: 4 });
-  });
-});
-
-describe("official usage views", () => {
-  it("filters active unpaid users before paging, rankings, counts and relationship search", () => {
-    const source = published();
-    source.reports.users!.rows = [
-      { username: "paid@example.com", displayName: "Paid", numberOfAgentsUsed: 1, agentResponsesReceived: 900 },
-      { username: "unpaid@example.com", displayName: "Unpaid", numberOfAgentsUsed: 2, agentResponsesReceived: 7 },
-      { username: "suspended@example.com", displayName: "Suspended", numberOfAgentsUsed: 1, agentResponsesReceived: 3 },
-      { username: "unknown@example.com", displayName: "Unknown", numberOfAgentsUsed: 1, agentResponsesReceived: 50 },
-      { username: "unmatched@example.com", displayName: "Unmatched", numberOfAgentsUsed: 1, agentResponsesReceived: 60 },
-      { username: "zero@example.com", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
-    ];
-    source.reports.userAgents!.rows = [
-      { agentId: "agent-a", agentName: "Find me", creatorType: "Custom", username: "unpaid@example.com", responsesSentToUsers: 2 },
-      { agentId: "agent-b", agentName: "Another", creatorType: "Custom", username: "unpaid@example.com", responsesSentToUsers: 5 },
-      { agentId: "agent-a", agentName: "Find me", creatorType: "Custom", username: "bridge@example.com", responsesSentToUsers: 1 },
-    ];
-    const licenseDirectory = savedLicenses([
-      ["paid@example.com", "enabled"], ["unpaid@example.com", "disabled"],
-      ["suspended@example.com", "suspended"], ["unknown@example.com", "unknown"],
-      ["zero@example.com", "disabled"], ["bridge@example.com", "disabled"],
-    ]);
-    licenseDirectory.value![5].identity.companyName = "Bridge company";
-    licenseDirectory.value![5].identity.department = "Bridge department";
-    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
-    const result = buildOfficialUsageUserView(source, { ...options, limit: 1, offset: 1 });
-    expect(result.users).toMatchObject({ count: 3, limit: 1, offset: 1, value: [{ username: "suspended@example.com", licenseAssignmentStatus: "no_active_paid_license" }] });
-    expect(result.counts).toMatchObject({ users: 3, filteredUsers: 3, userRows: 2, accessRows: 3, totalResponsesReceived: 10 });
-    expect(result.topUsersByResponses.map(user => user.username)).toEqual(["unpaid@example.com", "suspended@example.com", "bridge@example.com"]);
-    expect(result.topUsersByResponses.at(-1)).toMatchObject({ responses: 1, responsesSource: "userAgents" });
-    expect(result.licenseCoverage).toEqual({
-      state: "available", observedAt: licenseDirectory.observedAt, activeReportUsers: 6,
-      paidUsers: 1, unpaidUsers: 3, unknownUsers: 2, message: null,
-    });
-    const searched = buildOfficialUsageUserView(source, { ...options, search: "Find me", limit: 1 });
-    expect(searched.users.count).toBe(2);
-    expect(searched.users.value[0].rows.map(row => row.agentId)).toEqual(["agent-b", "agent-a"]);
-    const bridge = buildOfficialUsageUserView(source, { ...options, search: "bridge@example.com" }).users.value[0];
-    expect(bridge).toMatchObject({
-      missingUserReport: true, reportedResponsesReceived: 0, bridgeResponsesSentToUsers: 1,
-      licenseAssignmentStatus: "no_active_paid_license", companyName: "Bridge company", department: "Bridge department",
-    });
-  });
-
-  it("moves users between exclusive current-license cohorts without consulting the activity period", () => {
-    const source = published();
-    source.reports.userAgents!.rows = [];
-    source.reports.users!.rows = [
-      { username: "person@example.com", displayName: "Person", numberOfAgentsUsed: 1, agentResponsesReceived: 1 },
-      { username: "paid-no-activity@example.com", displayName: "No activity", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
-    ];
-    const licenseDirectory = savedLicenses([["person@example.com", "disabled"], ["paid-no-activity@example.com", "enabled"]]);
-    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
-    expect(buildOfficialUsageUserView(source, options).users.count).toBe(1);
-    for (const state of ["enabled", "warning", "partially_enabled"] as const) {
-      licenseDirectory.value![0].copilotServiceState = state;
-      const result = buildOfficialUsageUserView(source, options);
-      expect(result.users.count).toBe(0);
-      expect(result.licenseCoverage).toMatchObject({ paidUsers: 1, unpaidUsers: 0 });
-    }
-    for (const state of ["disabled", "suspended", "locked_out"] as const) {
-      licenseDirectory.value![0].copilotServiceState = state;
-      expect(buildOfficialUsageUserView(source, options).users.count).toBe(1);
-    }
-    licenseDirectory.value![0].copilotServiceState = "unknown";
-    expect(buildOfficialUsageUserView(source, options)).toMatchObject({ users: { count: 0 }, licenseCoverage: { unknownUsers: 1 } });
-  });
-
-  it("excludes unknown, expired, failed and ambiguous licensing instead of treating it as unpaid", () => {
-    const source = published();
-    source.reports.userAgents!.rows = [];
-    source.reports.users!.rows = [
-      { username: "case@example.com", displayName: "Case", numberOfAgentsUsed: 1, agentResponsesReceived: 2 },
-      { username: "CASE@example.com", displayName: "Other", numberOfAgentsUsed: 1, agentResponsesReceived: 3 },
-    ];
-    const licenseDirectory = savedLicenses([["case@example.com", "disabled"]]);
-    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
-    expect(buildOfficialUsageUserView(source, options)).toMatchObject({
-      users: { count: 0 }, licenseCoverage: { state: "available", unknownUsers: 2 },
-    });
-    source.reports.users!.rows.pop();
-    source.reports.users!.rows.push({
-      username: licenseDirectory.value![0].identity.objectId, displayName: "Object ID alias", numberOfAgentsUsed: 1, agentResponsesReceived: 3,
-    });
-    expect(buildOfficialUsageUserView(source, options)).toMatchObject({ users: { count: 0 }, licenseCoverage: { unknownUsers: 2 } });
-    source.reports.users!.rows.pop();
-    for (const directory of [
-      undefined,
-      { ...licenseDirectory, value: null },
-      { ...licenseDirectory, observedAt: null },
-      { ...licenseDirectory, attemptStatus: "failed" as const, message: "Directory refresh failed." },
-    ]) {
-      expect(buildOfficialUsageUserView(source, { ...options, licenseDirectory: directory })).toMatchObject({
-        users: { count: 0, value: [] }, licenseCoverage: { state: "unavailable", paidUsers: 0, unpaidUsers: 0, unknownUsers: 1 },
-        filters: { companies: [], departments: [] },
-      });
-    }
-    expect(buildOfficialUsageUserView(source, {
-      ...options, licenseDirectory: { ...licenseDirectory, value: null },
-    }).licenseCoverage?.message).toBe("Saved license data is missing or expired. Run Users sync.");
-    expect(buildOfficialUsageUserView(source, {
-      ...options, licenseDirectory: { ...licenseDirectory, value: [] },
-    })).toMatchObject({
-      users: { count: 0 }, licenseCoverage: { state: "available", unknownUsers: 1 },
-    });
-  });
-
-  it.each(["report", "directory"] as const)("excludes object-ID aliases of %s-ambiguous users from unpaid licensing", ambiguity => {
-    const source = published();
-    const licenseDirectory = savedLicenses([
-      ["case@example.com", "disabled"], ["control@example.com", "disabled"],
-      ...(ambiguity === "directory" ? [["CASE@example.com", "disabled"] as [string, CopilotServiceSummaryState]] : []),
-    ]);
-    const directory = licenseDirectory.value!;
-    directory.forEach(user => {
-      user.identity.companyName = user.identity.userPrincipalName === "control@example.com" ? "Verified company" : "Ambiguous company";
-      user.identity.department = user.identity.userPrincipalName === "control@example.com" ? "Verified department" : "Ambiguous department";
-    });
-    source.reports.userAgents!.rows = [];
-    source.reports.users!.rows = [
-      "case@example.com",
-      ambiguity === "directory" ? directory[2].identity.objectId : "CASE@example.com",
-      directory[0].identity.objectId,
-      "control@example.com",
-    ].map(username => ({ username, displayName: username, numberOfAgentsUsed: 1, agentResponsesReceived: 3 }));
-
-    const result = buildOfficialUsageUserView(source, {
-      staleAfterDays: 35, licenseCohort: "active_without_paid", licenseDirectory,
-    });
-    expect(result.licenseCoverage).toMatchObject({
-      state: "available", activeReportUsers: 4, paidUsers: 0, unpaidUsers: 1, unknownUsers: 3,
-    });
-    expect(result.users).toMatchObject({ count: 1, value: [{ username: "control@example.com" }] });
-    expect(result.filters).toMatchObject({ companies: ["Verified company"], departments: ["Verified department"] });
-    expect(result.topUsersByResponses.map(user => user.username)).toEqual(["control@example.com"]);
-  });
-
-  it("computes aggregate metrics without treating active-user counts as additive identities", () => {
-    const result = buildOfficialUsageAggregateView(published(), [], {
-      staleAfterDays: 35,
-      inactiveDays: 30,
-      activityWindowDays: 30,
-      now: new Date("2026-07-10T00:00:00.000Z"),
-    });
-
-    expect(result.availability).toBe("active");
-    expect(result.summary.usage).toMatchObject({ totalResponses: 13, totalResponsesBasis: "agents_report", totalResponsesCoverage: "agents_report_only", totalActiveUsers: 2, totalActiveUsersBasis: "users_and_users_agents_distinct_identity", activeUsersAreNonAdditive: true });
-    expect(result.summary.usage.responseReconciliation).toMatchObject({ status: "mismatch", sourceValues: { agents: 13, userAgents: 15, users: 13 } });
-    expect(result.summary.activityWindow).toMatchObject({ activeAgents: 2, activeUsers: 2, responses: 9, responseBasis: "agents_report" });
-    expect(result.agents.count).toBe(3);
-    expect(result.agents.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({ agentId: "usage-a", identityStatus: "unresolved", activeUsersTotal: 2, activeUsersTotalBasis: "userAgents_distinct_identity" }),
-    ]));
-    expect(result.missingKinds).toEqual([]);
-  });
-
-  it("preserves case-distinct pseudonyms and reports discrepancies without guessed package joins", () => {
-    const result = buildOfficialUsageUserView(published(), { staleAfterDays: 35, limit: 1 });
-
-    expect(result.counts).toMatchObject({ users: 2, accessRows: 4, reportOnlyRows: 4, mismatchCount: 1 });
-    expect(result.users.count).toBe(2);
-    expect(result.users.value).toHaveLength(1);
-    expect(result.users.value[0]).toMatchObject({ username: "CaseSensitiveUser", displayName: "Pseudonym A" });
-    expect(result.users.value[0].rows.every(row => row.packageStatus === "report-only" && row.identityStatus === "unresolved")).toBe(true);
-    expect(result.topUsersByResponses[0]).toMatchObject({ responses: 9, responsesSource: "users", agentsUsed: 2, agentsUsedSource: "users" });
-    expect(result.users.value[0].userLastActivityDateUtc).toBe("2026-07-06T00:00:00.000Z");
-    expect(result.lineages[0]).toMatchObject({ kind: "agents", schemaVersion: "observed-v1", sourceFreshness: "known" });
-  });
-
-  it("distinguishes never imported, incomplete, unselected, and stale states", () => {
-    const base = { activeRevision: 1, activeSet: null, reports: {}, activeSelectionIncomplete: false } as const;
-    expect(buildOfficialUsageAggregateView({ ...base, retainedCompleteSets: 0, retainedIncompleteSets: 0, hasImportHistory: false }, [], { staleAfterDays: 35 }).availability).toBe("never_imported");
-    expect(buildOfficialUsageAggregateView({ ...base, retainedCompleteSets: 0, retainedIncompleteSets: 1, hasImportHistory: true }, [], { staleAfterDays: 35 }).availability).toBe("incomplete");
-    expect(buildOfficialUsageAggregateView({ ...base, retainedCompleteSets: 1, retainedIncompleteSets: 0, hasImportHistory: true }, [], { staleAfterDays: 35 }).availability).toBe("not_selected");
-    expect(buildOfficialUsageAggregateView({ ...base, retainedCompleteSets: 0, retainedIncompleteSets: 0, hasImportHistory: true }, [], { staleAfterDays: 35 }).availability).toBe("deleted");
-    expect(buildOfficialUsageAggregateView(published(), [], { staleAfterDays: 35, now: new Date("2026-09-01T00:00:00.000Z") }).availability).toBe("stale");
-    const oldAcceptance = published();
-    oldAcceptance.activeSet = { ...oldAcceptance.activeSet!, reportingPeriod: { startDate: "2026-08-03", endDate: "2026-09-01", provenance: "source_metadata" }, acceptedAt: "2026-06-01T00:00:00.000Z" };
-    expect(buildOfficialUsageAggregateView(oldAcceptance, [], { staleAfterDays: 35, now: new Date("2026-09-02T00:00:00.000Z") }).availability).toBe("stale");
-  });
-
-  it("keeps unknown source coverage dates nullable instead of inventing a reporting period", () => {
-    const source = published();
-    source.activeSet = {
-      ...source.activeSet!,
-      reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
-      acceptedAt: "2026-09-12T00:00:00.000Z",
-    };
-    for (const report of Object.values(source.reports)) {
-      if (report) report.lineage.reportingPeriod = { startDate: null, endDate: null, days: null, provenance: "activity_range" };
-    }
-
-    const result = buildOfficialUsageAggregateView(source, [], {
-      staleAfterDays: 35,
-      now: new Date("2026-09-12T12:00:00.000Z"),
-    });
-
-    expect(result).toMatchObject({ availability: "active", periodAgeDays: null, acceptedAgeDays: 0 });
-    expect(result.lineages.every(item => item.reportingPeriod.startDate === null && item.reportingPeriod.endDate === null)).toBe(true);
-  });
-
-  it("filters the complete dataset before paging", () => {
-    const result = buildOfficialUsageUserView(published(), { staleAfterDays: 35, search: "pseudonym b", limit: 1 });
-    expect(result.users).toMatchObject({ count: 1, value: [expect.objectContaining({ username: "casesensitiveuser" })] });
-  });
-
-  it("sorts all agent rows before paging and retains undated rows until a date filter is selected", () => {
-    const source = published();
-    source.reports.agents!.rows.push({
-      agentId: "undated",
-      agentName: "Undated",
-      creatorType: "Agent built by Microsoft",
-      activeUsersLicensed: 0,
-      activeUsersUnlicensed: 0,
-      responsesSentToUsers: 50,
-    });
-    const sorted = buildOfficialUsageAggregateView(source, [], {
-      staleAfterDays: 35,
-      agentSortBy: "responses",
-      sortDirection: "desc",
-      limit: 1,
-      offset: 1,
-    });
-    expect(sorted.agents.count).toBe(4);
-    expect(sorted.agents.value[0]).toMatchObject({ agentId: "usage-a", responsesSentToUsers: 9 });
-
-    const dated = buildOfficialUsageAggregateView(source, [], {
-      staleAfterDays: 35,
-      startDate: "2026-01-01",
-      limit: 100,
-    });
-    expect(dated.agents.value.map(agent => agent.agentId)).not.toContain("undated");
-  });
-
-  it("uses inclusive UTC civil date filters while the default retains unknown dates", () => {
-    const source = published();
-    source.reports.users!.rows.push({
-      username: "unknown-date",
-      displayName: "Unknown date",
-      numberOfAgentsUsed: 0,
-      agentResponsesReceived: 0,
-    });
-
-    const unfiltered = buildOfficialUsageUserView(source, { staleAfterDays: 35, limit: 100 });
-    expect(unfiltered.users.value.map(user => user.username)).toContain("unknown-date");
-    expect(unfiltered.cohorts).toMatchObject({ zeroResponses: 1, lowResponses: 1, reviewCandidates: 2, missingBridgeRows: 1, threshold: 5 });
-
-    const filtered = buildOfficialUsageUserView(source, {
-      staleAfterDays: 35,
-      startDate: "2026-07-05",
-      endDate: "2026-07-05",
-      limit: 100,
-    });
-    expect(filtered.users.value.map(user => user.username)).toEqual(["casesensitiveuser"]);
-    expect(filtered.filters).toMatchObject({ startDate: "2026-07-05", endDate: "2026-07-05" });
-  });
-
-  it.each(["asc", "desc"] as const)("ranks distinct active users %s before paging and keeps missing evidence last", sortDirection => {
-    const source = published();
-    source.reports.agents!.rows.push({
-      ...source.reports.agents!.rows[0], agentId: "unknown-reach", activeUsersLicensed: 10_000, activeUsersUnlicensed: 10_000,
-    });
-    source.reports.userAgents!.rows.push({
-      ...source.reports.userAgents!.rows[0], agentId: "explicit-zero", responsesSentToUsers: 0,
-    });
-    const all = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35, agentSortBy: "activeUsers", sortDirection });
-    expect(all.agents.value.at(-1)).toMatchObject({ agentId: "unknown-reach", activeUsersIdentityCount: null });
-    expect(all.agents.value[0]).toMatchObject(sortDirection === "desc"
-      ? { agentId: "usage-a", activeUsersIdentityCount: 2 }
-      : { agentId: "explicit-zero", activeUsersIdentityCount: 0 });
-    const page = buildOfficialUsageAggregateView(source, [], {
-      staleAfterDays: 35, agentSortBy: "activeUsers", sortDirection, limit: 1, offset: 1,
-    });
-    expect(page.agents.value).toEqual(all.agents.value.slice(1, 2));
-    expect(page.filters.sortBy).toBe("activeUsers");
-  });
-
-  it.each(["responses", "agentsUsed"] as const)("keeps unknown Users-report %s last in both sort directions", userSortBy => {
-    const source = drilldownPublished();
-    source.reports.userAgents!.rows.find(row => row.username === "bridge-only")!.responsesSentToUsers = 10_000;
-    for (const sortDirection of ["asc", "desc"] as const) {
-      const result = buildOfficialUsageUserView(source, { staleAfterDays: 35, userSortBy, sortDirection });
-      expect(result.users.value.slice(-2).every(user => user.missingUserReport)).toBe(true);
-      expect(result.users.value[0]).toMatchObject(sortDirection === "asc"
-        ? { username: "zero-user", reportedResponsesReceived: 0 }
-        : { username: "users-only", reportedResponsesReceived: 900 });
-    }
-  });
-
-  it.each(["licensedUsers", "unlicensedUsers", "lastActivity"] as const)(
-    "keeps missing agent %s last in both directions without hiding explicit zero", agentSortBy => {
-      const source = published();
-      source.reports.agents!.rows.push({
-        ...source.reports.agents!.rows[0], agentId: "undated-zero", activeUsersLicensed: 0,
-        activeUsersUnlicensed: 0, lastActivityDateUtc: undefined,
-      });
-      for (const sortDirection of ["asc", "desc"] as const) {
-        const options = { staleAfterDays: 35, agentSortBy, sortDirection };
-        const result = buildOfficialUsageAggregateView(source, [], options);
-        expect(result.agents.value.at(-1)?.agentId).toBe(agentSortBy === "lastActivity" ? "undated-zero" : "usage-report-only");
-        if (agentSortBy !== "lastActivity" && sortDirection === "asc") {
-          expect(result.agents.value[0].agentId).toBe("undated-zero");
+  it("keeps small-tenant lineage probes indexed after shared fact-table statistics are collected", async () => {
+    await fixture.operator.query("ANALYZE official_usage_row_facts; ANALYZE official_usage_version_rows; ANALYZE official_usage_versions; ANALYZE official_usage_set_versions");
+    const identity = owner(); await publish(identity);
+    await reports.history.connections.selectedRead(async client => {
+      const root = await reports.history.root(client, identity.tenantId, new Date());
+      const original = client.query, query = client.query.bind(client);
+      let captured: { text: string; values: unknown[] } | undefined;
+      client.query = ((text: string, values: unknown[] = []) => {
+        if (text.startsWith("WITH snapshot_sets AS MATERIALIZED")) captured = { text, values };
+        return query(text, values);
+      }) as typeof client.query;
+      try { await reports.history.validateRoot(client, root, identity); }
+      finally { client.query = original; }
+      if (!captured) throw new Error("lineage_probe_missing");
+      const plan = (await query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${captured.text}`, captured.values)).rows[0]["QUERY PLAN"][0];
+      expect(Buffer.byteLength(JSON.stringify(plan))).toBeLessThanOrEqual(1048576);
+      type PlanNode = { "Relation Name"?: string; "Actual Rows"?: number; "Rows Removed by Filter"?: number; "Actual Loops"?: number; Plans?: PlanNode[] };
+      const pending: PlanNode[] = [plan.Plan];
+      let probes = 0;
+      while (pending.length) {
+        const node = pending.pop()!;
+        pending.push(...node.Plans ?? []);
+        if (node["Relation Name"] === "official_usage_membership_counts") {
+          probes++;
+          expect(((node["Actual Rows"] ?? 0) + (node["Rows Removed by Filter"] ?? 0)) * (node["Actual Loops"] ?? 0)).toBeLessThanOrEqual(250);
         }
-        expect(buildOfficialUsageAggregateView(source, [], { ...options, limit: 1, offset: 3 }).agents.value)
-          .toEqual(result.agents.value.slice(3));
+        expect(node["Relation Name"]).not.toBe("official_usage_row_facts");
       }
-    },
-  );
-
-  it("distinguishes an absent Users report from a present empty report in response totals", () => {
-    const source = published();
-    source.reports.users = undefined;
-    const absent = buildOfficialUsageUserView(source, { staleAfterDays: 35 });
-    expect(absent.counts.totalResponsesReceived).toBeNull();
-    expect(absent.users.value.every(user => user.missingUserReport && user.reviewCohort === "unknown")).toBe(true);
-    source.reports.users = published().reports.users;
-    source.reports.users!.rows = [];
-    expect(buildOfficialUsageUserView(source, { staleAfterDays: 35 }).counts.totalResponsesReceived).toBe(0);
+      expect(probes).toBeGreaterThan(0);
+    });
+    expect((await users(identity)).counts).toEqual({ total: 2, filtered: 2 });
   });
-
-  it("does not call missing relationship evidence a discrepancy with the Users report", () => {
-    const source = published();
-    source.reports.userAgents!.rows = source.reports.userAgents!.rows.filter(row => row.username !== "CaseSensitiveUser");
-    const absentRows = buildOfficialUsageUserView(source, { staleAfterDays: 35 });
-    expect(absentRows.users.value.find(user => user.username === "CaseSensitiveUser")).toMatchObject({
-      rows: [], hasReportMismatch: false, reportedResponsesReceived: 9,
-    });
-    source.reports.userAgents = undefined;
-    expect(buildOfficialUsageUserView(source, { staleAfterDays: 35 }).counts.mismatchCount).toBe(0);
+  it("keeps authoritative totals, reconciliation and nonadditive active identities separate", async () => {
+    const identity = owner(); await publish(identity);
+    const page = await agents(identity);
+    expect(page.summary).toMatchObject({ reportedResponses: 13, bridgeResponses: 15, userReportedResponses: 13,
+      distinctActiveReportUsers: 2, licensedOccurrences: 3, unlicensedOccurrences: 1,
+      responseReconciliation: "mismatch", activeUsersAreNonAdditive: true });
+    expect(page.counts).toEqual({ total: 3, filtered: 3 });
+    expect(page.value.find(row => row.agentId === "usage-a")).toMatchObject({ activeUsers: 2, activeUsersBasis: "userAgents_distinct_identity", identityStatus: "unresolved" });
+    expect(page.value.find(row => row.agentId === "usage-report-only")).toMatchObject({ responses: 2, responseSource: "userAgents", licensedUserOccurrences: null });
+    expect(page.analytics).toMatchObject({ basis: "filtered_rows", responses: 15, agents: { anchorDateUtc: day(), windowResponses: 11, windowDistinctActiveUsers: 2 } });
   });
-
-  it("rejects inexact Users-report response totals rather than rounding the report-wide count", () => {
-    const source = published();
-    source.reports.users!.rows[0].agentResponsesReceived = Number.MAX_SAFE_INTEGER;
-    source.reports.users!.rows[1].agentResponsesReceived = 1;
-    expect(() => buildOfficialUsageUserView(source, { staleAfterDays: 35 }))
-      .toThrowError(expect.objectContaining({ code: "official_usage_total_limit" }));
+  it("ranks response analytics numerically across digit widths", async () => {
+    const identity = owner();
+    await publish(identity, { agents: ["nine,Nine,Custom,1,0,9,", "ten,Ten,Custom,1,0,10,", "hundred,Hundred,Custom,1,0,100,"], users: [], userAgents: [] });
+    const page = await agents(identity);
+    expect(page.analytics.agents?.mostResponses.map(row => row.responses)).toEqual([100, 10, 9]);
+    expect(page.analytics.agents?.leastResponses.map(row => row.responses)).toEqual([9, 10, 100]);
   });
-
-  it.each(["asc", "desc"] as const)("keeps missing user activity dates last when sorting %s before paging", sortDirection => {
-    const source = published();
-    source.reports.users!.rows.push({
-      username: "undated-user", displayName: "Undated", numberOfAgentsUsed: 0, agentResponsesReceived: 0,
+  it.each([["absent", "unknown"], ["unresolved", "unknown"], ["empty", "none"]] as const)(
+    "preserves the no-matching-report activity golden with %s evidence", async (evidence, state) => {
+      const identity = owner(); await directory(identity, [directoryUser(1, "person@example.invalid", "enabled")]);
+      if (evidence !== "absent") await publish(identity, { agents: [], users: [],
+        userAgents: evidence === "unresolved" ? ["agent,Agent,Custom,unresolved,1,"] : [] });
+      const selected = await reports.capture(identity, "delegated", "copilot_users");
+      expect((await reports.page(selected.id, identity)).value).toMatchObject([{ agentActivityState: state }]);
     });
-    source.reports.userAgents!.rows.push({
-      ...source.reports.userAgents!.rows[0], username: "bridge-only", lastActivityDateUtc: "2026-07-08T00:00:00.000Z",
-    });
-    const options = { staleAfterDays: 35, userSortBy: "lastActivity" as const, sortDirection };
-    const result = buildOfficialUsageUserView(source, options);
-    expect(result.users.value.slice(0, 2).map(user => user.username)).toEqual(sortDirection === "asc"
-      ? ["casesensitiveuser", "CaseSensitiveUser"]
-      : ["CaseSensitiveUser", "casesensitiveuser"]);
-    expect(result.users.value.slice(2).every(user => !user.userLastActivityDateUtc)).toBe(true);
-    expect(buildOfficialUsageUserView(source, { ...options, offset: 2, limit: 2 }).users.value)
-      .toEqual(result.users.value.slice(2));
+  it("preserves case-distinct pseudonyms, full Users totals and separately paged report-only relationships", async () => {
+    const identity = owner(); await publish(identity);
+    const page = await users(identity, { sort: "responses", order: "desc" }, 1);
+    expect(page.counts).toEqual({ total: 2, filtered: 2 });
+    expect(page.value).toMatchObject([{ username: "CaseSensitiveUser", displayName: "Pseudonym A", reportedResponses: 9,
+      reportedAgentsUsed: 2, bridgeResponses: 11, relationshipCount: 3, hasReportMismatch: true, objectId: null, userLastActivityDateUtc: day() }]);
+    expect(page.value[0]).not.toHaveProperty("rows");
+    const child = await relationships(identity, page.selection.id, "CaseSensitiveUser", 1);
+    expect(child.counts).toEqual({ total: 3, filtered: 3 }); expect(child.value).toHaveLength(1);
+    expect(child.value[0].identityStatus).toBe("unresolved"); expect(child.page.nextCursor).toEqual(expect.any(String));
+    const next = await reports.page(page.selection.id, identity, { limit: 1, cursor: page.page.nextCursor! });
+    expect(next.value).toMatchObject([{ username: "casesensitiveuser", reportedResponses: 4, relationshipCount: 1, hasReportMismatch: false }]);
+    await expect(reports.exact(page.selection.id, identity, "CASESENSITIVEUSER")).rejects.toMatchObject({ status: 404 });
   });
-
-  it("applies cohort boundaries and sorts the full result before paging", () => {
-    const source = published();
-    source.reports.users!.rows.push(
-      { username: "zero", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
-      { username: "boundary", displayName: "Boundary", numberOfAgentsUsed: 1, agentResponsesReceived: 4, lastActivityDateUtc: "2026-07-01T00:00:00.000Z" },
-      { username: "above", displayName: "Above", numberOfAgentsUsed: 1, agentResponsesReceived: 5, lastActivityDateUtc: "2026-07-01T00:00:00.000Z" },
-    );
-    const result = buildOfficialUsageUserView(source, {
-      staleAfterDays: 35,
-      lowResponseThreshold: 4,
-      cohort: "review",
-      userSortBy: "responses",
-      sortDirection: "desc",
-      limit: 1,
-    });
-
-    expect(result.cohorts).toMatchObject({ zeroResponses: 1, lowResponses: 2, reviewCandidates: 3, threshold: 4 });
-    expect(result.users.count).toBe(3);
-    expect(result.users.value[0]).toMatchObject({ reportedResponsesReceived: 4, reviewCohort: "low_responses" });
-    expect(result.users.value.map(user => user.username)).not.toContain("above");
+  it("filters and orders server rows before paging without inventing identities", async () => {
+    const identity = owner(); await publish(identity);
+    expect((await users(identity, { search: "pseudonym b" }, 1)).value).toMatchObject([{ username: "casesensitiveuser" }]);
+    expect((await agents(identity, { search: "Agent A" }, 1)).value).toMatchObject([{ agentId: "usage-a" }]);
+    for (const sort of ["responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity", "name"] as const) {
+      for (const order of ["asc", "desc"] as const) {
+        const full = await agents(identity, { sort, order }), first = await agents(identity, { sort, order }, 1);
+        const second = await reports.page(first.selection.id, identity, { limit: 1, cursor: first.page.nextCursor! });
+        expect(first.value).toEqual(full.value.slice(0, 1)); expect(second.value).toEqual(full.value.slice(1, 2));
+        expect(second.counts).toEqual(full.counts); expect(second.summary).toEqual(first.summary);
+      }
+    }
   });
-
-  it("anchors user inactivity to the latest observed Users date rather than today's clock", () => {
-    const result = buildOfficialUsageUserView(published(), {
-      staleAfterDays: 35,
-      activity: "recent",
-      inactiveDays: 1,
-      now: new Date("2036-01-01T00:00:00.000Z"),
-      limit: 100,
-    });
-
-    expect(result.recencyAnchorDateUtc).toBe("2026-07-06T00:00:00.000Z");
-    expect(result.users.value.map(user => user.username)).toEqual(expect.arrayContaining(["CaseSensitiveUser", "casesensitiveuser"]));
+  it("retains unknown activity until an inclusive civil-date predicate is selected", async () => {
+    const identity = owner(), rows = baseline();
+    rows.agents.push("undated,Unknown,Custom,1,0,0,"); await publish(identity, rows);
+    const all = await agents(identity, { sort: "lastActivity", order: "asc" });
+    expect(all.value.at(-1)).toMatchObject({ agentId: "undated", lastActivityDateUtc: null });
+    const exact = await agents(identity, { startDate: day(), endDate: day() });
+    expect(exact.value.map(row => row.agentId).sort()).toEqual(["usage-a", "usage-report-only"]);
+    expect((await agents(identity, { endDate: day(-35) })).value).toMatchObject([{ agentId: "usage-b" }]);
   });
-
-  it("ignores old additive scalars and reports unknown per-agent totals without the identity bridge", () => {
-    const source = published();
-    Object.assign(source.reports.agents!.rows[0], { activeUsersTotal: 999 });
-    const withBridge = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
-    expect(withBridge.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
-      activeUsersLicensed: 2,
-      activeUsersUnlicensed: 1,
-      activeUsersTotal: 2,
-      activeUsersIdentityCount: 2,
-      activeUsersTotalBasis: "userAgents_distinct_identity",
-    });
-
-    source.reports.userAgents = undefined;
-    const withoutBridge = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
-    expect(withoutBridge.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
-      activeUsersLicensed: 2,
-      activeUsersUnlicensed: 1,
-      activeUsersTotal: null,
-      activeUsersIdentityCount: null,
-      activeUsersTotalBasis: "unknown",
-    });
-    expect(withoutBridge.summary.usage.topAgentsByActiveUsers).toEqual([]);
+  it("keeps wide Unicode name/identity cursors within 4 KiB without dropping either sort direction", async () => {
+    const identity = owner(), rows: Rows = { agents: [], userAgents: [], users: [] };
+    for (let n = 0; n < 4; n++) rows.agents.push(`${`id${n}`.padEnd(512, "語")},${`Name${n}`.padEnd(512, "語")},Custom,1,0,${n + 1},`);
+    await publish(identity, rows);
+    for (const order of ["asc", "desc"] as const) {
+      const first = await agents(identity, { sort: "name", order }, 2);
+      expect(first.value).toHaveLength(2); expect(Buffer.byteLength(first.page.nextCursor!)).toBeLessThanOrEqual(4096);
+      const next = await reports.page(first.selection.id, identity, { limit: 2, cursor: first.page.nextCursor! }) as ReportPage<ReportAgent>;
+      const expected = order === "asc" ? [0, 1, 2, 3] : [3, 2, 1, 0];
+      expect([...first.value, ...next.value].map(row => Number(row.agentId[2]))).toEqual(expected);
+      expect(next.page.nextCursor).toBeNull(); expect(Buffer.byteLength(next.page.previousCursor!)).toBeLessThanOrEqual(4096);
+      expect((await reports.page(first.selection.id, identity, { limit: 2, cursor: next.page.previousCursor! })).value).toEqual(first.value);
+    }
   });
-
-  it("counts distinct positive-response identities without treating reported zero rows as active users", () => {
-    const source = drilldownPublished();
-    source.reports.users!.rows.push({
-      username: "users-only-zero", displayName: "No responses", numberOfAgentsUsed: 0, agentResponsesReceived: 0,
-    });
-    const result = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
-
-    expect(result.summary.usage).toMatchObject({
-      totalActiveUsers: 5,
-      activeUserReconciliation: { sourceValues: { users: 3, userAgents: 4 }, status: "mismatch", difference: 1 },
-    });
-    expect(result.summary.activityWindow.activeUsers).toBe(4);
-    expect(result.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
-      activeUsersTotal: 3, activeUsersIdentityCount: 3, activeUsersTotalBasis: "userAgents_distinct_identity",
-    });
-    expect(result.summary.usage.topAgentsByActiveUsers.find(agent => agent.id === "usage-a")?.activeUsers).toBe(3);
-    expect(buildOfficialUsageUserView(source, { staleAfterDays: 35 }).users.value.map(user => user.username))
-      .toEqual(expect.arrayContaining(["zero-user", "users-only-zero"]));
+  it("distinguishes absent selection, incomplete imports, unselected retained sets, deletion and stale evidence", async () => {
+    const identity = owner();
+    expect((await users(identity)).reports.availability).toBe("never_imported");
+    const draft = await stage(identity, "users", ["person,Person,1,1,"], randomUUID());
+    const partial = await imports.accept(identity, { stagingId: draft.id, revision: draft.revision, contentHash: draft.contentHash, expectedActiveRevision: draft.activeRevision });
+    expect((await users(identity)).reports.availability).toBe("incomplete");
+    await imports.confirm(identity, await imports.confirmPreview(identity, partial.setId, "delete"));
+    const first = await publish(identity, { agents: [], userAgents: [], users: ["person,Person,1,1,"] });
+    const active = await users(identity);
+    expect(active.reports).toMatchObject({ availability: "active", periodAgeDays: null, acceptedAgeDays: 0,
+      reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" } });
+    await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=clock_timestamp()-interval '40 days' WHERE id=$1", [first.setId]);
+    expect((await users(identity)).reports).toMatchObject({ availability: "stale", acceptedAgeDays: 40 });
+    const second = await publish(identity, { agents: [], userAgents: [], users: ["person,Person,1,2,"] });
+    await imports.confirm(identity, await imports.confirmPreview(identity, second.setId, "delete"));
+    expect((await users(identity)).reports.availability).toBe("not_selected");
+    await imports.confirm(identity, await imports.confirmPreview(identity, first.setId, "delete"));
+    expect((await users(identity)).reports.availability).toBe("deleted");
   });
-
-  it("does not infer an active-user zero for an agent absent from an otherwise present companion report", () => {
-    const source = published();
-    source.reports.userAgents!.rows = source.reports.userAgents!.rows.filter(row => row.agentId !== "usage-a");
-    const result = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
-
-    expect(result.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
-      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
-    });
-    expect(result.summary.usage.topAgentsByActiveUsers.map(agent => agent.id)).not.toContain("usage-a");
+  it("does not replace missing Users observations or missing relationship evidence with inferred zero", async () => {
+    const identity = owner();
+    await publish(identity, { agents: ["agent,Agent,Custom,4,0,7,"], userAgents: ["agent,Agent,Custom,bridge,7,"], users: [] });
+    const page = await users(identity);
+    expect(page.summary.userReportedResponses).toBe(0);
+    expect(page.value).toMatchObject([{ username: "bridge", missingUserReport: true, reportedResponses: null,
+      reportedAgentsUsed: null, bridgeResponses: 7, userLastActivityDateUtc: null, hasReportMismatch: false, reviewCohort: "unknown" }]);
+    await publish(identity, { agents: ["agent,Agent,Custom,4,0,7,"], userAgents: [], users: ["user,User,1,7,"] });
+    expect((await users(identity)).value).toMatchObject([{ hasReportMismatch: false, bridgeResponses: null, relationshipCount: 0 }]);
+    expect((await agents(identity)).value).toMatchObject([{ activeUsers: null, activeUsersBasis: "unknown", responseComparison: "not_comparable" }]);
   });
-
-  it.each(["activeUsersLicensed", "activeUsersUnlicensed"] as const)(
-    "fails explicitly instead of publishing an inexact %s occurrence total", metric => {
-      const source = published();
-      source.reports.agents!.rows[0][metric] = Number.MAX_SAFE_INTEGER;
-      source.reports.agents!.rows[1][metric] = 0;
-      const safe = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
-      expect(metric === "activeUsersLicensed"
-        ? safe.summary.usage.reportedLicensedActiveUserOccurrences
-        : safe.summary.usage.reportedUnlicensedActiveUserOccurrences).toBe(Number.MAX_SAFE_INTEGER);
-
-      source.reports.agents!.rows[1][metric] = 1;
-      expect(() => buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 }))
-        .toThrowError(expect.objectContaining({ code: "official_usage_total_limit" }));
-    });
-
-  it("preserves a disjoint 50k plus 50k identity union for export paging", () => {
-    const source = published();
-    source.reports.agents!.rows = Array.from({ length: 50_000 }, (_, index) => ({
-      agentId: `agents-report-${index}`,
-      agentName: `Agents report ${index}`,
-      creatorType: "Declarative",
-      activeUsersLicensed: 1,
-      activeUsersUnlicensed: 0,
-      responsesSentToUsers: 1,
-      lastActivityDateUtc: "2026-07-06T00:00:00.000Z",
-    }));
-    source.reports.userAgents!.rows = Array.from({ length: 50_000 }, (_, index) => ({
-      agentId: `agent-${index}`,
-      agentName: `Agent ${index}`,
-      creatorType: "Declarative",
-      username: `bridge-${String(index).padStart(5, "0")}`,
-      responsesSentToUsers: 1,
-      lastActivityDateUtc: "2026-07-06T00:00:00.000Z",
-    }));
-    source.reports.users!.rows = Array.from({ length: 50_000 }, (_, index) => ({
-      username: `user-${String(index).padStart(5, "0")}`,
-      displayName: `User ${index}`,
-      numberOfAgentsUsed: 1,
-      agentResponsesReceived: 1,
-      lastActivityDateUtc: "2026-07-06T00:00:00.000Z",
-    }));
-
-    const result = buildOfficialUsageUserView(source, { staleAfterDays: 35, limit: 100_000 });
-
-    expect(result.counts).toMatchObject({ users: 100_000, userRows: 50_000, accessRows: 50_000 });
-    expect(result.users.count).toBe(100_000);
-    expect(result.users.value).toHaveLength(100_000);
-    expect(result.users.value.some(user => user.username === "bridge-49999")).toBe(true);
-    expect(result.users.value.some(user => user.username === "user-00000")).toBe(true);
-    const aggregate = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35, limit: 100_000 });
-    expect(aggregate.summary.usage.totalActiveUsers).toBe(100_000);
-    expect(aggregate.agents.count).toBe(100_000);
-    expect(aggregate.agents.value).toHaveLength(100_000);
+  it("keeps explicit zero-response companions distinct from absent companions", async () => {
+    const identity = owner();
+    await publish(identity, { agents: ["zero,Zero,Custom,9,5,0,", "missing,Missing,Custom,8,3,0,"],
+      userAgents: ["zero,Zero,Custom,user,0,"], users: ["user,User,0,0,"] });
+    const page = await agents(identity);
+    expect(page.value.find(row => row.agentId === "zero")).toMatchObject({ activeUsers: 0, activeUsersBasis: "userAgents_distinct_identity" });
+    expect(page.value.find(row => row.agentId === "missing")).toMatchObject({ activeUsers: null, activeUsersBasis: "unknown" });
+    expect(page.summary.distinctActiveReportUsers).toBe(0);
+  });
+  it("rejects inexact aggregate totals instead of rounding safe individual rows", async () => {
+    const identity = owner(), value = 4503599627370496;
+    await expect(publish(identity, { agents: [], userAgents: [], users: [`one,One,1,${value},`, `two,Two,1,${value},`] }))
+      .rejects.toMatchObject({ status: 400, code: "numeric_overflow" });
+    expect((await users(identity)).reports.availability).toBe("never_imported");
+    const restored = await seedReportSet(fixture.operator, identity.tenantId, 1, "restored-overflow-fixture", { users: 2 });
+    await seedUserFact(fixture.operator, identity.tenantId, restored.versions.users, 0, "one", value);
+    await seedUserFact(fixture.operator, identity.tenantId, restored.versions.users, 1, "two", value);
+    await reports.history.connections.run(client => reports.history.accepted(client, identity.tenantId, restored.id));
+    await expect(users(identity, { setId: restored.id })).rejects.toMatchObject({ status: 409, code: "official_usage_total_limit" });
+  });
+  it("applies inclusive cohort thresholds and anchors inactivity to observed Users dates", async () => {
+    const identity = owner();
+    await publish(identity, { agents: [], userAgents: ["agent,Agent,Custom,bridge,4,"], users: [
+      `zero,Zero,0,0,${day(-40)}`, `one,One,1,1,${day(-40)}`, `five,Five,1,5,${day(-41)}`,
+      `six,Six,1,6,${day(-69)}`, `old,Old,1,7,${day(-70)}`, "undated,Undated,1,2,",
+    ] });
+    expect((await users(identity, { cohort: "zero" })).value.map(row => row.username)).toEqual(["zero"]);
+    expect((await users(identity, { cohort: "low", sort: "responses", order: "asc" })).value.map(row => row.username)).toEqual(["one", "undated", "five"]);
+    expect((await users(identity, { cohort: "review", lowResponseThreshold: 1 })).value.map(row => row.username).sort()).toEqual(["one", "zero"]);
+    expect((await users(identity, { reportActivity: "recent", inactiveDays: 30 })).value.map(row => row.username).sort()).toEqual(["five", "one", "six", "zero"]);
+    expect((await users(identity, { reportActivity: "inactive", inactiveDays: 30 })).value.map(row => row.username)).toEqual(["old"]);
+    expect((await users(identity, { reportActivity: "no-activity" })).value.map(row => row.username).sort()).toEqual(["bridge", "undated"]);
+  });
+  it("keeps agent/creator/positive-response predicates on the same relationship while preserving full user details", async () => {
+    const identity = owner();
+    await publish(identity, { agents: [], users: ["one,One,2,50,", "two,Two,2,40,", "three,Three,1,0,"], userAgents: [
+      "A,Alpha,Custom,one,0,", "B,Beta,Declarative,one,5,", "A,Alpha,Custom,two,4,", "B,Beta,Declarative,two,6,", "A,Alpha,Declarative,three,0,",
+    ] });
+    expect((await users(identity, { agentId: "A", creatorType: "Declarative", responsesOnly: true })).value).toEqual([]);
+    const page = await users(identity, { agentId: "A", creatorType: "Custom", responsesOnly: true });
+    expect(page.value).toMatchObject([{ username: "two", reportedResponses: 40, relationshipCount: 2, bridgeResponses: 10 }]);
+    expect((await relationships(identity, page.selection.id, "two")).value.map(row => row.agentId)).toEqual(["A", "B"]);
+    expect((await users(identity, { agentId: "a" })).value).toEqual([]);
+    expect((await users(identity, { agentId: "A", responsesOnly: true, search: "Beta" })).value).toEqual([]);
+  });
+  it("keeps exact parent identity and metrics independent of child search and paging", async () => {
+    const identity = owner(); await publish(identity);
+    const page = await agents(identity), detail = await reports.exact(page.selection.id, identity, "usage-a");
+    expect(detail).toMatchObject({ value: { agentId: "usage-a", responses: 9, bridgeResponses: 9, activeUsers: 2 } });
+    const children = await relationships(identity, page.selection.id, "usage-a", 1, { search: "casesensitiveuser", sort: "responses", order: "asc" });
+    expect(children.counts.filtered).toBe(2); expect(children.value).toMatchObject([{ username: "casesensitiveuser", responses: 4 }]);
+    expect((await reports.exact(page.selection.id, identity, "usage-a"))).toEqual(detail);
+    for (const id of ["USAGE-A", "Agent A", "inventory:usage-a"]) await expect(reports.exact(page.selection.id, identity, id)).rejects.toMatchObject({ status: 404 });
   });
 });
 
-describe("official usage agent detail", () => {
-  it("keeps distinct report identities, nonadditive categories and mismatching source totals without inventing user dates", () => {
-    const source = drilldownPublished();
-    const original = structuredClone(source);
-    const options = { staleAfterDays: 35, now: new Date("2026-07-10T00:00:00.000Z") };
-    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", options)!;
-    const aggregate = buildOfficialUsageAggregateView(source, [], options);
-
-    expect(detail.agent).toEqual(aggregate.agents.value.find(agent => agent.agentId === "usage-a"));
-    expect(detail.agent).toMatchObject({
-      activeUsersLicensed: 2,
-      activeUsersUnlicensed: 1,
-      activeUsersTotal: 3,
-      activeUsersIdentityCount: 3,
-      responsesSentToUsers: 9,
-      responseComparison: { status: "mismatch", sourceValues: { agents: 9, userAgents: 11 }, difference: 2 },
-      identityStatus: "unresolved",
-    });
-    expect(detail.summary).toEqual({
-      reportedUsers: 4, responseProducingUsers: 3, zeroResponseUsers: 1, userBreakdownResponses: 11,
-    });
-    expect(detail.users.value).toEqual([
-      { username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 5 },
-      { username: "casesensitiveuser", displayName: "Pseudonym B", responsesSentToUsers: 4 },
-      { username: "bridge-only", displayName: "bridge-only", responsesSentToUsers: 2 },
-      { username: "zero-user", displayName: "Zero User", responsesSentToUsers: 0 },
-    ]);
-    for (const user of detail.users.value) {
-      expect(Object.keys(user).sort()).toEqual(["displayName", "responsesSentToUsers", "username"]);
-    }
-    for (const key of ["authority", "availability", "staleAfterDays", "periodAgeDays", "acceptedAgeDays", "activeSet", "lineages", "missingKinds"] as const) {
-      expect(detail[key]).toEqual(aggregate[key]);
-    }
-    expect(source).toEqual(original);
+describe("native current licensing and organization evidence", () => {
+  async function organization() {
+    const identity = owner(), entries = [
+      ["first", " Alpha ", " Engineering ", "disabled", 9], ["second", "Alpha", "Sales", "disabled", 8],
+      ["third", "Beta", "Engineering", "suspended", 7], ["fourth", "Alpha", "Engineering", "disabled", 6],
+      ["fifth", "alpha", "engineering", "disabled", 5], ["missing", " \t ", null, "disabled", 4],
+      ["paid", "Paid only", "Paid department", "enabled", 3], ["unknown", "Unknown only", "Unknown department", "unknown", 2],
+      ["inactive", "Inactive only", "Inactive department", "disabled", 0],
+    ] as const;
+    await publish(identity, { agents: [], userAgents: [], users: entries.map(([name, , , , responses]) => `${name}@example.invalid,${name},1,${responses},`) });
+    const generation = await directory(identity, entries.map(([name, company, department, state], index) => directoryUser(index + 1, `${name}@example.invalid`, state, company, department)));
+    return { identity, generation };
+  }
+  it("returns trimmed case-preserving complete eligible facets rather than page-local organizations", async () => {
+    const { identity } = await organization(), page = await users(identity, { licenseCohort: "active_without_paid", sort: "responses", order: "desc" }, 1);
+    expect(page.counts.filtered).toBe(6);
+    expect(page.value).toMatchObject([{ username: "first@example.invalid", company: "Alpha", department: "Engineering" }]);
+    const companies = await reports.facets(page.selection.id, identity, { field: "company", limit: 100 });
+    const departments = await reports.facets(page.selection.id, identity, { field: "department", limit: 100 });
+    expect(companies.value.map(row => row.value)).toEqual(["Alpha", "alpha", "Beta", null]);
+    expect(departments.value.map(row => row.value)).toEqual(["Engineering", "engineering", "Sales", null]);
+    expect((await users(identity, { licenseCohort: "active_without_paid", company: "Alpha", department: "Engineering", search: "first" })).value)
+      .toMatchObject([{ username: "first@example.invalid" }]);
+    expect((await users(identity, { licenseCohort: "active_without_paid", company: null })).value).toMatchObject([{ username: "missing@example.invalid", company: null }]);
   });
-
   it.each([
-    ["responses", "asc", ["bridge-only", "casesensitiveuser"]],
-    ["responses", "desc", ["casesensitiveuser", "bridge-only"]],
-    ["displayName", "asc", ["casesensitiveuser", "zero-user"]],
-    ["displayName", "desc", ["zero-user", "casesensitiveuser"]],
-  ] as const)("sorts the entire user breakdown by %s %s before paging", (sortBy, sortDirection, usernames) => {
-    const result = buildOfficialUsageAgentDetailView(drilldownPublished(), "usage-a", {
-      staleAfterDays: 35, sortBy, sortDirection, limit: 2, offset: 1,
-    })!;
-
-    expect(result.users).toMatchObject({ count: 4, limit: 2, offset: 1 });
-    expect(result.users.value.map(user => user.username)).toEqual(usernames);
-    expect(result.filters).toEqual({ sortBy, sortDirection });
-    expect(result.summary).toEqual({
-      reportedUsers: 4, responseProducingUsers: 3, zeroResponseUsers: 1, userBreakdownResponses: 11,
-    });
+    [{ company: "Alpha" }, ["first", "fourth", "second"]], [{ department: "Engineering" }, ["first", "fourth", "third"]],
+    [{ company: "Alpha", department: "Engineering" }, ["first", "fourth"]], [{ company: "Alpha", department: "engineering" }, []],
+    [{ company: "alpha", department: "engineering" }, ["fifth"]], [{ company: "Al" }, []], [{ department: "Missing" }, []], [{ company: "Paid only" }, []],
+  ] as const)("uses exact organization values with AND semantics: %j", async (query, names) => {
+    const { identity } = await organization();
+    expect((await users(identity, { licenseCohort: "active_without_paid", ...query })).value.map(row => row.username)).toEqual(names.map(name => `${name}@example.invalid`));
   });
-
-  it("searches report display names and usernames without changing whole-agent metrics", () => {
-    const source = drilldownPublished();
-    const result = buildOfficialUsageAgentDetailView(source, "usage-a", {
-      staleAfterDays: 35, search: " PSEUDONYM ", sortDirection: "asc", limit: 1, offset: 1,
-    })!;
-    expect(result.filters.search).toBe("PSEUDONYM");
-    expect(result.users).toEqual({
-      value: [{ username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 5 }],
-      count: 2, limit: 1, offset: 1,
+  it.each(["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"] as const)(
+    "classifies current %s evidence independently of the report window", async state => {
+      const identity = owner();
+      await publish(identity, { agents: [], userAgents: [], users: [`person@example.invalid,Person,1,1,${day(-80)}`] });
+      await directory(identity, [directoryUser(1, "person@example.invalid", state)]);
+      const page = await users(identity, { licenseCohort: "active_without_paid" });
+      expect(page.counts.filtered).toBe(["disabled", "suspended", "locked_out"].includes(state) ? 1 : 0);
+      expect(page.summary).toMatchObject({ paidActiveReportUsers: ["enabled", "warning", "partially_enabled"].includes(state) ? 1 : 0,
+        activeWithoutPaidUsers: ["disabled", "suspended", "locked_out"].includes(state) ? 1 : 0, unknownLicenseActiveReportUsers: state === "unknown" ? 1 : 0 });
     });
-    const byUsername = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, search: "BRIDGE-ONLY" })!;
-    expect(byUsername.users.value).toEqual([{ username: "bridge-only", displayName: "bridge-only", responsesSentToUsers: 2 }]);
-    const empty = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, search: "absent" })!;
-    expect(empty.users).toMatchObject({ value: [], count: 0 });
-    expect(empty.summary).toEqual(result.summary);
-    expect(byUsername.summary).toEqual(result.summary);
-    expect(empty.agent.responsesSentToUsers).toBe(9);
+  it("does not leak unpaid licensing across principals or infer an object identity from display names", async () => {
+    const identity = owner();
+    await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,4,"] });
+    await directory(identity, [directoryUser(1, "person@example.invalid", "disabled", "Private", "Private")]);
+    const other = { ...identity, principalId: "different-reader" }, page = await users(other, { licenseCohort: "active_without_paid" });
+    expect(page.value).toEqual([]); expect(page.sources.directory.state).toBe("unavailable");
+    expect(page.summary.activeWithoutPaidUsers).toBeNull();
+    expect((await users(other)).value).toMatchObject([{ username: "person@example.invalid", objectId: null, company: null, department: null }]);
+    await directory(other, [{ ...directoryUser(2, "unrelated@example.invalid"), identity: { ...directoryUser(2, "unrelated@example.invalid").identity, displayName: "person@example.invalid" } }]);
+    expect((await users(other, { licenseCohort: "active_without_paid" })).value).toEqual([]);
   });
-
-  it("breaks sorting ties by the exact username in either direction", () => {
-    const source = published();
-    source.reports.userAgents!.rows[0].responsesSentToUsers = 4;
-    source.reports.users!.rows.forEach(row => { row.displayName = "Same label"; });
-    for (const sortBy of ["responses", "displayName"] as const) {
-      for (const sortDirection of ["asc", "desc"] as const) {
-        const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, sortBy, sortDirection })!;
-        expect(detail.users.value.map(user => user.username)).toEqual(["CaseSensitiveUser", "casesensitiveuser"]);
-      }
+  it.each(["report", "directory"] as const)("preserves %s ambiguity instead of calling it verified unpaid", async ambiguity => {
+    const identity = owner(), first = directoryUser(1, "case@example.invalid"), second = directoryUser(2, "CASE@example.invalid");
+    await directory(identity, ambiguity === "directory" ? [first, second] : [first]);
+    await publish(identity, { agents: [], userAgents: [], users: [
+      "case@example.invalid,Case,1,2,", `${ambiguity === "directory" ? second.identity.objectId : "CASE@example.invalid"},Other,1,3,`,
+      `${first.identity.objectId},Object alias,1,4,`,
+    ] });
+    const page = await users(identity, { licenseCohort: "active_without_paid" });
+    expect(page.value).toEqual([]); expect(page.summary).toMatchObject({ activeWithoutPaidUsers: 0, unknownLicenseActiveReportUsers: 3, unresolvedIdentities: 3 });
+  });
+  it("does not poison unique exact object IDs merely because unused directory aliases collide", async () => {
+    const identity = owner(), first = directoryUser(1, "case@example.invalid"), second = directoryUser(2, "CASE@example.invalid");
+    await directory(identity, [first, second]);
+    await publish(identity, { agents: [], userAgents: [], users: [
+      `${first.identity.objectId},First,1,2,`, `${second.identity.objectId},Second,1,3,`,
+    ] });
+    expect((await users(identity, { licenseCohort: "active_without_paid" })).value.map(row => row.objectId)).toEqual([first.identity.objectId, second.identity.objectId]);
+  });
+  it("includes 501-user tail organizations without draining users or deriving facets from the first 100 rows", async () => {
+    const identity = owner(), rows: Rows = { agents: [], userAgents: [], users: [] }, directoryRows: CopilotDirectoryUser[] = [];
+    for (let n = 0; n < 501; n++) {
+      const username = `person-${n}@example.invalid`;
+      rows.users.push(`${username},Person ${n},1,${501 - n},`);
+      directoryRows.push(directoryUser(n + 1, username, "disabled", n === 500 ? "Tail company" : "First company", n === 500 ? "Tail department" : "First department"));
     }
+    await publish(identity, rows); await directory(identity, directoryRows);
+    const first = await users(identity, { licenseCohort: "active_without_paid", sort: "responses", order: "desc" }, 100);
+    expect(first.value).toHaveLength(100); expect(first.counts.filtered).toBe(501);
+    expect(first.value.some(row => row.username === "person-500@example.invalid")).toBe(false);
+    expect((await reports.facets(first.selection.id, identity, { field: "company" })).value.map(row => row.value)).toEqual(["First company", "Tail company"]);
+    expect((await reports.facets(first.selection.id, identity, { field: "department" })).value.map(row => row.value)).toEqual(["First department", "Tail department"]);
+    expect((await users(identity, { licenseCohort: "active_without_paid", company: "Tail company", department: "Tail department", search: "person-500" }, 1)).value)
+      .toMatchObject([{ username: "person-500@example.invalid" }]);
   });
-
-  it("distinguishes missing active-user evidence, empty breakdowns and explicit zero-response rows", () => {
-    const source = drilldownPublished();
-    const zeroOnly = source.reports.userAgents!.rows.find(row => row.username === "zero-user")!;
-    source.reports.userAgents!.rows = [zeroOnly];
-    const zero = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(zero.summary).toEqual({ reportedUsers: 1, responseProducingUsers: 0, zeroResponseUsers: 1, userBreakdownResponses: 0 });
-    expect(zero.users.value).toEqual([{ username: "zero-user", displayName: "Zero User", responsesSentToUsers: 0 }]);
-    expect(zero.agent.responseComparison.sourceValues).toEqual({ agents: 9, userAgents: 0 });
-    expect(zero.agent).toMatchObject({
-      activeUsersTotal: 0, activeUsersIdentityCount: 0, activeUsersTotalBasis: "userAgents_distinct_identity",
-    });
-
-    source.reports.userAgents!.rows = [];
-    const empty = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(empty.summary).toEqual({ reportedUsers: 0, responseProducingUsers: null, zeroResponseUsers: 0, userBreakdownResponses: 0 });
-    expect(empty.users).toMatchObject({ value: [], count: 0 });
-    expect(empty.agent).toMatchObject({
-      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
-    });
-
-    source.reports.userAgents = undefined;
-    const missing = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(missing.summary).toEqual({ reportedUsers: null, responseProducingUsers: null, zeroResponseUsers: null, userBreakdownResponses: null });
-    expect(missing.users).toMatchObject({ value: [], count: 0 });
-    expect(missing.missingKinds).toEqual(["userAgents"]);
-    expect(missing.agent).toMatchObject({
-      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
-      responseComparison: { status: "not_comparable", sourceValues: { agents: 9, userAgents: null } },
-    });
-  });
-
-  it("keeps response-producing users unknown when companion rows only describe other agents", () => {
-    const source = drilldownPublished();
-    source.reports.userAgents!.rows = source.reports.userAgents!.rows.filter(row => row.agentId !== "usage-a");
-    expect(source.reports.userAgents!.rows.length).toBeGreaterThan(0);
-
-    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(detail.summary).toEqual({
-      reportedUsers: 0, responseProducingUsers: null, zeroResponseUsers: 0, userBreakdownResponses: 0,
-    });
-    expect(detail.agent.activeUsersIdentityCount).toBeNull();
-    expect(detail.users).toMatchObject({ value: [], count: 0 });
-    expect(detail.missingKinds).not.toContain("userAgents");
-  });
-
-  it("uses exact report IDs, never agent names or inferred inventory identities", () => {
-    const source = drilldownPublished();
-    const upper = buildOfficialUsageAgentDetailView(source, "usage-A", { staleAfterDays: 35 })!;
-    expect(upper.agent).toMatchObject({
-      agentId: "usage-A", agentName: "Agent A", sourceReport: "userAgents", sourceReports: ["userAgents"],
-      activeUsersLicensed: null, activeUsersUnlicensed: null, activeUsersTotal: 1, identityStatus: "unresolved",
-    });
-    expect(upper.users.value).toEqual([{ username: "upper-only", displayName: "upper-only", responsesSentToUsers: 11 }]);
-    for (const id of ["USAGE-A", "Agent A", "package-usage-a", " usage-a ", "unknown"]) {
-      expect(buildOfficialUsageAgentDetailView(source, id, { staleAfterDays: 35 })).toBeUndefined();
-    }
-    expect(buildOfficialUsageAgentDetailView({ ...source, reports: {} }, "usage-a", { staleAfterDays: 35 })).toBeUndefined();
-  });
-
-  it("falls back to exact report usernames when the Users companion is absent", () => {
-    const source = published();
-    source.reports.users = undefined;
-    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(detail.missingKinds).toEqual(["users"]);
-    expect(detail.users.value).toEqual([
-      { username: "CaseSensitiveUser", displayName: "CaseSensitiveUser", responsesSentToUsers: 5 },
-      { username: "casesensitiveuser", displayName: "casesensitiveuser", responsesSentToUsers: 4 },
-    ]);
-  });
-
-  it("bounds user pages independently of whole-agent metrics", () => {
-    const source = published();
-    source.reports.userAgents!.rows = Array.from({ length: 550 }, (_, index) => ({
-      agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: `user-${index}`, responsesSentToUsers: 1,
-    }));
-    const defaults = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
-    expect(defaults.users).toMatchObject({ count: 550, limit: 100, offset: 0 });
-    expect(defaults.users.value).toHaveLength(100);
-    const bounded = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, limit: 100_000 })!;
-    expect(bounded.users).toMatchObject({ count: 550, limit: 500, offset: 0 });
-    expect(bounded.users.value).toHaveLength(500);
-    expect(bounded.summary).toEqual({ reportedUsers: 550, responseProducingUsers: 550, zeroResponseUsers: 0, userBreakdownResponses: 550 });
-    const beyond = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, limit: 0, offset: 1_000_000 })!;
-    expect(beyond.users).toEqual({ value: [], count: 550, limit: 1, offset: 100_000 });
-    expect(beyond.summary).toEqual(bounded.summary);
+  it("preserves pinned metadata and excludes failed latest-attempt licensing on new captures without erasing reports", async () => {
+    const identity = owner();
+    await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,1,"] });
+    await directory(identity, [directoryUser(1, "person@example.invalid")]);
+    const prior = await users(identity, { licenseCohort: "active_without_paid" });
+    expect(prior.counts.filtered).toBe(1);
+    const stages = new UserSourceStages(fixture.runtime);
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
+      async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
+    expect(await reports.page(prior.selection.id, identity)).toEqual(prior);
+    const page = await users(identity, { licenseCohort: "active_without_paid" });
+    expect(page.value).toEqual([]); expect(page.sources.directory).toMatchObject({ state: "partial", attemptStatus: "failed" });
+    expect(page.summary.activeWithoutPaidUsers).toBeNull();
+    expect((await reports.facets(page.selection.id, identity, { field: "company" })).value).toEqual([]);
+    expect((await users(identity)).value).toMatchObject([{ username: "person@example.invalid", reportedResponses: 1 }]);
   });
 });
 
-describe("official usage users agent filter", () => {
-  it("selects exact bridge identities, including zero rows, while retaining each full Users total and all rows", () => {
-    const source = drilldownPublished();
-    const baseline = buildOfficialUsageUserView(source, { staleAfterDays: 35 });
-    const filtered = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-a" });
-
-    expect(baseline.filters).not.toHaveProperty("agentId");
-    expect(filtered.filters.agentId).toBe("usage-a");
-    expect(filtered.users.count).toBe(4);
-    expect(filtered.users.value.map(user => user.username)).toEqual(["CaseSensitiveUser", "casesensitiveuser", "zero-user", "bridge-only"]);
-    for (const user of filtered.users.value) {
-      expect(user).toEqual(baseline.users.value.find(candidate => candidate.username === user.username));
+describe("bounded native user CSV relationship batches", () => {
+  async function build(identity: SelectionIdentity, selectionId: string) {
+    const exports = new OfficialReportExports(reports, usageAudit(identity).actor);
+    const job = await exports.create(identity, { selectionId, kind: "official_users" }), source = exports.source(identity);
+    let reads = 0;
+    const measured: ExportSource = (signal, context) => source(signal, { ...context, read: async work => { reads++; return context.read(work); } });
+    await exports.engine.build(job, identity, reportExportColumns.official_users, measured);
+    return { exports, job, reads };
+  }
+  function download(identity: SelectionIdentity, exports: OfficialReportExports, job: string) {
+    return Readable.from(exports.engine.download(job, identity, new AbortController().signal))
+      .pipe(parse({ columns: true, bom: true, max_record_size: 262144 }));
+  }
+  it("writes one relationship/unknown row per person without one fenced query per user", async () => {
+    const identity = owner(), rows: Rows = { agents: ["agent,Agent,Custom,1,0,100,"], userAgents: [], users: [] };
+    for (let n = 0; n < 100; n++) {
+      rows.users.push(`user-${n},User ${n},1,1,`);
+      if (n % 2) rows.userAgents.push(`agent,Agent,Custom,user-${n},1,`);
     }
-    expect(filtered.users.value[0]).toMatchObject({
-      reportedResponsesReceived: 9, bridgeResponsesSentToUsers: 11, reportedAgentsUsed: 2, agentsAccessedTotal: 3,
-    });
-    expect(filtered.users.value[0].rows.map(row => row.agentId)).toEqual(["usage-a", "usage-b", "usage-report-only"]);
-    expect(filtered.counts).toEqual({ ...baseline.counts, filteredUsers: 4 });
-    expect(filtered.cohorts).toEqual(baseline.cohorts);
-    expect(filtered.topUsersByResponses[0]).toMatchObject({ username: "CaseSensitiveUser", responses: 9, responsesSource: "users" });
-    expect(filtered.users.value.find(user => user.username === "zero-user")).toMatchObject({
-      username: "zero-user", reportedResponsesReceived: 0, rows: [expect.objectContaining({ agentId: "usage-a", responsesSentToUsers: 0 })],
-    });
-  });
-
-  it("applies the agent filter, search and sorting before counts and pagination", () => {
-    const result = buildOfficialUsageUserView(drilldownPublished(), {
-      staleAfterDays: 35, agentId: "usage-a", search: "PSEUDONYM", userSortBy: "responses", sortDirection: "asc", limit: 1, offset: 1,
-    });
-
-    expect(result.users).toMatchObject({
-      value: [expect.objectContaining({ username: "CaseSensitiveUser", reportedResponsesReceived: 9 })],
-      count: 2, limit: 1, offset: 1,
-    });
-    expect(result.counts).toMatchObject({ users: 6, filteredUsers: 2, totalResponsesReceived: 913 });
-  });
-
-  it("applies agent, creator and response filters to the same relationship without truncating user details", () => {
-    const source = drilldownPublished();
-    source.reports.userAgents!.rows.push({
-      agentId: "usage-b", agentName: "Agent B", creatorType: "Custom", username: "zero-user", responsesSentToUsers: 20,
-    });
-    const responses = buildOfficialUsageUserView(source, {
-      staleAfterDays: 35, agentId: "usage-a", responsesOnly: true,
-    });
-    expect(responses.users.value.map(user => user.username)).not.toContain("zero-user");
-    expect(responses.users.value[0].rows).toHaveLength(3);
-    const wrongCreator = buildOfficialUsageUserView(source, {
-      staleAfterDays: 35, agentId: "usage-a", creatorType: "Custom",
-    });
-    expect(wrongCreator.users.count).toBe(0);
-    expect(buildOfficialUsageUserView(source, {
-      staleAfterDays: 35, creatorType: "Custom", responsesOnly: true,
-    }).users.value.map(user => user.username)).toContain("zero-user");
-  });
-
-  it("keeps case-distinct report IDs separate and never infers missing access rows", () => {
-    const source = drilldownPublished();
-    const upper = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-A" });
-    expect(upper.users.value.map(user => user.username)).toEqual(["upper-only"]);
-    for (const agentId of ["USAGE-A", "Agent A", "unknown"]) {
-      expect(buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId }).users).toMatchObject({ value: [], count: 0 });
+    await publish(identity, rows);
+    const page = await users(identity), { exports, job, reads } = await build(identity, page.selection.id);
+    expect(await exports.status(job, identity)).toMatchObject({ status: "ready", rows: 100 });
+    expect(reads).toBeLessThanOrEqual(3);
+    const chunks = await fixture.runtime.query("SELECT octet_length(bytes)::int AS n FROM data_export_chunks WHERE export_id=$1 ORDER BY ordinal LIMIT 250", [job]);
+    expect(chunks.rows.length).toBeGreaterThan(0); expect(chunks.rows.every(row => row.n <= 262144)).toBe(true);
+    let count = 0;
+    for await (const row of download(identity, exports, job)) {
+      const ordinal = Number(row.username.slice(5));
+      expect(row.responsesSentToUsers).toBe(ordinal % 2 ? "1" : "Unknown");
+      expect(row.reportedResponsesReceived).toBe("1"); expect(row.missingBridgeRows).toBe(String(!(ordinal % 2)));
+      count++;
     }
-    source.reports.userAgents = undefined;
-    const missing = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-a" });
-    expect(missing.users).toMatchObject({ value: [], count: 0 });
-    expect(missing.counts).toMatchObject({ users: 4, filteredUsers: 0, totalResponsesReceived: 913 });
+    expect(count).toBe(100);
+  });
+  it("continues a 501-relationship child through row boundaries and preserves parent order, totals and formula safety", async () => {
+    const identity = owner(), rows: Rows = { agents: [], userAgents: [], users: ["one,Alpha,501,1234,", "two,Zeta,0,0,"] };
+    for (let n = 0; n < 501; n++) rows.userAgents.push(`agent-${n},${n === 17 ? "=Bad" : `Agent ${String(n).padStart(3, "0")}`},Custom,one,1,`);
+    await publish(identity, rows);
+    const { exports, job, reads } = await build(identity, (await users(identity)).selection.id);
+    expect(await exports.status(job, identity)).toMatchObject({ status: "ready", rows: 502 });
+    expect(reads).toBeLessThanOrEqual(8);
+    let count = 0;
+    for await (const row of download(identity, exports, job)) {
+      if (count < 501) {
+        const expected = count === 0 ? 17 : count <= 17 ? count - 1 : count;
+        expect(row).toMatchObject({ username: "one", reportedResponsesReceived: "1234", agentId: `agent-${expected}`, responsesSentToUsers: "1" });
+        if (!count) expect(row.agentName).toBe("'=Bad");
+      } else expect(row).toMatchObject({ username: "two", agentId: "", reportedResponsesReceived: "0", responsesSentToUsers: "Unknown" });
+      count++;
+    }
+    expect(count).toBe(502);
+  });
+  it("continues byte-short wide relationship batches rather than treating fewer than 100 rows as EOF", async () => {
+    const identity = owner(), username = "person".padEnd(512, "語"), rows: Rows = { agents: [], userAgents: [], users: [`${username},Person,350,350,`] };
+    for (let n = 0; n < 350; n++) rows.userAgents.push(`${`a${String(n).padStart(3, "0")}`.padEnd(512, "語")},${"語".repeat(512)},${"語".repeat(128)},${username},1,`);
+    await publish(identity, rows);
+    const { exports, job, reads } = await build(identity, (await users(identity)).selection.id);
+    expect(await exports.status(job, identity)).toMatchObject({ status: "ready", rows: 350 });
+    expect(reads).toBeGreaterThan(5); expect(reads).toBeLessThanOrEqual(12);
+    const seen = new Set<number>();
+    for await (const row of download(identity, exports, job)) {
+      const ordinal = Number(row.agentId.slice(1, 4));
+      expect(ordinal).toBeGreaterThanOrEqual(0); expect(ordinal).toBeLessThan(350); expect(seen.has(ordinal)).toBe(false); seen.add(ordinal);
+      expect(row).toMatchObject({ username, reportedResponsesReceived: "350", responsesSentToUsers: "1" });
+    }
+    expect(seen.size).toBe(350);
+  });
+  it("does not serialize failed latest-attempt licensing as a verified unpaid verdict", async () => {
+    const identity = owner();
+    await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,1,"] });
+    await directory(identity, [directoryUser(1, "person@example.invalid")]);
+    const stages = new UserSourceStages(fixture.runtime);
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
+      async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
+    const page = await users(identity);
+    expect(page.sources.directory.state).toBe("partial");
+    const { exports, job } = await build(identity, page.selection.id);
+    let count = 0;
+    for await (const row of download(identity, exports, job)) {
+      expect(row).toMatchObject({ username: "person@example.invalid", entitlement: "unknown", licenseAssignmentStatus: "unavailable" });
+      count++;
+    }
+    expect(count).toBe(1);
   });
 });

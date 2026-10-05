@@ -1,6 +1,10 @@
 # Disaster recovery
 
-Production recovery is an approved maintenance action, never normal initialization. Keep the prior ZIP only for schema-compatible recovery. After an incompatible migration, repair forward or restore the database; never start an old writer against a newer schema and never replay uncertain writes.
+Production recovery is an approved maintenance action, never normal initialization. Keep a prior ZIP only if its compiled schema fingerprint exactly matches the database. There is no old-schema conversion or upgrade-on-restore. Development schema changes require an explicit reset; never start a mismatched writer or replay uncertain writes. No database, deployment, reset or restore was executed for this code-only change.
+
+The schema is one current DDL definition with a singleton `app_schema` fingerprint marker, not a migration history. Only current-schema dump/receipt pairs are supported for backup and restore. Existing dumps were not read, rewritten or deleted. SQLite audit import and old Static Web App retirement are no longer recovery or deployment steps.
+
+Use the current [Azure approval contract](../docs/azure-production-deployment.md#approval-file-and-preview): only `fresh`/`existing` installation modes are supported. `expectedSchemaVersion`, `legacyAuditBackupPath`, `legacyAuditBackupSha256` and `legacyStaticWebApp` must be absent, not merely empty or null. Old modes, parameters and receipts recording removed workflow steps fail closed. Reconcile unfinished retired workflows separately; do not edit receipts to force resume. No existing Static Web App is deleted by deploy or recovery.
 
 ## Local logical rehearsal
 
@@ -16,7 +20,7 @@ Invoke-LocalDeployment $context 'Reopen' `
   -RestoreDatabase agentcontrol_restore_operator_review
 ```
 
-The context reads the saved configuration and port from the fixed repository-root `.local/agent-control-phase01/` directory. Follow the [backup and restore runbook](../docs/operations.md#backup-and-isolated-restore), including operator review before `Reopen`. Restore verifies the archive checksum, table fingerprints and immutable migration prefix; migrates forward; invalidates sessions, provider qualifications, previews and execution owners; preserves uncertain sent writes as inconclusive; reconciles current deletion/access scope; runs retention to convergence; and leaves provider work disabled. Reopen repeats review transactionally. It never changes the retained app database. Remove only the exact reviewed synthetic target.
+The context reads saved configuration and port from the fixed repository-root `.local/agent-control-phase01/` directory. Follow the [backup and restore runbook](../docs/operations.md#backup-and-isolated-restore), including operator review before `Reopen`. Restore verifies the archive checksum, table fingerprints and exact current `schemaFingerprint` without upgrading; invalidates sessions, provider qualifications, previews and execution owners; preserves uncertain sent writes as inconclusive; reconciles current deletion/access scope; runs retention to convergence; and leaves provider work disabled. Reopen repeats review transactionally. It never changes the retained app database. Remove only the exact reviewed synthetic target.
 
 ## Future native Azure PITR drill
 
@@ -40,4 +44,4 @@ pwsh ./deploy-azure.ps1 -Action Recover -TargetFile <approved-target.json> `
 
 Recovery closes admission, drains without replay, backs up the current server, restores and reviews the isolated server while it remains in maintenance, then changes only `PGHOST` with `MAINTENANCE_MODE=true`. It starts the exact release contained, performs read-only route/configuration checks and requires the exact-run human login/callback/session receipt. Only then does it transactionally reopen the restored database with provider work disabled and remove application maintenance before bounded readiness/auth verification. The old server is retained until separate backup/retention approval; the verified restored server is transferred out of temporary cleanup ownership. Any post-switch failure reapplies maintenance, stops the app and records containment; it never silently falls back.
 
-Before reopening, verify schema 26 or the exact approved forward migration, runtime/admin privilege separation, five resolved vault references, login/callback/session invalidation, current report selection and source-scoped deletion/access, static/deep-link/API behavior and no execution owners. Record restored/source IDs, restore point, backup and release checksum, cleanup and operator approval without data or secret values.
+Before reopening, verify the exact compiled schema fingerprint, runtime/admin privilege separation, every selected vault reference, login/callback/session invalidation, current report selection and source-scoped deletion/access, static/deep-link/API behavior and no execution owners. Record restored/source IDs, restore point, schema fingerprint, backup and release checksum, cleanup and operator approval without data or secret values.

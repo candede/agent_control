@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { ResourceQueryResult } from "../types/powerPlatformInventory.js";
 import { inventoryProviderRoleIds } from "./inventoryRoleScope.js";
 import { PowerPlatformInventoryService } from "./powerPlatformInventory.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
+import { measureNativePages } from "./inventoryProviderTestSupport.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
 import { withTelemetryContext } from "./telemetry.js";
 import * as operationalState from "./operationalState.js";
+import { inventoryRuntime } from "./inventoryRuntime.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -19,6 +21,13 @@ vi.mock("connect-pg-simple", () => ({
   default: () => class {
     constructor() { throw new Error("Unit tests must not construct a session store."); }
   },
+}));
+vi.mock("./inventoryRuntime.js", () => ({
+  inventoryJobInput: async (database: { complete: () => Promise<void> }, scope: unknown, _domain: string, jobId: string) => ({
+    database, scope, jobId,
+  }),
+  completeInventoryJob: (input: { database: { complete: () => Promise<void> } }) => async () => input.database.complete(),
+  inventoryRuntime: vi.fn(() => ({ enqueue: async () => false })),
 }));
 
 const user: AuthenticatedUser = {
@@ -37,7 +46,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
   const job = { id: "11111111-1111-1111-1111-111111111111", status: "waiting_authorization", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, environmentScope: null, createdAt: "2026-09-08T00:00:00.000Z", attemptedAt: null, updatedAt: "2026-09-08T00:00:00.000Z", finishedAt: null };
   const repository = {
     submit: vi.fn(async () => job), getJob: vi.fn(async () => job), markRunning: vi.fn(async () => true), recordProgress: vi.fn(async () => undefined),
-    publish: vi.fn(async () => undefined), markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => undefined),
+    complete: vi.fn(async () => undefined), markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => undefined),
     cancel: vi.fn(async () => ({ ...job, status: "cancelled" })), recoverInterrupted: vi.fn(async () => 0),
     ...overrides,
   };
@@ -45,15 +54,46 @@ function fixture(overrides: Record<string, unknown> = {}) {
     observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     revalidateUser: vi.fn(async () => user), requireAvailable: vi.fn(async () => undefined), delegatedToken: vi.fn(async () => "opaque-token"),
     query: vi.fn(async () => emptyQueryResult()),
+    streams: () => ({ powerPlatformCatalog: async (input: { jobId: string }, token: string, types: string[], options: {
+      signal: AbortSignal; authorize: () => Promise<void>;
+      commitPublication: (operation: () => Promise<void>) => Promise<void>;
+      completeJob: (client: unknown, result: { jobId: string; rows: number }) => Promise<void>;
+    }) => {
+      await options.authorize();
+      await dependencies.query(token, types, options);
+      await options.authorize();
+      expect(options.commitPublication).toBeTypeOf("function");
+      await options.commitPublication(() => options.completeJob({}, { jobId: input.jobId, rows: 0 }));
+    } }),
   };
-  return { job, repository, dependencies, service: new PowerPlatformInventoryService(repository as never, dependencies as never) };
+  const boundedRepository = { ...repository, database: { complete: () => repository.complete() } };
+  return { job, repository, dependencies, service: new PowerPlatformInventoryService(boundedRepository as never, dependencies as never) };
 }
 
-function emptyQueryResult(): ResourceQueryResult {
-  return { resources: [], queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 0, pages: 1, unknownFieldCount: 0 };
+function emptyQueryResult(): void {
+  return undefined;
 }
 
 describe("Power Platform inventory refresh service", () => {
+  it.each(["enqueue", "observer"] as const)("does not relabel committed source success after a %s follow-up failure", async stage => {
+    const { service, repository, dependencies, job } = fixture();
+    if (stage === "enqueue") vi.mocked(inventoryRuntime).mockReturnValueOnce({
+      enqueue: vi.fn(async () => { throw new Error("private reconciliation enqueue error"); }),
+    } as never);
+    else dependencies.observeOperation.mockImplementation(async (_id, _user, operation) => {
+      const result = await operation(() => undefined);
+      if (repository.complete.mock.calls.length) throw new Error("private observation error");
+      return result;
+    });
+    await service.start(user, job.id);
+    await vi.waitFor(() => expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"event":"inventory_followup_failed"')));
+    await service.drain();
+    expect(repository.complete).toHaveBeenCalledOnce();
+    expect(repository.markFailed).not.toHaveBeenCalled();
+    expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("private");
+  });
+
   beforeEach(() => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -82,7 +122,7 @@ describe("Power Platform inventory refresh service", () => {
             if (stage === "activation") expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce();
             else expect(repository.markRunning).not.toHaveBeenCalled();
           }
-          expect(repository.publish).not.toHaveBeenCalled();
+          expect(repository.complete).not.toHaveBeenCalled();
           expect(repository.markFailed).not.toHaveBeenCalled();
           await expect(service.get(user, job.id)).resolves.toMatchObject({ id: job.id });
         } finally {
@@ -107,7 +147,7 @@ describe("Power Platform inventory refresh service", () => {
   it("starts only after current authorization and publishes complete results", async () => {
     const { service, repository, dependencies } = fixture();
     await expect(service.start(user, "11111111-1111-1111-1111-111111111111")).resolves.toMatchObject({ status: "waiting_authorization" });
-    await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(repository.complete).toHaveBeenCalledTimes(1));
     expect(dependencies.query).toHaveBeenCalledWith("opaque-token", ["microsoft.copilotstudio/agents"], expect.objectContaining({ expectedTenantId: "tenant-a" }));
     expect(dependencies.requireAvailable).toHaveBeenCalledBefore(dependencies.delegatedToken);
     expect(repository.markRunning).toHaveBeenCalledBefore(dependencies.query);
@@ -118,7 +158,7 @@ describe("Power Platform inventory refresh service", () => {
     const owner = { ...user, homeAccountId: `replacement-inventory-${stage}` };
     dependencies.revalidateUser.mockResolvedValue(owner);
     const loaded = deferred<typeof job>();
-    const queried = deferred<ResourceQueryResult>();
+    const queried = deferred<void>();
     if (stage === "load") repository.getJob.mockReturnValueOnce(loaded.promise);
     else dependencies.query.mockReturnValueOnce(queried.promise);
     const request = service.start(owner, job.id).catch(error => error);
@@ -133,7 +173,7 @@ describe("Power Platform inventory refresh service", () => {
       await request;
       await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalled());
     }
-    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
   });
 
   it("forwards explicit readiness retry and internal cleanup without querying after failure", async () => {
@@ -154,10 +194,10 @@ describe("Power Platform inventory refresh service", () => {
       const { service, job, repository, dependencies } = fixture();
       dependencies.revalidateUser.mockResolvedValue({ ...user, providerRoleIds });
       await service.start(user, job.id);
-      await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(repository.complete).toHaveBeenCalledOnce());
       expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
       expect(repository.markFailed).not.toHaveBeenCalled();
-      expect(dependencies.requireAvailable).toHaveBeenCalledTimes(2);
+      expect(dependencies.requireAvailable).toHaveBeenCalledTimes(3);
     }
   });
 
@@ -165,9 +205,9 @@ describe("Power Platform inventory refresh service", () => {
     const changedUser = { ...user, providerRoleIds: [inventoryProviderRoleIds.aiReader] };
     const duringQuery = fixture();
     duringQuery.job.requestedTypes = ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"];
-    duringQuery.dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(changedUser);
+    duringQuery.dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(user).mockResolvedValueOnce(changedUser);
     await duringQuery.service.start(user, duringQuery.job.id);
-    await vi.waitFor(() => expect(duringQuery.repository.publish).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(duringQuery.repository.complete).toHaveBeenCalledOnce());
     expect(duringQuery.dependencies.query).toHaveBeenCalledWith(expect.any(String), duringQuery.job.requestedTypes, expect.any(Object));
     expect(duringQuery.repository.markFailed).not.toHaveBeenCalled();
     expect(duringQuery.repository.markWaitingAuthorization).not.toHaveBeenCalled();
@@ -223,11 +263,11 @@ describe("Power Platform inventory refresh service", () => {
       } else if (phase === "admission readiness") {
         dependencies.requireAvailable.mockImplementationOnce(async () => { await pending.promise; });
       } else {
-        dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockImplementationOnce(async () => { await pending.promise; });
+        dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockImplementationOnce(async () => { await pending.promise; });
       }
       const request = service.start(owner, job.id).catch(error => error);
       const boundary = phase === "admission token" ? dependencies.delegatedToken : dependencies.requireAvailable;
-      await vi.waitFor(() => expect(boundary).toHaveBeenCalledTimes(phase === "publication readiness" ? 2 : 1));
+      await vi.waitFor(() => expect(boundary).toHaveBeenCalledTimes(phase === "publication readiness" ? 3 : 1));
       const cleanup = vi.fn(async () => service.waitForPrincipalAuthorization({
         tenantId: owner.tenantId!, principalId: owner.homeAccountId,
       }));
@@ -240,7 +280,7 @@ describe("Power Platform inventory refresh service", () => {
         await request;
         await service.drain();
       }
-      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.complete).not.toHaveBeenCalled();
       expect(repository.markFailed).not.toHaveBeenCalled();
       expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(phase === "publication readiness" ? 1 : 0);
     },
@@ -267,7 +307,7 @@ describe("Power Platform inventory refresh service", () => {
         if (closed) throw new AppError(503, "maintenance", "Provider admissions are closed.");
       });
       repository.recordProgress.mockReturnValueOnce(pending.promise);
-      dependencies.query.mockImplementationOnce(client.query.bind(client));
+      dependencies.query.mockImplementationOnce((token, types, options) => measureNativePages(client, token, types, options));
       await service.start(owner, job.id);
       await vi.waitFor(() => expect(repository.recordProgress).toHaveBeenCalledOnce());
       if (interruption === "replacement") await activateAccountSession(owner.tenantId!, owner.homeAccountId, async () => undefined);
@@ -276,14 +316,14 @@ describe("Power Platform inventory refresh service", () => {
       await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce());
       await service.drain();
       expect(fetcher).toHaveBeenCalledOnce();
-      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.complete).not.toHaveBeenCalled();
       expect(repository.markFailed).not.toHaveBeenCalled();
     },
   );
 
   it("reports a publication scope mismatch as a data failure, not a consent request", async () => {
     const { service, job, repository } = fixture();
-    repository.publish.mockRejectedValue(new AppError(409, "scope_mismatch", "The completed inventory query did not match the authorized resource types and environment."));
+    repository.complete.mockRejectedValue(new AppError(409, "scope_mismatch", "The completed inventory query did not match the authorized resource types and environment."));
     await service.start(user, job.id);
     await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledWith(
       { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "scope_mismatch",
@@ -325,7 +365,7 @@ describe("Power Platform inventory refresh service", () => {
     expect(JSON.stringify([...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls])).not.toContain("private-provider-row");
   });
 
-  it("allows a minute-long enumeration before publication with a bounded 150-second execution budget", async () => {
+  it("allows a minute-long enumeration within the existing thirty-minute source budget", async () => {
     vi.useFakeTimers();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
       const controller = new AbortController();
@@ -339,14 +379,14 @@ describe("Power Platform inventory refresh service", () => {
     }));
     await service.start(user, job.id);
     await vi.advanceTimersByTimeAsync(61_500);
-    expect(timeout).toHaveBeenCalledWith(150_000);
-    expect(repository.publish).toHaveBeenCalledOnce();
+    expect(timeout).toHaveBeenCalledWith(inventoryLimits.powerPlatformDeadlineMs);
+    expect(repository.complete).toHaveBeenCalledOnce();
     expect(repository.markFailed).not.toHaveBeenCalled();
     expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
   });
 
   it.each([
-    new AppError(504, "provider_timeout", "Power Platform inventory exceeded the 120-second enumeration limit."),
+    new AppError(504, "provider_timeout", `Power Platform inventory exceeded its ${inventoryLimits.powerPlatformDeadlineMs / 1_000}-second execution limit.`),
     new DOMException("private execution timeout", "TimeoutError"),
   ])("persists a clear timeout failure instead of generic failure or waiting authorization", async error => {
     const { service, job, dependencies, repository } = fixture();
@@ -355,9 +395,9 @@ describe("Power Platform inventory refresh service", () => {
     await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledOnce());
     expect(repository.markFailed).toHaveBeenCalledWith(
       { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "provider_timeout",
-      expect.stringMatching(/(?:120-second enumeration|150-second execution) limit/),
+      expect.stringMatching(/1800-second execution limit/),
     );
-    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
     expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
   });
 
@@ -367,7 +407,7 @@ describe("Power Platform inventory refresh service", () => {
     await first.service.start(user, first.job.id);
     await first.service.drain();
     expect(first.repository.markWaitingAuthorization).toHaveBeenCalledTimes(1);
-    expect(first.repository.publish).not.toHaveBeenCalled();
+    expect(first.repository.complete).not.toHaveBeenCalled();
   });
 
   it("lets Admin inherit Viewer authority and fences publication after all roles are lost", async () => {
@@ -379,12 +419,14 @@ describe("Power Platform inventory refresh service", () => {
     const fenced = fixture();
     fenced.dependencies.revalidateUser
       .mockResolvedValueOnce(user)
+      .mockResolvedValueOnce(user)
       .mockResolvedValueOnce({ ...user, roles: [] });
     await fenced.service.start(user, fenced.job.id);
     await vi.waitFor(() => expect(fenced.repository.markFailed).toHaveBeenCalledWith(
       expect.anything(), fenced.job.id, "missing_internal_role", expect.stringContaining("permission")));
     expect(fenced.repository.markWaitingAuthorization).not.toHaveBeenCalled();
-    expect(fenced.repository.publish).not.toHaveBeenCalled();
+    expect(fenced.dependencies.query).toHaveBeenCalledOnce();
+    expect(fenced.repository.complete).not.toHaveBeenCalled();
   });
 
   it("lets only the owning Viewer cancel its inventory refresh", async () => {
@@ -482,7 +524,7 @@ describe("Power Platform inventory refresh service", () => {
       await stopped;
       await service.drain();
       expect(dependencies.query).not.toHaveBeenCalled();
-      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.complete).not.toHaveBeenCalled();
       expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(stage === "markRunning" ? 1 : 0);
     },
   );
@@ -508,7 +550,7 @@ describe("Power Platform inventory refresh service", () => {
     expect(drainFailure).toBeUndefined();
     expect(repository.markFailed).not.toHaveBeenCalled();
     expect(dependencies.query).not.toHaveBeenCalled();
-    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
   });
 
   it("retains an admission permission-status persistence failure during shutdown", async () => {
@@ -593,7 +635,7 @@ describe("Power Platform inventory refresh service", () => {
     dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) =>
       options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true })));
     const starting = service.start(user, job.id);
-    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(phase === "running" ? 2 : 1));
     if (phase === "running") await starting;
     try {
       const reads = repository.getJob.mock.calls.length;
@@ -601,7 +643,7 @@ describe("Power Platform inventory refresh service", () => {
         await expect(service.start(other, job.id.toUpperCase())).rejects.toMatchObject({ status: 404, code: "not_found" });
       }
       expect(repository.getJob).toHaveBeenCalledTimes(reads);
-      expect(dependencies.revalidateUser).toHaveBeenCalledOnce();
+      expect(dependencies.revalidateUser).toHaveBeenCalledTimes(phase === "running" ? 2 : 1);
     } finally {
       pending.resolve(user);
       await starting;
@@ -619,9 +661,9 @@ describe("Power Platform inventory refresh service", () => {
       const pending = deferred<AuthenticatedUser>();
       const deadline = new AbortController();
       vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
-      dependencies.revalidateUser.mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
+      dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
       await service.start(user, job.id);
-      await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(3));
       let draining: Promise<void> | undefined;
       if (interruption === "cancel") await service.cancel(user, job.id);
       else if (interruption === "logout") await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
@@ -632,12 +674,12 @@ describe("Power Platform inventory refresh service", () => {
         ? new AppError(401, "interaction_required", "Late authorization failure.")
         : new Error("Late authorization transport failure."));
       await (draining ?? service.drain());
-      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.complete).not.toHaveBeenCalled();
       expect(getEventListeners(deadline.signal, "abort")).toHaveLength(0);
       if (interruption === "deadline") {
         expect(repository.markFailed).toHaveBeenCalledWith(
           { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id,
-          "provider_timeout", expect.stringContaining("150-second execution limit"),
+          "provider_timeout", expect.stringContaining("1800-second execution limit"),
         );
         expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
       } else {
@@ -698,7 +740,7 @@ describe("Power Platform inventory refresh service", () => {
         event: "inventory_refresh_status_failed", requestId: "request-status-failed", jobId: job.id, errorCode: "internal_error",
       })));
     expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(failure.message);
-    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
   });
 
   it("reports background persistence failures to an in-flight drain", async () => {
@@ -720,15 +762,15 @@ describe("Power Platform inventory refresh service", () => {
     const { service, repository, dependencies, job } = fixture();
     const pending = deferred<AuthenticatedUser>();
     const failure = new Error("private authorization-wait persistence failure");
-    dependencies.revalidateUser.mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
+    dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
     repository.markWaitingAuthorization.mockRejectedValueOnce(failure);
     await service.start(user, job.id);
-    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(3));
     const drained = expect(service.drain()).rejects.toBe(failure);
     pending.reject(new Error("Late authorization transport failure."));
     await drained;
     expect(repository.markFailed).not.toHaveBeenCalled();
-    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining('"event":"inventory_refresh_status_failed"'));
     expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(failure.message);
   });
@@ -738,7 +780,7 @@ describe("Power Platform inventory refresh service", () => {
     const finalValidation = deferred<void>();
     const refresh = fixture();
     const scopedUser = { ...user, homeAccountId: "logout-publication-principal" };
-    refresh.dependencies.revalidateUser.mockResolvedValueOnce(scopedUser).mockImplementationOnce(async () => {
+    refresh.dependencies.revalidateUser.mockResolvedValueOnce(scopedUser).mockResolvedValueOnce(scopedUser).mockImplementationOnce(async () => {
       finalValidation.resolve();
       return pending.promise;
     });
@@ -749,6 +791,6 @@ describe("Power Platform inventory refresh service", () => {
       pending.resolve(scopedUser);
     });
     await vi.waitFor(() => expect(refresh.repository.markWaitingAuthorization).toHaveBeenCalledTimes(1));
-    expect(refresh.repository.publish).not.toHaveBeenCalled();
+    expect(refresh.repository.complete).not.toHaveBeenCalled();
   });
 });

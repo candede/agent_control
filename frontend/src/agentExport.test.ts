@@ -1,25 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { downloadBlob, isSavedAgentRevision, maximumUnifiedAgentExportRows, selectedAgentExportReferences } from "./agentExport";
-
-afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
-
-describe("server-generated download delivery", () => {
-  it("releases the object URL and removes its temporary download anchor", () => {
-    vi.useFakeTimers();
-    const blob = new Blob(["server-approved-data"], { type: "text/csv" });
-    const create = vi.fn(() => "blob:fixture");
-    const revoke = vi.fn();
-    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: create });
-    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revoke });
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-    downloadBlob("inventory.csv", blob);
-    expect(create).toHaveBeenCalledWith(blob);
-    expect(document.querySelector("a[download='inventory.csv']")).not.toBeNull();
-    vi.runAllTimers();
-    expect(document.querySelector("a[download='inventory.csv']")).toBeNull();
-    expect(revoke).toHaveBeenCalledWith("blob:fixture");
-  });
-});
+import { describe, expect, it } from "vitest";
+import { maximumExplicitAgentReferences, selectedAgentExportReferences } from "./agentExport";
 
 describe("unified agent export references", () => {
   const canonical = "agent:11111111-1111-4111-8111-111111111111";
@@ -60,17 +40,10 @@ describe("unified agent export references", () => {
   });
 
   it("does not truncate a maximum-size selected package set", () => {
-    const ids = Array.from({ length: maximumUnifiedAgentExportRows }, (_, index) => `package-${index}`);
+    const ids = Array.from({ length: maximumExplicitAgentReferences }, (_, index) => `package-${index}`);
     const refs = selectedAgentExportReferences([], ids, []);
     expect(refs).toHaveLength(5_000);
     expect(refs.at(-1)).toBe("graph_packages:package-4999");
-  });
-
-  it.each([undefined, "", "a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), `${"a".repeat(63)}\n`, `${"a".repeat(64)}\n`])("rejects an invalid saved revision %j", value => {
-    expect(isSavedAgentRevision(value)).toBe(false);
-  });
-
-  it("accepts only the exact 64-character lowercase hexadecimal revision", () => {
-    expect(isSavedAgentRevision("0123456789abcdef".repeat(4))).toBe(true);
+    expect(() => selectedAgentExportReferences([], [...ids, "over-limit"], [])).toThrow(/at most 5,000/);
   });
 });

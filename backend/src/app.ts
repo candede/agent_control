@@ -7,22 +7,24 @@ import type pg from "pg";
 import { config, authConfigured } from "./config.js";
 import { pool } from "./db/pool.js";
 import { createSessionStore } from "./db/sessions.js";
-import { migrations, verifySchema } from "./db/schema.js";
+import { schemaFingerprint, verifySchema } from "./db/schema.js";
 import { AppError, errorHandler } from "./errors.js";
 import { apiAdmission } from "./middleware/admission.js";
-import { agentsRouter } from "./routes/agents.js";
-import { createAgentUsageRouter } from "./routes/agentUsage.js";
+import { agentsRouter, createAgentJobReadRouter, createAgentRefreshTargetsRouter } from "./routes/agents.js";
+import { createInventoryMutationsRouter } from "./routes/inventoryMutations.js";
 import { auditRouter } from "./routes/audit.js";
 import { authRouter } from "./routes/auth.js";
 import { capabilitiesRouter } from "./routes/capabilities.js";
 import { copilotStudioQuarantineRouter } from "./routes/copilotStudioQuarantine.js";
-import { createCopilotUsageRouter } from "./routes/copilotUsage.js";
 import { createDataSyncRouter } from "./routes/dataSync.js";
 import { defenderHuntingRouter } from "./routes/defenderHunting.js";
-import { inventoryRouter } from "./routes/inventory.js";
-import { createOfficialUsageRouter } from "./routes/officialUsage.js";
+import { inventoryRouter, createInventoryReadRouter } from "./routes/inventory.js";
+import { createOfficialReportDataRouter } from "./routes/officialReportData.js";
+import { reportRuntime } from "./services/reportExportDispatcher.js";
+import { reportIdentity } from "./services/reportIdentity.js";
 import { purviewAuditRouter } from "./routes/purviewAudit.js";
-import { unifiedAgentsRouter } from "./routes/unifiedAgents.js";
+import { createUnifiedAgentsRouter } from "./routes/unifiedAgents.js";
+import { createInventoryDataRouter } from "./routes/inventoryData.js";
 import { workbenchRouter } from "./routes/workbench.js";
 import { policyRoute } from "./routes/policy.js";
 import { maintenanceActive } from "./services/maintenance.js";
@@ -98,11 +100,17 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
       authConfigured,
       maintenance,
       providerWorkEnabled: !maintenance && providerWorkEnabled() && state.providerWorkEnabled,
-      schemaVersion: migrations.length,
+      schemaFingerprint,
       limits: { databasePool: 4, requestBodyBytes: 524_288, exportDeadlineSeconds: 15 },
     });
   });
-  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(), unifiedAgentsRouter, createAgentUsageRouter(database), inventoryRouter, copilotStudioQuarantineRouter, createCopilotUsageRouter(database), createOfficialUsageRouter(database), purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);
+  const reports = reportRuntime(database);
+  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(),
+    createOfficialReportDataRouter({ reports: reports.reports,
+      identity: async request => ({ identity: await reportIdentity(database, request.session.user!), tokenMode: "delegated" }),
+      enqueueExport: async () => { reports.wake(); } }),
+    createInventoryDataRouter(database), createInventoryMutationsRouter(database), createAgentJobReadRouter(database), createAgentRefreshTargetsRouter(database), createUnifiedAgentsRouter(database),
+    createInventoryReadRouter(database), inventoryRouter, copilotStudioQuarantineRouter, purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);
   app.use("/api", (_request, _response, next) => next(new AppError(404, "not_found", "API route not found.")));
   app.use("/assets", express.static(`${staticDirectory}/assets`, { immutable: true, maxAge: "1y", fallthrough: false, dotfiles: "deny" }));
   app.use(express.static(staticDirectory, { index: false, maxAge: 0, dotfiles: "deny", setHeaders: response => response.setHeader("Cache-Control", "no-store") }));

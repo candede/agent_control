@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inventoryCoverageLabel, inventoryCoverageValue, inventoryRequestScope, inventoryRoleHint, savedInventoryTime } from "./inventoryVerification";
+import { inventoryCoverageLabel, inventoryRequestScope, inventoryRoleHint, savedInventoryTime } from "./inventoryVerification";
 
 describe("saved inventory evidence labels", () => {
   it("keeps optional role hints separate from collection and permission evidence", () => {
@@ -12,14 +12,11 @@ describe("saved inventory evidence labels", () => {
     expect(inventoryRequestScope("finance-env")).toBe("Environment requested: finance-env");
   });
 
-  it("labels every coverage state without promoting absence to zero", () => {
+  it("labels every coverage state without promoting an unverified query to complete coverage", () => {
     expect(inventoryCoverageLabel("covered")).toBe("Authorized query verified");
-    expect(inventoryCoverageValue("covered", 0)).toBe("0");
-    expect(inventoryCoverageValue("covered", null)).toBe("Count not established");
-    expect(inventoryCoverageValue("not_requested", null)).toBe("Not requested");
-    expect(inventoryCoverageValue("not_authorized_scope", null)).toBe("Not queried (role scope)");
-    expect(inventoryCoverageValue("unknown", null)).toBe("Unknown (not verified)");
-    expect(inventoryCoverageValue("unknown", 0)).toBe("0 observed; completeness not verified");
+    expect(inventoryCoverageLabel("not_requested")).toBe("Not requested");
+    expect(inventoryCoverageLabel("not_authorized_scope")).toBe("Not queried (role scope)");
+    expect(inventoryCoverageLabel("unknown")).toBe("Unknown (not verified)");
   });
 
   it("identifies an invalid saved timestamp explicitly", () => {

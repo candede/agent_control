@@ -1,121 +1,83 @@
-import { useEffect, useRef, useState } from "react";
-import {
-  ApiError, confirmOfficialUsageSetOperation, getOfficialUsageAdminState, getOfficialUsageHistory,
-  previewOfficialUsageSetOperation, type OfficialUsageSetSummary,
-} from "../api/client";
-import { useSavedQuery } from "../savedQueries";
+import { useContext, useLayoutEffect, useRef, useState } from "react";
+import type { ReportHistorySet, ReportMetadata } from "../../../backend/src/types/officialReportData";
+import type { OfficialReportConfirmation } from "../../../backend/src/types/officialReportApi";
+import { confirmReportOperation, previewReportOperation } from "../api/reportData";
+import { ApiError } from "../api/client";
+import { useReportPage, useReportPrincipalScope } from "../useReportPage";
+import { CapabilityContext } from "../capabilityContext";
+import { hasRole } from "../authorization";
 import "./officialUsage.css";
-
-const pageSize = 100;
-
 export function OfficialUsageReportSelector({ principalKey, revision, onChanged }: {
-  principalKey: string;
-  revision: number;
-  onChanged: (selectionChanged: boolean) => void;
+  principalKey: string; revision: number; onChanged: (selectionChanged: boolean) => void;
 }) {
-  const [offset, setOffset] = useState(0);
-  const [reload, setReload] = useState(0);
-  const [selection, setSelection] = useState<string>();
-  const [busy, setBusy] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string>();
-  const [unverifiedRead, setUnverifiedRead] = useState<string>();
-  const [deniedRead, setDeniedRead] = useState<string>();
+  const scope = useReportPrincipalScope();
+  return <Selector key={JSON.stringify([principalKey, scope])} revision={revision} onChanged={onChanged} />;
+}
+function sameRevisions(confirmation: OfficialReportConfirmation, reports: ReportMetadata) {
+  return confirmation.activeRevision === reports.activeRevision && confirmation.historyRevision === reports.historyRevision
+    && confirmation.historyEpoch === reports.historyEpoch;
+}
+function reportLabel(set: ReportHistorySet) {
+  const dates = set.reportingStart && set.reportingEnd ? `${set.reportingStart} to ${set.reportingEnd}` : "No activity dates";
+  return `${set.periodProvenance === "activity_range" ? "Observed activity" : "Reporting window"}: ${dates} | ${set.id.slice(0, 8)}`;
+}
+function Selector({ revision, onChanged }: { revision: number; onChanged: (selected: boolean) => void }) {
+  const read = useReportPage<ReportHistorySet>("official-usage/history", { sort: "acceptedAt", order: "desc" }, revision);
+  const capability = useContext(CapabilityContext), canManage = !capability || hasRole(capability.user, "AgentControl.Admin");
+  const [candidate, setCandidate] = useState("");
+  const [busy, setBusy] = useState(false), [error, setError] = useState<string>();
+  const [denied, setDenied] = useState(false), [seenRevision, setSeenRevision] = useState(revision);
   const lifetime = useRef<AbortController | undefined>(undefined);
-  useEffect(() => {
-    const controller = new AbortController();
-    lifetime.current = controller;
-    return () => controller.abort();
-  }, []);
-
-  const readKey = JSON.stringify([revision, offset, reload]);
-  const read = useSavedQuery({
-    queryKey: ["saved", "report-set-selector", principalKey, revision, offset, reload],
-    queryFn: async ({ signal }) => {
-      const [admin, history] = await Promise.all([
-        getOfficialUsageAdminState({ signal }),
-        getOfficialUsageHistory({ limit: pageSize, offset }, { signal }),
-      ]);
-      return { admin, history };
-    },
-  });
-  const loading = read.isPending || read.isFetching;
-  const data = !read.isError && !loading && deniedRead !== readKey ? read.data : undefined;
-  const sets = data?.history.bundles.value ?? [];
-  const activeId = data?.admin.activeSetId ?? "";
-  const active = data?.admin.sets.find(set => set.id === activeId);
-  const candidateId = selection ?? activeId;
-  const candidate = sets.find(set => set.id === candidateId) ?? (candidateId === activeId ? active : undefined);
-  const needsRefresh = unverifiedRead === readKey;
-  const disabled = busy || !data || needsRefresh;
-  const count = data?.history.bundles.count ?? 0;
-  const placeholder = loading ? "Loading report sets..." : !data ? "Report sets unavailable"
-    : count === 0 ? "No report sets available" : activeId ? "Choose a report set" : "No report set selected";
-
-  async function selectReport(setId: string) {
-    if (disabled || setId === activeId || !sets.some(set => set.id === setId)) return;
-    const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted) return;
-    setSelection(setId);
-    setBusy(true);
-    setErrorMessage(undefined);
+  useLayoutEffect(() => { const controller = new AbortController(); lifetime.current = controller; return () => controller.abort(); }, [revision]);
+  if (seenRevision !== revision) {
+    setSeenRevision(revision); setCandidate(""); setBusy(false); setError(undefined);
+  }
+  const data = denied ? undefined : read.data, active = data?.reports.activeSetId;
+  const selected = data?.value.find(set => set.id === (candidate || active));
+  const placeholder = read.loading ? "Loading report sets..." : !data ? "Report sets unavailable"
+    : data.counts.filtered === 0 ? "No report sets available" : "No report set selected";
+  async function selectReport(id: string) {
+    const abort = lifetime.current;
+    if (!canManage || busy || read.loading || !data || error || !abort) return;
+    if (id === "older-reports" && data.page.nextCursor) { read.next(); return; }
+    if (id === "newer-reports" && data.page.previousCursor) { read.previous(); return; }
+    if (!id || id === active || !data.value.some(set => set.id === id)) return;
+    setCandidate(id); setBusy(true); setError(undefined);
     let confirming = false;
     try {
-      const preview = await previewOfficialUsageSetOperation(setId, "select");
-      if (signal.aborted) return;
-      if (preview.expectedRevision !== data.admin.activeRevision || preview.activeSetId !== data.admin.activeSetId) {
-        throw new Error("The shared report selection changed.");
+      const next = await previewReportOperation(id, "select", abort.signal);
+      if (abort.signal.aborted) return;
+      if (next.operation !== "select" || next.setId !== id || !sameRevisions(next, data.reports)) {
+        throw new ApiError(409, "selection_invalidated", "The shared report selection or history changed. Reload report selections before confirming.");
       }
       confirming = true;
-      await confirmOfficialUsageSetOperation(preview);
-      if (signal.aborted) return;
-      setSelection(undefined);
-      setReload(value => value + 1);
-      onChanged(true);
-    } catch (error) {
-      if (signal.aborted) return;
-      setSelection(undefined);
-      setUnverifiedRead(readKey);
-      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) setDeniedRead(readKey);
-      const uncertain = confirming && (!(error instanceof ApiError) || error.status === 0 || error.status >= 500);
-      setErrorMessage(`${error instanceof Error ? error.message : "Report selection could not be verified."} ${uncertain
-        ? "The selection may have been saved. Retry to check its status."
-        : "Retry to reload report sets before selecting again."}`);
-    } finally {
-      if (!signal.aborted) setBusy(false);
-    }
+      const result = await confirmReportOperation(next, abort.signal);
+      if (abort.signal.aborted) return;
+      if (result.activeSetId !== next.setId) throw new Error("The returned active report did not match the confirmed selection.");
+      setCandidate(""); setError(undefined); read.restart(); onChanged(true);
+    } catch (cause) {
+      if (!abort.signal.aborted) {
+        const uncertain = confirming && (!(cause instanceof ApiError) || cause.status === 0 || cause.status >= 500);
+        setError(`${uncertain ? "Selection may have been saved. " : ""}${cause instanceof Error ? cause.message : "Selection was not confirmed."} Retry to reload report sets before selecting again.`);
+        setCandidate("");
+        if (cause instanceof ApiError && [401, 403].includes(cause.status)) setDenied(true);
+      }
+    } finally { if (!abort.signal.aborted) setBusy(false); }
   }
-
-  return <section className="usage-report-selector" aria-label="Report set selection" aria-busy={loading || busy}>
-    <select aria-label="Report set" value={candidateId} disabled={disabled || count === 0}
-      title={candidate ? reportSetLabel(candidate) : "Report set"}
-      onChange={event => void selectReport(event.target.value)}>
-      <option value="" disabled>{placeholder}</option>
-      {activeId && !sets.some(set => set.id === activeId) ? <option value={activeId}>
-        {active ? reportSetLabel(active) : `Current report ${activeId.slice(0, 8)} (outside this page)`} - selected
-      </option> : null}
-      {selection && selection !== activeId && !candidate ? <option value={selection} disabled>Report not on this page</option> : null}
-      {sets.map(set => <option key={set.id} value={set.id}>{reportSetLabel(set)}{set.id === activeId ? " - selected" : ""}</option>)}
+  return <section className="usage-report-selector" aria-label="Report set selection" aria-busy={busy || read.loading}>
+    <select aria-label="Report set" value={candidate || active || ""} disabled={busy || read.loading || !data || !data.counts.filtered || !canManage || Boolean(error)}
+      title={selected ? reportLabel(selected) : "Report set"}
+      onChange={event => void selectReport(event.target.value)}><option value="" disabled>{placeholder}</option>
+      {active && !data?.value.some(set => set.id === active) ? <option value={active}>Current report {active.slice(0, 8)} (outside this page) - selected</option> : null}
+      {data?.value.map(set => <option key={set.id} value={set.id}>{reportLabel(set)}{set.id === active ? " - selected" : ""}</option>)}
+      {data?.page.previousCursor ? <option value="newer-reports">Newer report sets...</option> : null}
+      {data?.page.nextCursor ? <option value="older-reports">Older report sets...</option> : null}
     </select>
-    <span className="sr-only" role="status">{busy ? "Selecting report set..." : ""}</span>
-    {data && (count > pageSize || offset > 0) ? <div className="usage-report-selector-pages">
-      <button type="button" className="secondary" disabled={busy || offset === 0}
-        onClick={() => { setSelection(undefined); setOffset(value => Math.max(0, value - pageSize)); }}>Newer report sets</button>
-      <span>{sets.length ? `Report sets ${offset + 1}-${Math.min(offset + sets.length, count)} of ${count.toLocaleString()}`
-        : "No report sets remain on this page. Use Newer report sets to return."}</span>
-      <button type="button" className="secondary" disabled={busy || offset + pageSize >= count}
-        onClick={() => { setSelection(undefined); setOffset(value => value + pageSize); }}>Older report sets</button>
-    </div> : null}
-    {read.isError || errorMessage ? <div className="report-status error" role="alert">
-      {read.isError ? read.error.message : errorMessage}{" "}
-      <button type="button" className="secondary" disabled={busy || loading}
-        onClick={() => { setSelection(undefined); setErrorMessage(undefined); setReload(value => value + 1); onChanged(false); }}>Retry</button>
-    </div> : null}
+    <span className="sr-only" role="status">{busy ? "Selecting report set..." : read.loading ? "Loading report sets..." : ""}</span>
+    {!canManage ? <p>An administrator can change the shared report selection. Historical reports remain available in Manage reports.</p> : null}
+    {error || read.error ? <div className="report-status error" role="alert">{error ?? read.error?.message}{" "}
+      <button type="button" className="secondary" disabled={busy || read.loading} onClick={() => {
+        setError(undefined); setCandidate(""); setDenied(false); read.restart(); onChanged(false);
+      }}>Retry</button></div> : null}
   </section>;
-}
-
-function reportSetLabel(set: OfficialUsageSetSummary) {
-  const period = set.reportingPeriod;
-  const dates = period.startDate && period.endDate ? `${period.startDate} to ${period.endDate}` : "No activity dates";
-  const basis = period.provenance === "activity_range" ? "Observed activity" : "Reporting window";
-  return `${basis}: ${dates} | ${set.id.slice(0, 8)}`;
 }

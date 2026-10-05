@@ -157,15 +157,19 @@ describe("saved Users responsibility", () => {
 
   it("pages both people and agents server-side and rejects cross-person responses", async () => {
     const data = responsibilityFixture();
-    data.count = 51;
+    data.counts = { total: 51, filtered: 51 };
+    data.page.nextCursor = "next-responsibility-page";
     const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
     const change = vi.fn();
     const route = { view: "responsibility" as const, search: "", page: 0 };
     const view = render(<UserAgentResponsibility route={route} onRouteChange={change} />);
     await userEvent.click(await screen.findByRole("button", { name: "Next" }));
-    expect(change).toHaveBeenCalledWith({ ...route, page: 1 });
-    view.rerender(<UserAgentResponsibility route={{ ...route, page: 1 }} onRouteChange={change} />);
-    await waitFor(() => expect(read).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 50 }), expect.anything()));
+    expect(change).toHaveBeenCalledWith({ ...route, page: 1, selectionId: data.selection.id, cursor: data.page.nextCursor });
+    view.rerender(<UserAgentResponsibility route={change.mock.calls[0][0]} onRouteChange={change} />);
+    await waitFor(() => expect(read).toHaveBeenLastCalledWith(expect.objectContaining({
+      selectionId: data.selection.id, cursor: data.page.nextCursor, limit: 50,
+    }), expect.anything()));
+    expect(read.mock.calls[1][0]).not.toHaveProperty("offset");
     read.mockResolvedValue(responsibilityFixture("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
     view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("did not match the exact requested user");

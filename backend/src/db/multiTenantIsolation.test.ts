@@ -1,23 +1,33 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import type { CopilotDirectoryUser } from "../services/copilotUsageGraph.js";
-import { parseOfficialUsageReport } from "../services/officialUsageParser.js";
+import { generationInput } from "../../scripts/largeTenantFixtures.js";
+import { inventoryInput, inventorySelectionFixture, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+import { OfficialAgentUsage } from "../services/officialAgentUsage.js";
+import { LargeTenantUsersReports } from "../services/largeTenantUsersReports.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestigations.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { AgentIdentityRepository, type AgentIdentitySource } from "./agentIdentity.js";
 import { AgentPeopleRepository } from "./agentPeople.js";
-import { AgentUsageRepository } from "./agentUsage.js";
-import { saveUsageInventory } from "./agentUsageTestSupport.js";
+import { saveUsageInventory, usageIdentity } from "./agentUsageTestSupport.js";
 import { CapabilityRepository, type EvidenceKey } from "./capabilities.js";
-import { DataSyncRepository, type DataSyncScope } from "./dataSync.js";
+import { DataSyncRepository, requireUserPublication, type DataSyncScope, type UserSourcePublication } from "./dataSync.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
-import { OfficialUsageRepository } from "./officialUsage.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
+import { OfficialReportImports } from "./officialReportImports.js";
+import { UserSourceStages } from "./userSourceStages.js";
+import { UserSourcesRepository } from "./userSources.js";
+import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { PackageMutationQualificationRepository } from "./packageMutationQualifications.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
+import { packageInventoryRecord, powerPlatformInventoryRecord } from "../services/inventoryRecordProjection.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
+import { DataGenerations } from "./dataGenerations.js";
+import { LiveInventory } from "./liveInventory.js";
+import { NativeInventory } from "./nativeInventory.js";
+import { InventoryIdentityQueries } from "./inventoryIdentityQueries.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 const principalId = "overlapping-principal";
@@ -44,6 +54,23 @@ function label(scope: DataSyncScope) {
   return `${scope.tenantId}/${scope.principalId}`;
 }
 
+async function directoryPage(scope: DataSyncScope) {
+  const source = new UserSourcesRepository(fixture.runtime, "synthetic-multi-tenant-directory-key"), identity = await usageIdentity(fixture.runtime, scope);
+  const selection = await source.capture(identity, "delegated");
+  return source.page(selection.id, identity);
+}
+function collectDirectory(scope: DataSyncScope, user: CopilotDirectoryUser, publication: UserSourcePublication) {
+  const stages = new UserSourceStages(fixture.runtime);
+  return stages.execute(generationInput({
+    scope: { ...generationInput().scope, ...scope, source: "directory" }, jobKind: "data_sync", ...publication,
+  }), async lease => {
+    const key = await stages.query(lease, "discovery", "synthetic:isolation");
+    await stages.page(lease, key, "synthetic:isolation", 1, 1);
+    await stages.directory(lease, key, [user]);
+    await stages.finishQuery(lease, key);
+  }, { beforePublish: async () => {}, completeJob: client => requireUserPublication(client, scope, publication) });
+}
+
 function nativeResource(scope: DataSyncScope): PowerPlatformResource {
   return {
     tenantId: scope.tenantId, nativeId, environmentId, type: agentType, displayName: label(scope),
@@ -58,8 +85,8 @@ function nativeResource(scope: DataSyncScope): PowerPlatformResource {
 }
 
 describe("multi-tenant repositories with overlapping provider and principal identities", () => {
-  it("isolates package catalogs, detail caches, snapshots and child foreign keys", async () => {
-    const repository = new PackageInventoryRepository(fixture.runtime);
+  it("isolates typed package pages, pinned details and composite child foreign keys", async () => {
+    const repository = new PackageRefreshJobs(fixture.runtime);
     const scopes = partitions("packages");
     const saved = [];
     for (const scope of scopes) {
@@ -67,75 +94,86 @@ describe("multi-tenant repositories with overlapping provider and principal iden
         authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "shared-refresh",
       });
       await repository.markRunning(scope, job.id);
-      const result = await repository.publish(scope, job.id, {
-        packages: [allowlistedPackage({ id: "shared-package", displayName: label(scope), isBlocked: false,
-          appId: identityId, manifestId: "shared-manifest", supportedHosts: ["Copilot"] })],
-        totalRecords: 1, pages: 1,
-      });
-      saved.push({ scope, job, snapshotId: result.snapshotId });
+      const root = await refreshInventoryFixture(fixture.runtime, scope, job.id, "packages", [
+        packageInventoryRecord(allowlistedPackage({ id: "shared-package", displayName: label(scope), isBlocked: false,
+          appId: identityId, manifestId: "shared-manifest", supportedHosts: ["Copilot"] })),
+      ]);
+      saved.push({ scope, job, root, selected: await inventorySelectionFixture(fixture.runtime, scope, {}, "packages") });
     }
     expect(new Set(saved.map(value => value.job.id)).size).toBe(3);
     for (const current of saved) {
-      const page = await repository.list(current.scope);
-      expect(page).toMatchObject({ count: 1, value: [{ id: "shared-package", displayName: label(current.scope) }] });
-      expect(await repository.get(current.scope, "shared-package"))
-        .toMatchObject({ package: { displayName: label(current.scope), appId: identityId } });
-      expect(await repository.getMany(current.scope, ["shared-package", "missing"]))
-        .toMatchObject([{ id: "shared-package", package: { displayName: label(current.scope) } }, { id: "missing", package: null }]);
-      expect((await repository.readUnifiedSource(current.scope)).packages).toMatchObject([{ displayName: label(current.scope) }]);
+      const { queries, selection, identity, raw } = current.selected;
+      expect(raw).toMatchObject({ counts: { total: 1 }, value: [{ id: "shared-package", displayName: label(current.scope) }] });
+      expect(await queries.packageDetail(selection.id, identity, "shared-package"))
+        .toMatchObject({ displayName: label(current.scope), appId: identityId });
+      expect(await queries.exact(selection.id, identity, ["shared-package", "missing"]))
+        .toMatchObject([{ identity: "shared-package", residual: { displayName: label(current.scope) } }]);
+      expect((await queries.children(selection.id, identity, "shared-package", { kind: "supportedHosts" })).total).toBe(1);
       for (const other of saved.filter(value => value !== current)) {
         expect(await repository.getJob(current.scope, other.job.id)).toBeUndefined();
         expect(await repository.markRunning(current.scope, other.job.id)).toBe(false);
         expect(await repository.cancel(current.scope, other.job.id, current.scope.principalId)).toBeUndefined();
-        await expect(repository.list(current.scope, { snapshotId: other.snapshotId })).rejects.toMatchObject({ code: "not_found" });
-        await expect(repository.assertSnapshotCurrent(current.scope, other.snapshotId)).rejects.toMatchObject({ code: "not_found" });
+        await expect(queries.page(other.selected.selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+        await expect(queries.capture(identity, other.root.scopeId)).rejects.toMatchObject({ code: "selection_invalidated" });
       }
     }
-    for (const scope of scopes.slice(1)) {
-      await expect(fixture.runtime.query(`INSERT INTO package_inventory_resources
-        (snapshot_id,tenant_id,principal_id,native_id,display_name,is_blocked,identifiers,package_data)
-        VALUES($1,$2,$3,'foreign-child','Foreign child',false,'[{"kind":"package_id","value":"foreign-child"}]','{}')`,
-      [saved[0].snapshotId, scope.tenantId, scope.principalId])).rejects.toMatchObject({ code: "23503" });
+    const stages = new DataGenerations(fixture.runtime), input = inventoryInput(scopes[0].principalId);
+    input.scope.tenantId = scopes[0].tenantId;
+    const lease = await stages.begin(input);
+    try {
+      for (const other of saved.slice(1)) {
+        await expect(fixture.runtime.query(`INSERT INTO inventory_keys
+          (generation_id,scope_id,tenant_id,identity,schema_version,content_hash) VALUES($1,$2,$3,'foreign-child',1,$4)`,
+        [lease.id, other.root.scopeId, other.scope.tenantId, "a".repeat(64)])).rejects.toMatchObject({ code: "23503" });
+      }
+    } finally { await stages.abort(lease); }
+    const identities = await fixture.runtime.query(`SELECT r.tenant_id,s.principal_id FROM package_record_rows r
+      JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.native_id='shared-package' ORDER BY r.tenant_id,s.principal_id`);
+    expect(identities.rows).toHaveLength(3);
+    expect(identities.rows).toEqual(expect.arrayContaining(scopes.map(scope => ({ tenant_id: scope.tenantId, principal_id: scope.principalId }))));
+    for (const current of saved) {
+      await current.selected.queries.selections.invalidate(current.selected.selection.id, current.selected.identity);
     }
-    const identities = await fixture.runtime.query(`SELECT tenant_id FROM source_identifiers
-      WHERE source='graph_packages' AND identifier_kind='package_id' AND identifier_value='shared-package' ORDER BY tenant_id`);
-    expect(identities.rows).toEqual(scopes.slice(0, 2).map(scope => ({ tenant_id: scope.tenantId })));
   });
 
   it("keeps native agents, environments, identity candidates and verified identity caches scoped", async () => {
-    const repository = new PowerPlatformInventoryRepository(fixture.runtime);
+    const repository = new PowerPlatformRefreshJobs(fixture.runtime);
     const identities = new AgentIdentityRepository(fixture.runtime);
     const saved = [];
     for (const scope of partitions("native")) {
       const agent = nativeResource(scope);
       const environment: PowerPlatformResource = {
-        ...agent, nativeId: environmentId, type: environmentType, displayName: `Environment ${label(scope)}`,
+        ...agent, nativeId: environmentId, environmentId: null, type: environmentType, displayName: `Environment ${label(scope)}`,
         agentKind: "environment", lifecycle: "not_applicable", identifiers: [{ kind: "environment_id", value: environmentId }],
         provenance: {}, details: { environmentType: "Sandbox" },
       };
       const job = await repository.submit(scope, { idempotencyKey: "shared-refresh", roleScope: "full", requestedTypes: [agentType, environmentType] });
       await repository.markRunning(scope, job.id);
-      const result = await repository.publish(scope, job.id, {
-        resources: [agent, environment], queriedTypes: [agentType, environmentType], environmentScope: null,
-        totalRecords: 2, pages: 1, unknownFieldCount: 0,
-      });
-      const source: AgentIdentitySource = { recordId: "shared-record", snapshotId: result.snapshotId, nativeId,
-        environmentId, candidateId: identityId, sourceRevision: "a".repeat(64) };
+      const root = await refreshInventoryFixture(fixture.runtime, scope, job.id, "power_platform",
+        [agent, environment].map(powerPlatformInventoryRecord), [agentType, environmentType]);
+      const selected = await inventorySelectionFixture(fixture.runtime, scope);
+      const page = inventoryPresentation(selected.raw);
+      const record = await new LiveInventory(fixture.runtime).record(scope, page.value[0].id);
+      const source: AgentIdentitySource = { recordId: record.id, snapshotId: record.native!.observation.snapshotId, nativeId,
+        environmentId, candidateId: identityId, sourceRevision: record.revision };
       await identities.save(scope, source, { objectId: identityId, applicationId: identityId, runtimeStatus: "available",
         runtimeProvenance: verifiedAgentIdentityClientIdProvenance }, async () => {});
-      saved.push({ scope, source, job });
+      saved.push({ scope, source, job, root, selected, page });
     }
     for (const current of saved) {
-      expect((await repository.readUnifiedSource(current.scope)).resources).toMatchObject([{ tenantId: current.scope.tenantId, displayName: label(current.scope) }]);
-      expect((await repository.readAgentEnvironments(current.scope, [environmentId]))[environmentId])
-        .toMatchObject({ displayName: `Environment ${label(current.scope)}`, observation: { snapshotId: current.source.snapshotId } });
-      expect(await repository.readIdentityCandidates(current.scope, [agentType])).toMatchObject([{ tenantId: current.scope.tenantId, nativeId }]);
+      expect(current.page.value).toMatchObject([{ powerPlatformResource: { tenantId: current.scope.tenantId, displayName: label(current.scope) },
+        environment: { displayName: `Environment ${label(current.scope)}`, observation: { snapshotId: current.source.snapshotId } } }]);
+      const native = new InventoryIdentityQueries(fixture.runtime);
+      expect(await native.read(client => native.resolve(client, current.scope, [agentType], {
+        tenantId: current.scope.tenantId, sourceSystem: "power_platform", nativeId, resourceType: agentType, environmentId,
+        identifiers: [{ kind: "entra_agent_id", value: identityId }],
+      }))).toMatchObject({ status: "resolved", candidate: { tenantId: current.scope.tenantId, nativeId } });
       expect(await identities.read(current.scope, current.source)).toMatchObject({ objectId: identityId, applicationId: identityId });
       for (const other of saved.filter(value => value !== current)) {
-        await expect(repository.getResource(current.scope, other.source.snapshotId, agentType, environmentId, nativeId))
-          .rejects.toMatchObject({ code: "not_found" });
-        await expect(repository.getQuarantineSelection(current.scope, other.source.snapshotId, [nativeId]))
-          .rejects.toMatchObject({ code: "not_found" });
+        await expect(current.selected.queries.page(other.selected.selection.id, current.selected.identity))
+          .rejects.toMatchObject({ code: "selection_invalidated" });
+        await expect(new NativeInventory(fixture.runtime).resolveQuarantineTargets(current.scope, other.source.snapshotId, [nativeId]))
+          .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
         expect(await repository.getJob(current.scope, other.job.id)).toBeUndefined();
         expect(await identities.read(current.scope, other.source)).toBeNull();
         await identities.invalidate(current.scope, other.source);
@@ -147,11 +185,11 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const owner = saved[0];
     const pending = await repository.submit(owner.scope, { idempotencyKey: "reject-foreign-publication", roleScope: "full", requestedTypes: [agentType] });
     await repository.markRunning(owner.scope, pending.id);
-    await expect(repository.publish(owner.scope, pending.id, {
-      resources: [nativeResource(saved[1].scope)], queriedTypes: [agentType], environmentScope: null,
-      totalRecords: 1, pages: 1, unknownFieldCount: 0,
-    })).rejects.toMatchObject({ code: "scope_mismatch" });
-    expect((await repository.readUnifiedSource(owner.scope)).snapshot?.id).toBe(owner.source.snapshotId);
+    await expect(refreshInventoryFixture(fixture.runtime, owner.scope, pending.id, "power_platform",
+      [powerPlatformInventoryRecord(nativeResource(saved[1].scope))], [agentType])).rejects.toThrow("inventory_resource_scope");
+    expect((await new LiveInventory(fixture.runtime).record(owner.scope, owner.source.recordId)).native?.observation.snapshotId)
+      .toBe(owner.source.snapshotId);
+    for (const current of saved) await current.selected.queries.selections.invalidate(current.selected.selection.id, current.selected.identity);
   });
 
   it("retains account-private directory users and sync lineage while clearing only the requested scope", async () => {
@@ -167,35 +205,35 @@ describe("multi-tenant repositories with overlapping provider and principal iden
         accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null },
       serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [] };
       const checkedAt = new Date().toISOString();
-      await repository.publishDirectory(scope, [user], checkedAt, "Saved users.", publication);
+      await collectDirectory(scope, user, publication);
       await people.save(scope, [{ objectId: personId, status: "resolved", displayName: label(scope),
-        userPrincipalName: "same@example.invalid", checkedAt }], { generation: "initial", publication });
+        userPrincipalName: "same@example.invalid", checkedAt }], { generation: await people.generation(scope), publication });
       saved.push({ scope, run, publication, user });
     }
     for (const current of saved) {
-      expect((await repository.getDirectorySource(current.scope)).value).toMatchObject([{ identity: { displayName: label(current.scope) } }]);
+      expect((await directoryPage(current.scope)).value).toMatchObject([{ directory: { displayName: label(current.scope) } }]);
       expect(await people.read(current.scope, [personId])).toMatchObject([{ displayName: label(current.scope) }]);
       expect((await repository.listRuns(current.scope)).map(run => run.id)).toEqual([current.run.id]);
       for (const other of saved.filter(value => value !== current)) {
         expect(await repository.getRun(current.scope, other.run.id)).toBeUndefined();
-        await expect(repository.publishDirectory(current.scope, [other.user], new Date().toISOString(), "Foreign source.", other.publication))
-          .rejects.toMatchObject({ code: "data_sync_publication_superseded" });
+        await expect(collectDirectory(current.scope, other.user, other.publication)).rejects.toThrow("data_source_job_fenced");
       }
     }
     const owner = saved[0];
     await repository.cancel(owner.scope, owner.run.id);
     await repository.submit(owner.scope, { mode: "full", clearSavedData: true });
-    expect((await repository.getDirectorySource(owner.scope)).value).toBeNull();
+    expect(await directoryPage(owner.scope)).toMatchObject({ value: [], sources: { directory: { state: "unavailable", generationId: null } } });
     expect(await people.read(owner.scope, [personId])).toEqual([]);
     for (const other of saved.slice(1)) {
-      expect((await repository.getDirectorySource(other.scope)).value).toMatchObject([{ identity: { displayName: label(other.scope) } }]);
+      expect((await directoryPage(other.scope)).value).toMatchObject([{ directory: { displayName: label(other.scope) } }]);
       expect(await people.read(other.scope, [personId])).toMatchObject([{ displayName: label(other.scope) }]);
       expect(await repository.getRun(other.scope, other.run.id)).toMatchObject({ status: "running" });
     }
   });
 
   it("isolates identical report files, bundle receipts, active selections and private import previews", async () => {
-    const repository = new OfficialUsageRepository(fixture.runtime);
+    const repository = new OfficialReportImports(fixture.runtime);
+    const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-multi-tenant-report-key", 35);
     const [owner, otherTenant, otherAccount] = partitions("reports");
     const bundleId = randomUUID();
     const csvs = [
@@ -205,50 +243,56 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     ];
     const saved = [];
     for (const scope of [owner, otherTenant]) {
+      const identity = await usageIdentity(fixture.runtime, scope);
       const stages = [];
       for (const content of csvs) {
-        stages.push(await repository.stage(scope, {
-          bundleId, report: parseOfficialUsageReport(Buffer.from(content)), fileHash: createHash("sha256").update(content).digest("hex"),
-        }));
+        stages.push(await repository.stage(identity, { bundleId }, (async function* () { yield Buffer.from(content); })()));
       }
-      saved.push({ scope, stages, preview: await repository.previewBundle(scope, bundleId) });
+      saved.push({ scope, identity, stages, preview: await repository.bundle(identity, bundleId) });
     }
     for (const unauthorized of [otherTenant, otherAccount]) {
+      const identity = await usageIdentity(fixture.runtime, unauthorized);
       const stage = saved[0].stages[0];
-      expect(await repository.getStaging(unauthorized, stage.id)).toBeUndefined();
-      await expect(repository.accept(unauthorized, stage.id, {
-        stagingRevision: stage.revision, fileHash: stage.fileHash, expectedActiveRevision: stage.activeRevision,
-      })).rejects.toMatchObject({ code: "staging_not_found" });
-      await expect(repository.discardStaging(unauthorized, stage.id)).rejects.toMatchObject({ code: "staging_unavailable" });
+      await expect(repository.preview(identity, stage.id)).rejects.toMatchObject({ code: "staging_unavailable" });
+      await expect(repository.accept(identity, {
+        stagingId: stage.id, revision: stage.revision, contentHash: stage.contentHash, expectedActiveRevision: stage.activeRevision,
+      })).rejects.toMatchObject({ code: "staging_unavailable" });
+      await expect(repository.discard(identity, stage.id)).rejects.toMatchObject({ code: "staging_unavailable" });
     }
-    expect((await repository.getAdminState(otherAccount)).staging).toEqual([]);
-    await expect(repository.acceptBundle(otherTenant, bundleId, saved[0].preview)).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
+    expect((await repository.bundle(await usageIdentity(fixture.runtime, otherAccount), bundleId)).stages).toEqual([]);
+    await expect(repository.acceptBundle(saved[1].identity, bundleId, saved[0].preview)).rejects.toMatchObject({ code: "bundle_fence_mismatch" });
     const accepted = [];
-    for (const current of saved) accepted.push(await repository.acceptBundle(current.scope, bundleId, current.preview));
+    for (const current of saved) accepted.push(await repository.acceptBundle(current.identity, bundleId, current.preview));
     expect(accepted[0].setId).not.toBe(accepted[1].setId);
-    const first = await repository.getPublished(owner.tenantId);
-    const second = await repository.getPublished(otherTenant.tenantId);
-    expect(first.reports.agents?.rows).toEqual(second.reports.agents?.rows);
-    expect(first.reports.agents?.lineage.versionId).not.toBe(second.reports.agents?.lineage.versionId);
-    await expect(repository.getPublished(owner.tenantId, accepted[1].setId)).rejects.toMatchObject({ code: "official_usage_set_not_found" });
-    await expect(repository.previewSetOperation(owner, "select", accepted[1].setId)).rejects.toMatchObject({ code: "set_unavailable" });
-    await expect(repository.stage(owner, { bundleId: randomUUID(), correctionOfSetId: accepted[1].setId,
-      report: parseOfficialUsageReport(Buffer.from(csvs[0])), fileHash: createHash("sha256").update(csvs[0]).digest("hex") }))
+    const read = async (scope: DataSyncScope) => {
+      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      return reports.page(selection.id, identity);
+    };
+    const first = await read(owner), second = await read(otherTenant);
+    expect(first.value).toEqual(second.value);
+    expect(first.reports.lineages.find(lineage => lineage.kind === "agents")?.versionId)
+      .not.toBe(second.reports.lineages.find(lineage => lineage.kind === "agents")?.versionId);
+    expect((await read(otherAccount)).value).toEqual(first.value);
+    await expect(reports.capture(saved[0].identity, "delegated", "official_agents", { setId: accepted[1].setId }))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(repository.confirmPreview(saved[0].identity, accepted[1].setId, "select")).rejects.toMatchObject({ code: "staging_unavailable" });
+    await expect(repository.stage(saved[0].identity, { bundleId: randomUUID(), correctionOfSetId: accepted[1].setId },
+      (async function* () { yield Buffer.from(csvs[0]); })()))
       .rejects.toMatchObject({ code: "invalid_correction" });
-    const confirmation = await repository.previewSetOperation(owner, "delete", accepted[0].setId);
-    await expect(repository.confirmSetOperation(otherTenant, confirmation.id, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });
-    await repository.confirmSetOperation(owner, confirmation.id, confirmation);
-    expect((await repository.getPublished(owner.tenantId)).activeSet).toBeNull();
-    expect((await repository.getPublished(otherTenant.tenantId)).activeSet?.id).toBe(accepted[1].setId);
-    expect(await repository.acceptBundle(otherTenant, bundleId, saved[1].preview)).toMatchObject({ setId: accepted[1].setId });
+    const confirmation = await repository.confirmPreview(saved[0].identity, accepted[0].setId, "delete");
+    await expect(async () => repository.confirm(saved[1].identity, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });
+    await repository.confirm(saved[0].identity, confirmation);
+    expect((await read(owner)).reports.activeSetId).toBeNull();
+    expect((await read(otherTenant)).reports.activeSetId).toBe(accepted[1].setId);
+    expect(await repository.acceptBundle(saved[1].identity, bundleId, saved[1].preview)).toMatchObject({ setId: accepted[1].setId });
     const facts = await fixture.runtime.query("SELECT tenant_id,count(*)::int AS count FROM official_usage_row_facts GROUP BY tenant_id ORDER BY tenant_id");
     expect(facts.rows).toEqual([{ tenant_id: owner.tenantId, count: 3 }, { tenant_id: otherTenant.tenantId, count: 3 }]);
   });
 
   it.each(["graph_packages", "power_platform"] as const)("rejects foreign %s job IDs in sync attachments and progress", async source => {
     const repository = new DataSyncRepository(fixture.runtime);
-    const packages = new PackageInventoryRepository(fixture.runtime);
-    const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+    const packages = new PackageRefreshJobs(fixture.runtime);
+    const powerPlatform = new PowerPlatformRefreshJobs(fixture.runtime);
     const saved = [];
     for (const scope of partitions(`${source}-lineage`)) {
       const job = source === "graph_packages"
@@ -278,10 +322,10 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const repository = new DataSyncRepository(fixture.runtime);
     const [scope, other] = partitions(`${source}-retention`);
     const job = source === "graph_packages"
-      ? await new PackageInventoryRepository(fixture.runtime).submit(scope, {
+      ? await new PackageRefreshJobs(fixture.runtime).submit(scope, {
         authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "retained-child",
       })
-      : await new PowerPlatformInventoryRepository(fixture.runtime).submit(scope, {
+      : await new PowerPlatformRefreshJobs(fixture.runtime).submit(scope, {
         roleScope: "full", requestedTypes: [agentType], idempotencyKey: "retained-child",
       });
     const { run } = await repository.submit(scope, { mode: "incremental", sources: [source] });
@@ -359,7 +403,8 @@ describe("multi-tenant repositories with overlapping provider and principal iden
   });
 
   it("keeps canonical internal agent IDs and usage source memberships private for matching native identities", async () => {
-    const repository = new AgentUsageRepository(fixture.runtime);
+    const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-canonical-isolation-report-key", 35);
+    const repository = new OfficialAgentUsage(reports);
     const saved = [];
     for (const scope of partitions("canonical")) {
       const [record] = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["shared-package"], native: { nativeId, environmentId } }]);
@@ -367,12 +412,11 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     }
     expect(new Set(saved.map(value => value.record.id)).size).toBe(3);
     for (const current of saved) {
-      await repository.withSnapshot(current.scope, async client => {
-        expect((await repository.resolveRecord(current.scope, current.record.id, client)).id).toBe(current.record.id);
-        for (const other of saved.filter(value => value !== current)) {
-          await expect(repository.resolveRecord(current.scope, other.record.id, client)).rejects.toMatchObject({ code: "agent_not_found" });
-        }
-      });
+      const identity = await usageIdentity(fixture.runtime, current.scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      expect((await repository.summaries(selection.id, identity, [current.record.id]))[0].recordId).toBe(current.record.id);
+      for (const other of saved.filter(value => value !== current)) {
+        await expect(repository.summaries(selection.id, identity, [other.record.id])).rejects.toMatchObject({ code: "agent_not_found" });
+      }
     }
   });
 });

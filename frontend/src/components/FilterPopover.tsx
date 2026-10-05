@@ -22,28 +22,54 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
       if (window.innerWidth <= 760 || window.innerHeight <= 640) {
         panel.dataset.side = "below";
         panel.style.removeProperty("--agent-filter-max-height");
+        panel.style.removeProperty("--agent-filter-right");
         return;
       }
       const bounds = anchor.getBoundingClientRect();
+      const width = panel.getBoundingClientRect().width;
+      const left = Math.min(Math.max(bounds.right - width, 16), window.innerWidth - width - 16);
+      panel.style.setProperty("--agent-filter-right", `${bounds.right - left - width}px`);
       // Reserve the 10px anchor gap and a 16px viewport inset.
       const below = Math.max(0, window.innerHeight - bounds.bottom - 26);
       const above = Math.max(0, bounds.top - 26);
-      const opensAbove = below < 320 && above > below;
+      const needed = Math.min(560, panel.scrollHeight || 560);
+      const opensAbove = below < needed && above > below;
+      const previousHeight = panel.clientHeight;
+      const previousScroll = panel.scrollTop;
+      const remainedAbove = opensAbove && panel.dataset.side === "above";
       panel.dataset.side = opensAbove ? "above" : "below";
       panel.style.setProperty("--agent-filter-max-height", `${Math.min(560, opensAbove ? above : below)}px`);
+      if (remainedAbove && previousScroll > 0) {
+        panel.scrollTop = previousScroll + previousHeight - panel.clientHeight;
+      }
+    };
+    const positionAfterScroll = (event: Event) => {
+      if (event.target instanceof Node && popover.current?.contains(event.target)) return;
+      positionPopover();
     };
     positionPopover();
     window.addEventListener("resize", positionPopover);
-    window.addEventListener("scroll", positionPopover, true);
+    window.addEventListener("scroll", positionAfterScroll, true);
     return () => {
       window.removeEventListener("resize", positionPopover);
-      window.removeEventListener("scroll", positionPopover, true);
+      window.removeEventListener("scroll", positionAfterScroll, true);
     };
-  }, [open]);
+  }, [open, activeCount]);
 
   useEffect(() => {
     if (!open) return;
-    popover.current?.querySelector<HTMLElement>("select, input")?.focus();
+    let observer: MutationObserver | undefined;
+    const focusFirst = () => {
+      const first = popover.current?.querySelector<HTMLElement>("select, input");
+      if (!first || first.matches(":disabled")) return false;
+      if (document.activeElement === triggerRef.current || document.activeElement === document.body) first.focus();
+      observer?.disconnect();
+      return true;
+    };
+    if (!focusFirst() && popover.current) {
+      observer = new MutationObserver(focusFirst);
+      observer.observe(popover.current, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
+    }
     const dismissOutside = (event: PointerEvent) => {
       if (event.target instanceof Node && !root.current?.contains(event.target)) setOpen(false);
     };
@@ -56,6 +82,7 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
     document.addEventListener("pointerdown", dismissOutside);
     document.addEventListener("keydown", dismissEscape);
     return () => {
+      observer?.disconnect();
       document.removeEventListener("pointerdown", dismissOutside);
       document.removeEventListener("keydown", dismissEscape);
     };

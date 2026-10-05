@@ -1,12 +1,8 @@
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
 import type { UnifiedAgentRecord } from "./api/client";
 
-export const maximumUnifiedAgentExportRows = 5_000;
+export const maximumExplicitAgentReferences = 5_000;
 export type UnifiedAgentExportScope = "matching" | "selected";
-
-export function isSavedAgentRevision(value: unknown): value is string {
-  return typeof value === "string" && value.length === 64 && /^[0-9a-f]{64}$/.test(value);
-}
 
 type AgentExportRecord = {
   id: string;
@@ -46,19 +42,6 @@ export function selectedAgentExportReferences(
     const reference = unifiedAgentRecordId(target);
     references.add(canonicalBySource.get(reference) ?? reference);
   }
+  if (references.size > maximumExplicitAgentReferences) throw new RangeError("Select at most 5,000 exact source references.");
   return [...references];
-}
-
-export function downloadBlob(filename: string, blob: Blob) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.href = url;
-  link.download = filename;
-  document.body.append(link);
-  link.click();
-  window.setTimeout(() => {
-    link.remove();
-    URL.revokeObjectURL(url);
-  }, 0);
 }

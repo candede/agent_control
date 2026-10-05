@@ -114,6 +114,6 @@ it("the aggregate CLI rejects an application database and exits nonzero with the
   expect(result.status).toBe(1);
   expect(result.stderr).toContain("Software checks require the isolated test-db/test-postgres environment");
   expect(result.stderr).toContain("AGENT_CONTROL_ISOLATED_TESTS differs");
-  expect(result.stdout).toContain("[AUTOMATED CHECKS] FAILED: 0/5");
+  expect(result.stdout).toContain("[AUTOMATED CHECKS] FAILED: 0/4");
   expect(result.stdout).not.toMatch(/LOCAL READINESS|MICROSOFT|Permissions/);
 });

@@ -1,21 +1,28 @@
-import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { beforeAll, afterAll, it, expect } from "vitest";
 import pg from "pg";
 import { databaseSettings } from "../src/db/pool.js";
+import { schemaFingerprint } from "../src/db/schema.js";
 import { fixturePassword, testDatabase } from "./testDatabase.js";
 import { assertDistinctDatabaseTargets, backup, restore, fingerprints, reopenRestoredDatabase } from "./backup.js";
 import { AuditLog } from "../src/services/auditLog.js";
-import { OfficialUsageRepository } from "../src/db/officialUsage.js";
+import { OfficialReportImports } from "../src/db/officialReportImports.js";
+import { LargeTenantUsersReports } from "../src/services/largeTenantUsersReports.js";
+import { selectionIdentity } from "./largeTenantFixtures.js";
 import { DefenderHuntingRepository, type DefenderHuntingScope } from "../src/db/defenderHunting.js";
-import { PackageInventoryRepository } from "../src/db/packageInventory.js";
+import { PackageRefreshJobs } from "../src/db/packageRefreshJobs.js";
 import { PurviewAuditRepository, type PurviewAuditScope } from "../src/db/purviewAudit.js";
 import { allowlistedPackage } from "../src/services/packageObservation.js";
-import { parseOfficialUsageReport } from "../src/services/officialUsageParser.js";
-import { OfficialUsageOverviewService } from "../src/services/officialUsageOverview.js";
 import type { DefenderAgentInventoryRow, DefenderHuntingFilters } from "../src/types/defenderHunting.js";
 import type { PurviewAuditFilters } from "../src/types/purviewAudit.js";
+import { InventoryGenerations } from "../src/db/inventoryGenerations.js";
+import { inventoryBaseline, inventoryInput, packageRecord, refreshInventoryFixture } from "./inventoryFixtures.js";
+import { packageInventoryRecord } from "../src/services/inventoryRecordProjection.js";
+import { InventoryQueries } from "../src/db/inventoryQueries.js";
+import { backupTableKeys, fingerprintAlgorithm } from "./backupInventory.js";
+import { seedDisjointReportUnion } from "./officialReportFixtures.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 const directory = join(process.cwd(), "artifacts", "test-scratch", `postgres-backup-${randomUUID()}`);
@@ -24,6 +31,32 @@ beforeAll(async () => { mkdirSync(directory, { recursive: true }); fixture = awa
 afterAll(async () => {
   if (fixture) await fixture.operator.query(`DROP DATABASE IF EXISTS "${target}" WITH (FORCE)`);
   await fixture?.close(); rmSync(directory,{recursive:true,force:true});
+}, 30_000);
+
+it("rejects count corruption before creating a snapshot dump or success receipt", async () => {
+  const isolated = await testDatabase();
+  const file = join(directory, "invalid-membership-count.dump");
+  try {
+    const set = await seedDisjointReportUnion(isolated.operator, randomUUID(), 3);
+    await isolated.operator.query("UPDATE official_usage_membership_counts SET row_count=2 WHERE version_id=$1", [set.versions.users]);
+    await expect(backup(isolated.operator, file)).rejects.toThrow("official_membership_count_mismatch");
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.json`)).toBe(false);
+  } finally { await isolated.close(); }
+});
+
+it("retains exact fingerprint bytes across indexed 250-record COPY pages without growing offsets", async () => {
+  const isolated = await testDatabase();
+  try {
+    await inventoryBaseline(new InventoryGenerations(isolated.runtime), randomUUID(), 501);
+    const keys = backupTableKeys.package_record_rows.map(key => `"${key}"`).join(",");
+    const expected = (await isolated.operator.query(`SELECT convert_to(row_to_json(record)::text,'UTF8') AS body
+      FROM package_record_rows record ORDER BY ${keys}`)).rows;
+    const hash = createHash("sha256");
+    for (const [index, row] of expected.entries()) { if (index) hash.update("\n"); hash.update(row.body); }
+    const result = await fingerprints(isolated.operator, ["package_record_rows"]);
+    expect(result.package_record_rows).toEqual({ count: 501, hash: hash.digest("hex") });
+  } finally { await isolated.close(); }
 }, 30_000);
 
 it("binds restore isolation to the exact server and database identity", () => {
@@ -43,15 +76,26 @@ it("binds restore isolation to the exact server and database identity", () => {
 });
 
 it("restores an isolated native PostgreSQL backup with exact schema/count/content checks", async () => {
+  const inventory = new InventoryGenerations(fixture.runtime), inventoryPrincipal = randomUUID();
+  const inventoryRoot = await inventoryBaseline(inventory, inventoryPrincipal, 1, new Date(Date.now() - 1000));
+  await inventory.execute(inventoryInput(inventoryPrincipal),
+    { domain: "packages", mode: "delta", channel: "exact", targets: ["package-000000"] },
+    lease => inventory.append(lease, [{ ...packageRecord(0), deleted: true }]).then(() => {}), { authorize: async () => {} });
+  const inventoryIdentity = { ...selectionIdentity, principalId: inventoryPrincipal };
+  const inventoryReader = new InventoryQueries(fixture.runtime, "synthetic-inventory-restore-read-secret");
+  const inventorySelection = await inventoryReader.capture(inventoryIdentity, inventoryRoot.scopeId);
   const audit = new AuditLog({tenantId:"fixture-tenant",principalId:"fixture-principal"},fixture.runtime);
   await audit.startEvent({operationId:"fixture-operation",scope:"single",action:"block",targetBlockedState:true,agentId:"fixture-package",actor:{tenantId:"fixture-tenant",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid"},requestPath:"/fixture"});
-  const packages = new PackageInventoryRepository(fixture.runtime);
+  const packages = new PackageRefreshJobs(fixture.runtime);
   const packageScope={tenantId:"fixture-tenant",principalId:"fixture-principal"};
   const packageJob=await packages.submit(packageScope,{authorizationPrincipalId:packageScope.principalId,tokenMode:"delegated",idempotencyKey:"backup-fixture"});
   await packages.markRunning(packageScope,packageJob.id);
-  await packages.publish(packageScope,packageJob.id,{packages:[allowlistedPackage({id:"fixture-package",displayName:"Fixture package",isBlocked:false,appId:"fixture-app",manifestId:"fixture-manifest",assetId:"fixture-asset"})],totalRecords:1,pages:1});
-  const usage = new OfficialUsageRepository(fixture.runtime);
-  const usageScope={tenantId:"fixture-tenant",principalId:"fixture-principal"};
+  const packageRoot = await refreshInventoryFixture(fixture.runtime,packageScope,packageJob.id,"packages",[
+    packageInventoryRecord(allowlistedPackage({id:"fixture-package",displayName:"Fixture package",isBlocked:false,
+      appId:"fixture-app",manifestId:"fixture-manifest",assetId:"fixture-asset"}))]);
+  const usage = new OfficialReportImports(fixture.runtime);
+  const reader = new LargeTenantUsersReports(fixture.runtime, "synthetic-backup-read-secret-never-production", 35);
+  const usageScope={...selectionIdentity,tenantId:"fixture-tenant",principalId:"fixture-principal"};
   const metadata={reportingPeriod:{startDate:"2026-06-01",endDate:"2026-06-30",provenance:"operator_asserted" as const},sourceAsOf:{value:"2026-07-01T00:00:00Z",provenance:"operator_asserted" as const}};
   const reports=[
     "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nfixture-agent,Fixture agent,Your org,1,0,2,2026-06-30",
@@ -64,16 +108,17 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
       const content = correctionOfSetId && index === 2
         ? original.replace("Fixture user,1,2,2026-06-30", "Fixture user,1,3,2026-06-30")
         : original;
-      const staged=await usage.stage(owner,{report:parseOfficialUsageReport(Buffer.from(content),metadata),fileHash:createHash("sha256").update(content).digest("hex"),bundleId,correctionOfSetId});
-      await usage.accept(owner,staged.id,{stagingRevision:staged.revision,fileHash:staged.fileHash,expectedActiveRevision:staged.activeRevision});
+      await usage.stage(owner,{bundleId,correctionOfSetId},(async function* () { yield Buffer.from(content); })(),metadata);
     }
-    return usage.getPublished(owner.tenantId);
+    return usage.acceptBundle(owner,bundleId,await usage.bundle(owner,bundleId));
   };
   const historicalReports = await acceptBundle();
-  const currentReports = await acceptBundle(historicalReports.activeSet!.id);
-  expect(currentReports.activeSet!.id).not.toBe(historicalReports.activeSet!.id);
-  const historicalVersionIds = Object.values(historicalReports.reports).map(report => report!.lineage.versionId);
-  const currentVersionIds = new Set(Object.values(currentReports.reports).map(report => report!.lineage.versionId));
+  const historicalSelection = await reader.capture(usageScope,"delegated","official_users");
+  const historicalVersionIds = (await reader.page(historicalSelection.id,usageScope)).reports.lineages.map(lineage => lineage.versionId);
+  const currentReports = await acceptBundle(historicalReports.setId);
+  expect(currentReports.setId).not.toBe(historicalReports.setId);
+  const currentSelection = await reader.capture(usageScope,"delegated","official_users");
+  const currentVersionIds = new Set((await reader.page(currentSelection.id,usageScope)).reports.lineages.map(lineage => lineage.versionId));
   const sharedVersionIds = historicalVersionIds.filter(id => currentVersionIds.has(id));
   const historicalOnlyVersionIds = historicalVersionIds.filter(id => !currentVersionIds.has(id));
   expect(sharedVersionIds).toHaveLength(2);
@@ -121,15 +166,28 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await fixture.operator.query("INSERT INTO sessions(sid,sess,expire) VALUES ('restored-session','{}',clock_timestamp()+interval '1 hour')");
   const filename = join(directory,"fixture.dump");
   const before = await fingerprints(fixture.operator);
+  expect(before.inventory_exact_heads.count).toBe(1);
+  expect(Object.keys(before)).toEqual(Object.keys(backupTableKeys).sort());
+  await expect(fingerprints(fixture.operator, Array.from({ length: 129 }, (_, index) => `table_${index}`)))
+    .rejects.toThrow("Backup table inventory is invalid.");
   await backup(fixture.operator,filename);
   expect(statSync(filename).mode & 0o777).toBe(0o600);
   expect(statSync(`${filename}.json`).mode & 0o777).toBe(0o600);
   const receipt=JSON.parse(readFileSync(`${filename}.json`,"utf8"));
-  expect(receipt.version).toBe(3);
+  expect(receipt.format).toBe("agent-control-backup-v1");
+  expect(receipt.schemaFingerprint).toBe(schemaFingerprint);
+  expect(receipt.fingerprintAlgorithm).toBe(fingerprintAlgorithm);
   expect(Date.parse(receipt.snapshotAt)).toBeLessThanOrEqual(Date.parse(receipt.createdAt));
-  const laterCorrection = await acceptBundle(laterCorrectedOriginal.activeSet!.id, laterCorrectionScope);
-  await softDeleteOfficialSet(fixture.operator, laterCorrection.activeSet!.id);
-  await softDeleteOfficialSet(fixture.operator,historicalReports.activeSet!.id);
+  for (const incompatible of [{ schemaFingerprint: "0".repeat(64) }, { format: "unsupported" }]) {
+    writeFileSync(`${filename}.json`, JSON.stringify({ ...receipt, ...incompatible }));
+    try {
+      await expect(restore(fixture.operator, filename, target)).rejects.toThrow("Backup receipt/checksum mismatch.");
+      expect((await fixture.operator.query("SELECT 1 FROM pg_database WHERE datname=$1", [target])).rowCount).toBe(0);
+    } finally { writeFileSync(`${filename}.json`, JSON.stringify(receipt)); }
+  }
+  const laterCorrection = await acceptBundle(laterCorrectedOriginal.setId, laterCorrectionScope);
+  await usage.confirm(laterCorrectionScope,await usage.confirmPreview(laterCorrectionScope,laterCorrection.setId,"delete"));
+  await usage.confirm(usageScope,await usage.confirmPreview(usageScope,historicalReports.setId,"delete"));
   await fixture.operator.query("UPDATE defender_hunting_retained_scopes SET revoked_at=clock_timestamp(),revoked_by='current-review' WHERE id=$1",[historicalHunt.retainedScopeId]);
   const currentAfterReviewChanges=await fingerprints(fixture.operator);
   expect(await restore(fixture.operator,filename,target)).toEqual(before);
@@ -137,6 +195,11 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const restoredOperator = new pg.Pool({ ...databaseSettings(), database: target });
   const restoredRuntime = new pg.Pool({ ...databaseSettings(), database: target, user: "agentcontrol_app", password: fixturePassword });
   try {
+    const restoredInventory = new InventoryQueries(restoredRuntime, "synthetic-inventory-restore-read-secret");
+    await expect(restoredInventory.page(inventorySelection.id, inventoryIdentity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    const restoredStore = new InventoryGenerations(restoredRuntime);
+    expect((await restoredStore.gcMetadata(inventoryRoot.scopeId, inventoryRoot.tenantId)).exactHeads).toBe(1);
+    expect((await restoredRuntime.query("SELECT identity FROM inventory_exact_heads WHERE scope_id=$1", [inventoryRoot.scopeId])).rows).toEqual([]);
     const state = await restoredRuntime.query("SELECT mode,provider_work_enabled,deletion_reviewed_at,access_reviewed_at FROM operational_state");
     expect(state.rows[0]).toMatchObject({ mode: "maintenance", provider_work_enabled: false });
     expect(state.rows[0].deletion_reviewed_at).toBeTruthy();
@@ -144,14 +207,24 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM sessions")).rows[0].count).toBe(0);
     expect((await restoredRuntime.query("SELECT status,error_code FROM job_items WHERE job_id=$1",[uncertainJob])).rows[0]).toEqual({status:"inconclusive",error_code:"restored_uncertain_write"});
     expect((await restoredRuntime.query("SELECT status,lease_owner,lease_until FROM jobs WHERE id=$1",[uncertainJob])).rows[0]).toEqual({status:"partial",lease_owner:null,lease_until:null});
-    expect((await new PackageInventoryRepository(restoredRuntime).list(packageScope)).count).toBe(1);
-    expect((await new PackageInventoryRepository(restoredRuntime).list({...packageScope,principalId:"other"})).count).toBe(0);
-    expect((await new OfficialUsageRepository(restoredRuntime).getPublished(usageScope.tenantId)).reports.users?.rows).toHaveLength(1);
-    expect((await new OfficialUsageOverviewService(restoredRuntime).getOverview(laterCorrectionScope.tenantId)).summary)
+    expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1",
+      [packageRoot.scopeId])).rows[0].count).toBe(1);
+    await expect(restoredInventory.capture({ ...usageScope, sessionEpoch: "1" }, packageRoot.scopeId))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(restoredInventory.capture({ ...usageScope, principalId: "other", sessionEpoch: "0" }, packageRoot.scopeId))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM inventory_live_sources WHERE tenant_id=$1 AND principal_id=$2",
+      [packageScope.tenantId, packageScope.principalId])).rows[0].count).toBe(0);
+    const restoredReader = new LargeTenantUsersReports(restoredRuntime,"synthetic-backup-read-secret-never-production",35);
+    const restoredIdentity={...usageScope,sessionEpoch:"1"},restoredCorrectionIdentity={...laterCorrectionScope,sessionEpoch:"1"};
+    await expect(restoredReader.page(currentSelection.id,usageScope)).rejects.toMatchObject({code:"selection_invalidated"});
+    const restoredUsers=await restoredReader.capture(restoredIdentity,"delegated","official_users");
+    expect((await restoredReader.page(restoredUsers.id,restoredIdentity)).value).toHaveLength(1);
+    const restoredOverview=await restoredReader.capture(restoredCorrectionIdentity,"delegated","overview");
+    expect((await restoredReader.page(restoredOverview.id,restoredCorrectionIdentity)).analytics.overview)
       .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
-    await expect(new OfficialUsageRepository(restoredRuntime).getPublished(
-      laterCorrectionScope.tenantId, laterCorrectedOriginal.activeSet!.id,
-    )).rejects.toMatchObject({ code: "official_usage_set_not_found" });
+    await expect(restoredReader.capture(restoredCorrectionIdentity,"delegated","official_users",{setId:laterCorrectedOriginal.setId}))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
       historicalOnlyVersionIds])).rows[0].count).toBe(0);
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
@@ -167,11 +240,13 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     await expect(reopenRestoredDatabase(unavailableCurrent,target)).rejects.toThrow();
     await unavailableCurrent.end();
     expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0].mode).toBe("maintenance");
-    await softDeleteOfficialSet(fixture.operator,currentReports.activeSet!.id);
+    await usage.confirm(usageScope,await usage.confirmPreview(usageScope,currentReports.setId,"delete"));
     await fixture.operator.query("UPDATE defender_hunting_retained_scopes SET revoked_at=clock_timestamp(),revoked_by='current-review' WHERE id=$1",[currentHunt.retainedScopeId]);
     expect(await reopenRestoredDatabase(fixture.operator,target)).toEqual({mode:"normal",providerWorkEnabled:false});
     expect((await restoredOperator.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({mode:"normal",provider_work_enabled:false});
-    expect((await new OfficialUsageRepository(restoredRuntime).getPublished(usageScope.tenantId)).reports).toEqual({});
+    await expect(restoredReader.page(restoredUsers.id,restoredIdentity)).rejects.toMatchObject({code:"selection_invalidated"});
+    const reopenedUsers=await restoredReader.capture(restoredIdentity,"delegated","official_users");
+    expect((await restoredReader.page(reopenedUsers.id,restoredIdentity)).value).toEqual([]);
     expect(await restoredHunting.getJob(huntingScope,currentHunt.jobId)).toBeUndefined();
     await expect(restoredHunting.listRows(huntingScope,currentHunt.jobId)).rejects.toThrow("not found");
   } finally {
@@ -181,16 +256,6 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await expect(restore(fixture.operator,filename,"agentcontrol")).rejects.toThrow("isolated");
   await expect(restore(fixture.operator,filename,target)).rejects.toThrow("already exists");
 }, 30_000);
-
-async function softDeleteOfficialSet(database: pg.Pool, setId: string) {
-  await database.query("UPDATE official_usage_state SET active_set_id=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE active_set_id=$1",[setId]);
-  await database.query("UPDATE official_usage_sets SET deleted_at=COALESCE(deleted_at,clock_timestamp()) WHERE id=$1",[setId]);
-  await database.query(`UPDATE official_usage_versions version SET deleted_at=COALESCE(version.deleted_at,clock_timestamp())
-    WHERE EXISTS(SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=$1 AND membership.version_id=version.id)
-      AND NOT EXISTS(SELECT 1 FROM official_usage_set_versions membership
-        JOIN official_usage_sets report_set ON report_set.id=membership.set_id
-        WHERE membership.version_id=version.id AND report_set.deleted_at IS NULL)`,[setId]);
-}
 
 function huntingInventoryRow(agentId: string): DefenderAgentInventoryRow {
   return {projectionVersion:3,sourceTable:"AgentsInfo",observationTime:"2026-09-09T10:30:00.000Z",agentId,agentName:null,

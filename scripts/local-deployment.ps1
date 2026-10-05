@@ -1,7 +1,9 @@
 . (Join-Path $PSScriptRoot 'tenant-deployment.ps1')
+. (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1')
+. (Join-Path $PSScriptRoot 'local-runtime.ps1')
 
 function Invoke-DockerCommand {
-    param([string[]]$Arguments, [switch]$Capture)
+    param([string[]]$Arguments, [switch]$Capture, [switch]$CaptureError)
     $savedEnvironment = @{}
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
@@ -12,7 +14,15 @@ function Invoke-DockerCommand {
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
             }
         }
-        if ($Capture) { $result = @(& docker @Arguments); if ($LASTEXITCODE -ne 0) { throw "Docker $($Arguments[0]) failed (exit code $LASTEXITCODE). See the Docker diagnostics above." }; return ($result -join "`n") }
+        if ($Capture) {
+            $result = if ($CaptureError) { @(& docker @Arguments 2>&1) } else { @(& docker @Arguments) }
+            if ($LASTEXITCODE -ne 0) {
+                $detail = if ($CaptureError) { ConvertTo-RedactedFixtureLog ($result -join "`n") }
+                    else { 'See the Docker diagnostics above.' }
+                throw "Docker $($Arguments[0]) failed (exit code $LASTEXITCODE). $detail"
+            }
+            return ($result -join "`n")
+        }
         & docker @Arguments
         if ($LASTEXITCODE -ne 0) { throw "Docker $($Arguments[0]) failed (exit code $LASTEXITCODE). See the Docker diagnostics above." }
     } finally {
@@ -27,19 +37,20 @@ function Invoke-DockerCommand {
 }
 
 function New-LocalContext {
-    param([string]$Root,[string]$Project='agent-control')
+    param([string]$Root,[string]$Project='agent-control',[switch]$SkipSettings)
     if ($Project -cnotmatch '^[a-zA-Z][a-zA-Z0-9-]{2,39}$') { throw 'Project must be 3-40 letters, digits or hyphens, starting with a letter.' }
     $Project = $Project.ToLowerInvariant()
     $rootPath = [IO.Path]::GetFullPath($Root)
     $state = Join-Path (Join-Path $rootPath '.local') $Project
     if ($state -match "[\r\n']" -or $rootPath -match "[\r\n']") { throw 'Paths may contain spaces, but not newlines or single quotes.' }
-    $settings = Read-LocalSettings $state
+    $settings = if ($SkipSettings) { [ordered]@{} } else { Read-LocalSettings $state }
     $port = if ($settings.Contains('port')) { $settings.port } else { 0 }
     $url = if ($port) { "http://localhost:$port" } else { '' }
     return @{
         Root=$rootPath; State=$state; Project=$Project; Port=$port; Url=$url
         PublicUrl=$(if ($settings.publicUrl) { $settings.publicUrl } else { $url })
         Volume="${Project}_data"; Network="${Project}_default"; Image="${Project}-app:local"; Operator="${Project}-operator:local"
+        Checks="${Project}-checks:local"
         Compose=@('compose','--project-directory',$rootPath,'--env-file',(Join-Path $state 'compose.env'),'-f',(Join-Path $rootPath 'compose.yaml'),'-p',$Project)
     }
 }
@@ -56,9 +67,6 @@ function Read-LocalSettings {
         if ($settings -isnot [Collections.IDictionary] -or $document.RootElement.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Invalid settings object.' }
         # PowerShell otherwise coerces ISO-looking display names into dates.
         $value = [Text.Json.JsonElement]::new()
-        if ($document.RootElement.TryGetProperty('tenantDisplayName',[ref]$value) -and $value.ValueKind -eq [Text.Json.JsonValueKind]::String) {
-            $settings.tenantDisplayName = $value.GetString()
-        }
         if ($settings.tenants -is [array] -and $document.RootElement.TryGetProperty('tenants',[ref]$value) -and $value.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
             for ($index = 0; $index -lt $settings.tenants.Count; $index++) {
                 $name = [Text.Json.JsonElement]::new()
@@ -322,7 +330,7 @@ function Write-LocalText {
     Protect-LocalPath $Path
 }
 
-function Initialize-LocalState {
+function Read-LocalConfiguration {
     param($Context,[bool]$ExistingVolume,[switch]$Onboard,[switch]$Edit)
     $state = $Context.State
     $secretDirectory = Join-Path $state 'secrets'
@@ -341,16 +349,13 @@ function Initialize-LocalState {
     $settingsFile = Join-Path $state 'settings.json'
     $registryFile = Join-Path $secretDirectory 'tenants.json'
     $hasRegistry = Test-Path -LiteralPath $registryFile -PathType Leaf
-    $clientFile = Join-Path $secretDirectory 'client-secret'
+    foreach ($name in @('tenantId','clientId','tenantDomains','tenantDisplayName')) {
+        if ($settings.Contains($name)) {
+            throw 'Standalone tenant settings are no longer supported. Configure TENANTS_JSON through secrets/tenants.json and remove the obsolete settings fields; no credentials were converted.'
+        }
+    }
     if ($hasRegistry) {
         $profiles = ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText($registryFile))
-        foreach ($name in @('tenantId','clientId')) {
-            $savedIdentifier = ([string]$settings.$name).Trim()
-            if ($savedIdentifier -and $savedIdentifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings.' }
-        }
-        if ($settings.tenantId -and -not @($profiles | Where-Object { $_.tenantId -ieq ([string]$settings.tenantId).Trim() -and $_.clientId -ieq ([string]$settings.clientId).Trim() }).Count) {
-            throw 'Protected registry does not preserve the saved legacy tenant/application. Restore matching configuration; no tenant was discarded.'
-        }
         if ($settings.Contains('tenants') -and
             (ConvertTo-Json -InputObject (Get-LocalTenantMetadata $profiles) -Depth 20 -Compress) -cne
             (ConvertTo-Json -InputObject (Get-LocalTenantMetadata $settings.tenants) -Depth 20 -Compress)) {
@@ -358,31 +363,10 @@ function Initialize-LocalState {
         }
     } else {
         if ($settings.Contains('tenants')) { throw 'Protected tenant registry is missing. Restore secrets/tenants.json; saved tenants must not be discarded or regenerated.' }
-        $legacy = [ordered]@{
-            tenantId = ([string]$settings.tenantId).Trim()
-            clientId = ([string]$settings.clientId).Trim()
-            clientSecret = $(if (Test-Path -LiteralPath $clientFile) { [IO.File]::ReadAllText($clientFile).Trim() } else { '' })
-            domains = @()
+        if (Test-Path -LiteralPath (Join-Path $secretDirectory 'client-secret')) {
+            throw 'Standalone client-secret configuration is no longer supported. Configure TENANTS_JSON through secrets/tenants.json; the old file was not read or converted.'
         }
-        if ($settings.Contains('tenantDomains')) {
-            if ($settings.tenantDomains -isnot [array]) { throw 'Saved tenantDomains must be an array of exact accepted domains.' }
-            $legacy.domains = @($settings.tenantDomains | ForEach-Object { ConvertTo-DeploymentDomain $_ })
-            if ($legacy.domains.Count -ne $settings.tenantDomains.Count -or @($legacy.domains | Where-Object { -not $_ }).Count -or
-                @($legacy.domains | Sort-Object -Unique).Count -ne $legacy.domains.Count) {
-                throw 'Saved tenantDomains must contain unique exact accepted domains.'
-            }
-        }
-        if ($settings.Contains('tenantDisplayName')) {
-            if ($settings.tenantDisplayName -isnot [string] -or [string]::IsNullOrWhiteSpace($settings.tenantDisplayName) -or
-                $settings.tenantDisplayName.Length -gt 128 -or $settings.tenantDisplayName -match '[\x00-\x1f\x7f]') {
-                throw 'Saved tenantDisplayName must contain 1 to 128 printable characters.'
-            }
-            $legacy.displayName = $settings.tenantDisplayName
-        }
-        foreach ($identifier in @($legacy.tenantId,$legacy.clientId)) {
-            if ($identifier -and $identifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings.' }
-        }
-        $profiles = @($legacy)
+        $profiles = @(@{ tenantId=''; clientId=''; clientSecret=''; domains=@() })
     }
     $previousProfiles = ConvertTo-Json -InputObject $profiles -Depth 20 -Compress
     $previousMetadata = Get-LocalTenantMetadata $profiles
@@ -414,6 +398,9 @@ function Initialize-LocalState {
         }
     }
     $complete = @($profiles | Where-Object { -not $_.tenantId -or -not $_.clientId -or -not $_.clientSecret -or -not $_.domains.Count }).Count -eq 0
+    if (-not $complete -and @($profiles | Where-Object { $_.tenantId -or $_.clientId -or $_.clientSecret -or $_.domains.Count -or $_.displayName }).Count) {
+        throw 'Complete every tenant profile, including accepted domains, or leave all identity fields unset. Partial credentials are not saved; TENANTS_JSON must contain complete profiles.'
+    }
     if ($complete -or $Onboard -or $hasRegistry -or $profiles.Count -gt 1) { Assert-DeploymentTenantProfiles $profiles }
     $metadata = Get-LocalTenantMetadata $profiles
     $registryChanged = $complete -and (-not $hasRegistry -or (ConvertTo-Json -InputObject $profiles -Depth 20 -Compress) -cne $previousProfiles)
@@ -423,25 +410,31 @@ function Initialize-LocalState {
         $newIdentity = @($metadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')" }) -join "`n"
         $identityChanged = $oldIdentity -ine $newIdentity
         $settings.tenants = $metadata
-        $settings.Remove('tenantId')
-        $settings.Remove('clientId')
-        $settings.Remove('tenantDomains')
-        $settings.Remove('tenantDisplayName')
-    } elseif ($Edit) {
-        foreach ($name in @('tenantId','clientId')) {
-            if ($profiles[0].$name -and $profiles[0].$name -cne ([string]$settings.$name).Trim()) { $settings[$name] = $profiles[0].$name }
-        }
-        if ($profiles[0].domains.Count) { $settings.tenantDomains = @($profiles[0].domains) }
-        if ($profiles[0].displayName) { $settings.tenantDisplayName = $profiles[0].displayName }
-        else { $settings.Remove('tenantDisplayName') }
     }
-    $legacySecretChanged = -not $complete -and $profiles[0].clientSecret -and
-        (-not (Test-Path -LiteralPath $clientFile) -or [IO.File]::ReadAllText($clientFile).Trim() -cne $profiles[0].clientSecret)
     if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
     $settings.port = $port
     if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
     $settingsChanged = ($settings | ConvertTo-Json -Depth 20 -Compress) -cne $originalSettings
-    if ($Edit -and ($settingsChanged -or $registryChanged -or $legacySecretChanged) -and $ExistingVolume) {
+    return @{
+        Settings=$settings; Profiles=$profiles; Port=$port; PublicUrl=$publicUrl; ExistingVolume=$ExistingVolume; Edit=[bool]$Edit
+        Complete=$complete; HasRegistry=$hasRegistry; RegistryChanged=$registryChanged; SettingsChanged=$settingsChanged
+        IdentityChanged=$identityChanged
+    }
+}
+
+function Save-LocalConfiguration {
+    param($Context,$Plan)
+    $state = $Context.State
+    $secretDirectory = Join-Path $state 'secrets'
+    $settingsFile = Join-Path $state 'settings.json'
+    $registryFile = Join-Path $secretDirectory 'tenants.json'
+    $settings = $Plan.Settings; $profiles = $Plan.Profiles
+    $port = $Plan.Port; $publicUrl = $Plan.PublicUrl
+    $ExistingVolume = $Plan.ExistingVolume; $Edit = $Plan.Edit
+    $complete = $Plan.Complete; $hasRegistry = $Plan.HasRegistry
+    $registryChanged = $Plan.RegistryChanged; $settingsChanged = $Plan.SettingsChanged
+    $identityChanged = $Plan.IdentityChanged
+    if ($Edit -and ($settingsChanged -or $registryChanged) -and $ExistingVolume) {
         if (-not (Test-Path -LiteralPath (Join-Path $state 'compose.env'))) { throw 'Existing project compose.env is missing. Run start to recover it before editing configuration.' }
         $controlDirectory = Join-Path $state 'control'
         [IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
@@ -460,33 +453,43 @@ function Initialize-LocalState {
     }
     if ($registryChanged) { Write-LocalText $registryFile (ConvertTo-Json -InputObject $profiles -Depth 20) }
     if ($hasRegistry -or $registryChanged) { Protect-LocalPath $registryFile }
-    if ($legacySecretChanged) { Write-LocalText $clientFile $profiles[0].clientSecret }
-    if (Test-Path -LiteralPath $clientFile) { Protect-LocalPath $clientFile }
     if ($ExistingVolume -and $identityChanged) {
         Write-LocalText (Join-Path $state 'control/reauthenticate') 'tenant-configuration-changed'
         Write-Host 'Tenant/application/domain configuration changed. Existing sessions will be cleared on the next start; users must sign in again.'
     }
-    $userId = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
-    $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
     if ($settingsChanged -or -not (Test-Path -LiteralPath $settingsFile)) {
         Write-LocalText $settingsFile ($settings | ConvertTo-Json -Depth 20)
     }
     $Context.Port = $port
     $Context.Url = "http://localhost:$port"
     $Context.PublicUrl = if ($publicUrl) { $publicUrl } else { $Context.Url }
-    $trustProxy = if ($publicUrl) { '1' } else { '0' }
-    $lines = @("LOCAL_STATE_DIR='$state'","APP_PORT=$port","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$($Context.Image)",
-        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy")
-    Write-LocalText (Join-Path $state 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
+    Write-LocalComposeEnvironment $Context
     Protect-LocalPath $settingsFile
     Protect-LocalPath (Join-Path $state 'compose.env')
     if ($Edit) {
-        if ($settingsChanged -or $registryChanged -or $legacySecretChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
+        if ($settingsChanged -or $registryChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
         else { Write-Host 'Configuration unchanged.' }
         if (-not $complete) {
             Write-Host 'Identity configuration is incomplete. start will ask for missing credentials and accepted domains before launching the app.'
         }
     }
+}
+
+function Initialize-LocalState {
+    param($Context,[bool]$ExistingVolume,[switch]$Onboard,[switch]$Edit)
+    $plan = Read-LocalConfiguration $Context $ExistingVolume -Onboard:$Onboard -Edit:$Edit
+    Save-LocalConfiguration $Context $plan
+}
+
+function Write-LocalComposeEnvironment {
+    param($Context)
+    $userId = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
+    $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
+    $trustProxy = if ($Context.PublicUrl -cne $Context.Url) { '1' } else { '0' }
+    $image = if ($Context.RuntimeImageId) { $Context.RuntimeImageId } else { $Context.Image }
+    $lines = @("LOCAL_STATE_DIR='$($Context.State)'","APP_PORT=$($Context.Port)","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$image",
+        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy")
+    Write-LocalText (Join-Path $Context.State 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function Assert-LocalPort {
@@ -497,58 +500,142 @@ function Assert-LocalPort {
 }
 
 function Invoke-LocalOperator {
-    param($Context,[string[]]$Command,[string]$BackupDirectory)
+    param($Context,[string[]]$Command,[string]$BackupDirectory,[switch]$Capture)
     $arguments = @('run','--rm','--network',$Context.Network,
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly",
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",
         '-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e','PGDATABASE=agentcontrol','-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app')
     if ($BackupDirectory) { $arguments += @('--mount',"type=bind,source=$BackupDirectory,target=/backups") }
-    Invoke-DockerCommand ($arguments + @($Context.Operator) + $Command)
+    $image = if ($Context.OperatorImageId) { $Context.OperatorImageId } else { $Context.Operator }
+    Invoke-DockerCommand ($arguments + @($Context.OperatorArguments | Where-Object { $_ }) + @($image) + $Command) -Capture:$Capture
+}
+
+function Get-LocalBuildArguments {
+    param($Context,[string]$SourceRoot)
+    if (-not $SourceRoot) { $SourceRoot = $Context.Root }
+    if ($Context.BuildArguments) {
+        if ($Context.DependencyHashes) { Assert-LocalDependencyManifests $SourceRoot $Context.DependencyHashes }
+        return $Context.BuildArguments
+    }
+    $installed = [Environment]::GetEnvironmentVariable('AGENT_CONTROL_DEPENDENCY_IMAGE')
+    if (-not $installed) { return @() }
+    if ($installed -cnotmatch '^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,255}$') { throw 'Installed dependency image reference is invalid.' }
+    $image = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$installed) -Capture
+    if ($image -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Installed dependency image identity is invalid.' }
+    $hashes = Get-LocalDependencyManifests $image
+    Assert-LocalDependencyManifests $SourceRoot $hashes
+    $Context.DependencyImage = $installed
+    $Context.DependencyImageId = $image
+    return @('--network','none','--build-arg',"DEPENDENCY_BASE=$installed",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1')
+}
+
+function Get-LocalDependencyManifests {
+    param([string]$Image)
+    if ($Image -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Installed dependency image identity is invalid.' }
+    return Invoke-DockerCommand @('run','--rm','--network','none','--entrypoint','node',$Image,'-e',
+        'const fs=require("node:fs"),crypto=require("node:crypto");for(const f of ["node_modules/tsx/dist/cli.mjs","node_modules/vitest/vitest.mjs"])if(!fs.existsSync(f))throw Error("Installed build dependencies are missing");console.log(JSON.stringify(Object.fromEntries(["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(f=>[f,crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")]))));') -Capture | ConvertFrom-Json -AsHashtable
+}
+
+function Assert-LocalDependencyManifests {
+    param([string]$SourceRoot,$Hashes)
+    $manifests = @('package.json','package-lock.json','backend/package.json','frontend/package.json')
+    if ($Hashes.Count -ne $manifests.Count) { throw 'Installed dependency manifest inventory differs.' }
+    foreach ($path in $manifests) {
+        if ((Get-FileHash -LiteralPath (Join-Path $SourceRoot $path) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Hashes[$path]) {
+            throw 'Installed dependency manifests differ; offline reuse refused. Rebuild dependencies through the approved feed.'
+        }
+    }
+}
+
+function Assert-LocalDependencyImage {
+    param($Context)
+    if ($Context.DependencyImage -and
+        (Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$Context.DependencyImage) -Capture) -cne $Context.DependencyImageId) {
+        throw 'Installed dependency image changed during qualification; deployment refused.'
+    }
 }
 
 function Invoke-LocalSoftwareChecks {
-    param($Context)
+    param($Context,[string]$Image,[string]$SourceRoot,[switch]$ForceChecks)
+    if (-not $SourceRoot) { $SourceRoot = $Context.Root }
+    if (-not $Image) { $Image = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$Context.Operator) -Capture }
+    if ($Image -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Software qualification requires an immutable built image identity.' }
     $id = [Guid]::NewGuid().ToString('N')
     $project = "agent-control-check-$id"
     $scratchParent = Join-Path $Context.Root 'artifacts/test-scratch'
     $scratch = Join-Path $scratchParent $project
     [IO.Directory]::CreateDirectory($scratchParent) | Out-Null
     New-Item -ItemType Directory -Path $scratch -ErrorAction Stop | Out-Null
-    $compose = @('compose','--project-directory',$Context.Root,'--env-file',(Join-Path $scratch 'compose.env'),
-        '-f',(Join-Path $Context.Root 'compose.yaml'),'-p',$project,'--profile','test-db')
+    $compose = @('compose','--project-directory',$SourceRoot,'--env-file',(Join-Path $scratch 'compose.env'),
+        '-f',(Join-Path $SourceRoot 'compose.yaml'),'-f',(Join-Path $SourceRoot 'compose.large-tenant-test.yaml'),'-p',$project,'--profile','test-db')
     $failures = [Collections.Generic.List[Exception]]::new()
+    $evidence = Join-Path $Context.Root "artifacts/software-checks/$id"
+    [IO.Directory]::CreateDirectory($evidence) | Out-Null
     $started = $false
-    Write-Host '[AUTOMATED CHECKS] Qualifying software before maintenance, app shutdown or application database migration.'
+    Write-Host '[AUTOMATED CHECKS] Running explicit full regression validation of the compiled source snapshot.'
     Write-Host "Using isolated project $project with disposable PostgreSQL, synthetic credentials and no external network."
     try {
         Protect-LocalPath $scratch -Directory
-        Write-LocalText (Join-Path $scratch 'compose.env') "LOCAL_STATE_DIR='$scratch'`nLOCAL_TEST_IMAGE=$($Context.Operator)`n"
+        Write-LocalText (Join-Path $scratch 'compose.env') "LOCAL_STATE_DIR='$scratch'`nLOCAL_TEST_IMAGE=$Image`n"
         $started = $true
         Invoke-DockerCommand ($compose + @('up','-d','--no-build','--wait','--wait-timeout','90','test-postgres'))
-        Invoke-DockerCommand ($compose + @('run','--rm','--no-deps','--entrypoint','node','test-db','node_modules/tsx/dist/cli.mjs','backend/scripts/test-all.ts'))
+        $ids = @(Get-OwnedFixtureContainers $project)
+        if ($ids.Count -ne 1) { throw 'Expected exactly one owned PostgreSQL container.' }
+        $mounts = Invoke-DockerCommand @('inspect','--format','{{json .Mounts}}',$ids[0]) -Capture
+        [IO.File]::WriteAllText((Join-Path $evidence 'mounts.json'),$mounts)
+        $dataMount = @($mounts | ConvertFrom-Json | Where-Object { $_.Destination -eq '/var/lib/postgresql/data' })
+        if ($dataMount.Count -ne 1 -or $dataMount[0].Type -ne 'volume' -or $dataMount[0].Name -cne "${project}_large-tenant-data") { throw 'Software checks require exact owned disk-backed PGDATA.' }
+        Invoke-OwnedFixtureWorkload $compose $project $evidence @('node','node_modules/tsx/dist/cli.mjs','backend/scripts/test-all.ts') -TimeoutSeconds 2100
     } catch {
         $failures.Add($_.Exception)
     } finally {
         if ($started) {
-            try { Invoke-DockerCommand ($compose + @('down','--volumes','--remove-orphans')) }
+            try { Write-FixtureDiagnostics $project $evidence -Final }
+            catch { $failures.Add($_.Exception) }
+            try { Remove-OwnedFixture $compose $project $evidence }
             catch {
                 $failures.Add([InvalidOperationException]::new("Cleanup failed for isolated Compose project '$project': $($_.Exception.Message) Inspect only containers labeled com.docker.compose.project=$project.",$_.Exception))
             }
         }
         try { Remove-Item -LiteralPath $scratch -Recurse -Force }
         catch { $failures.Add([InvalidOperationException]::new("Could not remove owned fixture directory '$scratch': $($_.Exception.Message)",$_.Exception)) }
+        try {
+            $receiptPath = Join-Path $evidence 'result.json'
+            $outcome = if ($failures.Count) { 'failed' } else { 'passed' }
+            Write-LocalText $receiptPath (@{
+                version=2; project=$project; image=$Image; outcome=$outcome
+                completedAt=[DateTime]::UtcNow.ToString('o')
+                failures=@($failures | ForEach-Object { $_.Message })
+            } | ConvertTo-Json -Depth 6)
+        } catch { $failures.Add($_.Exception) }
     }
     if ($failures.Count) {
-        Write-Host '[AUTOMATED CHECKS] FAILED. The existing app, maintenance state and application database were not changed.'
+        Write-Host '[AUTOMATED CHECKS] FAILED. Validation did not stop the application or initialize its database.'
         throw [AggregateException]::new('Isolated software qualification failed. Resolve the reported test, command or cleanup failure before retrying.',$failures)
     }
 }
 
 function Get-LocalHealth {
-    param([string]$Url)
+    param([string]$Url,[string]$IsolatedContainer)
+    if ($IsolatedContainer) {
+        $ready = Get-IsolatedLocalHttp $IsolatedContainer '/api/ready'
+        if ($ready.status -ne 200 -or -not ($ready.body | ConvertFrom-Json).ok) { throw 'Database/schema readiness failed.' }
+        $auth = Get-IsolatedLocalHttp $IsolatedContainer '/api/auth/status'
+        if ($auth.status -ne 200) { throw 'Sign-in configuration endpoint failed.' }
+        return $auth.body | ConvertFrom-Json
+    }
     $ready = Invoke-RestMethod "$Url/api/ready" -TimeoutSec 10
     if (-not $ready.ok) { throw 'Database/schema readiness failed.' }
     return Invoke-RestMethod "$Url/api/auth/status" -TimeoutSec 10
+}
+
+function Get-IsolatedLocalHttp {
+    param([string]$Container,[string]$Route)
+    if ($Container -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}-app-1$' -or $Route -notin @('/api/ready','/api/auth/status','/api/agents')) {
+        throw 'Container-local HTTP is restricted to the owned isolated fresh-installation runtime and bounded proof routes.'
+    }
+    return Invoke-DockerCommand @('exec',$Container,'node','-e',
+        'fetch("http://127.0.0.1:3001"+process.argv[1],{signal:AbortSignal.timeout(10000)}).then(async r=>console.log(JSON.stringify({status:r.status,body:await r.text()}))).catch(()=>process.exit(1))',$Route) -Capture | ConvertFrom-Json
 }
 
 function Remove-ExpiredLocalBackups {
@@ -559,12 +646,14 @@ function Remove-ExpiredLocalBackups {
         $metadata=Get-Content -LiteralPath $receipt.FullName -Raw | ConvertFrom-Json
         $created=if ($metadata.createdAt -is [DateTime]) { $metadata.createdAt.ToUniversalTime() }
             else { [DateTimeOffset]::Parse([string]$metadata.createdAt,[Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
-        if ($metadata.version -notin @(1,2,3) -or $metadata.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid backup receipt; review before retention.' }
-        if ($metadata.version -eq 3) {
-            $snapshot=if ($metadata.snapshotAt -is [DateTime]) { $metadata.snapshotAt.ToUniversalTime() }
-                else { [DateTimeOffset]::Parse([string]$metadata.snapshotAt,[Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
-            if ($snapshot -gt $created) { throw 'Invalid backup snapshot timestamp; review before retention.' }
+        if ($metadata.format -cne 'agent-control-backup-v1' -or
+            $metadata.fingerprintAlgorithm -cne 'sha256-pg-row-json-pkey-utf8-v1' -or
+            $metadata.schemaFingerprint -cnotmatch '^[a-f0-9]{64}$' -or $metadata.sha256 -cnotmatch '^[a-f0-9]{64}$') {
+            throw 'Invalid or retired backup receipt; review before retention. Old formats are not converted or removed.'
         }
+        $snapshot=if ($metadata.snapshotAt -is [DateTime]) { $metadata.snapshotAt.ToUniversalTime() }
+            else { [DateTimeOffset]::Parse([string]$metadata.snapshotAt,[Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
+        if ($snapshot -gt $created) { throw 'Invalid backup snapshot timestamp; review before retention.' }
         if ($created -ge $threshold) { continue }
         $dump=$receipt.FullName.Substring(0,$receipt.FullName.Length-5)
         if (Test-Path -LiteralPath $dump) {
@@ -576,13 +665,35 @@ function Remove-ExpiredLocalBackups {
 }
 
 function Invoke-LocalDeployment {
-    param($Context,[string]$Action,[string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset)
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Start','Reset','Retain','Reopen','Backup','Restore')][string]$Action,
+        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset,[switch]$ForceChecks)
+    $operationLock = $null
+    try {
+        if ($Action -ne 'Test') {
+            $directory = Join-Path $Context.Root 'artifacts/local-operations'
+            [IO.Directory]::CreateDirectory($directory) | Out-Null
+            try { $operationLock = [IO.File]::Open((Join-Path $directory "$($Context.Project).lock"),'OpenOrCreate','ReadWrite','None') }
+            catch [IO.IOException] { throw 'Another operation may be changing this project. Wait for it to finish before retrying.' }
+        }
+        Invoke-LocalDeploymentCore @PSBoundParameters
+    } finally { if ($operationLock) { $operationLock.Dispose() } }
+}
+
+function Invoke-LocalDeploymentCore {
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Start','Reset','Retain','Reopen','Backup','Restore')][string]$Action,
+        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset,[switch]$ForceChecks)
     if ($DbReset -and $Action -ne 'Deploy') { throw '-DbReset is supported only by the start deployment workflow.' }
+    if ($ForceChecks -and $Action -notin @('Deploy','Test')) { throw '-ForceChecks is supported only by start or the internal Test action.' }
     $Context.DbResetStarted = $false
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Install and start the company-approved Docker engine/Desktop and Compose v2 before continuing.' }
     Invoke-DockerCommand @('info','--format','{{.ServerVersion}}') | Out-Null
     $composeVersion = Invoke-DockerCommand @('compose','version','--short') -Capture
     if ($composeVersion -notmatch '^v?([2-9]|[1-9][0-9])\.') { throw 'Docker Compose v2 or newer is required.' }
+    if ($Action -eq 'Stop') { Stop-LocalProject $Context; return }
+    if ($Action -in @('Deploy','Test')) {
+        Invoke-LocalApplication $Context -CheckOnly:($Action -eq 'Test') -ForceChecks:$ForceChecks -DbReset:$DbReset
+        return
+    }
     $volumes = Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture
     $existing = $Context.Volume -in ($volumes -split "`n")
     if ($Action -eq 'Reset') {
@@ -593,46 +704,9 @@ function Invoke-LocalDeployment {
         return
     }
     if ($Action -notin @('Deploy','EditConfig','Test') -and -not $existing) { throw 'Expected project volume is missing. Stop for recovery; use start for a new installation.' }
-    if ($Action -in @('Deploy','Test')) {
-        Write-Host '[AUTOMATED CHECKS] Building the operator/test image; the existing application remains untouched.'
-        Invoke-DockerCommand @('build','--target','operator','-t',$Context.Operator,$Context.Root)
-        Invoke-LocalSoftwareChecks $Context
-        if ($Action -eq 'Test') { return }
-        Write-Host '[DEPLOYMENT] Software checks passed. Building the runtime image before entering maintenance.'
-        Invoke-DockerCommand @('build','--target','runtime','-t',$Context.Image,$Context.Root)
-    }
     Initialize-LocalState $Context $existing -Onboard:($Action -in @('Deploy','Start')) -Edit:($Action -eq 'EditConfig')
     if ($Action -eq 'EditConfig') { return }
     $marker = Join-Path $Context.State 'control/maintenance'
-    if ($Action -eq 'Stop') {
-        [IO.File]::WriteAllText($marker,'maintenance')
-        Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130'))
-        return
-    }
-    if ($Action -eq 'Deploy') {
-        if ($DbReset) {
-            Write-Warning "Explicit database reset requested for project '$($Context.Project)', database 'agentcontrol'. All saved application data, reports, audit history, jobs and sessions will be deleted. Project configuration, secrets and backup files are retained."
-        }
-        $preflight = if ($DbReset) { @('preflight-reset','agentcontrol') } else { @('preflight') }
-        Write-Host '[DATABASE PREFLIGHT] Checking the database target before changing maintenance or stopping the app.'
-        try {
-            Invoke-DockerCommand ($Context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
-            Invoke-LocalOperator $Context (@('backend/scripts/database.ts') + $preflight)
-        } catch {
-            throw "Database preflight failed for project '$($Context.Project)': $($_.Exception.Message) This attempt has not changed maintenance or stopped the app. Review the database diagnostic above; no data was reset."
-        }
-        Write-Host '[DEPLOYMENT] Entering maintenance and draining the app before database initialization.'
-        [IO.File]::WriteAllText($marker,'maintenance')
-        Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
-        Assert-LocalPort $Context.Port
-        if ($DbReset) {
-            Write-Host "[DATABASE RESET] Recreating only '$($Context.Project)/agentcontrol'; project configuration and PostgreSQL roles are retained."
-            $Context.DbResetStarted = $true
-            Invoke-LocalOperator $Context @('backend/scripts/database.ts','reset','agentcontrol')
-            Write-Host '[DATABASE RESET] Empty database created. Applying the fresh schema and runtime grants.'
-        }
-        Invoke-LocalOperator $Context @('backend/scripts/database.ts','migrate')
-    }
     if ($Action -eq 'Retain') {
         $expected="$($Context.Project)/agentcontrol"
         if ($ConfirmCleanup -cne $expected) { throw "Retention cleanup denied. Exact confirmation required: $expected" }
@@ -671,16 +745,22 @@ function Invoke-LocalDeployment {
     if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
     try {
         Invoke-DockerCommand ($Context.Compose + @('up','-d','--no-build','--wait','--wait-timeout','90','app'))
-        $health = Get-LocalHealth $Context.Url
+        $healthEndpoint = $Context.Url
+        if ($Context.IsolatedHealthContainer) {
+            if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or
+                $Context.IsolatedHealthContainer -cne "$($Context.Project)-app-1" -or
+                $Context.Port -in @(3001,3002)) { throw 'Isolated readiness cannot target a retained installation.' }
+            $health = Get-LocalHealth $Context.Url -IsolatedContainer $Context.IsolatedHealthContainer
+            $healthEndpoint = "container://$($Context.IsolatedHealthContainer):3001"
+        } else { $health = Get-LocalHealth $Context.Url }
         if (-not $health.authConfigured) { throw 'App sign-in configuration is missing despite saved onboarding settings. Check the project secret mounts and Compose configuration, then rerun start.' }
     } catch {
         [IO.File]::WriteAllText($marker,'maintenance')
         throw
     }
     Write-Host 'Deployment verification summary'
-    if ($Action -eq 'Deploy') { Write-Host '[AUTOMATED CHECKS] PASSED: backend/frontend tests, backend typecheck, frontend lint and production build, using isolated fixtures.' }
-    else { Write-Host '[AUTOMATED CHECKS] NOT RUN: this internal Start action only starts the existing images.' }
-    Write-Host "[LOCAL READINESS] PASSED: $($Context.Url) (database/schema readiness and sign-in configuration)."
+    Write-Host '[AUTOMATED CHECKS] NOT RUN: this internal Start action only starts the existing images.'
+    Write-Host "[LOCAL READINESS] PASSED: $healthEndpoint (database/schema readiness and sign-in configuration)."
     if ($Context.PublicUrl -cne $Context.Url) {
         Write-Host "Open $($Context.PublicUrl) to sign in. Local health is verified; tunnel reachability is not checked."
         Show-LocalTunnelGuidance $Context.Port

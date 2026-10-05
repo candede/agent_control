@@ -5,20 +5,21 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { config } from "../config.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError, errorHandler } from "../errors.js";
-import { unifiedAgentsRouter } from "./unifiedAgents.js";
+import { createUnifiedAgentsRouter } from "./unifiedAgents.js";
+import { LiveInventory } from "../db/liveInventory.js";
 
 const mocks = vi.hoisted(() => {
-  process.env.TENANT_ID = "11111111-1111-4111-8111-111111111111";
-  process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
-  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
-  process.env.TENANT_DOMAINS = "example.invalid";
-  process.env.SESSION_SECRET = "agent-people-fixture-secret";
-  return { list: vi.fn(), generation: vi.fn(), resolve: vi.fn(), project: vi.fn(), requireAvailable: vi.fn() };
+  delete process.env.TENANTS_JSON_FILE;
+  process.env.TENANTS_JSON = JSON.stringify([{
+    tenantId: "11111111-1111-4111-8111-111111111111", clientId: "22222222-2222-4222-8222-222222222222",
+    clientSecret: "synthetic-route-test-secret", domains: ["example.invalid"],
+  }]);
+  process.env.SESSION_SECRET = "agent-people-fixture-secret-long-enough";
+  return { record: vi.fn(), assertCurrent: vi.fn(), generation: vi.fn(), resolve: vi.fn(), read: vi.fn(), requireAvailable: vi.fn() };
 });
-vi.mock("../services/unifiedAgents.js", () => ({ unifiedAgents: { list: mocks.list } }));
-vi.mock("../services/agentPeople.js", () => ({ agentPeople: { generation: mocks.generation, resolve: mocks.resolve } }));
-vi.mock("../services/savedAgentPeople.js", () => ({ savedAgentPeople: { project: mocks.project } }));
-vi.mock("../services/purviewAudit.js", () => ({ purviewAudit: { agentRecords: vi.fn() } }));
+vi.mock("../services/purviewAudit.js", () => ({
+  PurviewAuditService: class { agentRecords = vi.fn(); },
+}));
 vi.mock("../services/capabilities.js", () => ({ capabilities: {
   requireAvailable: mocks.requireAvailable,
   observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
@@ -29,7 +30,7 @@ vi.mock("../services/telemetry.js", async original => ({
 const recordId = "agent:33333333-3333-4333-8333-333333333333";
 const creatorId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ownerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const record = { id: recordId, powerPlatformResource: { createdBy: creatorId, details: { ownerId, lastModifiedBy: "non-user-id" } } };
+const record = { id: recordId, revision: "live-revision", people: { createdBy: creatorId, owner: ownerId, lastModifiedBy: "non-user-id" } };
 const people = { createdBy: { objectId: creatorId, status: "not_found", displayName: null, userPrincipalName: null,
   observedAt: "2026-09-20T12:00:00.000Z" } };
 let server: Server;
@@ -52,7 +53,11 @@ beforeAll(async () => {
     }
     next();
   });
-  app.use("/api", unifiedAgentsRouter);
+  const inventory = new LiveInventory();
+  inventory.record = mocks.record;
+  inventory.assertCurrent = mocks.assertCurrent;
+  app.use("/api", createUnifiedAgentsRouter(undefined, { inventory,
+    people: { generation: mocks.generation, resolve: mocks.resolve }, savedPeople: { read: mocks.read } }));
   app.use(errorHandler);
   server = await new Promise<Server>(resolve => {
     const listening = app.listen(0, "127.0.0.1", () => resolve(listening));
@@ -62,9 +67,9 @@ beforeEach(async () => {
   await activateAccountSession(config.tenants[0].tenantId!, "reader", async () => {});
   vi.resetAllMocks();
   mocks.generation.mockResolvedValue("initial");
-  mocks.list.mockResolvedValue({ count: 1, value: [record] });
+  mocks.record.mockResolvedValue(record);
   mocks.resolve.mockResolvedValue({ changed: true, notFound: 1, resolved: 0, failed: 0 });
-  mocks.project.mockResolvedValue([{ ...record, people }]);
+  mocks.read.mockResolvedValue(new Map([[creatorId, people.createdBy]]));
   mocks.requireAvailable.mockResolvedValue({ authorized: true });
 });
 afterAll(async () => {
@@ -76,11 +81,12 @@ describe("persisted agent people endpoint", () => {
     expect(await request({ recordId, force: true }, { role })).toEqual({ status: 200, body: { people, changed: true } });
     const scope = { tenantId: config.tenants[0].tenantId, principalId: "reader" };
     expect(mocks.generation).toHaveBeenCalledWith(scope);
-    expect(mocks.generation.mock.invocationCallOrder[0]).toBeLessThan(mocks.list.mock.invocationCallOrder[0]);
-    expect(mocks.list).toHaveBeenCalledExactlyOnceWith(scope, { recordId, limit: 1 });
+    expect(mocks.generation.mock.invocationCallOrder[0]).toBeLessThan(mocks.record.mock.invocationCallOrder[0]);
+    expect(mocks.record).toHaveBeenCalledExactlyOnceWith(scope, recordId);
     expect(mocks.resolve).toHaveBeenCalledWith(expect.objectContaining({ tenantId: config.tenants[0].tenantId, homeAccountId: "reader" }),
       [creatorId, ownerId], { generation: "initial", force: true, signal: expect.any(AbortSignal) });
-    expect(mocks.project).toHaveBeenCalledWith(scope, [record]);
+    expect(mocks.assertCurrent).toHaveBeenCalledExactlyOnceWith(scope, recordId, record.revision);
+    expect(mocks.read).toHaveBeenCalledWith(scope, [creatorId, ownerId]);
   });
 
   it("rejects missing sessions, roles, CSRF, wrong tenants and unavailable capability before reading private data", async () => {
@@ -90,15 +96,15 @@ describe("persisted agent people endpoint", () => {
     ] as const) expect((await request({ recordId }, options)).status).toBe(status);
     mocks.requireAvailable.mockRejectedValueOnce(new AppError(403, "capability_unavailable", "Unavailable"));
     expect((await request({ recordId })).status).toBe(403);
-    expect(mocks.list).not.toHaveBeenCalled();
+    expect(mocks.record).not.toHaveBeenCalled();
     expect(mocks.resolve).not.toHaveBeenCalled();
   });
 
   it("refuses arbitrary user queries, absent records and failed saved reads without invoking Graph", async () => {
     expect((await request({ recordId, userIds: [creatorId] })).status).toBe(400);
-    mocks.list.mockResolvedValueOnce({ count: 0, value: [] });
+    mocks.record.mockRejectedValueOnce(new AppError(404, "agent_not_found", "Unavailable"));
     expect((await request({ recordId })).status).toBe(404);
-    mocks.list.mockRejectedValueOnce(new AppError(409, "snapshot_unavailable", "Unavailable"));
+    mocks.record.mockRejectedValueOnce(new AppError(409, "snapshot_unavailable", "Unavailable"));
     expect((await request({ recordId })).status).toBe(409);
     expect(mocks.resolve).not.toHaveBeenCalled();
   });
@@ -106,7 +112,7 @@ describe("persisted agent people endpoint", () => {
   it("propagates reset conflicts rather than returning stale people", async () => {
     mocks.resolve.mockRejectedValueOnce(new AppError(409, "dataset_invalidated", "Saved data was cleared"));
     expect(await request({ recordId })).toMatchObject({ status: 409, body: { code: "dataset_invalidated" } });
-    expect(mocks.project).not.toHaveBeenCalled();
+    expect(mocks.read).not.toHaveBeenCalled();
   });
 
   it.each(["generation", "inventory", "projection"] as const)(
@@ -119,13 +125,13 @@ describe("persisted agent people endpoint", () => {
         await replaceSession();
         return "initial";
       });
-      if (phase === "inventory") mocks.list.mockImplementationOnce(async () => {
+      if (phase === "inventory") mocks.record.mockImplementationOnce(async () => {
         await replaceSession();
-        return { count: 1, value: [record] };
+        return record;
       });
-      if (phase === "projection") mocks.project.mockImplementationOnce(async () => {
+      if (phase === "projection") mocks.read.mockImplementationOnce(async () => {
         await replaceSession();
-        return [{ ...record, people }];
+        return new Map([[creatorId, people.createdBy]]);
       });
       expect(await request({ recordId })).toMatchObject({ status: 401, body: { code: "unauthorized" } });
       if (phase !== "projection") expect(mocks.resolve).not.toHaveBeenCalled();

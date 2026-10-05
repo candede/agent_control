@@ -9,7 +9,10 @@ export function responsibilityFixture(objectId?: string): AgentResponsibilityPag
       observedAt: "2026-09-12T10:00:00Z", status: "resolved" as const },
   };
   return {
-    revision: "a".repeat(64), coverage: "partial", unknownAgentCount: 1, invalidReferenceCount: 0,
+    selection: { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", revision: "a".repeat(64),
+      evaluatedAt: "2026-09-12T10:00:00Z", expiresAt: "2099-09-12T10:00:00Z" },
+    counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+    coverage: "partial", unknownAgentCount: 1, invalidReferenceCount: 0,
     sources: {
       graphPackages: { state: "unavailable", observation: null, error: { source: "graph_packages", code: "snapshot_unavailable", message: "No saved packages." } },
       powerPlatform: { state: "partial", observation: {
@@ -19,7 +22,7 @@ export function responsibilityFixture(objectId?: string): AgentResponsibilityPag
           storedCount: 1, uniqueIdentityCount: 1, queriedTypes: ["microsoft.copilotstudio/agents"] },
       }, error: { source: "power_platform", code: "environment_scope_limited", message: "Only the authorized environment is saved." } },
     },
-    people: objectId ? [] : [person], count: 1, offset: 0, limit: 50,
+    people: objectId ? [] : [person],
     selected: objectId ? { person, state: "reported", count: 1,
       agents: [{ id: responsibilityAgentId, displayName: "Responsible agent", presence: "power_platform", environmentId: "environment",
         roles: ["owner"], observedAt: "2026-09-12T10:00:00Z" }] } : null,

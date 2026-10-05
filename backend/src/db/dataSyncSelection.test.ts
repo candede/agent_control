@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type pg from "pg";
+import pg from "pg";
 import { DataSyncRepository } from "./dataSync.js";
 import { pool } from "./pool.js";
 
@@ -72,7 +72,7 @@ describe("data sync current-run selection", () => {
 
   it("ignores expired running or waiting rows during automatic admission", async () => {
     const execute = vi.fn(async () => emptyResult);
-    const client = { query: execute, release: vi.fn() };
+    const client = Object.assign(new pg.Client(),{ query: execute,release: vi.fn() });
     const database = { query: execute, connect: vi.fn(async () => client) } as unknown as pg.Pool;
     expect(await new DataSyncRepository(database).submitDue(scope)).toEqual({ run: null, created: false });
     expect(execute).toHaveBeenCalledWith(
@@ -85,7 +85,7 @@ describe("data sync current-run selection", () => {
 
   it("limits interrupted-admission pausing to the run that admission changed", async () => {
     const execute = vi.fn(async () => emptyResult);
-    const client = { query: execute, release: vi.fn() };
+    const client = Object.assign(new pg.Client(),{ query: execute,release: vi.fn() });
     const database = { query: execute, connect: vi.fn(async () => client) } as unknown as pg.Pool;
     const id = "11111111-1111-4111-8111-111111111111";
     await new DataSyncRepository(database).pausePrincipal(scope, "Interrupted admission.", id);
@@ -103,7 +103,7 @@ describe("data sync current-run selection", () => {
   it.each(["cancelled", "completed", "partial"] as const)("only accepts an idempotent cancellation for a %s terminal run", async status => {
     const execute = vi.fn(async (text: string) => text.startsWith("SELECT status")
       ? { ...emptyResult, rowCount: 1, rows: [{ status }] } : emptyResult);
-    const client = { query: execute, release: vi.fn() };
+    const client = Object.assign(new pg.Client(),{ query: execute,release: vi.fn() });
     const database = { query: execute, connect: vi.fn(async () => client) } as unknown as pg.Pool;
     const repository = new DataSyncRepository(database);
     const get = vi.spyOn(repository, "getRun").mockResolvedValue(undefined);

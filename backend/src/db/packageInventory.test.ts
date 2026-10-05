@@ -1,318 +1,222 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { retain } from "../../scripts/database.js";
+import { inventorySelectionFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
+import { GraphPackagesClient } from "../services/graphPackages.js";
+import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRuntime.js";
+import { StreamedInventory } from "../services/streamedInventory.js";
+import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import { PackageRefreshJobs, type PackageDataScope } from "./packageRefreshJobs.js";
+import type { InventoryQuery } from "./inventoryQueries.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let repository: PackageInventoryRepository;
+let jobs: PackageRefreshJobs;
 const scope = { tenantId: "tenant-package", principalId: "reader-package" };
-
-beforeAll(async () => {
-  fixture = await testDatabase();
-  repository = new PackageInventoryRepository(fixture.runtime);
+const selections: Awaited<ReturnType<typeof inventorySelectionFixture>>[] = [];
+beforeAll(async () => { fixture = await testDatabase(); jobs = new PackageRefreshJobs(fixture.runtime); });
+afterEach(async () => {
+  for (const selected of selections.splice(0)) await selected.queries.selections.invalidate(selected.selection.id, selected.identity);
 });
 afterAll(async () => { await fixture?.close(); });
 
-function packageValue(id: string, blocked = false, overrides: Record<string, unknown> = {}) {
-  return allowlistedPackage({
-    id,
-    displayName: `Package ${id}`,
-    isBlocked: blocked,
-    supportedHosts: ["Copilot"],
-    appId: `app-${id}`,
-    manifestId: `manifest-${id}`,
-    assetId: `asset-${id}`,
-    ...overrides,
-  });
-}
-
-async function running(idempotencyKey: string, requestedIds?: string[]) {
-  const job = await repository.submit(scope, {
-    authorizationPrincipalId: scope.principalId,
-    tokenMode: "delegated",
-    idempotencyKey,
-    requestedIds,
-  });
-  expect(await repository.markRunning(scope, job.id)).toBe(true);
+const packageValue = (id: string, blocked = false, overrides: Record<string, unknown> = {}) =>
+  allowlistedPackage({ id, displayName: `Package ${id}`, isBlocked: blocked, supportedHosts: ["Copilot"],
+    appId: `app-${id}`, manifestId: `manifest-${id}`, assetId: `asset-${id}`, ...overrides });
+async function running(idempotencyKey: string, requestedIds?: string[], owner: PackageDataScope = scope) {
+  const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId,
+    tokenMode: owner.tokenMode ?? "delegated", idempotencyKey, requestedIds });
+  expect(await jobs.markRunning(owner, job.id)).toBe(true);
   return job.id;
 }
+async function refreshThroughProvider(owner: PackageDataScope, jobId: string, values: CopilotPackageDetail[],
+  options: { targets?: string[]; pageSize?: number; expectedCount?: number; expiresAt?: Date; failContinuation?: boolean } = {}) {
+  if (values.length > 100 || (options.targets?.length ?? 0) > 100) throw new Error("tiny_package_provider_fixture_limit");
+  const pageSize = options.pageSize ?? 100;
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new Error("tiny_package_provider_page_limit");
+  const client = new GraphPackagesClient(async request => {
+    const url = new URL(String(request));
+    if (!url.pathname.endsWith("/packages")) {
+      const id = decodeURIComponent(url.pathname.split("/").at(-1)!);
+      const value = values.find(item => item.id === id);
+      return value ? Response.json(value) : Response.json({ error: { code: "notFound" } }, { status: 404 });
+    }
+    const offset = Number(url.searchParams.get("$skiptoken") ?? 0);
+    if (offset && options.failContinuation) return Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 });
+    const next = new URL(url);
+    next.searchParams.set("$skiptoken", String(offset + pageSize));
+    return Response.json({ value: values.slice(offset, offset + pageSize), "@odata.count": options.expectedCount ?? values.length,
+      ...(offset + pageSize < values.length ? { "@odata.nextLink": next.href } : {}) });
+  }, { minimumReadIntervalMs: 0, maxAttempts: 1 });
+  const input = await inventoryJobInput(fixture.runtime, owner, "packages", jobId);
+  if (options.expiresAt) input.expiresAt = options.expiresAt;
+  const stream = new StreamedInventory(fixture.runtime, client);
+  const hooks = { authorize: async () => {}, completeJob: completeInventoryJob(input, "packages") };
+  const root = await (options.targets
+    ? stream.exact(input, "synthetic", options.targets, hooks)
+    : stream.graphCatalog(input, "synthetic", hooks));
+  if (input.scope.tokenMode === "delegated") await reconcileInventoryFixture(fixture.runtime, owner);
+  return root;
+}
+async function selected(query: InventoryQuery = {}, owner = scope) {
+  const result = await inventorySelectionFixture(fixture.runtime, owner, query, "packages");
+  selections.push(result);
+  return result;
+}
 
-describe.sequential("Package inventory repository", () => {
-  it("gives admitted package work a fresh four-hour deadline and publishes beyond the old thirty-minute window", async () => {
-    const longScope = { tenantId: "tenant-long-package-refresh", principalId: "reader-long-package-refresh" };
-    const job = await repository.submit(longScope, {
-      authorizationPrincipalId: longScope.principalId, tokenMode: "delegated", idempotencyKey: "long-refresh",
-    });
-    const submitted = await fixture.operator.query<{ seconds: number }>(
-      "SELECT EXTRACT(EPOCH FROM (deadline_at-created_at))::double precision AS seconds FROM package_refresh_jobs WHERE id=$1", [job.id]);
-    expect(submitted.rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
-    await fixture.operator.query("UPDATE package_refresh_jobs SET created_at=clock_timestamp()-interval '2 hours',deadline_at=clock_timestamp()+interval '1 minute' WHERE id=$1", [job.id]);
-    expect(await repository.markRunning(longScope, job.id)).toBe(true);
-    const admitted = await fixture.operator.query<{ seconds: number }>(
-      "SELECT EXTRACT(EPOCH FROM (deadline_at-attempted_at))::double precision AS seconds FROM package_refresh_jobs WHERE id=$1", [job.id]);
-    expect(admitted.rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
-    await fixture.operator.query("UPDATE package_refresh_jobs SET attempted_at=clock_timestamp()-interval '1 hour',deadline_at=clock_timestamp()+interval '3 hours' WHERE id=$1", [job.id]);
-    await repository.recordProgress(longScope, job.id, 1, 1, 1, "Active long-running collection.");
-    await repository.publish(longScope, job.id, { packages: [packageValue("long-collected")], totalRecords: 1, pages: 1 });
-    expect(await repository.getJob(longScope, job.id)).toMatchObject({ status: "succeeded", observedCount: 1 });
+describe.sequential("streamed package inventory and durable refresh jobs", () => {
+  it("gives admitted package work four hours and publishes beyond the old thirty-minute window", async () => {
+    const owner = { tenantId: "tenant-long-package-refresh", principalId: "reader-long-package-refresh" };
+    const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: "long-refresh" });
+    expect((await fixture.operator.query(`SELECT EXTRACT(EPOCH FROM (deadline_at-created_at))::double precision AS seconds
+      FROM package_refresh_jobs WHERE id=$1`, [job.id])).rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
+    await fixture.operator.query(`UPDATE package_refresh_jobs SET created_at=clock_timestamp()-interval '2 hours',
+      deadline_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, [job.id]);
+    expect(await jobs.markRunning(owner, job.id)).toBe(true);
+    expect((await fixture.operator.query(`SELECT EXTRACT(EPOCH FROM (deadline_at-attempted_at))::double precision AS seconds
+      FROM package_refresh_jobs WHERE id=$1`, [job.id])).rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
+    await fixture.operator.query(`UPDATE package_refresh_jobs SET attempted_at=clock_timestamp()-interval '1 hour',
+      deadline_at=clock_timestamp()+interval '3 hours' WHERE id=$1`, [job.id]);
+    await jobs.recordProgress(owner, job.id, 1, 1, 1, "Active long-running collection.");
+    await refreshThroughProvider(owner, job.id, [packageValue("long-collected")]);
+    expect(await jobs.getJob(owner, job.id)).toMatchObject({ status: "succeeded", observedCount: 1 });
   });
 
   it("does not let retained dispatch-expired jobs exhaust fresh admission", async () => {
-    const expiredScope = { tenantId: "tenant-package-deadline", principalId: "reader-package-deadline" };
-    const input = { authorizationPrincipalId: expiredScope.principalId, tokenMode: "delegated" as const };
-    const expiredJobs = [];
-    for (let index = 0; index < 5; index += 1) {
-      expiredJobs.push(await repository.submit(expiredScope, { ...input, idempotencyKey: `expired-${index}` }));
-    }
+    const owner = { tenantId: "tenant-package-deadline", principalId: "reader-package-deadline" };
+    const input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const };
+    const expired = [];
+    for (let index = 0; index < 5; index++) expired.push(await jobs.submit(owner, { ...input, idempotencyKey: `expired-${index}` }));
     await fixture.runtime.query(`UPDATE package_refresh_jobs SET deadline_at=clock_timestamp()-interval '1 second'
-      WHERE tenant_id=$1 AND principal_id=$2`, [expiredScope.tenantId, expiredScope.principalId]);
-    expect(await repository.markRunning(expiredScope, expiredJobs[0].id)).toBe(false);
-
-    for (let index = 0; index < 5; index += 1) {
-      await expect(repository.submit(expiredScope, { ...input, idempotencyKey: `fresh-${index}` }))
-        .resolves.toMatchObject({ status: "waiting_authorization" });
-    }
-    await expect(repository.submit(expiredScope, { ...input, idempotencyKey: "fresh-over-limit" }))
-      .rejects.toMatchObject({ code: "job_limit" });
-    expect(await repository.getJob(expiredScope, expiredJobs[0].id)).toBeDefined();
+      WHERE tenant_id=$1 AND principal_id=$2`, [owner.tenantId, owner.principalId]);
+    expect(await jobs.markRunning(owner, expired[0].id)).toBe(false);
+    for (let index = 0; index < 5; index++) await expect(jobs.submit(owner, { ...input, idempotencyKey: `fresh-${index}` }))
+      .resolves.toMatchObject({ status: "waiting_authorization" });
+    await expect(jobs.submit(owner, { ...input, idempotencyKey: "fresh-over-limit" })).rejects.toMatchObject({ code: "job_limit" });
+    expect(await jobs.getJob(owner, expired[0].id)).toBeDefined();
   });
 
   it("cancels only the requesting principal's unfinished read job", async () => {
-    const job = await repository.submit(scope, {
-      authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cancel",
-    });
-    expect(await repository.cancel({ ...scope, principalId: "other-reader" }, job.id, scope.principalId)).toBeUndefined();
-    expect(await repository.cancel(scope, job.id, "other-reader")).toMatchObject({ status: "waiting_authorization" });
-    expect(await repository.cancel(scope, job.id, scope.principalId)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
+    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cancel" });
+    expect(await jobs.cancel({ ...scope, principalId: "other-reader" }, job.id, scope.principalId)).toBeUndefined();
+    expect(await jobs.cancel(scope, job.id, "other-reader")).toMatchObject({ status: "waiting_authorization" });
+    expect(await jobs.cancel(scope, job.id, scope.principalId)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
   });
 
   it("retains internal sync cleanup provenance instead of blaming the requesting principal", async () => {
-    const job = await repository.submit(scope, {
-      authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-sync-cleanup",
-    });
-    await repository.cancel(scope, job.id, scope.principalId, "sync_cleanup");
-    await repository.cancel(scope, job.id, scope.principalId);
-    expect(await repository.getJob(scope, job.id)).toMatchObject({
+    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cleanup" });
+    await jobs.cancel(scope, job.id, scope.principalId, "sync_cleanup");
+    await jobs.cancel(scope, job.id, scope.principalId);
+    expect(await jobs.getJob(scope, job.id)).toMatchObject({
       status: "cancelled", errorCode: "data_sync_cleanup", message: expect.stringContaining("original failure or interruption"),
     });
   });
 
-  it("publishes complete allowlisted snapshots and scopes filters before counts and paging", async () => {
+  it("atomically publishes complete provider pages and filters before counts and keysets", async () => {
     const id = await running("package-broad");
-    await repository.publish(scope, id, { packages: [packageValue("b", true), packageValue("a")], totalRecords: 2, pages: 2 });
-    expect(await repository.list(scope, { search: "Package", blocked: false, limit: 1 })).toMatchObject({
-      count: 1,
-      value: [{ id: "a", sourceSystem: "graph_packages" }],
-      snapshot: { scopeKind: "broad", observedCount: 2, pageCount: 2 },
-      summary: { total: 2, allowed: 1, blocked: 1 },
-      filteredSummary: { total: 1, allowed: 1, blocked: 0 },
-    });
-    expect(await repository.list({ ...scope, principalId: "other-reader" })).toMatchObject({ value: [], count: 0, snapshot: null, summary: { total: 0 } });
-    const identifiers = await fixture.runtime.query<{ count: number }>("SELECT count(*)::int AS count FROM source_identifiers WHERE tenant_id=$1 AND source='graph_packages'", [scope.tenantId]);
-    expect(identifiers.rows[0].count).toBe(8);
+    await refreshThroughProvider(scope, id, [packageValue("b", true), packageValue("a")], { pageSize: 1 });
+    expect(await jobs.getJob(scope, id)).toMatchObject({ status: "succeeded", observedCount: 2, pageCount: 2 });
+    const read = await selected({ search: "Package", blocked: false });
+    const page = await read.queries.page(read.selection.id, read.identity, { limit: 1 });
+    expect(page.counts).toMatchObject({ total: 2, scoped: 2, filtered: 1 });
+    expect(page.value.map(row => row.residual)).toMatchObject([{ id: "a", sourceSystem: "graph_packages" }]);
+    expect(await read.queries.facets(read.selection.id, read.identity, "blocked"))
+      .toMatchObject({ value: [{ value: "false" }, { value: "true" }], total: 2 });
+    await expect(read.queries.page(read.selection.id, { ...read.identity, principalId: "other-reader" }))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    const identifiers = await fixture.runtime.query(`SELECT count(*)::int AS total FROM inventory_facts
+      WHERE generation_id=(SELECT id FROM data_generations WHERE job_id=$1 AND state='published') AND kind='search'`, [id]);
+    expect(identifiers.rows[0].total).toBe(8);
   });
 
-  it("keeps broad data current when exact refreshes publish or fail", async () => {
-    const exact = await running("package-exact", ["c"]);
-    await repository.publish(scope, exact, { packages: [packageValue("c")], totalRecords: 1, pages: 1 });
-    expect((await repository.list(scope)).value.map(value => value.id)).toEqual(["a", "b"]);
-    expect((await repository.get(scope, "c"))?.package.id).toBe("c");
-
+  it("retains broad membership and provenance while exact observations succeed or a later scan fails", async () => {
+    await refreshThroughProvider(scope, await running("package-exact", ["c"]), [packageValue("c")], { targets: ["c"] });
+    const before = await selected();
+    expect(before.raw.value.map(row => row.id)).toEqual(["a", "b", "c"]);
+    expect(await before.queries.packageDetail(before.selection.id, before.identity, "c"))
+      .toMatchObject({ id: "c", observation: { current: true } });
     const failed = await running("package-failed");
-    await repository.recordProgress(scope, failed, 1, 1, 2);
-    await repository.markFailed(scope, failed, "provider_error", "The complete scan failed.");
-    expect(await repository.getJob(scope, failed)).toMatchObject({ status: "failed", pageCount: 1, observedCount: 1, totalRecords: 2 });
-    expect((await repository.list(scope)).count).toBe(2);
+    await jobs.recordProgress(scope, failed, 1, 1, 2);
+    await jobs.markFailed(scope, failed, "provider_error", "The complete scan failed.");
+    expect(await jobs.getJob(scope, failed)).toMatchObject({ status: "failed", pageCount: 1, observedCount: 1, totalRecords: 2 });
+    expect((await selected()).raw.value).toEqual(before.raw.value);
   });
 
-  it("loads only exact authorized targets without broad enumeration", async () => {
-    expect(await repository.getMany(scope, ["c", "a", "missing"])).toMatchObject([
-      { id: "c", package: { id: "c" } },
-      { id: "a", package: { id: "a" } },
-      { id: "missing", package: null },
+  it("resolves only bounded exact authorized targets and rejects a foreign principal", async () => {
+    const read = await selected();
+    expect((await read.queries.exact(read.selection.id, read.identity, ["c", "a", "missing"]))
+      .map(row => ({ id: row.identity, package: row.residual }))).toMatchObject([
+      { id: "a", package: { id: "a" } }, { id: "c", package: { id: "c" } },
     ]);
-    expect(await repository.getMany({ ...scope, principalId: "other-reader" }, ["a", "c"])).toEqual([
-      { id: "a", package: null },
-      { id: "c", package: null },
-    ]);
+    await expect(read.queries.packageDetail(read.selection.id, read.identity, "missing"))
+      .rejects.toMatchObject({ code: "inventory_record_not_found" });
+    await expect(read.queries.exact(read.selection.id, { ...read.identity, principalId: "other-reader" }, ["a", "c"]))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
   });
 
-  it("rejects incomplete, duplicate, and out-of-scope publication without replacing saved data", async () => {
+  it("rejects incomplete, duplicate and out-of-scope publication without replacing the saved root", async () => {
+    const before = (await selected()).raw;
     const incomplete = await running("package-incomplete");
-    await expect(repository.publish(scope, incomplete, { packages: [packageValue("partial")], totalRecords: 2, pages: 1 })).rejects.toMatchObject({ code: "incomplete_package_coverage" });
+    await expect(refreshThroughProvider(scope, incomplete, [packageValue("partial"), packageValue("unread")],
+      { pageSize: 1, failContinuation: true })).rejects.toMatchObject({ status: 503 });
+    await jobs.markFailed(scope, incomplete, "incomplete_coverage", "Synthetic partial provider response.");
+    const duplicate = await running("package-duplicate");
+    await expect(refreshThroughProvider(scope, duplicate, [packageValue("duplicate"), packageValue("duplicate")]))
+      .rejects.toMatchObject({ code: "23505" });
+    await jobs.markFailed(scope, duplicate, "duplicate_identity", "Synthetic duplicate provider response.");
     const exact = await running("package-wrong-target", ["expected"]);
-    await expect(repository.publish(scope, exact, { packages: [packageValue("other")], totalRecords: 1, pages: 1 })).rejects.toMatchObject({ code: "package_scope_mismatch" });
-    expect((await repository.list(scope)).value.map(value => value.id)).toEqual(["a", "b"]);
+    const graph = new GraphPackagesClient(async () => Response.json(packageValue("other")), { minimumReadIntervalMs: 0, maxAttempts: 1 });
+    const input = await inventoryJobInput(fixture.runtime, scope, "packages", exact);
+    await expect(new StreamedInventory(fixture.runtime, graph).exact(input, "synthetic", ["expected"], {
+      authorize: async () => {}, completeJob: completeInventoryJob(input, "packages"),
+    })).rejects.toMatchObject({ code: "target_mismatch" });
+    await jobs.markFailed(scope, exact, "target_mismatch", "Synthetic wrong provider target.");
+    expect((await selected()).raw.value).toEqual(before.value);
   });
 
-  it("pages, filters, sorts, counts and facets beyond the first page without returning all rows", async () => {
-    const values = Array.from({ length: 73 }, (_, index) => packageValue(
-      `boundary-${String(index).padStart(3, "0")}`,
-      index % 3 === 0,
-      {
-        publisher: index % 2 === 0 ? "Even publisher" : "Odd publisher",
-        availableTo: index % 4 === 0 ? "some" : "none",
-        supportedHosts: index % 5 === 0 ? ["Teams"] : ["Copilot"],
-        platform: index % 7 === 0 ? "CopilotStudio" : "OtherPlatform",
-        createdDateTime: index < 60 ? new Date().toISOString() : "2020-01-01T00:00:00.000Z",
-      },
-    ));
-    const id = await running("package-boundary");
-    await repository.publish(scope, id, { packages: values, totalRecords: values.length, pages: 2 });
-    const secondPage = await repository.list(scope, {
-      publisher: "Even publisher",
-      blocked: false,
-      host: "Copilot",
-      platform: "Other Platform",
-      createdWithinDays: 1,
-      sortBy: "displayName",
-      sortDirection: "desc",
-      limit: 10,
-      offset: 10,
-    });
-    expect(secondPage.value).toHaveLength(3);
-    expect(secondPage.count).toBe(13);
-    expect(secondPage.summary).toEqual({ total: 73, allowed: 48, blocked: 25 });
-    expect(secondPage.filteredSummary).toEqual({ total: 13, allowed: 13, blocked: 0 });
-    expect(secondPage.facets.publishers.map(option => option.value)).toEqual(["Even publisher", "Odd publisher"]);
-    expect(secondPage.value[0].id > secondPage.value.at(-1)!.id).toBe(true);
+  it("publishes the complete continuation chain rather than a provider count hint", async () => {
+    const owner = { tenantId: "tenant-count-hint", principalId: "reader-count-hint" };
+    const job = await running("catalog-count-hint", undefined, owner);
+    await refreshThroughProvider(owner, job, [packageValue("hint-a"), packageValue("hint-b")], { pageSize: 1, expectedCount: 1 });
+    expect(await jobs.getJob(owner, job)).toMatchObject({ status: "succeeded", observedCount: 2, totalRecords: 2, pageCount: 2 });
+    expect((await selected({}, owner)).raw.value.map(row => row.id)).toEqual(["hint-a", "hint-b"]);
   });
 
-  it("overlays exact state without resurrecting stale identity details across provider revisions", async () => {
-    const unifiedScope = { tenantId: "tenant-package-unified", principalId: "reader-package-unified" };
-    const revisionA = "2026-09-10T10:00:00.000Z";
-    const revisionB = "2026-09-11T10:00:00.000Z";
-    const broad = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-broad",
-    });
-    expect(await repository.markRunning(unifiedScope, broad.id)).toBe(true);
-    await repository.publish(unifiedScope, broad.id, {
-      packages: [packageValue("retain"), packageValue("delete")],
-      totalRecords: 2,
-      pages: 1,
-    });
-    const exact = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-exact",
-      requestedIds: ["delete", "new"],
-    });
-    expect(await repository.markRunning(unifiedScope, exact.id)).toBe(true);
-    await repository.publish(unifiedScope, exact.id, {
-      packages: [packageValue("new", false, {
-        lastModifiedDateTime: revisionA,
-        version: "1",
-        elementDetails: [{
-          elementType: "AgentMetadatas",
-          elements: [{ id: "metadata", definition: "{\"fixture\":\"synthetic\"}" }],
-        }],
-      })],
-      totalRecords: 1,
-      pages: 1,
-    });
-    const application = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "application",
-      idempotencyKey: "unified-application",
-    });
-    expect(await repository.markRunning(unifiedScope, application.id)).toBe(true);
-    await repository.publish(unifiedScope, application.id, {
-      packages: [packageValue("application-only")],
-      totalRecords: 1,
-      pages: 1,
-    });
-    const newerBroad = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-newer-broad",
-      catalogOnly: true,
-    });
-    expect(await repository.markRunning(unifiedScope, newerBroad.id)).toBe(true);
-    await repository.publish(unifiedScope, newerBroad.id, {
-      packages: [packageValue("retain"), packageValue("new", true, {
-        lastModifiedDateTime: revisionA,
-        version: "1",
-      })],
-      totalRecords: 2,
-      pages: 1,
-    });
-
-    const source = await repository.readUnifiedSource(unifiedScope);
-    expect(source.packages.map(value => value.id)).toEqual(["new", "retain"]);
-    expect(source.packages.find(value => value.id === "new")).toMatchObject({
-      isBlocked: true,
-      elementDetails: [{ elementType: "AgentMetadatas" }],
-    });
-    expect(source.observations.new).toMatchObject({
-      scopeKind: "broad",
-      identityDetails: { snapshotId: expect.any(String) },
-    });
-    expect(source.snapshot).toMatchObject({ scopeKind: "broad", tokenMode: "delegated", observedCount: 2 });
-
-    const changedBroad = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-changed-broad",
-      catalogOnly: true,
-    });
-    expect(await repository.markRunning(unifiedScope, changedBroad.id)).toBe(true);
-    await repository.publish(unifiedScope, changedBroad.id, {
-      packages: [packageValue("retain"), packageValue("new", false, {
-        lastModifiedDateTime: revisionB,
-        version: "2",
-        appId: "changed-app-new",
-      })],
-      totalRecords: 2,
-      pages: 1,
-    });
-    const changed = await repository.readUnifiedSource(unifiedScope);
-    expect(changed.packages.find(value => value.id === "new")).not.toHaveProperty("elementDetails");
-    expect(changed.observations.new).not.toHaveProperty("identityDetails");
-
-    const emptyExact = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-empty-exact",
-      requestedIds: ["new"],
-    });
-    expect(await repository.markRunning(unifiedScope, emptyExact.id)).toBe(true);
-    await repository.publish(unifiedScope, emptyExact.id, {
-      packages: [packageValue("new", false, {
-        lastModifiedDateTime: revisionA,
-        version: "1",
-        elementDetails: [],
-      })],
-      totalRecords: 1,
-      pages: 1,
-    });
-    const explicitlyEmpty = await repository.readUnifiedSource(unifiedScope);
-    expect(explicitlyEmpty.packages.find(value => value.id === "new")).toMatchObject({ elementDetails: [] });
-    expect(explicitlyEmpty.observations.new).toMatchObject({ scopeKind: "exact" });
-    expect(explicitlyEmpty.observations.new).not.toHaveProperty("identityDetails");
-
-    const absentExact = await repository.submit(unifiedScope, {
-      authorizationPrincipalId: unifiedScope.principalId,
-      tokenMode: "delegated",
-      idempotencyKey: "unified-absent-exact",
-      requestedIds: ["new"],
-    });
-    expect(await repository.markRunning(unifiedScope, absentExact.id)).toBe(true);
-    await repository.publish(unifiedScope, absentExact.id, {
-      packages: [],
-      totalRecords: 0,
-      pages: 1,
-    });
-    expect((await repository.readUnifiedSource(unifiedScope)).packages.map(value => value.id)).toEqual(["retain"]);
+  it("pages, filters, sorts, counts and facets beyond the first page without full-set reads", async () => {
+    const values = Array.from({ length: 73 }, (_, index) => packageValue(`boundary-${String(index).padStart(3, "0")}`, index % 3 === 0, {
+      publisher: index % 2 === 0 ? "Even publisher" : "Odd publisher", availableTo: index % 4 === 0 ? "some" : "none",
+      supportedHosts: index % 5 === 0 ? ["Teams"] : ["Copilot"], platform: index % 7 === 0 ? "CopilotStudio" : "OtherPlatform",
+      createdDateTime: index < 60 ? new Date().toISOString() : "2020-01-01T00:00:00.000Z",
+    }));
+    const job = await running("package-boundary");
+    await refreshThroughProvider(scope, job, values, { pageSize: 50 });
+    expect(await jobs.getJob(scope, job)).toMatchObject({ pageCount: 2, observedCount: 73 });
+    const read = await selected({ publisher: "Even publisher", blocked: false, host: "Copilot", platform: "otherplatform",
+      createdWithinDays: 1, sortBy: "displayName", sortDirection: "desc" });
+    const first = await read.queries.page(read.selection.id, read.identity, { limit: 10 });
+    expect(first.value).toHaveLength(10);
+    expect(first.counts).toMatchObject({ total: 73, filtered: 13 });
+    const second = await read.queries.page(read.selection.id, read.identity, { limit: 10, cursor: first.page.nextCursor! });
+    expect(second.value).toHaveLength(3);
+    expect(second.counts).toEqual(first.counts);
+    expect(second.value[0].id > second.value.at(-1)!.id).toBe(true);
+    expect((await read.queries.page(read.selection.id, read.identity, { limit: 10, cursor: second.page.previousCursor! })).value).toEqual(first.value);
+    const unfiltered = await selected();
+    expect((await unfiltered.queries.facets(unfiltered.selection.id, unfiltered.identity, "publisher")).value.map(row => row.value))
+      .toEqual(["Even publisher", "Odd publisher"]);
   });
 
-  it("applies finite retention without granting runtime snapshot deletion", async () => {
-    await fixture.operator.query("UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second'");
-    await fixture.operator.query("UPDATE package_refresh_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE status<>'running'");
+  it("expires a selected source, retains finite job metadata, and denies direct control or published-row deletion", async () => {
+    const owner = { tenantId: "tenant-package-retention", principalId: "reader-package-retention" };
+    const job = await running("expiring-source", undefined, owner);
+    await refreshThroughProvider(owner, job, [packageValue("expiring")], { expiresAt: new Date(Date.now() + 2500) });
+    const read = await selected({}, owner);
+    await expect(fixture.runtime.query("DELETE FROM package_inventory_snapshots WHERE tenant_id=$1", [owner.tenantId])).rejects.toThrow();
+    await expect(fixture.runtime.query("DELETE FROM package_record_rows WHERE tenant_id=$1", [owner.tenantId])).rejects.toThrow();
+    await expect.poll(() => read.queries.page(read.selection.id, read.identity).then(() => "live", error => error.code),
+      { timeout: 3500, interval: 100 }).toBe("selection_invalidated");
+    await fixture.operator.query("UPDATE package_refresh_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [job]);
     await retain(fixture.operator);
-    expect(await repository.list(scope)).toMatchObject({ value: [], count: 0, snapshot: null, summary: { total: 0 } });
-    await expect(fixture.runtime.query("DELETE FROM package_inventory_snapshots")).rejects.toThrow();
+    expect(await jobs.getJob(owner, job)).toBeUndefined();
   });
 });

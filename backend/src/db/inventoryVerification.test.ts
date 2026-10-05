@@ -1,184 +1,226 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bootstrap, grantRuntime, migrate } from "../../scripts/database.js";
-import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
-import { allowlistedPackage } from "../services/packageObservation.js";
-import { inventoryQueryTypes } from "../services/inventoryRoleScope.js";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { inventoryBaseline, inventoryDelta, inventoryInput, inventorySelectionFixture, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryPresentation, inventorySourceStatuses } from "../services/inventoryPresentation.js";
 import { PowerPlatformResourceQueryClient } from "../services/powerPlatformResourceQuery.js";
-import { powerPlatformResourceTypes, type InventoryRoleScope, type PowerPlatformResourceType, type ResourceQueryResult } from "../types/powerPlatformInventory.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
-import { migrationChecksum, migrations, verifySchema } from "./schema.js";
+import { StreamedInventory } from "../services/streamedInventory.js";
+import { powerPlatformResourceTypes, type InventoryRoleScope, type PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { LiveInventory } from "./liveInventory.js";
+import { InventoryIdentityQueries, currentNativeInventorySql } from "./inventoryIdentityQueries.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(); });
 afterAll(async () => { await fixture?.close(); });
-
 const agentType = "microsoft.copilotstudio/agents";
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const nativeIds = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"];
 
-async function publishInventory(requestedTypes: readonly PowerPlatformResourceType[] = powerPlatformResourceTypes) {
+async function publishInventory(roleScope: InventoryRoleScope = "unknown", requestedTypes: readonly PowerPlatformResourceType[] = powerPlatformResourceTypes) {
   const scope = { tenantId: `verification-${randomUUID()}`, principalId: "reader" };
-  const repository = new PowerPlatformInventoryRepository(fixture.runtime);
-  const job = await repository.submit(scope, { idempotencyKey: "verify", roleScope: "unknown", requestedTypes });
-  await repository.markRunning(scope, job.id);
-  const query = new PowerPlatformResourceQueryClient(async () => Response.json({
+  const input = inventoryInput(scope.principalId, "power_platform");
+  input.scope.tenantId = scope.tenantId;
+  input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: requestedTypes });
+  const provider = new PowerPlatformResourceQueryClient(async () => Response.json({
     totalRecords: 2, count: 2, resultTruncated: 0,
     data: nativeIds.map(name => ({ name, tenantId: scope.tenantId, type: agentType, properties: { environmentId, displayName: name } })),
   }));
-  const result = await query.query("fixture-token", requestedTypes, { expectedTenantId: scope.tenantId });
-  expect(result.resources.every(resource => resource.environmentId === environmentId)).toBe(true);
-  const saved = await repository.publish(scope, job.id, result);
-  return { scope, repository, result, snapshotId: saved.snapshotId };
+  const publisher = new StreamedInventory(fixture.runtime, undefined, provider);
+  const root = await publisher.powerPlatformCatalog(input, "synthetic-token", requestedTypes, { roleScope, authorize: async () => {} });
+  return { scope, root, input, publisher };
 }
 
-describe("saved inventory verification", () => {
-  it("verifies actual saved counts independently of filtering, paging, and optional role hints", async () => {
-    const { scope, repository, snapshotId } = await publishInventory();
-    const page = await repository.list(scope, { search: nativeIds[0], limit: 1 });
-    expect(page).toMatchObject({
-      count: 1, value: [{ nativeId: nativeIds[0] }],
-      snapshot: {
-        id: snapshotId, roleScope: "unknown", observedCount: 2, totalRecords: 2, pageCount: 1,
-        verification: { status: "verified", scope: "authorized_query", storedCount: 2, uniqueIdentityCount: 2, queriedTypes: powerPlatformResourceTypes },
-      },
-    });
-    expect(page.snapshot?.coverage.find(item => item.type === agentType)).toMatchObject({ status: "covered", count: 2 });
-    expect(page.snapshot?.coverage.find(item => item.type === "microsoft.powerplatform/environments")).toMatchObject({ status: "covered", count: 0 });
-    await fixture.operator.query("UPDATE power_platform_inventory_snapshots SET role_scope='ai' WHERE id=$1", [snapshotId]);
-    const changedHint = await repository.list(scope);
-    expect(changedHint.snapshot?.coverage).toEqual(page.snapshot?.coverage);
-    expect(changedHint.snapshot?.verification.queriedTypes).toEqual(powerPlatformResourceTypes);
-  });
-
-  it("rejects missing rows on every saved-data reader instead of repeating a successful job label", async () => {
-    const { scope, repository, snapshotId } = await publishInventory();
-    await fixture.operator.query("DELETE FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND native_id=$2", [snapshotId, nativeIds[1]]);
-    for (const read of [
-      () => repository.list(scope),
-      () => repository.readUnifiedSource(scope),
-      () => repository.readIdentityCandidates(scope, [agentType]),
-      () => repository.getResource(scope, snapshotId, agentType, environmentId, nativeIds[0]),
-      () => repository.getQuarantineSelection(scope, snapshotId, [nativeIds[0]]),
-      () => repository.resolveQuarantineTargets(scope, snapshotId, [nativeIds[0]]),
-    ]) {
-      await expect(read()).rejects.toMatchObject({ code: "inventory_verification_failed" });
-    }
-  });
-
-  it("uses the same latest source selection for activity identity links, without depending on role claims", async () => {
-    const { scope, repository, result } = await publishInventory();
-    const job = await repository.submit(scope, { idempotencyKey: "latest-agent-scope", roleScope: "full", requestedTypes: [agentType] });
-    await repository.markRunning(scope, job.id);
-    const latest = await repository.publish(scope, job.id, {
-      ...result, queriedTypes: [agentType],
-      resources: result.resources.map(resource => ({
-        ...resource, identifiers: [{ kind: "entra_agent_id" as const, value: resource.nativeId }],
-      })),
-    });
-    const candidates = await repository.readIdentityCandidates(scope, [agentType]);
-    expect(candidates).toHaveLength(2);
-    expect(candidates.every(candidate => candidate.identifiers.length === 1 && candidate.identifiers[0].kind === "entra_agent_id")).toBe(true);
-    expect((await repository.readUnifiedSource(scope)).snapshot?.id).toBe(latest.snapshotId);
-    expect(await repository.readIdentityCandidates({ ...scope, principalId: "different-reader" }, [agentType])).toEqual([]);
-  });
-
-  it.each(["types", "environment", "provider_total"] as const)("rejects inconsistent saved %s evidence even when the row count is unchanged", async change => {
-    const { scope, repository, snapshotId } = await publishInventory();
-    if (change === "types") await fixture.operator.query("UPDATE power_platform_inventory_snapshots SET queried_types='[\"microsoft.powerplatform/environments\"]' WHERE id=$1", [snapshotId]);
-    else if (change === "environment") await fixture.operator.query("UPDATE power_platform_inventory_snapshots SET environment_scope='different-environment' WHERE id=$1", [snapshotId]);
-    else await fixture.operator.query("UPDATE power_platform_inventory_snapshots SET total_records=1 WHERE id=$1", [snapshotId]);
-    await expect(repository.list(scope)).rejects.toMatchObject({ code: "inventory_verification_failed" });
-  });
-
-  it("binds publication to the actual executed types and environment and requires integer page counts", async () => {
-    const { scope, repository, result, snapshotId } = await publishInventory();
-    const changes: Array<Partial<ResourceQueryResult>> = [
-      { queriedTypes: [agentType] },
-      { queriedTypes: [] },
-      { environmentScope: environmentId },
-      { pages: 1.5 },
-    ];
-    for (const [index, change] of changes.entries()) {
-      const job = await repository.submit(scope, { idempotencyKey: `mismatch-${index}`, roleScope: "unknown", requestedTypes: powerPlatformResourceTypes });
-      await repository.markRunning(scope, job.id);
-      await expect(repository.publish(scope, job.id, { ...result, ...change })).rejects.toMatchObject({
-        status: 409, code: "pages" in change ? "incomplete_inventory_coverage" : "scope_mismatch",
-      });
-      expect((await repository.list(scope)).snapshot?.id).toBe(snapshotId);
-      await repository.markFailed(scope, job.id, "fixture_scope_failure", "Fixture scope verification failed.");
-    }
-  });
-
-  it("does not relabel unqueried types as verified zero", async () => {
-    const { scope, repository } = await publishInventory([agentType]);
-    const snapshot = (await repository.list(scope)).snapshot!;
-    expect(snapshot.verification.queriedTypes).toEqual([agentType]);
-    expect(snapshot.coverage.find(item => item.type === "microsoft.powerplatform/environments")).toEqual({
-      type: "microsoft.powerplatform/environments", status: "not_requested", count: null,
+describe("typed immutable inventory verification", () => {
+  it.each(["full", "ai", "unknown"] as const)("verifies source counts independently of filtering, paging and the %s role hint", async roleScope => {
+    const { scope, root } = await publishInventory(roleScope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope, { search: nativeIds[0] }, "power_platform");
+    const page = await selected.queries.page(selected.selection.id, selected.identity, { limit: 1 });
+    expect(page.counts).toMatchObject({ total: 2, scoped: 2, filtered: 1 });
+    expect(page.value.map(row => row.nativeId)).toEqual([nativeIds[0]]);
+    expect(inventorySourceStatuses(page.freshness.sources).powerPlatform).toMatchObject({
+      state: "available", observation: { snapshotId: root.baselineId, roleScope, coverage: "covered",
+        observedCount: 2, totalRecords: 2, pageCount: 1, coveredCount: 2,
+        verification: { status: "verified", scope: "authorized_query", storedCount: 2, uniqueIdentityCount: 2,
+          queriedTypes: expect.arrayContaining(powerPlatformResourceTypes) } },
     });
   });
 
-  it.each(["broad", "exact"] as const)("detects deleted %s package rows rather than treating them as empty inventory or a tombstone", async kind => {
-    const scope = { tenantId: `verification-${randomUUID()}`, principalId: "reader" };
-    const repository = new PackageInventoryRepository(fixture.runtime);
-    const value = { ...allowlistedPackage({ id: "package", displayName: "Agent", isBlocked: false }), identityDetailsCollected: true as const };
-    const broad = await repository.submit(scope, { idempotencyKey: "broad", authorizationPrincipalId: scope.principalId, tokenMode: "delegated" });
-    await repository.markRunning(scope, broad.id);
-    let saved = await repository.publish(scope, broad.id, { packages: [value], totalRecords: 1, pages: 1 });
-    if (kind === "exact") {
-      const exact = await repository.submit(scope, {
-        idempotencyKey: "exact", authorizationPrincipalId: scope.principalId, tokenMode: "delegated", requestedIds: ["package"],
-      });
-      await repository.markRunning(scope, exact.id);
-      saved = await repository.publish(scope, exact.id, { packages: [value], totalRecords: 1, pages: 1 });
+  it("prevents published native row deletion and retains verified selected and current identity reads", async () => {
+    const { scope, root } = await publishInventory();
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform");
+    await expect(fixture.operator.query("DELETE FROM power_platform_record_rows WHERE generation_id=$1", [root.baselineId]))
+      .rejects.toThrow("inventory_content_pinned");
+    expect((await selected.queries.page(selected.selection.id, selected.identity)).counts.total).toBe(2);
+    for (const nativeId of nativeIds) {
+      const record = await new LiveInventory(fixture.runtime).record(scope, unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId }));
+      expect(record.native?.resource.nativeId).toBe(nativeId);
     }
-    expect((await repository.readUnifiedSource(scope)).packages).toHaveLength(1);
-    await fixture.operator.query("DELETE FROM package_inventory_resources WHERE snapshot_id=$1", [saved.snapshotId]);
-    await expect(repository.readUnifiedSource(scope)).rejects.toMatchObject({ code: "inventory_verification_failed" });
   });
-});
 
-describe("inventory verification schema upgrade", () => {
-  it("replaces role-derived coverage with actual query scope without changing roles, totals, or migration32", async () => {
-    const upgrade = await testDatabase(false);
-    try {
-      await bootstrap(upgrade.operator, fixturePassword);
-      await migrate(upgrade.operator, migrations.filter(step => step.version <= 32));
-      const rows: Array<{ id: string; role: InventoryRoleScope; queried: PowerPlatformResourceType[] }> = [];
-      for (const role of ["full", "ai", "unknown"] as const) {
-        const id = randomUUID();
-        const queried = inventoryQueryTypes(role, powerPlatformResourceTypes);
-        const coverage = powerPlatformResourceTypes.map(type => ({
-          type, status: !queried.includes(type) ? "not_authorized_scope" : role === "unknown" ? "unknown" : "covered",
-          count: role === "unknown" || !queried.includes(type) ? null : 0,
-        }));
-        await upgrade.operator.query(`INSERT INTO power_platform_inventory_snapshots(
-          id,tenant_id,principal_id,query_hash,role_scope,requested_types,coverage,observed_count,total_records,page_count,unknown_field_count)
-          VALUES($1,'upgrade',$2,repeat('a',64),$2,$3::jsonb,$4::jsonb,0,0,1,0)`,
-        [id, role, JSON.stringify(powerPlatformResourceTypes), JSON.stringify(coverage)]);
-        rows.push({ id, role, queried });
-      }
-      await migrate(upgrade.operator);
-      await migrate(upgrade.operator);
-      await grantRuntime(upgrade.operator);
-      await verifySchema(upgrade.runtime);
-      expect(migrationChecksum(migrations.find(step => step.version === 32)!.sql))
-        .toBe("9f1ed70e6403658b453a4664e57b3a3f58bac25764e2b549bea859259089d60f");
-      expect((await upgrade.operator.query(`SELECT column_name FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='power_platform_inventory_snapshots' AND column_name='coverage'`)).rowCount).toBe(0);
-      const repository = new PowerPlatformInventoryRepository(upgrade.runtime);
-      for (const row of rows) {
-        const snapshot = (await repository.list({ tenantId: "upgrade", principalId: row.role })).snapshot!;
-        expect(snapshot).toMatchObject({
-          id: row.id, roleScope: row.role, totalRecords: 0, observedCount: 0,
-          verification: { status: "verified", storedCount: 0, uniqueIdentityCount: 0, queriedTypes: row.queried },
-        });
-        expect(snapshot.coverage.find(item => item.type === agentType)).toMatchObject({ status: "covered", count: 0 });
-      }
-    } finally {
-      await upgrade.close();
+  it("uses the latest executed source scope for current identities and never another principal's source", async () => {
+    const { scope } = await publishInventory();
+    const latest = await nativeInventoryFixture(fixture.runtime, scope, nativeIds.map(nativeId => ({
+      nativeId, environmentId, identifiers: [{ kind: "entra_agent_id", value: nativeId }],
+    })), { resourceTypes: [agentType] });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    for (const nativeId of nativeIds) {
+      const id = unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId });
+      const record = await new LiveInventory(fixture.runtime).record(scope, id);
+      expect(record.native).toMatchObject({ identifiers: [{ kind: "entra_agent_id", value: nativeId }],
+        observation: { snapshotId: latest.baselineId } });
+      await expect(new LiveInventory(fixture.runtime).record({ ...scope, principalId: "different-reader" }, id))
+        .rejects.toMatchObject({ code: "agent_not_found" });
     }
-  }, 30_000);
+  });
+
+  it("uses the newest complete tenant-wide agent query without unioning obsolete or environment-scoped membership", async () => {
+    const scope = { tenantId: "native-source-precedence", principalId: randomUUID() };
+    await nativeInventoryFixture(fixture.runtime, scope, [
+      { nativeId: "obsolete-global-agent", environmentId, identifiers: [] },
+      { nativeId: environmentId, type: "microsoft.powerplatform/environments", displayName: "Finance production", identifiers: [] },
+    ], { resourceTypes: [...powerPlatformResourceTypes] });
+    const latest = await nativeInventoryFixture(fixture.runtime, scope,
+      [{ nativeId: "current-global-agent", environmentId, identifiers: [] }], { resourceTypes: [agentType] });
+    await nativeInventoryFixture(fixture.runtime, scope,
+      [{ nativeId: "scoped-only-agent", environmentId, identifiers: [] }], { resourceTypes: [agentType], environmentId });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope);
+    const page = inventoryPresentation(selected.raw);
+    expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["current-global-agent"]);
+    expect(page.value[0].environment).toMatchObject({ displayName: "Finance production" });
+    expect(inventorySourceStatuses(selected.raw.freshness.sources).powerPlatform)
+      .toMatchObject({ observation: { snapshotId: latest.baselineId, environmentScope: null, observedCount: 1 } });
+    await expect(new LiveInventory(fixture.runtime).record(scope,
+      unifiedAgentRecordId({ source: "power_platform", nativeId: "obsolete-global-agent", environmentId })))
+      .rejects.toMatchObject({ code: "agent_not_found" });
+  });
+
+  it("pins source-scope precedence and retains canonical survivors across changed complete queries and verified emptiness", async () => {
+    const scope = { tenantId: "native-scope-survivors", principalId: randomUUID() };
+    const environment = (displayName: string) => ({
+      nativeId: environmentId, type: "microsoft.powerplatform/environments" as const, displayName, identifiers: [],
+    });
+    const agent = (nativeId: string) => ({ nativeId, environmentId, identifiers: [] });
+    await nativeInventoryFixture(fixture.runtime, scope,
+      [agent("retained"), agent("deleted"), environment("Original environment")], { resourceTypes: [...powerPlatformResourceTypes] });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const first = await inventorySelectionFixture(fixture.runtime, scope);
+    const original = inventoryPresentation(first.raw);
+    const retainedId = original.value.find(row => row.powerPlatformResource?.nativeId === "retained")!.id;
+
+    await nativeInventoryFixture(fixture.runtime, scope, [agent("retained"), agent("added")], { resourceTypes: [agentType] });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const second = await inventorySelectionFixture(fixture.runtime, scope);
+    const current = inventoryPresentation(second.raw);
+    expect(current.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "retained"]);
+    expect(current.value.find(row => row.powerPlatformResource?.nativeId === "retained")?.id).toBe(retainedId);
+    expect(current.value.every(row => row.environment?.displayName === "Original environment")).toBe(true);
+    const historical = await first.queries.page(first.selection.id, first.identity);
+    expect(inventoryPresentation(historical).value).toEqual(original.value);
+    expect(historical.freshness.state).toBe("stale");
+
+    await nativeInventoryFixture(fixture.runtime, scope,
+      [agent("retained"), agent("added"), environment("Replacement environment")], { resourceTypes: [...powerPlatformResourceTypes] });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const third = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
+    expect(third.value.find(row => row.powerPlatformResource?.nativeId === "retained")?.id).toBe(retainedId);
+    expect(third.value.every(row => row.environment?.displayName === "Replacement environment")).toBe(true);
+    await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: [agentType] });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const empty = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
+    expect(empty.value).toEqual([]);
+    expect(empty.counts.total).toBe(0);
+    expect(empty.sources.powerPlatform).toMatchObject({ state: "available",
+      observation: { observedCount: 0, coverage: "covered", verification: { storedCount: 0, uniqueIdentityCount: 0 } } });
+  });
+
+  it("keeps equal-catalog-time native authority deterministic when the nonwinning scope is compacted later", async () => {
+    const scope = { tenantId: "native-compaction-precedence", principalId: randomUUID() }, observedAt = new Date();
+    const broad = await nativeInventoryFixture(fixture.runtime, scope,
+      [{ nativeId: "broad-agent", environmentId, identifiers: [] }], { resourceTypes: [...powerPlatformResourceTypes], observedAt });
+    const agents = await nativeInventoryFixture(fixture.runtime, scope,
+      [{ nativeId: "agents-only", environmentId, identifiers: [] }], { resourceTypes: [agentType], observedAt });
+    const winner = broad.scopeId < agents.scopeId ? broad : agents, loser = winner === broad ? agents : broad;
+    const expected = winner === broad ? "broad-agent" : "agents-only";
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const before = await inventorySelectionFixture(fixture.runtime, scope), original = inventoryPresentation(before.raw);
+    expect(original.value.map(row => row.powerPlatformResource?.nativeId)).toEqual([expected]);
+    const input = inventoryInput(scope.principalId, "power_platform");
+    input.scope.tenantId = scope.tenantId;
+    input.scope.selector = inventorySelector({ domain: "power_platform",
+      resourceTypes: loser === broad ? powerPlatformResourceTypes : [agentType] });
+    await new InventoryGenerations(fixture.runtime).compact(input, loser, { authorize: async () => {} });
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const after = await inventorySelectionFixture(fixture.runtime, scope), compacted = inventoryPresentation(after.raw);
+    expect(compacted.value.map(row => ({ id: row.id, nativeId: row.powerPlatformResource?.nativeId })))
+      .toEqual(original.value.map(row => ({ id: row.id, nativeId: row.powerPlatformResource?.nativeId })));
+    const current = await new InventoryIdentityQueries(fixture.runtime).read(client =>
+      client.query(`${currentNativeInventorySql} SELECT native_id FROM native`, [scope.tenantId, scope.principalId, [agentType]]));
+    expect(current.rows).toEqual([{ native_id: expected }]);
+    await before.queries.selections.invalidate(before.selection.id, before.identity);
+    await after.queries.selections.invalidate(after.selection.id, after.identity);
+  });
+
+  it.each(["resource_types", "environment_id", "expected_count", "role_scope", "omitted_fields"] as const)(
+    "rejects post-publication changes to %s rather than changing saved evidence", async field => {
+      const { scope, root } = await publishInventory();
+      const selected = await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform");
+      const changes = { resource_types: "ARRAY['microsoft.powerplatform/environments']::text[]",
+        environment_id: "'different-environment'", expected_count: "1", role_scope: "'ai'", omitted_fields: "1" };
+      await expect(fixture.operator.query(`UPDATE inventory_attempts SET ${field}=${changes[field]} WHERE generation_id=$1`, [root.baselineId]))
+        .rejects.toThrow("inventory_attempt_immutable");
+      expect((await selected.queries.page(selected.selection.id, selected.identity)).counts.total).toBe(2);
+    });
+
+  it("freezes requested source intent before the first provider page", async () => {
+    const { scope, root, input } = await publishInventory();
+    await expect(new InventoryGenerations(fixture.runtime).execute({ ...input, jobId: randomUUID() },
+      { domain: "power_platform", mode: "baseline", channel: "catalog", resourceTypes: powerPlatformResourceTypes },
+      async lease => { await fixture.runtime.query("UPDATE inventory_attempts SET environment_id=$2 WHERE generation_id=$1", [lease.id, environmentId]); },
+      { authorize: async () => {} })).rejects.toThrow("inventory_intent_immutable");
+    expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform")).raw.freshness.sources[0].generation_id).toBe(root.baselineId);
+  });
+
+  it.each(["types", "environment", "fractional_count", "provider_total"] as const)(
+    "rejects inconsistent streamed %s evidence and preserves the prior complete head", async change => {
+      const { scope, root, input } = await publishInventory();
+      const data = nativeIds.map(name => ({ name, tenantId: scope.tenantId,
+        type: change === "types" ? "unsupported/resource" : agentType, properties: { environmentId, displayName: name } }));
+      const provider = new PowerPlatformResourceQueryClient(async () => Response.json({
+        totalRecords: change === "provider_total" ? 1 : 2, count: change === "fractional_count" ? 1.5 : 2, resultTruncated: 0, data,
+      }));
+      const requestedEnvironment = change === "environment" ? "22222222-2222-4222-8222-222222222222" : undefined;
+      const next = { ...input, jobId: randomUUID(), scope: { ...input.scope,
+        selector: inventorySelector({ domain: "power_platform", environmentId: requestedEnvironment, resourceTypes: powerPlatformResourceTypes }) } };
+      await expect(new StreamedInventory(fixture.runtime, undefined, provider).powerPlatformCatalog(next, "synthetic-token",
+        powerPlatformResourceTypes, { environmentId: requestedEnvironment, authorize: async () => {} })).rejects.toThrow();
+      expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform")).raw.freshness.sources[0].generation_id).toBe(root.baselineId);
+    });
+
+  it("does not claim that an unrequested environment source was verified empty", async () => {
+    const { scope } = await publishInventory("unknown", [agentType]);
+    const { raw } = await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform");
+    expect(inventorySourceStatuses(raw.freshness.sources).powerPlatform.observation).toMatchObject({
+      roleScope: "unknown", verification: { queriedTypes: [agentType] },
+    });
+    expect(raw.freshness.sources[0].resource_types).not.toContain("microsoft.powerplatform/environments");
+  });
+
+  it.each(["broad", "exact"] as const)("prevents deletion of published %s package rows instead of inventing an empty inventory", async kind => {
+    const principalId = randomUUID(), store = new InventoryGenerations(fixture.runtime);
+    await inventoryBaseline(store, principalId, 2);
+    if (kind === "exact") await inventoryDelta(store, principalId, 1);
+    const selected = await inventorySelectionFixture(fixture.runtime, { tenantId: "synthetic-tenant", principalId }, {}, "packages");
+    const row = (await fixture.runtime.query(`SELECT r.generation_id,r.identity FROM package_record_rows r
+      JOIN data_scope_epochs s ON s.id=r.scope_id JOIN data_generations g ON g.id=r.generation_id
+      WHERE s.principal_id=$1 AND r.native_id=$2 ORDER BY g.observed_at DESC,g.created_at DESC LIMIT 1`,
+    [principalId, selected.raw.value[0].id])).rows[0];
+    expect(row).toBeDefined();
+    await expect(fixture.operator.query("DELETE FROM package_record_rows WHERE generation_id=$1 AND identity=$2", [row.generation_id, row.identity]))
+      .rejects.toThrow("inventory_content_pinned");
+    expect((await selected.queries.page(selected.selection.id, selected.identity)).counts.total).toBe(2);
+  });
 });

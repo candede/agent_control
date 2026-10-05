@@ -4,6 +4,7 @@ import type { UnifiedAgentRecord } from "../src/api/client";
 import { createInventoryVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
+import { fulfillInventoryPage, isInventorySelectionRequest } from "./selectedInventoryFixture";
 
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const creator = "52bff06b-5db5-42cd-9919-28f95e3c07af";
@@ -48,15 +49,14 @@ async function open(page: Page, value: UnifiedAgentRecord) {
   await page.clock.setFixedTime(new Date(layoutTime));
   const writes: string[] = [];
   page.on("request", request => {
-    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(new URL(request.url()).pathname);
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request) && !isInventorySelectionRequest(request)) writes.push(new URL(request.url()).pathname);
   });
   const summary = { total: 1, linked: 0, graphOnly: value.packages.length ? 1 : 0, powerPlatformOnly: value.packages.length ? 0 : 1, ambiguous: 0, conflicting: 0 };
   const inventoryScope = value.packages.length ? "catalog" : "power_platform_only";
-  await page.route("**/api/agent-inventory*", route => route.fulfill({ json: {
-    ...unifiedAgents, value: [value], count: 1, summary, filteredSummary: summary,
+  await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route, {
+    ...unifiedAgents, value: [value], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: value.packages.length }, summary, filteredSummary: summary,
     inventoryScope, scopeSummary: summary,
-    facets: { environments: value.environment ? [{ value: environmentId, label: value.environment.displayName }] : [], platforms: [] },
-  } }));
+  }));
   if (value.powerPlatformResource) await page.route(`**/api/inventory/resources/${value.powerPlatformResource.nativeId}/related*`, route => {
     const query = new URL(route.request().url()).searchParams;
     expect(query.get("snapshotId")).toBe(observation.snapshotId);

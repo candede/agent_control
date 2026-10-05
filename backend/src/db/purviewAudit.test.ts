@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import { nativeInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import type { PurviewAuditFilters, PurviewAuditPartialReason, PurviewAuditRecord, PurviewAuditResult } from "../types/purviewAudit.js";
 import { PurviewAuditRepository, type PurviewAuditScope } from "./purviewAudit.js";
 
@@ -166,17 +167,8 @@ describe.sequential("Purview audit repository", () => {
   });
 
   it("associates only exact BotId plus environment matches from the reader's current inventory", async () => {
-    const inventoryJob = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_refresh_jobs
-      (id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
-      VALUES(gen_random_uuid(),$1,$2,'audit-association',repeat('a',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`, [scope.tenantId, scope.resultScope.scopeId])).rows[0].id;
-    const snapshot = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_inventory_snapshots
-      (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count)
-      VALUES(gen_random_uuid(),$1,$2,$3,repeat('a',64),'full','["microsoft.copilotstudio/agents"]',$4,1,1,1,0) RETURNING id`,
-      [inventoryJob, scope.tenantId, scope.resultScope.scopeId, JSON.stringify(["microsoft.copilotstudio/agents"])])).rows[0].id;
-    await fixture.operator.query(`INSERT INTO power_platform_inventory_resources
-      (snapshot_id,tenant_id,principal_id,native_id,resource_type,environment_id,source_system,creator_type,agent_kind,lifecycle,identity_confidence,identifiers,provenance,details,unknown_field_count)
-      VALUES($1,$2,$3,'inventory-agent','microsoft.copilotstudio/agents','environment-a','power_platform','unknown','copilot_studio_agent','unknown','exact_native',$4,'{}','{}',0)`,
-    [snapshot, scope.tenantId, scope.resultScope.scopeId, JSON.stringify([{ kind: "cds_bot_id", value: "bot-a" }])]);
+    await nativeInventoryFixture(fixture.runtime, { tenantId: scope.tenantId, principalId: scope.resultScope.scopeId },
+      [{ nativeId: "inventory-agent", environmentId: "environment-a", identifiers: [{ kind: "cds_bot_id", value: "bot-a" }] }]);
     const job = await submitAndBegin("association");
     await repository.recordProviderQuery(scope, job.id, job.execution, "provider-query-association", "succeeded");
     await repository.publish(scope, job.id, job.execution, result([

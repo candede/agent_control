@@ -12,11 +12,6 @@ export type TenantConfiguration = {
 
 const identifierPattern = /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const tenantRegistryValue = secretValue("TENANTS_JSON");
-const legacyIdentity = {
-  tenantId: tenantRegistryValue === undefined ? secretValue("TENANT_ID") : undefined,
-  clientId: tenantRegistryValue === undefined ? secretValue("CLIENT_ID") : undefined,
-  clientSecret: tenantRegistryValue === undefined ? secretValue("CLIENT_SECRET") : undefined,
-};
 const tenants: readonly TenantConfiguration[] = readTenantConfigurations();
 
 const port = Number(process.env.PORT ?? 3001);
@@ -35,7 +30,7 @@ export const config = {
   sessionSecret: secretValue("SESSION_SECRET") ?? "",
   trustProxy: deploymentTarget === "azure" || process.env.TRUST_PROXY === "1",
 };
-export const authConfigured = config.tenants.length > 0 && config.tenants.every(tenant => tenant.domains.length > 0);
+export const authConfigured = config.tenants.length > 0;
 
 export function findTenantConfiguration(tenantId: string | undefined) {
   return typeof tenantId === "string" ? config.tenants.find(tenant => tenant.tenantId === tenantId.toLowerCase()) : undefined;
@@ -80,24 +75,23 @@ function normalizeDomain(value: string) {
 }
 
 function readTenantConfigurations(): TenantConfiguration[] {
-  if (tenantRegistryValue !== undefined) {
-    let parsed: unknown;
-    try { parsed = JSON.parse(tenantRegistryValue); }
-    catch { throw new Error("TENANTS_JSON must contain a JSON array of tenant profiles."); }
-    if (!Array.isArray(parsed)) throw new Error("TENANTS_JSON must contain a JSON array of tenant profiles.");
-    const profiles = parsed.map((value: unknown, index) => parseTenantConfiguration(value, `TENANTS_JSON entry ${index + 1}`));
-    assertUniqueTenants(profiles);
-    return profiles;
+  if (tenantRegistryValue === undefined) {
+    if (["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "TENANT_DOMAINS", "TENANT_DISPLAY_NAME"].some(name =>
+      process.env[name] !== undefined || process.env[`${name}_FILE`] !== undefined)) {
+      throw new Error("Runtime tenant configuration must use TENANTS_JSON or TENANTS_JSON_FILE with accepted sign-in domains.");
+    }
+    return [];
   }
-  const { tenantId, clientId, clientSecret } = legacyIdentity;
-  if (!tenantId || !clientId || !clientSecret) return [];
-  const domains = secretValue("TENANT_DOMAINS")?.split(",").map(value => value.trim()).filter(Boolean) ?? [];
-  return [parseTenantConfiguration({
-    tenantId, clientId, clientSecret, domains, displayName: process.env.TENANT_DISPLAY_NAME,
-  }, "Legacy tenant settings", true)];
+  let parsed: unknown;
+  try { parsed = JSON.parse(tenantRegistryValue); }
+  catch { throw new Error("TENANTS_JSON must contain a JSON array of tenant profiles."); }
+  if (!Array.isArray(parsed)) throw new Error("TENANTS_JSON must contain a JSON array of tenant profiles.");
+  const profiles = parsed.map((value: unknown, index) => parseTenantConfiguration(value, `TENANTS_JSON entry ${index + 1}`));
+  assertUniqueTenants(profiles);
+  return profiles;
 }
 
-function parseTenantConfiguration(value: unknown, label: string, allowMissingDomains = false): TenantConfiguration {
+function parseTenantConfiguration(value: unknown, label: string): TenantConfiguration {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a tenant profile.`);
   const profile = value as Record<string, unknown>;
   if (typeof profile.tenantId !== "string" || !identifierPattern.test(profile.tenantId)
@@ -107,7 +101,7 @@ function parseTenantConfiguration(value: unknown, label: string, allowMissingDom
   if (typeof profile.clientSecret !== "string" || !profile.clientSecret.trim() || /[\r\n\0]/.test(profile.clientSecret)) {
     throw new Error(`${label}: clientSecret must be a non-empty, single-line secret value.`);
   }
-  if (!Array.isArray(profile.domains) || (!allowMissingDomains && profile.domains.length === 0)) {
+  if (!Array.isArray(profile.domains) || profile.domains.length === 0) {
     throw new Error(`${label}: domains must contain at least one accepted sign-in domain.`);
   }
   const domains = profile.domains.map((domain: unknown) => {
@@ -163,13 +157,6 @@ export function validateRuntimeConfig() {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("PORT is invalid.");
   if (!Number.isSafeInteger(config.officialUsageStaleDays) || config.officialUsageStaleDays < 1 || config.officialUsageStaleDays > 365) throw new Error("OFFICIAL_USAGE_STALE_AFTER_DAYS must be an integer from 1 to 365.");
   if (Buffer.byteLength(config.sessionSecret) < 32) throw new Error("SESSION_SECRET requires at least 32 bytes; recover the existing secret file.");
-  if (tenantRegistryValue === undefined) {
-    const configuredAuthValues = Object.values(legacyIdentity).filter(Boolean).length;
-    if (configuredAuthValues !== 0 && configuredAuthValues !== 3) throw new Error("TENANT_ID, CLIENT_ID, and CLIENT_SECRET must be configured together.");
-    if (configuredAuthValues === 3 && !authConfigured) {
-      throw new Error("Existing tenant credentials are retained. Add TENANT_DOMAINS or migrate them to TENANTS_JSON with accepted sign-in domains.");
-    }
-  }
   if (config.deploymentTarget === "azure" && (config.nodeEnv !== "production" || origin.protocol !== "https:" || callback.protocol !== "https:" || !authConfigured)) {
     throw new Error("Azure requires production mode, HTTPS origins, and configured Entra authentication.");
   }

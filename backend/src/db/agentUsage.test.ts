@@ -1,392 +1,375 @@
+import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { AgentUsageService, combineAgentInventoryRevision } from "../services/agentUsage.js";
+import { OfficialAgentUsage } from "../services/officialAgentUsage.js";
+import { LargeTenantUsersReports } from "../services/largeTenantUsersReports.js";
 import { AuditLog } from "../services/auditLog.js";
-import type { AgentUsageAssociationRemoval } from "../types/agentUsage.js";
-import { AgentUsageRepository } from "./agentUsage.js";
+import type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
+import type { ReportQuery } from "../types/officialReportData.js";
 import {
-  deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIntent,
+  awaitUsageInventoryExpiry, deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope,
 } from "./agentUsageTestSupport.js";
-import { OfficialUsageRepository } from "./officialUsage.js";
-import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
+import { OfficialReportImports } from "./officialReportImports.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let service: AgentUsageService;
-
+let reports: LargeTenantUsersReports, service: OfficialAgentUsage;
 beforeAll(async () => {
   fixture = await testDatabase();
-  service = new AgentUsageService(fixture.runtime);
-}, 60_000);
+  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-native-agent-usage-read-secret", 35);
+  service = new OfficialAgentUsage(reports);
+});
 afterAll(async () => { await fixture?.close(); });
 afterEach(() => vi.restoreAllMocks());
 
-describe("persisted reviewed agent usage", () => {
-  it("projects exact package IDs onto existing logical agents without association writes or inventory changes", async () => {
+async function selected(scope: AgentUsageScope, query: ReportQuery = {}) {
+  const identity = await usageIdentity(fixture.runtime, scope);
+  return { identity, selection: await reports.capture(identity, "delegated", "official_agents", query) };
+}
+async function inventory(scope: AgentUsageScope, records: readonly { id: string }[]) {
+  return reports.history.connections.selectedRead(async client =>
+    service.inventorySummaries(client, await reports.currentInventoryData(client, scope), records.map(record => record.id)));
+}
+async function associate(scope: AgentUsageScope, recordId: string, input: CandidateAgentUsageMutation) {
+  return service.mutate(await usageIdentity(fixture.runtime, scope), recordId, input, usageAudit(scope).actor);
+}
+function removal(input: CandidateAgentUsageMutation): CandidateAgentUsageMutation {
+  const { target: _target, ...result } = input;
+  return result;
+}
+async function selectSet(scope: AgentUsageScope, setId: string) {
+  const imports = new OfficialReportImports(fixture.runtime), identity = await usageIdentity(fixture.runtime, scope);
+  return imports.confirm(identity, await imports.confirmPreview(identity, setId, "select"));
+}
+async function associationCount(tenantId: string) {
+  return (await fixture.runtime.query<{ count: number }>("SELECT count(*)::int AS count FROM agent_usage_associations WHERE tenant_id=$1", [tenantId])).rows[0].count;
+}
+async function sourceRows(tenantId: string) {
+  return (await fixture.runtime.query(`SELECT to_jsonb(source) AS value FROM unified_agent_memberships source
+    JOIN inventory_memberships m ON m.generation_id=source.generation_id AND m.identity=source.identity
+    JOIN inventory_roots root ON root.baseline_id=m.baseline_id AND root.current
+      AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
+    WHERE source.tenant_id=$1 ORDER BY source.source_scope_id,source.source_identity LIMIT 250`, [tenantId])).rows;
+}
+
+describe("persisted reviewed agent usage through exact native contracts", () => {
+  it("projects exact package IDs without association writes or inventory changes and pages associations separately", async () => {
     const scope = newUsageScope();
     const records = await saveUsageInventory(fixture.runtime, scope, [
       { packages: ["Report-A", "Report-B"], native: { nativeId: "Native-A", environmentId: "env-a" } },
-      { packages: ["Report-Zero"] },
-      { packages: ["Report-Missing"] },
-      { packages: [], native: { nativeId: "Report-A", environmentId: "env-b" } },
+      { packages: ["Report-Zero"] }, { packages: ["Report-Missing"] }, { packages: [], native: { nativeId: "Report-A", environmentId: "env-b" } },
     ]);
     await publishUsageReports(fixture.runtime, scope);
-    const before = await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY source,native_id", [scope.tenantId]);
-    const result = await service.project(scope, records);
-    expect(result.summaries.get(records[0].id)).toMatchObject({
-      status: "linked", responses: 30, activeUsers: 3,
-      associations: [
-        { reportAgentId: "Report-A", basis: "exact_package_id", target: { source: "graph_packages", packageId: "Report-A" } },
-        { reportAgentId: "Report-B", basis: "exact_package_id", target: { source: "graph_packages", packageId: "Report-B" } },
-      ],
-    });
-    expect(result.summaries.get(records[1].id)).toMatchObject({ status: "linked", responses: 0, activeUsers: 0 });
-    expect(result.summaries.get(records[2].id)).toMatchObject({ status: "linked", responses: 1, activeUsers: null });
-    expect(result.summaries.get(records[3].id)).toMatchObject({ status: "unlinked", responses: null });
+    const before = await sourceRows(scope.tenantId);
+    expect(before).toHaveLength(6);
+    expect(await inventory(scope, records)).toMatchObject([
+      { status: "linked", responses: 30, activeUsers: 3, associationCount: 2 },
+      { status: "linked", responses: 0, activeUsers: 0 }, { status: "linked", responses: 1, activeUsers: null }, { status: "unlinked", responses: null },
+    ]);
+    const { identity, selection } = await selected(scope);
+    const first = await service.associations(selection.id, identity, records[0].id, { limit: 1 });
+    expect(first.value).toMatchObject([{ reportAgentId: "Report-A", basis: "exact_package_id", target: { source: "graph_packages", packageId: "Report-A" } }]);
+    expect(first.counts).toEqual({ total: 2, filtered: 2 });
+    const second = await service.associations(selection.id, identity, records[0].id, { limit: 1, cursor: first.page.nextCursor! });
+    expect(second.value).toMatchObject([{ reportAgentId: "Report-B", basis: "exact_package_id" }]);
+    expect(second.page.nextCursor).toBeNull();
     expect(await associationCount(scope.tenantId)).toBe(0);
-    expect(await new AuditLog(scope, fixture.runtime).listEvents({ action: "associate-agent-usage" })).toEqual([]);
-    expect((await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY source,native_id", [scope.tenantId])).rows)
-      .toEqual(before.rows);
+    expect(await new AuditLog(scope, fixture.runtime).listEvents()).toEqual([]);
+    expect(await sourceRows(scope.tenantId)).toEqual(before);
   });
 
-  it("matches each newly selected report automatically and never adds overlapping report totals", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
-    const first = await publishUsageReports(fixture.runtime, scope, 179);
-    const previous = await service.project(scope, records);
-    const second = await publishUsageReports(fixture.runtime, scope, 181);
-    const current = await service.project(scope, records);
-    expect(previous.summaries.get(records[0].id)).toMatchObject({ reportSetId: first.setId, responses: 179 });
-    expect(current.summaries.get(records[0].id)).toMatchObject({
-      reportSetId: second.setId, responses: 181, associations: [{ basis: "exact_package_id" }],
-    });
-    expect(current.context.revision).not.toBe(previous.context.revision);
-    const reports = new OfficialUsageRepository(fixture.runtime);
-    const selection = await reports.previewSetOperation(scope, "select", first.setId);
-    await reports.confirmSetOperation(scope, selection.id, {
-      operation: "select", setId: first.setId, expectedRevision: selection.expectedRevision, confirmationHash: selection.confirmationHash,
-    });
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({
-      reportSetId: first.setId, responses: 179,
-    });
+  it("matches newly selected reports without adding overlapping totals and fences mutations against old selections", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    const first = await publishUsageReports(fixture.runtime, scope, 179), previous = await inventory(scope, records);
+    const second = await publishUsageReports(fixture.runtime, scope, 181), current = await inventory(scope, records);
+    expect(previous[0]).toMatchObject({ reportSetId: first.setId, responses: 179 });
+    expect(current[0]).toMatchObject({ reportSetId: second.setId, responses: 181 });
+    await selectSet(scope, first.setId);
+    expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: first.setId, responses: 179 });
     await deleteUsageSet(fixture.runtime, scope, first.setId);
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({
-      status: "unavailable", responses: null,
-    });
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unavailable", responses: null });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
 
-  it("scopes automatic matching to each tenant and viewer's current saved package evidence", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+  it("scopes automatic matches to each tenant and viewer's current source evidence", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }],
+      { expiresAt: new Date(Date.now() + 3000) });
     await publishUsageReports(fixture.runtime, scope);
-    const viewer = { ...scope, principalId: "automatic-viewer" };
-    const otherRecords = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Report-A"] }]);
-    expect(otherRecords[0].id).not.toBe(records[0].id);
-    expect((await service.project(viewer, otherRecords)).summaries.get(otherRecords[0].id)).toMatchObject({
-      status: "linked", responses: 10,
-    });
-    const otherTenant = newUsageScope();
-    const foreign = await saveUsageInventory(fixture.runtime, otherTenant, [{ packages: ["Report-A"] }]);
-    expect((await service.project(otherTenant, foreign)).summaries.get(foreign[0].id)).toMatchObject({ status: "unavailable", responses: null });
-    await publishUsageReports(fixture.runtime, otherTenant, 99);
-    expect((await service.project(otherTenant, foreign)).summaries.get(foreign[0].id)).toMatchObject({ responses: 99 });
-    await fixture.operator.query("UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2",
-      [scope.tenantId, scope.principalId]);
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ status: "unlinked", responses: null });
-    expect((await service.project(viewer, otherRecords)).summaries.get(otherRecords[0].id)).toMatchObject({ responses: 10 });
+    const viewer = { ...scope, principalId: "automatic-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Report-A"] }]);
+    expect(other[0].id).not.toBe(records[0].id);
+    expect((await inventory(viewer, other))[0]).toMatchObject({ status: "linked", responses: 10 });
+    const foreignScope = newUsageScope(), foreign = await saveUsageInventory(fixture.runtime, foreignScope, [{ packages: ["Report-A"] }]);
+    expect((await inventory(foreignScope, foreign))[0]).toMatchObject({ status: "unavailable", responses: null });
+    await publishUsageReports(fixture.runtime, foreignScope, 99);
+    expect((await inventory(foreignScope, foreign))[0].responses).toBe(99);
+    await awaitUsageInventoryExpiry(fixture.runtime, scope);
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unlinked", responses: null });
+    expect((await inventory(viewer, other))[0].responses).toBe(10);
+    const { identity, selection } = await selected(scope);
+    await expect(service.summaries(selection.id, identity, [records[0].id])).rejects.toMatchObject({ code: "agent_not_found" });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
 
-  it("provides explicit unavailable metrics and current-record-only candidate browsing", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
-    const result = await service.project(scope, records);
-    expect(result.context.availability).toBe("never_imported");
-    expect([...result.summaries.values()]).toEqual(records.map(() => ({
-      status: "unavailable", reportSetId: null, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
-    })));
-    expect(await service.candidates(scope, records[0].id, { offset: 0, limit: 50 })).toMatchObject({ value: [], count: 0 });
-    await expect(service.candidates({ ...scope, principalId: "other" }, records[0].id, { offset: 0, limit: 50 }))
-      .rejects.toMatchObject({ status: 404, code: "agent_not_found" });
+  it("returns unavailable nulls without reports and permits candidates only for the current exact record", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
+    const { identity, selection } = await selected(scope);
+    const summaries = await service.summaries(selection.id, identity, records.map(record => record.id));
+    expect(summaries).toHaveLength(records.length);
+    expect(summaries.every(row => row.status === "unavailable" && row.responses === null && row.activeUsers === null
+      && row.context.reports.availability === "never_imported" && row.associationCount === 0)).toBe(true);
+    expect(await service.candidates(selection.id, identity, records[0].id, {})).toMatchObject({ value: [], counts: { total: 0, filtered: 0 } });
+    const other = await selected({ ...scope, principalId: "other" });
+    await expect(service.candidates(other.selection.id, other.identity, records[0].id, {})).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
-  it("returns bounded Agents-only candidates without user rows or automatic association", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("returns cursor-bounded Agents-only candidates without disclosing user rows or creating associations", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const result = await service.candidates(scope, records[0].id, { search: "reported", offset: 1, limit: 2 });
-    expect(result).toMatchObject({ count: 4, offset: 1, limit: 2, context: { availability: "active" } });
-    expect(result.value.map(value => value.agentId)).toEqual(["Report-B", "Report-Missing"]);
-    expect(result.value.every(value => value.associated === false)).toBe(true);
-    expect(JSON.stringify(result)).not.toMatch(/CaseUser|caseuser|Shared|ZeroUser|BridgeUser|username|displayName/);
-    expect((await service.project(scope, records)).summaries.get(records[0].id))
-      .toMatchObject({ status: "unlinked", responses: null, activeUsers: null });
+    const { identity, selection } = await selected(scope, { search: "reported", sort: "name", order: "asc" });
+    const first = await service.candidates(selection.id, identity, records[0].id, { limit: 1 });
+    const page = await service.candidates(selection.id, identity, records[0].id, { limit: 2, cursor: first.page.nextCursor!,
+      inventoryRevision: first.context.inventoryRevision });
+    expect(page.counts).toEqual({ total: 4, filtered: 4 });
+    expect(page.value.map(row => row.agentId)).toEqual(["Report-B", "Report-Missing"]);
+    expect(page.value.every(row => !row.associated)).toBe(true);
+    expect(JSON.stringify(page)).not.toMatch(/CaseUser|caseuser|Shared|ZeroUser|BridgeUser|username|displayName/);
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unlinked", responses: null });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
 
-  it("commits merged report metrics and success audits atomically without changing inventory authority", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("commits merged metrics and success audits atomically without changing inventory authority", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const before = await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY native_id", [scope.tenantId]);
-    const initialRevision = await service.revision(scope);
-    const one = await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
-    expect(one.context.revision).not.toBe(initialRevision);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-B", { source: "graph_packages", packageId: "Package-B" }), usageAudit(scope));
-    const result = await service.project(scope, records);
-    expect(result.summaries.get(records[0].id)).toMatchObject({
-      status: "linked", responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z",
-    });
-    expect(result.summaries.get(records[0].id)!.associations.map(value => value.reportAgentId)).toEqual(["Report-A", "Report-B"]);
-    expect(result.summaries.get(records[1].id)).toMatchObject({ status: "unlinked", responses: null, activeUsers: null });
-    expect((await service.candidates(scope, records[0].id, { offset: 0, limit: 50 })).value.filter(value => value.associated).map(value => value.agentId))
-      .toEqual(["Report-A", "Report-B"]);
-    expect((await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY native_id", [scope.tenantId])).rows)
-      .toEqual(before.rows);
+    const before = await sourceRows(scope.tenantId);
+    expect(before).toHaveLength(3);
+    const initial = await usageIntent(fixture.runtime, scope);
+    const one = await associate(scope, records[0].id, initial);
+    expect(one.usageRevision).not.toBe(initial.usageRevision);
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-B", { source: "graph_packages", packageId: "Package-B" }));
+    expect(await inventory(scope, records)).toMatchObject([{ status: "linked", responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z" },
+      { status: "unlinked", responses: null, activeUsers: null }]);
+    const { identity, selection } = await selected(scope);
+    expect((await service.associations(selection.id, identity, records[0].id, {})).value.map(row => row.reportAgentId)).toEqual(["Report-A", "Report-B"]);
+    expect((await service.candidates(selection.id, identity, records[0].id, {})).value.filter(row => row.associated).map(row => row.agentId)).toEqual(["Report-B", "Report-A"]);
+    expect(await sourceRows(scope.tenantId)).toEqual(before);
     const audit = await new AuditLog(scope, fixture.runtime).listEvents({ action: "associate-agent-usage" });
     expect(audit).toHaveLength(2);
     expect(audit.every(event => event.status === "succeeded" && event.metadata?.selection === "admin_reviewed"
-      && event.metadata?.reportSetId === one.context.reportSet?.id && !event.targetBlockedState)).toBe(true);
-    expect(audit.every(event => /^[a-f0-9]{64}$/.test(String(event.metadata?.reportAgentHash)))).toBe(true);
+      && event.metadata.reportSetId === one.reportSetId && !event.targetBlockedState && /^[a-f0-9]{64}$/.test(String(event.metadata.reportAgentHash)))).toBe(true);
+    expect(audit.map(event => event.metadata?.targetSelectionHash).sort()).toEqual(["Package-A", "Package-B"].map(nativeId =>
+      createHash("sha256").update(JSON.stringify(JSON.stringify(["graph_packages", "", nativeId]))).digest("hex")).sort());
+  });
+
+  it("aggregates one hundred exact canonical targets in one bounded query without multiplying shared users", async () => {
+    const scope = newUsageScope();
+    const records = await saveUsageInventory(fixture.runtime, scope, [
+      { packages: ["Report-A", "Report-B"] },
+      ...Array.from({ length: 99 }, (_, index) => ({ packages: [`unmatched-${index}`] })),
+    ]);
+    await publishUsageReports(fixture.runtime, scope);
+    await reports.history.connections.selectedRead(async client => {
+      const context = await reports.currentInventoryData(client, scope);
+      const query = vi.spyOn(client, "query");
+      try {
+        const summaries = await service.inventorySummaries(client, context, records.map(record => record.id));
+        expect(summaries).toHaveLength(100);
+        expect(summaries[0]).toMatchObject({ recordId: records[0].id, responses: 30, activeUsers: 3, associationCount: 2 });
+        expect(summaries.slice(1).every(summary => summary.status === "unlinked" && summary.responses === null)).toBe(true);
+        expect(query).toHaveBeenCalledOnce();
+        expect(query.mock.calls[0][1]?.[7]).toHaveLength(100);
+        expect(Buffer.byteLength(JSON.stringify(query.mock.calls[0][1]))).toBeLessThanOrEqual(1024 * 1024);
+        expect(Buffer.byteLength(JSON.stringify(summaries))).toBeLessThanOrEqual(1024 * 1024);
+        await expect(service.inventorySummaries(client, context, [...records.map(record => record.id), records[0].id]))
+          .rejects.toMatchObject({ code: "data_exact_ids_limit" });
+        await expect(service.inventorySummaries(client, context, [records[0].id, records[0].id.toUpperCase().replace("AGENT:", "agent:")]))
+          .rejects.toMatchObject({ code: "data_exact_ids_limit" });
+        expect(query).toHaveBeenCalledOnce();
+      } finally { query.mockRestore(); }
+    });
   });
 
   it("distinguishes explicit zero from absent companion evidence after persistence", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-Zero"), usageAudit(scope));
-    expect((await service.project(scope, records)).summaries.get(records[0].id))
-      .toMatchObject({ responses: 0, activeUsers: 0, lastActivityDateUtc: null });
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-Missing"), usageAudit(scope));
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ responses: 1, activeUsers: null });
-    await expect(service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Bridge-Only"), usageAudit(scope)))
-      .rejects.toMatchObject({ code: "usage_report_agent_not_found" });
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-Zero"));
+    expect((await inventory(scope, records))[0]).toMatchObject({ responses: 0, activeUsers: 0, lastActivityDateUtc: null });
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-Missing"));
+    expect((await inventory(scope, records))[0]).toMatchObject({ responses: 1, activeUsers: null });
+    await expect(associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Bridge-Only"))).rejects.toMatchObject({ code: "usage_report_agent_not_found" });
   });
 
-  it("shares only source-qualified associations across private viewer UUIDs and isolates tenants", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("shares source-qualified associations across private viewer UUIDs but isolates tenants", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
-    const viewer = { ...scope, principalId: "another-viewer" };
-    const otherRecords = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }, { packages: ["Package-C"] }]);
-    expect(otherRecords[0].id).not.toBe(records[0].id);
-    const otherProjection = await service.project(viewer, otherRecords);
-    expect(otherProjection.summaries.get(otherRecords[0].id)).toMatchObject({ status: "linked", responses: 10, activeUsers: 2 });
-    expect(otherProjection.summaries.get(otherRecords[1].id)).toMatchObject({ status: "unlinked", responses: null });
-    const otherTenant = newUsageScope();
-    const foreignRecords = await saveUsageInventory(fixture.runtime, otherTenant, [{ packages: ["Package-A"] }]);
-    await publishUsageReports(fixture.runtime, otherTenant);
-    expect((await service.project(otherTenant, foreignRecords)).summaries.get(foreignRecords[0].id))
-      .toMatchObject({ status: "unlinked", responses: null });
-    await expect(service.candidates(viewer, records[0].id, { offset: 0, limit: 50 })).rejects.toMatchObject({ code: "agent_not_found" });
-    await expect(service.attach(otherTenant, records[0].id, await usageIntent(fixture.runtime, otherTenant), usageAudit(otherTenant)))
-      .rejects.toMatchObject({ code: "agent_not_found" });
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const viewer = { ...scope, principalId: "another-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }, { packages: ["Package-C"] }]);
+    expect(other[0].id).not.toBe(records[0].id);
+    expect(await inventory(viewer, other)).toMatchObject([{ status: "linked", responses: 10, activeUsers: 2 }, { status: "unlinked", responses: null }]);
+    const foreignScope = newUsageScope(), foreign = await saveUsageInventory(fixture.runtime, foreignScope, [{ packages: ["Package-A"] }]);
+    await publishUsageReports(fixture.runtime, foreignScope);
+    expect((await inventory(foreignScope, foreign))[0]).toMatchObject({ status: "unlinked", responses: null });
+    const otherSelection = await selected(viewer);
+    await expect(service.candidates(otherSelection.selection.id, otherSelection.identity, records[0].id, {})).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(associate(foreignScope, records[0].id, await usageIntent(fixture.runtime, foreignScope))).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
-  it("uses the current Power Platform environment/GUID contract but not opaque-ID or package case folding", async () => {
-    const scope = newUsageScope();
-    const nativeId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+  it("uses environment/GUID normalization but never folds opaque IDs or package IDs", async () => {
+    const scope = newUsageScope(), nativeId = "abcdefab-1234-4567-89ab-abcdefabcdef";
     const records = await saveUsageInventory(fixture.runtime, scope, [
-      { packages: [], native: { nativeId, environmentId: "ENV-A" } },
-      { packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "ENV-B" } },
-      { packages: [nativeId] },
-      { packages: [], native: { nativeId: "Opaque-ID", environmentId: null } },
-      { packages: [], native: { nativeId: "opaque-id", environmentId: null } },
+      { packages: [], native: { nativeId, environmentId: "ENV-A" } }, { packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "ENV-B" } },
+      { packages: [nativeId] }, { packages: [], native: { nativeId: "Opaque-ID", environmentId: null } }, { packages: [], native: { nativeId: "opaque-id", environmentId: null } },
     ]);
     await publishUsageReports(fixture.runtime, scope);
     const target = { source: "power_platform" as const, nativeId: nativeId.toUpperCase(), environmentId: "env-a" };
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", target), usageAudit(scope));
-    await service.attach(scope, records[3].id, await usageIntent(fixture.runtime, scope, "Report-B",
-      { source: "power_platform", nativeId: "Opaque-ID", environmentId: null }), usageAudit(scope));
-    const result = await service.project(scope, records);
-    expect(records.map(record => result.summaries.get(record.id)?.responses)).toEqual([10, null, null, 20, null]);
-    const viewer = { ...scope, principalId: "pp-viewer" };
-    const shared = await saveUsageInventory(fixture.runtime, viewer, [{ packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "env-a" } }]);
-    expect((await service.project(viewer, shared)).summaries.get(shared[0].id)).toMatchObject({ status: "linked", responses: 10 });
-    await expect(service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-Missing",
-      { ...target, environmentId: "env-b" }), usageAudit(scope))).rejects.toMatchObject({ code: "usage_target_mismatch" });
-    await expect(service.attach(scope, records[2].id, await usageIntent(fixture.runtime, scope, "Report-Missing",
-      { source: "graph_packages", packageId: nativeId.toUpperCase() }), usageAudit(scope))).rejects.toMatchObject({ code: "usage_target_mismatch" });
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", target));
+    await associate(scope, records[3].id, await usageIntent(fixture.runtime, scope, "Report-B", { source: "power_platform", nativeId: "Opaque-ID", environmentId: null }));
+    expect((await inventory(scope, records)).map(row => row.responses)).toEqual([10, null, null, 20, null]);
+    const viewer = { ...scope, principalId: "pp-viewer" }, shared = await saveUsageInventory(fixture.runtime, viewer, [{ packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "env-a" } }]);
+    expect((await inventory(viewer, shared))[0]).toMatchObject({ status: "linked", responses: 10 });
+    const valid = await usageIntent(fixture.runtime, scope, "Report-Missing", target);
+    await expect(associate(scope, records[0].id, { ...valid, target: { ...target, environmentId: "env-b" } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
+    const packageIntent = await usageIntent(fixture.runtime, scope, "Report-Missing", { source: "graph_packages", packageId: nativeId });
+    await expect(associate(scope, records[2].id, { ...packageIntent, target: { source: "graph_packages", packageId: nativeId.toUpperCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
   });
 
-  it("rejects conflicting reassignment, supports exact same-target retries, and requires explicit authorized removal", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("requires explicit authorized removal before reassignment while preserving same-target retries", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
     const initial = await usageIntent(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, initial, usageAudit(scope));
-    await expect(service.attach(scope, records[0].id, initial, usageAudit(scope))).rejects.toMatchObject({ code: "agent_usage_changed" });
+    await associate(scope, records[0].id, initial);
+    await expect(associate(scope, records[0].id, initial)).rejects.toMatchObject({ code: "agent_usage_changed" });
     const current = await usageIntent(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, current, usageAudit(scope));
-    expect(await service.revision(scope)).toBe(current.expectedUsageRevision);
-    await expect(service.attach(scope, records[0].id, { ...current, target: { source: "graph_packages", packageId: "Package-B" } }, usageAudit(scope)))
-      .rejects.toMatchObject({ code: "usage_association_conflict" });
-    await expect(service.remove(scope, records[1].id, removal(current), usageAudit(scope))).rejects.toMatchObject({ code: "usage_association_not_found" });
-    await service.remove(scope, records[0].id, removal(current), usageAudit(scope));
-    expect(await service.revision(scope)).not.toBe(initial.expectedUsageRevision);
-    await service.attach(scope, records[1].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Package-C" }), usageAudit(scope));
-    const result = await service.project(scope, records);
-    expect(result.summaries.get(records[0].id)).toMatchObject({ status: "unlinked" });
-    expect(result.summaries.get(records[1].id)).toMatchObject({ status: "linked", responses: 10 });
+    expect((await associate(scope, records[0].id, current)).usageRevision).toBe(current.usageRevision);
+    await expect(associate(scope, records[0].id, { ...current, target: { source: "graph_packages", packageId: "Package-B" } })).rejects.toMatchObject({ code: "usage_association_conflict" });
+    const wrongOwner = await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Package-C" });
+    await expect(associate(scope, records[1].id, removal(wrongOwner))).rejects.toMatchObject({ code: "usage_association_not_found" });
+    await associate(scope, records[0].id, removal(current));
+    await associate(scope, records[1].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Package-C" }));
+    expect(await inventory(scope, records)).toMatchObject([{ status: "unlinked" }, { status: "linked", responses: 10 }]);
   });
 
-  it("serializes concurrent reviewed writes and retains one winner plus one failed audit", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("serializes concurrent reviewed writes with one winner and one failed audit", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const otherAdmin = { ...scope, principalId: "concurrent-administrator" };
-    const otherRecords = await saveUsageInventory(fixture.runtime, otherAdmin, [{ packages: ["Package-C"] }]);
-    const initial = await usageIntent(fixture.runtime, scope);
-    const otherIntent = await usageIntent(fixture.runtime, otherAdmin, "Report-A", { source: "graph_packages", packageId: "Package-C" });
-    const settled = await Promise.allSettled([
-      service.attach(scope, records[0].id, initial, usageAudit(scope)),
-      service.attach(otherAdmin, otherRecords[0].id, otherIntent, usageAudit(otherAdmin)),
-    ]);
+    const other = { ...scope, principalId: "concurrent-administrator" }, otherRecords = await saveUsageInventory(fixture.runtime, other, [{ packages: ["Package-C"] }]);
+    const initial = await usageIntent(fixture.runtime, scope), otherIntent = await usageIntent(fixture.runtime, other, "Report-A", { source: "graph_packages", packageId: "Package-C" });
+    const settled = await Promise.allSettled([associate(scope, records[0].id, initial), associate(other, otherRecords[0].id, otherIntent)]);
     expect(settled.map(value => value.status).sort()).toEqual(["fulfilled", "rejected"]);
-    expect(settled.find((value): value is PromiseRejectedResult => value.status === "rejected")?.reason)
-      .toMatchObject({ code: "agent_usage_changed" });
+    expect(settled.find((value): value is PromiseRejectedResult => value.status === "rejected")?.reason).toMatchObject({ code: "agent_usage_changed" });
     expect(await associationCount(scope.tenantId)).toBe(1);
-    const events = [...await new AuditLog(scope, fixture.runtime).listEvents(), ...await new AuditLog(otherAdmin, fixture.runtime).listEvents()];
-    expect(events.map(event => event.status).sort()).toEqual(["failed", "succeeded"]);
+    const audit = [...await new AuditLog(scope, fixture.runtime).listEvents(), ...await new AuditLog(other, fixture.runtime).listEvents()];
+    expect(audit.map(row => row.status).sort()).toEqual(["failed", "succeeded"]);
   });
 
-  it("rejects stale combined inventory revisions and source targets that disappeared", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("rejects stale exact inventory fingerprints and disappeared sources", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
     const input = await usageIntent(fixture.runtime, scope);
-    await expect(service.attach(scope, records[0].id, { ...input, expectedInventoryRevision: "f".repeat(64) }, usageAudit(scope)))
-      .rejects.toMatchObject({ code: "inventory_changed" });
-    await fixture.operator.query("UPDATE package_inventory_snapshots SET is_current=false WHERE tenant_id=$1 AND principal_id=$2",
-      [scope.tenantId, scope.principalId]);
-    await expect(service.attach(scope, records[0].id, input, usageAudit(scope))).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(associate(scope, records[0].id, { ...input, inventoryRevision: "f".repeat(64) })).rejects.toMatchObject({ code: "inventory_changed" });
+    await fixture.operator.query(`UPDATE data_scope_epochs SET epoch=epoch+1
+      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages'`, [scope.tenantId, scope.principalId]);
+    await expect(associate(scope, records[0].id, input)).rejects.toMatchObject({ code: "agent_not_found" });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
 
-  it("rolls back associations and their revision if the transaction's success audit fails", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("rolls back associations and their revision when the success audit fails", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const input = await usageIntent(fixture.runtime, scope);
-    const complete = AuditLog.prototype.completeEvent;
+    const input = await usageIntent(fixture.runtime, scope), complete = AuditLog.prototype.completeEvent;
     vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(function (id, update) {
-      if (update.status === "succeeded") return Promise.reject(new Error("Simulated audit persistence failure"));
-      return complete.call(this, id, update);
+      return update.status === "succeeded" ? Promise.reject(new Error("Simulated audit persistence failure")) : complete.call(this, id, update);
     });
-    await expect(service.attach(scope, records[0].id, input, usageAudit(scope))).rejects.toThrow("audit persistence");
+    await expect(associate(scope, records[0].id, input)).rejects.toThrow("audit persistence");
     expect(await associationCount(scope.tenantId)).toBe(0);
-    expect(await service.revision(scope)).toBe(input.expectedUsageRevision);
-    expect((await new AuditLog(scope, fixture.runtime).listEvents()).map(value => value.status)).toEqual(["failed"]);
+    expect((await usageIntent(fixture.runtime, scope)).usageRevision).toBe(input.usageRevision);
+    expect((await new AuditLog(scope, fixture.runtime).listEvents()).map(row => row.status)).toEqual(["failed"]);
   });
 
-  it("never carries associations into a newly accepted report set and fences old export revisions", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("never carries associations into a newly accepted set and fences old mutation revisions", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     const first = await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
-    const oldIntent = await usageIntent(fixture.runtime, scope);
-    const second = await publishUsageReports(fixture.runtime, scope, 11);
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const old = await usageIntent(fixture.runtime, scope), second = await publishUsageReports(fixture.runtime, scope, 11);
     expect(second.setId).not.toBe(first.setId);
-    const result = await service.project(scope, records);
-    expect(result.context.reportSet?.id).toBe(second.setId);
-    expect(result.summaries.get(records[0].id)).toMatchObject({ status: "unlinked", responses: null });
-    const combined = combineAgentInventoryRevision(await readUnifiedInventoryRevision(scope, fixture.runtime), await service.revision(scope));
-    expect(combined).not.toBe(oldIntent.expectedInventoryRevision);
-    await expect(service.remove(scope, records[0].id, removal(oldIntent), usageAudit(scope))).rejects.toMatchObject({ code: "agent_usage_changed" });
+    expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: second.setId, status: "unlinked", responses: null });
+    await expect(associate(scope, records[0].id, removal(old))).rejects.toMatchObject({ code: "agent_usage_changed" });
     expect(await associationCount(scope.tenantId)).toBe(1);
-    const reports = new OfficialUsageRepository(fixture.runtime);
-    const selection = await reports.previewSetOperation(scope, "select", first.setId);
-    await reports.confirmSetOperation(scope, selection.id, {
-      operation: "select", setId: first.setId, expectedRevision: selection.expectedRevision, confirmationHash: selection.confirmationHash,
-    });
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ status: "linked", responses: 10 });
+    await selectSet(scope, first.setId);
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "linked", responses: 10 });
   });
 
-  it("immediately cascades soft deletion and cannot publish or mutate the deleted set", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
-    const report = await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
+  it("immediately cascades deleted associations and invalidates previously captured reads and writes", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope), report = await publishUsageReports(fixture.runtime, scope);
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
     const old = await usageIntent(fixture.runtime, scope);
     await deleteUsageSet(fixture.runtime, scope, report.setId);
     expect(await associationCount(scope.tenantId)).toBe(0);
-    expect(await service.revision(scope)).not.toBe(old.expectedUsageRevision);
-    const result = await service.project(scope, records);
-    expect(result.context).toMatchObject({ availability: "deleted", reportSet: null, lineages: [] });
-    expect(result.summaries.get(records[0].id)).toMatchObject({ status: "unavailable", responses: null, activeUsers: null });
-    await expect(service.attach(scope, records[0].id, old, usageAudit(scope))).rejects.toMatchObject({ code: "agent_usage_changed" });
+    const current = await selected(scope), [summary] = await service.summaries(current.selection.id, current.identity, [records[0].id]);
+    expect(summary).toMatchObject({ status: "unavailable", responses: null, activeUsers: null, context: { reports: { availability: "deleted", setId: null, lineages: [] } } });
+    await expect(associate(scope, records[0].id, old)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
 
-  it.each(["set", "version", "artifact"])("fences %s expiry without waiting for retention", async entity => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
-    const report = await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
-    const old = await usageIntent(fixture.runtime, scope);
+  it.each(["set", "version", "artifact"] as const)("fences %s expiry before retention and honors dry-run collection", async entity => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope), report = await publishUsageReports(fixture.runtime, scope);
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const old = await usageIntent(fixture.runtime, scope), identity = await usageIdentity(fixture.runtime, scope);
+    // One shared slice visits one tenant; position this fixture at its actual turn before testing rollback.
+    if (entity === "set") await fixture.operator.query(`UPDATE data_lifecycle_progress
+      SET cursor=jsonb_build_object('step',0,'tenant',coalesce(
+        (SELECT max(tenant_id COLLATE "C") FROM official_usage_history_state WHERE tenant_id COLLATE "C"<$1 COLLATE "C"),''))
+      WHERE worker='operator'`, [scope.tenantId]);
+    if (entity === "set") await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [report.setId]);
+    else await fixture.operator.query(`UPDATE official_usage_${entity === "version" ? "versions" : "artifacts"} SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND kind='agents'`, [scope.tenantId]);
+    await expect(service.summaries(old.selectionId, identity, [records[0].id])).rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(associate(scope, records[0].id, old)).rejects.toMatchObject({ code: "selection_invalidated" });
     if (entity === "set") {
-      await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [report.setId]);
-    } else if (entity === "version") {
-      await fixture.operator.query("UPDATE official_usage_versions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND kind='agents'", [scope.tenantId]);
-    } else {
-      await fixture.operator.query("UPDATE official_usage_artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND kind='agents'", [scope.tenantId]);
-    }
-    expect(await service.revision(scope)).not.toBe(old.expectedUsageRevision);
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ status: "unavailable", responses: null });
-    expect((await service.candidates(scope, records[0].id, { offset: 0, limit: 50 })).value).toEqual([]);
-    await expect(service.attach(scope, records[0].id, old, usageAudit(scope))).rejects.toMatchObject({ code: "agent_usage_changed" });
-    if (entity === "set") {
-      const dry = await retain(fixture.operator, { batchSize: 100, dryRun: true });
-      expect(dry.affected.agentUsageAssociations).toBeGreaterThan(0);
+      expect((await retain(fixture.operator, { batchSize: 100, dryRun: true })).affected.officialHistoryExpired).toBeGreaterThan(0);
       expect(await associationCount(scope.tenantId)).toBe(1);
       await retain(fixture.operator, { batchSize: 100 });
       expect(await associationCount(scope.tenantId)).toBe(0);
     }
+    const current = await selected(scope);
+    expect((await service.candidates(current.selection.id, current.identity, records[0].id, {})).value).toEqual([]);
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unavailable", responses: null });
   });
 
-  it("keeps tenant associations through principal source cleanup but stops resolving absent sources", async () => {
-    const scope = newUsageScope();
-    const records = await saveUsageInventory(fixture.runtime, scope);
+  it("keeps tenant associations through principal cleanup but stops resolving absent sources", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    await service.attach(scope, records[0].id, await usageIntent(fixture.runtime, scope), usageAudit(scope));
-    const viewer = { ...scope, principalId: "retained-viewer" };
-    const other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }]);
-    await fixture.operator.query("DELETE FROM package_inventory_snapshots WHERE tenant_id=$1 AND principal_id=$2", [scope.tenantId, scope.principalId]);
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const viewer = { ...scope, principalId: "retained-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }]);
+    await saveUsageInventory(fixture.runtime, scope, []);
     expect(await associationCount(scope.tenantId)).toBe(1);
-    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ status: "unlinked", responses: null });
-    expect((await service.project(viewer, other)).summaries.get(other[0].id)).toMatchObject({ status: "linked", responses: 10 });
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unlinked", responses: null });
+    expect((await inventory(viewer, other))[0]).toMatchObject({ status: "linked", responses: 10 });
   });
 
-  it("holds source and report locks once for the entire saved snapshot", async () => {
-    const scope = newUsageScope();
-    await saveUsageInventory(fixture.runtime, scope);
+  it("holds source publication locks through the mutation audit and uses repeatable-read summary callbacks", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const repository = new AgentUsageRepository(fixture.runtime);
-    await repository.withSnapshot(scope, async client => {
-      await repository.readSources(scope, client);
-      await repository.read(scope, client);
-      const competitor = await fixture.runtime.connect();
-      try {
-        await competitor.query("BEGIN");
-        for (const key of [
-          `package-refresh:${scope.tenantId}:${scope.principalId}`, `power-platform:${scope.tenantId}:${scope.principalId}`, `official-usage:${scope.tenantId}`,
-        ]) {
-          expect((await competitor.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired", [key])).rows[0].acquired).toBe(false);
-        }
-      } finally {
-        await competitor.query("ROLLBACK");
-        competitor.release();
+    const complete = AuditLog.prototype.completeEvent;
+    vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
+      if (update.status === "succeeded") {
+        const competitor = await fixture.runtime.connect();
+        try {
+          await competitor.query("BEGIN");
+          expect((await competitor.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired",
+            [`data-sync:${scope.tenantId}:${scope.principalId}`])).rows[0].acquired).toBe(false);
+          const scopes = (await competitor.query(`SELECT id,source FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
+            AND source IN ('inventory_canonical','inventory_packages','inventory_power_platform') ORDER BY source`,
+          [scope.tenantId, scope.principalId])).rows;
+          expect(scopes.map(value => value.source)).toEqual(["inventory_canonical", "inventory_packages", "inventory_power_platform"]);
+          expect((await competitor.query("SELECT id FROM data_scope_epochs WHERE id=ANY($1::uuid[]) FOR UPDATE SKIP LOCKED",
+            [scopes.map(value => value.id)])).rows).toEqual([]);
+        } finally { await competitor.query("ROLLBACK"); competitor.release(); }
       }
+      return complete.call(this, id, update);
+    });
+    await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
+    const current = await selected(scope);
+    await reports.read(current.selection.id, current.identity, async (client, context) => {
+      expect((await client.query("SHOW transaction_isolation")).rows[0].transaction_isolation).toBe("repeatable read");
+      expect((await service.inventorySummaries(client, context, [records[0].id]))[0].responses).toBe(10);
     });
   });
 });
-
-function removal(input: Awaited<ReturnType<typeof usageIntent>>): AgentUsageAssociationRemoval {
-  const { target: _target, ...result } = input;
-  return result;
-}
-
-async function associationCount(tenantId: string) {
-  return (await fixture.runtime.query<{ count: number }>("SELECT count(*)::int AS count FROM agent_usage_associations WHERE tenant_id=$1", [tenantId])).rows[0].count;
-}

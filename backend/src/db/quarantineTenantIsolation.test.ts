@@ -3,11 +3,12 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "./copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { NativeInventory } from "./nativeInventory.js";
+import { nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: CopilotStudioQuarantineRepository;
-let inventory: PowerPlatformInventoryRepository;
+let inventory: NativeInventory;
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const botId = "22222222-2222-4222-8222-222222222222";
 const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 };
@@ -15,7 +16,7 @@ const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".re
 beforeAll(async () => {
   fixture = await testDatabase();
   repository = new CopilotStudioQuarantineRepository(fixture.runtime);
-  inventory = new PowerPlatformInventoryRepository(fixture.runtime);
+  inventory = new NativeInventory(fixture.runtime);
 });
 afterAll(async () => { await fixture?.close(); });
 
@@ -37,14 +38,9 @@ async function running(scope: QuarantineScope) {
       { kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }],
     provenance: {}, details: { isQuarantined: false },
   };
-  const refresh = await inventory.submit(scope, {
-    idempotencyKey: "same-refresh", roleScope: "full", requestedTypes: [resource.type],
-  });
-  await inventory.markRunning(scope, refresh.id);
-  const saved = await inventory.publish(scope, refresh.id, {
-    resources: [resource], queriedTypes: [resource.type], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
-  });
-  const target = (await inventory.resolveQuarantineTargets(scope, saved.snapshotId, [resource.nativeId]))[0];
+  const saved = await nativeInventoryFixture(fixture.runtime, scope, [resource]);
+  await reconcileInventoryFixture(fixture.runtime, scope);
+  const target = (await inventory.resolveQuarantineTargets(scope, saved.baselineId, [resource.nativeId]))[0];
   const directStatus = { environmentId, botId, isBotQuarantined: false, lastUpdateTimeUtc: "2026-09-01T00:00:00Z",
     observedAt: new Date().toISOString(), correlationId: randomUUID() };
   const input = {

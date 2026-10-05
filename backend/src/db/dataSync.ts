@@ -11,33 +11,14 @@ import {
   type DataSyncSourceStatus,
   type StartDataSyncInput,
 } from "../types/dataSync.js";
-import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
-import {
-  isCopilotAppActivityFresh,
-  isCopilotServiceSummaryState,
-  type CopilotUsageAttemptStatus,
-  type CopilotUsageSnapshotSource,
-  type SavedCopilotUsageSource,
-} from "../types/copilotUsage.js";
 import { pool, transaction } from "./pool.js";
-import { readAutomaticInventoryRevisions } from "./unifiedInventoryRevision.js";
-
-export type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../types/copilotUsage.js";
+import { readAutomaticInventoryRevisions } from "./inventoryAutomaticRevisions.js";
+import { dataConnections } from "./dataConnections.js";
+import { UserSourcesRepository } from "./userSources.js";
+import { config } from "../config.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
 export type UserSourcePublication = { runId: string; jobId: string };
-
-type CopilotDirectorySnapshot = {
-  serviceEvidenceVersion: 1;
-  users: readonly CopilotDirectoryUser[];
-};
-
-type UserSourceSnapshot =
-  | { sourceId: "directory"; value: CopilotDirectorySnapshot }
-  | { sourceId: "app_activity"; value: CopilotReportResult };
-
-const maximumSnapshotBytes = 32 * 1024 * 1024;
-const maximumSnapshotRows = 100_000;
 
 type RunRow = {
   id: string;
@@ -67,17 +48,6 @@ type MarkerRow = {
   count: number | null;
   last_success_at: Date;
   updated_at: Date;
-};
-
-type SavedSourceRow = {
-  source_id: CopilotUsageSnapshotSource;
-  attempt_status: CopilotUsageAttemptStatus | null;
-  message: string | null;
-  attempted_at: Date | null;
-  last_success_at: Date | null;
-  row_count: number | null;
-  observed_at: Date | null;
-  snapshot_data: unknown;
 };
 
 type SourceUpdate = {
@@ -139,28 +109,12 @@ export class DataSyncRepository {
 
   async automaticRevisions(scope: DataSyncScope) {
     validateScope(scope);
-    const [inventory, users] = await Promise.all([
-      readAutomaticInventoryRevisions(scope, this.database),
-      this.database.query<{ source_id: CopilotUsageSnapshotSource; report_refresh_date: string | null }>(`
-        SELECT state.source_id,state.attempt_status,state.message,state.attempted_at,
-          state.last_success_at,state.row_count,snapshot.id,snapshot.observed_at,
-          CASE WHEN state.source_id='app_activity' THEN snapshot.snapshot_data->>'reportRefreshDate' END AS report_refresh_date
-        FROM copilot_usage_source_state state
-        LEFT JOIN copilot_usage_snapshots snapshot
-          ON snapshot.id=state.current_snapshot_id AND snapshot.tenant_id=state.tenant_id
-          AND snapshot.principal_id=state.principal_id AND snapshot.source_id=state.source_id
-          AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-        WHERE state.tenant_id=$1 AND state.principal_id=$2 AND state.source_id IN ('directory','app_activity')
-        ORDER BY state.source_id`, [scope.tenantId, scope.principalId]),
-    ]);
-    const now = new Date();
-    return {
-      ...inventory,
-      users: hash(["automatic-users-v1", scope.tenantId, scope.principalId, users.rows.map(row => ({
-        ...row,
-        ...(row.source_id === "app_activity" ? { fresh: isCopilotAppActivityFresh(row.report_refresh_date, now) } : {}),
-      }))]),
-    };
+    return dataConnections(this.database).selectedRead(async client => {
+      const now = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
+      const inventory = await readAutomaticInventoryRevisions(scope, client, now);
+      const users = await new UserSourcesRepository(this.database, config.sessionSecret).metadataInRead(client, { ...scope, tokenMode: "delegated" }, now);
+      return { ...inventory, users: hash(["automatic-users-v2", scope.tenantId, scope.principalId, users]) };
+    });
   }
 
   async finishAutomatic(scope: DataSyncScope, runId: string) {
@@ -472,110 +426,6 @@ export class DataSyncRepository {
     return sources.rowCount ?? 0;
   }
 
-  async publishDirectory(scope: DataSyncScope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string, publication?: UserSourcePublication) {
-    return this.publishUserSource(scope, { sourceId: "directory", value: { serviceEvidenceVersion: 1, users: value } }, value.length, observedAt, message, publication);
-  }
-
-  async publishAppActivity(scope: DataSyncScope, value: CopilotReportResult, observedAt: string, message: string, publication?: UserSourcePublication) {
-    return this.publishUserSource(scope, { sourceId: "app_activity", value }, value.users.length, observedAt, message, publication);
-  }
-
-  async recordUserSourceFailure(
-    scope: DataSyncScope,
-    sourceId: CopilotUsageSnapshotSource,
-    status: Exclude<CopilotUsageAttemptStatus, "available">,
-    message: string,
-    attemptedAt: string,
-    publication?: UserSourcePublication,
-  ) {
-    validateScope(scope);
-    await transaction(this.database, async client => {
-      await lockScope(client, scope);
-      if (publication) await requireUserPublication(client, scope, publication);
-      await client.query(`INSERT INTO copilot_usage_source_state(
-          tenant_id,principal_id,source_id,attempt_status,message,attempted_at)
-        VALUES($1,$2,$3,$4,$5,$6)
-        ON CONFLICT (tenant_id,principal_id,source_id) DO UPDATE SET
-          attempt_status=EXCLUDED.attempt_status,message=EXCLUDED.message,
-          attempted_at=EXCLUDED.attempted_at,updated_at=clock_timestamp()`,
-      [scope.tenantId, scope.principalId, sourceId, status, boundedMessage(message), attemptedAt]);
-    });
-  }
-
-  async getUserSources(scope: DataSyncScope): Promise<{
-    directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
-    appActivity: SavedCopilotUsageSource<CopilotReportResult>;
-  }> {
-    const values = await this.readUserSources(scope, ["directory", "app_activity"], this.database);
-    return {
-      directory: projectSavedSource<CopilotDirectoryUser[]>("directory", values.get("directory")),
-      appActivity: projectSavedSource<CopilotReportResult>("app_activity", values.get("app_activity")),
-    };
-  }
-
-  async getDirectorySource(scope: DataSyncScope, database: Pick<pg.Pool, "query"> = this.database) {
-    const values = await this.readUserSources(scope, ["directory"], database);
-    return projectSavedSource<CopilotDirectoryUser[]>("directory", values.get("directory"));
-  }
-
-  private async readUserSources(scope: DataSyncScope, sources: readonly CopilotUsageSnapshotSource[], database: Pick<pg.Pool, "query">) {
-    validateScope(scope);
-    const result = await database.query<SavedSourceRow>(`SELECT state.source_id,state.attempt_status,state.message,
-        state.attempted_at,state.last_success_at,state.row_count,snapshot.observed_at,snapshot.snapshot_data
-      FROM copilot_usage_source_state state
-      LEFT JOIN copilot_usage_snapshots snapshot
-        ON snapshot.id=state.current_snapshot_id AND snapshot.tenant_id=state.tenant_id
-        AND snapshot.principal_id=state.principal_id AND snapshot.source_id=state.source_id
-        AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-      WHERE state.tenant_id=$1 AND state.principal_id=$2 AND state.source_id=ANY($3::text[])`,
-    [scope.tenantId, scope.principalId, sources]);
-    return new Map(result.rows.map(row => [row.source_id, row]));
-  }
-
-  private async publishUserSource(
-    scope: DataSyncScope,
-    snapshot: UserSourceSnapshot,
-    rowCount: number,
-    observedAt: string,
-    message: string,
-    publication?: UserSourcePublication,
-  ) {
-    validateScope(scope);
-    const { sourceId, value } = snapshot;
-    if (!Number.isSafeInteger(rowCount) || rowCount < 0 || rowCount > maximumSnapshotRows) throw new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot row limit.");
-    let payload = JSON.stringify(value);
-    const bytes = Buffer.byteLength(payload, "utf8");
-    if (bytes > maximumSnapshotBytes) throw snapshotStorageLimit();
-    if (sourceId === "directory") {
-      const encoded = JSON.stringify(encodeDirectorySnapshot(value));
-      if (Buffer.byteLength(encoded, "utf8") < bytes) payload = encoded;
-    }
-    const snapshotId = randomUUID();
-    await transaction(this.database, async client => {
-      await lockScope(client, scope);
-      if (publication) await requireUserPublication(client, scope, publication);
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`copilot-usage:${scope.tenantId}:${scope.principalId}:${sourceId}`]);
-      await client.query(`UPDATE copilot_usage_snapshots SET is_current=false
-        WHERE tenant_id=$1 AND principal_id=$2 AND source_id=$3 AND is_current`,
-      [scope.tenantId, scope.principalId, sourceId]);
-      const inserted = await client.query(`INSERT INTO copilot_usage_snapshots(
-          id,tenant_id,principal_id,source_id,snapshot_data,row_count,observed_at)
-        SELECT $1,$2,$3,$4,$5::jsonb,$6,$7
-        WHERE octet_length($5::jsonb::text)<=$8`,
-      [snapshotId, scope.tenantId, scope.principalId, sourceId, payload, rowCount, observedAt, maximumSnapshotBytes]);
-      if (inserted.rowCount !== 1) throw snapshotStorageLimit();
-      await client.query(`INSERT INTO copilot_usage_source_state(
-          tenant_id,principal_id,source_id,attempt_status,message,attempted_at,
-          last_success_at,row_count,current_snapshot_id)
-        VALUES($1,$2,$3,'available',$4,$5,$5,$6,$7)
-        ON CONFLICT (tenant_id,principal_id,source_id) DO UPDATE SET
-          attempt_status='available',message=EXCLUDED.message,attempted_at=EXCLUDED.attempted_at,
-          last_success_at=EXCLUDED.last_success_at,row_count=EXCLUDED.row_count,
-          current_snapshot_id=EXCLUDED.current_snapshot_id,updated_at=clock_timestamp()`,
-      [scope.tenantId, scope.principalId, sourceId, boundedMessage(message), observedAt, rowCount, snapshotId]);
-    });
-    return snapshotId;
-  }
 }
 
 function normalizeSources(mode: DataSyncMode, requested: readonly DataSyncSourceId[] | undefined) {
@@ -620,80 +470,6 @@ function projectSource(row: SourceRow): DataSyncSourceStatus {
     message: row.message,
     canRetry: row.can_retry,
   };
-}
-
-function projectSavedSource<T>(source: CopilotUsageSnapshotSource, row: SavedSourceRow | undefined): SavedCopilotUsageSource<T> {
-  const snapshot = row?.snapshot_data ?? null;
-  const value = source === "directory" && snapshot !== null ? decodeDirectorySnapshot(snapshot) : snapshot;
-  return {
-    source,
-    attemptStatus: row?.attempt_status ?? null,
-    message: row?.message ?? null,
-    attemptedAt: row?.attempted_at?.toISOString() ?? null,
-    lastSuccessAt: row?.last_success_at?.toISOString() ?? null,
-    rowCount: row?.row_count ?? null,
-    observedAt: row?.observed_at?.toISOString() ?? null,
-    value: value as T | null,
-  };
-}
-
-function encodeDirectorySnapshot(snapshot: CopilotDirectorySnapshot) {
-  const servicePlanSets: CopilotDirectoryUser["servicePlans"][] = [];
-  const indexes = new Map<string, number>();
-  const users = snapshot.users.map(({ servicePlans, ...user }) => {
-    const key = JSON.stringify(servicePlans);
-    let servicePlanSet = indexes.get(key);
-    if (servicePlanSet === undefined) {
-      servicePlanSet = servicePlanSets.length;
-      servicePlanSets.push(servicePlans);
-      indexes.set(key, servicePlanSet);
-    }
-    return { ...user, servicePlanSet };
-  });
-  return { serviceEvidenceVersion: 1, storageEncoding: "service-plan-sets-v1", servicePlanSets, users };
-}
-
-function decodeDirectorySnapshot(snapshot: unknown): unknown[] {
-  if (!isSnapshotObject(snapshot) || snapshot.serviceEvidenceVersion !== 1 || !Array.isArray(snapshot.users)) {
-    throw invalidDirectorySnapshot();
-  }
-  if (snapshot.users.length > maximumSnapshotRows) throw snapshotStorageLimit();
-  let users: unknown[] = snapshot.users;
-  if ("storageEncoding" in snapshot) {
-    const sets = snapshot.servicePlanSets;
-    if (snapshot.storageEncoding !== "service-plan-sets-v1" || !isSnapshotPlanSets(sets)) throw invalidDirectorySnapshot();
-    let bytes = Buffer.byteLength('{"serviceEvidenceVersion":1,"users":[]}');
-    users = users.map((user, index) => {
-      if (!isSnapshotObject(user) || "servicePlans" in user || typeof user.servicePlanSet !== "number"
-        || !Number.isSafeInteger(user.servicePlanSet) || user.servicePlanSet < 0 || user.servicePlanSet >= sets.length) throw invalidDirectorySnapshot();
-      const { servicePlanSet, ...fields } = user;
-      const servicePlans = sets[servicePlanSet];
-      const restored = { ...fields, servicePlans };
-      // Bound expansion before copying shared evidence, including on malformed saved data.
-      bytes += Buffer.byteLength(JSON.stringify(restored), "utf8") + (index === 0 ? 0 : 1);
-      if (bytes > maximumSnapshotBytes) throw snapshotStorageLimit();
-      return { ...restored, servicePlans: servicePlans.map(plan => ({ ...plan })) };
-    });
-  }
-  if (!users.every(user => isSnapshotObject(user) && user.serviceEvidenceVersion === 1
-    && isCopilotServiceSummaryState(user.copilotServiceState) && Array.isArray(user.servicePlans))) throw invalidDirectorySnapshot();
-  return users;
-}
-
-function isSnapshotObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isSnapshotPlanSets(value: unknown): value is Record<string, unknown>[][] {
-  return Array.isArray(value) && value.every(set => Array.isArray(set) && set.every(isSnapshotObject));
-}
-
-function invalidDirectorySnapshot() {
-  return new AppError(409, "copilot_usage_snapshot_invalid", "Saved Copilot service data has an unsupported format. Refresh Users before retrying.");
-}
-
-function snapshotStorageLimit() {
-  return new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot storage limit.");
 }
 
 async function finalizeRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {
@@ -778,7 +554,8 @@ export async function requireUserPublication(client: pg.PoolClient, scope: DataS
       AND source.tenant_id=run.tenant_id AND source.principal_id=run.principal_id
     WHERE run.id=$1 AND run.tenant_id=$2 AND run.principal_id=$3
       AND run.status IN ('running','waiting') AND run.expires_at>clock_timestamp()
-      AND source.source_id='users' AND source.job_id=$4 AND source.status='running'`,
+      AND source.source_id='users' AND source.job_id=$4 AND source.status='running'
+    FOR UPDATE OF run, source`,
   [publication.runId, scope.tenantId, scope.principalId, publication.jobId]);
   if (!current.rowCount) {
     throw new AppError(409, "data_sync_publication_superseded", "This user-source attempt stopped or was superseded; its saved data was not published.");
@@ -802,11 +579,6 @@ function validateUuid(value: string, label: string) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
     throw new AppError(400, "invalid_data_sync_job", `The ${label} is invalid.`);
   }
-}
-
-function boundedMessage(message: string) {
-  if (!message || message.length > 1024) throw new AppError(500, "invalid_data_sync_message", "Data sync source status message is invalid.");
-  return message;
 }
 
 function hash(value: unknown) {

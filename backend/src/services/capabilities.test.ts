@@ -62,6 +62,28 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe("capability list database admission", () => {
+  it("retains registry order and complete policy results without saturating the three foreground connections", async () => {
+    const { repository, value, probes } = service();
+    let active = 0, maximum = 0;
+    async function read<T>(result: T) {
+      active++; maximum = Math.max(maximum, active);
+      try { await new Promise<void>(resolve => setImmediate(resolve)); return result; }
+      finally { active--; }
+    }
+    repository.configuration.mockImplementation(async () => read({ enabled: false, sharedDataScope: false, previewQualified: false, revision: 1 }));
+    repository.evidence.mockImplementation(async () => read(undefined));
+    const result = await value.list({ ...reader, roles: ["AgentControl.Admin"] });
+    expect(result.map(view => view.definition.id)).toEqual(capabilityDefinitions.map(definition => definition.id));
+    expect(result.every(view => view.decision.capabilityId === view.definition.id)).toBe(true);
+    expect(maximum).toBeGreaterThan(0);
+    expect(maximum).toBeLessThanOrEqual(3);
+    expect(active).toBe(0);
+    expect(probes.delegatedToken).not.toHaveBeenCalled();
+    expect(probes.applicationToken).not.toHaveBeenCalled();
+  });
+});
+
 describe.each(["automatic", "targeted"] as const)("%s check cancellation ownership", mode => {
   it.each([0, 1])("cancels caller %i without cancelling the other shared caller", async cancelled => {
     const held = deferred<unknown>();

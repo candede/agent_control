@@ -7,6 +7,7 @@ import { isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { operationalLog } from "../services/telemetry.js";
 import type { AppRole } from "../types/capability.js";
+import { DataGenerations } from "./dataGenerations.js";
 
 const PgSessionStore = connectPgSimple(session);
 
@@ -68,6 +69,7 @@ function sanitizedSession(data: SessionData, allowMissingClientId: boolean): Ses
 }
 
 export async function revokeAccountSessions(database: pg.Pool, tenantId: string, principalId: string) {
+  await new DataGenerations(database).revokePrincipal(tenantId, principalId);
   await database.query("DELETE FROM sessions WHERE tenant_id=$1 AND principal_id=$2", [tenantId, principalId]);
 }
 

@@ -1,8 +1,11 @@
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
-import type { PackageDataScope } from "./packageInventory.js";
+import type { PackageDataScope } from "./packageRefreshJobs.js";
 import { pool } from "./pool.js";
+import { dataConnections } from "./dataConnections.js";
+import { lockDataScope } from "./dataGenerations.js";
+import { parseUnifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { verifiedAgentIdentityClientIdProvenance, type AgentIdentityCacheStatus, type AgentIdentityResolutionOutcome,
   type AgentIdentityRuntimeProvenance, type AgentIdentityRuntimeStatus, type VerifiedAgentIdentityIds } from "../types/agentInvestigations.js";
 
@@ -18,19 +21,27 @@ export type AgentIdentityCacheState = {
 };
 export type AgentIdentityFailure = { status: Exclude<AgentIdentityResolutionOutcome, "resolved">; code: string };
 
-const sourceWhere = `resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.snapshot_id=$3
+const sourceWhere = `membership.tenant_id=$1 AND membership.principal_id=$2 AND membership.source='power_platform'
+  AND resource.generation_id=$3 AND membership.agent_id=substr($7,7)
   AND resource.native_id=$4 AND resource.environment_id=$5 AND resource.resource_type='microsoft.copilotstudio/agents'
-  AND resource.agent_kind='copilot_studio_agent'
-  AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-  AND resource.provenance->'entraAgentId'->>'sourceSystem'='power_platform'
-  AND resource.provenance->'entraAgentId'->>'path'='properties.entraAgentId'
-  AND EXISTS (SELECT 1 FROM jsonb_array_elements(resource.identifiers) identifier
-    WHERE identifier->>'kind'='entra_agent_id' AND lower(identifier->>'value')=$6)
-  AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(resource.identifiers) identifier
-    WHERE identifier->>'kind'='entra_agent_id' AND lower(identifier->>'value') IS DISTINCT FROM $6)`;
-const sourceJoin = `FROM power_platform_inventory_resources resource
-  JOIN power_platform_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
-    AND snapshot.tenant_id=resource.tenant_id AND snapshot.principal_id=resource.principal_id`;
+  AND resource.residual->>'agentKind'='copilot_studio_agent'
+  AND resource.residual->'provenance'->'entraAgentId'->>'sourceSystem'='power_platform'
+  AND resource.residual->'provenance'->'entraAgentId'->>'path'='properties.entraAgentId'
+  AND EXISTS (SELECT 1 FROM inventory_facts identifier WHERE identifier.generation_id=resource.generation_id
+    AND identifier.identity=resource.identity AND identifier.kind='identifier'
+    AND identifier.payload->>'kind'='entra_agent_id' AND lower(identifier.value)=$6)
+  AND NOT EXISTS (SELECT 1 FROM inventory_facts identifier WHERE identifier.generation_id=resource.generation_id
+    AND identifier.identity=resource.identity AND identifier.kind='identifier'
+    AND identifier.payload->>'kind'='entra_agent_id' AND lower(identifier.value) IS DISTINCT FROM $6)
+  AND NOT EXISTS(SELECT 1 FROM inventory_live_sources other JOIN inventory_facts identifier
+    ON identifier.generation_id=other.source_generation_id AND identifier.identity=other.source_identity
+    WHERE other.tenant_id=$1 AND other.principal_id=$2 AND other.source='power_platform'
+      AND other.agent_id<>membership.agent_id AND identifier.kind='identifier'
+      AND identifier.payload->>'kind'='entra_agent_id'
+      AND md5(lower(identifier.value))=md5($6) AND lower(identifier.value)=$6)`;
+const sourceJoin = `FROM inventory_live_sources membership
+  JOIN power_platform_record_rows resource ON resource.generation_id=membership.source_generation_id AND resource.identity=membership.source_identity
+  JOIN data_generations snapshot ON snapshot.id=resource.generation_id`;
 
 export class AgentIdentityRepository {
   constructor(private readonly database: pg.Pool = pool) {}
@@ -39,17 +50,18 @@ export class AgentIdentityRepository {
     return (await this.readState(scope, source)).value ?? null;
   }
 
-  async readState(scope: PackageDataScope, source: AgentIdentitySource): Promise<AgentIdentityCacheState> {
+  async readState(scope: PackageDataScope, source: AgentIdentitySource,
+    database: Pick<pg.Pool, "query"> = this.database): Promise<AgentIdentityCacheState> {
     const parameters = sourceParameters(scope, source);
-    const { rows } = await this.database.query<{
+    const { rows } = await database.query<{
       candidate_id: string; application_id: string | null; checked_at: Date; expires_at: Date; fresh: boolean;
       outcome: AgentIdentityResolutionOutcome; runtime_status: AgentIdentityRuntimeStatus; last_error_code: string | null;
       runtime_provenance: AgentIdentityRuntimeProvenance | null;
     }>(`
       SELECT cache.candidate_id,cache.application_id,cache.checked_at,cache.expires_at,
         cache.expires_at>clock_timestamp() AS fresh,cache.outcome,cache.runtime_status,cache.last_error_code,cache.runtime_provenance ${sourceJoin}
-      JOIN agent_identity_cache cache ON cache.tenant_id=resource.tenant_id AND cache.principal_id=resource.principal_id
-        AND cache.snapshot_id=resource.snapshot_id AND cache.native_id=resource.native_id AND cache.environment_id=resource.environment_id
+      JOIN agent_identity_cache cache ON cache.tenant_id=membership.tenant_id AND cache.principal_id=membership.principal_id
+        AND cache.snapshot_id=resource.generation_id AND cache.native_id=resource.native_id AND cache.environment_id=resource.environment_id
       WHERE ${sourceWhere} AND cache.candidate_id=$6::uuid AND cache.record_id=$7 AND cache.source_revision=$8`,
     [...parameters, source.recordId, source.sourceRevision]);
     const value = rows[0];
@@ -99,17 +111,17 @@ export class AgentIdentityRepository {
     outcome: AgentIdentityResolutionOutcome; errorCode: string | null; ttlMs: number;
   }, fence: () => Promise<void>) {
     const parameters = sourceParameters(scope, source);
-    const client = await this.database.connect();
-    try {
-      await client.query("BEGIN");
+    return dataConnections(this.database).run(async client => {
       await client.query("SET LOCAL lock_timeout='3s'; SET LOCAL statement_timeout='5s'");
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`agent-identity:${scope.tenantId}`]);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`agent-identity:${scope.tenantId}`]);
       await fence();
-      // Source rows are immutable to runtime; locking them would require forbidden UPDATE privileges.
-      // The parent snapshot lock prevents refresh invalidation and cascading deletion until commit.
-      const current = await client.query(`SELECT snapshot.id ${sourceJoin} WHERE ${sourceWhere} FOR SHARE OF snapshot`, parameters);
+      const current = await client.query(`SELECT snapshot.id,membership.source_scope_id,membership.canonical_scope_id
+        ${sourceJoin} WHERE ${sourceWhere}`, [...parameters, source.recordId]);
       if (current.rowCount !== 1) throw new AppError(409, "agent_identity_source_changed", "The current saved source changed during identity resolution. Refresh Agents.");
+      for (const scopeId of [current.rows[0].source_scope_id, current.rows[0].canonical_scope_id].sort()) {
+        await lockDataScope(client, scopeId, scope.tenantId);
+      }
       await client.query(`DELETE FROM agent_identity_cache WHERE tenant_id=$1 AND (expires_at<=clock_timestamp()
         OR (principal_id=$2 AND record_id=$3))`, [scope.tenantId, scope.principalId, source.recordId]);
       const count = (await client.query<{ principal_count: number; tenant_count: number }>(`
@@ -122,22 +134,22 @@ export class AgentIdentityRepository {
         (tenant_id,principal_id,snapshot_id,native_id,environment_id,candidate_id,record_id,source_revision,application_id,checked_at,expires_at,
           outcome,runtime_status,last_error_code,runtime_provenance)
         SELECT $1,$2,$3,$4,$5,$6::text::uuid,$7,$8,$9,statement_timestamp(),
-          LEAST(statement_timestamp()+($13::int*interval '1 millisecond'),snapshot.expires_at),$10,$11,$12,$14
+          LEAST(statement_timestamp()+($13::int*interval '1 millisecond'),membership.authority_expires_at),$10,$11,$12,$14
         ${sourceJoin} WHERE ${sourceWhere}`,
       [...parameters, source.recordId, source.sourceRevision, value.applicationId, value.outcome, value.runtimeStatus, value.errorCode, value.ttlMs, value.runtimeProvenance]);
       if (saved.rowCount !== 1) throw new AppError(409, "agent_identity_source_changed", "The current saved source changed or expired before identity publication. Refresh Agents.");
       await fence();
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally { client.release(); }
+      if ((await client.query(`SELECT snapshot.id ${sourceJoin} WHERE ${sourceWhere}`, [...parameters, source.recordId])).rowCount !== 1) {
+        throw new AppError(409, "agent_identity_source_changed", "The current source expired before identity publication.");
+      }
+    });
   }
 }
 
 function sourceParameters(scope: PackageDataScope, source: AgentIdentitySource) {
   if (!scope.tenantId || !scope.principalId || !isDirectoryObjectId(source.snapshotId) || !isDirectoryObjectId(source.candidateId)
-    || !source.recordId || source.recordId.length > 2_048 || !source.nativeId || source.nativeId.length > 512
+    || !source.recordId || source.recordId.length > 2_048 || parseUnifiedAgentRecordId(source.recordId)?.source !== "canonical"
+    || !source.nativeId || source.nativeId.length > 512
     || !source.environmentId || source.environmentId.length > 512 || !/^[a-f0-9]{64}$/.test(source.sourceRevision)) {
     throw new AppError(400, "invalid_agent_identity_source", "Identity resolution requires an exact current source identity.");
   }

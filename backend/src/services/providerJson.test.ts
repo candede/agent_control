@@ -1,14 +1,30 @@
 import { setImmediate } from "node:timers/promises";
+import pg from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { boundedProviderJson, boundedProviderText, ProviderResponseLimitError } from "./providerJson.js";
+import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 import { GraphPackagesClient, graphError, type FetchLike } from "./graphPackages.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { allowlistedPackage } from "./packageObservation.js";
-import { CopilotUsageGraphClient } from "./copilotUsageGraph.js";
+import { UserSourceProvider } from "./userSourceProvider.js";
+import { UserSourceStages } from "../db/userSourceStages.js";
+import { reportHeaders } from "./userSourceGraphFields.js";
 
-vi.mock("csv-parse/sync", () => ({
-  parse: () => { throw new Error("CSV parsing must not run in failed-download transport tests."); },
-}));
+async function readActivity(fetcher: FetchLike, signal = new AbortController().signal) {
+  const database = new pg.Pool({ max: 4 });
+  const stages = new UserSourceStages(database);
+  vi.spyOn(stages, "query").mockResolvedValue("synthetic-activity-query");
+  for (const method of ["page", "activity", "finishQuery", "progress"] as const) {
+    vi.spyOn(stages, method).mockRejectedValue(new Error("Failed transport must not finalize or publish activity."));
+  }
+  try {
+    return await new UserSourceProvider(fetcher).activity(stages, {
+      id: "00000000-0000-4000-8000-000000000001", scopeId: "00000000-0000-4000-8000-000000000002",
+      tenantId: "transport-fixture", owner: "00000000-0000-4000-8000-000000000003", version: 1,
+      epoch: "0", sessionEpoch: "0", expectedRevision: "0", schemaVersion: 1,
+    }, "token", signal);
+  } finally { await database.end(); }
+}
 
 describe("bounded provider observations", () => {
   it.each([undefined, 16 * 1024 * 1024])("aborts and cancels a stalled JSON response body with budget %s", async maximumBytes => {
@@ -22,10 +38,10 @@ describe("bounded provider observations", () => {
   });
 
   describe("bounded report download cleanup", () => {
-    it("rejects malformed UTF-8 reports before CSV parsing", async () => {
+    it("rejects malformed UTF-8 reports before activity publication", async () => {
       const fetcher = vi.fn<FetchLike>(async () => new Response(Uint8Array.of(0xff)));
-      await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token"))
-        .rejects.toMatchObject({ status: 502, code: "provider_schema", message: "Provider response was not valid UTF-8." });
+      await expect(readActivity(fetcher))
+        .rejects.toMatchObject({ status: 502, code: "provider_schema", message: "Invalid activity CSV or UTF-8." });
       expect(fetcher).toHaveBeenCalledOnce();
     });
 
@@ -36,8 +52,8 @@ describe("bounded provider observations", () => {
         .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), {
           status: 302, headers: { location: "https://reports.office.com/data/download/report" },
         }))
-        .mockResolvedValueOnce(new Response(null, { status: 403 }));
-      const pending = new CopilotUsageGraphClient(fetcher).listAppActivity("token").catch(error => error);
+        .mockResolvedValueOnce(new Response(null, { status: 400 }));
+      const pending = readActivity(fetcher).catch(error => error);
       try {
         expect(await Promise.race([pending, setImmediate("still pending")])).toMatchObject({ code: "report_download_failed" });
         expect(fetcher).toHaveBeenCalledTimes(2);
@@ -45,7 +61,7 @@ describe("bounded provider observations", () => {
       } finally { cleanup.resolve(); await pending; }
     });
 
-    it.each([302, 403].flatMap(status => ["stalled", "rejected"].map(mode => ({ status, mode }))))(
+    it.each([302, 400].flatMap(status => ["stalled", "rejected"].map(mode => ({ status, mode }))))(
       "preserves the sanitized download error for status $status with $mode cleanup", async ({ status, mode }) => {
         const cleanup = Promise.withResolvers<void>();
         const cancel = vi.fn(() => mode === "stalled" ? cleanup.promise : Promise.reject(new Error("private cleanup details")));
@@ -54,7 +70,7 @@ describe("bounded provider observations", () => {
             status: 302, headers: { location: "https://reports.office.com/data/download/report" },
           }))
           .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), { status }));
-        const pending = new CopilotUsageGraphClient(fetcher).listAppActivity("token").catch(error => error);
+        const pending = readActivity(fetcher).catch(error => error);
         try {
           const result = await Promise.race([pending, setImmediate("still pending")]);
           expect(result).toMatchObject({ code: status === 302 ? "invalid_provider_link" : "report_download_failed" });
@@ -73,23 +89,23 @@ describe("bounded provider observations", () => {
           status: 302, headers: { location: "https://reports.office.com/data/download/report" },
         }))
         .mockResolvedValueOnce(new Response(null, { status: 403 }));
-      await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token", controller.signal)).rejects.toBe(reason);
+      await expect(readActivity(fetcher, controller.signal)).rejects.toBe(reason);
       expect(fetcher).toHaveBeenCalledOnce();
     });
 
     it("does not request a report after cancellation", async () => {
       const reason = new DOMException("cancelled", "AbortError");
       const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 403 }));
-      await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token", AbortSignal.abort(reason))).rejects.toBe(reason);
+      await expect(readActivity(fetcher, AbortSignal.abort(reason))).rejects.toBe(reason);
       expect(fetcher).not.toHaveBeenCalled();
     });
 
     it.each([3, 4].flatMap(depth => ["cancellation", "deadline"].map(mode => ({ depth, mode }))))(
-      "preserves report $mode between body completion and CSV parsing ($depth microtasks)", async ({ depth, mode }) => {
+      "preserves report $mode between stream completion and stage finalization ($depth microtasks)", async ({ depth, mode }) => {
         const controller = new AbortController();
         const reason = new DOMException(mode, mode === "cancellation" ? "AbortError" : "TimeoutError");
         const body = new ReadableStream<Uint8Array>({
-          start(stream) { stream.enqueue(new TextEncoder().encode("CSV must not be parsed")); },
+          start(stream) { stream.enqueue(new TextEncoder().encode(`${reportHeaders.join(",")}\n`)); },
           pull(stream) {
             stream.close();
             const abortAfterMicrotasks = (remaining: number) => {
@@ -100,13 +116,9 @@ describe("bounded provider observations", () => {
           },
         }, { highWaterMark: 0 });
         const fetcher = vi.fn<FetchLike>(async () => new Response(body));
-        const timeout = mode === "deadline" ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal) : undefined;
-        try {
-          await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token", mode === "cancellation" ? controller.signal : undefined))
-            .rejects.toBe(reason);
-          expect(fetcher).toHaveBeenCalledOnce();
-          expect(body.locked).toBe(false);
-        } finally { timeout?.mockRestore(); }
+        await expect(readActivity(fetcher, controller.signal)).rejects.toBe(reason);
+        expect(fetcher).toHaveBeenCalledOnce();
+        expect(body.locked).toBe(false);
       },
     );
   });
@@ -255,8 +267,8 @@ describe("bounded provider observations", () => {
   });
 
   it("never follows foreign pagination and bounds directory input", async () => {
-    const fetcher = vi.fn(async () => Response.json({ value: [], "@odata.nextLink": "https://other.invalid/collect" }));
-    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("private-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
+    const fetcher = vi.fn(async () => Response.json({ value: [{ id: "P_1", displayName: "Package", isBlocked: false }], "@odata.nextLink": "https://other.invalid/collect" }));
+    await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "private-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledTimes(1);
     await expect(new DirectoryPrincipalsClient(async () => Response.json({ value: Array.from({ length: 51 }, () => ({ id: "fixture" })) })).search("token", "fi")).rejects.toMatchObject({ code: "provider_schema" });
     const bounded = vi.fn(async () => new Response("x".repeat(2_000_001)));

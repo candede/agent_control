@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   enterMaintenance: vi.fn(),
   loadOperationalState: vi.fn(),
   log: vi.fn(),
+  resources: vi.fn(),
   recover: vi.fn(),
   dataSyncDrain: vi.fn<() => Promise<void>>(),
   bulkDrain: vi.fn<() => Promise<void>>(),
@@ -16,26 +17,40 @@ const mocks = vi.hoisted(() => ({
   powerPlatformDrain: vi.fn<() => Promise<void>>(),
   purviewDrain: vi.fn<() => Promise<void>>(),
   defenderDrain: vi.fn<() => Promise<void>>(),
+  reportStart: vi.fn(),
+  reportDrain: vi.fn<() => Promise<void>>(),
+  inventoryStart: vi.fn(),
+  inventoryDrain: vi.fn<() => Promise<void>>(),
 }));
 vi.mock("./config.js", () => ({ config: { port: 3001, tenants: [{ tenantId: "tenant-a" }, { tenantId: "tenant-b" }], nodeEnv: "test" }, validateRuntimeConfig: vi.fn() }));
 vi.mock("./app.js", () => ({ createApp: () => ({ app: { listen: mocks.listen }, store: { close: mocks.storeClose } }) }));
-vi.mock("./db/pool.js", () => ({ pool: { end: mocks.poolEnd, waitingCount: 0 } }));
+vi.mock("./db/pool.js", () => ({ pool: { end: mocks.poolEnd, waitingCount: 0, totalCount: 2, idleCount: 2,
+  admissionState: { foreground: 0, queue: 0 } } }));
 vi.mock("./db/packageMutationQualifications.js", () => ({ PackageMutationQualificationRepository: class { recoverInterrupted = mocks.recover; } }));
 vi.mock("./db/copilotStudioQuarantineCanaries.js", () => ({ CopilotStudioQuarantineCanaryRepository: class { recoverInterrupted = mocks.recover; } }));
 vi.mock("./services/bulkJobs.js", () => ({ bulkJobs: { recover: mocks.recover }, drainBulkJobs: mocks.bulkDrain }));
 vi.mock("./services/copilotStudioQuarantineJobs.js", () => ({
   copilotStudioQuarantineJobs: { recoverInterrupted: mocks.recover }, drainCopilotStudioQuarantineJobs: mocks.quarantineDrain,
 }));
-vi.mock("./services/maintenance.js", () => ({ enterMaintenance: mocks.enterMaintenance }));
+vi.mock("./services/maintenance.js", () => ({ enterMaintenance: mocks.enterMaintenance, maintenanceActive: () => false }));
 vi.mock("./services/defenderHunting.js", () => ({ defenderHunting: { recover: mocks.recover, drain: mocks.defenderDrain } }));
 vi.mock("./services/dataSync.js", () => ({ dataSync: { recover: mocks.recover, drain: mocks.dataSyncDrain } }));
 vi.mock("./services/packageInventory.js", () => ({ packageInventory: { recover: mocks.recover, drain: mocks.packageDrain } }));
 vi.mock("./services/powerPlatformInventory.js", () => ({ powerPlatformInventory: { recover: mocks.recover, drain: mocks.powerPlatformDrain } }));
 vi.mock("./services/purviewAudit.js", () => ({ purviewAudit: { recover: mocks.recover, drain: mocks.purviewDrain } }));
-vi.mock("./services/operationalState.js", () => ({ loadOperationalState: mocks.loadOperationalState }));
-vi.mock("./services/telemetry.js", () => ({ operationalLog: mocks.log, observeDatabasePool: vi.fn() }));
+vi.mock("./services/reportExportDispatcher.js", () => ({
+  reportRuntime: () => ({ start: mocks.reportStart, drain: mocks.reportDrain }),
+}));
+vi.mock("./services/inventoryRuntime.js", () => ({
+  inventoryRuntime: () => ({ start: mocks.inventoryStart, drain: mocks.inventoryDrain }),
+}));
+vi.mock("./services/operationalState.js", () => ({ loadOperationalState: mocks.loadOperationalState, readOperationalState: mocks.loadOperationalState }));
+vi.mock("./services/telemetry.js", () => ({
+  operationalLog: mocks.log, observeDatabasePool: vi.fn(), observeRuntimeResources: mocks.resources,
+}));
 
-const childDrains = [mocks.bulkDrain, mocks.quarantineDrain, mocks.packageDrain, mocks.powerPlatformDrain, mocks.purviewDrain, mocks.defenderDrain];
+const childDrains = [mocks.bulkDrain, mocks.quarantineDrain, mocks.packageDrain, mocks.powerPlatformDrain,
+  mocks.purviewDrain, mocks.defenderDrain, mocks.reportDrain, mocks.inventoryDrain];
 let signals: Map<string, () => void>;
 let completeHttp: ((error?: Error) => void) | undefined;
 
@@ -73,11 +88,79 @@ async function settle() {
 }
 
 describe("maintenance shutdown lifecycle", () => {
+  it("acceptance: startup drains full quarantine batches before admitting new HTTP jobs", async () => {
+    vi.clearAllTimers();
+    vi.resetModules();
+    mocks.recover.mockClear(); mocks.listen.mockClear();
+    let calls = 0;
+    const nextBatch = Promise.withResolvers<number>();
+    mocks.recover.mockImplementation(async () => {
+      calls++;
+      if (calls === 7) return 1000;
+      if (calls === 8) return nextBatch.promise;
+      return 0;
+    });
+    const startup = import("./server.js");
+    await vi.waitFor(() => expect(mocks.recover).toHaveBeenCalledTimes(8));
+    expect(mocks.recover.mock.calls.slice(6, 8)).toEqual([["tenant-a", true], ["tenant-a", true]]);
+    expect(mocks.listen).not.toHaveBeenCalled();
+    nextBatch.resolve(1);
+    await vi.waitFor(() => expect(mocks.listen).toHaveBeenCalledOnce());
+    await startup;
+    expect(mocks.listen).toHaveBeenCalledOnce();
+  });
+  it("recovers expired bulk leases off HTTP reads without overlapping poll passes", async () => {
+    mocks.recover.mockClear();
+    let finish!: () => void;
+    mocks.recover.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.resources).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      totalCount: 2, idleCount: 2, waitingCount: 0, admissionState: { foreground: 0, queue: 0 },
+    }));
+    expect(mocks.recover).toHaveBeenCalledExactlyOnceWith("tenant-a");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.recover).toHaveBeenCalledTimes(1);
+    finish();
+    await settle();
+    expect(mocks.recover).toHaveBeenLastCalledWith("tenant-b");
+    expect(mocks.recover).toHaveBeenCalledTimes(4);
+    expect(mocks.recover.mock.calls).toEqual([["tenant-a"], ["tenant-a"], ["tenant-b"], ["tenant-b"]]);
+  });
+  it("does not admit periodic bulk recovery during database maintenance", async () => {
+    mocks.recover.mockClear();
+    mocks.loadOperationalState.mockResolvedValue({ mode: "maintenance" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.recover).not.toHaveBeenCalled();
+  });
+  it("acceptance: shutdown drains the existing in-flight quarantine recovery pass before closing its pool", async () => {
+    mocks.recover.mockClear();
+    const recovery = Promise.withResolvers<void>();
+    mocks.recover.mockResolvedValueOnce(undefined).mockReturnValueOnce(recovery.promise);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.recover.mock.calls).toEqual([["tenant-a"], ["tenant-a"]]);
+    signals.get("SIGTERM")!();
+    completeHttp!();
+    await settle();
+    expect(mocks.poolEnd).not.toHaveBeenCalled();
+    recovery.resolve();
+    await settle();
+    expect(mocks.recover).toHaveBeenCalledTimes(2);
+    expect(mocks.poolEnd).toHaveBeenCalledOnce();
+  });
   it("recovers interrupted work for every configured tenant", () => {
     for (const tenantId of ["tenant-a", "tenant-b"]) {
       expect(mocks.recover).toHaveBeenCalledWith(tenantId, true);
-      expect(mocks.recover.mock.calls.filter(([tenant]) => tenant === tenantId)).toHaveLength(3);
+      expect(mocks.recover.mock.calls.filter(([tenant]) => tenant === tenantId)).toHaveLength(4);
     }
+  });
+
+  it("starts the durable export dispatcher after recovery and before HTTP admission", () => {
+    expect(mocks.reportStart).toHaveBeenCalledOnce();
+    expect(mocks.recover.mock.invocationCallOrder.at(-1)!).toBeLessThan(mocks.reportStart.mock.invocationCallOrder[0]);
+    expect(mocks.reportStart.mock.invocationCallOrder[0]).toBeLessThan(mocks.listen.mock.invocationCallOrder[0]);
+    expect(mocks.inventoryStart).toHaveBeenCalledOnce();
+    expect(mocks.recover.mock.invocationCallOrder.at(-1)!).toBeLessThan(mocks.inventoryStart.mock.invocationCallOrder[0]);
+    expect(mocks.inventoryStart.mock.invocationCallOrder[0]).toBeLessThan(mocks.listen.mock.invocationCallOrder[0]);
   });
 
   it("keeps database and session persistence open until admitted HTTP requests have finished", async () => {
@@ -127,10 +210,11 @@ describe("maintenance shutdown lifecycle", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["coordinator", "worker", "http", "store", "pool"])("reports %s failures without leaking the error or abandoning other worker drains", async stage => {
+  it.each(["coordinator", "worker", "report-export", "http", "store", "pool"])("reports %s failures without leaking the error or abandoning other worker drains", async stage => {
     const failure = new Error("Private driver detail must not be logged");
     if (stage === "coordinator") mocks.dataSyncDrain.mockRejectedValue(failure);
     if (stage === "worker") mocks.bulkDrain.mockRejectedValue(failure);
+    if (stage === "report-export") mocks.reportDrain.mockRejectedValue(failure);
     if (stage === "store") mocks.storeClose.mockImplementation(() => { throw failure; });
     if (stage === "pool") mocks.poolEnd.mockRejectedValue(failure);
     signals.get("SIGTERM")!();

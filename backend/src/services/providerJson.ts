@@ -1,5 +1,6 @@
 import { isUtf8 } from "node:buffer";
 import { AppError } from "../errors.js";
+import { peakCheckpoint } from "./peakMemory.js";
 
 export class ProviderResponseLimitError extends AppError {
   constructor(readonly maximumBytes: number, readonly observedBytes: number) {
@@ -54,6 +55,11 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
 export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal, maximumBytes?: number): Promise<T> {
   const text = await boundedProviderText(response, maximumBytes, signal);
   signal?.throwIfAborted();
-  try { return JSON.parse(text) as T; }
+  try {
+    peakCheckpoint("provider.parse");
+    const result = JSON.parse(text) as T;
+    peakCheckpoint("provider.parse");
+    return result;
+  }
   catch { throw new AppError(502, "provider_schema", "Provider response was not valid JSON."); }
 }

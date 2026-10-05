@@ -25,6 +25,27 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
 };
 
 describe("purposeful saved agent context", () => {
+  it("preserves server-counted high-fanout configuration and package totals without embedding children", () => {
+    render(<AgentOverview record={{ ...record, packageCount: 6000, packagesComplete: false,
+      powerPlatformResource: { ...resource, connectorCounts: { connectors: 400, operations: 9000 },
+        details: { connectorDetailsStatus: "partial", distinctPowerPlatformConnectors: 401, distinctPowerPlatformConnectorsOperations: 9999 } } }}
+      peopleState={peopleState} />);
+    expect(field("Saved connectors")).toHaveTextContent("400");
+    expect(field("Saved operations")).toHaveTextContent("9000");
+    expect(screen.getByText("Status and access summarize all 6,000 published versions.")).toBeVisible();
+    expect(screen.getByText("Saved configuration is available in the paged source members above.")).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Configured connector details" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Configured connector details are unavailable. Refresh inventory in Sync.")).not.toBeInTheDocument();
+  });
+  it("shows server-owned aggregate status, access, installation and authoring values instead of the source preview", () => {
+    render(<AgentOverview record={{ ...record, columns: { status: "4 blocked · 96 not blocked", availability: "Specific users or groups",
+      deployment: "Varies by package", builtWith: "Copilot Studio / Microsoft 365 Copilot Agent Builder" } }} peopleState={peopleState} />);
+    expect(screen.getByText("4 blocked · 96 not blocked")).toBeVisible();
+    expect(screen.getByText("Specific users or groups")).toBeVisible();
+    expect(screen.getByText("Varies by package")).toBeVisible();
+    expect(field("Built with")).toHaveTextContent("Copilot Studio / Microsoft 365 Copilot Agent Builder");
+    expect(screen.queryByText("Publication status unknown")).not.toBeInTheDocument();
+  });
   it.each(["fresh", "stale", "missing", "invalidated"] as const)("omits the package-detail freshness notice for %s summaries and full details", state => {
     const selectedPackage: CopilotPackage = {
       id: "package", displayName: "Agent", isBlocked: false,

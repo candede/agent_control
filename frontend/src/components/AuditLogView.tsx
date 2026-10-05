@@ -22,7 +22,7 @@ import {
   type CopilotPackage,
   type LocalAuditAction,
 } from "../api/client";
-import { downloadBlob } from "../agentExport";
+import { downloadFile } from "../downloadFile";
 import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
@@ -199,7 +199,7 @@ function LocalAuditLogView({
     setExportError(undefined);
     try {
       const blob = await downloadAdministrativeAuditCsv(events.map(event => event.id), controller.signal);
-      if (!controller.signal.aborted) downloadBlob("administrative-audit.csv", blob);
+      if (!controller.signal.aborted) downloadFile("administrative-audit.csv", blob);
     } catch (requestError) {
       if (!controller.signal.aborted) setExportError({
         key,

@@ -1,158 +1,154 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { testDatabase } from "../../scripts/testDatabase.js";
-import { AgentUsageService } from "../services/agentUsage.js";
-import { SavedAgentPeopleService } from "../services/savedAgentPeople.js";
-import { UnifiedAgentsService } from "../services/unifiedAgents.js";
-import { resolvePackageAgentLinks } from "../services/packageAgentIdentity.js";
-import type { CopilotDirectoryUser } from "../services/copilotUsageGraph.js";
-import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
-import { DataSyncRepository, type DataSyncScope } from "./dataSync.js";
-import { PackageInventoryRepository } from "./packageInventory.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
-import { UnifiedAgentRegistry } from "./unifiedAgentRegistry.js";
-import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
-import { AgentPeopleRepository } from "./agentPeople.js";
-import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
 import { parse } from "csv-parse/sync";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { fixtureDirectoryUser, publishFixtureDirectory } from "../../scripts/userSourceFixture.js";
+import { inventorySelectionFixture, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
+import { DataExports } from "../services/dataExports.js";
+import { inventoryExportColumns, inventoryExportSource } from "../services/inventoryExports.js";
+import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+import type { DataSyncScope } from "./dataSync.js";
+import type { InventoryQuery } from "./inventoryQueries.js";
+import { UserSourceStages } from "./userSourceStages.js";
+import { DataGenerations } from "./dataGenerations.js";
+import { AppError } from "../errors.js";
+import { AgentPeopleRepository } from "./agentPeople.js";
 
 const personId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const observedAt = "2026-09-15T10:00:00.000Z";
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
-let repository: DataSyncRepository;
-
-beforeAll(async () => {
-  fixture = await testDatabase();
-  repository = new DataSyncRepository(fixture.runtime);
-});
+beforeAll(async () => { fixture = await testDatabase(); });
 afterAll(async () => { await fixture?.close(); });
 
 function directoryUser(displayName = "Saved Person", objectId = personId): CopilotDirectoryUser {
-  return {
-    identity: { objectId, displayName, userPrincipalName: "saved#EXT#@example.onmicrosoft.com",
-      accountEnabled: true, userType: "Guest", employeeType: null, department: null, companyName: null },
-    serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
-  };
+  const user = fixtureDirectoryUser(objectId, displayName, "saved#EXT#@example.onmicrosoft.com");
+  user.identity.userType = "Guest";
+  return user;
 }
-
+async function publish(scope: DataSyncScope, users: CopilotDirectoryUser[], expiresAt?: Date) {
+  const sessionEpoch = await new DataGenerations(fixture.runtime).sessionEpoch(scope.tenantId, scope.principalId);
+  return publishFixtureDirectory(fixture.runtime, { ...selectionIdentity, ...scope, sessionEpoch }, users,
+    { observedAt: new Date(observedAt), ...(expiresAt ? { expiresAt } : {}) });
+}
 async function inventory(scope: DataSyncScope) {
-  const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
-  const native: PowerPlatformResource = {
-    tenantId: scope.tenantId, nativeId: "native-agent", environmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    type: "microsoft.copilotstudio/agents", displayName: "Agent", location: null,
-    createdAt: null, createdBy: personId, lastPublishedAt: null, sourceSystem: "power_platform",
-    authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "agent", lifecycle: "published",
-    identityConfidence: "exact_native",
-    identifiers: [
-      { kind: "environment_id", value: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-      { kind: "power_platform_resource_id", value: "native-agent" },
-    ],
-    provenance: {}, unknownFieldCount: 0,
+  await nativeInventoryFixture(fixture.runtime, scope, [{
+    nativeId: "native-agent", environmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", displayName: "Agent",
+    createdBy: personId, authoringTool: "Copilot Studio", agentKind: "agent", lifecycle: "published",
+    identifiers: [{ kind: "environment_id", value: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      { kind: "power_platform_resource_id", value: "native-agent" }],
     details: { ownerId: personId.toUpperCase(), lastModifiedBy: personId },
-  };
-  const job = await powerPlatform.submit(scope, {
-    idempotencyKey: `people-${scope.principalId}`, roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
-  });
-  await powerPlatform.markRunning(scope, job.id);
-  await powerPlatform.publish(scope, job.id, {
-    resources: [native], queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null,
-    totalRecords: 1, pages: 1, unknownFieldCount: 0,
-  });
-  return new UnifiedAgentsService({
-    packages: new PackageInventoryRepository(fixture.runtime), powerPlatform,
-    usage: new AgentUsageService(fixture.runtime), people: new SavedAgentPeopleService(repository, new AgentPeopleRepository(fixture.runtime)),
-    registry: new UnifiedAgentRegistry(fixture.runtime), resolveLinks: resolvePackageAgentLinks,
-    operationPackageIds: async () => [],
-    readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
-  });
+  }]);
+  await reconcileInventoryFixture(fixture.runtime, scope);
+}
+async function selected(scope: DataSyncScope, query: InventoryQuery = {}) {
+  const read = await inventorySelectionFixture(fixture.runtime, scope, query);
+  return { ...read, page: inventoryPresentation(read.raw) };
+}
+async function exportRows(read: Awaited<ReturnType<typeof selected>>) {
+  const exports = new DataExports(fixture.runtime, read.queries.selections, async () => {});
+  const id = await exports.create(read.identity, { selectionId: read.selection.id, queryHash: read.selection.queryHash,
+    kind: "unified_agents", filename: "synthetic-people.csv" });
+  await exports.build(id, read.identity, inventoryExportColumns.unified_agents, inventoryExportSource(read.queries, read.identity));
+  let csv = "";
+  for await (const chunk of exports.download(id, read.identity, new AbortController().signal)) {
+    csv += chunk.toString();
+    expect(Buffer.byteLength(csv)).toBeLessThan(262_144);
+  }
+  return parse(csv, { bom: true, columns: true }) as Array<Record<string, string>>;
 }
 
-describe("persisted saved directory agent people", () => {
-  it("persists unlicensed creators into subsequent lists and exports, including explicit lookup outcomes", async () => {
+describe("selected persisted directory people", () => {
+  it("persists unlicensed creators into selected SQL and durable exports, including explicit lookup outcomes", async () => {
     const scope = { tenantId: "cached-people", principalId: "private-reader" };
-    const service = await inventory(scope);
-    const cache = new AgentPeopleRepository(fixture.runtime);
-    const before = await service.list(scope);
-    const checkedAt = new Date(Date.now() - 1_000).toISOString();
+    await inventory(scope);
+    const before = await selected(scope), cache = new AgentPeopleRepository(fixture.runtime);
+    const checkedAt = new Date(Date.now() - 1_000).toISOString(), generation = await cache.generation(scope);
     await cache.save(scope, [{ objectId: personId, status: "resolved", displayName: "Unlicensed Creator",
-      userPrincipalName: "unlicensed@example.invalid", checkedAt }], { generation: "initial" });
-    const after = await service.list(scope, { search: "Unlicensed Creator", sortBy: "createdBy" });
-    expect(after.count).toBe(1);
-    expect(after.value[0].id).toBe(before.value[0].id);
-    expect(after.value[0].people?.createdBy?.displayName).toBe("Unlicensed Creator");
-    expect((await repository.getDirectorySource(scope)).value).toBeNull();
-    await expect(service.forExport(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+      userPrincipalName: "unlicensed@example.invalid", checkedAt }], { generation });
+    const after = await selected(scope, { search: "Unlicensed Creator", sortBy: "createdBy" });
+    expect(after.page.counts.filtered).toBe(1);
+    expect(after.page.value[0].id).toBe(before.page.value[0].id);
+    expect(after.page.value[0].people?.createdBy?.displayName).toBe("Unlicensed Creator");
+    expect(await cache.directoryIds(scope, [personId])).toEqual([]);
+    await expect(exportRows(before)).rejects.toMatchObject({ code: "selection_invalidated" });
     await cache.save(scope, [{ objectId: personId, status: "lookup_failed", displayName: null,
-      userPrincipalName: null, checkedAt: new Date().toISOString(), errorCode: "provider_timeout" }], { generation: "initial" });
-    const failed = await service.list(scope);
-    const rows = parse(buildUnifiedAgentCsv(await service.forExport(scope, failed.revision!), Date.now() + 15_000).buffer,
-      { bom: true, columns: true });
-    expect(rows[0]).toMatchObject({
+      userPrincipalName: null, checkedAt: new Date().toISOString(), errorCode: "provider_timeout" }], { generation });
+    const failed = await selected(scope), rows = await exportRows(failed);
+    expect(rows.find(row => row.recordType === "agent")).toMatchObject({
       createdBy: personId, createdByDisplayName: "Unlicensed Creator", createdByObservedAt: checkedAt,
       createdByResolutionStatus: "lookup_failed", createdByErrorCode: "provider_timeout",
     });
     await cache.save(scope, [{ objectId: personId, status: "not_found", displayName: null,
-      userPrincipalName: null, checkedAt: new Date(Date.now() + 1).toISOString() }], { generation: "initial" });
-    expect((await service.list(scope)).value[0].people?.createdBy).toMatchObject({ status: "not_found", displayName: null });
+      userPrincipalName: null, checkedAt: new Date(Date.now() + 1).toISOString() }], { generation });
+    expect((await selected(scope)).page.value[0].people?.createdBy).toMatchObject({ status: "not_found", displayName: null });
   });
 
-  it("excludes other tenants, principals, app reports, unmatched IDs and expired snapshots", async () => {
+  it("excludes other tenants, principals, app reports, unmatched IDs and genuinely expired directory generations", async () => {
     const scope = { tenantId: "saved-people", principalId: "private-reader" };
-    const service = await inventory(scope);
-    const before = await service.list(scope);
-    expect(before.value[0].people).toBeUndefined();
-    await repository.publishDirectory({ ...scope, tenantId: "other-tenant" }, [directoryUser("Other tenant")], observedAt, "Fixture.");
-    await repository.publishDirectory({ ...scope, principalId: "other-reader" }, [directoryUser("Other principal")], observedAt, "Fixture.");
-    await repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, observedAt, "Fixture.");
-    const isolated = await service.list(scope);
-    expect(isolated.value[0].people).toBeUndefined();
-    expect(isolated.revision).toBe(before.revision);
-    await repository.publishDirectory(scope, [directoryUser("Unmatched", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")], observedAt, "Fixture.");
-    expect((await service.list(scope)).value[0].people).toBeUndefined();
-    const snapshotId = await repository.publishDirectory(scope, [directoryUser()], observedAt, "Fixture.");
-    const saved = await service.list(scope);
-    expect(saved.value[0].people?.owner).toEqual({
+    await inventory(scope);
+    const before = await selected(scope);
+    expect(before.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    await publish({ ...scope, tenantId: "other-tenant" }, [directoryUser("Other tenant")]);
+    await publish({ ...scope, principalId: "other-reader" }, [directoryUser("Other principal")]);
+    const stages = new UserSourceStages(fixture.runtime);
+    await stages.execute(generationInput({ scope: { ...generationInput().scope, ...scope, source: "app_activity" } }), async lease => {
+      const key = await stages.query(lease, "activity", "synthetic:empty-activity");
+      await stages.finishQuery(lease, key);
+    }, { beforePublish: async () => {} });
+    const isolated = await selected(scope);
+    expect(isolated.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect(isolated.page.value[0].id).toBe(before.page.value[0].id);
+    await publish(scope, [directoryUser("Unmatched", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")]);
+    expect((await selected(scope)).page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    const expiresAt = new Date(Date.now() + 1500);
+    await publish(scope, [directoryUser()], expiresAt);
+    const saved = await selected(scope);
+    expect(saved.page.value[0].people?.owner).toMatchObject({
       objectId: personId, displayName: "Saved Person", userPrincipalName: "saved#EXT#@example.onmicrosoft.com", observedAt,
     });
-    expect(saved.value[0].people?.createdBy).toEqual(saved.value[0].people?.owner);
-    expect(saved.value[0].people?.lastModifiedBy).toEqual(saved.value[0].people?.owner);
-    expect(saved.value[0].id).toBe(before.value[0].id);
-    await fixture.operator.query("UPDATE copilot_usage_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [snapshotId]);
-    const expired = await service.list(scope);
-    expect(expired.value[0].people).toBeUndefined();
-    expect(expired.value[0].powerPlatformResource?.details.ownerId).toBe(personId.toUpperCase());
-    expect(expired.value[0].id).toBe(saved.value[0].id);
-    await expect(service.assertRevision(scope, saved.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-    await expect(service.forExport(scope, saved.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+    expect(saved.page.value[0].people?.createdBy).toEqual(saved.page.value[0].people?.owner);
+    expect(saved.page.value[0].people?.lastModifiedBy).toEqual(saved.page.value[0].people?.owner);
+    expect(saved.page.value[0].id).toBe(before.page.value[0].id);
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now()) + 20));
+    const expired = await selected(scope);
+    expect(expired.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect(expired.page.value[0].powerPlatformResource?.details.ownerId).toBe(personId.toUpperCase());
+    expect(expired.page.value[0].id).toBe(saved.page.value[0].id);
+    await expect(saved.queries.page(saved.selection.id, saved.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(exportRows(saved)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
 
-  it("invalidates exports on same-timestamp snapshot replacement without changing memberships or source identity", async () => {
+  it("keeps an existing read pinned across same-timestamp directory replacement while new selections see the new people", async () => {
     const scope = { tenantId: "saved-people", principalId: "replacement-reader" };
-    const service = await inventory(scope);
-    await repository.publishDirectory(scope, [directoryUser()], observedAt, "Fixture.");
-    const before = await service.list(scope);
-    await service.assertRevision(scope, before.revision!);
-    await repository.publishDirectory(scope, [directoryUser("Replacement Person")], observedAt, "Fixture.");
-    await expect(service.forExport(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-    await expect(service.assertRevision(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
-    const after = await service.list(scope);
-    expect(after.revision).not.toBe(before.revision);
-    expect(after.value[0].people?.owner?.displayName).toBe("Replacement Person");
-    expect(after.value[0].id).toBe(before.value[0].id);
-    expect(after.value[0].powerPlatformResource).toEqual(before.value[0].powerPlatformResource);
-    expect(after.value[0].identity).toEqual(before.value[0].identity);
-    expect((await service.forExport(scope, after.revision!)).value[0].people).toEqual(after.value[0].people);
+    await inventory(scope);
+    await publish(scope, [directoryUser()]);
+    const before = await selected(scope);
+    await publish(scope, [directoryUser("Replacement Person")]);
+    const oldPage = inventoryPresentation(await before.queries.page(before.selection.id, before.identity));
+    expect(oldPage.value[0].people?.owner?.displayName).toBe("Saved Person");
+    const after = await selected(scope);
+    expect(after.page.value[0].people?.owner?.displayName).toBe("Replacement Person");
+    expect(after.page.value[0].id).toBe(before.page.value[0].id);
+    expect(after.page.value[0].powerPlatformResource).toEqual(before.page.value[0].powerPlatformResource);
+    expect(after.page.value[0].identity).toEqual(before.page.value[0].identity);
+    expect((await exportRows(before)).find(row => row.recordType === "agent")?.createdByDisplayName).toBe("Saved Person");
+    expect((await exportRows(after)).find(row => row.recordType === "agent")?.createdByDisplayName).toBe("Replacement Person");
   });
 
-  it("keeps a valid prior observation after failed refresh, but rejects malformed saved identity data explicitly", async () => {
+  it("retains a valid prior observation when denied or malformed directory replacements fail", async () => {
     const scope = { tenantId: "saved-people", principalId: "failure-reader" };
-    const service = await inventory(scope);
-    await repository.publishDirectory(scope, [directoryUser()], observedAt, "Fixture.");
-    await repository.recordUserSourceFailure(scope, "directory", "permission_required", "Fixture denial.", new Date().toISOString());
-    const retained = await service.list(scope);
-    expect(retained.value[0].people?.owner?.observedAt).toBe(observedAt);
-    await repository.publishDirectory(scope, [{ ...directoryUser(), identity: { objectId: personId } } as CopilotDirectoryUser], observedAt, "Malformed fixture.");
-    await expect(service.list(scope)).rejects.toMatchObject({ code: "copilot_usage_snapshot_invalid" });
-    await repository.publishDirectory(scope, [directoryUser()], observedAt, "Fixed fixture.");
-    expect((await service.list(scope)).value[0].id).toBe(retained.value[0].id);
+    await inventory(scope);
+    await publish(scope, [directoryUser()]);
+    const stages = new UserSourceStages(fixture.runtime);
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, ...scope } }),
+      async () => { throw new AppError(403, "permission_required", "Synthetic denial."); }, { beforePublish: async () => {} }))
+      .rejects.toMatchObject({ code: "permission_required" });
+    const retained = await selected(scope);
+    expect(retained.page.value[0].people?.owner?.observedAt).toBe(observedAt);
+    await expect(publish(scope, [directoryUser("Malformed", "not-a-guid")])).rejects.toMatchObject({ code: "provider_schema" });
+    expect((await selected(scope)).page.value[0].people?.owner?.observedAt).toBe(observedAt);
+    await publish(scope, [directoryUser()]);
+    expect((await selected(scope)).page.value[0].id).toBe(retained.page.value[0].id);
   });
 });

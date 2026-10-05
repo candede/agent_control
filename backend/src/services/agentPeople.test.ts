@@ -4,14 +4,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { SavedCopilotUsageSource } from "../db/dataSync.js";
+import type { CachedAgentPerson } from "../db/agentPeople.js";
+import type { DataSyncScope } from "../db/dataSync.js";
 import { AgentPeopleService } from "./agentPeople.js";
 import type { DirectoryPrincipal } from "./directoryPrincipals.js";
 
 const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const observedAt = "2026-09-20T12:00:00.000Z";
-const options = { generation: "initial" };
+const generation = { sessionEpoch: "0", scopeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", scopeEpoch: "0" };
+const options = { generation };
+const cachedPerson = (objectId: string, status: CachedAgentPerson["status"] = "resolved"): CachedAgentPerson => ({
+  objectId, status, displayName: "Saved person", userPrincipalName: "saved@example.invalid",
+  observedAt, checkedAt: observedAt, lastConclusiveAt: observedAt, expiresAt: "2026-09-27T12:00:00.000Z",
+});
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -19,12 +25,11 @@ function harness() {
   const user: AuthenticatedUser = { tenantId: randomUUID(), homeAccountId: randomUUID(), username: "reader@example.invalid",
     displayName: "Reader", roles: ["AgentControl.Viewer"] };
   const repository = {
-    generation: vi.fn(async () => "initial"), referencedIds: vi.fn(async () => [id, secondId]),
-    read: vi.fn(async () => []), save: vi.fn(),
+    generation: vi.fn(async () => generation),
+    referencedIds: vi.fn(async (_scope: DataSyncScope, after = "") => after ? [] : [id, secondId]),
+    directoryIds: vi.fn(async (_scope: DataSyncScope, _ids: readonly string[]): Promise<string[]> => []),
+    read: vi.fn(async (_scope: DataSyncScope, _ids: readonly string[]): Promise<CachedAgentPerson[]> => []), save: vi.fn(),
   };
-  const source: SavedCopilotUsageSource<unknown> = { source: "directory", value: null, observedAt: null,
-    attemptStatus: null, message: null, attemptedAt: null, lastSuccessAt: null, rowCount: null };
-  const saved = { getDirectorySource: vi.fn(async () => source) };
   const directory = { resolve: vi.fn(async (_token, ids): Promise<DirectoryPrincipal[]> => ids.map(entity => ({
     ...entity, displayName: "Unlicensed creator", secondaryText: "mail@example.invalid",
     userPrincipalName: "login@example.invalid", principalKind: "user" as const,
@@ -37,10 +42,10 @@ function harness() {
   const observeOperation = vi.fn(async (_id, _user, operation) => operation(reportedFailures));
   const service = new AgentPeopleService({} as pg.Pool, {
     observeOperation,
-    repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
+    repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
     now: () => new Date(observedAt),
   });
-  return { service, user, repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions, reportedFailures, observeOperation };
+  return { service, user, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions, reportedFailures, observeOperation };
 }
 
 describe("persistent agent people resolution", () => {
@@ -60,21 +65,36 @@ describe("persistent agent people resolution", () => {
 
   it("skips fresh cached results unless explicitly retried", async () => {
     const value = harness();
-    value.repository.read.mockResolvedValueOnce([{ objectId: id }] as never);
+    value.repository.read.mockResolvedValueOnce([cachedPerson(id)]);
     expect((await value.service.resolve(value.user, [id], options)).changed).toBe(false);
     expect(value.directory.resolve).not.toHaveBeenCalled();
-    value.repository.read.mockResolvedValueOnce([{ objectId: id }] as never);
+    value.repository.read.mockResolvedValueOnce([cachedPerson(id)]);
     await value.service.resolve(value.user, [id], { ...options, force: true });
     expect(value.directory.resolve).toHaveBeenCalledTimes(1);
   });
 
   it("uses existing reference identities during automatic sync rather than forcing all lookups", async () => {
     const value = harness();
-    value.repository.read.mockResolvedValueOnce([{ objectId: id, status: "resolved" }] as never);
+    value.repository.read.mockResolvedValueOnce([cachedPerson(id)]);
     await value.service.refreshReferences(value.user, new AbortController().signal,
       { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false, useCache: true });
     expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
       [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal));
+  });
+
+  it("walks reference cursors without exceeding 100 IDs in directory or cache reads", async () => {
+    const value = harness();
+    const objectId = (index: number) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    const first = Array.from({ length: 100 }, (_, index) => objectId(index + 1));
+    const second = [objectId(101), objectId(102), objectId(103)];
+    value.repository.referencedIds.mockResolvedValueOnce(first).mockResolvedValueOnce(second).mockResolvedValueOnce([]);
+    expect(await value.service.refreshReferences(value.user, new AbortController().signal,
+      { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false }))
+      .toEqual({ changed: true, resolved: 103, notFound: 0, failed: 0 });
+    expect(value.repository.referencedIds.mock.calls.map(call => call[1])).toEqual(["", objectId(100), objectId(103)]);
+    expect(value.repository.directoryIds.mock.calls.map(call => call[1])).toEqual([first, second]);
+    expect(value.repository.read.mock.calls.map(call => call[1])).toEqual([first, second]);
+    expect(value.directory.resolve).toHaveBeenCalledTimes(103);
   });
 
   it("keeps 404 not-found distinct from lookup failure and does not claim deletion", async () => {
@@ -92,24 +112,17 @@ describe("persistent agent people resolution", () => {
 
   it("refreshes only referenced people missing from the licensed reporting roster during Users sync", async () => {
     const value = harness();
-    value.saved.getDirectorySource.mockResolvedValue({
-      source: "directory", observedAt, rowCount: 1, attemptStatus: "available", attemptedAt: observedAt,
-      lastSuccessAt: observedAt, message: "Fixture",
-      value: [{ identity: { objectId: id, displayName: "Licensed", userPrincipalName: "licensed@example.invalid",
-        accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null },
-      serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [] }],
-    });
+    value.repository.directoryIds.mockResolvedValue([id]);
     const publication = { runId: randomUUID(), jobId: randomUUID() };
     await value.service.refreshReferences(value.user, new AbortController().signal, publication, { incompleteOnly: false });
     expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
       [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal));
-    expect(value.repository.save.mock.calls[0][2]).toMatchObject({ generation: "initial", publication });
+    expect(value.repository.save.mock.calls[0][2]).toMatchObject({ generation, publication });
   });
 
   it("retries only failed or missing people rather than refreshing completed references again", async () => {
     const value = harness();
-    value.repository.read.mockResolvedValueOnce([{ objectId: id, status: "resolved" },
-      { objectId: secondId, status: "lookup_failed" }] as never);
+    value.repository.read.mockResolvedValueOnce([cachedPerson(id), cachedPerson(secondId, "lookup_failed")]);
     await value.service.refreshReferences(value.user, new AbortController().signal,
       { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: true });
     expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
@@ -135,7 +148,7 @@ describe("persistent agent people resolution", () => {
     controller.abort(new Error("Fixture cancellation"));
     await expect(cancelled.service.resolve(cancelled.user, [id], { ...options, signal: controller.signal }))
       .rejects.toThrow("Fixture cancellation");
-    expect(cancelled.saved.getDirectorySource).not.toHaveBeenCalled();
+    expect(cancelled.repository.directoryIds).not.toHaveBeenCalled();
     expect(cancelled.repository.read).not.toHaveBeenCalled();
     expect(cancelled.directory.resolve).not.toHaveBeenCalled();
 
@@ -144,7 +157,7 @@ describe("persistent agent people resolution", () => {
     deadlineController.abort(new DOMException("Private deadline details", "TimeoutError"));
     await expect(deadline.service.resolve(deadline.user, [id], { ...options, signal: deadlineController.signal }))
       .rejects.toMatchObject({ status: 504, code: "provider_timeout" });
-    expect(deadline.saved.getDirectorySource).not.toHaveBeenCalled();
+    expect(deadline.repository.directoryIds).not.toHaveBeenCalled();
 
     const timedOut = harness();
     timedOut.directory.resolve.mockRejectedValueOnce(new DOMException("Private provider details", "TimeoutError"));
@@ -159,13 +172,13 @@ describe("persistent agent people resolution", () => {
     const controller = new AbortController();
     value.repository.generation.mockImplementationOnce(async () => {
       controller.abort(new Error("Fixture cancellation"));
-      return "initial";
+      return generation;
     });
     await expect(value.service.refreshReferences(value.user, controller.signal,
       { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false }))
       .rejects.toThrow("Fixture cancellation");
     expect(value.repository.referencedIds).not.toHaveBeenCalled();
-    expect(value.saved.getDirectorySource).not.toHaveBeenCalled();
+    expect(value.repository.directoryIds).not.toHaveBeenCalled();
   });
 
   it("bounds provider concurrency and rejects invalid IDs before provider work", async () => {
@@ -179,6 +192,9 @@ describe("persistent agent people resolution", () => {
       return ids.map(entity => ({ ...entity, displayName: entity.resourceId, principalKind: "unknown" }));
     });
     await expect(value.service.resolve(value.user, ["arbitrary-name"], options)).rejects.toMatchObject({ code: "invalid_agent_people" });
+    await expect(value.service.resolve(value.user, Array.from({ length: 101 }, () => randomUUID()), options))
+      .rejects.toMatchObject({ code: "invalid_agent_people" });
+    expect(value.repository.directoryIds).not.toHaveBeenCalled();
     await value.service.resolve(value.user, Array.from({ length: 19 }, () => randomUUID()), options);
     expect(maximum).toBe(8);
     expect(value.repository.save).toHaveBeenCalledTimes(3);
@@ -219,16 +235,15 @@ describe("persistent agent people resolution", () => {
       };
       if (phase === "generation") value.repository.generation.mockImplementationOnce(async () => {
         await replaceSession();
-        return "initial";
+        return generation;
       });
       if (phase === "references") value.repository.referencedIds.mockImplementationOnce(async () => {
         await replaceSession();
         return [id];
       });
-      if (phase === "directory") value.saved.getDirectorySource.mockImplementationOnce(async () => {
+      if (phase === "directory") value.repository.directoryIds.mockImplementationOnce(async () => {
         await replaceSession();
-        return { source: "directory", value: null, observedAt: null, attemptStatus: null,
-          message: null, attemptedAt: null, lastSuccessAt: null, rowCount: null };
+        return [];
       });
       if (phase === "cache") value.repository.read.mockImplementationOnce(async () => {
         await replaceSession();
@@ -343,10 +358,7 @@ describe("persistent agent people resolution", () => {
       const blocked = new Promise<void>(resolve => { release = resolve; });
       const reached = vi.fn();
       const stall = async () => { reached(); await blocked; };
-      if (phase === "directory") {
-        const source = await value.saved.getDirectorySource();
-        value.saved.getDirectorySource.mockClear().mockImplementationOnce(async () => { await stall(); return source; });
-      }
+      if (phase === "directory") value.repository.directoryIds.mockImplementationOnce(async () => { await stall(); return []; });
       if (phase === "cache") value.repository.read.mockImplementationOnce(async () => { await stall(); return []; });
       if (phase === "authentication") value.revalidateUser.mockImplementationOnce(async () => { await stall(); return value.user; });
       if (phase === "capability") value.requireAvailable.mockImplementationOnce(stall);

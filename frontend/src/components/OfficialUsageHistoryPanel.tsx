@@ -1,122 +1,47 @@
-import { useEffect, useState } from "react";
-import { Trash2 } from "lucide-react";
-import {
-  ApiError,
-  getOfficialUsageHistory,
-  type OfficialUsageHistoryBundleSummary,
-  type OfficialUsageHistoryView,
-} from "../api/client";
-import { useSavedRead } from "../savedQueries";
-import { reportDates } from "./officialUsageImportPresentation";
-import { formatSyncInstant } from "./syncPresentation";
-import "./officialUsage.css";
-
-const pageSize = 25;
-
-export type ReportHistoryAdminControls = {
-  busy: boolean;
-  onDelete: (report: OfficialUsageHistoryBundleSummary) => void;
-  onResume?: (bundleId: string) => void;
-};
-
-export function OfficialUsageHistoryPanel({ revision, onSelect, admin }: {
-  revision: number;
-  onSelect?: (setId: string) => void;
-  admin?: ReportHistoryAdminControls;
-}) {
-  const [history, setHistory] = useState<OfficialUsageHistoryView>();
-  const [offset, setOffset] = useState(0);
-  const [reload, setReload] = useState(0);
-  const [read, setRead] = useState<{ key: string; error?: string }>();
-  const readSaved = useSavedRead();
-  const readKey = JSON.stringify([offset, reload, revision]);
-  const scopedRead = read?.key === readKey ? read : undefined;
-  const loading = !scopedRead;
-  const error = scopedRead?.error;
-  const displayedHistory = history?.bundles.offset === offset ? history : undefined;
-  const verified = !loading && !error && Boolean(displayedHistory);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    const query = { limit: pageSize, offset };
-    void readSaved(["official-usage-history", query, revision, reload],
-      signal => getOfficialUsageHistory(query, { signal }), controller.signal)
-      .then(next => {
-        if (controller.signal.aborted) return;
-        setHistory(next);
-        setRead({ key: readKey });
-        if (offset > 0 && offset >= next.bundles.count) {
-          setOffset(Math.max(0, Math.floor(Math.max(0, next.bundles.count - 1) / pageSize) * pageSize));
-        }
-      })
-      .catch(reason => {
-        if (controller.signal.aborted || (reason instanceof ApiError && reason.kind === "aborted")) return;
-        if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setHistory(undefined);
-        setRead({ key: readKey, error: reason instanceof Error ? reason.message : "Reports could not be loaded." });
-      });
-    return () => controller.abort();
-  }, [offset, readKey, readSaved, reload, revision]);
-
-  useEffect(() => {
-    const refresh = () => { if (!admin?.busy) setReload(value => value + 1); };
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, [admin?.busy]);
-
-  const first = displayedHistory?.bundles.count ? offset + 1 : 0;
-  const last = displayedHistory ? Math.min(offset + displayedHistory.bundles.value.length, displayedHistory.bundles.count) : 0;
-  const disabled = !verified || admin?.busy;
-
-  return <section className="official-usage-history-panel" aria-label="Saved report sets" aria-busy={loading}>
-    {error ? <div className="error-banner" role="alert">
-      <p>{error}</p>
-      {displayedHistory ? <p>The list below could not be updated.</p> : null}
-      <button type="button" className="secondary" disabled={admin?.busy} onClick={() => setReload(value => value + 1)}>Retry</button>
-    </div> : null}
-    {loading ? <p role="status">Loading reports...</p> : null}
-    {displayedHistory ? <>
-      <p className="usage-history-count">{displayedHistory.bundles.count.toLocaleString()} saved report {displayedHistory.bundles.count === 1 ? "set" : "sets"}</p>
-      {displayedHistory.bundles.value.length ? <div className="table-shell usage-history-table" role="region" aria-label="Saved reports" tabIndex={0}>
-        <table role="table">
-          <thead><tr>
-            <th scope="col">Imported</th>
-            <th scope="col">Activity dates</th>
-            <th scope="col">Reports</th>
-            <th scope="col">Status</th>
-            <th scope="col"><span className="sr-only">Actions</span></th>
-          </tr></thead>
-          <tbody>{displayedHistory.bundles.value.map(bundle => <tr key={bundle.id}>
-            <td><span className="usage-mobile-label" aria-hidden="true">Imported</span>
-              {bundle.acceptedAt ? <time dateTime={bundle.acceptedAt}>{formatSyncInstant(bundle.acceptedAt)}</time> : "Not finished"}</td>
-            <td><span className="usage-mobile-label" aria-hidden="true">Activity dates</span>
-              {reportDates(bundle)}<small>{bundle.reportingWindowKnown ? "Reporting period" : "Observed activity"}</small></td>
-            <td><span className="usage-mobile-label" aria-hidden="true">Reports</span>
-              {bundle.kinds.length} CSVs<small>{bundle.rowCount.toLocaleString()} rows</small></td>
-            <td><span className="usage-mobile-label" aria-hidden="true">Status</span>
-              <span className={`usage-report-badge${bundle.isActive && !bundle.deletedAt ? " is-current" : ""}`}>
-              {bundle.deletedAt ? "Deleted" : !bundle.complete ? "Incomplete" : bundle.isActive ? "Current" : "Saved"}
-            </span></td>
-            <td><div className="table-actions">
-              {bundle.complete && !bundle.deletedAt && onSelect ? <button type="button" className="secondary"
-                disabled={disabled} onClick={() => onSelect(bundle.id)}>View report</button> : null}
-              {!bundle.complete && !bundle.deletedAt && admin?.onResume ? <button type="button" className="secondary"
-                disabled={disabled} onClick={() => admin.onResume?.(bundle.bundleId)}>Continue import</button> : null}
-              {admin && !bundle.deletedAt ? <button type="button" className="icon-button danger"
-                aria-label={`Delete report set: ${reportDates(bundle)}`} disabled={disabled}
-                onClick={() => admin.onDelete(bundle)}><Trash2 size={16} aria-hidden="true" /></button> : null}
-            </div></td>
-          </tr>)}</tbody>
-        </table>
-      </div> : <div className="usage-empty-state"><h3>No reports yet</h3><p>Add the three Microsoft 365 CSV exports to see agent usage.</p></div>}
-      {displayedHistory.bundles.count > pageSize ? <nav className="table-pagination" aria-label="Report history pages">
-        <button type="button" className="secondary" disabled={offset === 0 || loading || admin?.busy}
-          onClick={() => setOffset(value => Math.max(0, value - pageSize))}>Previous</button>
-        <span>{first}-{last} of {displayedHistory.bundles.count.toLocaleString()}</span>
-        <button type="button" className="secondary" disabled={last >= displayedHistory.bundles.count || loading || admin?.busy}
-          onClick={() => setOffset(value => value + pageSize)}>Next</button>
-      </nav> : null}
-      {displayedHistory.bundles.count ? <p className="usage-import-hint">Switch report sets in Agents to explore usage. Activity dates do not imply continuous coverage.</p> : null}
+import { useState } from "react";
+import type { ReportHistorySet, ReportMetadata, ReportObservation } from "../../../backend/src/types/officialReportData";
+import { useReportPage } from "../useReportPage";
+import { usageCount, usageDate } from "../usageInsights";
+import { ReportPageControls, ReportReadStatus } from "./ReportPageControls";
+export type ReportHistoryAdminControls = { busy: boolean; onDelete: (report: ReportHistorySet, evidence: ReportMetadata) => void };
+export function OfficialUsageHistoryPanel({ revision, onSelect, admin }: { revision: number; onSelect?: (setId: string) => void; admin?: ReportHistoryAdminControls }) {
+  const read = useReportPage<ReportHistorySet>("official-usage/history", { sort: "acceptedAt", order: "desc" }, revision);
+  const [observations, setObservations] = useState<string>();
+  const data = read.data, history = data?.analytics.history;
+  const busy = read.loading || Boolean(admin?.busy);
+  return <section className="official-usage-history-panel" aria-label="Saved report sets">
+    <ReportReadStatus read={read} />
+    {data ? <><p>{data.counts.total.toLocaleString()} saved report sets</p>
+      {data.counts.filtered > 0 ? <div className="table-shell"><table><thead><tr><th>Imported</th><th>Reporting window</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+        {data.value.map(set => <tr key={set.id}><td>{usageDate(set.acceptedAt)}</td><td>
+          {set.reportingStart || set.reportingEnd ? <>
+            {set.reportingStart ? <time dateTime={set.reportingStart}>{usageDate(set.reportingStart)}</time> : "Not reported"} to{" "}
+            {set.reportingEnd ? <time dateTime={set.reportingEnd}>{usageDate(set.reportingEnd)}</time> : "Not reported"}
+          </> : "No activity dates"}
+          <small>{set.periodProvenance === "activity_range" ? "Observed activity" : "Reporting period"}</small></td>
+          <td>{set.active ? "Current" : set.visibility === "superseded" ? "Superseded" : "Saved"}<small>{set.id}</small></td><td>
+            <button type="button" disabled={busy} onClick={() => onSelect?.(set.id)}>View report</button>
+            <button type="button" disabled={busy} onClick={() => setObservations(set.id)}>Report observations</button>
+            {admin ? <button type="button" disabled={busy} onClick={() => admin.onDelete(set, data.reports)}>Delete report set</button> : null}</td></tr>)}</tbody></table></div> : null}
+      {!data.value.length && !data.counts.filtered ? <><h4>No reports yet</h4><p>Add all three Microsoft 365 CSV exports.</p></> : null}
+      <ReportPageControls {...read} loading={busy} disabled={Boolean(admin?.busy)} label="report sets" />
+      <p>Activity dates do not imply continuous coverage. New imports do not change this pinned history selection.</p>
+      <button type="button" disabled={busy} onClick={read.restart}>Load current report history</button>
+      {history ? <details><summary>History coverage and reuse</summary>
+        <p>{history.imports.toLocaleString()} imports; {history.uniqueObservations.toLocaleString()} observations; {history.observationRows.toLocaleString()} observed rows;
+          {history.uniquePayloads.toLocaleString()} unique payloads, {history.repeatedRowsReused.toLocaleString()} repeated rows reused.</p>
+        <p>{history.knownWindows} known windows, {history.unknownWindows} unknown windows, {history.overlappingKnownWindows} overlapping known windows.</p>
+        <p>Observed activity {usageDate(history.earliestActivityDateUtc)} to {usageDate(history.latestActivityDateUtc)} does not prove continuous coverage. Totals are not additive across imports.</p>
+      </details> : null}
+      {observations ? <HistoryObservations key={data.selection.id + observations} setId={observations} selectionId={data.selection.id}
+        onRestartSelection={() => { setObservations(undefined); read.restart(); }} /> : null}
     </> : null}
-    {!displayedHistory && !loading && error && offset > 0 ? <button type="button" className="secondary" onClick={() => setOffset(0)}>First page</button> : null}
   </section>;
+}
+function HistoryObservations({ setId, selectionId, onRestartSelection }: { setId: string; selectionId: string; onRestartSelection: () => void }) {
+  const read = useReportPage<ReportObservation>(`official-usage/history/${encodeURIComponent(setId)}/observations`, { selectionId }, 0, true, onRestartSelection);
+  return <section aria-label="Report observations"><h4>Observations for {setId}</h4><ReportReadStatus read={read} />
+    <ul>{read.data?.value.map(row => <li key={row.versionId}><strong>{row.kind}</strong>: {usageCount(row.rowCount)} rows; imported {usageDate(row.acceptedAt)};
+      source as of {usageDate(row.sourceAsOf)} ({row.sourceAsOfProvenance}, {row.sourceFreshness}); version {row.versionId}; hash {row.contentHash}
+      {row.supersedesVersionId ? `; corrects ${row.supersedesVersionId}` : ""}</li>)}</ul><ReportPageControls {...read} label="observations" /></section>;
 }

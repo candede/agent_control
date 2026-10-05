@@ -1,5 +1,6 @@
 import type { CopilotPackage } from "./copilotPackage.js";
-import type { AgentUsageContext, AgentUsageSummary } from "./agentUsage.js";
+import type { CandidateAgentUsageSummary } from "./officialReportApi.js";
+import type { ReportMetadata } from "./officialReportData.js";
 import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
 import type {
   InventoryCoverageStatus,
@@ -9,6 +10,8 @@ import type {
 } from "./powerPlatformInventory.js";
 
 export type UnifiedAgentSource = "graph_packages" | "power_platform";
+export type InventoryReportSummary = Omit<CandidateAgentUsageSummary, "context"> & { reportSetId: string | null };
+export type InventoryReportContext = { reports: ReportMetadata; revision: string; expiresAt: string | null };
 export type UnifiedAgentSourceFilter = "all" | UnifiedAgentSource | "both";
 export const unifiedAgentInventoryScopes = ["catalog", "power_platform_only", "all"] as const;
 export type UnifiedAgentInventoryScope = typeof unifiedAgentInventoryScopes[number];
@@ -25,7 +28,6 @@ export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
 // Legacy API views; the category selector uses the catalog's raw type facets instead.
 export const unifiedAgentQuickViews = ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const;
-export type UnifiedAgentQuickView = typeof unifiedAgentQuickViews[number];
 export const unifiedAgentViews = [...unifiedAgentQuickViews, "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
 export type UnifiedAgentView = typeof unifiedAgentViews[number];
 export const unifiedAgentAccessFilters = ["all", "available", "unavailable", "unknown"] as const;
@@ -82,12 +84,12 @@ export type UnifiedAgentSourceObservation = {
   snapshotId: string;
   observedAt: string;
   expiresAt: string;
-  current: true;
+  current: boolean;
 };
 
 export type UnifiedAgentPackageObservation = UnifiedAgentSourceObservation & {
-  tokenMode: "delegated";
-  scopeKind: "broad";
+  tokenMode: "delegated" | "application";
+  scopeKind: "broad" | "exact";
   observedCount: number;
   totalRecords: number;
 };
@@ -161,6 +163,10 @@ export type SavedAgentEnvironment = {
 };
 
 export type UnifiedAgentRecord = {
+  columns?: Record<string, string | number | null>;
+  memberCount?: number;
+  packageCount?: number;
+  packagesComplete?: boolean;
   id: string;
   displayName: string;
   presence: UnifiedAgentPresence;
@@ -173,7 +179,7 @@ export type UnifiedAgentRecord = {
     createdBy?: SavedAgentPerson;
     lastModifiedBy?: SavedAgentPerson;
   };
-  usage?: AgentUsageSummary;
+  usage?: InventoryReportSummary;
   identity: {
     state: UnifiedAgentLinkState;
     evidence: UnifiedAgentLinkEvidence[];
@@ -218,24 +224,27 @@ export type UnifiedAgentInventoryVerification = {
   };
 };
 
+export type UnifiedAgentInventoryUnavailable = {
+  state: "not_collected" | "preparing";
+  message: string;
+};
+
 export type UnifiedAgentInventoryPage = {
-  revision?: string;
-  /** Earliest known current evidence expiry across the complete inventory, before filtering or paging. */
-  expiresAt?: string | null;
-  usageContext?: AgentUsageContext;
-  inventoryOverview?: {
+  selection: { id: string; revision: string; evaluatedAt: string; expiresAt: string };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
+  counts: { total: number; scoped: number; filtered: number; packageTargets: number };
+  freshness: { state: string; capturedRevision: string; sources: unknown[] };
+  usageContext: InventoryReportContext;
+  inventoryOverview: {
     availableToUsers: number;
     organizationCreated: number;
     teamsAvailable: number;
     createdOrAvailable: number;
   };
   value: UnifiedAgentRecord[];
-  count: number;
-  offset: number;
-  limit: number;
   /** Complete authorized inventory before inventory scope, ordinary filters, or paging. */
   summary: UnifiedAgentInventorySummary;
-  /** Resolved scope for scopeSummary, inventoryOverview, and facets. */
+  /** Resolved scope for scopeSummary and inventoryOverview. */
   inventoryScope: UnifiedAgentInventoryScope;
   /** Selected inventory scope before ordinary filters or paging. */
   scopeSummary: UnifiedAgentInventorySummary;
@@ -246,11 +255,6 @@ export type UnifiedAgentInventoryPage = {
     pendingPackages: number;
     pendingDetails?: { missing: number; stale: number; invalidated: number };
     invalidPackages?: number;
-  };
-  facets: {
-    environments: Array<{ value: string; label: string }>;
-    platforms: Array<{ value: string; label: string }>;
-    types: Array<{ value: string; label: string }>;
   };
   sources: {
     graphPackages: UnifiedAgentSourceStatus;
@@ -264,7 +268,7 @@ export type UnifiedAgentInventoryQuery = {
   /** Defaults to all for exact reads and other non-UI consumers. */
   inventoryScope?: UnifiedAgentInventoryScope;
   /** Exact saved Graph package type; no inferred publisher or management classification. */
-  type?: string;
+  type?: string | null;
   view?: UnifiedAgentView;
   endUserAccess?: UnifiedAgentAccessFilter;
   reportedUsage?: UnifiedAgentUsageFilter;
@@ -275,15 +279,16 @@ export type UnifiedAgentInventoryQuery = {
   search?: string;
   source?: UnifiedAgentSourceFilter;
   linkState?: UnifiedAgentLinkState;
-  environmentId?: string;
+  environmentId?: string | null;
   blocked?: boolean;
-  publisher?: string;
-  availableTo?: string;
-  host?: string;
-  platform?: string;
+  publisher?: string | null;
+  availableTo?: import("./inventoryFacets.js").InventoryFacetValue;
+  host?: string | null;
+  platform?: string | null;
   createdWithinDays?: number;
   sortBy?: UnifiedAgentSort;
   sortDirection?: UnifiedAgentSortDirection;
   limit?: number;
-  offset?: number;
+  selectionId?: string;
+  cursor?: string;
 };

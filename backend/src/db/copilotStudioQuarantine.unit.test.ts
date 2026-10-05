@@ -99,12 +99,17 @@ describe("quarantine submission receipt identity without a database", () => {
     it("cancels recovered queued work before computing job status", async () => {
       const f = leaseFixture();
       f.job.cancel_requested = true;
-      await f.repository.recoverInterrupted();
+      f.query.mockImplementation(async text => {
+        const statement = String(text);
+        if (statement.includes("FROM copilot_quarantine_jobs j WHERE")) return f.result([{ ...f.job, bytes: 1000 }]);
+        if (statement.includes("SELECT id FROM bounded")) return f.result([{ id: f.item.id }]);
+        return f.result([]);
+      });
+      await f.repository.recoverInterrupted(scope.tenantId);
       const statements = f.query.mock.calls.map(([text]) => String(text));
-      const cancellation = statements.findIndex(text => text.includes("SET status='cancelled',error_code='cancelled'"));
-      expect(cancellation).toBeGreaterThan(statements.findIndex(text => text.includes("SET status=CASE WHEN sent_at IS NULL")));
-      expect(statements[cancellation]).toContain("status='queued'");
-      expect(statements[cancellation]).toContain("AND cancel_requested");
+      const cancellation = statements.findIndex(text => text.includes("WHEN $2 THEN 'cancelled' ELSE 'queued' END"));
+      expect(cancellation).toBeGreaterThan(statements.findIndex(text => text.includes("SELECT id FROM bounded")));
+      expect(f.query.mock.calls[cancellation][1]).toEqual([f.item.id, true]);
       expect(cancellation).toBeLessThan(statements.findIndex(text => text.includes("UPDATE copilot_quarantine_jobs SET status=CASE")));
     });
 

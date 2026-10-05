@@ -461,6 +461,7 @@ function AccessAssignmentForm({
               scope === "all" ||
               (scope === "specific" && (!directoryAllowed || resolving || selected.length === 0))
             }
+            aria-disabled={locked}
             onClick={() => void handleApply()}
           >
             {busy || submitting

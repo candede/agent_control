@@ -3,19 +3,31 @@ import { expect, test } from "@playwright/test";
 import type { BulkActionJob, BulkJobStatus } from "../src/api/client";
 import { capabilityViews, layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { automaticRefreshFixture } from "./automaticRefreshFixtures";
+import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 const job: BulkActionJob = {
   id: "11111111-2222-4333-8444-555555555555", action: "block", targetBlockedState: true,
   status: "running", canResume: false, total: 4, completed: 1, succeeded: 1, failed: 0, skipped: 0,
   currentAgentName: "Service desk assistant with a long published version name",
-  results: [{ id: "done", displayName: "Completed agent", status: "succeeded" }],
+  inconclusive: 0, cancelled: 0, queued: 2, reconciliationRequired: 0, retryEligible: 0, resultRevision: "1",
   createdAt: layoutTime, updatedAt: layoutTime,
 };
+
+function resultPage(current: BulkActionJob) {
+  return { revision: current.resultRevision, counts: { total: current.total, filtered: current.total },
+    page: { limit: 50, nextCursor: null, previousCursor: null },
+    value: Array.from({ length: current.total }, (_, index) => ({
+      id: `target-${index}`, displayName: `Target ${index}`,
+      status: index < current.succeeded ? "succeeded" : current.inconclusive ? "inconclusive" : current.cancelled ? "cancelled" : "queued",
+      reconciliationStatus: current.reconciliationRequired ? "required" : "not_required",
+    })) };
+}
 
 test.afterEach(async ({ page }) => page.unrouteAll({ behavior: "wait" }));
 
 test("package controls stay enabled through diagnostic expiry and background inventory reads without recurring permission checks", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
+  await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
   await page.clock.install({ time: new Date(layoutTime) });
   const views = capabilityViews.map(view => ["graph.package.block.manage", "graph.package.access.manage"].includes(view.definition.id) ? {
     ...view,
@@ -41,9 +53,12 @@ test("package controls stay enabled through diagnostic expiry and background inv
   } }));
   await page.route(url => url.pathname === "/api/agent-inventory" && !url.searchParams.has("recordId"), route => {
     if (!backgroundChange) return route.fallback();
-    finishSavedRead = () => route.fulfill({ json: unifiedAgents });
+    finishSavedRead = () => fulfillInventoryPage(route, unifiedAgents);
   });
+  const initialAutomaticRead = page.waitForResponse(response => new URL(response.url()).pathname === "/api/data-sync/auto-refresh");
   await page.goto("/agents");
+  await initialAutomaticRead;
+  await page.clock.runFor(1);
   const selected = page.getByRole("checkbox", { name: "Select Service desk assistant", exact: true });
   await expect(selected).toBeEnabled();
   await expect.poll(() => permissionChecks).toBe(1);
@@ -90,9 +105,10 @@ for (const action of ["block", "unblock"] as const) {
     const commands: string[] = [];
     await page.route("**/api/agents/bulk-jobs?*", route => route.fulfill({ json: { value: [current] } }));
     await page.route(`**/api/agents/bulk-jobs/${job.id}**`, route => {
+      if (new URL(route.request().url()).pathname.endsWith("/items")) return route.fulfill({ json: resultPage(current) });
       if (route.request().method() === "POST") {
         commands.push(new URL(route.request().url()).pathname);
-        current = { ...current, status: "succeeded", canResume: false, completed: 10, succeeded: 10 };
+        current = { ...current, status: "succeeded", canResume: false, completed: 10, succeeded: 10, queued: 0, resultRevision: "2" };
       }
       return route.fulfill({ json: current });
     });
@@ -124,14 +140,12 @@ test("a reopened running job has one panel with inline cancellation and a retain
   let completeCancel: (() => Promise<void>) | undefined;
   let cancellations = 0;
   await page.route(`**/api/agents/bulk-jobs/${job.id}**`, route => {
+    if (new URL(route.request().url()).pathname.endsWith("/items")) return route.fulfill({ json: resultPage(current) });
     if (route.request().method() === "POST") {
       expect(new URL(route.request().url()).pathname).toBe(`/api/agents/bulk-jobs/${job.id}/cancel`);
       cancellations += 1;
       completeCancel = async () => {
-        const results: BulkActionJob["results"] = [...job.results,
-          ...["pending-1", "pending-2", "pending-3"].map(id => ({ id, displayName: id, status: "cancelled" as const }))];
-        const result = { targetBlockedState: true, total: 4, succeeded: 1, failed: 0, skipped: 0, results };
-        current = { ...job, status: "cancelled", completed: 4, results, result };
+        current = { ...job, status: "cancelled", completed: 4, cancelled: 3, queued: 0, resultRevision: "2" };
         await route.fulfill({ json: current });
       };
       return;
@@ -181,9 +195,9 @@ for (const [status, label] of [
     const waiting = status === "waiting_authorization" || status === "partial";
     const current: BulkActionJob = {
       ...job, status, canResume: waiting,
-      results: waiting ? [{ id: "uncertain", displayName: "Uncertain agent", status: "inconclusive",
-        reconciliationStatus: "required", message: "Provider response lost." }] : job.results,
+      inconclusive: Number(waiting), reconciliationRequired: Number(waiting),
     };
+    await page.route(`**/api/agents/bulk-jobs/${job.id}/items?*`, route => route.fulfill({ json: resultPage(current) }));
     await page.route(`**/api/agents/bulk-jobs/${job.id}`, route => route.fulfill({ json: current }));
     await page.goto(`/agents?controlJob=${job.id}`);
     const panel = page.getByRole("region", { name: "Exact package bulk actions" });

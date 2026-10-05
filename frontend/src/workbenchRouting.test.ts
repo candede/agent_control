@@ -19,6 +19,16 @@ import {
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it("round trips server-owned 5000-target selection without member IDs in the URL", () => {
+    const query = agentRouteSearch({ ...parseAgentRoute("status=blocked"), selectedIds: [],
+      selectionStorage: "session", selectionCount: 5_000 });
+    expect(query.get("selectionState")).toBe("session");
+    expect(query.get("selectionCount")).toBe("5000");
+    expect(query.getAll("selected")).toEqual([]);
+    expect(query.toString().length).toBeLessThan(100);
+    expect(parseAgentRoute(query.toString())).toMatchObject({ selectionStorage: "session", selectionCount: 5_000, selectedIds: [] });
+  });
+
   it("round trips exact Users responsibility context and leaves invalid identities explicitly invalid", () => {
     const route = { view: "responsibility" as const, personId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", search: "", page: 2 };
     const query = usersRouteSearch(route);
@@ -88,14 +98,14 @@ describe("workbench routing", () => {
   it("round trips bounded agent search, status and selection", () => {
     const query = agentRouteSearch({
       inventoryScope: "catalog",
-      packageType: "",
+      packageType: undefined,
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "  owned bot  ",
       status: "blocked",
-      publisher: "all",
-      availability: "all",
-      host: "all",
-      platform: "all",
+      publisher: undefined,
+      availability: undefined,
+      host: undefined,
+      platform: undefined,
       createdWithinDays: "",
       sortBy: "displayName",
       sortDirection: "asc",
@@ -104,7 +114,7 @@ describe("workbench routing", () => {
       refreshMode: "delegated",
       source: "all",
       linkState: "all",
-      environmentId: "",
+      environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
     expect(workbenchUrl("agents", query)).toBe(
@@ -112,14 +122,14 @@ describe("workbench routing", () => {
     );
     expect(parseAgentRoute(query.toString())).toEqual({
       inventoryScope: "catalog",
-      packageType: "",
+      packageType: undefined,
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "owned bot",
       status: "blocked",
-      publisher: "all",
-      availability: "all",
-      host: "all",
-      platform: "all",
+      publisher: undefined,
+      availability: undefined,
+      host: undefined,
+      platform: undefined,
       createdWithinDays: "",
       sortBy: "displayName",
       sortDirection: "asc",
@@ -133,7 +143,7 @@ describe("workbench routing", () => {
       syncRunId: undefined,
       source: "all",
       linkState: "all",
-      environmentId: "",
+      environmentId: undefined,
       inventorySnapshotId: undefined,
       selectedPowerPlatformIds: [],
       quarantineJobId: undefined,
@@ -154,14 +164,14 @@ describe("workbench routing", () => {
     const selectedIds = Array.from({ length: 5_000 }, (_, index) => `package-${index}-${"x".repeat(32)}`);
     const query = agentRouteSearch({
       inventoryScope: "catalog",
-      packageType: "",
+      packageType: undefined,
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "",
       status: "all",
-      publisher: "all",
-      availability: "all",
-      host: "all",
-      platform: "all",
+      publisher: undefined,
+      availability: undefined,
+      host: undefined,
+      platform: undefined,
       createdWithinDays: "",
       sortBy: "displayName",
       sortDirection: "asc",
@@ -170,7 +180,7 @@ describe("workbench routing", () => {
       refreshMode: "delegated",
       source: "all",
       linkState: "all",
-      environmentId: "",
+      environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
 
@@ -236,7 +246,7 @@ describe("workbench routing", () => {
   });
 
   it("drops obsolete source/link filters without losing legacy exact resource identities", () => {
-    const route = parseAgentRoute("source=power_platform&linkState=matched&environment=env-a&detail=bot-a&selectedResource=power_platform%3Aenv-a%3Abot-a");
+    const route = parseAgentRoute("source=power_platform&linkState=matched&environment=~string%3Aenv-a&detail=bot-a&selectedResource=power_platform%3Aenv-a%3Abot-a");
     expect(route).toMatchObject({
       source: "all", linkState: "all", environmentId: "env-a",
       detailId: "power_platform:env-a:bot-a",
@@ -246,7 +256,7 @@ describe("workbench routing", () => {
     expect(agentRouteSearch(route).has("source")).toBe(false);
     expect(agentRouteSearch(route).has("linkState")).toBe(false);
     expect(parseAgentRoute(agentRouteSearch(route).toString()).detailId).toBe(route.detailId);
-    expect(parseAgentRoute("source=power_platform&environment=env-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
+    expect(parseAgentRoute("source=power_platform&environment=~string%3Aenv-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
   });
 
   it("round trips source-specific audit and Sync report state", () => {
@@ -295,14 +305,26 @@ describe("workbench routing", () => {
   });
 
   it("round trips raw Graph types and combined evidence filters with all supported table sorts", () => {
-    for (const packageType of ["", "firstParty", "thirdParty", "shared", "lob", "futureType", "microsoft", "all", "a & b"]) {
+    for (const packageType of [undefined, null, "firstParty", "thirdParty", "shared", "lob", "futureType", "microsoft", "all", "a & b"]) {
       for (const sortBy of ["hosts", "responses", "activeUsers", "lastActivity", "owner", "publisher"] as const) {
         const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a&access=available&usage=used&management=organization_managed&relevance=organization"), packageType, sortBy, sortDirection: "desc" as const };
         expect(parseAgentRoute(agentRouteSearch(route).toString())).toEqual(route);
       }
     }
-    expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ packageType: "", sortBy: "displayName" });
+    expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ packageType: undefined, sortBy: "displayName" });
     expect(agentRouteSearch(parseAgentRoute("")).has("show")).toBe(false);
+  });
+
+  it("round trips unknown and literal reserved-looking facets without changing their meaning", () => {
+    for (const value of [undefined, null, "all", "__unknown__", "__some_or_all__", "~null", "~some-or-all", "公司🌏"]) {
+      const state = { ...parseAgentRoute(""), packageType: value, publisher: value, host: value, platform: value,
+        availability: value, environmentId: value };
+      expect(parseAgentRoute(agentRouteSearch(state).toString())).toEqual(state);
+    }
+    const state = { ...parseAgentRoute(""), availability: { kind: "some-or-all" as const } };
+    expect(parseAgentRoute(agentRouteSearch(state).toString())).toEqual(state);
+    expect(agentRouteSearch({ ...parseAgentRoute(""), publisher: "all" }).get("publisher")).toBe("~string:all");
+    expect(agentRouteSearch({ ...parseAgentRoute(""), publisher: null }).get("publisher")).toBe("~null");
   });
 
   it.each([
@@ -315,9 +337,9 @@ describe("workbench routing", () => {
   ])("migrates legacy show=%s without broadening its result", (legacy, key, value) => {
     const route = parseAgentRoute(`show=${legacy}&inventory=power_platform_only&q=policy&page=3`);
     const query = agentRouteSearch(route);
-    expect(route.packageType).toBe(key === "type" ? value : "");
+    expect(route.packageType).toBe(key === "type" ? value : undefined);
     expect(query.has("show")).toBe(false);
-    expect(query.get(key)).toBe(value);
+    expect(query.get(key)).toBe(["type", "platform"].includes(key) ? `~string:${value}` : value);
     expect(query.get("inventory")).toBe("power_platform_only");
     expect(query.get("q")).toBe("policy");
     expect(query.get("page")).toBe("3");

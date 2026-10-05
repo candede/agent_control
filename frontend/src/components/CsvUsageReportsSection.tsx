@@ -1,5 +1,5 @@
 import { Upload } from "lucide-react";
-import { getOfficialUsageHistory } from "../api/client";
+import { reportPages } from "../api/reportData";
 import { useSavedQuery } from "../savedQueries";
 import { usageDate } from "../usageInsights";
 import { formatSyncInstant } from "./syncPresentation";
@@ -15,13 +15,12 @@ export function CsvUsageReportsSection({
   onManageUsageReports: () => void;
 }) {
   const read = useSavedQuery({
-    queryKey: ["saved", "csv-usage-reports", principalKey, revision],
-    queryFn: ({ signal }) => getOfficialUsageHistory({ limit: 1, offset: 0 }, { signal }),
+    queryKey: ["saved", "csv-usage-reports", principalKey, revision], gcTime: 0,
+    queryFn: ({ signal }) => reportPages.history({ limit: 1 }, signal),
   });
   const loading = read.isPending || read.isFetching;
-  const summary = loading || read.isError ? undefined : read.data?.summary;
-  const activity = summary?.activityDateRange;
-  const hasReports = Boolean(summary?.importCount);
+  const summary = loading || read.isError ? undefined : read.data?.analytics.history;
+  const hasReports = Boolean(summary?.imports);
 
   return <section className="data-sync-reports" aria-labelledby="sync-reports-heading" aria-busy={loading}>
     <header className="data-sync-page-header">
@@ -46,7 +45,7 @@ export function CsvUsageReportsSection({
       {summary ? <>
         <div className="csv-usage-coverage">
           <div className="sync-health-heading">
-            <h3>{hasReports ? `${summary.importCount.toLocaleString()} saved report ${summary.importCount === 1 ? "set" : "sets"}` : "No reports yet"}</h3>
+            <h3>{hasReports ? `${summary.imports.toLocaleString()} saved report ${summary.imports === 1 ? "set" : "sets"}` : "No reports yet"}</h3>
             <span className={`data-sync-state state-${hasReports ? "success" : "attention"}`}>
               {hasReports ? "Reports available" : "Import needed"}
             </span>
@@ -55,8 +54,8 @@ export function CsvUsageReportsSection({
             <dl className="csv-usage-range">
               <div>
                 <dt>Observed activity dates (UTC)</dt>
-                <dd>{activity?.earliestDateUtc && activity.latestDateUtc
-                  ? <DateRange start={activity.earliestDateUtc.slice(0, 10)} end={activity.latestDateUtc.slice(0, 10)} />
+                <dd>{summary.earliestActivityDateUtc && summary.latestActivityDateUtc
+                  ? <DateRange start={summary.earliestActivityDateUtc} end={summary.latestActivityDateUtc} />
                   : "No dates found in imported reports"}</dd>
               </div>
             </dl>
@@ -64,8 +63,8 @@ export function CsvUsageReportsSection({
           </> : <p>Add the Agents, Users &amp; agents, and Users CSV exports from the same reporting period.</p>}
         </div>
         {hasReports ? <div className="csv-usage-import-summary">
-          {summary.latestObservedAt ? <p>Last imported <time dateTime={summary.latestObservedAt}>
-            {formatSyncInstant(summary.latestObservedAt)}</time></p> : null}
+          {summary.latestAcceptedAt ? <p>Last imported <time dateTime={summary.latestAcceptedAt}>
+            {formatSyncInstant(summary.latestAcceptedAt)}</time></p> : null}
         </div> : null}
       </> : null}
     </div>

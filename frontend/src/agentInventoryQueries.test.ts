@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createUnifiedVerification } from "./test/inventoryVerification";
+import { createUnifiedVerification, inventoryPageMetadata } from "./test/inventoryVerification";
 import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage, type UnifiedAgentRecord } from "./api/client";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
+import { reports } from "./test/reportDataFixture";
 
 vi.mock("./api/client", async importOriginal => ({
   ...await importOriginal<typeof import("./api/client")>(),
@@ -11,10 +12,11 @@ vi.mock("./api/client", async importOriginal => ({
 function page(expiresAt = "2026-09-20T12:10:00.000Z"): UnifiedAgentInventoryPage {
   const summary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
   return {
+    ...inventoryPageMetadata(undefined, expiresAt),
     inventoryScope: "all", scopeSummary: summary,
-    revision: "a".repeat(64), value: [], count: 0, offset: 0, limit: 50, summary, filteredSummary: summary,
+    value: [], summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
-    facets: { environments: [], platforms: [], types: [] }, partial: true, errors: [],
+    partial: true, errors: [],
     sources: {
       graphPackages: {
         state: "available", error: null,
@@ -41,7 +43,7 @@ function pageWithPeople(people: UnifiedAgentRecord["people"]): UnifiedAgentInven
       observations: { graphPackages: null, powerPlatform: null, packageSnapshots: {} },
       people,
     }],
-    count: 1,
+    counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 0 },
   };
 }
 
@@ -76,17 +78,27 @@ describe("AgentInventoryQueries", () => {
   });
 
   it("reuses saved reads for 30 seconds while separating filters, sorts and pages", async () => {
-    const query = { view: "organization" as const, sortBy: "responses" as const, sortDirection: "desc" as const, offset: 0 };
+    const query = { view: "organization" as const, sortBy: "responses" as const, sortDirection: "desc" as const };
     await queries.read("tenant:account:viewer:1", query, signal());
     await queries.read("tenant:account:viewer:1", { ...query }, signal());
     expect(read).toHaveBeenCalledTimes(1);
-    await queries.read("tenant:account:viewer:1", { ...query, offset: 50 }, signal());
+    await queries.read("tenant:account:viewer:1", { ...query, selectionId: page().selection.id, cursor: "next-page" }, signal());
     await queries.read("tenant:account:viewer:1", { ...query, view: "all" }, signal());
     await queries.read("tenant:account:viewer:1", { ...query, sortBy: "hosts" }, signal());
     expect(read).toHaveBeenCalledTimes(4);
     vi.advanceTimersByTime(30_001);
     await queries.read("tenant:account:viewer:1", query, signal());
     expect(read).toHaveBeenCalledTimes(5);
+  });
+
+  it.each(["not_collected", "preparing"] as const)("does not pin or retain a %s result as an empty inventory", async state => {
+    const unavailable = { state, message: "Waiting for inventory." };
+    read.mockResolvedValueOnce(unavailable);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(unavailable);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(page());
+    expect(read).toHaveBeenCalledTimes(2);
+    await queries.read("owner", {}, signal());
+    expect(read).toHaveBeenCalledTimes(2);
   });
 
   it("does not reuse private data across tenants, accounts, roles or revalidated sessions", async () => {
@@ -97,6 +109,60 @@ describe("AgentInventoryQueries", () => {
     queries.clear();
     await queries.read("tenant-a:user-a:viewer:1", {}, signal());
     expect(read).toHaveBeenCalledTimes(6);
+  });
+  it.each([false, true])("acceptance: optional identity current=%s controls active expiry, not retained stale evidence", async current => {
+    const result = pageWithPeople(undefined);
+    const expiresAt = current ? "2026-09-20T12:00:05.000Z" : "2026-09-20T11:59:00.000Z";
+    result.value[0].observations.packageSnapshots.aging = {
+      id: "catalog", snapshotId: "catalog", scopeKind: "broad", current: true,
+      observedAt: "2026-09-20T11:00:00.000Z", expiresAt: result.selection.expiresAt,
+      identityDetails: { id: "detail", snapshotId: "detail", current, observedAt: "2026-09-20T11:00:00.000Z", expiresAt },
+    };
+    read.mockResolvedValue(result);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(result);
+    if (current) {
+      vi.advanceTimersByTime(5_001);
+      await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    }
+  });
+  it.each(["fresh", "stale"] as const)("acceptance: optional package/access detail %s evidence has the same active expiry rules", async state => {
+    const result = pageWithPeople(undefined);
+    result.value[0].packages = [{ id: "access", displayName: "Access details", isBlocked: false,
+      sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
+      lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
+      detailFreshness: { state, observedAt: "2026-09-20T11:00:00.000Z",
+        expiresAt: state === "fresh" ? "2026-09-20T12:00:05.000Z" : "2026-09-20T11:59:00.000Z" },
+      availableTo: "none", deployedTo: "none" }];
+    read.mockResolvedValue(result);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(result);
+    if (state === "fresh") {
+      vi.advanceTimersByTime(5_001);
+      await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    }
+  });
+
+  it("retains only the current and directly adjacent pinned pages, including reverse-cursor aliases", async () => {
+    read.mockImplementation(async query => {
+      const number = Number(query?.cursor?.split("-").at(-1) ?? 0);
+      return { ...page(), page: { limit: 50, previousCursor: number ? `back-${number - 1}` : null, nextCursor: `forward-${number + 1}` } };
+    });
+    const selected = page().selection.id;
+    for (let number = 0; number <= 4; number++) {
+      await queries.read("owner", { selectionId: selected, ...(number ? { cursor: `forward-${number}` } : {}) }, signal());
+    }
+    expect(read).toHaveBeenCalledTimes(5);
+    await queries.read("owner", { selectionId: selected, cursor: "forward-3" }, signal());
+    await queries.read("owner", { selectionId: selected, cursor: "forward-4" }, signal());
+    expect(read).toHaveBeenCalledTimes(5);
+    await queries.read("owner", { selectionId: selected, cursor: "back-3" }, signal());
+    expect(read).toHaveBeenCalledTimes(6);
+    await queries.read("owner", { selectionId: selected, cursor: "forward-4" }, signal());
+    expect(read).toHaveBeenCalledTimes(6);
+    await queries.read("owner", { selectionId: selected, cursor: "forward-2" }, signal());
+    expect(read).toHaveBeenCalledTimes(7);
+    await queries.read("owner", { selectionId: selected, publisher: "different-filter" }, signal());
+    await queries.read("owner", { selectionId: selected, cursor: "forward-2" }, signal());
+    expect(read).toHaveBeenCalledTimes(9);
   });
 
   it("separates quick-view and independent evidence filters in the saved query cache", async () => {
@@ -122,13 +188,7 @@ describe("AgentInventoryQueries", () => {
 
     const usagePage = page();
     usagePage.usageContext = {
-      revision: "usage", lineages: [], availability: "active",
-      reportSet: {
-        id: "report", bundleId: "bundle", complete: true, kinds: ["agents", "userAgents", "users"],
-        reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
-        supersedesSetId: null, acceptedAt: null, deletedAt: null, createdAt: "2026-09-20T12:00:00.000Z",
-        expiresAt: "2026-09-20T12:00:10.000Z",
-      },
+      revision: "usage", expiresAt: null, reports: { ...reports, expiresAt: "2026-09-20T12:00:10.000Z" },
     };
     queries.clear();
     read.mockResolvedValueOnce(usagePage);
@@ -138,7 +198,7 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(4);
     queries.clear();
     read.mockResolvedValueOnce({
-      ...usagePage, usageContext: { ...usagePage.usageContext, reportSet: { ...usagePage.usageContext.reportSet!, expiresAt: null }, expiresAt: "2026-09-20T12:00:15.000Z" },
+      ...usagePage, usageContext: { ...usagePage.usageContext, reports: { ...reports, expiresAt: null }, expiresAt: "2026-09-20T12:00:15.000Z" },
     });
     await queries.read("owner", {}, signal());
     vi.advanceTimersByTime(5_000);
@@ -150,13 +210,7 @@ describe("AgentInventoryQueries", () => {
     const expiresAt = "2026-09-20T12:00:05.000Z";
     const expiring: UnifiedAgentInventoryPage = source === "source" ? page(expiresAt) : {
       ...page(),
-      usageContext: { revision: "usage", lineages: [], availability: "active" as const, expiresAt,
-        reportSet: {
-          id: "report", bundleId: "bundle", complete: true, kinds: ["agents", "userAgents", "users"],
-          reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" as const },
-          supersedesSetId: null, acceptedAt: null, deletedAt: null, createdAt: "2026-09-20T12:00:00.000Z", expiresAt: null,
-        },
-      },
+      usageContext: { revision: "usage", reports: { ...reports, expiresAt: null }, expiresAt },
     };
     read.mockImplementationOnce(async () => {
       vi.setSystemTime(new Date(expiresAt));
@@ -164,7 +218,7 @@ describe("AgentInventoryQueries", () => {
     });
 
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
-    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ revision: "a".repeat(64) });
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ selection: { revision: "1" } });
     expect(read).toHaveBeenCalledTimes(2);
   });
 
@@ -181,13 +235,12 @@ describe("AgentInventoryQueries", () => {
   });
 
   it("expires an empty filtered page when its off-page context deadline is reached", async () => {
-    const filteredPage = { ...page(), expiresAt: "2026-09-20T12:00:05.000Z" };
-    filteredPage.facets.environments = [{ value: "environment-id", label: "Saved environment" }];
+    const filteredPage = { ...page(), selection: { ...page().selection, expiresAt: "2026-09-20T12:00:05.000Z" } };
     read.mockResolvedValueOnce(filteredPage);
     await expect(queries.read("owner", { search: "no results" }, signal())).resolves.toBe(filteredPage);
     vi.advanceTimersByTime(5_000);
     await expect(queries.read("owner", { search: "no results" }, signal())).resolves.toMatchObject({
-      facets: { environments: [] },
+      selection: { expiresAt: "2026-09-20T12:10:00.000Z" },
     });
     expect(read).toHaveBeenCalledTimes(2);
   });
@@ -196,7 +249,7 @@ describe("AgentInventoryQueries", () => {
     ["2026-09-20T12:00:00.000Z", "inventory_changed"],
     ["invalid", "invalid_inventory_expiry"],
   ])("rejects a page-level deadline of %s", async (expiresAt, code) => {
-    read.mockResolvedValueOnce({ ...page(), expiresAt });
+    read.mockResolvedValueOnce({ ...page(), selection: { ...page().selection, expiresAt } });
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code });
     await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
     expect(read).toHaveBeenCalledTimes(2);

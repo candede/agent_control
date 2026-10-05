@@ -1,5 +1,5 @@
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
-import { PowerPlatformInventoryRepository, type InventoryDataScope, type InventoryRefreshInput } from "../db/powerPlatformInventory.js";
+import { PowerPlatformRefreshJobs, type InventoryDataScope, type InventoryRefreshInput } from "../db/powerPlatformRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -8,32 +8,33 @@ import { hasAppRole } from "../types/capability.js";
 import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import { capabilities } from "./capabilities.js";
 import { inventoryQueryTypes, inventoryRoleScope } from "./inventoryRoleScope.js";
-import { PowerPlatformResourceQueryClient, powerPlatformInventoryQueryDeadlineMs } from "./powerPlatformResourceQuery.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 import { requireProviderAdmissions } from "./operationalState.js";
+import { StreamedInventory } from "./streamedInventory.js";
+import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
 
 type InventoryRefreshDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
-  query: PowerPlatformResourceQueryClient["query"];
+  streams: (database: ConstructorParameters<typeof StreamedInventory>[0]) => Pick<StreamedInventory, "powerPlatformCatalog">;
 };
 
-const resourceQuery = new PowerPlatformResourceQueryClient();
 const defaultDependencies: InventoryRefreshDependencies = {
   delegatedToken: acquireDelegatedToken,
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
-  query: resourceQuery.query.bind(resourceQuery),
+  streams: database => new StreamedInventory(database),
 };
 
 type ActiveRefresh = { scope: InventoryDataScope; controller: AbortController; operation: Promise<void> };
 type StartingRefresh = Omit<ActiveRefresh, "operation"> & { operation: Promise<InventoryRefreshJob> };
 const maximumActiveRefreshes = 4;
-const refreshExecutionDeadlineMs = powerPlatformInventoryQueryDeadlineMs + 30_000;
+const refreshExecutionDeadlineMs = inventoryLimits.powerPlatformDeadlineMs;
 
 export class PowerPlatformInventoryService {
   private readonly active = new Map<string, ActiveRefresh>();
@@ -41,7 +42,7 @@ export class PowerPlatformInventoryService {
   private draining = false;
 
   constructor(
-    private readonly repository = new PowerPlatformInventoryRepository(),
+    private readonly repository = new PowerPlatformRefreshJobs(),
     private readonly dependencies: InventoryRefreshDependencies = defaultDependencies,
   ) {}
 
@@ -213,6 +214,8 @@ export class PowerPlatformInventoryService {
   private async run(scope: InventoryDataScope, current: InventoryRefreshJob, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
     const startedAt = performance.now();
     let stage = "query";
+    let sourceAuthorized = false;
+    let committed = false;
     const assertCurrent = () => {
       signal.throwIfAborted();
       assertAccountSessionValidation(validation);
@@ -221,38 +224,63 @@ export class PowerPlatformInventoryService {
     try {
       assertCurrent();
       const queryTypes = inventoryQueryTypes(current.roleScope, current.requestedTypes);
-      const result = await this.dependencies.observeOperation("powerPlatform.inventory.read",
-        { tenantId: scope.tenantId, homeAccountId: scope.principalId }, () => this.dependencies.query(token, queryTypes, {
+      const input = await inventoryJobInput(this.repository.database, scope, "power_platform", id, {
+        environmentId: current.environmentScope ?? undefined, resourceTypes: queryTypes,
+      });
+      await this.dependencies.observeOperation("powerPlatform.inventory.read",
+        { tenantId: scope.tenantId, homeAccountId: scope.principalId }, async () => {
+        await this.dependencies.streams(this.repository.database).powerPlatformCatalog(input, token, queryTypes, {
         signal,
         expectedTenantId: scope.tenantId,
         environmentId: current.environmentScope ?? undefined,
+        roleScope: current.roleScope,
+        getAccessToken: async () => {
+          assertCurrent();
+          const refreshed = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "powerPlatform.inventory.read");
+          assertCurrent();
+          return refreshed;
+        },
         onProgress: async progress => {
           assertCurrent();
           await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords);
           assertCurrent();
           operationalLog("info", "inventory_refresh_progress", { jobId: id, ...progress });
         },
-      }), { signal });
-      stage = "publication_authorization";
-      assertCurrent();
-      const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
-      assertCurrent();
-      requireSamePrincipal(scope, freshUser);
-      requireReader(freshUser);
-      requireSameQueryScope(current, freshUser);
-      await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser);
-      assertCurrent();
-      await commitAccountSessionValidation(validation, async () => {
-        assertCurrent();
-        stage = "publication";
-        await this.repository.publish(scope, id, result);
-      });
+        authorize: async () => {
+          stage = sourceAuthorized ? "publication_authorization" : "collection_authorization";
+          assertCurrent();
+          const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
+          assertCurrent();
+          requireSamePrincipal(scope, freshUser);
+          requireReader(freshUser);
+          requireSameQueryScope(current, freshUser);
+          await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser);
+          assertCurrent();
+          sourceAuthorized = true;
+          stage = "query";
+        },
+        commitPublication: operation => commitAccountSessionValidation(validation, async () => {
+          assertCurrent();
+          await operation();
+        }),
+        completeJob: async (...args) => {
+          assertCurrent();
+          stage = "publication";
+          await completeInventoryJob(input, "power_platform")(...args);
+        },
+        });
+        committed = true;
+      }, { signal });
+      await inventoryRuntime(this.repository.database).enqueue(scope);
       operationalLog("info", "inventory_refresh_succeeded", {
-        jobId: id, status: "succeeded", pages: result.pages, observedCount: result.resources.length,
-        totalRecords: result.totalRecords, queriedTypeCount: result.queriedTypes.length,
-        environmentScoped: result.environmentScope !== null, durationMs: Math.round(performance.now() - startedAt),
+        jobId: id, status: "succeeded", queriedTypeCount: queryTypes.length,
+        environmentScoped: current.environmentScope !== null, durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
+      if (committed) {
+        operationalLog("warn", "inventory_followup_failed", { jobId: id, stage, ...errorTelemetry(error, "inventory_reconciliation_pending") });
+        return;
+      }
       let cause = error;
       try { assertCurrent(); } catch (currentError) { cause = currentError; }
       const failure = isTimeoutError(cause) ? new AppError(504, "provider_timeout",

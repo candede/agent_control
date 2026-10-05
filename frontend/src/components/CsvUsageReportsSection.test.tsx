@@ -1,162 +1,128 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import * as api from "../api/client";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "../api/client";
+import { reportPages } from "../api/reportData";
+import { historySet, reportPage } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 import { CsvUsageReportsSection } from "./CsvUsageReportsSection";
-import { reportHistoryFixture } from "./reportHistoryFixture";
 
-afterEach(() => vi.restoreAllMocks());
-
-function history(): api.OfficialUsageHistoryView {
-  const data = reportHistoryFixture();
-  data.summary = {
-    ...data.summary,
-    importCount: 8, uniqueObservationCount: 24, observationRowCount: 1_234,
-    latestObservedAt: "2026-09-24T08:00:00.000Z",
-    reportingWindows: {
-      earliestStartDateUtc: "2026-04-01", latestEndDateUtc: "2026-09-20",
-      knownCount: 8, unknownCount: 0, overlappingKnownWindowCount: 2, additive: false,
-    },
-    activityDateRange: {
-      earliestDateUtc: "2026-04-05T00:00:00.000Z", latestDateUtc: "2026-09-18T00:00:00.000Z",
-      provenance: "last_activity_dates", provesReportingCoverage: false,
-    },
-  };
-  data.bundles.count = 8;
-  data.bundles.limit = 1;
-  return data;
+vi.mock("../api/reportData", async original => {
+  const actual = await original<typeof import("../api/reportData")>();
+  return { ...actual, reportPages: { ...actual.reportPages, history: vi.fn() } };
+});
+function history(empty = false, dated = true) {
+  const page = reportPage(empty ? [] : [historySet()], { counts: { total: empty ? 0 : 8, filtered: empty ? 0 : 8 },
+    page: { limit: 1, nextCursor: empty ? null : "next-set", previousCursor: null } });
+  return { ...page, analytics: { ...page.analytics, history: {
+    imports: empty ? 0 : 8, uniqueObservations: 24, observationRows: 1234, uniquePayloads: 1000, repeatedRowsReused: 234,
+    earliestAcceptedAt: null, latestAcceptedAt: dated ? "2026-09-24T08:00:00.000Z" : null,
+    earliestActivityDateUtc: dated ? "2026-04-05" : null, latestActivityDateUtc: dated ? "2026-09-18" : null,
+    earliestReportingStart: "2026-04-01", latestReportingEnd: "2026-09-20", knownWindows: 8, unknownWindows: 0,
+    overlappingKnownWindows: 2, additive: false as const, activityRangeProvesCoverage: false as const,
+  } } };
 }
-
-const props = {
-  principalKey: "tenant:viewer",
-  revision: 0,
-  canUploadUsage: true,
-  onOpenUsageImport: vi.fn(),
-  onManageUsageReports: vi.fn(),
-};
+const props = { principalKey: "tenant:viewer", revision: 0, canUploadUsage: true, onOpenUsageImport: vi.fn(), onManageUsageReports: vi.fn() };
+beforeEach(() => { vi.mocked(reportPages.history).mockResolvedValue(history()); });
+afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("CSV usage reports section", () => {
-  it("uses the earliest and latest CSV activity dates across history rather than optional windows or the latest page", async () => {
-    const getHistory = vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(history());
+  it("uses global observed activity dates and exact set counts, not optional windows or the single returned row", async () => {
     render(<CsvUsageReportsSection {...props} />);
     const section = screen.getByRole("region", { name: "CSV usage reports" });
     expect(within(section).getByRole("heading", { level: 2, name: "CSV usage reports" })).toBeVisible();
     await screen.findByText("Reports available");
-    expect(getHistory).toHaveBeenCalledExactlyOnceWith({ limit: 1, offset: 0 }, { signal: expect.any(AbortSignal) });
+    expect(reportPages.history).toHaveBeenCalledExactlyOnceWith({ limit: 1 }, expect.any(AbortSignal));
     expect(within(section).getByRole("heading", { name: "8 saved report sets" })).toBeVisible();
     const range = screen.getByText("Observed activity dates (UTC)").closest("div")!;
     expect([...range.querySelectorAll("time")].map(time => time.dateTime)).toEqual(["2026-04-05", "2026-09-18"]);
-    expect(range).toHaveTextContent("to");
     expect(screen.queryByText("Known reporting windows (UTC)")).not.toBeInTheDocument();
-    expect(screen.queryByText("Reporting dates (UTC)")).not.toBeInTheDocument();
-    expect(screen.queryByText(/Cumulative report range/)).not.toBeInTheDocument();
     expect(section).toHaveTextContent("Last imported");
     expect(section).toHaveTextContent("Observed activity across all saved report sets, not continuous reporting coverage");
     expect(section).toHaveTextContent("Report totals are kept separate");
     expect(within(section).queryByRole("button", { name: /Refresh/ })).not.toBeInTheDocument();
   });
-
-  it.each([true, false])("keeps report management available with upload permission %s", async canUploadUsage => {
-    vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(reportHistoryFixture([]));
-    const onManageUsageReports = vi.fn();
-    const onOpenUsageImport = vi.fn();
-    render(<CsvUsageReportsSection {...props} {...{ canUploadUsage, onManageUsageReports, onOpenUsageImport }} />);
+  it.each([true, false])("keeps management available while independently enforcing upload permission %s", async canUploadUsage => {
+    vi.mocked(reportPages.history).mockResolvedValue(history(true));
+    render(<CsvUsageReportsSection {...props} canUploadUsage={canUploadUsage} />);
     await screen.findByText("Import needed");
     expect(screen.getByRole("heading", { name: "No reports yet" })).toBeVisible();
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
-    expect(onManageUsageReports).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Manage reports" }));
+    expect(props.onManageUsageReports).toHaveBeenCalledOnce();
     if (canUploadUsage) {
-      await userEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
-      expect(onOpenUsageImport).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
+      expect(props.onOpenUsageImport).toHaveBeenCalledOnce();
     } else {
       expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
       expect(screen.getByText("An AgentControl.Admin can import reports.")).toBeVisible();
     }
   });
-
-  it("shows observed activity dates when optional reporting windows are missing or mixed", async () => {
-    const data = history();
-    data.summary.reportingWindows.knownCount = 7;
-    data.summary.reportingWindows.unknownCount = 1;
-    const getHistory = vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(data);
+  it("preserves observed dates with mixed or entirely missing reporting windows", async () => {
+    const data = history(); data.analytics.history.knownWindows = 7; data.analytics.history.unknownWindows = 1;
+    vi.mocked(reportPages.history).mockResolvedValue(data);
     const view = render(<CsvUsageReportsSection {...props} />);
     await screen.findByText("Reports available");
     const dates = () => [...screen.getByText("Observed activity dates (UTC)").closest("div")!.querySelectorAll("time")].map(time => time.dateTime);
     expect(dates()).toEqual(["2026-04-05", "2026-09-18"]);
-    const unknown = structuredClone(data);
-    unknown.summary.reportingWindows = {
-      earliestStartDateUtc: null, latestEndDateUtc: null,
-      knownCount: 0, unknownCount: 8, overlappingKnownWindowCount: 0, additive: false,
-    };
-    getHistory.mockResolvedValue(unknown);
+    vi.mocked(reportPages.history).mockResolvedValue({ ...data, analytics: { ...data.analytics, history: {
+      ...data.analytics.history, knownWindows: 0, unknownWindows: 8, earliestReportingStart: null, latestReportingEnd: null,
+    } } });
     view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
     await screen.findByText("Reports available");
     expect(dates()).toEqual(["2026-04-05", "2026-09-18"]);
     expect(screen.queryByText("Reporting dates not supplied")).not.toBeInTheDocument();
-    expect(screen.queryByText(/no known reporting window/)).not.toBeInTheDocument();
   });
-
-  it("shows unknown dates, not an invented range, for accepted reports without dated rows", async () => {
-    const data = reportHistoryFixture();
-    vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(data);
+  it("does not invent dates when accepted reports have no dated rows", async () => {
+    vi.mocked(reportPages.history).mockResolvedValue(history(false, false));
     render(<CsvUsageReportsSection {...props} />);
     expect(await screen.findByText("Reports available")).toBeVisible();
     expect(screen.getByText("No dates found in imported reports")).toBeVisible();
     expect(screen.getByRole("region", { name: "CSV usage reports" }).querySelector("time")).toBeNull();
   });
-
-  it("shows a valid single-day range without requesting manual dates", async () => {
-    const data = history();
-    data.summary.activityDateRange.earliestDateUtc = data.summary.activityDateRange.latestDateUtc = "2026-09-18";
-    vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(data);
+  it("shows a valid single-day range without requiring manual reporting dates", async () => {
+    const data = history(); data.analytics.history.earliestActivityDateUtc = "2026-09-18";
+    vi.mocked(reportPages.history).mockResolvedValue(data);
     render(<CsvUsageReportsSection {...props} />);
     await screen.findByText("Reports available");
-    const range = screen.getByText("Observed activity dates (UTC)").closest("div")!;
-    expect([...range.querySelectorAll("time")].map(time => time.dateTime)).toEqual(["2026-09-18", "2026-09-18"]);
+    expect([...screen.getByText("Observed activity dates (UTC)").closest("div")!.querySelectorAll("time")].map(time => time.dateTime))
+      .toEqual(["2026-09-18", "2026-09-18"]);
   });
-
-  it("reloads after report mutations and hides the previous range while verifying or after deletion", async () => {
-    const getHistory = vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValue(history());
+  it("hides prior dates during mutation revalidation and accepts explicit empty history after deletion", async () => {
     const view = render(<CsvUsageReportsSection {...props} />);
     await screen.findByText("Reports available");
-    let resolve!: (value: api.OfficialUsageHistoryView) => void;
-    getHistory.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const pending = deferred<ReturnType<typeof history>>();
+    vi.mocked(reportPages.history).mockReturnValueOnce(pending.promise);
     view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
     expect(screen.getByRole("status")).toHaveTextContent("Loading reports");
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
-    await act(async () => resolve(reportHistoryFixture([])));
+    await act(async () => pending.resolve(history(true)));
     expect(await screen.findByText("Import needed")).toBeVisible();
-    expect(getHistory).toHaveBeenCalledTimes(2);
+    expect(reportPages.history).toHaveBeenCalledTimes(2);
   });
-
-  it.each([403, 503])("does not show stale success after a %s failure and supports retry", async status => {
-    const getHistory = vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValueOnce(history())
-      .mockRejectedValueOnce(new api.ApiError(status, "summary_unavailable", "Report summary unavailable."))
-      .mockResolvedValue(history());
+  it.each([403, 503])("does not display stale success after status %s and permits explicit retry", async status => {
+    vi.mocked(reportPages.history).mockResolvedValueOnce(history())
+      .mockRejectedValueOnce(new ApiError(status, "summary_unavailable", "Report summary unavailable.")).mockResolvedValue(history());
     const view = render(<CsvUsageReportsSection {...props} />);
     await screen.findByText("Reports available");
     view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Report summary unavailable.");
     expect(screen.queryByText("Reports available")).not.toBeInTheDocument();
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByText("Reports available")).toBeVisible();
-    expect(getHistory).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByText("Reports available");
+    expect(reportPages.history).toHaveBeenCalledTimes(3);
   });
-
-  it("aborts a prior principal's read and ignores its late response", async () => {
-    let resolve!: (value: api.OfficialUsageHistoryView) => void;
-    const getHistory = vi.spyOn(api, "getOfficialUsageHistory")
-      .mockReturnValueOnce(new Promise(done => { resolve = done; }))
-      .mockResolvedValue(reportHistoryFixture([]));
+  it("aborts old principal reads, never applies obsolete history and never automatically follows cursors", async () => {
+    const pending = deferred<ReturnType<typeof history>>();
+    vi.mocked(reportPages.history).mockReturnValueOnce(pending.promise);
     const view = render(<CsvUsageReportsSection {...props} />);
-    await waitFor(() => expect(getHistory).toHaveBeenCalledOnce());
-    const signal = getHistory.mock.calls[0][1]!.signal!;
-    view.rerender(<CsvUsageReportsSection {...props} principalKey="other:viewer" />);
-    expect(await screen.findByText("Import needed")).toBeVisible();
-    expect(signal.aborted).toBe(true);
-    await act(async () => resolve(history()));
-    expect(screen.queryByText("Reports available")).not.toBeInTheDocument();
+    await waitFor(() => expect(reportPages.history).toHaveBeenCalledOnce());
+    const oldSignal = vi.mocked(reportPages.history).mock.calls[0][1];
+    view.rerender(<CsvUsageReportsSection {...props} principalKey="different-principal" />);
+    await screen.findByText("Reports available");
+    expect(oldSignal?.aborted).toBe(true);
+    await act(async () => pending.resolve(history(true)));
+    expect(screen.queryByText("Import needed")).not.toBeInTheDocument();
+    expect(reportPages.history).toHaveBeenCalledTimes(2);
   });
 });

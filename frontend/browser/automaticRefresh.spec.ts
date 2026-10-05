@@ -1,7 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
+import { fulfillInventoryPage, isInventorySelectionRequest } from "./selectedInventoryFixture";
 import { expect, test } from "@playwright/test";
 import type { AutomaticRefreshResult, CapabilityView, CopilotPackageDetail } from "../src/api/client";
-import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { selectedFixtureRead, selectedUsersPage } from "../src/test/selectedUsageFixture";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { capabilityViews, layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 
@@ -14,8 +15,16 @@ test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" })
 test("background Users refresh keeps the page stable and interactive with a subtle corner indicator", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
-  const updated = structuredClone(copilotUsageFixture);
-  updated.users[2].importedUsage!.reportedResponsesReceived = 2;
+  const original = selectedUsersPage(), updated = selectedUsersPage();
+  updated.value[2] = { ...updated.value[2], reportedResponses: 2, bridgeResponses: 2, reportedAgentsUsed: 1,
+    agentActivityState: "active", attention: ["agent_usage_low"] };
+  updated.summary = { ...updated.summary, usingAgentsUsers: 3, noAgentActivityUsers: 0 };
+  updated.selection = { ...updated.selection, id: "70000000-0000-4000-8000-000000000001" };
+  updated.sources.directory = { ...updated.sources.directory, generationId: "90000000-0000-4000-8000-000000000001", revision: "3" };
+  updated.reports = { ...updated.reports, setId: "80000000-0000-4000-8000-000000000001", activeSetId: "80000000-0000-4000-8000-000000000001",
+    activeRevision: "5", historyRevision: "36", lineages: updated.reports.lineages.map((lineage, index) => ({
+      ...lineage, versionId: `80000000-0000-4000-8000-00000000001${index}`, contentHash: "f".repeat(64),
+    })) };
   let refreshing = false;
   let reads = 0;
   let checks = 0;
@@ -28,10 +37,15 @@ test("background Users refresh keeps the page stable and interactive with a subt
       nextCheckAt: layoutTime,
     } });
   });
-  await page.route("**/api/copilot-usage/users", async route => {
-    reads += 1;
+  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/copilot-usage/users") reads += 1;
     if (refreshing) await pending;
-    await route.fulfill({ json: refreshing ? updated : copilotUsageFixture });
+    const data = refreshing ? updated : original;
+    if (url.searchParams.has("selectionId") && url.searchParams.get("selectionId") !== data.selection.id) {
+      return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The selected source changed." } });
+    }
+    return route.fulfill({ json: selectedFixtureRead(url.href, data) });
   });
   try {
     await page.goto("/users");
@@ -42,6 +56,8 @@ test("background Users refresh keeps the page stable and interactive with a subt
     await expect.poll(() => checks).toBe(1);
     await page.clock.runFor(500);
     await search.fill("Ben");
+    await expect(table.locator("tbody tr")).toHaveCount(1);
+    await expect(table.getByRole("button", { name: "Ben", exact: true })).toBeVisible();
     const tableBefore = await table.boundingBox();
     const rowBefore = await table.locator("tbody").innerText();
     const readsBefore = reads;
@@ -75,10 +91,12 @@ test("background Users refresh keeps the page stable and interactive with a subt
     await page.screenshot({ path: info.outputPath("users-background-refresh.png") });
 
     await search.fill("Cleo");
+    await expect(search).toHaveValue("Cleo");
+    await expect(table.getByRole("button", { name: "Ben", exact: true })).toHaveCount(0);
+    finish();
     await table.getByRole("button", { name: "Cleo", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Cleo", exact: true });
     await expect(dialog).toBeVisible();
-    finish();
     await expect(dialog.getByText("Agent responses", { exact: true }).locator("..").locator("strong")).toHaveText("2");
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Close user details" }).click();
@@ -90,7 +108,7 @@ test("background Users refresh keeps the page stable and interactive with a subt
   }
 });
 
-test("an open agent Overview stays stable through repeated minute refreshes of its saved details", async ({ page }, info) => {
+test("an open agent Overview keeps background pins and stays stable through explicit saved reloads", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
   const item = unifiedAgents.value[0].packages[0];
@@ -113,10 +131,9 @@ test("an open agent Overview stays stable through repeated minute refreshes of i
     ...automaticRefreshFixture({ users: "users-1", graph_packages: `packages-${version}`, power_platform: "platform-1" }),
     nextCheckAt: layoutTime,
   } }));
-  await page.route(url => url.pathname === "/api/agent-inventory", route => route.fulfill({
-    json: { ...unifiedAgents, revision: String(version + 1).repeat(64) },
-  }));
-  await page.route(url => url.pathname === `/api/agents/${item.id}`, async route => {
+  await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route,
+    unifiedAgents));
+  await page.route(url => url.pathname === `/api/agents/${item.id}/detail`, async route => {
     const description = descriptions[version];
     reads += 1;
     if (pending) await pending;
@@ -145,6 +162,8 @@ test("an open agent Overview stays stable through repeated minute refreshes of i
       version = nextVersion;
       pending = new Promise<void>(resolve => { finish = resolve; });
       await page.clock.fastForward(60_000);
+      expect(reads).toBe(readsBefore + version - 1);
+      await dialog.getByRole("button", { name: "Reload saved inventory", exact: true }).dispatchEvent("click");
       await expect.poll(() => reads).toBe(readsBefore + version);
       await page.clock.runFor(501);
       expect(await dialog.boundingBox()).toEqual(bounds);
@@ -190,7 +209,7 @@ test("an open management draft retains its controls and focus during a slow back
   const pending = new Promise<void>(resolve => { finish = resolve; });
   const writes: string[] = [];
   page.on("request", request => {
-    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request) && !isInventorySelectionRequest(request)
       && new URL(request.url()).pathname !== "/api/capabilities/check") writes.push(new URL(request.url()).pathname);
   });
   await page.route(url => url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check",
@@ -199,10 +218,9 @@ test("an open management draft retains its controls and focus during a slow back
     ...automaticRefreshFixture({ users: "users-1", graph_packages: refreshing ? "packages-2" : "packages-1", power_platform: "platform-1" }),
     nextCheckAt: layoutTime,
   } }));
-  await page.route(url => url.pathname === "/api/agent-inventory", route => route.fulfill({
-    json: { ...unifiedAgents, revision: (refreshing ? "b" : "a").repeat(64) },
-  }));
-  await page.route(url => url.pathname === `/api/agents/${item.id}`, async route => {
+  await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route,
+    unifiedAgents));
+  await page.route(url => url.pathname === `/api/agents/${item.id}/detail`, async route => {
     reads += 1;
     if (refreshing) await pending;
     await route.fulfill({ json: detail });
@@ -222,6 +240,8 @@ test("an open management draft retains its controls and focus during a slow back
     const scrollTop = await panel.evaluate(element => element.scrollTop);
     refreshing = true;
     await page.clock.fastForward(60_000);
+    expect(reads).toBe(1);
+    await dialog.getByRole("button", { name: "Reload saved inventory", exact: true }).dispatchEvent("click");
     await expect.poll(() => reads).toBe(2);
     await page.clock.runFor(501);
     await expect(none).toBeChecked();
@@ -240,7 +260,7 @@ test("an open management draft retains its controls and focus during a slow back
   }
 });
 
-test("an open user Overview stays stable through repeated minute refreshes and adopts new saved data", async ({ page }, info) => {
+test("an open user Overview stays stable while revalidating and requires explicit restart after source changes", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
   let version = 0;
@@ -251,12 +271,20 @@ test("an open user Overview stays stable through repeated minute refreshes and a
     ...automaticRefreshFixture({ users: `users-${version}`, graph_packages: "packages-1", power_platform: "platform-1" }),
     nextCheckAt: layoutTime,
   } }));
-  await page.route("**/api/copilot-usage/users", async route => {
-    const response = structuredClone(copilotUsageFixture);
-    if (version) response.users[0].directory.companyName = `Updated organization ${version}`;
-    reads += 1;
+  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), async route => {
+    const url = new URL(route.request().url()), response = selectedUsersPage();
+    if (version) {
+      response.value[0].directory.companyName = `Updated organization ${version}`;
+      response.selection = { ...response.selection, id: `70000000-0000-4000-8000-${String(version).padStart(12, "0")}` };
+      response.sources.directory = { ...response.sources.directory,
+        generationId: `90000000-0000-4000-8000-${String(version).padStart(12, "0")}`, revision: String(version + 2) };
+    }
+    if (url.pathname === "/api/copilot-usage/users") reads += 1;
     if (pending) await pending;
-    await route.fulfill({ json: response });
+    if (url.searchParams.has("selectionId") && url.searchParams.get("selectionId") !== response.selection.id) {
+      return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The selected source changed." } });
+    }
+    return route.fulfill({ json: selectedFixtureRead(url.href, response) });
   });
   try {
     await page.goto("/users");
@@ -268,13 +296,12 @@ test("an open user Overview stays stable through repeated minute refreshes and a
     await page.clock.runFor(501);
     const bounds = await dialog.boundingBox();
     const organizationBounds = await organization.boundingBox();
-    const readsBefore = reads;
-
     for (version = 1; version <= 2; version += 1) {
+      const readsBefore = reads;
       const content = await panel.innerText();
       pending = new Promise<void>(resolve => { finish = resolve; });
       await page.clock.fastForward(60_000);
-      await expect.poll(() => reads).toBe(readsBefore + version);
+      await expect.poll(() => reads).toBe(readsBefore + 1);
       await page.clock.runFor(501);
       expect(await dialog.boundingBox()).toEqual(bounds);
       expect(await organization.boundingBox()).toEqual(organizationBounds);
@@ -283,8 +310,16 @@ test("an open user Overview stays stable through repeated minute refreshes and a
       await dialog.screenshot({ path: info.outputPath(`user-overview-background-refresh-${version}.png`) });
 
       finish!();
-      await expect(dialog.getByText(`Updated organization ${version}`, { exact: true })).toBeVisible();
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByRole("alert")).toContainText("This selection changed or expired.");
+      await expect(page.getByText(`Updated organization ${version}`, { exact: true })).toHaveCount(0);
       pending = undefined;
+      await page.clock.runFor(501);
+      expect(reads).toBe(readsBefore + 1);
+      await page.getByRole("button", { name: "Restart selection", exact: true }).click();
+      await expect.poll(() => reads).toBe(readsBefore + 2);
+      await page.getByRole("button", { name: "Ada", exact: true }).click();
+      await expect(dialog.getByText(`Updated organization ${version}`, { exact: true })).toBeVisible();
       expect(await dialog.boundingBox()).toEqual(bounds);
       expect(await organization.boundingBox()).toEqual(organizationBounds);
       await expect(dialog.getByRole("button", { name: "Close user details" })).toBeFocused();

@@ -1,4 +1,3 @@
-import type { CopilotPackage } from "../types/copilotPackage.js";
 import type { InventoryIdentifier, InventoryIdentifierKind } from "../types/powerPlatformInventory.js";
 
 export type InventoryIdentityRecord = {
@@ -36,22 +35,6 @@ export function normalizeNativeIdentity(value: string): string {
 
 export function powerPlatformAgentKey(environmentId: string | null, nativeId: string): string {
   return JSON.stringify([environmentId?.toLowerCase() ?? "", normalizeNativeIdentity(nativeId)]);
-}
-
-export function packageInventoryIdentity(tenantId: string, value: CopilotPackage): InventoryIdentityRecord {
-  return {
-    nativeId: value.id,
-    tenantId,
-    environmentId: null,
-    sourceSystem: "graph_packages",
-    resourceType: "microsoft.graph/copilotpackages",
-    identifiers: sortIdentifiers([
-      { kind: "package_id", value: value.id },
-      ...(value.appId ? [{ kind: "package_app_id" as const, value: value.appId }] : []),
-      ...(value.manifestId ? [{ kind: "manifest_id" as const, value: value.manifestId }] : []),
-      ...(value.assetId ? [{ kind: "asset_id" as const, value: value.assetId }] : []),
-    ]),
-  };
 }
 
 export function resolveExactInventoryIdentity(source: InventoryIdentityRecord, candidates: readonly InventoryIdentityRecord[], options: {

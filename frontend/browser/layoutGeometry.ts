@@ -121,8 +121,16 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
         if (textWidth && rect.width + tolerance < needed) {
           failures.push(`${name(control)} is too narrow for its displayed value (${rect.width.toFixed(1)}px, needs ${needed.toFixed(1)}px)`);
         }
-        if (control.parentElement === label && Math.abs(rect.width - label.getBoundingClientRect().width) > tolerance) {
-          failures.push(`${name(control)} does not fill its field`);
+        if (control.parentElement === label) {
+          const labelCss = getComputedStyle(label);
+          const siblings = Array.from(label.children).filter(element => element !== control && visible(element)
+            && !["absolute", "fixed"].includes(getComputedStyle(element).position));
+          const available = labelCss.display === "flex" && labelCss.flexDirection === "row"
+            ? label.clientWidth - parseFloat(labelCss.paddingLeft) - parseFloat(labelCss.paddingRight)
+              - siblings.reduce((width, element) => width + element.getBoundingClientRect().width, 0)
+              - (parseFloat(labelCss.columnGap) || 0) * siblings.length
+            : label.getBoundingClientRect().width;
+          if (Math.abs(rect.width - available) > tolerance) failures.push(`${name(control)} does not fill its field`);
         }
         if (control.clientWidth && control.scrollWidth > control.clientWidth + tolerance && inputType !== "search") {
           failures.push(`${name(control)} clips its contents`);

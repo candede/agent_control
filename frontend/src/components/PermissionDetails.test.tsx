@@ -18,6 +18,18 @@ function fixture(): CapabilityView {
 }
 
 describe("Permission issue details", () => {
+  it.each(["interaction_required", "authorization_expired"])("keeps application %s recovery in app setup rather than delegated sign-in", category => {
+    const view = fixture();
+    view.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
+    view.decision = { ...view.decision, capabilityId: view.definition.id, status: "unknown", evidence: { category } };
+    render(<PermissionDetails view={view} now={now} />);
+    const setup = screen.getByRole("region", { name: "Setup and documentation" });
+    expect(setup).toHaveTextContent("Verify the application's credentials, then retry the explicit application-scope operation.");
+    expect(setup).toHaveTextContent("User sign-in does not repair app-only authorization.");
+    expect(screen.getByRole("link", { name: "Entra admin center" })).toHaveAttribute("href", "https://entra.microsoft.com/");
+    expect(screen.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+  });
+
   it("shows concise requirements without readiness or verification metadata", () => {
     render(<PermissionDetails view={fixture()} now={now} />);
     expect(screen.getByText("Microsoft denied the required API permission.")).toBeVisible();

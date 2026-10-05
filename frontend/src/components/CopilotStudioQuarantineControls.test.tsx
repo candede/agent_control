@@ -1,17 +1,17 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState, type ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import { getQuarantineJobs, previewQuarantine, submitQuarantine, type CapabilityView, type QuarantineJob, type QuarantinePreview, type SessionUser } from "../api/client";
+import { getQuarantineJob, getQuarantineJobs, previewQuarantine, submitQuarantine, type CapabilityView, type QuarantineJob, type QuarantinePreview, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof import("../api/client")>(),
-  getQuarantineJobs: vi.fn(), previewQuarantine: vi.fn(), submitQuarantine: vi.fn(),
+  getQuarantineJob: vi.fn(), getQuarantineJobs: vi.fn(), previewQuarantine: vi.fn(), submitQuarantine: vi.fn(),
 }));
 
 const user: SessionUser = { homeAccountId: "admin-a", displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
@@ -21,6 +21,7 @@ const snapshot = { id: "snapshot-a", observedAt: new Date().toISOString(), expir
 const target = {
   nativeId: "native-agent", displayName: "Test agent", type: "microsoft.copilotstudio/agents" as const, environmentId,
   identifiers: [{ kind: "environment_id" as const, value: environmentId }, { kind: "cds_bot_id" as const, value: botId }],
+  quarantineIdentity: { environmentId, botId },
   details: { isQuarantined: false },
 };
 
@@ -187,5 +188,21 @@ describe("on-demand quarantine changes", () => {
     expect(await screen.findByText("Quarantine job: Succeeded")).toBeInTheDocument();
     expect(screen.getByText("0 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
     expect(onJobChange).toHaveBeenCalledWith(expect.objectContaining({ id: "job-a" }));
+  });
+
+  it("notifies the inventory owner when active job polling reaches a terminal revision", async () => {
+    const complete: QuarantineJob = {
+      id: "polled-job", action: "quarantine", status: "succeeded", confirmationHash: "c".repeat(64), confirmation: preview().summary,
+      isCanary: false, total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
+      canResume: false, canReconcile: false, createdAt: snapshot.observedAt, updatedAt: snapshot.observedAt, results: [],
+    };
+    vi.mocked(getQuarantineJob).mockResolvedValueOnce({ ...complete, status: "running", completed: 0, succeeded: 0 })
+      .mockResolvedValue(complete);
+    const onJobChange = vi.fn();
+    renderControls(onDemandDecision(), user, { variant: "bulk", initialJobId: complete.id, onJobChange });
+    expect(await screen.findByText("Quarantine job: Running")).toBeInTheDocument();
+    expect(onJobChange).not.toHaveBeenCalled();
+    await waitFor(() => expect(onJobChange).toHaveBeenCalledWith(complete), { timeout: 2000 });
+    expect(screen.getByText("Quarantine job: Succeeded")).toBeInTheDocument();
   });
 });

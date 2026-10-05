@@ -6,14 +6,12 @@
   "resourceGroup": "approved-agent-control-resource-group",
   "region": "approved-region",
   "entraApplicationId": "00000000-0000-0000-0000-000000000000",
-  "tenantDomains": ["approved-tenant.onmicrosoft.com"],
-  "tenantDisplayName": "",
-  "tenantRegistrySecretName": "",
+  "tenantRegistrySecretName": "agent-control-tenants-json",
   "tenantRegistryRegistrationApprovalReference": "",
   "canonicalOrigin": "https://approved-agent-control-app.azurewebsites.net",
   "callbackUri": "https://approved-agent-control-app.azurewebsites.net/api/auth/callback",
   "existingVaultResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-security-resource-group/providers/Microsoft.KeyVault/vaults/approved-vault-name",
-  "installationMode": "upgrade",
+  "installationMode": "existing",
   "firstInstallApproved": false,
   "expectedResourceIds": {
     "appServicePlan": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-agent-control-resource-group/providers/Microsoft.Web/serverfarms/approved-agent-control-plan",
@@ -21,10 +19,7 @@
     "postgresFlexibleServer": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-agent-control-resource-group/providers/Microsoft.DBforPostgreSQL/flexibleServers/approved-agent-control-postgres"
   },
   "expectedDatabaseName": "agentcontrol",
-  "expectedSchemaVersion": 27,
   "runnerIpv4Address": "192.0.2.10",
-  "legacyAuditBackupPath": null,
-  "legacyAuditBackupSha256": null,
   "resources": {
     "appServicePlan": {
       "name": "approved-agent-control-plan",
@@ -91,41 +86,28 @@
     "burstablePocLimitationsAccepted": false,
     "reference": null
   },
-  "legacyStaticWebApp": {
-    "resourceId": null,
-    "retirementApproved": false,
-    "approvalReference": null
-  },
   "preparedVaultContract": {
     "secretNames": [
-      "agent-control-tenant-id",
-      "agent-control-client-id",
-      "agent-control-client-secret",
+      "agent-control-tenants-json",
       "agent-control-session-secret",
       "agent-control-postgres-admin-password",
       "agent-control-postgres-app-password"
     ],
     "runtimeConsumers": [
-      "agent-control-tenant-id",
-      "agent-control-client-id",
-      "agent-control-client-secret",
+      "agent-control-tenants-json",
       "agent-control-session-secret",
       "agent-control-postgres-app-password"
     ],
     "administratorPasswordRuntimeAccessible": false,
     "bootstrapSecretCleanupRequired": true,
     "versions": [
-      { "name": "agent-control-tenant-id", "version": null },
-      { "name": "agent-control-client-id", "version": null },
-      { "name": "agent-control-client-secret", "version": null },
+      { "name": "agent-control-tenants-json", "version": null },
       { "name": "agent-control-session-secret", "version": null },
       { "name": "agent-control-postgres-admin-password", "version": null },
       { "name": "agent-control-postgres-app-password", "version": null }
     ],
     "existingVersions": [
-      { "name": "agent-control-tenant-id", "version": null },
-      { "name": "agent-control-client-id", "version": null },
-      { "name": "agent-control-client-secret", "version": null },
+      { "name": "agent-control-tenants-json", "version": null },
       { "name": "agent-control-session-secret", "version": null },
       { "name": "agent-control-postgres-admin-password", "version": null },
       { "name": "agent-control-postgres-app-password", "version": null }

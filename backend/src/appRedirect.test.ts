@@ -10,14 +10,14 @@ vi.mock("./db/sessions.js", async importOriginal => {
 
 let server: Server;
 let origin: string;
-const database = { query: vi.fn(() => { throw new Error("Bookmark migration must not access a database."); }) };
+const database = { options: { max: 4 }, query: vi.fn(() => { throw new Error("Bookmark migration must not access a database."); }) };
 
 beforeAll(async () => {
   const { app } = createApp(database as never, "artifacts/not-used");
   await new Promise<void>(resolve => { server = app.listen(0, "127.0.0.1", resolve); });
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
-afterAll(async () => { server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve())); });
+afterAll(async () => { if (server) { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } });
 
 describe("retired Security bookmark migration", () => {
   it.each(["/security", "/security/", "/security?job=private-job&agentRecordId=private-agent",

@@ -13,7 +13,7 @@ $afterFile=Join-Path $context.State "backups/proof-$([guid]::NewGuid().ToString(
 $operator=@('run','--rm','--network',$context.Network,'--mount',"type=bind,source=$($context.State)/secrets,target=/run/secrets,readonly",'--mount',"type=bind,source=$($context.State),target=/evidence",'-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e',"PGDATABASE=$controlDatabase",'-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app',$context.Operator,'backend/scripts/restart-fixture.ts')
 if (Test-Path -LiteralPath $receipt) { throw 'Previous persistence receipt requires review before another run.' }
 $hashes=@{}
-foreach ($name in @('postgres-admin','postgres-app','session','client-secret')) { $hashes[$name]=(Get-FileHash -LiteralPath (Join-Path $context.State "secrets/$name")).Hash }
+foreach ($name in @('postgres-admin','postgres-app','session','tenants.json')) { $hashes[$name]=(Get-FileHash -LiteralPath (Join-Path $context.State "secrets/$name")).Hash }
 $settings=Get-Content -LiteralPath (Join-Path $context.State 'settings.json') -Raw | ConvertFrom-Json
 Invoke-DockerCommand ($context.Compose + @('exec','-T','postgres','psql','-U','agentcontrol_admin','-d','agentcontrol','-v','ON_ERROR_STOP=1','-c',"CREATE DATABASE `"$controlDatabase`""))
 try {
@@ -23,7 +23,7 @@ try {
     Invoke-DockerCommand ($context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
     Invoke-LocalDeployment $context 'Start'
     Invoke-DockerCommand ($operator + @('verify','/evidence/persistence-fixture.json'))
-    Invoke-LocalDeployment $context 'Deploy'
+    Invoke-LocalDeployment $context 'Deploy' -ForceChecks
     Invoke-DockerCommand ($operator + @('verify','/evidence/persistence-fixture.json'))
     Invoke-LocalDeployment $context 'Backup' -BackupFile $afterFile
     $before=(Get-Content -LiteralPath "$beforeFile.json" -Raw | ConvertFrom-Json).tables | ConvertTo-Json -Depth 5 -Compress
@@ -32,7 +32,9 @@ try {
     Invoke-LocalDeployment $context 'Restore' -BackupFile $beforeFile -RestoreDatabase $restoreDatabase
     foreach ($name in $hashes.Keys) { if ((Get-FileHash -LiteralPath (Join-Path $context.State "secrets/$name")).Hash -cne $hashes[$name]) { throw 'A runtime secret changed during redeploy.' } }
     $currentSettings=Get-Content -LiteralPath (Join-Path $context.State 'settings.json') -Raw | ConvertFrom-Json
-    foreach ($key in @('port','tenantId','clientId')) { if ($currentSettings.$key -cne $settings.$key) { throw 'Origin/identity settings changed during redeploy.' } }
+    foreach ($key in @('port','publicUrl','tenants')) {
+        if (($currentSettings.$key | ConvertTo-Json -Depth 20 -Compress) -cne ($settings.$key | ConvertTo-Json -Depth 20 -Compress)) { throw 'Origin/identity settings changed during redeploy.' }
+    }
     $services=(Invoke-DockerCommand ($context.Compose + @('ps','--format','json')) -Capture) -split "`n" | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
     if (@($services).Count -ne 2 -or @($services | Where-Object { $_.Health -ne 'healthy' }).Count) { throw 'Expected exactly two healthy runtime services.' }
     Write-Host 'Persistence proof passed: data, credentials, origin, two-service health and isolated native restore.'

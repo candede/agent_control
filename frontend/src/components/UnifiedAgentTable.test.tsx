@@ -53,6 +53,7 @@ const record: UnifiedAgentRecord = {
       { kind: "environment_id", value: "11111111-1111-4111-8111-111111111111" },
       { kind: "cds_bot_id", value: "22222222-2222-4222-8222-222222222222" },
     ],
+    quarantineIdentity: { environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222" },
     provenance: {},
     details: {},
     unknownFieldCount: 0,
@@ -119,18 +120,36 @@ function capabilities(): CapabilityView[] {
 function renderTable(overrides: Partial<ComponentProps<typeof UnifiedAgentTable>> = {}, views = capabilities(), actions = workbenchActions) {
   const props = {
     records: [record], selectedPackageIds: new Set<string>(), selectedPowerPlatformKeys: new Set<string>(),
+    selectedPackageCount: overrides.selectedPackageIds?.size ?? 0, allPackagesSelected: false,
     packageSelectionAllowed: true, packageOperationsAllowed: true, quarantineSelectionAllowed: true, selectionDisabled: false,
     onToggleSelection: vi.fn(), onViewDetails: vi.fn(), onManageAccess: vi.fn(), onSetBlocked: vi.fn(),
     ...overrides,
   };
   const content = (next: Partial<typeof props> = {}) => <CapabilityContext value={{
     views, user, now: Date.now(), loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
-  }}><WorkbenchActionProvider value={actions}><UnifiedAgentTable {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
+  }}><WorkbenchActionProvider value={actions}><UnifiedAgentTable {...props} {...next}
+    selectedPackageCount={next.selectedPackageCount ?? next.selectedPackageIds?.size ?? props.selectedPackageCount}
+    /></WorkbenchActionProvider></CapabilityContext>;
   const result = render(content());
   return { ...result, props, update: (next: Partial<typeof props>) => result.rerender(content(next)) };
 }
 
 describe("UnifiedAgentTable", () => {
+  it.each([false, true])("shows all 5000 server-counted group targets with all-matching mode %s", allPackagesSelected => {
+    const { props } = renderTable({ records: [{ ...record, packages: [record.packages[0]], packageCount: 5_000, packagesComplete: false }],
+      quarantineSelectionAllowed: false, selectedPackageCount: 5_000, allPackagesSelected,
+      selectedRecordIds: allPackagesSelected ? undefined : new Set([record.id]) });
+    expect(screen.getByText("5000 published versions selected")).toBeVisible();
+    const checkbox = screen.getByRole("checkbox", { name: `Select ${record.displayName}` });
+    expect(checkbox).toBeChecked();
+    if (allPackagesSelected) {
+      expect(checkbox).toBeDisabled();
+      expect(checkbox).toHaveAttribute("title", "Clear the all-matching package selection before selecting individual agent targets.");
+      fireEvent.click(checkbox);
+      expect(props.onToggleSelection).not.toHaveBeenCalled();
+    } else expect(checkbox).toBeEnabled();
+  });
+
   it("keeps exact package actions available while changing selection is disabled for a saved-data refresh", () => {
     const singlePackage = { ...record, packages: [record.packages[0]] };
     const { props, update } = renderTable({ records: [singlePackage], selectionDisabled: true, packageActionsDisabled: false });
@@ -229,18 +248,18 @@ describe("UnifiedAgentTable", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
     expect(screen.getByRole("cell", { name: "7" })).toBeVisible();
-    const range = screen.getByText(usageCoverageLabel(automaticUsageContext.reportSet));
+    const range = screen.getByText(usageCoverageLabel(automaticUsageContext.reports));
     expect(range.closest(".agent-grid-toolbar")).not.toBeNull();
     expect(screen.queryByText(/Usage covers the selected Microsoft 365 report/)).not.toBeInTheDocument();
     expect(screen.queryByText("Selected report.")).not.toBeInTheDocument();
-    update({ usageContext: { ...automaticUsageContext, reportSet: { ...automaticUsageContext.reportSet!, id: "different-snapshot" } } });
+    update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, setId: "different-snapshot" } } });
     expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
     expect(screen.queryByRole("cell", { name: "181" })).not.toBeInTheDocument();
     update({ usageContext: undefined });
     expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
-    update({ usageContext: { ...automaticUsageContext, availability: "deleted" } });
+    update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, availability: "deleted" } } });
     expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
-    update({ usageContext: { ...automaticUsageContext, availability: "stale" } });
+    update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, availability: "stale" } } });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
   });
 
@@ -251,9 +270,9 @@ describe("UnifiedAgentTable", () => {
     });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
     expect(document.querySelector(".agent-report-note")).toBeNull();
-    expect(screen.queryByText(usageCoverageLabel(automaticUsageContext.reportSet))).not.toBeInTheDocument();
+    expect(screen.queryByText(usageCoverageLabel(automaticUsageContext.reports))).not.toBeInTheDocument();
     update({ controls: undefined });
-    expect(screen.getByText(usageCoverageLabel(automaticUsageContext.reportSet))).toBeVisible();
+    expect(screen.getByText(usageCoverageLabel(automaticUsageContext.reports))).toBeVisible();
   });
 
   it("surfaces malformed optional timestamps without crashing the table or inventing dates", () => {
@@ -388,6 +407,7 @@ describe("UnifiedAgentTable", () => {
       if (scenario === "missing-bot") resource.identifiers = resource.identifiers.filter(item => item.kind !== "cds_bot_id");
       if (scenario === "invalid-environment") resource.environmentId = "not-an-environment-id";
       if (scenario === "duplicate-bot") resource.identifiers = [...resource.identifiers, { kind: "cds_bot_id", value: "33333333-3333-4333-8333-333333333333" }];
+      if (scenario === "missing-bot" || scenario === "duplicate-bot") resource.quarantineIdentity = null;
       const invalid = { ...record, powerPlatformResource: resource, observations: { ...record.observations, powerPlatform: snapshot } };
       const { update } = renderTable({ records: [invalid], selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
       expect(screen.getByRole("checkbox")).toBeChecked();
@@ -405,6 +425,7 @@ describe("UnifiedAgentTable", () => {
       ...record, id: "unified-2", environmentId: secondEnvironment, packages: [],
       powerPlatformResource: {
         ...record.powerPlatformResource!, environmentId: secondEnvironment,
+        quarantineIdentity: { ...record.powerPlatformResource!.quarantineIdentity!, environmentId: secondEnvironment },
         identifiers: record.powerPlatformResource!.identifiers.map(item => item.kind === "environment_id" ? { ...item, value: secondEnvironment } : item),
       },
     };
@@ -435,6 +456,7 @@ describe("UnifiedAgentTable", () => {
         powerPlatformResource: {
           ...resource, nativeId: "22222222-2222-4222-8222-222222222222", details: { schemaName: "verified-schema" },
           identifiers: resource.identifiers.filter(item => supplied || item.kind !== "cds_bot_id"),
+          quarantineIdentity: supplied ? resource.quarantineIdentity : null,
         },
         identity: { state: "matched", evidence, packageEvidence: [{ packageId: "package-1", evidence }], reason: null },
       }],
@@ -467,6 +489,7 @@ describe("UnifiedAgentTable", () => {
         nativeId: manifestId,
         details: { schemaName: manifestId },
         identifiers: [{ kind: "environment_id", value: record.environmentId! }],
+        quarantineIdentity: null,
       },
     };
     renderTable({ records: [builder], selectedPackageIds: new Set(builder.packages.map(item => item.id)) });
@@ -474,6 +497,17 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByText("2 published versions selected")).toBeVisible();
     expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View details for Builder agent" })).toBeEnabled();
+  });
+
+  it("uses the explicit native control summary without treating the bounded identifier preview as complete", () => {
+    const selected: UnifiedAgentRecord = { ...record, packages: [], powerPlatformResource: {
+      ...record.powerPlatformResource!, identifiers: [], identifierCount: 9000, identifiersComplete: false,
+    } };
+    const { props } = renderTable({ records: [selected], packageSelectionAllowed: false });
+    const checkbox = screen.getByRole("checkbox");
+    expect(checkbox).toBeEnabled();
+    fireEvent.click(checkbox);
+    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(selected);
   });
 
   it.each([null, record.environmentId])("renders one graph-only group with all package selections and optional environment %s", environmentId => {

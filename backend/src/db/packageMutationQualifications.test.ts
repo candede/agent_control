@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
-import { bootstrap, grantRuntime, migrate, retain } from "../../scripts/database.js";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { grantRuntime, initializeSchema, retain } from "../../scripts/database.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { runBulkJob } from "../services/bulkJobs.js";
 import { capabilities } from "../services/capabilities.js";
@@ -12,7 +12,7 @@ import { GraphPackagesClient } from "../services/graphPackages.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
 import { assessCanaryRestoration, packageCanaryMutation, PackageMutationQualificationRepository } from "./packageMutationQualifications.js";
 import type { PackageAccessMutationState } from "../services/packageMutationState.js";
-import { migrations, verifySchema } from "./schema.js";
+import { verifySchema } from "./schema.js";
 import { transaction } from "./pool.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -24,36 +24,13 @@ const prestate = { kind: "block" as const, isBlocked: false };
 const poststate = { kind: "block" as const, isBlocked: true };
 
 beforeAll(async () => {
-  fixture = await testDatabase(false);
-  await bootstrap(fixture.operator, fixturePassword);
-  await migrate(fixture.operator);
-  await grantRuntime(fixture.operator);
+  fixture = await testDatabase();
   qualifications = new PackageMutationQualificationRepository(fixture.runtime);
   jobs = new JobRepository(fixture.runtime);
 });
 afterAll(async () => { await fixture?.close(); });
 
 describe("Package mutation qualifications", () => {
-  it("preserves legacy canary approvals through the complete runtime upgrade", async () => {
-    const legacy = await testDatabase(false);
-    try {
-      await bootstrap(legacy.operator, fixturePassword);
-      await migrate(legacy.operator, migrations.slice(0, 11));
-      await grantRuntime(legacy.operator);
-      const repository = new PackageMutationQualificationRepository(legacy.runtime);
-      const approval = await repository.createApproved(administrator, qualificationInput());
-      await migrate(legacy.operator);
-      await grantRuntime(legacy.operator);
-      await verifySchema(legacy.runtime);
-      expect((await repository.list(administrator)).value).toContainEqual(expect.objectContaining({
-        id: approval.id, targetId: approval.targetId, status: "approved", action: "block",
-        prestate: approval.prestate, poststate: approval.poststate, approvedByPrincipalId: administrator.homeAccountId,
-      }));
-    } finally {
-      await legacy.close();
-    }
-  });
-
   it("requires separate approvals and durable verification of both exact directions", async () => {
     await expect(qualifications.createApproved({ ...administrator, roles: [] }, qualificationInput())).rejects.toMatchObject({ code: "missing_internal_role" });
     const approvals = await createApprovals("package-1");
@@ -170,7 +147,7 @@ describe("Package mutation qualifications", () => {
     const approvals = await createApprovals("retained-cycle");
     const completed = await executeClaimedCycle(await qualifications.claimCycle(operator, approvals.original.id, approvals.restoration.id, identity(), identity()));
     const jobIds = [completed.original.jobId, completed.restoration.jobId];
-    await migrate(fixture.operator);
+    await initializeSchema(fixture.operator);
     await grantRuntime(fixture.operator);
     await verifySchema(fixture.runtime);
     await transaction(fixture.operator, async client => {
@@ -182,7 +159,7 @@ describe("Package mutation qualifications", () => {
     expect((await fixture.operator.query("SELECT id FROM jobs WHERE id=ANY($1::uuid[])", [jobIds])).rows).toEqual([]);
     expect(await qualifications.current("tenant-1", "block", "a".repeat(64), 7)).toMatchObject({ id: completed.original.id, jobId: completed.original.jobId });
     expect(await qualifications.current("tenant-1", "unblock", "a".repeat(64), 7)).toMatchObject({ id: completed.restoration.id });
-    await migrate(fixture.operator);
+    await initializeSchema(fixture.operator);
     await fixture.operator.query(`UPDATE package_mutation_qualifications SET qualified_at=clock_timestamp()-interval '31 days',expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, [completed.original.id]);
     await expect(fixture.runtime.query("DELETE FROM package_mutation_qualifications WHERE id=$1", [completed.original.id])).rejects.toThrow();
     await retain(fixture.operator);

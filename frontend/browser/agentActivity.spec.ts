@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import type { AgentInvestigationContext, PurviewAuditRecord } from "../src/api/client";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
+import { fulfillInventoryPage, isInventorySelectionRequest } from "./selectedInventoryFixture";
 
 const agent = unifiedAgents.value[0];
 const savedContext: AgentInvestigationContext = {
@@ -21,13 +22,14 @@ const auditRecord: PurviewAuditRecord = {
 };
 
 async function open(page: Page, context = savedContext) {
+  await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
   const reads: URL[] = [];
   const writes: string[] = [];
-  const checks = { inventory: 0, context: 0 };
+  const checks = { inventory: 0, inventoryPages: 0, context: 0 };
   page.on("request", request => {
-    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request) && !isInventorySelectionRequest(request)
       && new URL(request.url()).pathname !== "/api/capabilities/check") writes.push(new URL(request.url()).pathname);
   });
   await page.route("**/api/agent-inventory/investigations/context?**", route => {
@@ -45,9 +47,10 @@ async function open(page: Page, context = savedContext) {
       nextCheckAt: new Date(Date.parse(layoutTime) + checks.inventory * 60_000).toISOString(),
     } });
   });
-  await page.route(url => url.pathname === "/api/agent-inventory", route => route.fulfill({ json: {
-    ...unifiedAgents, revision: String(checks.inventory).padStart(64, "0"),
-  } }));
+  await page.route(url => url.pathname === "/api/agent-inventory", route => {
+    checks.inventoryPages++;
+    return fulfillInventoryPage(route, { ...unifiedAgents });
+  });
   await page.route("**/api/agent-inventory/investigations/purview?**", route => {
     const url = new URL(route.request().url());
     expect(url.searchParams.get("recordId")).toBe(agent.id);
@@ -58,6 +61,8 @@ async function open(page: Page, context = savedContext) {
     } });
   });
   await page.goto("/agents");
+  await expect.poll(() => checks.inventory).toBe(1);
+  await expect.poll(() => checks.inventoryPages).toBe(2);
   await page.getByRole("button", { name: agent.displayName, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: agent.displayName });
   await dialog.getByRole("tab", { name: "Activity", exact: true }).click();
@@ -138,8 +143,12 @@ test("Purview selection, paging and search survive refresh, one minute of time a
   await dialog.getByRole("button", { name: "Refresh investigation access" }).click();
   await expect.poll(() => reads.length).toBe(count + 1);
   const contextChecks = checks.context;
+  const inventoryChecks = checks.inventory;
+  const inventoryPages = checks.inventoryPages;
   await page.clock.runFor(65_000);
-  await expect.poll(() => checks.inventory).toBeGreaterThan(1);
+  await expect.poll(() => checks.inventory).toBe(inventoryChecks + 1);
+  await expect.poll(() => checks.inventoryPages).toBe(inventoryPages + 1);
+  await dialog.getByRole("button", { name: "Refresh investigation access" }).click();
   await expect.poll(() => checks.context).toBeGreaterThan(contextChecks);
   await expect(dialog.getByRole("button", { name: "Purview audit", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(dialog.getByRole("searchbox", { name: "Search saved audit metadata" })).toHaveValue("correlation");

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import { nativeInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingQueryResult } from "../types/defenderHunting.js";
 import { DefenderHuntingRepository, type DefenderHuntingScope } from "./defenderHunting.js";
 
@@ -267,17 +268,11 @@ describe.sequential("Defender hunting repository", () => {
   });
 
   it("does not equate opaque saved Entra agent IDs with enterprise object IDs or blueprint parent identities", async () => {
-    const inventoryJob = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_refresh_jobs
-      (id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
-      VALUES(gen_random_uuid(),'tenant-a','security-a','defender-association',repeat('a',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`)).rows[0].id;
-    const snapshot = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_inventory_snapshots
-      (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count)
-      VALUES(gen_random_uuid(),$1,'tenant-a','security-a',repeat('a',64),'full','["microsoft.copilotstudio/agents"]',$2,1,1,1,0) RETURNING id`,
-    [inventoryJob, JSON.stringify(["microsoft.copilotstudio/agents"])])).rows[0].id;
-    await fixture.operator.query(`INSERT INTO power_platform_inventory_resources
-      (snapshot_id,tenant_id,principal_id,native_id,resource_type,environment_id,source_system,creator_type,agent_kind,lifecycle,identity_confidence,identifiers,provenance,details,unknown_field_count)
-      VALUES($1,'tenant-a','security-a','power-agent','microsoft.copilotstudio/agents','environment-a','power_platform','unknown','copilot_studio_agent','unknown','exact_native',$2,'{}','{}',0)`,
-    [snapshot, JSON.stringify([{ kind: "entra_agent_id", value: "11111111-1111-4111-8111-111111111111" }, { kind: "entra_blueprint_id", value: "22222222-2222-4222-8222-222222222222" }])]);
+    await nativeInventoryFixture(fixture.runtime, { tenantId: "tenant-a", principalId: "security-a" },
+      [{ nativeId: "power-agent", environmentId: "environment-a", identifiers: [
+        { kind: "entra_agent_id", value: "11111111-1111-4111-8111-111111111111" },
+        { kind: "entra_blueprint_id", value: "22222222-2222-4222-8222-222222222222" },
+      ] }]);
     const exact = await submitAndBegin("exact-association", principalScope, { ...filters, agentIds: ["defender-agent"] });
     await repository.publish(principalScope, exact.job.id, exact.execution, result([inventoryRow()]));
     const readScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a", resultScopes: [principalScope.resultScope], qualifications: [{ resultScope: principalScope.resultScope,

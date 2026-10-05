@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PackageInventoryRepository } from "./packageInventory.js";
+import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { pool } from "./pool.js";
 
 vi.mock("./pool.js", () => ({
@@ -19,7 +19,10 @@ const job = {
   authorization_principal_id: scope.principalId,
   token_mode: "delegated",
   scope_kind: "broad",
-  requested_ids: [],
+  target_count: 0,
+  result_revision: "2026-09-22 00:00:00+00",
+  catalog_only: false,
+  auto_details: false,
   status: "waiting_authorization",
   page_count: 0,
   observed_count: 0,
@@ -46,39 +49,42 @@ beforeEach(() => {
 describe("package refresh admission", () => {
   it("rejects an expired idempotent replay instead of returning an undefined job", async () => {
     query.mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [{ ...job, request_hash: requestHash }] })
       .mockResolvedValueOnce(emptyResult);
 
-    await expect(new PackageInventoryRepository().submit(scope, input))
+    await expect(new PackageRefreshJobs().submit(scope, input))
       .rejects.toMatchObject({ status: 409, code: "package_refresh_expired" });
-    expect(query).toHaveBeenCalledTimes(3);
+    expect(query).toHaveBeenCalledTimes(4);
     expect(query.mock.calls.some(([statement]) => String(statement).includes("INSERT"))).toBe(false);
-    expect(query.mock.calls[2][0]).toContain("job.expires_at>clock_timestamp()");
+    expect(query.mock.calls[3][0]).toContain("job.expires_at>clock_timestamp()");
   });
 
   it("returns a retained idempotent job without creating another refresh", async () => {
     query.mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [{ ...job, request_hash: requestHash }] })
       .mockResolvedValueOnce({ ...emptyResult, rows: [job] });
 
-    await expect(new PackageInventoryRepository().submit(scope, input))
+    await expect(new PackageRefreshJobs().submit(scope, input))
       .resolves.toMatchObject({ id: job.id, status: "waiting_authorization" });
-    expect(query).toHaveBeenCalledTimes(3);
+    expect(query).toHaveBeenCalledTimes(4);
   });
 
   it("keeps rejecting mismatched idempotent requests before reading the job", async () => {
     query.mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [{ ...job, request_hash: "different-request" }] });
 
-    await expect(new PackageInventoryRepository().submit(scope, input))
+    await expect(new PackageRefreshJobs().submit(scope, input))
       .rejects.toMatchObject({ code: "idempotency_mismatch" });
-    expect(query).toHaveBeenCalledTimes(2);
+    expect(query).toHaveBeenCalledTimes(3);
   });
 
   it("settles expired authorization handoffs instead of leaving them running without a worker", async () => {
     query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1 })
       .mockResolvedValueOnce({ ...emptyResult, rows: [job] });
-    await new PackageInventoryRepository().markWaitingAuthorization(scope, job.id);
+    await new PackageRefreshJobs().markWaitingAuthorization(scope, job.id);
 
     const statement = query.mock.calls[0][0];
     expect(typeof statement).toBe("string");
@@ -97,7 +103,7 @@ describe("package refresh admission", () => {
 
   it("starts a four-hour execution window without reviving an expired dispatch", async () => {
     query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ id: job.id }] });
-    await expect(new PackageInventoryRepository().markRunning(scope, job.id)).resolves.toBe(true);
+    await expect(new PackageRefreshJobs().markRunning(scope, job.id)).resolves.toBe(true);
     expect(query.mock.calls[0][0]).toContain("deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')");
     expect(query.mock.calls[0][0]).toContain("deadline_at>clock_timestamp()");
     expect(query.mock.calls[0][0]).toContain("expires_at>clock_timestamp()");
@@ -107,31 +113,34 @@ describe("package refresh admission", () => {
   it("counts only retained jobs still within their dispatch deadline under the scope lock", async () => {
     query.mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [{ count: 0 }] })
       .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [job] });
-    const repository = new PackageInventoryRepository();
+    const repository = new PackageRefreshJobs();
 
     await expect(repository.submit(scope, input)).resolves.toMatchObject({ status: "waiting_authorization" });
 
     expect(query.mock.calls[0][0]).toContain("pg_advisory_xact_lock");
-    expect(query.mock.calls[0][1]).toEqual([`package-refresh:${scope.tenantId}:${scope.principalId}`]);
-    const outstanding = query.mock.calls[2];
+    expect(query.mock.calls[0][1]).toEqual([`data-sync:${scope.tenantId}:${scope.principalId}`]);
+    expect(query.mock.calls[1][1]).toEqual([`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+    const outstanding = query.mock.calls[3];
     expect(outstanding[0]).toContain("status IN ('waiting_authorization','running')");
     expect(outstanding[0]).toContain("expires_at>clock_timestamp()");
     expect(outstanding[0]).toContain("deadline_at>clock_timestamp()");
     expect(outstanding[1]).toEqual([scope.tenantId, scope.principalId]);
-    expect(query.mock.calls[3][0]).toContain("INSERT INTO package_refresh_jobs");
-    expect(query.mock.calls[4][1]).toEqual([expect.any(String), scope.tenantId, scope.principalId]);
+    expect(query.mock.calls[4][0]).toContain("INSERT INTO package_refresh_jobs");
+    expect(query.mock.calls[5][1]).toEqual([expect.any(String), scope.tenantId, scope.principalId]);
   });
 
   it("still rejects five unexpired unfinished jobs before creating another job", async () => {
     query.mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce({ ...emptyResult, rows: [{ count: 5 }] });
-    const repository = new PackageInventoryRepository();
+    const repository = new PackageRefreshJobs();
 
     await expect(repository.submit(scope, input)).rejects.toMatchObject({ code: "job_limit" });
-    expect(query).toHaveBeenCalledTimes(3);
+    expect(query).toHaveBeenCalledTimes(4);
   });
 });

@@ -18,7 +18,7 @@ git clone https://github.com/candede/agent_control.git
 cd agent_control
 ```
 
-Install **PowerShell 7** and start **Docker Desktop** (or Docker Engine with Compose v2). Node.js and PostgreSQL run in containers; no host Node.js installation is needed.
+Install **Git** and **PowerShell 7**, and start **Docker Desktop** (or Docker Engine with Compose v2). Keep the Git checkout: deployment uses it to snapshot build inputs, including non-ignored uncommitted files. Node.js and PostgreSQL run in containers; no host Node.js installation is needed.
 
 ### 2. Set up Microsoft sign-in
 
@@ -40,13 +40,19 @@ Microsoft Agent 365 licensing is required for the Copilot package APIs. See [Mic
 pwsh ./deploy-local.ps1 start
 ```
 
-This builds and starts the app with PostgreSQL after automated checks. A first-run wizard collects your settings and port; saved configuration lives in `.local/agent-control/`. No `.env` file is needed.
+This validates configuration, builds the app, and starts it with PostgreSQL. A first-run wizard collects your settings and port before building; saved configuration lives in `.local/agent-control/`. No `.env` file is needed.
+
+Normal start does **not** run the regression suite or create a test database. It reuses Docker build layers, checks database compatibility and readiness, and leaves an unchanged healthy app running. Full validation is explicit: run `pwsh ./deploy-local.ps1 check`, or `start -ForceChecks` to validate and then deploy the same source snapshot. Full checks can still take several minutes. See [start versus full checks](docs/deployment-setup.md#start-versus-full-checks).
 
 Open **[http://localhost:3001](http://localhost:3001)** and sign in with your work or school account. If you choose another port, update the redirect URI and use that port in the browser.
 
 ## Using the app
 
 Start with **Permissions** to check access, then **Sync** to collect your first inventory.
+After a fresh installation or database reset, Agents shows collection guidance
+while the first inventory is collected and prepared. Results appear automatically
+when ready; missing inventory is not reported as zero matching agents or an export
+failure. Open **Sync** to review progress or permission issues.
 
 | Page | What to do |
 | --- | --- |
@@ -64,6 +70,7 @@ Inventory and user data refresh automatically while you are signed in and the ap
 pwsh ./deploy-local.ps1 start        # Start or update
 pwsh ./deploy-local.ps1 stop         # Stop; keep data and settings
 pwsh ./deploy-local.ps1 edit-config  # Change settings
+pwsh ./deploy-local.ps1 check        # Full software validation; do not deploy
 ```
 
 Run `start` again after changing settings. To keep a separate installation, add `-Project <name>` to each command.

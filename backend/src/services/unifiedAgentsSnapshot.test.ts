@@ -1,74 +1,74 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import pg from "pg";
-import { PackageInventoryRepository } from "../db/packageInventory.js";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
-import { UnifiedAgentRegistry } from "../db/unifiedAgentRegistry.js";
-import { pool } from "../db/pool.js";
-import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import { agentUsage } from "./agentUsage.js";
-import { savedAgentPeople } from "./savedAgentPeople.js";
-import { UnifiedAgentsService } from "./unifiedAgents.js";
+import { testDatabase } from "../../scripts/testDatabase.js";
+import { inventoryBaseline } from "../../scripts/inventoryFixtures.js";
+import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { InventoryGenerations } from "../db/inventoryGenerations.js";
+import { InventoryQueries } from "../db/inventoryQueries.js";
+import { AuditLog } from "./auditLog.js";
+import { DataExports, type ExportSource } from "./dataExports.js";
+import { inventoryExportColumns, inventoryExportSource } from "./inventoryExports.js";
 
-afterEach(() => vi.restoreAllMocks());
+describe("selected inventory transaction dependencies", () => {
+  let fixture: Awaited<ReturnType<typeof testDatabase>>;
+  beforeAll(async () => { fixture = await testDatabase(); });
+  afterEach(() => vi.restoreAllMocks());
+  afterAll(async () => { await fixture?.close(); });
 
-describe("Unified agent snapshot dependencies", () => {
-  it("uses the snapshot client for default operation-reference reads and exports without another pool checkout", async () => {
-    const scope = { tenantId: "tenant-unified", principalId: "viewer" };
-    const client = Object.assign(new pg.Client(), { release: vi.fn() });
-    const packages = ["matched", "other"].map((id): CopilotPackageDetail => ({
-      id, displayName: id, isBlocked: false, sourceSystem: "graph_packages",
-      authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
-      lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
-    }));
-    const observation = {
-      snapshotId: "11111111-1111-4111-8111-111111111110",
-      scopeKind: "broad" as const,
-      observedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
-    };
-    const clientQuery = vi.spyOn(client, "query").mockImplementation(async sql => {
-      const text = String(sql);
-      if (!text.includes("FROM audit_events") && !text.includes("'graph_packages' AS source")) {
-        throw new Error("Unexpected snapshot query");
-      }
-      const rows = text.includes("FROM audit_events") ? [{ agent_id: "matched" }] : [];
-      return { rows, rowCount: rows.length, fields: [], command: "SELECT", oid: 0 };
+  async function selectedOperation() {
+    const principalId = randomUUID(), identity = { ...selectionIdentity, principalId };
+    const scope = { tenantId: identity.tenantId, principalId };
+    const root = await inventoryBaseline(new InventoryGenerations(fixture.runtime), principalId, 2);
+    const operationId = randomUUID(), audit = new AuditLog(scope, fixture.runtime);
+    const event = await audit.startEvent({
+      id: randomUUID(), operationId, scope: "bulk", action: "block", targetBlockedState: true,
+      agentId: "package-000000", requestPath: "/fixture",
+      actor: { tenantId: scope.tenantId, homeAccountId: principalId, username: "fixture@example.invalid", displayName: "Fixture" },
     });
-    const poolQuery = vi.spyOn(pool, "query").mockRejectedValue(new Error("Unexpected extra pool checkout"));
-    vi.spyOn(PackageInventoryRepository.prototype, "readUnifiedSource").mockResolvedValue({
-      packages, observations: Object.fromEntries(packages.map(value => [value.id, observation])),
-      snapshot: {
-        id: observation.snapshotId, tokenMode: "delegated", scopeKind: "broad",
-        requestedIds: [], observedCount: packages.length, totalRecords: packages.length, pageCount: 1,
-        observedAt: observation.observedAt, expiresAt: observation.expiresAt,
-      },
-    });
-    vi.spyOn(PowerPlatformInventoryRepository.prototype, "readUnifiedSource").mockResolvedValue({
-      resources: [], snapshot: null,
-    });
-    vi.spyOn(UnifiedAgentRegistry.prototype, "withSnapshot").mockImplementation((_scope, work) => work(client));
-    vi.spyOn(UnifiedAgentRegistry.prototype, "reconcile").mockImplementation(async (_client, _scope, records) => [...records]);
-    vi.spyOn(agentUsage, "project").mockImplementation(async (_scope, records) => ({
-      context: { availability: "never_imported", reportSet: null, lineages: [], revision: "c".repeat(64) },
-      summaries: new Map(records.map(record => [record.id, {
-        status: "unavailable", reportSetId: null, responses: null, activeUsers: null,
-        lastActivityDateUtc: null, associations: [],
-      }])),
-    }));
-    vi.spyOn(savedAgentPeople, "project").mockImplementation(async (_scope, records) => [...records]);
+    await audit.completeEvent(event.id, { status: "succeeded" });
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-inventory-transaction-cursor-key");
+    const selection = await queries.capture(identity, root.scopeId, { operationIdPrefix: operationId.slice(0, 8) });
+    return { queries, identity, selection };
+  }
 
-    const service = new UnifiedAgentsService();
-    const query = { operationIdPrefix: "a5331a93" };
-    const page = await service.list(scope, query);
-    expect(page).toMatchObject({ count: 1, value: [{ packages: [{ id: "matched" }] }] });
-    const exported = await service.forExport(scope, page.revision!, query);
-    expect(exported.value).toEqual(page.value);
-    const auditCalls = clientQuery.mock.calls.filter(([sql]) => String(sql).includes("FROM audit_events"));
-    expect(auditCalls).toHaveLength(2);
-    for (const [sql, values] of auditCalls) {
-      expect(sql).toContain("tenant_id=$1 AND principal_id=$2");
-      expect(values).toEqual([scope.tenantId, scope.principalId, "a5331a93%", ["matched", "other"]]);
-    }
+  it("reads operation-reference rows, counts and context on one repeatable-read client without a pool query", async () => {
+    const { queries, identity, selection } = await selectedOperation();
+    const connect = vi.spyOn(fixture.runtime, "connect");
+    const poolQuery = vi.spyOn(fixture.runtime, "query").mockRejectedValue(new Error("Unexpected extra pool query"));
+    const query = vi.spyOn(pg.Client.prototype, "query");
+    const page = await queries.page(selection.id, identity);
+    expect(page.counts).toMatchObject({ total: 2, filtered: 1 });
+    expect(page.value.map(row => row.id)).toEqual(["package-000000"]);
+    expect(connect).toHaveBeenCalledTimes(1);
     expect(poolQuery).not.toHaveBeenCalled();
+    expect(new Set(query.mock.contexts).size).toBe(1);
+    expect(query.mock.calls.filter(([sql]) => sql === "BEGIN ISOLATION LEVEL REPEATABLE READ")).toHaveLength(1);
+    expect(query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1);
+  });
+
+  it("keeps each durable export source callback on its supplied selected client", async () => {
+    const { queries, identity, selection } = await selectedOperation();
+    const exports = new DataExports(fixture.runtime, queries.selections, async () => {});
+    const id = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind: "graph_packages", filename: "synthetic-operation.csv" });
+    const source = inventoryExportSource(queries, identity);
+    let reads = 0;
+    const checked: ExportSource = async function* (signal, job) {
+      yield* source(signal, { ...job, read: work => job.read(async client => {
+        const connect = vi.spyOn(fixture.runtime, "connect");
+        const poolQuery = vi.spyOn(fixture.runtime, "query").mockRejectedValue(new Error("Unexpected export source pool query"));
+        try {
+          reads++;
+          const result = await work(client);
+          expect(connect).not.toHaveBeenCalled();
+          expect(poolQuery).not.toHaveBeenCalled();
+          return result;
+        } finally { connect.mockRestore(); poolQuery.mockRestore(); }
+      }) });
+    };
+    await exports.build(id, identity, inventoryExportColumns.graph_packages, checked);
+    expect(reads).toBe(1);
+    expect(await exports.status(id, identity)).toMatchObject({ status: "ready", rows: 1 });
   });
 });

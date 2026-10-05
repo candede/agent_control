@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import type { InventorySourceAwareDetail, PowerPlatformResource, UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
-import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
+import { fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
 
 const environmentId = "22222222-2222-4222-8222-222222222222";
 const botId = "33333333-3333-4333-8333-333333333333";
@@ -20,6 +20,7 @@ const resource: PowerPlatformResource = {
   createdAt: layoutTime, createdBy: null, lastPublishedAt: layoutTime,
   sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown",
   agentKind: "copilot_studio_agent", lifecycle: "published", identityConfidence: "exact_native",
+  quarantineIdentity: { environmentId, botId },
   identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }],
   provenance: {}, details: {
     schemaName: "cr123_serviceDesk", isQuarantined: false, ownerId: "Support operations",
@@ -57,6 +58,7 @@ const draft: UnifiedAgentRecord = {
   presence: "power_platform", packages: [], identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "Not published." },
   powerPlatformResource: {
     ...resource, nativeId: draftId, displayName: "Unpublished helpdesk assistant", lifecycle: "draft", lastPublishedAt: null,
+    quarantineIdentity: { environmentId, botId: draftId },
     details: { schemaName: "cr123_helpdesk_draft", isQuarantined: false, ownerId: "Tenant maker" },
     identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: draftId }],
   },
@@ -64,18 +66,17 @@ const draft: UnifiedAgentRecord = {
 };
 const summary = { total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 };
 const catalog: UnifiedAgentInventoryPage = {
-  ...unifiedAgents, value: [merged, unifiedAgents.value[2], draft], count: 3,
+  ...unifiedAgents, value: [merged, unifiedAgents.value[2], draft],
   inventoryScope: "all", scopeSummary: summary,
   summary, filteredSummary: summary, identityCollection: { checkedPackages: 3, pendingPackages: 0 },
   verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, {}, layoutTime),
-  facets: { ...unifiedAgents.facets, environments: [{ value: environmentId, label: "Finance production" }] },
   sources: { ...unifiedAgents.sources, powerPlatform: { state: "available", observation, error: null } },
   partial: false, errors: [],
 };
 
 async function mockScopedCatalog(page: Page, inventory: UnifiedAgentInventoryPage = catalog) {
-  await page.route("**/api/agent-inventory*", route => {
-    const params = new URL(route.request().url()).searchParams;
+  await page.route(url => url.pathname === "/api/agent-inventory", route => {
+    const params = inventoryFixtureQuery(route);
     const inventoryScope = params.get("inventoryScope") === "power_platform_only" ? "power_platform_only"
       : params.get("inventoryScope") === "all" ? "all" : "catalog";
     const value = inventory.value.filter(record => inventoryScope === "all"
@@ -86,10 +87,15 @@ async function mockScopedCatalog(page: Page, inventory: UnifiedAgentInventoryPag
       graphOnly: inventoryScope === "power_platform_only" ? 0 : 1,
       powerPlatformOnly: inventoryScope === "catalog" ? 0 : 1,
     };
-    return route.fulfill({ json: {
-      ...inventory, inventoryScope, scopeSummary, value, count: value.length, filteredSummary: scopeSummary,
-      inventoryOverview: summarizeAgentAvailability(value),
-    } });
+    return fulfillInventoryPage(route, {
+      ...inventory, inventoryScope, scopeSummary, value, counts: { ...inventory.counts, scoped: scopeSummary.total, filtered: value.length },
+      filteredSummary: scopeSummary,
+      inventoryOverview: {
+        catalog: { availableToUsers: 2, organizationCreated: 1, teamsAvailable: 2, createdOrAvailable: 2 },
+        power_platform_only: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 },
+        all: { availableToUsers: 2, organizationCreated: 2, teamsAvailable: 2, createdOrAvailable: 3 },
+      }[inventoryScope],
+    });
   });
 }
 
@@ -185,7 +191,7 @@ test("one agent row selects all published versions and configuration controls wi
     ...related, nativeId: draftId, identifiers: draft.powerPlatformResource!.identifiers,
   } }));
   const detailReads: string[] = [];
-  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[0].id)}`, route => {
+  await page.route(url => url.pathname === `/api/agents/${encodeURIComponent(merged.packages[0].id)}/detail`, route => {
     detailReads.push(`${route.request().method()} ${merged.packages[0].id}`);
     return route.fulfill({ json: {
     ...merged.packages[0],
@@ -198,7 +204,7 @@ test("one agent row selects all published versions and configuration controls wi
     }],
     } });
   });
-  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[1].id)}`, route => {
+  await page.route(url => url.pathname === `/api/agents/${encodeURIComponent(merged.packages[1].id)}/detail`, route => {
     detailReads.push(`${route.request().method()} ${merged.packages[1].id}`);
     return route.fulfill({ json: {
       ...merged.packages[1], longDescription: "Microsoft Teams edition with its own saved configuration.",

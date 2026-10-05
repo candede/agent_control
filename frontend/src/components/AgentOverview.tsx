@@ -36,6 +36,8 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
   const connectors = resource?.details.connectors;
   const connectorCount = resource?.details.distinctPowerPlatformConnectors;
   const operationCount = resource?.details.distinctPowerPlatformConnectorsOperations;
+  const savedConnectors = resource?.connectorCounts;
+  const packageCount = record.packageCount ?? record.packages.length;
   const partialConnectors = resource?.details.capabilityDetailsTruncated || resource?.details.connectorDetailsStatus === "partial";
   const offset = Math.min(connectorOffset, Math.max(0, Math.ceil((connectors?.length ?? 0) / connectorPageSize) - 1) * connectorPageSize);
   const environment = record.environment?.id.toLowerCase() === record.environmentId?.toLowerCase() ? record.environment : undefined;
@@ -87,7 +89,7 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
       <OverviewFact label="End-user access" value={<AgentAvailability record={observedRecord} />} />
       <OverviewFact label="Installed for" value={installationSummary ?? (observedRecord.packages.length ? "Unknown" : "Not reported")} />
     </div>
-    {record.packages.length > 1 ? <p className="agent-insight-note">Status and access summarize all {record.packages.length} published versions.</p> : null}
+    {packageCount > 1 ? <p className="agent-insight-note">Status and access summarize all {packageCount.toLocaleString()} published versions.</p> : null}
     {missingName ? <p className="agent-insight-note">Agent name not reported; showing its resource ID.</p> : null}
     <section className="agent-overview-information" aria-label="Agent information">
       {description || information.length || dates.length ? <section className="agent-overview-section" aria-label="About">
@@ -131,6 +133,8 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
       <Properties values={properties([
         { label: "Connectors", value: connectorCount },
         { label: "Operations", value: operationCount },
+        { label: "Saved connectors", value: savedConnectors?.connectors },
+        { label: "Saved operations", value: savedConnectors?.operations },
       ])} />
       {record.observations.powerPlatform && !(Date.parse(record.observations.powerPlatform.expiresAt) > now)
         ? <p className="notice">Configuration details have expired. Refresh them in Sync.</p> : null}
@@ -159,7 +163,9 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
           <button type="button" className="secondary" disabled={offset === 0} onClick={() => setConnectorOffset(offset - connectorPageSize)}>Previous connectors</button>
           <button type="button" className="secondary" disabled={offset + connectorPageSize >= connectors.length} onClick={() => setConnectorOffset(offset + connectorPageSize)}>Next connectors</button>
         </div> : null}
-      </> : <p>{connectorCount === 0 && !partialConnectors || connectorCount === undefined && connectors !== undefined && !partialConnectors
+      </> : savedConnectors && (savedConnectors.connectors > 0 || savedConnectors.operations > 0)
+        ? <p>Saved configuration is available in the paged source members above.</p>
+        : <p>{connectorCount === 0 && !partialConnectors || connectorCount === undefined && connectors !== undefined && !partialConnectors
           ? "No configured connectors were reported."
           : "Configured connector details are unavailable. Refresh inventory in Sync."}</p>}
       {partialConnectors ? <p className="agent-insight-note">Some connector or operation details are unavailable.</p> : null}

@@ -1,214 +1,231 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as api from "../api/client";
-import { usageInsightsPublished } from "../test/usageInsightsFixture";
-import { reportHistoryFixture } from "./reportHistoryFixture";
+import type { OfficialReportConfirmation, OfficialReportConfirmed } from "../../../backend/src/types/officialReportApi";
+import type { ReportMetadata } from "../../../backend/src/types/officialReportData";
+import { ApiError } from "../api/client";
+import * as api from "../api/reportData";
+import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
+import { historySet, reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 import { OfficialUsageReportSelector } from "./OfficialUsageReportSelector";
 
-const first = {
-  ...usageInsightsPublished.activeSet!, id: "11111111-1111-4111-8111-111111111111",
-  reportingPeriod: { ...usageInsightsPublished.activeSet!.reportingPeriod, provenance: "activity_range" as const },
-};
-const second = {
-  ...first, id: "22222222-2222-4222-8222-222222222222",
-  reportingPeriod: { startDate: "2026-07-01", endDate: "2026-07-30", provenance: "operator_asserted" as const },
-};
-let activeSetId: string | null;
-let activeRevision: number;
-
-function admin(): api.OfficialUsageAdminState {
-  return { activeSetId, activeRevision, sets: [first, second], staging: [] };
+vi.mock("../api/reportData", async original => ({ ...await original<typeof import("../api/reportData")>(),
+  readReportPage: vi.fn(), previewReportOperation: vi.fn(), confirmReportOperation: vi.fn() }));
+const first = historySet(1, { periodProvenance: "activity_range" }), second = historySet(2, { reportingStart: "2026-02-01", reportingEnd: "2026-02-28" });
+let metadata: ReportMetadata;
+function confirmation(setId = second.id): OfficialReportConfirmation {
+  return { id: "confirmation", operation: "select", setId, activeRevision: metadata.activeRevision,
+    historyRevision: metadata.historyRevision, historyEpoch: metadata.historyEpoch, hash: "a".repeat(64) };
 }
-function confirmation(setId = second.id): api.OfficialUsageConfirmation {
-  return {
-    id: "confirmation", operation: "select", setId, activeSetId, expectedRevision: activeRevision,
-    confirmationHash: "a".repeat(64), expiresAt: "2026-12-01T00:00:00.000Z",
-  };
-}
-beforeEach(() => {
-  activeSetId = first.id;
-  activeRevision = 3;
-  vi.spyOn(api, "getOfficialUsageAdminState").mockImplementation(async () => admin());
-  vi.spyOn(api, "getOfficialUsageHistory").mockImplementation(async () => reportHistoryFixture([first, second], activeSetId));
-  vi.spyOn(api, "previewOfficialUsageSetOperation").mockImplementation(async setId => confirmation(setId));
-  vi.spyOn(api, "confirmOfficialUsageSetOperation").mockImplementation(async preview => {
-    activeSetId = preview.setId;
-    activeRevision += 1;
-    return { activeSetId, activeRevision };
-  });
-});
-afterEach(() => vi.restoreAllMocks());
-
+function page() { return reportPage([first, second], { reports: metadata, counts: { total: 2, filtered: 2 } }); }
+const admin: ReturnType<typeof useCapabilityContext> = { user: { tenantId: "tenant", homeAccountId: "principal", displayName: "Admin",
+  username: "admin@example.invalid", roles: ["AgentControl.Viewer", "AgentControl.Admin"] }, loading: false, pending: false,
+  error: undefined, now: Date.now(), views: [], reload: vi.fn(async () => {}), openPermissions: vi.fn() };
 async function ready() {
-  const select = await screen.findByRole("combobox", { name: "Report set" });
+  const select = screen.getByRole("combobox", { name: "Report set" });
   await waitFor(() => expect(select).toBeEnabled());
   return select;
 }
-
 async function choose() {
   const select = await ready();
   await userEvent.selectOptions(select, second.id);
   return select;
 }
+beforeEach(() => {
+  metadata = { ...reports };
+  vi.mocked(api.readReportPage).mockImplementation(async () => page());
+  vi.mocked(api.previewReportOperation).mockImplementation(async id => confirmation(id));
+  vi.mocked(api.confirmReportOperation).mockImplementation(async input => {
+    metadata = { ...metadata, activeSetId: input.setId, setId: input.setId, activeRevision: String(Number(metadata.activeRevision) + 1) };
+    return { activeSetId: metadata.activeSetId, activeRevision: metadata.activeRevision };
+  });
+});
+afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
-describe("shared report-set selector", () => {
-  it("applies a dropdown selection immediately without action buttons or explanatory text", async () => {
+describe("compact shared report-set selection", () => {
+  it("applies the chosen report through an exact fenced preview without adding a confirmation panel", async () => {
     const onChanged = vi.fn();
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
     const select = await ready();
-    expect(within(select).getByRole("option", { name: /Observed activity/ })).toHaveTextContent(first.id.slice(0, 8));
-    expect(within(select).getByRole("option", { name: "Reporting window: 2026-07-01 to 2026-07-30 | 22222222" })).toBeVisible();
-    expect(select).not.toHaveTextContent("Imported");
-    expect(select).toHaveAttribute("title", `Observed activity: ${first.reportingPeriod.startDate} to ${first.reportingPeriod.endDate} | 11111111`);
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(screen.queryByText(/Select one saved three-file/)).not.toBeInTheDocument();
-    expect(api.previewOfficialUsageSetOperation).not.toHaveBeenCalled();
+    expect(within(select).getByRole("option", { name: /Observed activity: 2026-01-01 to 2026-01-31/ })).toBeVisible();
+    expect(within(select).getByRole("option", { name: /Reporting window: 2026-02-01 to 2026-02-28/ })).toBeVisible();
     await userEvent.selectOptions(select, second.id);
-    await waitFor(() => expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce());
-    expect(api.previewOfficialUsageSetOperation).toHaveBeenCalledWith(second.id, "select");
-    expect(onChanged).toHaveBeenCalledExactlyOnceWith(true);
+    expect(api.previewReportOperation).toHaveBeenCalledWith(second.id, "select", expect.any(AbortSignal));
+    expect(screen.queryByRole("region", { name: "Confirm report selection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+    expect(screen.queryByText(/matching report sets/)).not.toBeInTheDocument();
+    await waitFor(() => expect(onChanged).toHaveBeenCalledExactlyOnceWith(true));
+    expect(api.confirmReportOperation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      setId: second.id, operation: "select", activeRevision: "4", historyRevision: "35", historyEpoch: "2", hash: "a".repeat(64),
+    }), expect.any(AbortSignal));
     await waitFor(() => expect(select).toBeEnabled());
     expect(select).toHaveValue(second.id);
-    expect(select).toHaveAttribute("title", "Reporting window: 2026-07-01 to 2026-07-30 | 22222222");
-    expect(screen.queryByText(/Report set selected/)).not.toBeInTheDocument();
     await userEvent.selectOptions(select, second.id);
-    expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce();
+    expect(api.previewReportOperation).toHaveBeenCalledOnce();
   });
-
-  it("can select an older page while displaying a current selection outside both metadata pages", async () => {
-    const older = { ...second, id: "33333333-3333-4333-8333-333333333333" };
-    activeSetId = "44444444-4444-4444-8444-444444444444";
-    vi.mocked(api.getOfficialUsageHistory).mockImplementation(async query => {
-      const page = reportHistoryFixture(query?.offset ? [older] : [first, second], activeSetId);
-      return { ...page, bundles: { ...page.bundles, offset: query?.offset ?? 0, limit: 100, count: 101 } };
-    });
+  it("keeps the dropdown disabled while the selected report is being verified and applied", async () => {
+    const pending = deferred<OfficialReportConfirmation>();
+    vi.mocked(api.previewReportOperation).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
-    expect(await screen.findByRole("option", { name: /Current report 44444444 \(outside this page\)/ })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Older report sets" }));
-    expect(await screen.findByRole("option", { name: /33333333/ })).toBeVisible();
-    expect(api.getOfficialUsageHistory).toHaveBeenLastCalledWith({ limit: 100, offset: 100 }, { signal: expect.any(AbortSignal) });
-    expect(screen.getByRole("button", { name: "Older report sets" })).toBeDisabled();
-    await userEvent.selectOptions(screen.getByRole("combobox"), older.id);
-    await waitFor(() => expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledWith(expect.objectContaining({ setId: older.id })));
+    const select = await choose();
+    expect(select).toBeDisabled();
+    expect(select).toHaveValue(second.id);
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    await act(async () => pending.resolve(confirmation()));
+    await ready();
+    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
+    select.focus();
+    expect(select).toHaveFocus();
   });
-
-  it("requires a successful refresh after the shared revision changes before preview", async () => {
+  it.each([first.id, ""])("does not mutate when choosing the current report or placeholder: %s", async value => {
+    const onChanged = vi.fn();
+    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
+    const select = await ready();
+    fireEvent.change(select, { target: { value } });
+    expect(select).toHaveValue(first.id);
+    expect(screen.queryByRole("region", { name: "Confirm report selection" })).not.toBeInTheDocument();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+  it("pages by opaque cursor, keeps an active report outside this page and never drains retained history", async () => {
+    const outside = historySet(99).id, older = historySet(33);
+    metadata = { ...metadata, activeSetId: outside };
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => reportPage(query?.cursor ? [older] : [first, second], {
+      reports: metadata, counts: { total: 100000, filtered: 100000 },
+      page: { limit: 50, nextCursor: query?.cursor ? null : "older", previousCursor: query?.cursor ? "newer" : null },
+    }));
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
-    activeRevision += 1;
-    await choose();
-    expect(await screen.findByRole("alert")).toHaveTextContent("shared report selection changed");
-    expect(api.confirmOfficialUsageSetOperation).not.toHaveBeenCalled();
-    expect(screen.getByRole("combobox")).toBeDisabled();
-    expect(screen.getByRole("combobox")).toHaveValue(first.id);
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await choose();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    await waitFor(() => expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce());
+    expect(screen.getByRole("option", { name: `Current report ${outside.slice(0, 8)} (outside this page) - selected` })).toBeVisible();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    await userEvent.selectOptions(await ready(), "older-reports");
+    await waitFor(() => expect(screen.getByRole("combobox")).toContainHTML(older.id));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/history", expect.objectContaining({ selectionId, cursor: "older", limit: 50 }), expect.any(AbortSignal));
+    await userEvent.selectOptions(await ready(), older.id);
+    await waitFor(() => expect(api.confirmReportOperation).toHaveBeenCalledOnce());
+    expect(api.previewReportOperation).toHaveBeenLastCalledWith(older.id, "select", expect.any(AbortSignal));
   });
-
-  it("verifies uncertain selection through reads rather than retrying a consumed confirmation", async () => {
-    vi.mocked(api.confirmOfficialUsageSetOperation).mockImplementationOnce(async preview => {
-      activeSetId = preview.setId;
-      activeRevision += 1;
-      throw new api.ApiError(0, "network_error", "Connection lost.");
+  it.each(["activeRevision", "historyRevision", "historyEpoch"] as const)("requires a refreshed history when the confirmation %s no longer matches the displayed evidence", async field => {
+    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
+    const select = await ready();
+    metadata = { ...metadata, [field]: String(Number(metadata[field]) + 1) };
+    await userEvent.selectOptions(select, second.id);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/shared report.*changed/i);
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Confirm report selection" })).not.toBeInTheDocument();
+    expect(select).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await choose();
+    await waitFor(() => expect(api.confirmReportOperation).toHaveBeenCalledOnce());
+  });
+  it("verifies an uncertain committed selection by reading, never replaying a consumed confirmation", async () => {
+    vi.mocked(api.confirmReportOperation).mockImplementationOnce(async input => {
+      metadata = { ...metadata, activeSetId: input.setId, activeRevision: "5" };
+      throw new ApiError(0, "network_error", "Connection lost");
     });
     const onChanged = vi.fn();
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
     await choose();
-    expect(await screen.findByRole("alert")).toHaveTextContent("may have been saved");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/may have been saved/i);
     expect(onChanged).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.getByRole("combobox")).toHaveValue(second.id));
-    expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce();
+    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
     expect(onChanged).toHaveBeenCalledExactlyOnceWith(false);
   });
-
-  it("keeps a saved selection successful when its metadata reload fails", async () => {
+  it("keeps a committed selection successful even when its subsequent metadata read fails", async () => {
     const onChanged = vi.fn();
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
     await ready();
-    vi.mocked(api.getOfficialUsageAdminState).mockRejectedValueOnce(new Error("Metadata unavailable."));
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new Error("Metadata unavailable"));
     await choose();
     expect(await screen.findByRole("alert")).toHaveTextContent("Metadata unavailable");
     expect(onChanged).toHaveBeenCalledExactlyOnceWith(true);
     expect(screen.getByRole("combobox")).toBeDisabled();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.getByRole("combobox")).toHaveValue(second.id));
-    expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce();
+    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
   });
-
-  it.each([401, 403])("hides report options after a %s refresh failure", async status => {
+  it.each([401, 403])("retires report options after a %i history refresh rejection", async status => {
     const view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
-    vi.mocked(api.getOfficialUsageHistory).mockRejectedValueOnce(new api.ApiError(status, "forbidden", "Report access denied."));
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(status, "forbidden", "Report access denied"));
     view.rerender(<OfficialUsageReportSelector principalKey="admin" revision={1} onChanged={vi.fn()} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Report access denied");
-    expect(screen.queryByRole("option", { name: /2026-07-01/ })).not.toBeInTheDocument();
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("option", { name: /2026-01-01/ })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox")).toBeDisabled();
   });
-
-  it("does not confirm a preview that completes after unmount", async () => {
-    let resolve!: (value: api.OfficialUsageConfirmation) => void;
-    vi.mocked(api.previewOfficialUsageSetOperation).mockReturnValueOnce(new Promise(done => { resolve = done; }));
-    const onChanged = vi.fn();
-    const view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
-    await choose();
-    expect(screen.getByRole("combobox")).toBeDisabled();
-    expect(screen.getByRole("status")).toHaveTextContent("Selecting report set");
+  it("does not reveal or confirm a preview completed after unmount", async () => {
+    const pending = deferred<OfficialReportConfirmation>(); vi.mocked(api.previewReportOperation).mockReturnValue(pending.promise);
+    const onChanged = vi.fn(), view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
+    await userEvent.selectOptions(await ready(), second.id);
+    const signal = vi.mocked(api.previewReportOperation).mock.calls[0][2];
     view.unmount();
-    await act(async () => resolve(confirmation()));
-    expect(api.confirmOfficialUsageSetOperation).not.toHaveBeenCalled();
+    expect(signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(confirmation()));
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
   });
-
-  it("clears cached options when selection permission is revoked", async () => {
-    vi.mocked(api.previewOfficialUsageSetOperation).mockRejectedValueOnce(new api.ApiError(403, "forbidden", "Admin role required."));
-    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
+  it("does not notify a replacement principal after an obsolete confirmation succeeds", async () => {
+    const pending = deferred<OfficialReportConfirmed>(); vi.mocked(api.confirmReportOperation).mockReturnValue(pending.promise);
+    const onChanged = vi.fn(), view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
     await choose();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Admin role required");
-    expect(screen.queryByRole("option", { name: /2026-07-01/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox")).toBeDisabled();
-    expect(api.confirmOfficialUsageSetOperation).not.toHaveBeenCalled();
+    const signal = vi.mocked(api.confirmReportOperation).mock.calls[0][1];
+    view.rerender(<OfficialUsageReportSelector principalKey="replacement" revision={0} onChanged={onChanged} />);
+    expect(signal?.aborted).toBe(true);
+    await act(async () => pending.resolve({ activeSetId: second.id, activeRevision: "5" }));
+    expect(onChanged).not.toHaveBeenCalled();
   });
-
-  it("can return from an older page after retained reports are deleted", async () => {
-    let shrunk = false;
-    vi.mocked(api.getOfficialUsageHistory).mockImplementation(async query => {
-      const page = reportHistoryFixture(query?.offset && shrunk ? [] : [first, second], activeSetId);
-      return { ...page, bundles: { ...page.bundles, offset: query?.offset ?? 0, limit: 100, count: shrunk ? 2 : 102 } };
-    });
+  it("retires a pending preview across revision A-B-A transitions even if its transport ignores abort", async () => {
+    const pending = deferred<OfficialReportConfirmation>(); vi.mocked(api.previewReportOperation).mockReturnValue(pending.promise);
+    const view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
+    await userEvent.selectOptions(await ready(), second.id);
+    const signal = vi.mocked(api.previewReportOperation).mock.calls[0][2];
+    view.rerender(<OfficialUsageReportSelector principalKey="admin" revision={1} onChanged={vi.fn()} />);
+    view.rerender(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
+    expect(signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(confirmation()));
+    expect(screen.queryByRole("region", { name: "Confirm report selection" })).not.toBeInTheDocument();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+  });
+  it("removes confirmation immediately when Admin access is revoked but preserves Viewer history", async () => {
+    const pending = deferred<OfficialReportConfirmation>();
+    vi.mocked(api.previewReportOperation).mockReturnValueOnce(pending.promise);
+    const panel = (roles: NonNullable<typeof admin.user>["roles"]) => <CapabilityContext.Provider value={{ ...admin, user: { ...admin.user!, roles } }}>
+      <OfficialUsageReportSelector principalKey="same" revision={0} onChanged={vi.fn()} /></CapabilityContext.Provider>;
+    const view = render(panel(["AgentControl.Viewer", "AgentControl.Admin"]));
+    await choose();
+    view.rerender(panel(["AgentControl.Viewer"]));
+    expect(screen.queryByRole("region", { name: "Confirm report selection" })).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox")).toBeDisabled();
+    expect(screen.getByText(/An administrator can change/)).toBeVisible();
+    await act(async () => pending.resolve(confirmation()));
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+  });
+  it("makes an invalidated history cursor explicitly restartable without silently loading another generation", async () => {
+    vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...page(), page: { limit: 50, nextCursor: "next", previousCursor: null } })
+      .mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "A retained report was deleted"));
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
-    shrunk = true;
-    await userEvent.click(screen.getByRole("button", { name: "Older report sets" }));
-    expect(await screen.findByText(/No report sets remain on this page/)).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Newer report sets" }));
-    await waitFor(() => expect(screen.getByRole("option", { name: /2026-07-01/ })).toBeVisible());
-    expect(screen.queryByRole("button", { name: "Older report sets" })).not.toBeInTheDocument();
+    await userEvent.selectOptions(await ready(), "older-reports");
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await ready();
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
-
-  it("does not notify a replacement screen when a confirmation completes after unmount", async () => {
-    let resolve!: (value: { activeSetId: string; activeRevision: number }) => void;
-    vi.mocked(api.confirmOfficialUsageSetOperation).mockReturnValueOnce(new Promise(done => { resolve = done; }));
-    const onChanged = vi.fn();
-    const view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
-    await choose();
-    await waitFor(() => expect(api.confirmOfficialUsageSetOperation).toHaveBeenCalledOnce());
-    view.unmount();
-    await act(async () => resolve({ activeSetId: second.id, activeRevision: 4 }));
-    expect(onChanged).not.toHaveBeenCalled();
-  });
-
-  it("shows empty history within the dropdown without adding extra UI", async () => {
-    activeSetId = null;
-    vi.mocked(api.getOfficialUsageHistory).mockResolvedValue(reportHistoryFixture([]));
+  it("shows empty history in the selector without admitting an empty report operation", async () => {
+    metadata = { ...metadata, activeSetId: null, setId: null, availability: "never_imported" };
+    vi.mocked(api.readReportPage).mockResolvedValue({ ...page(), value: [], counts: { total: 0, filtered: 0 } });
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
-    expect(await screen.findByRole("option", { name: "No report sets available" })).toBeInTheDocument();
+    await screen.findByRole("option", { name: "No report sets available" });
     expect(screen.getByRole("combobox")).toBeDisabled();
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "" } });
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(api.confirmOfficialUsageSetOperation).not.toHaveBeenCalled();
   });
 });

@@ -2,10 +2,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Request, RequestHandler } from "express";
 
 const packageDiagnosticNumberFields = new Set([
+  "bytes", "rows", "pins", "queueDepth", "backlogRoots", "oldestAgeMs",
   "missingCount", "nullCount", "emptyCount", "nonemptyCount", "invalidCount",
   "matchingCount", "differingCount", "listOnlyCount", "detailOnlyCount", "bothMissingCount",
   "requestCount", "retryCount", "throttleCount", "requestDurationMs", "maxRequestDurationMs",
   "admissionWaitMs", "retryWaitMs", "readIntervalMs", "retryAfterMs",
+  "rssBytes", "heapUsedBytes", "heapTotalBytes", "externalBytes", "arrayBufferBytes",
+  "poolTotal", "poolIdle", "poolWaiting", "poolForeground", "poolQueue",
 ]);
 
 const allowedFields = new Set([
@@ -22,7 +25,6 @@ const allowedFields = new Set([
 
 type TelemetryContext = { requestId?: string; jobId?: string; route?: string };
 const context = new AsyncLocalStorage<TelemetryContext>();
-
 export function withTelemetryContext<T>(fields: TelemetryContext, operation: () => T): T {
   return context.run({ ...context.getStore(), ...fields }, operation);
 }
@@ -60,6 +62,19 @@ export function observeDatabasePool(waitingCount: number) {
   if (Number.isInteger(waitingCount) && waitingCount > 0) {
     operationalLog("error", "database_pool_saturated", { count: waitingCount });
   }
+}
+
+export function observeRuntimeResources(database: {
+  totalCount: number; idleCount: number; waitingCount: number;
+  admissionState?: { foreground: number; queue: number };
+}) {
+  const memory = process.memoryUsage();
+  operationalLog("info", "runtime_resource_sample", {
+    rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, heapTotalBytes: memory.heapTotal,
+    externalBytes: memory.external, arrayBufferBytes: memory.arrayBuffers,
+    poolTotal: database.totalCount, poolIdle: database.idleCount, poolWaiting: database.waitingCount,
+    poolForeground: database.admissionState?.foreground, poolQueue: database.admissionState?.queue,
+  });
 }
 
 export const httpTelemetry: RequestHandler = (request, response, next) => {

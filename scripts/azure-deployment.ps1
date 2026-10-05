@@ -2,12 +2,8 @@
 
 . (Join-Path $PSScriptRoot 'tenant-deployment.ps1')
 
-$script:ReleaseSchemaVersion = 27
-
 $script:RequiredSecretNames = @(
-    'agent-control-tenant-id',
-    'agent-control-client-id',
-    'agent-control-client-secret',
+    'agent-control-tenants-json',
     'agent-control-session-secret',
     'agent-control-postgres-admin-password',
     'agent-control-postgres-app-password'
@@ -26,21 +22,16 @@ $script:EstimateItemNames = @(
 
 function Get-AzureRequiredSecretNames {
     param($Target)
-    $names = @($script:RequiredSecretNames)
-    if ($Target.tenantRegistrySecretName) { $names += [string]$Target.tenantRegistrySecretName }
-    return $names
+    return @($script:RequiredSecretNames)
 }
 
 function Get-AzureRuntimeSecretReferences {
     param($Target)
     $references = [ordered]@{
-        TENANT_ID = 'agent-control-tenant-id'
-        CLIENT_ID = 'agent-control-client-id'
-        CLIENT_SECRET = 'agent-control-client-secret'
+        TENANTS_JSON = 'agent-control-tenants-json'
         SESSION_SECRET = 'agent-control-session-secret'
         PGPASSWORD = 'agent-control-postgres-app-password'
     }
-    if ($Target.tenantRegistrySecretName) { $references.TENANTS_JSON = [string]$Target.tenantRegistrySecretName }
     return $references
 }
 
@@ -152,25 +143,30 @@ function Test-ApprovedAzureTarget {
     if ($Target.contractVersion -ne 2 -or $Target.isApproval -ne $true) {
         throw 'Target contract version 2 and explicit isApproval=true are required.'
     }
+    $targetKeys = if ($Target -is [Collections.IDictionary]) { @($Target.Keys) } else { @($Target.PSObject.Properties.Name) }
+    if ('expectedSchemaVersion' -in $targetKeys) {
+        throw "Target option 'expectedSchemaVersion' is no longer supported. Existing databases must match the compiled schema fingerprint; reset incompatible development databases explicitly."
+    }
+    foreach ($name in @('legacyAuditBackupPath', 'legacyAuditBackupSha256', 'legacyStaticWebApp')) {
+        if ($name -in $targetKeys) {
+            throw "Target option '$name' is no longer supported. SQLite audit import and Static Web App retirement are retired; remove the option even if it is empty or null. Existing data and resources are not changed."
+        }
+    }
+    if ($Target.installationMode -cnotin @('fresh', 'existing')) {
+        throw 'installationMode supports only fresh or existing; schema upgrades and SQLite audit import are no longer supported.'
+    }
     Assert-GuidValue $Target.tenantId 'tenantId'
     Assert-GuidValue $Target.subscriptionId 'subscriptionId'
     Assert-GuidValue $Target.entraApplicationId 'entraApplicationId'
-    if ($Target.tenantRegistrySecretName) {
-        if ($Target.tenantRegistrySecretName -cne 'agent-control-tenants-json') { throw 'tenantRegistrySecretName must name the prepared agent-control-tenants-json secret, never inline registry values.' }
-        if ([string]::IsNullOrWhiteSpace([string]$Target.tenantRegistryRegistrationApprovalReference) -or
-            [string]$Target.tenantRegistryRegistrationApprovalReference -match '[\x00-\x1f\x7f]') {
-            throw 'Registry mode requires tenantRegistryRegistrationApprovalReference confirming callback, roles, assignments and grants in every configured tenant.'
-        }
+    foreach ($name in @('tenantDomains','tenantDisplayName')) {
+        if ($name -in $targetKeys) { throw "Standalone tenant option '$name' is no longer supported. Configure profiles in the TENANTS_JSON registry." }
     }
-    if (-not $Target.tenantRegistrySecretName -or $Target.tenantDomains) {
-        Assert-DeploymentTenantProfiles @(@{
-            tenantId = $Target.tenantId; clientId = $Target.entraApplicationId; clientSecret = 'validation-only'
-            domains = $Target.tenantDomains
-        })
+    if ($Target.tenantRegistrySecretName -cne 'agent-control-tenants-json') {
+        throw 'TENANTS_JSON is required: tenantRegistrySecretName must name the prepared agent-control-tenants-json secret.'
     }
-    if ($Target.tenantDisplayName -and ([string]$Target.tenantDisplayName -match '[\x00-\x1f\x7f]' -or
-        [string]::IsNullOrWhiteSpace([string]$Target.tenantDisplayName) -or ([string]$Target.tenantDisplayName).Length -gt 128)) {
-        throw 'tenantDisplayName must contain 1 to 128 printable characters when supplied.'
+    if ([string]::IsNullOrWhiteSpace([string]$Target.tenantRegistryRegistrationApprovalReference) -or
+        [string]$Target.tenantRegistryRegistrationApprovalReference -match '[\x00-\x1f\x7f]') {
+        throw 'Registry configuration requires tenantRegistryRegistrationApprovalReference confirming callback, roles, assignments and grants in every configured tenant.'
     }
     if ($Target.resourceGroup -notmatch '^[a-zA-Z0-9._()/-]{1,90}$' -or $Target.resourceGroup -match '[/\\]') {
         throw 'resourceGroup is invalid.'
@@ -220,22 +216,12 @@ function Test-ApprovedAzureTarget {
         $Target.expectedResourceIds.postgresFlexibleServer -ine $expectedPostgres -or $Target.expectedDatabaseName -cne 'agentcontrol') {
         throw 'Expected resource/database identities do not exactly match the approved target.'
     }
-    if ($Target.installationMode -notin @('fresh', 'upgrade', 'legacy_import')) { throw 'installationMode is invalid.' }
     if ($Target.installationMode -eq 'fresh' -and $Target.firstInstallApproved -ne $true) {
         throw 'Fresh install requires an explicit first-install approval.'
     }
     if ($Target.installationMode -ne 'fresh' -and $Target.firstInstallApproved -eq $true) {
         throw 'Existing-target deployment cannot also approve fresh initialization.'
     }
-    if ($Target.expectedSchemaVersion -notin @(26, $script:ReleaseSchemaVersion)) { throw 'The approved baseline must name schema version 26 (role cutover) or 27 (current release).' }
-    if ($Target.installationMode -eq 'legacy_import') {
-        if (-not $Target.legacyAuditBackupPath -or $Target.legacyAuditBackupSha256 -notmatch '^[a-f0-9]{64}$') {
-            throw 'Legacy import requires one bounded SQLite-safe backup path and exact checksum.'
-        }
-    } elseif ($Target.legacyAuditBackupPath -or $Target.legacyAuditBackupSha256) {
-        throw 'Legacy audit inputs are accepted only for legacy_import mode.'
-    }
-
     $requiredSecrets = @(Get-AzureRequiredSecretNames $Target)
     $runtimeSecrets = @((Get-AzureRuntimeSecretReferences $Target).Values)
     if (@(Compare-Object @($Target.preparedVaultContract.secretNames) $requiredSecrets -CaseSensitive).Count -or
@@ -251,9 +237,7 @@ function Test-ApprovedAzureTarget {
     }
     if (@($Target.preparedVaultContract.versions).Count -ne $requiredSecrets.Count) { throw 'Prepared vault must select exactly one version for every required secret.' }
     if ($Target.installationMode -ne 'fresh') {
-        $existingNames = if ($Target.tenantRegistrySecretName -and @($Target.preparedVaultContract.existingVersions).Count -eq $script:RequiredSecretNames.Count) {
-            @($script:RequiredSecretNames)
-        } else { $requiredSecrets }
+        $existingNames = $requiredSecrets
         if (@($Target.preparedVaultContract.existingVersions).Count -ne $existingNames.Count) {
             throw 'Existing deployment requires every previously selected version for a fail-closed credential comparison.'
         }
@@ -314,13 +298,6 @@ function Test-ApprovedAzureTarget {
     }
     if ($Target.resources.monitoring.actionGroupResourceId -notmatch "^/subscriptions/$([regex]::Escape($Target.subscriptionId))/resourceGroups/[^/]+/providers/Microsoft\.Insights/actionGroups/[^/]+$") {
         throw 'An exact existing action-group resource ID in the approved subscription is required.'
-    }
-    if ($Target.legacyStaticWebApp.resourceId) {
-        if ($Target.legacyStaticWebApp.resourceId -notmatch "^/subscriptions/$([regex]::Escape($Target.subscriptionId))/resourceGroups/[^/]+/providers/Microsoft\.Web/staticSites/[^/]+$" -or
-            $Target.legacyStaticWebApp.retirementApproved -ne $true -or
-            [string]::IsNullOrWhiteSpace([string]$Target.legacyStaticWebApp.approvalReference)) {
-            throw 'Legacy Static Web App retirement requires its exact approved identity and approval reference.'
-        }
     }
     return $Target
 }
@@ -556,13 +533,17 @@ function Import-AzureDeploymentReceipt {
         'prerequisites', 'operator_identity', 'bicep_build', 'sku_pricing_preflight', 'vault_preflight',
         'registration_verify', 'qualification_preflight', 'target_inventory', 'release_inspection', 'bicep_what_if',
         'approval_checkpoint', 'resume_verify', 'resource_deploy', 'network_reconcile', 'enter_maintenance',
-        'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_migrate', 'legacy_import',
+        'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
         'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
-        'authentication_smoke_verify', 'database_reopen', 'open_and_verify', 'retire_legacy_swa',
+        'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
         'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup'
     )
     if (@($receipt.completedSteps | Where-Object { $_ -notin $knownSteps }).Count) {
         throw 'Resume receipt contains an unknown completed step.'
+    }
+    if (($receipt.failedStep -and $receipt.failedStep -notin $knownSteps) -or
+        @($receipt.attemptedSteps | Where-Object { ($_ -replace '^resume-skip:', '') -notin $knownSteps }).Count) {
+        throw 'Resume receipt contains an unsupported failed or attempted step; reconcile it separately without replay.'
     }
     $Context.RunId = [string]$receipt.runId
     foreach ($step in @($receipt.completedSteps | Select-Object -Unique)) { $Context.Completed.Add([string]$step) }
@@ -661,9 +642,6 @@ function Invoke-RealAzureOperation {
                 }
                 $values[$secretName] = [string]$secret.value
             }
-            if ($values['agent-control-tenant-id'] -ine $target.tenantId -or $values['agent-control-client-id'] -ine $target.entraApplicationId) {
-                throw 'Prepared vault tenant/application identifiers do not match the approved target.'
-            }
             if ([Text.Encoding]::UTF8.GetByteCount($values['agent-control-session-secret']) -lt 32 -or
                 $values['agent-control-postgres-admin-password'].Length -lt 32 -or
                 $values['agent-control-postgres-app-password'].Length -lt 32 -or
@@ -671,18 +649,10 @@ function Invoke-RealAzureOperation {
                 @($values.GetEnumerator() | Where-Object { $_.Key -cne $target.tenantRegistrySecretName -and $_.Value -match "[`r`n`0]" }).Count) {
                 throw 'Prepared secret value-format separation contract failed.'
             }
-            $profileCount = 1
-            if ($target.tenantRegistrySecretName) {
-                $profiles = ConvertFrom-DeploymentTenantRegistry $values[$target.tenantRegistrySecretName]
-                $primary = @($profiles | Where-Object { $_.tenantId -ieq $target.tenantId -and $_.clientId -ieq $target.entraApplicationId })
-                if ($primary.Count -ne 1) { throw 'Tenant registry must retain the approved primary tenant/application; no tenant may be silently replaced.' }
-                $migratingRegistry = $target.installationMode -ne 'fresh' -and
-                    -not @($target.preparedVaultContract.existingVersions | Where-Object name -CEQ $target.tenantRegistrySecretName).Count
-                if ($migratingRegistry -and $primary[0].clientSecret -cne $values['agent-control-client-secret']) {
-                    throw 'First registry migration must preserve the approved legacy client secret; credential rotation requires its separate approved workflow.'
-                }
-                $profileCount = $profiles.Count
-            }
+            $profiles = ConvertFrom-DeploymentTenantRegistry $values[$target.tenantRegistrySecretName]
+            $primary = @($profiles | Where-Object { $_.tenantId -ieq $target.tenantId -and $_.clientId -ieq $target.entraApplicationId })
+            if ($primary.Count -ne 1) { throw 'Tenant registry must contain the approved primary tenant/application; no tenant may be silently replaced.' }
+            $profileCount = $profiles.Count
             $Context.TenantProfileCount = $profileCount
             $Context.SecretValues = $values
             return @{ vaultResourceId = $target.existingVaultResourceId; secretVersions = @($target.preparedVaultContract.versions); tenantProfileCount = $profileCount; valuesRedacted = $true }
@@ -843,14 +813,10 @@ function Invoke-RealAzureOperation {
                 completedAt = $completedAt.ToUniversalTime().ToString('o'); status = 'completed'; attempts = $attempts }
         }
         'database_preflight' {
-            $expectedCurrentVersion = if ($target.installationMode -eq 'fresh') { 0 } else { [int]$target.expectedSchemaVersion }
-            return Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $target.installationMode, [string]$expectedCurrentVersion)
+            return Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $target.installationMode, $target.expectedDatabaseName)
         }
-        'database_migrate' {
-            return Invoke-AzureDatabaseContainer $Context @('backend/scripts/database.ts')
-        }
-        'legacy_import' {
-            return Invoke-AzureDatabaseContainer $Context @('backend/scripts/import-legacy-audit.ts', $target.legacyAuditBackupPath, $target.legacyAuditBackupSha256) -LegacyBackupPath $target.legacyAuditBackupPath
+        'database_initialize' {
+            return Invoke-AzureDatabaseContainer $Context @('backend/scripts/database.ts', 'initialize')
         }
         'package_deploy' {
             Get-AzJson @('webapp', 'deploy', '--ids', $target.expectedResourceIds.appService, '--src-path', $Context.ArtifactPath,
@@ -884,7 +850,7 @@ function Invoke-RealAzureOperation {
                 if (-not $resolved -and $attempts -lt 5 -and $Context.ExecutionMode -eq 'Real') { Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempts)) }
             } while (-not $resolved -and $attempts -lt 5)
             if (-not $resolved) {
-                throw 'All exact native Key Vault references, including CLIENT_SECRET and TENANTS_JSON when configured, must report Resolved with the approved names and versions.'
+                throw 'All exact native Key Vault references, including TENANTS_JSON, must report Resolved with the approved names and versions.'
             }
             $adminScope = "$($target.existingVaultResourceId)/secrets/agent-control-postgres-admin-password"
             $adminAccess = Get-AzJson @('role', 'assignment', 'list', '--assignee-object-id', $app.identity.principalId,
@@ -1022,16 +988,6 @@ function Invoke-RealAzureOperation {
             }
             return @{ admission = 'open'; readiness = 'passed'; authConfiguration = 'passed'; attempts = $attempts; loginProof = 'human-approved-receipt' }
         }
-        'retire_legacy_swa' {
-            if (-not $target.legacyStaticWebApp.resourceId) { return @{ required = $false } }
-            $legacy = Get-AzJson @('resource', 'show', '--ids', $target.legacyStaticWebApp.resourceId)
-            if ($legacy.id -ine $target.legacyStaticWebApp.resourceId -or $legacy.type -ine 'Microsoft.Web/staticSites' -or
-                $legacy.tags.app -cne 'agent-control') {
-                throw 'Legacy Static Web App ownership did not match the exact approved retirement target.'
-            }
-            Get-AzJson @('resource', 'delete', '--ids', $legacy.id) | Out-Null
-            return @{ retiredResourceId = $legacy.id; afterSingleAppSmoke = $true }
-        }
         'database_reopen' {
             return Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'reopen') -ServerName $Context.ServingServerName
         }
@@ -1076,14 +1032,13 @@ function Invoke-RealAzureOperation {
         'resume_verify' {
             if (-not $Context.Resuming) { throw 'Resume verification requires an imported receipt.' }
             $uncertainExternalWrites = @('resource_deploy', 'network_reconcile', 'managed_backup', 'package_deploy',
-                'monitoring_verify', 'open_and_verify', 'retire_legacy_swa', 'pitr_restore', 'recovery_switch')
+                'monitoring_verify', 'open_and_verify', 'pitr_restore', 'recovery_switch')
             if ($Context.PreviousFailedStep -in $uncertainExternalWrites) {
                 throw "Receipt stopped during '$($Context.PreviousFailedStep)', whose external outcome is uncertain; reconcile it explicitly before any replay."
             }
             if ($Context.Completed.Contains('resource_deploy')) {
-                $mode = if ($Context.Completed.Contains('database_migrate')) { 'upgrade' } else { 'fresh' }
-                $version = if ($mode -eq 'upgrade') { [string]$script:ReleaseSchemaVersion } else { '0' }
-                Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $mode, $version) `
+                $mode = if ($Context.Target.installationMode -ceq 'existing' -or $Context.Completed.Contains('database_initialize')) { 'existing' } else { 'fresh' }
+                Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $mode, $target.expectedDatabaseName) `
                     -ServerName $Context.ServingServerName | Out-Null
             }
             $firewall = "postgres-firewall:wizard-$($Context.RunId)"
@@ -1229,10 +1184,8 @@ function New-AzureParameterFile {
         location = @{ value = $target.region }
         tenantId = @{ value = $target.tenantId }
         appRegistrationClientId = @{ value = $target.entraApplicationId }
-        tenantDomains = @{ value = @($target.tenantDomains | Where-Object { $null -ne $_ }) }
-        tenantDisplayName = @{ value = [string]$target.tenantDisplayName }
         tenantRegistrySecretName = @{ value = [string]$target.tenantRegistrySecretName }
-        tenantRegistrySecretVersion = @{ value = $(if ($target.tenantRegistrySecretName) { Get-SelectedSecretVersion $target $target.tenantRegistrySecretName } else { '' }) }
+        tenantRegistrySecretVersion = @{ value = Get-SelectedSecretVersion $target $target.tenantRegistrySecretName }
         appServicePlanName = @{ value = $target.resources.appServicePlan.name }
         appServiceName = @{ value = $target.resources.appService.name }
         postgresServerName = @{ value = $target.resources.postgresFlexibleServer.name }
@@ -1241,9 +1194,6 @@ function New-AzureParameterFile {
         keyVaultSubscriptionId = @{ value = $vaultParts[2] }
         keyVaultResourceGroupName = @{ value = $vaultParts[4] }
         keyVaultName = @{ value = $vaultParts[8] }
-        tenantIdSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-tenant-id' }
-        clientIdSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-client-id' }
-        clientSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-client-secret' }
         sessionSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-session-secret' }
         postgresAdminPasswordSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-postgres-admin-password' }
         postgresAppPasswordSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-postgres-app-password' }
@@ -1269,7 +1219,7 @@ function New-AzureParameterFile {
 }
 
 function Invoke-AzureDatabaseContainer {
-    param($Context, [string[]]$Command, [string]$LegacyBackupPath, [string]$ServerName, [string]$CurrentServerName, [switch]$RuntimeRole)
+    param($Context, [string[]]$Command, [string]$ServerName, [string]$CurrentServerName, [switch]$RuntimeRole)
     $target = $Context.Target
     $directory = New-AzureBootstrapDirectory $Context
     Assert-AzureBootstrapMaterialized $Context
@@ -1283,11 +1233,6 @@ function Invoke-AzureDatabaseContainer {
         '-e', 'APP_PGPASSWORD_FILE=/run/secrets/postgres-app',
         '-e', 'PGSSLMODE=verify-full')
     if ($CurrentServerName) { $arguments += @('-e', "CURRENT_PGHOST=$CurrentServerName.postgres.database.azure.com") }
-    if ($LegacyBackupPath) {
-        $full = [IO.Path]::GetFullPath($LegacyBackupPath)
-        $arguments += @('--mount', "type=bind,source=$full,target=/legacy/audit.sqlite,readonly")
-        $Command = @($Command[0], '/legacy/audit.sqlite', $Command[2])
-    }
     $arguments += @('agent-control-azure-operator:local') + $Command
     $result = Invoke-ExternalCommand docker $arguments -SensitiveOutput
     if (-not $result.output) { return @{ outcome = 'succeeded' } }
@@ -1432,10 +1377,6 @@ function Invoke-AzureDeployment {
             $evidence.database_reopen = Invoke-DeploymentOperation $Context 'database_reopen'
             $failedStep = 'open_and_verify'
             $evidence.open_and_verify = Invoke-DeploymentOperation $Context 'open_and_verify'
-            if ($Context.Target.legacyStaticWebApp.resourceId) {
-                $failedStep = 'retire_legacy_swa'
-                $evidence.retire_legacy_swa = Invoke-DeploymentOperation $Context 'retire_legacy_swa'
-            }
             $failedStep = 'cleanup'
             $evidence.cleanup = Invoke-DeploymentOperation $Context 'cleanup'
             return Write-AzureDeploymentReceipt $Context 'recovered' $null $evidence
@@ -1452,7 +1393,7 @@ function Invoke-AzureDeployment {
             $failedStep = 'network_reconcile'
             $evidence.network_reconcile = Invoke-DeploymentOperation $Context 'network_reconcile'
         }
-        foreach ($step in @('database_preflight', 'database_migrate')) {
+        foreach ($step in @('database_preflight', 'database_initialize')) {
             $failedStep = $step
             $evidence[$step] = Invoke-DeploymentOperation $Context $step
         }
@@ -1463,10 +1404,6 @@ function Invoke-AzureDeployment {
             }
             $failedStep = 'enter_maintenance'
             $evidence.enter_maintenance = Invoke-DeploymentOperation $Context 'enter_maintenance'
-        }
-        if ($Context.Target.installationMode -eq 'legacy_import') {
-            $failedStep = 'legacy_import'
-            $evidence.legacy_import = Invoke-DeploymentOperation $Context 'legacy_import'
         }
         foreach ($step in @('package_deploy', 'runtime_access_verify', 'monitoring_verify')) {
             $failedStep = $step
@@ -1488,10 +1425,6 @@ function Invoke-AzureDeployment {
         $evidence.database_reopen = Invoke-DeploymentOperation $Context 'database_reopen'
         $failedStep = 'open_and_verify'
         $evidence.open_and_verify = Invoke-DeploymentOperation $Context 'open_and_verify'
-        if ($Context.Target.legacyStaticWebApp.resourceId) {
-            $failedStep = 'retire_legacy_swa'
-            $evidence.retire_legacy_swa = Invoke-DeploymentOperation $Context 'retire_legacy_swa'
-        }
         $failedStep = 'cleanup'
         $evidence.cleanup = Invoke-DeploymentOperation $Context 'cleanup'
         return Write-AzureDeploymentReceipt $Context 'deployed' $null $evidence

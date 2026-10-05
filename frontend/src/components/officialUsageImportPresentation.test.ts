@@ -1,16 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { OfficialUsageBundlePreview } from "../api/client";
-import { companionMetadata, errorMessage, kindLabel } from "./officialUsageImportPresentation";
-import { usageInsightsPublished } from "../test/usageInsightsFixture";
+import type { OfficialReportPreview } from "../../../backend/src/types/officialReportApi";
+import { companionMetadata, kindLabel } from "./officialUsageImportPresentation";
 
-function preview(provenance: "activity_range" | "operator_asserted" | "source_metadata"): OfficialUsageBundlePreview {
+function preview(provenance: "activity_range" | "operator_asserted" | "source_metadata"): Pick<OfficialReportPreview, "reportingPeriod" | "sourceAsOf" | "sourceAsOfProvenance"> {
   return {
-    bundleId: "bundle", bundleHash: "hash", expectedActiveRevision: 1, staging: [], missingKinds: [], reconciliation: {},
-    acceptedVersions: [{
-      kind: "agents", versionId: "version", fileHash: "file",
-      reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", provenance },
-      sourceAsOf: null, sourceAsOfProvenance: "absent",
-    }],
+    reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", provenance, days: 30 },
+    sourceAsOf: null, sourceAsOfProvenance: "absent",
   };
 }
 
@@ -25,7 +20,7 @@ describe("CSV import presentation and restored companion metadata", () => {
     expect(companionMetadata()).toEqual({});
   });
 
-  it.each(["operator_asserted", "source_metadata"] as const)("preserves an explicit %s period when resuming a legacy draft", provenance => {
+  it.each(["operator_asserted", "source_metadata"] as const)("preserves an explicit %s period when resuming streamed staging", provenance => {
     expect(companionMetadata(preview(provenance))).toEqual({
       reportingStart: "2026-08-01", reportingEnd: "2026-08-30", periodProvenance: provenance,
     });
@@ -33,23 +28,15 @@ describe("CSV import presentation and restored companion metadata", () => {
 
   it("preserves known source freshness but never invents it from a date or filename", () => {
     const value = preview("activity_range");
-    value.acceptedVersions[0].sourceAsOf = "2026-09-01T00:00:00Z";
+    value.sourceAsOf = "2026-09-01T00:00:00Z";
     expect(companionMetadata(value)).toEqual({});
-    value.acceptedVersions[0].sourceAsOfProvenance = "source_metadata";
+    value.sourceAsOfProvenance = "source_metadata";
     expect(companionMetadata(value)).toEqual({ sourceAsOf: "2026-09-01T00:00:00Z", sourceAsOfProvenance: "source_metadata" });
   });
 
-  it("uses an incomplete retained set's explicit period when there is no staging preview", () => {
-    const set = { ...usageInsightsPublished.activeSet!, reportingPeriod: {
-      startDate: "2026-08-01", endDate: "2026-08-30", provenance: "operator_asserted" as const,
-    } };
-    expect(companionMetadata(undefined, set)).toEqual({
+  it("retains an explicit period without inferring source freshness", () => {
+    expect(companionMetadata(preview("operator_asserted"))).toEqual({
       reportingStart: "2026-08-01", reportingEnd: "2026-08-30", periodProvenance: "operator_asserted",
     });
-  });
-
-  it("retains useful errors and supplies an explicit message for unknown failures", () => {
-    expect(errorMessage(new Error("CSV header missing."))).toBe("CSV header missing.");
-    expect(errorMessage(null)).toBe("The official usage request failed.");
   });
 });

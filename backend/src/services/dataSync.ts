@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { pool } from "../db/pool.js";
 import { DataSyncRepository, type DataSyncScope } from "../db/dataSync.js";
-import { OfficialUsageRepository } from "../db/officialUsage.js";
+import { OfficialReportStatusRepository, type OfficialReportStatus } from "../db/officialReportStatus.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { automaticDataSyncSourceIds, dataSyncFailureStatus, type AutomaticRefreshResult, type DataSyncRun, type DataSyncSourceId, type DataSyncSourceStatus, type DataSyncState, type StartDataSyncInput } from "../types/dataSync.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
@@ -10,7 +10,6 @@ import { requireProviderAdmissions } from "./operationalState.js";
 import { requireAdmissions } from "./maintenance.js";
 import { hasAppRole } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { PublishedOfficialUsage } from "../types/officialUsage.js";
 import { CopilotUsageService, type CopilotUsageRefreshResult } from "./copilotUsage.js";
 import { packageInventory, type PackageInventoryService } from "./packageInventory.js";
 import { powerPlatformInventory, type PowerPlatformInventoryService } from "./powerPlatformInventory.js";
@@ -25,7 +24,7 @@ type DataSyncDependencies = {
   repository: Pick<DataSyncRepository,
     "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listMarkers" | "attachJob" | "updateSource"
     | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted" | "submitDue" | "automaticRevisions" | "finishAutomatic">;
-  officialUsage: Pick<OfficialUsageRepository, "getPublished">;
+  officialUsage: Pick<OfficialReportStatusRepository, "read">;
   packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization" | "refreshDueDetails">;
   powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
   copilotUsage: Pick<CopilotUsageService, "refreshUsers">;
@@ -80,7 +79,7 @@ export class DataSyncService {
     requireViewer(user);
     const scope = dataScope(user);
     let run = await this.dependencies.repository.getLatestRun(scope);
-    const published = await this.dependencies.officialUsage.getPublished(scope.tenantId);
+    const published = await this.dependencies.officialUsage.read(scope.tenantId);
     if (run) run = await this.reconcileRun(user, scope, run, published);
     if (hasAcceptedUsage(published)) {
       await this.dependencies.repository.recordSuccessMarker(scope, "usage_reports", usageRowCount(published), usageAcceptedAt(published));
@@ -164,7 +163,7 @@ export class DataSyncService {
       const current = await this.dependencies.repository.getRun(scope, id);
       assertCurrentSync(authorization);
       if (!current) throw new AppError(404, "not_found", "Data sync run was not found.");
-      const reconciled = await this.reconcileRun(user, scope, current, await this.dependencies.officialUsage.getPublished(scope.tenantId));
+      const reconciled = await this.reconcileRun(user, scope, current, await this.dependencies.officialUsage.read(scope.tenantId));
       assertCurrentSync(authorization);
       const candidates = reconciled.sources.filter(source => source.canRetry).map(source => source.source);
       const requested = sources ?? candidates;
@@ -409,7 +408,7 @@ export class DataSyncService {
       ? this.runPowerPlatform(user, scope, runId, activeRun, incompleteOnly) : undefined;
     const results = await Promise.allSettled(sources.map(source => {
       if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, activeRun, inventoryReady, automatic, signedInAt);
-      if (source === "graph_packages") return this.runPackages(user, scope, runId, activeRun, incompleteOnly, automatic);
+      if (source === "graph_packages") return this.runPackages(user, scope, runId, activeRun, incompleteOnly);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
@@ -491,7 +490,7 @@ export class DataSyncService {
     }
   }
 
-  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, activeRun: ActiveRun, retryFailed: boolean, automatic: boolean) {
+  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, activeRun: ActiveRun, retryFailed: boolean) {
     let jobId: string | null = null;
     try {
       assertCurrentSync(activeRun);
@@ -500,7 +499,6 @@ export class DataSyncService {
       const job = await this.dependencies.packages.submit(user, {
         tokenMode: "delegated",
         requestedIds: [],
-        ...(automatic ? { catalogOnly: true } : {}),
         idempotencyKey: childIdempotencyKey(runId, "graph-packages", attempt),
       });
       jobId = job.id;
@@ -512,9 +510,7 @@ export class DataSyncService {
         status: "running",
         jobId,
         count: job.observedCount,
-        message: automatic
-          ? "Checking delegated authorization to collect the agent list. Package details refresh separately."
-          : "Checking delegated authorization to collect the agent list and matching identities.",
+        message: "Checking delegated authorization to collect the agent list. Package details refresh separately.",
         canRetry: false,
       });
       assertCurrentSync(activeRun);
@@ -638,7 +634,7 @@ export class DataSyncService {
     user: AuthenticatedUser,
     scope: DataSyncScope,
     run: DataSyncRun,
-    published: PublishedOfficialUsage,
+    published: OfficialReportStatus,
   ) {
     run = await this.reconcileUsage(scope, run, published);
     // The local worker owns child progress and failure cleanup until it settles.
@@ -677,11 +673,11 @@ export class DataSyncService {
     return (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
   }
 
-  private async reconcileUsage(scope: DataSyncScope, run: DataSyncRun, published?: PublishedOfficialUsage) {
+  private async reconcileUsage(scope: DataSyncScope, run: DataSyncRun, published?: OfficialReportStatus) {
     if (run.status === "cancelled") return run;
     const source = run.sources.find(value => value.source === "usage_reports");
     if (!source || source.status === "succeeded") return run;
-    const current = published ?? await this.dependencies.officialUsage.getPublished(scope.tenantId);
+    const current = published ?? await this.dependencies.officialUsage.read(scope.tenantId);
     if (hasAcceptedUsage(current)) {
       await this.dependencies.repository.updateSource(scope, run.id, "usage_reports", {
         status: "succeeded",
@@ -773,7 +769,7 @@ export class DataSyncService {
 function defaultDependencies(database: pg.Pool): DataSyncDependencies {
   return {
     repository: new DataSyncRepository(database),
-    officialUsage: new OfficialUsageRepository(database),
+    officialUsage: new OfficialReportStatusRepository(database),
     packages: packageInventory,
     powerPlatform: powerPlatformInventory,
     copilotUsage: new CopilotUsageService(database),
@@ -879,21 +875,20 @@ function safeSyncFailure(error: unknown) {
   return "The source failed before complete saved-data publication.";
 }
 
-function hasAcceptedUsage(published: PublishedOfficialUsage) {
-  return published.activeSet?.complete === true && Object.keys(published.reports).length === 3;
+function hasAcceptedUsage(published: OfficialReportStatus) {
+  return published.complete;
 }
 
-function usageRowCount(published: PublishedOfficialUsage) {
-  return Object.values(published.reports).reduce((count, report) => count + (report?.rows.length ?? 0), 0);
+function usageRowCount(published: OfficialReportStatus) {
+  return published.count;
 }
 
-function usageAcceptedAt(published: PublishedOfficialUsage) {
-  return published.activeSet?.acceptedAt
-    ?? Object.values(published.reports).map(report => report?.lineage.acceptedAt).filter((value): value is string => Boolean(value)).sort().at(-1)
-    ?? new Date().toISOString();
+function usageAcceptedAt(published: OfficialReportStatus) {
+  if (!published.acceptedAt) throw new Error("official_report_acceptance_missing");
+  return published.acceptedAt;
 }
 
-function reconcileUsageMarker(sources: DataSyncSourceStatus[], published: PublishedOfficialUsage) {
+function reconcileUsageMarker(sources: DataSyncSourceStatus[], published: OfficialReportStatus) {
   if (!hasAcceptedUsage(published)) return sources.map(source => source.source === "usage_reports" ? {
     source: source.source,
     status: "not_started" as const,

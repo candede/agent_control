@@ -1,13 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
-import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
+import { NativeInventory } from "./nativeInventory.js";
+import { nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./copilotStudioQuarantine.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: CopilotStudioQuarantineRepository;
-let inventory: PowerPlatformInventoryRepository;
+let inventory: NativeInventory;
 const scope = { tenantId: "tenant-a", principalId: "operator-a" };
 const actor: QuarantineActor = { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator", username: "operator@example.invalid" };
 const authority: QuarantineAuthority = { contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 };
@@ -17,26 +18,19 @@ const botId = "22222222-2222-4222-8222-222222222222";
 beforeAll(async () => {
   fixture = await testDatabase();
   repository = new CopilotStudioQuarantineRepository(fixture.runtime);
-  inventory = new PowerPlatformInventoryRepository(fixture.runtime);
+  inventory = new NativeInventory(fixture.runtime);
 });
 afterAll(async () => { await fixture?.close(); });
 
 async function seedInventory(principalId = scope.principalId, observedAt = new Date(), targetBotId = botId) {
-  const queryHash = createHash("sha256").update(`${principalId}:${observedAt.toISOString()}:${randomUUID()}`).digest("hex");
-  const jobId = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_refresh_jobs
-    (id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
-    VALUES(gen_random_uuid(),'tenant-a',$1,$2,repeat('c',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`,
-  [principalId, `inventory-${principalId}-${observedAt.getTime()}`])).rows[0].id;
-  const snapshotId = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_inventory_snapshots
-    (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count,observed_at)
-    VALUES(gen_random_uuid(),$1,'tenant-a',$2,$3,'full','["microsoft.copilotstudio/agents"]',$4,1,1,1,0,$5) RETURNING id`,
-  [jobId, principalId, queryHash, JSON.stringify(["microsoft.copilotstudio/agents"]), observedAt])).rows[0].id;
-  await fixture.operator.query(`INSERT INTO power_platform_inventory_resources
-    (snapshot_id,tenant_id,principal_id,native_id,resource_type,environment_id,display_name,source_system,creator_type,agent_kind,lifecycle,identity_confidence,identifiers,provenance,details,unknown_field_count)
-    VALUES($1,'tenant-a',$2,'native-agent','microsoft.copilotstudio/agents',$3,'Canary agent','power_platform','unknown','copilot_studio_agent','published','exact_native',$4,'{}',$5,0)`,
-  [snapshotId, principalId, environmentId, JSON.stringify([{ kind: "power_platform_resource_id", value: "native-agent" }, { kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: targetBotId }]),
-    JSON.stringify({ isQuarantined: false, quarantinedAt: null })]);
-  return snapshotId;
+  const owner = { tenantId: scope.tenantId, principalId };
+  const root = await nativeInventoryFixture(fixture.runtime, owner, [{
+    nativeId: "native-agent", environmentId, displayName: "Canary agent", lifecycle: "published",
+    identifiers: [{ kind: "power_platform_resource_id", value: "native-agent" }, { kind: "environment_id", value: environmentId },
+      { kind: "cds_bot_id", value: targetBotId }], details: { isQuarantined: false, quarantinedAt: null },
+  }], { observedAt });
+  await reconcileInventoryFixture(fixture.runtime, owner);
+  return root.baselineId;
 }
 
 function frozen(target: InventoryQuarantineTarget, state = false, updatedAt = "2026-09-09T19:00:00.000Z"): FrozenQuarantineTarget {
@@ -59,7 +53,7 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     const target = await inventory.resolveQuarantineTargets(scope, snapshotId, ["native-agent"]);
     expect(target).toMatchObject([{ resourceNativeId: "native-agent", environmentId, botId, inventoryQuarantineState: false }]);
     await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: "other" }, snapshotId, ["native-agent"]))
-      .rejects.toMatchObject({ code: "quarantine_inventory_unavailable" });
+      .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
     await expect(inventory.resolveQuarantineTargets(scope, snapshotId, ["Canary agent"]))
       .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
   });
@@ -109,7 +103,7 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     const current = await repository.beginItem(lease!);
     await repository.markSent(lease!, current!.item, authority);
     await fixture.operator.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [existing.id]);
-    expect(await repository.recoverInterrupted()).toBeGreaterThan(0);
+    expect(await repository.recoverInterrupted(scope.tenantId)).toBeGreaterThan(0);
     expect(await repository.get(scope, existing.id)).toMatchObject({ status: "inconclusive", canReconcile: true });
 
     const snapshotId = await seedInventory("blocked-operator");
@@ -143,10 +137,10 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     const current = await repository.beginItem(lease!);
     await repository.markSent(lease!, current!.item, authority);
     expect(job.status).toBe("queued");
-    await repository.recoverInterrupted();
+    await repository.recoverInterrupted(scope.tenantId);
     expect((await repository.get(startupScope, job.id))?.status).toBe("queued");
     expect((await repository.get(startupScope, runningJob.id))?.status).toBe("running");
-    await repository.recoverInterrupted(true);
+    while (await repository.recoverInterrupted(scope.tenantId, true) > 0) {}
     expect(await repository.get(startupScope, job.id)).toMatchObject({ status: "waiting_authorization", canResume: true });
     expect(await repository.get(startupScope, runningJob.id)).toMatchObject({ status: "inconclusive", canReconcile: true });
   });

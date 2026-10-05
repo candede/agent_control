@@ -4,11 +4,11 @@ import express from "express";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { defenderHuntingRouter } from "./defenderHunting.js";
-import { unifiedAgentsRouter } from "./unifiedAgents.js";
+import { createUnifiedAgentsRouter } from "./unifiedAgents.js";
 import { defenderHunting } from "../services/defenderHunting.js";
 import { purviewAudit } from "../services/purviewAudit.js";
 import { agentInvestigations } from "../services/agentInvestigations.js";
-import { agentIdentityResolution } from "../services/agentIdentityResolution.js";
+import { AgentIdentityResolutionService } from "../services/agentIdentityResolution.js";
 import { capabilities } from "../services/capabilities.js";
 
 vi.mock("../middleware/auth.js", async importOriginal => {
@@ -18,9 +18,13 @@ vi.mock("../middleware/auth.js", async importOriginal => {
     requestScope: () => ({ tenantId: "tenant-a", principalId: "reader-a" }),
   };
 });
-vi.mock("../services/auditLog.js", () => ({ getAuditLog: () => ({
-  startEvent: vi.fn(async () => ({ id: "audit-a" })), completeEvent: vi.fn(async () => undefined),
-}) }));
+vi.mock("../services/auditLog.js", () => ({
+  getAuditLog: () => ({ startEvent: vi.fn(async () => ({ id: "audit-a" })), completeEvent: vi.fn(async () => undefined) }),
+  AuditLog: class {
+    startEvent = vi.fn(async () => ({ id: "audit-a" }));
+    completeEvent = vi.fn(async () => undefined);
+  },
+}));
 vi.mock("../services/csvExport.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/csvExport.js")>(),
   createExportPublicationValidator: () => async (validateSource?: () => Promise<void>) => { await validateSource?.(); },
@@ -34,6 +38,7 @@ vi.mock("../services/purviewAudit.js", () => ({ purviewAudit: { agentRecords: vi
 const id = "11111111-1111-4111-8111-111111111111";
 const recordId = `agent:${id}`;
 const user = { tenantId: "tenant-a", homeAccountId: "reader-a", roles: ["AgentControl.Viewer"] };
+const agentIdentityResolution = new AgentIdentityResolutionService();
 let server: Server;
 let origin: string;
 
@@ -46,7 +51,8 @@ beforeAll(async () => {
     accountId: "reader-a", csrfToken: "test-csrf" } as never;
     next();
   });
-  app.use("/api", defenderHuntingRouter, unifiedAgentsRouter);
+  app.use("/api", defenderHuntingRouter, createUnifiedAgentsRouter(undefined,
+    { investigations: agentInvestigations, identities: agentIdentityResolution, purview: purviewAudit }));
   app.use(((error: AppError, _request, response, _next) => response.status(error.status ?? 500).json({ code: error.code })) as express.ErrorRequestHandler);
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -152,7 +158,8 @@ describe("agent investigation HTTP wiring", () => {
       expect(denied.status).toBe(403);
       expect(defenderHunting.submit).not.toHaveBeenCalled();
       expect(context).toHaveBeenCalledOnce();
-      expect(purviewAudit.agentRecords).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(user), recordId, { limit: 50, offset: 0 });
+      expect(purviewAudit.agentRecords).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(user), recordId,
+        { limit: 50, offset: 0 }, expect.any(Function));
     } finally { context.mockRestore(); }
   });
 });

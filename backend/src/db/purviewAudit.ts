@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
-import { resolveExactInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type {
   PurviewAuditFilters,
@@ -18,7 +17,7 @@ import type {
 } from "../types/purviewAudit.js";
 import { purviewAuditPresets } from "../types/purviewAudit.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
-import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
+import { InventoryIdentityQueries, type InventoryIdentityReadScope } from "./inventoryIdentityQueries.js";
 import { pool, transaction } from "./pool.js";
 import type { AgentPurviewQuery, AgentPurviewTarget } from "../types/agentInvestigations.js";
 
@@ -417,7 +416,7 @@ export class PurviewAuditRepository {
       WHERE job_id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5`,
     [id, readScope.tenantId, resultScope.kind, resultScope.scopeId, resultScope.configurationRevision]);
     const projected = rows.rows.map(projectRecord);
-    const associations = await this.resolveAssociations(this.database, readScope, resultScope, projected);
+    const associations = await this.resolveAssociations(readScope, resultScope, projected);
     return { value: projected.map((record, index) => ({ ...record, association: associations[index] })), count: count.rows[0].count, limit: boundedLimit, offset: boundedOffset, job };
   }
 
@@ -484,15 +483,14 @@ export class PurviewAuditRepository {
     });
   }
 
-  private async resolveAssociations(database: Pick<pg.Pool, "query">, readScope: PurviewAuditReadScope, resultScope: PurviewAuditResultScope, records: readonly PurviewAuditRecord[]) {
+  private async resolveAssociations(readScope: PurviewAuditReadScope, resultScope: PurviewAuditResultScope, records: readonly PurviewAuditRecord[]) {
     const identityScope = readScope.inventoryIdentityScope;
     if (resultScope.kind !== "principal" || !identityScope || identityScope.principalId !== resultScope.scopeId) {
       return records.map(() => ({ status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const }));
     }
-    const identities = await new PowerPlatformInventoryRepository(this.database).readIdentityCandidates(
-      { tenantId: readScope.tenantId, principalId: identityScope.principalId }, identityScope.resourceTypes, database,
-    );
-    return records.map(record => {
+    const inventory = new InventoryIdentityQueries(this.database);
+    return inventory.read(async client => {
+    const resolve = async (record: PurviewAuditRecord) => {
       if (record.auditLogRecordType !== "powerPlatformAdministratorActivity" || record.service !== "PowerPlatform"
         || !purviewAuditPresets.copilot_studio_admin.operationFilters.includes(record.operation)) {
         return { status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const };
@@ -500,12 +498,17 @@ export class PurviewAuditRepository {
       if (!record.botId && record.agentId) return { status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const };
       if (!record.botId) return { status: "unresolved" as const, reason: "no_documented_exact_identifier" as const };
       if (!record.environmentId) return { status: "unresolved" as const, reason: "missing_environment" as const };
-      const resolved = resolveExactInventoryIdentity({ nativeId: record.wrapperId, tenantId: readScope.tenantId, environmentId: record.environmentId, sourceSystem: "power_platform",
-        resourceType: "microsoft.copilotstudio/agents", identifiers: [{ kind: "cds_bot_id", value: record.botId }] }, identities);
+      const resolved = await inventory.resolve(client, { tenantId: readScope.tenantId, principalId: identityScope.principalId },
+        identityScope.resourceTypes, { nativeId: record.wrapperId, tenantId: readScope.tenantId, environmentId: record.environmentId, sourceSystem: "power_platform",
+          resourceType: "microsoft.copilotstudio/agents", identifiers: [{ kind: "cds_bot_id", value: record.botId }] });
       if (resolved.status === "resolved") return { status: "resolved" as const, sourceSystem: "power_platform" as const, nativeId: resolved.candidate.nativeId,
         resourceType: resolved.candidate.resourceType, environmentId: resolved.candidate.environmentId!, matchedKind: "cds_bot_id" as const };
       if (resolved.status === "ambiguous") return { status: "ambiguous" as const, reason: "multiple_exact_candidates" as const, candidateCount: resolved.candidateCount ?? resolved.candidates.length };
       return { status: "unresolved" as const, reason: resolved.reason === "no_documented_cross_source_relation" ? resolved.reason : "no_documented_exact_identifier" as const };
+    };
+    const result = [];
+    for (const record of records) result.push(await resolve(record));
+    return result;
     });
   }
 

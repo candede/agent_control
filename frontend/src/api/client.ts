@@ -1,24 +1,26 @@
 import type { AppRole, CapabilityCheckProgress, CapabilityView } from "../../../backend/src/types/capability";
 import { capabilityIds, supportsAutomaticCapabilityCheck } from "../../../backend/src/types/capability";
-import type { PackageDetailFreshness, PackageStatus } from "../../../backend/src/types/copilotPackage";
-export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
-import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
+import type {
+  CopilotPackage, CopilotPackageDetail as StoredPackageDetail, PackageAccessEntity,
+  PackageAccessUpdate, PackageAccessUpdateResult,
+} from "../../../backend/src/types/copilotPackage";
+export type {
+  CopilotPackage, PackageStatus, PackageAccessEntity, PackageAccessTarget,
+  PackageAccessMutationMode, PackageAccessUpdate,
+} from "../../../backend/src/types/copilotPackage";
+import type { InventoryRefreshJob, InventoryRefreshJobList, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
-import type { OfficialUsageAgentDetailView, OfficialUsageAgentUsersView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
-export type { OfficialUsageAgentUsersView } from "../../../backend/src/types/officialUsage";
-import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
-import type { AutomaticRefreshResult, DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
-import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
-import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
+import type { WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
+import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentInventoryUnavailable, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
+import { encodeInventoryFacet, inventoryFacetFields, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
 export type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
 import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 export type { AgentResponsibilityPage } from "../../../backend/src/types/agentResponsibility";
-import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
-export type { AgentUsageAssociation, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
 import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
@@ -26,13 +28,13 @@ export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, I
 export type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
+  UnifiedAgentInventoryUnavailable,
   UnifiedAgentInventoryVerification,
   UnifiedAgentRecord,
   UnifiedAgentPowerPlatformObservation,
 } from "../../../backend/src/types/unifiedAgents";
-export type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
-export type { CopilotAppActivity, CopilotServicePlan, CopilotServiceSummaryState, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
-export { copilotAgentActivity, hasReportedAgentActivity, isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
+export type { CopilotServicePlan, CopilotServiceSummaryState } from "../../../backend/src/types/copilotUsage";
+export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
@@ -52,66 +54,6 @@ export type QuarantinePreview = {
   statuses: QuarantineStatusView[];
 };
 
-export type OfficialUsageStagingPreview = {
-  id: string;
-  revision: number;
-  status: "active" | "accepted" | "replaced" | "expired" | "cancelled";
-  kind: OfficialUsageReportKind;
-  fileHash: string;
-  parserVersion: string;
-  schemaVersion: string;
-  bundleId: string;
-  correctionOfSetId: string | null;
-  reportingPeriod: Pick<OfficialUsageReportBase["reportingPeriod"], "startDate" | "endDate" | "provenance">;
-  sourceAsOf: string | null;
-  sourceAsOfProvenance: "source_metadata" | "operator_asserted" | "absent";
-  sourceFreshness: "known" | "unknown";
-  downloadedAt: string | null;
-  rowCount: number;
-  warnings: string[];
-  reconciliation: Record<string, unknown>;
-  activeRevision: number;
-  acceptedVersionId: string | null;
-  acceptedSetId: string | null;
-  createdAt: string;
-  expiresAt: string;
-  acceptedAt: string | null;
-};
-
-export type OfficialUsageAdminState = {
-  activeSetId: string | null;
-  activeRevision: number;
-  staging: OfficialUsageStagingPreview[];
-  sets: OfficialUsageSetSummary[];
-};
-
-export type OfficialUsageConfirmation = {
-  id: string;
-  operation: "select" | "delete";
-  setId: string;
-  expectedRevision: number;
-  confirmationHash: string;
-  activeSetId: string | null;
-  expiresAt: string;
-};
-
-export type OfficialUsageBundlePreview = {
-  bundleId: string;
-  bundleHash: string;
-  expectedActiveRevision: number;
-  staging: OfficialUsageStagingPreview[];
-  acceptedVersions: Array<{
-    kind: OfficialUsageReportKind;
-    versionId: string;
-    fileHash: string;
-    reportingPeriod: Pick<OfficialUsageReportBase["reportingPeriod"], "startDate" | "endDate" | "provenance">;
-    sourceAsOf: string | null;
-    sourceAsOfProvenance: "source_metadata" | "operator_asserted" | "absent";
-  }>;
-  missingKinds: OfficialUsageReportKind[];
-  reconciliation: Record<string, unknown>;
-};
-
 export type SessionUser = {
   displayName: string;
   username: string;
@@ -120,75 +62,8 @@ export type SessionUser = {
   roles: AppRole[];
 };
 
-export type CopilotPackage = {
-  id: string;
-  displayName: string;
-  type?: string;
-  shortDescription?: string;
-  isBlocked: boolean;
-  supportedHosts?: string[];
-  createdDateTime?: string;
-  lastModifiedDateTime?: string;
-  publisher?: string;
-  availableTo?: PackageStatus;
-  deployedTo?: PackageStatus;
-  elementTypes?: string[];
-  platform?: string;
-  version?: string;
-  manifestVersion?: string;
-  manifestId?: string;
-  appId?: string;
-  assetId?: string;
-  sourceSystem: "graph_packages";
-  authoringTool: string | null;
-  creatorType: "unknown";
-  agentKind: "copilot_package";
-  lifecycle: "unknown";
-  identityConfidence: "exact_native";
-  provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: "ga" | "preview" }>;
-  detailFreshness?: PackageDetailFreshness;
-};
-
-export type PackageAccessEntity = {
-  resourceId: string;
-  resourceType: "user" | "group" | string;
-};
-
-export type PackageAccessTarget = "availability" | "installation";
-export type PackageAccessMutationMode = "add" | "replace";
-export type PackageAccessScope = "specific" | "none";
-
-export type PackageAccessUpdate =
-  | {
-      target: PackageAccessTarget;
-      mode: "add";
-      scope: "specific";
-      principals: PackageAccessEntity[];
-    }
-  | {
-      target: PackageAccessTarget;
-      mode: "replace";
-      scope: "specific";
-      principals: PackageAccessEntity[];
-    }
-  | {
-      target: PackageAccessTarget;
-      mode: "replace";
-      scope: "none";
-      principals: never[];
-    };
-
-export type PackageAccessReplacement = Extract<
-  PackageAccessUpdate,
-  { mode: "replace" }
->;
-
-type PackageAccessUpdateResult = {
-  changed: boolean;
-  previousCount: number;
-  resultingCount: number;
-  principals: PackageAccessEntity[];
-};
+export type PackageAccessScope = PackageAccessUpdate["scope"];
+export type PackageAccessReplacement = PackageAccessUpdate & { mode: "replace" };
 
 export type DirectoryPrincipal = PackageAccessEntity & {
   displayName: string;
@@ -196,71 +71,48 @@ export type DirectoryPrincipal = PackageAccessEntity & {
   principalKind: "user" | "securityGroup" | "microsoft365Group" | "unknown";
 };
 
-type PackageElementDetail = {
-  elementType: string;
-  elements: Array<{
-    id: string;
-    definition: string;
-  }>;
-};
-
-export type CopilotPackageDetail = CopilotPackage & {
-  longDescription?: string;
-  categories?: string[];
-  sensitivity?: string;
-  allowedUsersAndGroups?: PackageAccessEntity[];
-  acquireUsersAndGroups?: PackageAccessEntity[];
-  elementDetails?: PackageElementDetail[];
+export type CopilotPackageDetail = StoredPackageDetail & {
   observation?: PackageObservation;
+  accessReadError?: string;
+  matchingEvidence?: UnifiedAgentRecord["identity"]["evidence"];
+  selectedSource?: { selectionId: string; recordId: string; sourceScopeId: string; sourceIdentity: string; generationId: string };
 };
 
 type PackageObservation = {
+  id?: string;
   observedAt: string;
   expiresAt: string;
   scopeKind: "broad" | "exact";
+  current?: boolean;
   source?: "Microsoft Graph package catalog";
   apiMaturity?: "v1.0 read; preview controls";
 };
 
-type PackageSnapshot = PackageObservation & {
-  id: string;
-  tokenMode: "delegated" | "application";
-  requestedIds: string[];
-  observedCount: number;
-  totalRecords: number;
-  pageCount: number;
-};
-
 export type PackagePage = {
   value: CopilotPackage[];
-  count: number;
-  snapshot: PackageSnapshot | null;
-  summary: PackageCountSummary;
-  filteredSummary: PackageCountSummary;
-  facets: {
-    publishers: PackageFacetOption[];
-    availability: PackageFacetOption[];
-    hosts: PackageFacetOption[];
-    platforms: PackageFacetOption[];
-  };
+  selection: { id: string; revision: string; expiresAt: string; evaluatedAt: string };
+  counts: { total: number; scoped: number; filtered: number };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
+  freshness: { state: string; capturedRevision: string; sources: unknown[] };
+  mode: "delegated" | "application";
 };
 
-type PackageCountSummary = { total: number; allowed: number; blocked: number };
-type PackageFacetOption = { value: string; label: string };
 type PackageListQuery = {
-  snapshotId?: string;
+  selectionId?: string;
+  cursor?: string;
+  recordId?: string;
+  mode?: "delegated" | "application";
   search?: string;
   operationIdPrefix?: string;
   blocked?: boolean;
-  publisher?: string;
-  availableTo?: string;
-  host?: string;
-  platform?: string;
+  publisher?: string | null;
+  availableTo?: InventoryFacetValue;
+  host?: string | null;
+  platform?: string | null;
   createdWithinDays?: number;
   sortBy?: "displayName" | "publisher" | "lastModifiedAt";
   sortDirection?: "asc" | "desc";
   limit?: number;
-  offset?: number;
 };
 
 export type PackageRefreshJob = {
@@ -268,7 +120,8 @@ export type PackageRefreshJob = {
   authorizationPrincipalId: string;
   tokenMode: "delegated" | "application";
   scopeKind: "broad" | "exact";
-  requestedIds: string[];
+  targetCount: number;
+  resultRevision: string;
   status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
   pageCount: number;
   observedCount: number;
@@ -282,7 +135,7 @@ export type PackageRefreshJob = {
   finishedAt: string | null;
 };
 
-type BulkPackageResult = {
+export type BulkPackageResult = {
   id: string;
   displayName: string;
   status: "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
@@ -329,8 +182,12 @@ type BulkActionJobBase = {
   succeeded: number;
   failed: number;
   skipped: number;
-  results: BulkPackageResult[];
-  result?: BulkActionResult;
+  inconclusive: number;
+  cancelled: number;
+  queued: number;
+  reconciliationRequired: number;
+  retryEligible: number;
+  resultRevision: string;
   currentAgentName?: string;
   error?: string;
   createdAt: string;
@@ -351,6 +208,13 @@ export type BulkActionJob = BulkActionJobBase &
         accessUpdate: PackageAccessUpdate;
       }
   );
+
+export type BulkJobItemPage = {
+  value: Array<Omit<BulkPackageResult, "status"> & { status: BulkPackageResult["status"] | "queued" | "running" }>;
+  revision: string;
+  counts: { total: number; filtered: number };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
+};
 
 export type BlockAuditAction = "block" | "unblock";
 export type AccessAuditAction = "update-availability" | "update-installation";
@@ -387,6 +251,7 @@ type PackageMutationConfirmationSummary = {
 };
 
 export type PackageMutationPreview = {
+  selectionId?: string;
   confirmationHash: string;
   summary: PackageMutationConfirmationSummary;
 };
@@ -434,19 +299,12 @@ type AuditEventsResponse = {
   count: number;
 };
 
-type InventoryListQuery = {
-  snapshotId: string;
-  environmentId?: string;
-  search?: string;
-  sortBy?: "displayName" | "environmentId" | "createdAt" | "lastPublishedAt";
-  sortDirection?: "asc" | "desc";
-};
-
 type AuditRequestContext = {
   actionGroupId?: string;
 };
 
 export class ApiError extends Error {
+  retryAfterSeconds?: number;
   status: number;
   code: string;
   requestId?: string;
@@ -457,7 +315,7 @@ export class ApiError extends Error {
     status: number,
     code: string,
     message: string,
-    options: { requestId?: string; type?: string; kind?: "problem" | "aborted" | "network" } = {},
+    options: { requestId?: string; type?: string; kind?: "problem" | "aborted" | "network"; retryAfterSeconds?: number } = {},
   ) {
     super(message);
     this.status = status;
@@ -465,6 +323,7 @@ export class ApiError extends Error {
     this.requestId = options.requestId;
     this.type = options.type;
     this.kind = options.kind ?? "problem";
+    this.retryAfterSeconds = options.retryAfterSeconds;
   }
 
   get authenticationExpired() {
@@ -556,88 +415,110 @@ export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
   return request<WorkbenchJobsResponse>("/api/workbench/jobs", { signal: options.signal });
 }
 
-export async function getAgents(query: PackageListQuery = {}, options: { signal?: AbortSignal } = {}) {
+function inventoryQueryParams(query: Record<string, unknown>) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== "") params.set(key, String(value));
+    if (value === undefined) continue;
+    if ((inventoryFacetFields as readonly string[]).includes(key)) params.set(key, encodeInventoryFacet(value as InventoryFacetValue));
+    else if (value !== "") params.set(key, String(value));
   }
-  return request<PackagePage>(`/api/agents${params.size ? `?${params}` : ""}`, { signal: options.signal });
+  return params;
 }
 
-export function getUnifiedAgents(
+export async function getAgents(query: PackageListQuery = {}, options: { signal?: AbortSignal } = {}) {
+  const generation = sessionGeneration;
+  let selectionId = query.selectionId;
+  if (!selectionId) {
+    const criteria = { ...query };
+    delete criteria.limit;
+    delete criteria.mode;
+    const selected = await request<{ id: string }>("/api/agents/selections", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: Object.fromEntries(inventoryQueryParams(criteria)), mode: query.mode ?? "delegated" }), signal: options.signal,
+    });
+    selectionId = selected.id;
+  }
+  assertCurrentRequest(generation, options.signal);
+  const params = new URLSearchParams({ selectionId, limit: String(query.limit ?? 50) });
+  if (query.mode) params.set("mode", query.mode);
+  if (query.cursor) params.set("cursor", query.cursor);
+  return request<PackagePage>(`/api/agents?${params}`, { signal: options.signal });
+}
+
+export async function getUnifiedAgents(
   query: UnifiedAgentInventoryQuery = {},
   options: { signal?: AbortSignal } = {},
 ) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== "") params.set(key, String(value));
+  const generation = sessionGeneration;
+  let selectionId = query.selectionId;
+  if (!selectionId) {
+    const criteria = { ...query };
+    delete criteria.limit;
+    const selected = await request<{ id: string } | UnifiedAgentInventoryUnavailable>("/api/agent-inventory/selections", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: Object.fromEntries(inventoryQueryParams(criteria)) }), signal: options.signal,
+    });
+    assertCurrentRequest(generation, options.signal);
+    if ("state" in selected) {
+      if (!["not_collected", "preparing"].includes(selected.state) || typeof selected.message !== "string" || !selected.message) {
+        throw new ApiError(500, "invalid_inventory_availability", "The server returned invalid inventory availability.");
+      }
+      return selected;
+    }
+    selectionId = selected.id;
   }
-
+  assertCurrentRequest(generation, options.signal);
+  const params = new URLSearchParams({ selectionId, limit: String(query.limit ?? 50) });
+  if (query.cursor) params.set("cursor", query.cursor);
   return request<UnifiedAgentInventoryPage>(
-    `/api/agent-inventory${params.size ? `?${params}` : ""}`,
+    `/api/agent-inventory?${params}`,
     { signal: options.signal },
   );
 }
 
-export type UnifiedAgentExportQuery = Omit<UnifiedAgentInventoryQuery, "recordId" | "limit" | "offset">;
+export type InventoryFacetField = "type" | "publisher" | "host" | "platform" | "environmentId" | "source" | "linkState" | "blocked" | "availableTo";
+export function getUnifiedAgentDetail(selectionId: string, recordId: string, options: { signal?: AbortSignal } = {}) {
+  return request<UnifiedAgentRecord>(`/api/agent-inventory/${encodeURIComponent(recordId)}/detail?${new URLSearchParams({ selectionId })}`,
+    { signal: options.signal });
+}
+
+export function getInventoryFacets(selectionId: string, field: InventoryFacetField,
+    query: { search?: string; cursor?: string; selected?: boolean } = {}, options: { signal?: AbortSignal } = {}) {
+    const params = new URLSearchParams({ selectionId, field, limit: "50" });
+    for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+    return request<{ value: { value: InventoryFacetValue; label: string }[]; total: number; nextCursor: string | null }>(
+      `/api/agent-inventory/facets?${params}`, { signal: options.signal });
+  }
+  export type InventoryMember = {
+    source_scope_id: string; source_identity: string; source_generation_id: string;
+    domain: "packages" | "power_platform"; native_id: string; environment_id: string | null;
+    display_name: string; observed_at: string; expires_at: string;
+  };
+  export function getInventoryMembers(selectionId: string, recordId: string, cursor?: string, options: { signal?: AbortSignal } = {}) {
+    const params = new URLSearchParams({ selectionId, limit: "50", ...cursor ? { cursor } : {} });
+    return request<{ value: InventoryMember[]; total: number; nextCursor: string | null }>(
+      `/api/agent-inventory/${encodeURIComponent(recordId)}/members?${params}`, { signal: options.signal });
+  }
+  export function getInventoryChildren(selectionId: string, recordId: string, member: InventoryMember, kind: string,
+    cursor?: string, options: { signal?: AbortSignal } = {}) {
+    const params = new URLSearchParams({ selectionId, kind, sourceScopeId: member.source_scope_id,
+      sourceIdentity: member.source_identity, limit: "50", ...cursor ? { cursor } : {} });
+    return request<{ value: { ordinal: number; kind: string; value: string; payload: Record<string, unknown> }[]; total: number; nextCursor: string | null }>(
+      `/api/agent-inventory/${encodeURIComponent(recordId)}/children?${params}`, { signal: options.signal });
+  }
+
+export function getInventorySections(selectionId: string, recordId: string, member: InventoryMember,
+  options: { cursor?: string; signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams({ selectionId, sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity, limit: "50" });
+  if (options.cursor) params.set("cursor", options.cursor);
+  return request<{ value: Array<{ kind: string; total: number }>; nextCursor: string | null }>(
+    `/api/agent-inventory/${encodeURIComponent(recordId)}/sections?${params}`, { signal: options.signal });
+}
 
 export function getAgentResponsibility(query: AgentResponsibilityQuery = {}, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== "") params.set(key, String(value));
   return request<AgentResponsibilityPage>(`/api/agent-responsibility${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function getAgentUsageCandidates(
-  recordId: string,
-  query: { search?: string; offset?: number; limit?: number } = {},
-  options: { signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== "") params.set(key, String(value));
-  }
-  return request<AgentUsageCandidatePage>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-candidates${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function associateAgentUsage(recordId: string, input: AgentUsageAssociationInput) {
-  return request<{ context: AgentUsageContext }>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
-  });
-}
-
-export function removeAgentUsageAssociation(recordId: string, input: AgentUsageAssociationRemoval) {
-  return request<{ context: AgentUsageContext }>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
-    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
-  });
-}
-
-type UnifiedAgentExportInput = { revision: string } & (
-  | { query?: UnifiedAgentExportQuery; recordIds?: never }
-  | { recordIds: string[]; query?: Pick<UnifiedAgentExportQuery, "sortBy" | "sortDirection"> }
-);
-
-export async function downloadUnifiedAgentInventoryCsv(input: UnifiedAgentExportInput) {
-  return requestBlob("/api/agent-inventory/export.csv", {
-    method: "POST",
-    headers: {
-      Accept: "text/csv",
-      "Content-Type": "application/json",
-      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-    },
-    body: JSON.stringify(input),
-  });
-}
-
-export async function downloadPackageInventoryCsv(input: { ids?: string[]; snapshotId: string; filters?: Omit<PackageListQuery, "snapshotId" | "limit" | "offset"> }) {
-  return requestBlob("/api/agents/export.csv", {
-    method: "POST",
-    headers: {
-      Accept: "text/csv",
-      "Content-Type": "application/json",
-      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-    },
-    body: JSON.stringify(input),
-  });
 }
 
 export function startPackageRefresh(mode: "delegated" | "application" = "delegated", options: { idempotencyKey?: string } = {}) {
@@ -648,14 +529,20 @@ export function startPackageRefresh(mode: "delegated" | "application" = "delegat
   });
 }
 
-export function refreshPackageIdentityDetails(
-  ids: string[],
-  mode: "delegated" | "application" = "delegated",
+export async function refreshPackageIdentityDetails(
+  input: { selectionId: string; ids?: string[]; recordIds?: string[] },
+  options: { signal?: AbortSignal } = {},
 ) {
-  return request<PackageRefreshJob>("/api/agents/refresh-jobs", {
+  const job = await request<PackageRefreshJob>("/api/agents/refresh-selection", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids, mode }),
+    body: JSON.stringify(input),
+    signal: options.signal,
+  });
+  if (job.status !== "waiting_authorization") return job;
+  return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}/resume`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: job.tokenMode }),
+    signal: options.signal,
   });
 }
 
@@ -681,30 +568,18 @@ export function getPackageRefreshJobs(mode: "delegated" | "application" = "deleg
   );
 }
 
-export function cancelPackageRefreshJob(id: string, mode: "delegated" | "application" = "delegated") {
-  return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(id)}/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
-  });
-}
+export type PackageRefreshTargetPage = {
+  value: Array<{ id: string; ordinal: number; status: string }>;
+  revision: string;
+  counts: { total: number; filtered: number };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
+};
 
-export function getInventorySourceAwareDetail(input: {
-  snapshotId: string;
-  nativeId: string;
-  environmentId: string | null;
-}, options: { signal?: AbortSignal } = {}) {
-  const params = new URLSearchParams({
-    snapshotId: input.snapshotId,
-    environmentId: input.environmentId ?? "",
-  });
-  return request<InventorySourceAwareDetail>(`/api/inventory/resources/${encodeURIComponent(input.nativeId)}/related?${params}`, { signal: options.signal });
-}
-
-export function getInventoryQuarantineSelection(snapshotId: string, nativeIds: string[], options: { signal?: AbortSignal } = {}) {
-  const params = new URLSearchParams({ snapshotId });
-  for (const id of nativeIds) params.append("selected", id);
-  return request<{ value: PowerPlatformResource[]; snapshot: InventorySnapshot }>(`/api/inventory/quarantine-selection?${params}`, { signal: options.signal });
+export function getPackageRefreshTargets(job: Pick<PackageRefreshJob, "id" | "tokenMode" | "resultRevision">,
+  options: { cursor?: string; signal?: AbortSignal } = {}) {
+  const query = new URLSearchParams({ mode: job.tokenMode, revision: job.resultRevision, limit: "50" });
+  if (options.cursor) query.set("cursor", options.cursor);
+  return request<PackageRefreshTargetPage>(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}/targets?${query}`, { signal: options.signal });
 }
 
 export function refreshInventory(scope: { types?: PowerPlatformResourceType[]; environmentId?: string } = {}) {
@@ -771,174 +646,6 @@ export function reconcileQuarantineJob(id: string) {
   });
 }
 
-export async function downloadInventoryCsv(query: InventoryListQuery, signal?: AbortSignal) {
-  const params = inventorySearchParams(query);
-  return requestBlob(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { signal, headers: { Accept: "text/csv" } });
-}
-
-export function getOfficialUsageAdminState(options: { signal?: AbortSignal } = {}) {
-  return request<OfficialUsageAdminState>("/api/official-usage/admin", { signal: options.signal });
-}
-
-export function getOfficialUsageHistory(
-  query: { limit?: number; offset?: number } = {},
-  options: { signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageHistoryView>(`/api/official-usage/history${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function stageOfficialUsageReport(file: File, input: {
-  bundleId: string;
-  correctionOfSetId?: string;
-  rejectDuplicateKind?: boolean;
-  reportingStart?: string;
-  reportingEnd?: string;
-  periodProvenance?: "source_metadata" | "operator_asserted";
-  sourceAsOf?: string;
-  sourceAsOfProvenance?: "source_metadata" | "operator_asserted";
-  downloadedAt?: string;
-}, options: { signal?: AbortSignal } = {}) {
-  const form = new FormData();
-  form.append("file", file);
-  for (const [key, value] of Object.entries(input)) {
-    if (value !== undefined) form.append(key, String(value));
-  }
-  return request<OfficialUsageStagingPreview>("/api/official-usage/staging", { method: "POST", body: form, signal: options.signal });
-}
-
-export function discardOfficialUsageStaging(id: string) {
-  return request<void>(`/api/official-usage/staging/${encodeURIComponent(id)}`, { method: "DELETE" });
-}
-
-export function previewOfficialUsageBundle(bundleId: string, options: { signal?: AbortSignal } = {}) {
-  return request<OfficialUsageBundlePreview>(`/api/official-usage/bundles/${encodeURIComponent(bundleId)}/preview`, { method: "POST", signal: options.signal });
-}
-
-export function acceptOfficialUsageBundle(preview: OfficialUsageBundlePreview) {
-  return request<{ setId: string; versionId: string; activeRevision: number; complete: boolean; reusedExistingSet?: boolean }>(`/api/official-usage/bundles/${encodeURIComponent(preview.bundleId)}/accept`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }),
-  });
-}
-
-export function previewOfficialUsageSetOperation(setId: string, operation: "select" | "delete") {
-  return request<OfficialUsageConfirmation>(`/api/official-usage/sets/${encodeURIComponent(setId)}/preview`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation }),
-  });
-}
-
-export function confirmOfficialUsageSetOperation(confirmation: OfficialUsageConfirmation) {
-  return request<{ activeSetId: string | null; activeRevision: number }>(`/api/official-usage/confirmations/${encodeURIComponent(confirmation.id)}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(confirmation),
-  });
-}
-
-export function acknowledgeLegacyUsageCleanup(disposition: "reimported" | "discarded") {
-  return request<void>("/api/official-usage/legacy-cleanup-acknowledgements", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ disposition }),
-  });
-}
-
-export type OfficialUsageAgentQuery = {
-  inactiveDays?: number;
-  activityWindowDays?: number;
-  setId?: string;
-  search?: string;
-  creatorType?: string;
-  startDate?: string;
-  endDate?: string;
-  sortBy?: OfficialUsageAggregateView["filters"]["sortBy"];
-  sortDirection?: "asc" | "desc";
-  limit?: number;
-  offset?: number;
-};
-
-export type OfficialUsageOverviewQuery = {
-  scope?: "history" | "selected";
-  search?: string;
-  startDate?: string;
-  endDate?: string;
-  sortBy?: "agentName" | "lastActivity";
-  sortDirection?: "asc" | "desc";
-  limit?: number;
-  offset?: number;
-};
-
-export function getOfficialUsageOverview(query: OfficialUsageOverviewQuery = {}, options: { signal?: AbortSignal } = {}) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageOverviewView>(`/api/official-usage/overview${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function getOfficialUsageAggregate(
-  query: OfficialUsageAgentQuery = {},
-  options: { signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageAggregateView>(`/api/official-usage/aggregate${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export type OfficialUsageUserQuery = {
-  setId?: string;
-  licenseCohort?: "active_without_paid";
-  company?: string;
-  department?: string;
-  agentId?: string;
-  search?: string;
-  creatorType?: string;
-  activity?: "all" | "recent" | "inactive" | "no-activity";
-  responsesOnly?: boolean;
-  inactiveDays?: number;
-  startDate?: string;
-  endDate?: string;
-  lowResponseThreshold?: number;
-  cohort?: "all" | "zero" | "low" | "review";
-  sortBy?: "displayName" | "responses" | "agentsUsed" | "lastActivity";
-  sortDirection?: "asc" | "desc";
-  limit?: number;
-  offset?: number;
-};
-
-export function getOfficialUsageUsers(query: OfficialUsageUserQuery = {}, options: { signal?: AbortSignal } = {}) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageUserView>(`/api/official-usage/users${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function getOfficialUsageAgentDetail(
-  agentId: string,
-  query: {
-    setId?: string;
-    search?: string;
-    sortBy?: "responses" | "displayName";
-    sortDirection?: "asc" | "desc";
-    limit?: number;
-    offset?: number;
-  } = {},
-  options: { signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageAgentDetailView>(`/api/official-usage/agents/${encodeURIComponent(agentId)}${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
-export function getOfficialUsageAgentUsers(
-  query: { agentIds: string[]; setId: string; search?: string; limit?: number; offset?: number },
-  options: { signal?: AbortSignal } = {},
-) {
-  const { agentIds, ...rest } = query;
-  const params = new URLSearchParams({ agentIds: JSON.stringify(agentIds) });
-  for (const [key, value] of Object.entries(rest)) if (value !== undefined) params.set(key, String(value));
-  return request<OfficialUsageAgentUsersView>(`/api/official-usage/agent-users?${params}`, { signal: options.signal });
-}
-
-export function getCopilotUsageUsers(options: { signal?: AbortSignal } = {}) {
-  return request<CopilotUsageUsersResponse>("/api/copilot-usage/users", { signal: options.signal });
-}
-
 export function getDataSyncState(options: { signal?: AbortSignal } = {}) {
   return request<DataSyncState>("/api/data-sync/state", { signal: options.signal });
 }
@@ -961,15 +668,6 @@ export function startDataSync(input: StartDataSyncInput, options: { signal?: Abo
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-    signal: options.signal,
-  });
-}
-
-export function retryDataSyncRun(id: string, sources?: DataSyncSourceId[], options: { signal?: AbortSignal } = {}) {
-  return request<DataSyncRun>(`/api/data-sync/runs/${encodeURIComponent(id)}/retry`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(sources ? { sources } : {}),
     signal: options.signal,
   });
 }
@@ -1132,20 +830,9 @@ export async function downloadDefenderHuntingCsv(id: string, options: AgentHunti
   return requestBlob(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, options), { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
-export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return requestBlob(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { signal, headers: { Accept: "text/csv" } });
-}
-
-function inventorySearchParams(query: InventoryListQuery) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== "") params.set(key, String(value));
-  return params;
-}
-
-export async function getAgentDetails(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}`, { signal: options.signal });
+export async function getAgentDetails(selectionId: string, id: string, options: { signal?: AbortSignal; mode?: "delegated" | "application" } = {}) {
+  const params = new URLSearchParams({ selectionId, ...options.mode ? { mode: options.mode } : {} });
+  return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}/detail?${params}`, { signal: options.signal });
 }
 
 export async function searchDirectoryPrincipals(search: string, limit = 25, options: { signal?: AbortSignal } = {}) {
@@ -1207,21 +894,42 @@ export async function updateAgentsAccess(
   });
 }
 
+export function countPackageMutationSelection(input: { selectionId: string; ids?: string[]; recordIds?: string[] }, options: { signal?: AbortSignal } = {}) {
+  return request<{ count: number }>("/api/agents/mutation-selection", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal: options.signal,
+  });
+}
+
 export function previewPackageMutation(input: {
   action: AuditAction;
-  ids: string[];
+  ids?: string[];
+  recordIds?: string[];
+  selectionId?: string;
   mutationScope: AuditScope;
   accessUpdate?: PackageAccessUpdate;
-}) {
+}, options: { signal?: AbortSignal } = {}) {
   return request<PackageMutationPreview>("/api/agents/mutation-preview", {
     method: "POST",
+    signal: options.signal,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       action: input.action,
       ids: input.ids,
+      recordIds: input.recordIds,
+      selectionId: input.selectionId,
       mutationScope: input.mutationScope,
       ...input.accessUpdate,
     }),
+  });
+}
+
+export function submitSelectedPackageMutation(input: {
+  action: AuditAction; selectionId: string; confirmationHash: string; accessUpdate?: PackageAccessUpdate; ids?: string[]; recordIds?: string[];
+}) {
+  const path = input.accessUpdate ? "access" : input.action;
+  return request<BulkActionJob>(`/api/agents/${path}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selectionId: input.selectionId, ids: input.ids, recordIds: input.recordIds, confirmationHash: input.confirmationHash, ...input.accessUpdate }),
   });
 }
 
@@ -1268,23 +976,18 @@ export function getBulkActionJobs(limit = 20, options: { signal?: AbortSignal } 
   return request<{ value: BulkActionJob[] }>(`/api/agents/bulk-jobs?limit=${limit}`, { signal: options.signal });
 }
 
+export function getBulkActionJobItems(id: string, query: { revision: string; cursor?: string; limit?: number },
+  options: { signal?: AbortSignal } = {}) {
+  const search = new URLSearchParams({ revision: query.revision, limit: String(query.limit ?? 50) });
+  if (query.cursor) search.set("cursor", query.cursor);
+  return request<BulkJobItemPage>(`/api/agents/bulk-jobs/${encodeURIComponent(id)}/items?${search}`, { signal: options.signal });
+}
+
 export function reconcileBulkActionJob(id: string) {
   return request<BulkActionJob & { reconciliation: { attempted: number; failed: number; errors: Array<{ id: string; message: string }> } }>(
     `/api/agents/bulk-jobs/${encodeURIComponent(id)}/reconcile`,
     { method: "POST" },
   );
-}
-
-export async function blockAllAgents(confirmationHash: string) {
-  return request<BulkActionJob>("/api/agents/block-all", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmationHash }),
-  });
-}
-
-export async function unblockAllAgents(confirmationHash: string) {
-  return request<BulkActionJob>("/api/agents/unblock-all", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmationHash }),
-  });
 }
 
 export async function downloadAdministrativeAuditCsv(ids: string[], signal?: AbortSignal) {
@@ -1359,7 +1062,7 @@ function auditContextHeaders(context: AuditRequestContext | undefined) {
     : undefined;
 }
 
-async function request<T>(path: string, init: RequestInit = {}, options: { revalidateSession?: boolean } = {}): Promise<T> {
+export async function request<T>(path: string, init: RequestInit = {}, options: { revalidateSession?: boolean } = {}): Promise<T> {
   return requestBody(path, {
     ...init,
     headers: {
@@ -1451,6 +1154,8 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     {
       requestId: "requestId" in problem && typeof problem.requestId === "string" ? problem.requestId : response.headers.get("X-Request-ID") ?? undefined,
       type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,
+      retryAfterSeconds: /^\d+$/.test(response.headers.get("Retry-After") ?? "")
+        ? Number(response.headers.get("Retry-After")) : undefined,
     },
   );
 }

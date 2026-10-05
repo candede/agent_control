@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { InventoryRefreshTargets } from "./components/InventoryRefreshTargets";
 import {
   ArrowRight,
   Ban,
@@ -19,21 +20,21 @@ import {
   ApiError,
   blockAgent,
   blockAgents,
-  downloadInventoryCsv,
-  downloadUnifiedAgentInventoryCsv,
   getAgentDetails,
   getAgents,
-  getUnifiedAgents,
+  getUnifiedAgentDetail,
   getPackageRefreshJob,
   getPackageRefreshJobs,
   getInventoryRefreshJob,
   getInventoryRefreshJobs,
   getBulkActionJob,
+  getBulkActionJobItems,
   getBulkActionJobs,
   getCurrentUser,
   getWorkbenchMetadata,
   cancelBulkActionJob,
   previewPackageMutation,
+  submitSelectedPackageMutation,
   reconcileBulkActionJob,
   resumeBulkActionJob,
   signOut,
@@ -50,23 +51,25 @@ import {
   updateAgentsAccess,
   type BulkActionJob,
   type BulkActionResult,
+  type BulkPackageResult,
   type AuditAction,
   type CopilotPackage,
   type CopilotPackageDetail,
   type DataSyncSourceId,
   type PackageMutationPreview,
+  countPackageMutationSelection,
   type PackageAccessUpdate,
   type PackageAccessTarget,
-  type PackagePage,
   type PackageRefreshJob,
   type InventoryRefreshJob,
   type PowerPlatformResource,
   type SessionUser,
   type UnifiedAgentInventoryPage,
   type UnifiedAgentRecord,
-  type UnifiedAgentExportQuery,
+  type UnifiedAgentInventoryQuery,
 } from "./api/client";
-import { downloadBlob, isSavedAgentRevision, maximumUnifiedAgentExportRows, selectedAgentExportReferences, type UnifiedAgentExportScope } from "./agentExport";
+import { selectedAgentExportReferences, type UnifiedAgentExportScope } from "./agentExport";
+import { ReportExportButton } from "./components/ReportExportButton";
 import "./App.css";
 import { isJobPolling, jobStatusMessage } from "./jobStatus";
 import { parseBulkRefSearch } from "./bulkRefSearch";
@@ -77,7 +80,7 @@ import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
 import { BackgroundRefreshIndicator } from "./components/BackgroundRefreshIndicator";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentInventoryUnavailable, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 import { inventoryScopeAgentCount } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 import { inventoryAttentionReasons } from "./inventoryVerification";
@@ -103,7 +106,6 @@ import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPa
 import { AgentSyncTools } from "./components/AgentSyncTools";
 import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { SyncHistoryView } from "./components/SyncHistoryView";
-import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
   agentRouteSearch,
   dataSyncRouteSearch,
@@ -134,14 +136,25 @@ const inventoryRefreshPollIntervalMs = 1_000;
 const foregroundJobPollBudgetMs = 5 * 60_000;
 const agentDisplayPageSize = 50;
 
-function withPackageSummaryFallback(
-  detail: CopilotPackageDetail,
-  summary: CopilotPackage,
-): CopilotPackageDetail {
-  return {
-    ...detail,
-    availableTo: detail.availableTo ?? summary.availableTo,
-    deployedTo: detail.deployedTo ?? summary.deployedTo,
+function selectedPackagePreview(record: UnifiedAgentRecord, detail: CopilotPackageDetail, selectionId: string): UnifiedAgentRecord {
+  if (record.packages.some(item => item.id === detail.id)) return record;
+  const source = detail.selectedSource, observed = detail.observation;
+  if (!source || !observed || source.selectionId !== selectionId || source.recordId !== record.id.replace(/^agent:/, "")
+    || source.sourceIdentity !== detail.id || !source.generationId) {
+    throw new Error("The selected published version does not belong to the displayed inventory group.");
+  }
+  const primary = record.packages[0];
+  return { ...record, packages: [...(primary ? [primary] : []), detail], packagesComplete: false,
+    identity: { ...record.identity, packageEvidence: [
+      ...record.identity.packageEvidence.filter(value => value.packageId === primary?.id),
+      { packageId: detail.id, evidence: detail.matchingEvidence ?? [] },
+    ] },
+    observations: { ...record.observations, packageSnapshots: {
+      ...(primary && record.observations.packageSnapshots[primary.id]
+        ? { [primary.id]: record.observations.packageSnapshots[primary.id] } : {}),
+      [detail.id]: { id: source.generationId, snapshotId: source.generationId, scopeKind: "exact",
+        observedAt: observed.observedAt, expiresAt: observed.expiresAt, current: observed.current === true, identityDetails: null },
+    } },
   };
 }
 
@@ -149,10 +162,12 @@ function LinkedAgentJobStatus({
   controlJob,
   error,
   refreshJob,
+  owner,
 }: {
   controlJob?: BulkActionJob;
   error?: string;
   refreshJob?: PackageRefreshJob;
+  owner?: string;
 }) {
   return (
     <>
@@ -163,6 +178,7 @@ function LinkedAgentJobStatus({
           <span>{refreshJob.observedCount}{refreshJob.totalRecords === null ? "" : ` of ${refreshJob.totalRecords}`} packages observed</span>
           <code>{refreshJob.id}</code>
           {refreshJob.message ? <span>{refreshJob.message}</span> : null}
+          {refreshJob.scopeKind === "exact" ? <InventoryRefreshTargets job={refreshJob} owner={owner} /> : null}
         </section>
       ) : null}
       {controlJob ? (
@@ -298,7 +314,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     principalKey: string;
     value: Awaited<ReturnType<typeof getWorkbenchMetadata>>;
   }>();
-  const [legacyUsagePresent, setLegacyUsagePresent] = useState(hasLegacyUsageStorage);
   const capabilityState = useCapabilities(user, sessionEpoch);
   const [trackedJob, setTrackedJob] = useState<BulkActionJob>();
   const [bulkJobCommand, setBulkJobCommand] = useState<BulkJobCommand>();
@@ -308,8 +323,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [linkedJobError, setLinkedJobError] = useState<string>();
   const [authSetup, setAuthSetup] = useState<{ authConfigured: boolean; callback: string; setup?: string }>();
   const [agents, setAgents] = useState<CopilotPackage[]>([]);
-  const [agentPage, setAgentPage] = useState<PackagePage>();
   const [unifiedAgentPage, setUnifiedAgentPage] = useState<UnifiedAgentInventoryPage>();
+  const [inventoryUnavailable, setInventoryUnavailable] = useState<UnifiedAgentInventoryUnavailable>();
+  const inventoryNavigation = useRef<{ key: string; selectionId?: string; cursor?: string }>({ key: "" });
   const [unifiedAgentReadError, setUnifiedAgentReadError] = useState<string>();
   const [selectedUnifiedAgent, setSelectedUnifiedAgent] = useState<UnifiedAgentRecord>();
   const [agentPackageSelection, setAgentPackageSelection] = useState<{ owner: string; recordId: string; packageId: string }>();
@@ -320,9 +336,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [pendingPowerPlatformIds, setPendingPowerPlatformIds] = useState<Set<string>>(() => new Set(initialAgentRoute.selectedPowerPlatformIds));
   const [agentEnvironmentFilter, setAgentEnvironmentFilter] = useState(initialAgentRoute.environmentId);
   const [requestedQuarantineJobId, setRequestedQuarantineJobId] = useState(initialAgentRoute.quarantineJobId);
+  const lastQuarantineResult = useRef<string | undefined>(undefined);
   const [requestedInventorySnapshotId, setRequestedInventorySnapshotId] = useState(initialAgentRoute.inventorySnapshotId);
-  const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number; verificationOnly: boolean }>();
-  const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
   const [signingOut, setSigningOut] = useState(false);
   const [loadingAgents, setLoadingAgents] = useState(false);
@@ -348,6 +363,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(
     () => new Set(initialAgentRoute.selectedIds),
   );
+  const [serverPackageSelection, setServerPackageSelection] = useState<{ id: string; owner: string }>();
+  const [groupPackageSelection, setGroupPackageSelection] = useState<{ id: string; owner: string; groups: Set<string> }>();
+  const [groupTargetCount, setGroupTargetCount] = useState<{ key: string; count?: number; error?: string }>();
+  const [bulkAccessSelection, setBulkAccessSelection] = useState<{ id: string; owner: string; count: number; ids?: string[]; recordIds?: string[] }>();
   const [pendingStoredAgentSelectionCount, setPendingStoredAgentSelectionCount] = useState(
     initialAgentRoute.selectionStorage === "session" ? initialAgentRoute.selectionCount : undefined,
   );
@@ -361,7 +380,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [savedAgentDetail, setAgentDetail] = useState<{
     owner: string;
     recordId?: string;
-    inventoryRevision?: string;
+    selectionId?: string;
     detail: CopilotPackageDetail;
   }>();
   const [agentDetailTab, setAgentDetailTab] = useState(initialAgentRoute.detailTab ?? "identities");
@@ -381,6 +400,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [exportingCsv, setExportingCsv] = useState(false);
   const [agentExportError, setAgentExportError] = useState<{ message: string; reloadRequired: boolean }>();
   const [exportingPowerPlatformCsv, setExportingPowerPlatformCsv] = useState(false);
+  const exportSequence = useRef(0);
+  const [inventoryExport, setInventoryExport] = useState<{
+    sequence: number; owner: string; selectionId: string; kind: "unified_agents" | "power_platform_agents"; ids?: string[];
+  }>();
   const [refreshingPowerPlatformAgents, setRefreshingPowerPlatformAgents] = useState(false);
   const [powerPlatformAgentRefreshJob, setPowerPlatformAgentRefreshJob] = useState<InventoryRefreshJob>();
   const [agentReloadRevision, setAgentReloadRevision] = useState(0);
@@ -397,11 +420,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     listPage?: UnifiedAgentInventoryPage;
     sourcePage?: UnifiedAgentInventoryPage;
   }>();
+  const currentDetailSelection = useRef<string | undefined>(undefined);
+  useEffect(() => { currentDetailSelection.current = unifiedAgentDetailPage?.sourcePage?.selection?.id; },
+    [unifiedAgentDetailPage?.sourcePage?.selection?.id]);
   const agentListRequestId = useRef(0);
   const agentListAbortController = useRef<AbortController | undefined>(undefined);
   const forceCurrentAgentReload = useRef(false);
   const verificationOnlyAgentReload = useRef(false);
   const bulkJobPollRequestId = useRef(0);
+  const bulkJobRequestAbort = useRef<AbortController | undefined>(undefined);
   const bulkJobCommandRequestId = useRef<number | undefined>(undefined);
   const packageRefreshRequestId = useRef(0);
   const inventoryRefreshRequestId = useRef(0);
@@ -421,6 +448,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     : `signed-out:${sessionEpoch}`;
   const agentDetail = savedAgentDetail?.owner === principalKey ? savedAgentDetail.detail : undefined;
   useEffect(() => () => savedQueries.clear(), [principalKey, savedQueries]);
+  useEffect(() => () => { bulkJobRequestAbort.current?.abort(); }, [principalKey]);
   const sessionOwnerRef = useRef<string | undefined>(principalKey);
   const activeViewRef = useRef(activeView);
   const workbenchMetadata = loadedWorkbenchMetadata?.principalKey === principalKey
@@ -484,7 +512,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     agentDetailsCache.current.clear();
     void Promise.resolve().then(() => {
       setAgents([]);
-      setAgentPage(undefined);
       setUnifiedAgentPage(undefined);
       setSelectedUnifiedAgent(undefined);
       setUnifiedAgentDetailPage(undefined);
@@ -590,14 +617,28 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     void Promise.resolve().then(() => {
       if (!active) return;
       const restored = restorePackageSelection(user, pendingStoredAgentSelectionCount);
-      if (restored.status === "restored") {
+      if (restored.status === "restored"
+        && (!restored.inventory || restored.inventory.query === JSON.stringify(currentUnifiedAgentQuery()))) {
         setSelectedAgentIds(new Set(restored.ids));
+        setServerPackageSelection(restored.inventory?.allMatching ? { id: restored.inventory.id, owner: principalKey } : undefined);
+        setGroupPackageSelection(restored.inventory?.groups
+          ? { id: restored.inventory.id, owner: principalKey, groups: new Set(restored.inventory.groups) } : undefined);
+        setGroupTargetCount(undefined);
+        if (restored.inventory) {
+          inventoryNavigation.current = { key: JSON.stringify([principalKey, currentUnifiedAgentQuery()]),
+            selectionId: restored.inventory.id, cursor: restored.inventory.cursor };
+          setAgentPageIndex(restored.inventory.page);
+          forceCurrentAgentReload.current = false;
+        }
         setSelectionRouteNotice({
           tone: "success",
-          text: `${restored.ids.length.toLocaleString()} selected packages were restored from this signed-in browser session.`,
+          text: `${pendingStoredAgentSelectionCount.toLocaleString()} selected packages were restored from this signed-in browser session. Current membership and control authority are checked before any action.`,
         });
       } else {
         setSelectedAgentIds(new Set());
+        setServerPackageSelection(undefined);
+        setGroupPackageSelection(undefined);
+        clearPackageSelection(user);
         setSelectionRouteNotice({
           tone: "error",
           text: `The prior ${pendingStoredAgentSelectionCount.toLocaleString()}-package selection could not be restored. No partial selection was applied.`,
@@ -608,10 +649,23 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     return () => {
       active = false;
     };
-  }, [pendingStoredAgentSelectionCount, user]);
+  }, [pendingStoredAgentSelectionCount, principalKey, user]);
 
   useEffect(() => {
     if (!user || activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
+    if (sessionOwnerRef.current !== principalKey) return;
+    const selectedPin = unifiedAgentPage?.inventoryScope === agentInventoryScope ? unifiedAgentPage.selection.id : undefined;
+    const matching = serverPackageSelection?.owner === principalKey && serverPackageSelection.id === selectedPin;
+    const groups = groupPackageSelection?.owner === principalKey && groupPackageSelection.id === selectedPin
+      ? [...groupPackageSelection.groups] : [];
+    const groupKey = groups.length ? JSON.stringify([principalKey, selectedPin,
+      selectedAgentIds.size ? [...selectedAgentIds] : undefined, groups]) : undefined;
+    const targetCount = matching ? unifiedAgentPage!.counts.packageTargets
+      : groupKey && groupTargetCount?.key === groupKey ? groupTargetCount.count : undefined;
+    const inventory = selectedPin && targetCount !== undefined && targetCount > 0 && (matching || groups.length)
+      ? { id: selectedPin, query: JSON.stringify(currentUnifiedAgentQuery()),
+        cursor: inventoryNavigation.current.cursor, page: agentPageIndex, count: targetCount,
+        ...(matching ? { allMatching: true } : { groups }) } : undefined;
     const search = agentRouteSearch({
       inventoryScope: agentInventoryScope,
       packageType,
@@ -632,6 +686,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       detailId: selectedUnifiedAgent?.id ?? agentDetail?.id ?? requestedAgentDetailId,
       detailTab: agentDetailTab,
       selectedIds: [...selectedAgentIds],
+      ...(inventory ? { selectionStorage: "session" as const, selectionCount: inventory.count } : {}),
       refreshMode: requestedPackageRefreshMode,
       controlJobId: requestedPackageControlJobId,
       source: "all",
@@ -643,7 +698,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     });
     const selectionStored = search.get("selectionState") === "session";
     const selectionSaved = selectionStored && user
-      ? storePackageSelection(user, [...selectedAgentIds])
+      ? storePackageSelection(user, matching ? [] : [...selectedAgentIds], inventory)
       : false;
     const next = workbenchUrl("agents", search);
     if (`${window.location.pathname}${window.location.search}` !== next) {
@@ -653,11 +708,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       void Promise.resolve().then(() => setSelectionRouteNotice({
         tone: selectionSaved ? "success" : "error",
         text: selectionSaved
-          ? `${selectedAgentIds.size.toLocaleString()} selected packages are preserved only for this signed-in browser session and omitted from the URL.`
-          : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
+          ? `${(inventory?.count ?? selectedAgentIds.size).toLocaleString()} selected packages are preserved only for this signed-in browser session and omitted from the URL.`
+          : `The selection remains active, but could not be preserved in browser session storage. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user, groupPackageSelection, groupTargetCount, principalKey, serverPackageSelection, unifiedAgentPage]);
 
   useEffect(() => {
     if (!user || activeView !== "sync") return;
@@ -677,11 +732,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
+      || !unifiedAgentPage?.selection?.id
       || busyAgentId || busyBulkAction
       || (selectedUnifiedAgent?.id === requestedAgentDetailId && unifiedAgentDetailPage?.listPage === unifiedAgentPage)
       || (agentDetail?.id === requestedAgentDetailId && unifiedAgentDetailPage?.listPage === unifiedAgentPage)
       || loadingAgentDetailId === requestedAgentDetailId) return;
-    const unified = findUnifiedAgentRecord(unifiedAgentPage?.value ?? [], requestedAgentDetailId, agentEnvironmentFilter);
+    const unified = findUnifiedAgentRecord(unifiedAgentPage?.value ?? [], requestedAgentDetailId, agentEnvironmentFilter ?? undefined);
     const selectReferencedPackage = (record: UnifiedAgentRecord) => {
       const exact = record.packages.find(item => item.id === requestedAgentDetailId
         || unifiedAgentRecordId({ source: "graph_packages", packageId: item.id }) === requestedAgentDetailId);
@@ -711,49 +767,25 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       const target = parseUnifiedAgentRecordId(requestedAgentDetailId)
         ?? { source: "graph_packages" as const, packageId: requestedAgentDetailId };
       const recordId = unifiedAgentRecordId(target);
-      const resolved = await readSavedQuery(savedQueries, ["unified-agent-detail", principalKey, recordId, agentReloadRevision],
-        signal => getUnifiedAgents({ recordId }, { signal }), controller.signal);
+      const selectionId = unifiedAgentPage?.selection?.id;
+      if (!selectionId) throw new Error("Refresh saved agent inventory before opening this exact agent.");
+      let record = await getUnifiedAgentDetail(selectionId, recordId, { signal: controller.signal });
       if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
-      if (resolved.count > 1 || resolved.value.length > 1) throw new Error("The agent link is ambiguous; select an exact source-qualified agent.");
-      if (resolved.value.length === 1) {
-        const record = resolved.value[0];
-        setUnifiedAgentDetailPage({ listPage: unifiedAgentPage, sourcePage: resolved });
-        setSelectedUnifiedAgent(record);
-        selectReferencedPackage(record);
-        setRequestedAgentDetailId(record.id);
-        setAgentDetail(current => current?.owner === principalKey && current.recordId === record.id
-          && record.packages.some(item => item.id === current.detail.id) ? current : undefined);
-        return;
+      const nativeDetail = target.source === "graph_packages"
+        ? await getAgentDetails(selectionId, target.packageId, { signal: controller.signal }) : undefined;
+      if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
+      if (nativeDetail && target.source === "graph_packages" && nativeDetail.id !== target.packageId) {
+        throw new Error("Saved agent details did not match the requested published version.");
       }
-      if (target.source !== "graph_packages") throw new Error("The exact agent is not available in the current saved inventory. Refresh saved agent inventory and retry.");
-      const detail = await readSavedQuery(savedQueries, ["package-detail", principalKey, target.packageId, agentReloadRevision],
-        signal => getAgentDetails(target.packageId, { signal }), controller.signal);
-      if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
-        if (detail.id !== target.packageId) throw new Error("Saved agent details did not match the requested published version.");
-        const fallbackRecord: UnifiedAgentRecord = {
-          id: unifiedAgentRecordId({ source: "graph_packages", packageId: detail.id }),
-          displayName: detail.displayName,
-          presence: "graph_packages",
-          environmentId: null,
-          packages: [detail],
-          powerPlatformResource: null,
-          identity: {
-            state: "unmatched",
-            evidence: [],
-            packageEvidence: [{ packageId: detail.id, evidence: [] }],
-            reason: "No Power Platform counterpart is available in the current saved unified inventory.",
-          },
-          observations: {
-            graphPackages: null,
-            packageSnapshots: {},
-            powerPlatform: null,
-          },
-        };
-        setUnifiedAgentDetailPage({ listPage: unifiedAgentPage });
-        setSelectedUnifiedAgent(fallbackRecord);
-        setAgentDetail({ owner: principalKey, recordId: fallbackRecord.id, detail });
-        setRequestedAgentDetailId(fallbackRecord.id);
-      }
+      if (nativeDetail) record = selectedPackagePreview(record, nativeDetail, selectionId);
+      setUnifiedAgentDetailPage({ listPage: unifiedAgentPage, sourcePage: unifiedAgentPage });
+      setSelectedUnifiedAgent(record);
+      selectReferencedPackage(record);
+      setRequestedAgentDetailId(record.id);
+      if (nativeDetail) setAgentDetail({ owner: principalKey, recordId: record.id,
+        selectionId: unifiedAgentPage?.selection.id, detail: nativeDetail });
+      else setAgentDetail(current => current?.owner === principalKey && current.recordId === record.id
+        && record.packages.some(item => item.id === current.detail.id) ? current : undefined);
     }).catch(requestError => {
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
         setAgentDetail(undefined);
@@ -844,7 +876,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     getBulkActionJobs(50, { signal: controller.signal }).then(({ value }) => {
       if (controller.signal.aborted || bulkJobPollRequestId.current !== owner) return;
       const retained = value.find(job => isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization"
-        || job.results.some(result => result.status === "inconclusive" && result.reconciliationStatus === "required"));
+        || job.reconciliationRequired > 0);
       if (!retained || resumedBulkJobIds.current.has(retained.id)) return;
       resumedBulkJobIds.current.add(retained.id);
       resumeBulkJob(retained.id);
@@ -915,7 +947,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       agentListAbortController.current?.abort();
       void Promise.resolve().then(() => {
         setAgents([]);
-        setAgentPage(undefined);
         setUnifiedAgentPage(undefined);
         setSelectedUnifiedAgent(undefined);
         setAgentPackageSelection(undefined);
@@ -933,7 +964,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       void Promise.resolve().then(() => {
         clearPackageSelection(user);
         setAgents([]);
-        setAgentPage(undefined);
         setUnifiedAgentPage(undefined);
         setSelectedUnifiedAgent(undefined);
         setUnifiedAgentDetailPage(undefined);
@@ -942,7 +972,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setPackageControlError(undefined);
         setSelectedPowerPlatformTargets(new Map());
         setSelectedPowerPlatformSnapshot(null);
-        setAgentSnapshotId(undefined);
         setSelectedAgentIds(new Set());
         setPendingStoredAgentSelectionCount(undefined);
         setSelectionRouteNotice(undefined);
@@ -960,11 +989,21 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       return;
     }
     if (activeView !== "agents" && activeView !== "sync" && activeView !== "audit") return;
+    if (pendingStoredAgentSelectionCount !== undefined) return;
     const forceCurrentSnapshot = forceCurrentAgentReload.current;
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
+  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
+
+  useEffect(() => {
+    if (!inventoryUnavailable || loadingAgents || !hasRole(user, "AgentControl.Viewer")
+      || !["agents", "sync", "audit"].includes(activeView)) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && navigator.onLine) loadSavedAgents(true);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [activeView, inventoryUnavailable, loadingAgents, user]);
 
 
   useEffect(() => {
@@ -973,18 +1012,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const scopeEpoch = agentScopeEpochRef.current;
     void Promise.all([...pendingPowerPlatformIds].map(async key => {
       try {
-        const known = findUnifiedAgentRecord(unifiedAgentPage.value, key, agentEnvironmentFilter);
+        const known = findUnifiedAgentRecord(unifiedAgentPage.value, key, agentEnvironmentFilter ?? undefined);
         if (known) return { record: known };
         const target = parseUnifiedAgentRecordId(key) ?? (agentEnvironmentFilter
           ? { source: "power_platform" as const, nativeId: key, environmentId: agentEnvironmentFilter }
           : undefined);
         if (!target) throw new Error("An exact environment and native resource identity is required.");
         const recordId = unifiedAgentRecordId(target);
-        const page = await readSavedQuery(savedQueries, ["unified-agent-detail", principalKey, recordId, agentReloadRevision],
-          signal => getUnifiedAgents({ recordId }, { signal }), controller.signal);
-        if (page.count > 1 || page.value.length > 1) throw new Error("The bookmarked agent identity is ambiguous.");
-        if (page.value.length !== 1) throw new Error("The exact agent is unavailable in the current saved inventory.");
-        return { record: page.value[0] };
+        const selectionId = unifiedAgentPage.selection?.id;
+        if (!selectionId) throw new Error("Refresh saved agent inventory before restoring exact targets.");
+        const record = await readSavedQuery(savedQueries, ["unified-agent-detail", principalKey, selectionId, recordId, agentReloadRevision],
+          signal => getUnifiedAgentDetail(selectionId, recordId, { signal }), controller.signal);
+        return { record };
       } catch (requestError) {
         return { error: errorMessage(requestError) };
       }
@@ -1054,12 +1093,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   );
 
   const effectivePlatformFilter = platformFilter;
-  const publisherOptions = agentPage?.facets.publishers ?? [];
-  const hostOptions = agentPage?.facets.hosts ?? [];
-  const availableToOptions = agentPage?.facets.availability ?? [];
-  const platformOptions = unifiedAgentPage?.facets?.platforms ?? agentPage?.facets.platforms ?? [];
-  const agentEnvironmentNames = Object.fromEntries((unifiedAgentPage?.facets?.environments ?? [])
-    .map(option => [option.value.toLowerCase(), option.label]));
+  const publisherOptions: Array<{ value: string; label: string }> = [];
+  const hostOptions: Array<{ value: string; label: string }> = [];
+  const availableToOptions: Array<{ value: string; label: string }> = [];
+  const platformOptions: Array<{ value: string; label: string }> = [];
+  const agentEnvironmentNames = Object.fromEntries((unifiedAgentPage?.value ?? [])
+    .flatMap(record => record.environmentId && record.environment?.displayName
+      ? [[record.environmentId.toLowerCase(), record.environment.displayName]] : []));
 
   const canReadSensitiveUsage = hasRole(user, "AgentControl.Viewer");
   const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
@@ -1193,7 +1233,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setSyncHistoryRevision(revision => revision + 1);
     const changed = new Set(sources);
     if (changed.has("graph_packages") || changed.has("power_platform")) {
-      requestCurrentAgentReload();
+      if (inventoryNavigation.current.selectionId && (agentPageIndex > 0 || selectedAgentIds.size > 0
+        || groupPackageSelection?.owner === principalKey || serverPackageSelection?.owner === principalKey
+        || selectedUnifiedAgent || requestedAgentDetailId)) {
+        agentInventoryQueries.clear();
+        setAgentReloadRevision(revision => revision + 1);
+      } else requestCurrentAgentReload();
     }
     if (changed.has("users")) {
       setCopilotUsersDataRevision(revision => revision + 1);
@@ -1223,6 +1268,27 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   const visibleUnifiedAgentPage = unifiedAgentPage?.inventoryScope === agentInventoryScope
     ? unifiedAgentPage : undefined;
+  const matchingPackageSelection = serverPackageSelection?.owner === principalKey
+    && serverPackageSelection.id === visibleUnifiedAgentPage?.selection?.id ? serverPackageSelection : undefined;
+  const matchingPackageCount = matchingPackageSelection ? visibleUnifiedAgentPage?.counts?.packageTargets ?? 0 : 0;
+  const selectedGroups = groupPackageSelection?.owner === principalKey
+    && groupPackageSelection.id === visibleUnifiedAgentPage?.selection?.id ? groupPackageSelection.groups : new Set<string>();
+  const groupTargetKey = canOperate && selectedGroups.size ? JSON.stringify([principalKey, groupPackageSelection!.id,
+    selectedAgentIds.size ? [...selectedAgentIds] : undefined, [...selectedGroups.keys()]]) : undefined;
+  const groupCount = groupTargetCount?.key === groupTargetKey ? groupTargetCount : undefined;
+  const groupCountPending = Boolean(groupTargetKey && groupCount?.count === undefined);
+  const selectedPackageCount = groupTargetKey ? groupCount?.count ?? 0 : selectedAgentIds.size;
+  useEffect(() => {
+    if (!groupTargetKey) return;
+    const [owner, selectionId, ids, recordIds] = JSON.parse(groupTargetKey) as [string, string, string[] | null, string[]];
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      void countPackageMutationSelection({ selectionId, ids: ids ?? undefined, recordIds }, { signal: abort.signal })
+        .then(result => { if (!abort.signal.aborted && sessionOwnerRef.current === owner) setGroupTargetCount({ key: groupTargetKey, count: result.count }); })
+        .catch(error => { if (!abort.signal.aborted && sessionOwnerRef.current === owner) setGroupTargetCount({ key: groupTargetKey, error: errorMessage(error) }); });
+    }, 100);
+    return () => { clearTimeout(timer); abort.abort(); };
+  }, [groupTargetKey]);
   const displayedUnifiedAgents = visibleUnifiedAgentPage?.value ?? [];
   const inventoryScopeCount = visibleUnifiedAgentPage
     ? inventoryScopeAgentCount(visibleUnifiedAgentPage.summary, agentInventoryScope) : undefined;
@@ -1235,25 +1301,25 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ? `Power Platform collected ${formatRefreshTime(new Date(nativeObservation.observedAt))}`
       : "No saved Power Platform observation. Open Sync to collect it."] : []),
   ].join(" · ");
-  const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
+  const agentInventoryIssueSummary = inventoryUnavailable ? "" : inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const hasActiveAgentFilters =
-    Boolean(packageType) ||
+    packageType !== undefined ||
     endUserAccess !== "all" ||
     reportedUsage !== "all" ||
     agentManagement !== "all" ||
     agentRelevance !== "all" ||
     deferredQuery.trim().length > 0 ||
-    agentEnvironmentFilter.trim().length > 0 ||
+    agentEnvironmentFilter !== undefined ||
     statusFilter !== "all" ||
-    publisherFilter !== "all" ||
-    availableToFilter !== "all" ||
-    hostFilter !== "all" ||
-    effectivePlatformFilter !== "all" ||
+    publisherFilter !== undefined ||
+    availableToFilter !== undefined ||
+    hostFilter !== undefined ||
+    effectivePlatformFilter !== undefined ||
     parseOptionalPositiveInteger(createdWithinDays) !== undefined;
-  const exportableAgentCount = visibleUnifiedAgentPage?.count ?? 0;
-  const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size;
+  const exportableAgentCount = visibleUnifiedAgentPage?.counts.filtered ?? 0;
+  const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size + selectedGroups.size;
   const exportSelectionRestoring = pendingPowerPlatformIds.size > 0 || pendingStoredAgentSelectionCount !== undefined;
-  const agentExportRevision = isSavedAgentRevision(visibleUnifiedAgentPage?.revision) ? visibleUnifiedAgentPage.revision : undefined;
+  const agentExportRevision = visibleUnifiedAgentPage?.selection?.id;
   const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (unifiedAgentPage && !agentExportRevision));
   const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
     record => record.observations.powerPlatform,
@@ -1278,6 +1344,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function clearAgentState() {
+    setInventoryUnavailable(undefined);
+    setInventoryExport(undefined);
+    setServerPackageSelection(undefined);
+    setBulkAccessSelection(undefined);
+    inventoryNavigation.current = { key: "" };
+    setGroupPackageSelection(undefined);
+    setGroupTargetCount(undefined);
     agentScopeEpochRef.current += 1;
     setAgentScopeEpoch(agentScopeEpochRef.current);
     agentDetailRequestId.current += 1;
@@ -1301,7 +1374,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     clearActiveBulkJobId();
     clearPackageSelection(user);
     setAgents([]);
-    setAgentPage(undefined);
     setUnifiedAgentPage(undefined);
     setSelectedUnifiedAgent(undefined);
     setUnifiedAgentDetailPage(undefined);
@@ -1313,8 +1385,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setPendingPowerPlatformIds(new Set());
     setRequestedInventorySnapshotId(undefined);
     setRequestedQuarantineJobId(undefined);
-    setSavedAgentPageOwner(undefined);
-    setAgentSnapshotId(undefined);
     setSelectedAgentIds(new Set());
     setPendingStoredAgentSelectionCount(undefined);
     setSelectionRouteNotice(undefined);
@@ -1347,6 +1417,37 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLinkedJobError(undefined);
   }
 
+  function invalidateAgentSelection() {
+    setInventoryUnavailable(undefined);
+    agentListRequestId.current += 1;
+    agentListAbortController.current?.abort();
+    agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
+    agentInventoryQueries.clear();
+    agentDetailsCache.current.clear();
+    inventoryNavigation.current = { key: "" };
+    setInventoryExport(undefined);
+    setServerPackageSelection(undefined);
+    setGroupPackageSelection(undefined);
+    setGroupTargetCount(undefined);
+    setUnifiedAgentPage(undefined);
+    setAgents([]);
+    setSelectedUnifiedAgent(undefined);
+    setUnifiedAgentDetailPage(undefined);
+    setAgentPackageSelection(undefined);
+    setAgentDetail(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setSelectedAgentIds(new Set());
+    setSelectedPowerPlatformTargets(new Map());
+    setSelectedPowerPlatformSnapshot(null);
+    setBulkConfirmation(undefined);
+    setBulkAccessSelection(undefined);
+    setBulkAccessAgentIds(undefined);
+    setLoadingAgents(false);
+    clearPackageSelection(user);
+    setUnifiedAgentReadError("The saved inventory selection is no longer available. Reload saved inventory.");
+  }
+
   async function loadSession() {
     const requestId = ++sessionRequestId.current;
     sessionAbortController.current?.abort();
@@ -1376,20 +1477,20 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
   }
 
-  function currentUnifiedAgentQuery(): UnifiedAgentExportQuery {
+  function currentUnifiedAgentQuery(): UnifiedAgentInventoryQuery {
     return {
-      ...(packageType ? { type: packageType } : {}),
+      ...(packageType !== undefined ? { type: packageType } : {}),
       ...(endUserAccess !== "all" ? { endUserAccess } : {}),
       ...(reportedUsage !== "all" ? { reportedUsage } : {}),
       ...(agentManagement !== "all" ? { management: agentManagement } : {}),
       ...(agentRelevance !== "all" ? { relevance: agentRelevance } : {}),
       ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-      ...(agentEnvironmentFilter.trim() ? { environmentId: agentEnvironmentFilter.trim() } : {}),
+      ...(agentEnvironmentFilter !== undefined ? { environmentId: agentEnvironmentFilter } : {}),
       ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-      ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
-      ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
-      ...(hostFilter === "all" ? {} : { host: hostFilter }),
-      ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+      ...(publisherFilter === undefined ? {} : { publisher: publisherFilter }),
+      ...(availableToFilter === undefined ? {} : { availableTo: availableToFilter }),
+      ...(hostFilter === undefined ? {} : { host: hostFilter }),
+      ...(effectivePlatformFilter === undefined ? {} : { platform: effectivePlatformFilter }),
       ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
       inventoryScope: agentInventoryScope,
       sortBy: agentSortBy,
@@ -1399,7 +1500,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   async function loadAgents(forceCurrentSnapshot = false) {
     if (forceCurrentSnapshot) agentInventoryQueries.clear();
-    const verificationOnly = verificationOnlyAgentReload.current;
     verificationOnlyAgentReload.current = false;
     const requestId = ++agentListRequestId.current;
     agentListAbortController.current?.abort();
@@ -1409,33 +1509,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
 
     try {
-      const packageQuery = {
-          ...(!forceCurrentSnapshot && agentSnapshotId && savedAgentPageOwner?.principalKey === principalKey ? { snapshotId: agentSnapshotId } : {}),
-          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
-          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
-          ...(hostFilter === "all" ? {} : { host: hostFilter }),
-          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
-          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-          sortBy: agentSortBy === "publisher" || agentSortBy === "lastModifiedAt" ? agentSortBy : "displayName" as const,
-          sortDirection: agentSortDirection,
-          limit: agentDisplayPageSize,
-          offset: 0,
-      };
-      const [response, unifiedResponse, inventoryRefreshJobs] = await Promise.all([
-        readSavedQuery(savedQueries, ["package-summaries", principalKey, packageQuery, agentReloadRevision],
-          signal => getAgents(packageQuery, { signal }), controller.signal).catch(requestError => {
-          if (isAccessDenied(requestError)) throw requestError;
-          if (requestId === agentListRequestId.current && !controller.signal.aborted) {
-            setError(`Saved package summaries are unavailable: ${errorMessage(requestError)}`);
-          }
-          return undefined;
-        }),
+      const inventoryKey = JSON.stringify([principalKey, currentUnifiedAgentQuery()]);
+      if (forceCurrentSnapshot || inventoryNavigation.current.key !== inventoryKey) {
+        inventoryNavigation.current = { key: inventoryKey };
+        if (agentPageIndex !== 0) setAgentPageIndex(0);
+      }
+      const [unifiedResponse, inventoryRefreshJobs] = await Promise.all([
         agentInventoryQueries.read(principalKey, {
           ...currentUnifiedAgentQuery(),
           limit: agentDisplayPageSize,
-          offset: agentPageIndex * agentDisplayPageSize,
+          selectionId: inventoryNavigation.current.selectionId,
+          cursor: inventoryNavigation.current.cursor,
         }, controller.signal),
         readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision],
           signal => getInventoryRefreshJobs({ signal }), controller.signal).catch(requestError => {
@@ -1447,14 +1531,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         }),
       ]);
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
-      const lastPage = Math.max(Math.ceil(unifiedResponse.count / agentDisplayPageSize) - 1, 0);
-      if (agentPageIndex > lastPage) {
-        if (verificationOnly) verificationOnlyAgentReload.current = true;
-        setAgentPageIndex(lastPage);
+      if ("state" in unifiedResponse) {
+        invalidateAgentSelection();
+        setInventoryUnavailable(unifiedResponse);
+        setUnifiedAgentReadError(undefined);
+        setAgentExportError(undefined);
+        setLastAgentListRefreshAt(undefined);
+        setPackageSnapshotExpiresAt(undefined);
         return;
       }
-      setAgents(response?.value ?? []);
-      setAgentPage(response);
+      setInventoryUnavailable(undefined);
+      inventoryNavigation.current.selectionId = unifiedResponse.selection.id;
+      setAgents(unifiedResponse.value.flatMap(record => record.packages));
       setUnifiedAgentPage(unifiedResponse);
       setUnifiedAgentReadError(undefined);
       setAgentExportError(current => current === agentExportError ? undefined : current);
@@ -1466,14 +1554,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setPowerPlatformAgentRefreshJob(current =>
           current === powerPlatformAgentRefreshJob ? latestPowerPlatformAgentJob : current);
       }
-      setSavedAgentPageOwner({ principalKey, requestId, verificationOnly });
-      setAgentSnapshotId(response?.snapshot?.id);
-      setLastAgentListRefreshAt(response?.snapshot ? new Date(response.snapshot.observedAt) : undefined);
-      setPackageSnapshotExpiresAt(response?.snapshot ? new Date(response.snapshot.expiresAt) : undefined);
+      const graph = unifiedResponse.sources.graphPackages.observation;
+      setLastAgentListRefreshAt(graph ? new Date(graph.observedAt) : undefined);
+      setPackageSnapshotExpiresAt(graph ? new Date(graph.expiresAt) : undefined);
       agentDetailsCache.current.clear();
     } catch (requestError) {
       if (requestId === agentListRequestId.current && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+        setInventoryUnavailable(undefined);
         if (isAccessDenied(requestError)) clearAgentState();
+        else if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
+          invalidateAgentSelection();
+        }
         setError(errorMessage(requestError));
         setUnifiedAgentReadError(errorMessage(requestError));
       }
@@ -1520,14 +1611,19 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   async function handleRefreshMatchingDetails() {
     if (!isCurrentAgentScope()) return;
-    const ids = [...selectedAgentIds];
-    if (ids.length < 1 || ids.length > 100 || !user || sessionRevalidationInFlight.current) return;
+    const count = matchingPackageSelection ? matchingPackageCount : selectedPackageCount;
+    const selectionId = visibleUnifiedAgentPage?.selection?.id;
+    if (!selectionId || groupCountPending || count < 1 || count > 5000 || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
     setRefreshingAgents(true);
     setError(undefined);
     try {
-      let job = await refreshPackageIdentityDetails(ids);
+      let job = await refreshPackageIdentityDetails({ selectionId,
+        ...matchingPackageSelection ? {} : {
+          ids: selectedAgentIds.size ? [...selectedAgentIds] : undefined,
+          recordIds: selectedGroups.size ? [...selectedGroups] : undefined,
+        } });
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       handleSyncRunsChanged();
       setLinkedPackageRefreshJob(job);
@@ -1603,7 +1699,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setQuery(nextQuery);
   }
 
-  async function handleViewAgentDetails(agent: CopilotPackage) {
+  async function handleViewAgentDetails(agent: Pick<CopilotPackage, "id">) {
     if (!isCurrentAgentScope()) return;
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
@@ -1611,7 +1707,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     agentDetailAbortController.current = controller;
     const owner = principalKey;
     const recordId = selectedUnifiedAgent?.id;
-    const inventoryRevision = unifiedAgentDetailPage?.sourcePage?.revision;
+    const selectionId = unifiedAgentDetailPage?.sourcePage?.selection?.id;
 
     setAgentDetailError(undefined);
     setAgentDetail(current => current?.owner === owner && current.recordId === recordId
@@ -1619,17 +1715,22 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLoadingAgentDetailId(agent.id);
 
     try {
-      const savedDetail = await readSavedQuery(savedQueries, ["package-detail", principalKey, agent.id, agentReloadRevision],
-        signal => getAgentDetails(agent.id, { signal }), controller.signal);
+      if (!selectionId) throw new Error("Reload inventory before opening saved package details.");
+      const savedDetail = await getAgentDetails(selectionId, agent.id, { signal: controller.signal });
       if (savedDetail.id !== agent.id) throw new Error("Saved agent details did not match the requested published version.");
-      const detail = withPackageSummaryFallback(
-        savedDetail,
-        agent,
-      );
+      const detail = savedDetail;
 
-      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal) && currentDetailSelection.current === selectionId) {
+        if (selectedUnifiedAgent && !selectedUnifiedAgent.packages.some(item => item.id === agent.id)) {
+          const projected = selectedPackagePreview(selectedUnifiedAgent, detail, selectionId);
+          setSelectedUnifiedAgent(current => current && current.id === recordId ? { ...current,
+            packages: projected.packages, packagesComplete: false, identity: projected.identity,
+            observations: projected.observations } : current);
+        }
+        if (recordId) setAgentPackageSelection({ owner, recordId, packageId: agent.id });
+        agentDetailsCache.current.clear();
         agentDetailsCache.current.set(agent.id, detail);
-        setAgentDetail({ owner, recordId, inventoryRevision, detail });
+        setAgentDetail({ owner, recordId, selectionId, detail });
       }
 
     } catch (requestError) {
@@ -1664,18 +1765,24 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!hasRole(user, "AgentControl.Admin") || !providerActionAllowed(access, true, Date.now())) {
       throw new Error("Current Admin access and package access-management authorization are required.");
     }
+    const controller = new AbortController();
+    agentDetailAbortController.current = controller;
     let job = await startExactPackageRefresh(id, "delegated");
     if (agentDetailRequestId.current !== requestId) return;
     while (job.status === "running") {
       await wait(packageRefreshPollIntervalMs);
       if (agentDetailRequestId.current !== requestId) return;
-      job = await getPackageRefreshJob(job.id, job.tokenMode);
+      job = await getPackageRefreshJob(job.id, job.tokenMode, { signal: controller.signal });
       if (agentDetailRequestId.current !== requestId) return;
     }
     if (job.status !== "succeeded") throw new Error(job.message ?? "Microsoft Graph could not load current package access. Check delegated permissions and retry.");
-    const detail = await getAgentDetails(id);
+    const page = await getAgents({ recordId: `graph_packages:${encodeURIComponent(id)}`, limit: 1 }, { signal: controller.signal });
+    if (agentDetailRequestId.current !== requestId) return;
+    const detail = await getAgentDetails(page.selection.id, id, { signal: controller.signal });
     if (agentDetailRequestId.current !== requestId) return;
     if (detail.id !== id) throw new Error("Current access details did not match the requested published version.");
+    if (detail.accessReadError) throw new Error(detail.accessReadError);
+    agentDetailsCache.current.clear();
     agentDetailsCache.current.set(id, detail);
     return detail;
   }
@@ -1699,7 +1806,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setSingleAccessAgentDetail(detail);
         if (agentDetail?.id === agent.id) setAgentDetail({
           owner: principalKey, recordId: selectedUnifiedAgent?.id,
-          inventoryRevision: unifiedAgentDetailPage?.sourcePage?.revision, detail,
+          selectionId: unifiedAgentDetailPage?.sourcePage?.selection.id, detail,
         });
       }
     } catch (requestError) {
@@ -1798,7 +1905,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setExportChoiceOpen(true);
   }
 
-  async function handleExportCsv(scope: UnifiedAgentExportScope) {
+  function handleExportCsv(scope: UnifiedAgentExportScope) {
     if (exportingCsv) return;
     const owner = principalKey;
     if (!ownsAgentScope(owner) || !hasRole(user, "AgentControl.Viewer")) return;
@@ -1810,68 +1917,31 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setAgentExportError({ message: "Wait for the current saved agent filters to finish loading, then try again.", reloadRequired: false });
       return;
     }
-    if (scope === "matching" && (exportableAgentCount === 0 || exportableAgentCount > maximumUnifiedAgentExportRows)) {
-      setAgentExportError({ message: `Choose filters matching 1-${maximumUnifiedAgentExportRows.toLocaleString()} agents before exporting.`, reloadRequired: false });
+    if (scope === "matching" && exportableAgentCount === 0) {
+      setAgentExportError({ message: "No agents match the current saved filters.", reloadRequired: false });
       return;
     }
-    if (scope === "selected" && (selectedExportTargetCount === 0 || exportSelectionRestoring)) {
-      setAgentExportError({ message: "Select agents and wait for saved selections to finish restoring before exporting the selection.", reloadRequired: false });
+    if (scope === "selected" && (selectedExportTargetCount === 0 || selectedExportTargetCount > 5000 || exportSelectionRestoring)) {
+      setAgentExportError({ message: "Select 1–5,000 exact references and wait for saved selections to finish restoring.", reloadRequired: false });
       return;
     }
 
     setExportChoiceOpen(false);
     setAgentExportError(undefined);
-    setExportingCsv(true);
-    try {
-      const query = currentUnifiedAgentQuery();
-      const blob = await downloadUnifiedAgentInventoryCsv(scope === "selected" ? {
-        revision: agentExportRevision,
-        recordIds: selectedAgentExportReferences(unifiedAgentPage?.value ?? [], selectedAgentIds, selectedPowerPlatformTargets.keys()),
-        query: { sortBy: query.sortBy, sortDirection: query.sortDirection },
-      } : { revision: agentExportRevision, query });
-      if (!ownsAgentScope(owner)) return;
-      downloadBlob("agents.csv", blob);
-    } catch (requestError) {
-      if (ownsAgentScope(owner)) {
-        const invalidated = requestError instanceof ApiError && requestError.status === 409;
-        setAgentExportError({
-          message: invalidated
-            ? `The saved agent inventory changed or a selected reference is no longer available. Reload the saved inventory, review your selection, and try again. ${errorMessage(requestError)}`
-            : errorMessage(requestError),
-          reloadRequired: invalidated,
-        });
-      }
-    } finally {
-      if (ownsAgentScope(owner)) setExportingCsv(false);
-    }
+    setInventoryExport({ sequence: ++exportSequence.current, owner, selectionId: agentExportRevision, kind: "unified_agents",
+      ids: scope === "selected" ? [...new Set([...selectedAgentExportReferences(unifiedAgentPage?.value ?? [], selectedAgentIds, selectedPowerPlatformTargets.keys()),
+        ...selectedGroups.keys()])] : undefined });
   }
 
-  async function handleExportPowerPlatformAgentCsv() {
+  function handleExportPowerPlatformAgentCsv() {
     if (!isCurrentAgentScope()) return;
-    const snapshotId = unifiedAgentPage?.sources.powerPlatform.observation?.snapshotId;
-    if (!snapshotId || exportingPowerPlatformCsv) {
+    if (!agentExportRevision || agentExportNeedsReload || exportingPowerPlatformCsv) {
       return;
     }
 
     setExportChoiceOpen(false);
     setError(undefined);
-    setExportingPowerPlatformCsv(true);
-    const owner = principalKey;
-    try {
-      const blob = await downloadInventoryCsv({
-        snapshotId,
-        search: deferredQuery.trim() || undefined,
-        environmentId: agentEnvironmentFilter.trim() || undefined,
-      });
-      if (!ownsAgentScope(owner)) return;
-      downloadBlob(`power-platform-agent-inventory-${snapshotId}.csv`, blob);
-    } catch (caught) {
-      if (ownsAgentScope(owner)) {
-        setError(caught instanceof Error ? caught.message : "Unable to export Power Platform agent inventory.");
-      }
-    } finally {
-      if (ownsAgentScope(owner)) setExportingPowerPlatformCsv(false);
-    }
+    setInventoryExport({ sequence: ++exportSequence.current, owner: principalKey, selectionId: agentExportRevision, kind: "power_platform_agents" });
   }
 
   async function handleRefreshPowerPlatformAgents() {
@@ -1937,25 +2007,30 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   async function requestBulkAction(targetBlockedState: boolean) {
-    if (!isCurrentAgentScope()) return;
+    if (!isCurrentAgentScope() || groupCountPending || matchingPackageSelection && (loadingAgents || deferredQuery !== query)) return;
     const label = targetBlockedState ? "block" : "unblock";
     const scope = [...selectedAgentIds];
 
-    if (scope.length === 0) {
+    if (scope.length === 0 && !selectedGroups.size && !matchingPackageSelection) {
       setError("Select one or more agents before running a bulk action.");
       return;
     }
 
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
+    const controller = new AbortController();
+    agentDetailAbortController.current = controller;
     const owner = principalKey;
     if (loadingAgentDetailId) setRequestedAgentDetailId(undefined);
     setLoadingAgentDetailId(undefined);
     setError(undefined);
     try {
-      const preview = await previewPackageMutation({ action: label, ids: scope, mutationScope: "bulk" });
+      const targets = matchingPackageSelection ? { selectionId: matchingPackageSelection.id }
+        : selectedGroups.size ? { ids: scope.length ? scope : undefined, recordIds: [...selectedGroups.keys()] } : { ids: scope };
+      const preview = await previewPackageMutation({ action: label, ...targets, mutationScope: "bulk" }, { signal: controller.signal });
       if (!ownsAgentFlowRequest(requestId, owner)) return;
-      setBulkConfirmation({ action: label, ids: scope, mutationScope: "bulk", preview });
+      if (selectedGroups.size && !preview.selectionId) throw new Error("The server did not return the reviewed group selection.");
+      setBulkConfirmation({ action: label, ...targets, ids: scope, selectionId: selectedGroups.size ? preview.selectionId : targets.selectionId, mutationScope: "bulk", preview });
     } catch (requestError) {
       if (ownsAgentFlowRequest(requestId, owner)) setError(errorMessage(requestError));
     }
@@ -1963,18 +2038,20 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
     if (!isCurrentAgentScope()) return;
-    const { action: label, ids, mutationScope, preview, accessUpdate } = confirmation;
+    const { action: label, ids, recordIds, selectionId, mutationScope, preview, accessUpdate } = confirmation;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
 
     setBulkConfirmation(undefined);
+    setServerPackageSelection(undefined);
+    setGroupPackageSelection(undefined);
 
     clearTrackedJob();
     setBusyBulkAction(label);
     setBulkProgress(accessUpdate ? {
       action: label as "update-availability" | "update-installation",
       accessUpdate,
-      total: ids.length,
+      total: preview.summary.targetCount,
       completed: 0,
       succeeded: 0,
       failed: 0,
@@ -1982,7 +2059,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     } : {
       action: label as "block" | "unblock",
       targetBlockedState: label === "block",
-      total: ids.length,
+      total: preview.summary.targetCount,
       completed: 0,
       succeeded: 0,
       failed: 0,
@@ -1993,7 +2070,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     try {
       let job: BulkActionJob;
-      if (accessUpdate) {
+      if (selectionId) {
+        job = await submitSelectedPackageMutation({ action: label, selectionId, accessUpdate,
+          ids: recordIds && ids.length ? ids : undefined, recordIds, confirmationHash: preview.confirmationHash });
+      } else if (accessUpdate) {
         if (mutationScope === "single") {
           if (accessUpdate.mode !== "replace") throw new Error("Single-agent access updates must replace assignments.");
           job = await updateAgentAccess(ids[0], accessUpdate, preview.confirmationHash);
@@ -2025,13 +2105,24 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function requestBulkAccessUpdate() {
-    if (!isCurrentAgentScope()) return;
+    if (!isCurrentAgentScope() || groupCountPending || matchingPackageSelection && (loadingAgents || deferredQuery !== query)) return;
+    if (matchingPackageSelection || selectedGroups.size) {
+      const count = matchingPackageSelection ? matchingPackageCount : selectedPackageCount;
+      if (count > 100) { setError("Access changes support at most 100 package targets. Narrow the server filters."); return; }
+      setBulkAccessSelection(matchingPackageSelection ? { ...matchingPackageSelection, count } : {
+        id: visibleUnifiedAgentPage!.selection!.id, owner: principalKey, count,
+        ids: selectedAgentIds.size ? [...selectedAgentIds] : undefined, recordIds: [...selectedGroups.keys()],
+      });
+      setBulkAccessAgentIds([]);
+      return;
+    }
     if (selectedAgentIds.size === 0) {
       setError("Select one or more agents before managing access.");
       return;
     }
 
     setError(undefined);
+    setBulkAccessSelection(undefined);
     setBulkAccessAgentIds([...selectedAgentIds]);
   }
 
@@ -2039,7 +2130,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!isCurrentAgentScope()) return;
     const ids = bulkAccessAgentIds ?? [];
 
-    if (ids.length === 0) {
+    if (ids.length === 0 && (!bulkAccessSelection || bulkAccessSelection.owner !== principalKey
+      || bulkAccessSelection.id !== (bulkAccessSelection.recordIds ? visibleUnifiedAgentPage?.selection?.id : matchingPackageSelection?.id))) {
       throw new Error("The selected agents are no longer available.");
     }
 
@@ -2048,12 +2140,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const requestId = ++agentDetailRequestId.current;
 
     try {
-      for (const id of ids) {
-        if (!await refreshAccessDetails(id, requestId)) return;
-      }
-      await requestAccessConfirmation(ids, update, "bulk");
+      if (bulkAccessSelection) {
+        const action = update.target === "availability" ? "update-availability" : "update-installation";
+        const { recordIds, ids: exactIds } = bulkAccessSelection;
+        const preview = await previewPackageMutation({ action, selectionId: bulkAccessSelection.id, recordIds, ids: exactIds, mutationScope: "bulk", accessUpdate: update });
+        if (agentDetailRequestId.current !== requestId) return;
+        setBulkConfirmation({ action, ids: exactIds ?? [], recordIds, selectionId: bulkAccessSelection.id, mutationScope: "bulk", accessUpdate: update, preview });
+      } else await requestAccessConfirmation(ids, update, "bulk");
       if (agentDetailRequestId.current !== requestId) return;
       setBulkAccessAgentIds(undefined);
+      setBulkAccessSelection(undefined);
     } catch (requestError) {
       if (agentDetailRequestId.current !== requestId) return;
       setError(errorMessage(requestError));
@@ -2066,11 +2162,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const requestId = bulkJobPollRequestId.current + 1;
     bulkJobPollRequestId.current = requestId;
     const owner = principalKey;
+    bulkJobRequestAbort.current?.abort();
+    const controller = new AbortController();
+    bulkJobRequestAbort.current = controller;
     let keepStored = true;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
 
     try {
-      let job = initialJob ?? (await getBulkActionJob(jobId));
+      let job = initialJob ?? (await getBulkActionJob(jobId, { signal: controller.signal }));
       if (!ownsBulkJobRequest(requestId, owner)) return;
       setTrackedJob(job);
 
@@ -2087,7 +2186,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         if (!ownsBulkJobRequest(requestId, owner)) {
           return;
         }
-        job = await getBulkActionJob(jobId);
+        job = await getBulkActionJob(jobId, { signal: controller.signal });
 
         if (!ownsBulkJobRequest(requestId, owner)) {
           return;
@@ -2106,9 +2205,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
 
       keepStored = job.canResume || job.status === "waiting_authorization";
-      if (job.result) {
-        if (persist) applyBulkActionResult(job.result);
-        else setBulkResult(job.result);
+      if (["succeeded", "failed", "cancelled", "partial"].includes(job.status)) {
+        const page = await getBulkActionJobItems(job.id, { revision: job.resultRevision }, { signal: controller.signal });
+        if (!ownsBulkJobRequest(requestId, owner)) return;
+        const result: BulkActionResult = { ...job, results: page.value.filter((item): item is BulkPackageResult =>
+          item.status !== "queued" && item.status !== "running") };
+        if (persist) applyBulkActionResult(result);
+        else setBulkResult(result);
       }
       const message = jobStatusMessage(job.status);
       if (packageId && message) setPackageControlError({ packageId, message });
@@ -2122,6 +2225,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         else setLinkedJobError(`The exact package control job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
       }
     } finally {
+      if (bulkJobRequestAbort.current === controller) bulkJobRequestAbort.current = undefined;
       if (ownsBulkJobRequest(requestId, owner)) {
         setBusyBulkAction(undefined);
         setBulkProgress(undefined);
@@ -2189,11 +2293,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setSelectionRouteNotice(undefined);
     setSelectedAgentIds(
       new Set(
-        result.results
+        (result.total > result.results.length ? [] : result.results)
           .filter((result) => result.status === "failed")
           .map((result) => result.id),
       ),
     );
+    if (result.total > result.results.length) {
+      setSelectionRouteNotice({ tone: "success", text: "Task results are paged. Review the result pages before selecting new work." });
+      agentDetailsCache.current.clear();
+      agentInventoryQueries.clear();
+      requestCurrentAgentReload();
+    }
     if (result.results.some(item => item.status === "succeeded" || item.status === "skipped")) requestCurrentAgentReload();
   }
 
@@ -2216,7 +2326,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const reconciled = await reconcileBulkActionJob(trackedJob.id);
         if (!ownsBulkJobRequest(requestId, owner)) return;
         setTrackedJob(reconciled);
-        if (reconciled.result) setBulkResult(reconciled.result);
+        setBulkResult(undefined);
         if (reconciled.reconciliation.attempted > reconciled.reconciliation.failed) requestCurrentAgentReload();
         if (reconciled.reconciliation.failed) {
           setBulkJobError(`${reconciled.reconciliation.failed} provider read${reconciled.reconciliation.failed === 1 ? "" : "s"} could not be reconciled.`);
@@ -2266,19 +2376,23 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
+    agentDetailAbortController.current?.abort();
+    agentDetailRequestId.current += 1;
+    setBulkConfirmation(undefined);
+    setServerPackageSelection(undefined);
     if (values.search !== undefined) handleSearchQueryChange(values.search);
-    if (values.packageType !== undefined) setPackageType(values.packageType);
+    if ("packageType" in values) setPackageType(values.packageType);
     if (values.endUserAccess !== undefined) setEndUserAccess(values.endUserAccess);
     if (values.reportedUsage !== undefined) setReportedUsage(values.reportedUsage);
     if (values.management !== undefined) setAgentManagement(values.management);
     if (values.relevance !== undefined) setAgentRelevance(values.relevance);
-    if (values.platform !== undefined) setPlatformFilter(values.platform);
-    if (values.availability !== undefined) setAvailableToFilter(values.availability);
-    if (values.host !== undefined) setHostFilter(values.host);
+    if ("platform" in values) setPlatformFilter(values.platform);
+    if ("availability" in values) setAvailableToFilter(values.availability);
+    if ("host" in values) setHostFilter(values.host);
     if (values.status !== undefined) setStatusFilter(values.status);
     if (values.createdWithinDays !== undefined) setCreatedWithinDays(values.createdWithinDays);
-    if (values.publisher !== undefined) setPublisherFilter(values.publisher);
-    if (values.environmentId !== undefined) {
+    if ("publisher" in values) setPublisherFilter(values.publisher);
+    if ("environmentId" in values) {
       setAgentEnvironmentFilter(values.environmentId);
       resetPowerPlatformSelection();
     }
@@ -2288,19 +2402,23 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleClearAgentFilters() {
-    setPackageType("");
+    agentDetailAbortController.current?.abort();
+    agentDetailRequestId.current += 1;
+    setBulkConfirmation(undefined);
+    setServerPackageSelection(undefined);
+    setPackageType(undefined);
     setEndUserAccess("all");
     setReportedUsage("all");
     setAgentManagement("all");
     setAgentRelevance("all");
     handleSearchQueryChange("");
     resetPowerPlatformSelection();
-    setAgentEnvironmentFilter("");
+    setAgentEnvironmentFilter(undefined);
     setStatusFilter("all");
-    setPublisherFilter("all");
-    setAvailableToFilter("all");
-    setHostFilter("all");
-    setPlatformFilter("all");
+    setPublisherFilter(undefined);
+    setAvailableToFilter(undefined);
+    setHostFilter(undefined);
+    setPlatformFilter(undefined);
     setCreatedWithinDays("");
     setAgentPageIndex(0);
   }
@@ -2406,14 +2524,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function toggleUnifiedAgentSelection(record: UnifiedAgentRecord) {
+    setServerPackageSelection(undefined);
     setSelectionRouteNotice(undefined);
     const resource = record.powerPlatformResource;
     const observation = record.observations.powerPlatform;
     const nativeKey = resource ? quarantineTargetKey(resource) : undefined;
     const canSelectQuarantine = Boolean(canOperate && resource && !quarantineTargetReason(resource, observation));
     const quarantineSelected = nativeKey !== undefined && selectedPowerPlatformTargets.has(nativeKey);
-    const ids = record.packages.map(item => item.id);
-    const allSelected = ids.every(id => selectedAgentIds.has(id))
+    const grouped = record.packagesComplete === false;
+    const ids = grouped ? [] : record.packages.map(item => item.id);
+    const allSelected = (grouped ? selectedGroups.has(record.id) : ids.every(id => selectedAgentIds.has(id)))
       && (!canSelectQuarantine || quarantineSelected);
     if (!allSelected && canSelectQuarantine && nativeKey && !quarantineSelected) {
       if (selectedPowerPlatformTargets.size >= 25) {
@@ -2424,6 +2544,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setSelectionRouteNotice({ tone: "error", text: "The saved inventory changed. Clear the previous quarantine selection before selecting more agents." });
         return;
       }
+    }
+    if (grouped && visibleUnifiedAgentPage?.selection) {
+      if (!allSelected && selectedGroups.size >= 5000) {
+        setSelectionRouteNotice({ tone: "error", text: "Select at most 5,000 agent groups. Mutation previews also enforce the 5,000-package target ceiling." });
+        return;
+      }
+      const groups = new Set(selectedGroups);
+      if (allSelected) groups.delete(record.id);
+      else groups.add(record.id);
+      setGroupPackageSelection({ id: visibleUnifiedAgentPage.selection.id, owner: principalKey, groups });
     }
     setSelectedAgentIds(current => {
       const next = new Set(current);
@@ -2488,9 +2618,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function requestCurrentAgentReload() {
     if (!isCurrentAgentScope()) return;
+    setServerPackageSelection(undefined);
+    setGroupPackageSelection(undefined);
+    setGroupTargetCount(undefined);
     agentInventoryQueries.clear();
     forceCurrentAgentReload.current = true;
     setAgentReloadRevision(revision => revision + 1);
+  }
+
+  function handleInventoryExportInvalidation() {
+    if (!inventoryExport || !ownsAgentScope(inventoryExport.owner)) return;
+    clearAgentState();
+    setAgentExportError({ message: "The saved inventory selection changed or expired. Reload inventory before exporting again.", reloadRequired: true });
   }
 
   function verifySavedAgentInventory() {
@@ -2614,7 +2753,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           verifyingInventory={loadingAgents || deferredQuery !== query}
           inventoryError={unifiedAgentReadError}
           onVerifyInventory={verifySavedAgentInventory}
-          selectedPackageCount={selectedAgentIds.size}
+          selectedPackageCount={groupCountPending ? 0 : matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
           refreshingPackages={refreshingAgents}
           refreshingPowerPlatform={refreshingPowerPlatformAgents}
           exportingPowerPlatform={exportingPowerPlatformCsv}
@@ -2644,6 +2783,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           principalKey={principalKey}
           canUploadUsage={canImportReports}
           active={visibleActiveView === "sync"}
+          onOpenSync={visibleActiveView === "agents" || visibleActiveView === "users" ? () => navigateToView("sync") : undefined}
+          automaticRefresh={automaticRefresh}
           onSetupRequiredChange={setSyncSetupRequired}
           onRunsChanged={handleSyncRunsChanged}
           requestedRunId={requestedDataSyncRunId}
@@ -2659,7 +2800,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             jobId={requestedPowerPlatformJobId} onSelect={setRequestedPowerPlatformJobId}
             onCancelRequested={() => automaticRefresh.setPaused(true)}
             onChanged={() => handleDataSyncSourcesChanged(["power_platform"])} /> : null}
-          <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
+          <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} owner={principalKey} error={linkedJobError} />
           <SyncHistoryView key={principalKey} user={user} onOpenSyncRun={handleRequestedSyncRunChange} revision={syncHistoryRevision} />
         </>
       ) : null}
@@ -2672,21 +2813,20 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           revision={officialUsageDashboardRevision}
           onChanged={handleOfficialUsageChanged}
           onImported={finishUsageImport}
-          onLegacyCleared={() => setLegacyUsagePresent(false)}
         />
       ) : null}
-      {legacyUsagePresent ? (
-        <div className="report-status error" role="status">
-          <strong>Legacy browser report data is present in this browser.</strong>
-          <p>It was not read or migrated. Re-import the original Microsoft exports, or ask an AgentControl.Admin to explicitly discard the legacy copy.</p>
-          {canImportReports ? <button type="button" className="secondary" onClick={() => openUsageImport()}>Import reports in Sync</button> : null}
-        </div>
-      ) : null}
 
+      {inventoryExport?.owner === principalKey ? <div hidden={visibleActiveView !== "agents"
+        && !(inventoryExport.kind === "power_platform_agents" && visibleActiveView === "sync")}>
+        <ReportExportButton key={inventoryExport.sequence}
+          selectionId={inventoryExport.selectionId} kind={inventoryExport.kind} ids={inventoryExport.ids}
+          label="Prepare inventory CSV" autoStart onSelectionInvalidated={handleInventoryExportInvalidation}
+          onPendingChange={inventoryExport.kind === "power_platform_agents" ? setExportingPowerPlatformCsv : setExportingCsv} />
+      </div> : null}
       {visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>
-            <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
+            <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} owner={principalKey} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
             <ExactPackageLookup
               loading={Boolean(loadingAgentDetailId)}
               error={agentDetailError}
@@ -2702,7 +2842,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
           <div className="agent-catalog-heading">
             <div className="agent-catalog-title">
-              <h2 id="agents-heading" tabIndex={-1}>Agents <span>{visibleUnifiedAgentPage?.count.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
+              <h2 id="agents-heading" tabIndex={-1}>Agents <span>{visibleUnifiedAgentPage?.counts.filtered.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
             </div>
             {canReadSensitiveUsage ? <AgentInventoryScopes
               inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}
@@ -2710,7 +2850,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             <div className="agent-catalog-actions">
               <span className="last-refresh" aria-live="polite">
                 {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
-                  : inventoryCollectionText}
+                  : inventoryUnavailable?.message ?? inventoryCollectionText}
               </span>
               {agentInventoryIssueSummary ? <button type="button" className="secondary inventory-attention"
                 aria-label="Inventory needs attention · Open Sync" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>
@@ -2728,7 +2868,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   type="button"
                   className="secondary agent-export-button"
                   aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
-                  title={!agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
+                  title={inventoryUnavailable ? "Collect agent inventory before exporting" : !agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
                   disabled={!canReadSensitiveUsage || loadingAgents || deferredQuery !== query || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
                   onClick={requestExportCsv}
                 >
@@ -2754,10 +2894,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               : "A saved agent inventory revision is unavailable. Reload the saved inventory before exporting.")}</span>
             {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={requestCurrentAgentReload}>Reload saved agent inventory</button> : null}
           </div> : null}
-          {exportingCsv ? <div className="report-status" role="status">Preparing agent inventory CSV. The server exports each resolved agent once.</div> : null}
-          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
+          {matchingPackageSelection ? <p className="selection-summary">Server selection · no target list downloaded · maximum 5,000 targets per job</p> : null}
+          {groupTargetKey && groupCount?.error ? <p role="alert">{groupCount.error} Refresh inventory to reselect current groups.</p>
+            : groupCountPending ? <p role="status">Counting selected package targets...</p> : null}
+          {canOperate && !groupCountPending && (matchingPackageCount > 0 || selectedPackageCount > 0 || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
+              owner={principalKey}
             disabled={
-              Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
+              Boolean(matchingPackageSelection && (loadingAgents || deferredQuery !== query)) || Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
             }
             busyAction={busyBulkAction}
             progress={bulkProgress}
@@ -2765,7 +2908,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             job={trackedJob}
             jobCommand={bulkJobCommand}
             jobError={bulkJobError ?? (requestedPackageControlJobId ? linkedJobError : undefined)}
-            selectedCount={selectedAgentIds.size}
+            selectedCount={matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
             onBlockAll={() => void requestBulkAction(true)}
             onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => void requestBulkAction(false)}
@@ -2785,7 +2928,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             pendingTargetCount={pendingPowerPlatformIds.size}
             onClear={() => { if (ownsAgentScope(principalKey)) resetPowerPlatformSelection(); }}
             initialJobId={requestedQuarantineJobId}
-            onJobChange={job => { if (ownsAgentScope(principalKey)) setRequestedQuarantineJobId(job.id); }}
+            onJobChange={job => {
+              if (!ownsAgentScope(principalKey)) return;
+              setRequestedQuarantineJobId(job.id);
+              if (["queued", "running", "waiting_authorization"].includes(job.status)) return;
+              const result = JSON.stringify([principalKey, job.id, job.updatedAt, job.status]);
+              if (lastQuarantineResult.current === result) return;
+              lastQuarantineResult.current = result;
+              resetPowerPlatformSelection();
+              requestCurrentAgentReload();
+            }}
           /> : null}
 
           {loadingBulkRefSearch ? (
@@ -2797,21 +2949,48 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               <UnifiedAgentTable
                 records={displayedUnifiedAgents}
                 loading={loadingAgents && !unifiedAgentPage}
+                emptyState={inventoryUnavailable ? <div role="status">
+                  <h2>{inventoryUnavailable.state === "preparing" ? "Preparing agent inventory" : "No saved agent inventory yet"}</h2>
+                  <p>{inventoryUnavailable.message}</p>
+                  <button type="button" className="secondary" onClick={() => navigateToView("sync")}>Open Sync</button>
+                </div> : unifiedAgentReadError ? <>
+                  <h2>Agent inventory unavailable</h2><p>Reload saved inventory or open Sync to review source status.</p>
+                </> : !hasActiveAgentFilters ? <>
+                  <h2>No agents in this inventory</h2><p>The saved inventory contains no agents in this scope.</p>
+                </> : undefined}
                 controls={<AgentInventoryFilters key={principalKey}
+                  selectionId={unifiedAgentPage?.selection?.id}
+                  readOwnerKey={principalKey}
+                  onInvalidated={invalidateAgentSelection}
                   values={{ search: query, packageType, endUserAccess, reportedUsage, management: agentManagement, relevance: agentRelevance,
                     platform: effectivePlatformFilter, availability: availableToFilter,
                     host: hostFilter, status: statusFilter, createdWithinDays, publisher: publisherFilter,
                     environmentId: agentEnvironmentFilter, sortBy: agentSortBy, sortDirection: agentSortDirection }}
                   options={{ platforms: platformOptions, availability: availableToOptions, hosts: hostOptions,
-                    publishers: publisherOptions, environments: unifiedAgentPage?.facets?.environments ?? [],
-                    types: unifiedAgentPage?.facets?.types ?? [] }}
-                  matchingCount={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage?.count}
+                    publishers: publisherOptions, environments: [],
+                    types: [] }}
+                  matchingCount={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage?.counts.filtered}
                   loading={loadingAgents || deferredQuery !== query}
                   onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={setError} />}
+                selectionAction={canOperate && (visibleUnifiedAgentPage?.counts.packageTargets ?? 0) > 0 ? <button type="button"
+                  className="secondary agent-match-select" aria-pressed={Boolean(matchingPackageSelection)}
+                  aria-label={matchingPackageSelection ? "Clear all-matching package selection"
+                    : `Select all ${visibleUnifiedAgentPage?.counts.packageTargets} matching published versions`}
+                  title="Server selection; maximum 5,000 targets per mutation job."
+                  disabled={loadingAgents || deferredQuery !== query || Boolean(busyBulkAction)}
+                  onClick={() => {
+                    if (matchingPackageSelection) setServerPackageSelection(undefined);
+                    else if (visibleUnifiedAgentPage?.selection) {
+                      setSelectedAgentIds(new Set());
+                      setGroupPackageSelection(undefined);
+                      setServerPackageSelection({ id: visibleUnifiedAgentPage.selection.id, owner: principalKey });
+                    }
+                  }}>{matchingPackageSelection ? "Clear matching" : `Select all ${visibleUnifiedAgentPage?.counts.packageTargets.toLocaleString()}`}</button> : null}
                 columnPreferenceOwner={user ? JSON.stringify([user.tenantId ?? "", user.homeAccountId]) : undefined}
                 sortBy={agentSortBy}
                 sortDirection={agentSortDirection}
                 onSortChange={(sortBy, direction) => {
+                  setServerPackageSelection(undefined);
                   setAgentSortBy(sortBy);
                   setAgentSortDirection(direction);
                   setAgentPageIndex(0);
@@ -2819,6 +2998,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 usageContext={unifiedAgentPage?.usageContext}
                 busyPackageId={busyAgentId}
                 selectedPackageIds={selectedAgentIds}
+                selectedPackageCount={groupCountPending ? 0 : matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
+                allPackagesSelected={Boolean(matchingPackageSelection)}
+                selectedRecordIds={new Set(selectedGroups.keys())}
                 selectedPowerPlatformKeys={new Set(selectedPowerPlatformTargets.keys())}
                 packageSelectionAllowed
                 packageOperationsAllowed={canOperate}
@@ -2841,13 +3023,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   if (item) void handleAgentAction(item, blocked);
                 }}
               />
-              <AgentPageControls
-                pageIndex={agentPageIndex}
-                pageSize={agentDisplayPageSize}
-                totalCount={visibleUnifiedAgentPage?.count ?? 0}
-                loading={loadingAgents}
-                onPageChange={setAgentPageIndex}
-              />
+              {visibleUnifiedAgentPage && !unifiedAgentReadError ? <nav aria-label="Agent inventory pages" className="agent-inventory-pagination" aria-busy={loadingAgents}>
+                <span role="status">{visibleUnifiedAgentPage.value.length.toLocaleString()} shown · {visibleUnifiedAgentPage.counts.filtered.toLocaleString()} matching agents</span>
+                <div className="agent-inventory-page-actions">
+                  <button type="button" className="secondary" disabled={loadingAgents || !visibleUnifiedAgentPage.page.previousCursor}
+                    onClick={() => { inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.previousCursor ?? undefined;
+                      setAgentPageIndex(index => Math.max(0, index - 1)); }}>Previous</button>
+                  <button type="button" className="secondary" disabled={loadingAgents || !visibleUnifiedAgentPage.page.nextCursor}
+                    onClick={() => { inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.nextCursor ?? undefined;
+                      setAgentPageIndex(index => index + 1); }}>Next</button>
+                </div>
+              </nav> : null}
             </div>
         </section>
         )
@@ -2886,6 +3072,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
+          selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}
           record={selectedUnifiedAgent}
           onOpenPerson={personId => {
@@ -2894,7 +3081,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             handleUsersRouteChange({ view: "responsibility", personId, search: "", page: 0 });
           }}
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
-          inventoryRevision={unifiedAgentDetailPage?.sourcePage?.revision}
+          inventoryRevision={unifiedAgentDetailPage?.sourcePage?.selection.revision}
           inventoryError={unifiedAgentReadError}
           onRetryInventory={requestCurrentAgentReload}
           onUsageChanged={() => {
@@ -2933,7 +3120,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           selectedPackageId={agentPackageSelection?.owner === principalKey && agentPackageSelection.recordId === selectedUnifiedAgent.id
             ? agentPackageSelection.packageId : undefined}
           packageDetail={selectedUnifiedAgent.packages.some(item => item.id === agentDetail?.id) ? agentDetail : undefined}
-          packageDetailStale={savedAgentDetail?.inventoryRevision !== unifiedAgentDetailPage?.sourcePage?.revision}
+          packageDetailStale={Boolean(savedAgentDetail) && savedAgentDetail?.selectionId !== unifiedAgentDetailPage?.sourcePage?.selection.id}
           packageInventoryPending={loadingAgents || unifiedAgentDetailPage?.listPage !== unifiedAgentPage}
           packageDetailLoading={Boolean(loadingAgentDetailId)}
           packageDetailError={agentDetailError}
@@ -2976,10 +3163,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       {bulkAccessAgentIds ? (
         <AccessAssignmentModal
           context="bulk"
-          agentCount={bulkAccessAgentIds.length}
+          agentCount={bulkAccessSelection?.count ?? bulkAccessAgentIds.length}
           onCancel={() => {
             agentDetailRequestId.current += 1;
             setBulkAccessAgentIds(undefined);
+            setBulkAccessSelection(undefined);
           }}
           onSubmit={runBulkAccessUpdate}
         />
@@ -3021,6 +3209,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 export type BulkConfirmation = {
   action: AuditAction;
   ids: string[];
+  recordIds?: string[];
+  selectionId?: string;
   mutationScope: "single" | "bulk";
   preview: PackageMutationPreview;
   accessUpdate?: PackageAccessUpdate;
@@ -3118,34 +3308,6 @@ function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
     {loading ? <p role="status">Loading exact package…</p> : null}
     {error ? <p role="alert">{error}</p> : null}
   </section>;
-}
-
-function AgentPageControls({
-  pageIndex,
-  pageSize,
-  totalCount,
-  loading,
-  onPageChange,
-}: {
-  pageIndex: number;
-  pageSize: number;
-  totalCount: number;
-  loading: boolean;
-  onPageChange: (page: number) => void;
-}) {
-  const pageCount = Math.max(Math.ceil(totalCount / pageSize), 1);
-  const start = totalCount ? pageIndex * pageSize + 1 : 0;
-  const end = Math.min((pageIndex + 1) * pageSize, totalCount);
-  return (
-    <div className="agent-display-window" aria-live="polite">
-      <span>{start.toLocaleString()}-{end.toLocaleString()} of {totalCount.toLocaleString()} matching agents</span>
-      <div>
-        <button type="button" className="secondary" disabled={loading || pageIndex === 0} onClick={() => onPageChange(Math.max(0, pageIndex - 1))}>Previous</button>
-        <span>Page {pageIndex + 1} of {pageCount}</span>
-        <button type="button" className="secondary" disabled={loading || pageIndex + 1 >= pageCount} onClick={() => onPageChange(pageIndex + 1)}>Next</button>
-      </div>
-    </div>
-  );
 }
 
 function ExportIcon() {
@@ -3467,27 +3629,26 @@ function ExportChoiceModal({
           <h2 id="export-choice-title">Export agent inventory</h2>
         </div>
         <p>
-          Download one CSV row per resolved agent, retaining all package IDs and states,
-          Power Platform configuration, and partial-inventory status. The server checks
-          your current authorization and saved inventory revision.
-          CSV generation is also bounded to 8 MB and 15 seconds; narrow filters or
-          reduce the selection if a limit is reached.
+          Prepare a saved-selection CSV with one agent row and separate source and child rows.
+          All package IDs, configuration, and partial-inventory status are retained without
+          expanding high-fanout collections in the browser. The server checks your current
+          authorization throughout preparation and download. Completed files expire automatically.
         </p>
         <div className="export-choice-grid">
           <button
             type="button"
             className="secondary export-choice-card"
-            disabled={disabled || agentCount === 0 || agentCount > maximumUnifiedAgentExportRows}
+            disabled={disabled || agentCount === 0}
             onClick={() => onExport("matching")}
           >
             <strong>Download matching agents</strong>
             <span>Export all {agentCount.toLocaleString()} {isFiltered ? "filtered" : "saved"} agents across all pages, using the current filters and sorting.</span>
-            <small>{agentCount > maximumUnifiedAgentExportRows ? "More than 5,000 agents match. Narrow the filters before exporting." : "Up to 5,000 agent rows; not limited to the displayed page."}</small>
+            <small>Not limited to the displayed page or the 5,000-target mutation limit.</small>
           </button>
           <button
             type="button"
             className="secondary export-choice-card"
-            disabled={disabled || selectionRestoring || selectedTargetCount === 0}
+            disabled={disabled || selectionRestoring || selectedTargetCount === 0 || selectedTargetCount > 5000}
             onClick={() => onExport("selected")}
           >
             <strong>Download selected agents</strong>
@@ -3508,6 +3669,9 @@ function ExportChoiceModal({
 
 function errorMessage(error: unknown) {
   if (error instanceof ApiError) {
+    if (error.code === "selection_invalidated" && error.message === error.code) {
+      return "The saved inventory selection is no longer available. Reload saved inventory.";
+    }
     if (error.code === "invalid_origin") return error.message;
     if (error.status === 403) {
       return `${error.message} Open Permissions for the current account's exact requirements. Consent does not assign roles or licenses.`;

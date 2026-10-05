@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b tsconfig.build.json tsconfig.node.json && vite build",
+    "typecheck": "tsc -b",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run"
@@ -16,8 +17,7 @@
     "dompurify": "^3.4.11",
     "lucide-react": "^1.23.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "recharts": "^3.9.1"
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",

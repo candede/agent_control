@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import type pg from "pg";
+import { pool } from "../db/pool.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus } from "../types/dataSync.js";
@@ -10,8 +10,11 @@ import { DataSyncService } from "./dataSync.js";
 import * as operationalState from "./operationalState.js";
 
 vi.mock("../db/pool.js", () => ({
-  pool: {},
-  secretValue: vi.fn(),
+  pool: { options: { max: 4 },
+    query: vi.fn(async () => { throw new Error("Unit tests must not query a database."); }),
+    connect: vi.fn(async () => { throw new Error("Unit tests must not open a database connection."); }),
+  },
+  secretValue: vi.fn((name: string) => name === "SESSION_SECRET" ? "synthetic-data-sync-unit-session-secret" : undefined),
   transaction: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
 }));
 
@@ -127,7 +130,8 @@ describe("DataSyncService", () => {
     expect(result.revisions).toEqual({ users: "users-revision", graph_packages: "inventory-revision", power_platform: "inventory-revision" });
     expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, undefined, expect.any(AbortSignal));
     await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
-    expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({ catalogOnly: true, requestedIds: [] }));
+    expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({ requestedIds: [] }));
+    expect(harness.packages.submit.mock.calls[0][1]).not.toHaveProperty("catalogOnly");
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.objectContaining({ automatic: true }));
     expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.any(Object),
       { incompleteOnly: false, useCache: true });
@@ -373,7 +377,7 @@ describe("DataSyncService", () => {
 
   it("passes the clean full opt-in through admission while retaining accepted official usage", async () => {
     const harness = serviceHarness();
-    harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+    harness.officialUsage.read.mockResolvedValue(acceptedUsage());
     const started = await harness.service.start(user, { mode: "full", clearSavedData: true });
     expect(harness.repository.submit).toHaveBeenCalledWith({
       tenantId: user.tenantId, principalId: user.homeAccountId,
@@ -516,29 +520,29 @@ describe("DataSyncService", () => {
     "reconciles the currently accepted usage selection independently of a %s latest run",
     async latest => {
       const harness = serviceHarness();
-      const missing = await harness.officialUsage.getPublished();
+      const missing = await harness.officialUsage.read();
       harness.run.sources = [harness.run.sources.find(source => source.source === (latest === "users-only" ? "users" : "usage_reports"))!];
       harness.run.sources[0].status = latest === "cancelled" ? "cancelled" : "succeeded";
       harness.run.sources[0].count = 99;
       harness.run.status = latest === "cancelled" ? "cancelled" : "completed";
       if (latest === "no-run") harness.repository.getLatestRun.mockResolvedValue(undefined);
       const historical = structuredClone(harness.run);
-      harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+      harness.officialUsage.read.mockResolvedValue(acceptedUsage());
       expect((await harness.service.state(user)).sources[3]).toMatchObject({ status: "succeeded", count: 3 });
 
       const replacement = acceptedUsage();
-      replacement.reports.users.rows.push({});
-      replacement.activeSet.acceptedAt = "2026-09-16T10:00:00.000Z";
-      harness.officialUsage.getPublished.mockResolvedValue(replacement as never);
+      replacement.count += 1;
+      replacement.acceptedAt = "2026-09-16T10:00:00.000Z";
+      harness.officialUsage.read.mockResolvedValue(replacement);
       const current = await harness.service.state(user);
       expect(current.sources[3]).toMatchObject({
-        source: "usage_reports", status: "succeeded", count: 4, lastSuccessAt: replacement.activeSet.acceptedAt,
+        source: "usage_reports", status: "succeeded", count: 4, lastSuccessAt: replacement.acceptedAt,
       });
       expect(harness.repository.recordSuccessMarker).toHaveBeenLastCalledWith(
-        { tenantId: user.tenantId, principalId: user.homeAccountId }, "usage_reports", 4, replacement.activeSet.acceptedAt,
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, "usage_reports", 4, replacement.acceptedAt,
       );
 
-      harness.officialUsage.getPublished.mockResolvedValue(missing);
+      harness.officialUsage.read.mockResolvedValue(missing);
       const removed = await harness.service.state(user);
       expect(removed.usageImportRequired).toBe(true);
       expect(removed.sources[3]).toMatchObject({
@@ -560,11 +564,12 @@ describe("DataSyncService", () => {
   it("treats a complete accepted zero-row report bundle as saved usage rather than a required import", async () => {
     const harness = serviceHarness();
     const published = acceptedUsage();
-    for (const report of Object.values(published.reports)) report.rows.length = 0;
-    harness.officialUsage.getPublished.mockResolvedValue(published as never);
+    published.count = 0;
+    harness.officialUsage.read.mockResolvedValue(published);
     const state = await harness.service.state(user);
     expect(state.usageImportRequired).toBe(false);
     expect(state.sources[3]).toMatchObject({ source: "usage_reports", status: "succeeded", count: 0 });
+    expect(harness.officialUsage.read).toHaveBeenCalledWith(user.tenantId);
   });
 
   it.each(["graph_packages", "power_platform"] as const)("projects measured %s progress and preserves its phase message", async sourceId => {
@@ -682,7 +687,7 @@ describe("DataSyncService", () => {
 
   it("lets an existing complete accepted three-report bundle satisfy a nondestructive resync", async () => {
     const harness = serviceHarness();
-    harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+    harness.officialUsage.read.mockResolvedValue(acceptedUsage());
     const started = await harness.service.start(user, { mode: "full", sources: ["usage_reports"] });
     expect(started.sources).toEqual([
       expect.objectContaining({
@@ -699,7 +704,7 @@ describe("DataSyncService", () => {
     harness.run.sources = [harness.run.sources.find(source => source.source === "usage_reports")!];
     harness.run.sources[0].status = "awaiting_upload";
     harness.run.status = "waiting";
-    harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+    harness.officialUsage.read.mockResolvedValue(acceptedUsage());
     const exact = await harness.service.getRun(
       { tenantId: user.tenantId!, principalId: user.homeAccountId },
       harness.run.id,
@@ -719,7 +724,7 @@ describe("DataSyncService", () => {
     harness.run.sources = [harness.run.sources.find(source => source.source === "usage_reports")!];
     harness.run.sources[0].status = "cancelled";
     harness.run.status = "cancelled";
-    harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+    harness.officialUsage.read.mockResolvedValue(acceptedUsage());
     const exact = await harness.service.getRun(
       { tenantId: user.tenantId!, principalId: user.homeAccountId },
       harness.run.id,
@@ -728,7 +733,7 @@ describe("DataSyncService", () => {
       status: "cancelled",
       sources: [{ source: "usage_reports", status: "cancelled" }],
     });
-    expect(harness.officialUsage.getPublished).not.toHaveBeenCalled();
+    expect(harness.officialUsage.read).not.toHaveBeenCalled();
     expect(harness.repository.updateSource).not.toHaveBeenCalled();
   });
 
@@ -1344,17 +1349,10 @@ function serviceHarness() {
     refreshReferences: vi.fn(async () => ({ changed: false, resolved: 0, notFound: 0, failed: 0 })),
   };
   const officialUsage = {
-    getPublished: vi.fn(async () => ({
-      activeRevision: 1,
-      activeSet: null,
-      reports: {},
-      retainedCompleteSets: 0,
-      retainedIncompleteSets: 0,
-      hasImportHistory: false,
-      activeSelectionIncomplete: false,
-    })),
+    read: vi.fn(async (): Promise<{ complete: boolean; count: number; acceptedAt: string | null }> =>
+      ({ complete: false, count: 0, acceptedAt: null })),
   };
-  const service = new DataSyncService({} as pg.Pool, {
+  const service = new DataSyncService(pool, {
     repository,
     packages,
     powerPlatform,
@@ -1429,25 +1427,7 @@ function powerPlatformJob(id: string, status: "waiting_authorization" | "running
 }
 
 function acceptedUsage() {
-  const acceptedAt = "2026-09-15T10:00:00.000Z";
-  const report = (kind: "agents" | "userAgents" | "users") => ({
-    kind,
-    rows: [{}],
-    lineage: { acceptedAt },
-  });
-  return {
-    activeRevision: 2,
-    activeSet: { complete: true, acceptedAt },
-    reports: {
-      agents: report("agents"),
-      userAgents: report("userAgents"),
-      users: report("users"),
-    },
-    retainedCompleteSets: 1,
-    retainedIncompleteSets: 0,
-    hasImportHistory: true,
-    activeSelectionIncomplete: false,
-  };
+  return { complete: true, count: 3, acceptedAt: "2026-09-15T10:00:00.000Z" };
 }
 
 function deferred<T>() {

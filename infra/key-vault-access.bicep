@@ -3,9 +3,9 @@ targetScope = 'resourceGroup'
 @description('Existing administrator-prepared Key Vault. This module changes role assignments only.')
 param vaultName string
 
-@description('Exactly five runtime secret names; the administrator password is intentionally excluded.')
-@minLength(5)
-@maxLength(5)
+@description('Exactly three runtime secret names: tenant registry, session and application database credentials.')
+@minLength(3)
+@maxLength(3)
 param runtimeSecretNames array
 
 @description('System-assigned App Service principal receiving per-secret read access.')

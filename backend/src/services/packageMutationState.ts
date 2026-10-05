@@ -19,8 +19,10 @@ export type PackageAccessMutationState = {
 
 export type PackageMutationState = PackageBlockMutationState | PackageAccessMutationState;
 
-export function capturePackageMutationState(details: CopilotPackageDetail, action: AuditAction): PackageMutationState {
+export function capturePackageMutationState(details: Pick<CopilotPackageDetail,
+  "isBlocked" | "availableTo" | "deployedTo" | "allowedUsersAndGroups" | "acquireUsersAndGroups">, action: AuditAction): PackageMutationState {
   if (action === "block" || action === "unblock") {
+    if (typeof details.isBlocked !== "boolean") throw new AppError(409, "incomplete_package_block_state", "An explicit current block state is required.");
     return { kind: "block", isBlocked: details.isBlocked };
   }
   if (action === "reassign") {

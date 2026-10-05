@@ -1,4 +1,6 @@
-import { isCopilotServiceActive, type CopilotServiceSummaryState, type CopilotUsageUser, type OfficialUsageUserSummary } from "../api/client";
+import { isCopilotServiceActive, type CopilotServiceSummaryState } from "../api/client";
+import type { CopilotDirectoryUser } from "../../../backend/src/types/copilotUsage";
+import type { ReportUser } from "../../../backend/src/types/officialReportData";
 import { copilotServicePresentation } from "../copilotServicePresentation";
 
 export function CopilotPaidFeatureStatus({ state, current = true }: {
@@ -11,13 +13,16 @@ export function CopilotPaidFeatureStatus({ state, current = true }: {
   </span>;
 }
 
-export function CopilotLicenseStatus({ user, current = true, licenseAssignmentStatus }: {
-  user?: Pick<CopilotUsageUser, "copilotServiceState"> | null;
+export function CopilotLicenseStatus({ user, current = true, entitlement }: {
+  user?: Pick<CopilotDirectoryUser, "copilotServiceState"> | null;
   current?: boolean;
-  licenseAssignmentStatus?: OfficialUsageUserSummary["licenseAssignmentStatus"];
+  entitlement?: ReportUser["entitlement"];
 }) {
   const inactive = user?.copilotServiceState === "disabled" || user?.copilotServiceState === "suspended" || user?.copilotServiceState === "locked_out";
-  if (licenseAssignmentStatus === "no_active_paid_license" && (!current || !inactive)) {
+  if ((entitlement === "no_paid" || entitlement === "paid_inactive") && !current) {
+    return <span className="copilot-user-badge unknown">Last saved: No active M365 Copilot license</span>;
+  }
+  if ((entitlement === "no_paid" || entitlement === "paid_inactive") && !inactive) {
     return <span className="copilot-user-badge attention">No active M365 Copilot license</span>;
   }
   if (!user) return <span className="copilot-user-badge unknown">License not verified</span>;

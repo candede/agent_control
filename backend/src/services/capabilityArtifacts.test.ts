@@ -34,20 +34,15 @@ describe("capability documentation artifacts", () => {
 
   it("documents the exact prepared-vault contract and excludes the admin password from runtime", () => {
     const setup = readRepositoryFile("docs/deployment-setup.md");
-    const bindingReadme = readRepositoryFile("plans/admin-poc-production/README.md");
     const documentedNames = [...setup.matchAll(/^\| `((?:agent-control-)[^`]+)` \|/gm)].map(match => match[1]);
-    const contractNames = [...bindingReadme.matchAll(/^\| `(agent-control-[^`]+)`\s+\|/gm)].map(match => match[1]);
 
     expect(documentedNames).toEqual([
-      "agent-control-tenant-id",
-      "agent-control-client-id",
-      "agent-control-client-secret",
+      "agent-control-tenants-json",
       "agent-control-session-secret",
       "agent-control-postgres-admin-password",
       "agent-control-postgres-app-password",
     ]);
-    expect(documentedNames).toEqual(contractNames);
-    expect(setup).toContain("Only the five rows other than `agent-control-postgres-admin-password`");
+    expect(setup).toContain("Only the three rows other than `agent-control-postgres-admin-password`");
     expect(setup).not.toContain("agent-control-evidence-expiry");
   });
 });

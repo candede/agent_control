@@ -15,6 +15,7 @@ import { CopilotStudioQuarantineClient, verifyCopilotStudioQuarantineConverged }
 import { maintenanceActive } from "./maintenance.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
+import { InventoryRuntime } from "./inventoryRuntime.js";
 
 export type QuarantineAuthorization = { accessToken: string; authority: QuarantineAuthority };
 type QuarantineAuthorizer = (scope: QuarantineScope) => Promise<QuarantineAuthorization>;
@@ -93,6 +94,11 @@ export async function runCopilotStudioQuarantineJob(
   }
   const lease = await repository.claim(scope, id, processOwner, resume);
   if (!lease) return;
+  const inventory = new InventoryRuntime(repository.database, async (owner, signal) => {
+    signal.throwIfAborted();
+    await authorizeJob(owner);
+    signal.throwIfAborted();
+  });
   try {
     for (let index = 0; index < 25 && !maintenanceActive() && !externalSignal?.aborted; index += 1) {
       requireProviderAdmissions();
@@ -107,6 +113,10 @@ export async function runCopilotStudioQuarantineJob(
         await repository.waitForAuthorization(scope, id);
         return;
       }
+      const publicationSignal = externalSignal
+        ? AbortSignal.any([externalSignal, AbortSignal.timeout(executionDeadlineMs)])
+        : AbortSignal.timeout(executionDeadlineMs);
+      await inventory.settleControls(scope, publicationSignal);
       const current = await repository.beginItem(lease);
       if (!current) break;
       const { job, item } = current;
@@ -200,6 +210,16 @@ export async function reconcileCopilotStudioQuarantineJob(
   const context = await repository.reconciliationItems(scope, id);
   assertAccountSessionValidation(validation);
   if (!context) throw new AppError(404, "not_found", "Quarantine job was not found.");
+  const inventory = new InventoryRuntime(repository.database, async (owner, signal) => {
+    requireProviderAdmissions();
+    signal.throwIfAborted();
+    assertAccountSessionValidation(validation);
+    const authorization = await authorize(owner);
+    requireAuthority(context.job, authorization.authority);
+    assertAccountSessionValidation(validation);
+    requireProviderAdmissions();
+    signal.throwIfAborted();
+  });
   const errors: Array<{ resourceNativeId: string; message: string }> = [];
   for (const item of context.items) {
     requireProviderAdmissions();
@@ -209,8 +229,9 @@ export async function reconcileCopilotStudioQuarantineJob(
       assertAccountSessionValidation(validation);
       requireAuthority(context.job, authorization.authority);
       const signal = AbortSignal.timeout(reconciliationDeadlineMs);
+      await inventory.settleControls(scope, signal);
       await repository.withReconciliationLock(scope, item, async () => {
-        await repository.assertReconciliationTarget(scope, item, context.job.is_canary);
+        await repository.assertReconciliationTarget(scope, item);
         requireProviderAdmissions();
         signal.throwIfAborted();
         assertAccountSessionValidation(validation);

@@ -1,47 +1,38 @@
 import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
+import pg from "pg";
 import { DataSyncRepository } from "../src/db/dataSync.js";
-import { migrations, verifySchema } from "../src/db/schema.js";
-import { prepareRestoredDatabase } from "./backup.js";
-import { bootstrap, grantRuntime, migrate, retain } from "./database.js";
+import { DataGenerations } from "../src/db/dataGenerations.js";
+import { UserSourcesRepository } from "../src/db/userSources.js";
+import { databaseSettings } from "../src/db/pool.js";
+import { verifySchema } from "../src/db/schema.js";
+import { backup, restore } from "./backup.js";
+import { retain, retainUntilConverged } from "./database.js";
 import { fixturePassword, testDatabase } from "./testDatabase.js";
+import { selectionIdentity } from "./largeTenantFixtures.js";
+import { fixtureDirectoryUser, publishFixtureDirectory, publishFixtureEmptyActivity } from "./userSourceFixture.js";
 
 const scope = { tenantId: "sync-persistence-tenant", principalId: "sync-reader" };
+const identity = (owner = scope, sessionEpoch = "0") => ({ ...selectionIdentity, ...owner, sessionEpoch });
+async function sourcePage(database: pg.Pool, owner = scope, sessionEpoch = "0") {
+  const reader = new UserSourcesRepository(database, "synthetic-persistence-source-read-secret");
+  const actor = identity(owner, sessionEpoch), selected = await reader.capture(actor, "delegated");
+  return reader.page(selected.id, actor);
+}
 
 describe("data sync persistence integration", () => {
-  it("upgrades schema 35's clean-full constraint for automatic sources without changing legacy intent or migration checksums", async () => {
-    const fixture = await testDatabase(false);
+  it("enforces the current clean-full scope and automatic source sequence", async () => {
+    const fixture = await testDatabase();
     try {
-      await bootstrap(fixture.operator, fixturePassword);
-      await migrate(fixture.operator, migrations.filter(step => step.version <= 35));
-      await grantRuntime(fixture.operator);
-      const prior = (await fixture.operator.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows;
-      expect(prior.at(-1)?.version).toBe(35);
-      const legacySources = ["users", "graph_packages", "power_platform", "usage_reports"];
-      const legacy = await fixture.operator.query<{ id: string }>(`INSERT INTO data_sync_runs
-        (id,tenant_id,principal_id,mode,source_ids,request_hash,status,completed_at,clear_saved_data)
-        VALUES(gen_random_uuid(),$1,$2,'full',$3::jsonb,repeat('a',64),'completed',clock_timestamp(),true) RETURNING id`,
-      [scope.tenantId, scope.principalId, JSON.stringify(legacySources)]);
-      await fixture.operator.query(`INSERT INTO data_sync_run_sources
-        (run_id,tenant_id,principal_id,source_id,status,count,message,can_retry)
-        SELECT $1,$2,$3,source,'succeeded',0,'Saved a legacy source.',false
-        FROM jsonb_array_elements_text($4::jsonb) source`,
-      [legacy.rows[0].id, scope.tenantId, scope.principalId, JSON.stringify(legacySources)]);
-      await expect(fixture.runtime.query(`INSERT INTO data_sync_runs
-        (id,tenant_id,principal_id,mode,source_ids,request_hash,clear_saved_data)
-        VALUES(gen_random_uuid(),$1,$2,'full','["users","graph_packages","power_platform"]',repeat('b',64),true)`,
-      [scope.tenantId, scope.principalId])).rejects.toMatchObject({
-        code: "23514", constraint: "data_sync_cleanup_full_scope",
-      });
-
-      await migrate(fixture.operator);
       await verifySchema(fixture.runtime);
       const repository = new DataSyncRepository(fixture.runtime);
-      expect((await fixture.runtime.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows.slice(0, prior.length)).toEqual(prior);
-      expect((await repository.getRun(scope, legacy.rows[0].id))?.sources).toHaveLength(4);
       const current = await repository.submit(scope, { mode: "full", clearSavedData: true });
       expect(current.run.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
       for (const [mode, sources] of [
         ["full", ["users", "graph_packages"]],
+        ["full", ["users", "graph_packages", "power_platform", "usage_reports"]],
         ["full", ["users", "graph_packages", "power_platform", "users"]],
         ["full", ["users", "graph_packages", "power_platform", "unknown"]],
         ["incremental", ["users", "graph_packages", "power_platform"]],
@@ -53,55 +44,47 @@ describe("data sync persistence integration", () => {
           code: "23514", constraint: "data_sync_cleanup_full_scope",
         });
       }
-      await expect(fixture.runtime.query("DELETE FROM data_sync_success_markers")).rejects.toThrow();
+      await expect(fixture.runtime.query("DELETE FROM data_sync_success_markers")).rejects.toMatchObject({ code: "42501" });
     } finally {
       await fixture.close();
     }
   });
 
-  it("upgrades schema 30 without changing prior checksums or administrative audit", async () => {
-    const fixture = await testDatabase(false);
+  it("initializes current sources with empty activity and least-privilege persistence", async () => {
+    const fixture = await testDatabase();
     try {
-      await bootstrap(fixture.operator, fixturePassword);
-      await migrate(fixture.operator, migrations.slice(0, 30));
-      const prior = (await fixture.operator.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows;
-      await fixture.operator.query(`INSERT INTO audit_events
-        (id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,target_blocked_state,agent_id,started_at,status,request_path)
-        VALUES(gen_random_uuid(),'preserved-sync-audit','preserved-sync-audit',$1,$2,'fixture@example.invalid','Fixture',
-          'single','block',true,'fixture-package',clock_timestamp(),'succeeded','/fixture')`, [scope.tenantId, scope.principalId]);
-      await migrate(fixture.operator);
-      await grantRuntime(fixture.operator);
       await verifySchema(fixture.runtime);
-      expect((await fixture.runtime.query("SELECT version,checksum FROM schema_migrations WHERE version<=30 ORDER BY version")).rows).toEqual(prior);
-      expect((await fixture.runtime.query("SELECT event_id FROM audit_events")).rows).toEqual([{ event_id: "preserved-sync-audit" }]);
       const repository = new DataSyncRepository(fixture.runtime);
       const { run } = await repository.submit(scope, { mode: "initial" });
-      expect(run.sources).toHaveLength(3);
-      await repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, new Date().toISOString(), "Saved empty activity report.");
-      expect((await repository.getUserSources(scope)).appActivity.rowCount).toBe(0);
-      for (const table of ["data_sync_runs", "copilot_usage_snapshots", "data_sync_success_markers"]) {
-        await expect(fixture.runtime.query(`DELETE FROM ${table}`)).rejects.toThrow();
+      expect(run.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
+      await publishFixtureEmptyActivity(fixture.runtime, identity());
+      expect((await sourcePage(fixture.runtime)).sources.app_activity.rowCount).toBe(0);
+      for (const table of ["data_sync_runs", "data_sync_success_markers", "agent_people_cache"]) {
+        await expect(fixture.runtime.query(`DELETE FROM ${table}`)).rejects.toMatchObject({ code: "42501" });
       }
     } finally {
       await fixture.close();
     }
   });
 
-  it("cleans expired snapshots and runs without resetting successful zero-row markers", async () => {
+  it("collects expired native records and runs without resetting successful zero-row markers", async () => {
     const fixture = await testDatabase();
     try {
       const repository = new DataSyncRepository(fixture.runtime);
       const { run } = await repository.submit(scope, { mode: "initial" });
       await repository.updateSource(scope, run.id, "users", { status: "succeeded", count: 0, message: "Saved zero users.", canRetry: false });
-      await repository.publishDirectory(scope, [], new Date().toISOString(), "Saved zero users.");
-      await fixture.operator.query("UPDATE copilot_usage_snapshots SET expires_at=clock_timestamp()-interval '1 second'");
+      const expiresAt = new Date(Date.now() + 1500);
+      const published = await publishFixtureDirectory(fixture.runtime, identity(), [], { expiresAt });
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now()) + 25));
       await fixture.operator.query(`INSERT INTO data_sync_runs
         (id,tenant_id,principal_id,mode,source_ids,request_hash,status,expires_at)
         VALUES(gen_random_uuid(),$1,$2,'incremental','["users"]',repeat('a',64),'completed',clock_timestamp()-interval '1 second')`,
       [scope.tenantId, scope.principalId]);
       const result = await retain(fixture.operator);
-      expect(result.affected).toMatchObject({ copilotUsageSnapshots: 1, dataSyncRuns: 1, copilotUsageMissingSnapshots: 1 });
-      expect((await repository.getUserSources(scope)).directory).toMatchObject({ value: null, attemptStatus: "failed", rowCount: null });
+      expect(result.affected).toMatchObject({ recordExpiredGenerations: 1, recordCollectedGenerations: 1, dataSyncRuns: 1 });
+      expect((await sourcePage(fixture.runtime)).sources.directory).toMatchObject({ generationId: null, state: "unavailable", rowCount: null });
+      expect((await fixture.runtime.query("SELECT collected_at FROM data_generations WHERE id=$1", [published.generationId])).rows[0].collected_at)
+        .toBeInstanceOf(Date);
       expect((await repository.listMarkers(scope)).find(source => source.source === "users")).toMatchObject({ status: "succeeded", count: 0 });
       expect(await repository.getRun(scope, run.id)).toBeDefined();
     } finally {
@@ -109,34 +92,44 @@ describe("data sync persistence integration", () => {
     }
   });
 
-  it("fences restored sync work and removes user snapshots no longer retained by the current database", async () => {
+  it("fences restored sync work and requires fresh principal evidence after an actual backup/restore", async () => {
     const current = await testDatabase();
-    const restored = await testDatabase();
+    const target = `agentcontrol_restore_${randomUUID().replaceAll("-", "")}`;
+    const directory = resolve("artifacts");
+    mkdirSync(directory, { recursive: true });
+    const filename = resolve(directory, `sync-restore-${randomUUID()}.dump`);
+    let restored: pg.Pool | undefined;
     try {
       const repository = new DataSyncRepository(current.runtime);
       const revoked = { ...scope, principalId: "revoked-reader" };
-      await repository.publishDirectory(scope, [], new Date().toISOString(), "Saved current users.");
-      await repository.publishDirectory(revoked, [], new Date().toISOString(), "Saved users before removal.");
+      await publishFixtureDirectory(current.runtime, identity(), [fixtureDirectoryUser(randomUUID(), "Current user", "current@example.invalid")]);
+      const removed = await publishFixtureDirectory(current.runtime, identity(revoked),
+        [fixtureDirectoryUser(randomUUID(), "Removed user", "removed@example.invalid")]);
       const { run } = await repository.submit(scope, { mode: "initial" });
       await repository.updateSource(scope, run.id, "users", { status: "running", message: "Reading users.", canRetry: false });
-      for (const table of ["data_sync_runs", "data_sync_run_sources", "copilot_usage_snapshots", "copilot_usage_source_state"]) {
-        const rows = (await current.operator.query(`SELECT * FROM ${table}`)).rows;
-        await restored.operator.query(`INSERT INTO ${table} SELECT * FROM jsonb_populate_recordset(NULL::${table},$1::jsonb)`, [JSON.stringify(rows)]);
+      await backup(current.operator, filename);
+      const removedScope = (await current.runtime.query("SELECT scope_id FROM data_generations WHERE id=$1", [removed.generationId])).rows[0].scope_id;
+      await new DataGenerations(current.runtime).invalidate(removedScope, revoked.tenantId);
+      await retainUntilConverged(current.operator);
+      await restore(current.operator, filename, target);
+      restored = new pg.Pool({ ...databaseSettings(), database: target, user: "agentcontrol_app", password: fixturePassword });
+      const restoredRepository = new DataSyncRepository(restored);
+      for (const owner of [scope, revoked]) {
+        const epoch = await new DataGenerations(restored).sessionEpoch(owner.tenantId, owner.principalId);
+        expect((await sourcePage(restored, owner, epoch)).sources.directory).toMatchObject({ generationId: null, state: "unavailable", rowCount: null });
       }
-      await current.operator.query("DELETE FROM copilot_usage_snapshots WHERE principal_id=$1", [revoked.principalId]);
-      await prepareRestoredDatabase(current.operator, restored.operator, new Date());
-      const restoredRepository = new DataSyncRepository(restored.runtime);
-      expect((await restoredRepository.getUserSources(scope)).directory).toMatchObject({ value: [], attemptStatus: "available", rowCount: 0 });
-      expect((await restoredRepository.getUserSources(revoked)).directory).toMatchObject({ value: null, attemptStatus: "failed", rowCount: null });
       expect((await restoredRepository.getRun(scope, run.id))?.sources.find(source => source.source === "users")).toMatchObject({
         status: "waiting_authorization", canRetry: true,
       });
-      expect((await restored.runtime.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({
+      expect((await restored.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({
         mode: "maintenance", provider_work_enabled: false,
       });
-      expect((await current.runtime.query("SELECT count(*)::int AS count FROM copilot_usage_snapshots")).rows[0].count).toBe(1);
+      expect((await current.runtime.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(1);
+      expect((await restored.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(0);
     } finally {
-      await restored.close();
+      await restored?.end();
+      await current.operator.query(`DROP DATABASE IF EXISTS "${target}"`);
+      rmSync(filename, { force: true }); rmSync(`${filename}.json`, { force: true });
       await current.close();
     }
   });

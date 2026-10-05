@@ -1,21 +1,22 @@
 import { useRef, type ReactNode, type RefObject } from "react";
 import { Search, X } from "lucide-react";
-import type { OfficialUsageUserView } from "../api/client";
+import type { ReportQuery } from "../../../backend/src/types/officialReportData";
 import { FilterPopover } from "./FilterPopover";
+import { ReportFacet } from "./ReportFacet";
 
-export type UserActivityFilterValues<Cohort extends string = OfficialUsageUserView["filters"]["cohort"]> = {
-  company: string;
-  department: string;
+export type UserActivityFilterValues<Cohort extends string = NonNullable<ReportQuery["cohort"]>> = {
+  company?: string | null;
+  department?: string | null;
   cohort: Cohort;
   lowResponseThreshold: string;
 };
 
-export function UserActivityFilters<Cohort extends string>({ values, companies, departments, cohorts, defaultCohort,
+export function UserActivityFilters<Cohort extends string>({ values, path, selectionId, cohorts, defaultCohort,
   cohortLabel = "Agent responses", searchLabel = "Search reported users or agents", search, searchRef, sort, sorts, matchingCount,
-  loading, validThreshold, agent, onChange, onSearch, onSort, onClear, onClearAgent, exportButton }: {
+  loading, validThreshold, agent, onChange, onSearch, onSort, onClear, onClearAgent, onRestartSelection, exportButton }: {
   values: UserActivityFilterValues<Cohort>;
-  companies: string[];
-  departments: string[];
+  path: string;
+  selectionId?: string;
   cohorts: readonly { value: Cohort; label: string }[];
   defaultCohort: Cohort;
   cohortLabel?: string;
@@ -33,17 +34,17 @@ export function UserActivityFilters<Cohort extends string>({ values, companies, 
   onSort: (value: string) => void;
   onClear: () => void;
   onClearAgent?: () => void;
+  onRestartSelection: () => void;
   exportButton?: ReactNode;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
-  const firstField = useRef<HTMLSelectElement>(null);
   const fields = [
-    { key: "company", label: "Company", all: "All companies", options: companies },
-    { key: "department", label: "Department", all: "All departments", options: departments },
+    { key: "company", label: "Company" },
+    { key: "department", label: "Department" },
   ] as const;
-  const chips: { key: string; label: string; value: string; remove: () => void }[] = fields.filter(field => values[field.key]).map(field => ({
-    key: field.key, label: field.label, value: values[field.key],
-    remove: () => onChange({ ...values, [field.key]: "" }),
+  const chips: { key: string; label: string; value: string; remove: () => void }[] = fields.filter(field => values[field.key] !== undefined).map(field => ({
+    key: field.key, label: field.label, value: values[field.key] ?? "Not reported",
+    remove: () => onChange({ ...values, [field.key]: undefined }),
   }));
   if (values.cohort !== defaultCohort) chips.push({
     key: "cohort", label: cohortLabel, value: cohorts.find(item => item.value === values.cohort)!.label,
@@ -74,17 +75,8 @@ export function UserActivityFilters<Cohort extends string>({ values, companies, 
       </div>
       <FilterPopover label="Filter users" activeCount={chips.length} triggerRef={trigger}>
         <div className="agent-filter-fields">
-          {fields.map((field, index) => <label key={field.key}>
-            <span>{field.label}</span>
-            <select ref={index === 0 ? firstField : undefined} value={values[field.key]}
-              className={values[field.key] ? "active-filter-select" : undefined}
-              onChange={event => onChange({ ...values, [field.key]: event.target.value })}>
-              <option value="">{field.all}</option>
-              {values[field.key] && !field.options.includes(values[field.key])
-                ? <option value={values[field.key]}>{values[field.key]}</option> : null}
-              {field.options.map(value => <option key={value} value={value}>{value}</option>)}
-            </select>
-          </label>)}
+          {fields.map(field => <ReportFacet key={field.key} compact path={path} selectionId={selectionId}
+            field={field.key} value={values[field.key]} onChange={value => onChange({ ...values, [field.key]: value })} onRestartSelection={onRestartSelection} />)}
           <label><span>{cohortLabel}</span><select value={values.cohort} className={values.cohort === defaultCohort ? undefined : "active-filter-select"}
             onChange={event => {
               const choice = cohorts.find(item => item.value === event.target.value);
@@ -98,7 +90,7 @@ export function UserActivityFilters<Cohort extends string>({ values, companies, 
           </select></label>
         </div>
         <footer><button type="button" className="secondary" disabled={!hasFilters} onClick={() => {
-          onClear(); firstField.current?.focus();
+          onClear(); trigger.current?.focus();
         }}>Reset filters</button></footer>
       </FilterPopover>
       {exportButton}

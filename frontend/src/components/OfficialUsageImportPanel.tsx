@@ -1,464 +1,328 @@
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import { useCallback, useContext, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import { CheckCircle2, FileText, LoaderCircle, Upload, XCircle } from "lucide-react";
-import {
-  ApiError,
-  acceptOfficialUsageBundle,
-  confirmOfficialUsageSetOperation,
-  discardOfficialUsageStaging,
-  getOfficialUsageAdminState,
-  getOfficialUsageAggregate,
-  previewOfficialUsageBundle,
-  previewOfficialUsageSetOperation,
-  stageOfficialUsageReport,
-  type OfficialUsageAggregateView,
-  type OfficialUsageBundlePreview,
-  type OfficialUsageStagingPreview,
-} from "../api/client";
-import { useSavedRead } from "../savedQueries";
-import { companionMetadata, errorMessage, kindLabel, type FileValidation } from "./officialUsageImportPresentation";
-import { usageCount, usageDate } from "../usageInsights";
+import type { OfficialReportPreview, OfficialReportBundlePreview, OfficialReportAccepted,
+  OfficialReportBundleAcceptance, OfficialReportConfirmation } from "../../../backend/src/types/officialReportApi";
+import type { ReportAgent, ReportPage } from "../../../backend/src/types/officialReportData";
+import { acceptReportBundle, confirmReportOperation, discardReportStage, previewReportBundle, previewReportOperation,
+  readReportStage, stageReport, reportPages, type ReportUploadMetadata } from "../api/reportData";
+import { ApiError } from "../api/client";
+import { CapabilityContext } from "../capabilityContext";
+import { hasRole } from "../authorization";
+import { useReportPrincipalScope } from "../useReportPage";
+import { usageCount } from "../usageInsights";
+import { companionMetadata, kindLabel } from "./officialUsageImportPresentation";
 import "./officialUsage.css";
 
-const reportGuideUrl = "https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide";
-const reportKinds = ["agents", "userAgents", "users"] as const;
-type Phase = "files" | "checking" | "saving" | "verifying" | "complete" | "cancelling";
-type Recovery = "validate" | "accept" | "verify" | "select" | "resume" | "cancel";
-type Accepted = Awaited<ReturnType<typeof acceptOfficialUsageBundle>>;
-type Draft = {
-  bundleId: string;
-  correctionOfSetId?: string;
-  metadata: ReturnType<typeof companionMetadata>;
-};
-
 export type OfficialUsageImportHandle = { dismiss: () => void };
+type Props = { ref?: Ref<OfficialUsageImportHandle>; initialStagingId?: string; initialBundleId?: string; correctionOfSetId?: string;
+  onChanged: () => void; onDone: (setId: string) => void; onCancel: () => void; onStaged?: (stagingId?: string) => void };
+type CheckedFile = { name: string; size: number; preview?: OfficialReportPreview; error?: string };
+type Recovery = "resume" | "bundle" | "acceptance" | "verify" | "fresh";
+type Busy = "uploading" | "resuming" | "accepting" | "verifying" | "discarding" | "selecting";
+type Verified = Pick<ReportPage<ReportAgent>, "reports" | "summary">;
+const kinds = ["agents", "userAgents", "users"] as const;
 
-export function OfficialUsageImportPanel({
-  ref, initialStagingId, initialBundleId, onChanged, onDone, onCancel,
-}: {
-  ref?: Ref<OfficialUsageImportHandle>;
-  initialStagingId?: string;
-  initialBundleId?: string;
-  onChanged: () => void;
-  onDone: (setId: string) => void;
-  onCancel: () => void;
-}) {
-  const [phase, setPhase] = useState<Phase>("files");
-  const [files, setFiles] = useState<FileValidation[]>([]);
-  const [preview, setPreview] = useState<OfficialUsageBundlePreview>();
-  const [accepted, setAccepted] = useState<Accepted>();
-  const [report, setReport] = useState<OfficialUsageAggregateView>();
-  const [problem, setProblem] = useState<{ text: string; recovery?: Recovery; denied?: boolean }>();
+export function OfficialUsageImportPanel(props: Props) {
+  const capability = useContext(CapabilityContext), principal = useReportPrincipalScope();
+  if (capability && !hasRole(capability.user, "AgentControl.Admin")) return <section className="official-usage-import" aria-label="Import CSV reports">
+    <div className="usage-import-body"><p role="alert">Current Admin access is required to import reports.</p></div>
+    <footer className="usage-import-footer"><button type="button" onClick={props.onCancel}>Back to Sync</button></footer></section>;
+  return <ImportFlow key={JSON.stringify([principal, props.initialStagingId, props.initialBundleId, props.correctionOfSetId])} {...props} />;
+}
+function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId, onChanged, onDone, onCancel, onStaged }: Props) {
+  const [files, setFiles] = useState<CheckedFile[]>([]), [bundle, setBundle] = useState<OfficialReportBundlePreview>();
+  const [accepted, setAccepted] = useState<OfficialReportAccepted>(), [verified, setVerified] = useState<Verified>();
+  const [attempt, setAttempt] = useState<{ bundleId: string; input: OfficialReportBundleAcceptance }>();
+  const [selection, setSelection] = useState<OfficialReportConfirmation>();
+  const [busy, setBusy] = useState<Busy>(), [error, setError] = useState<string>(), [recovery, setRecovery] = useState<Recovery>();
+  const [metadata, setMetadata] = useState<ReportUploadMetadata>({});
   const [dragging, setDragging] = useState(false);
-  const [restored, setRestored] = useState(false);
-  const [correcting, setCorrecting] = useState(false);
-  const [restoreRevision, setRestoreRevision] = useState(0);
-  const fileInput = useRef<HTMLInputElement>(null);
-  const pickerButton = useRef<HTMLButtonElement>(null);
-  const statusHeading = useRef<HTMLHeadingElement>(null);
-  const draft = useRef<Draft | undefined>(undefined);
-  const stages = useRef(new Map<string, OfficialUsageStagingPreview>());
-  const receipt = useRef<OfficialUsageBundlePreview | undefined>(undefined);
-  const saved = useRef<Accepted | undefined>(undefined);
-  const recovery = useRef<Recovery>("validate");
-  const currentPhase = useRef<Phase>("files");
-  const busy = useRef(false);
-  const cancelling = useRef(false);
-  const pending = useRef<Promise<void> | undefined>(undefined);
-  const lifetime = useRef<AbortController | undefined>(undefined);
-  const upload = useRef<AbortController | undefined>(undefined);
-  const readSaved = useSavedRead();
-
-  function changePhase(next: Phase) {
-    currentPhase.current = next;
-    setPhase(next);
-  }
-
-  function live() {
-    return Boolean(lifetime.current && !lifetime.current.signal.aborted);
-  }
-
-  function reportFailure(error: unknown) {
-    if (!live() || cancelling.current) return;
-    const denied = error instanceof ApiError && (error.status === 401 || error.status === 403);
-    if (denied) {
-      setFiles([]);
-      setPreview(undefined);
-      setReport(undefined);
-      setCorrecting(false);
-    }
-    const context = saved.current ? "Your reports were saved, but we couldn't open them yet. "
-      : receipt.current ? "We couldn't confirm whether the import finished. Retry to check; don't upload the files again. "
-        : "";
-    setProblem({ text: `${context}${errorMessage(error)}`, recovery: denied ? undefined : recovery.current, denied });
-    changePhase("files");
-  }
-
-  function run(work: () => Promise<void>) {
-    if (busy.current || !live()) return;
-    busy.current = true;
-    setProblem(undefined);
-    const task = work().catch(reportFailure).finally(() => { busy.current = false; });
-    pending.current = task;
-  }
-
+  const [cancelConfirm, setCancelConfirm] = useState(false), [denied, setDenied] = useState(false);
+  const [correction, setCorrection] = useState(correctionOfSetId);
+  const [initialId] = useState(() => initialBundleId ?? crypto.randomUUID());
+  const id = useRef(initialId), receipts = useRef(new Map<string, OfficialReportPreview>()), notified = useRef(false);
+  const lifetime = useRef<AbortController | undefined>(undefined), operation = useRef<AbortController | undefined>(undefined);
+  const work = useRef<Promise<void> | undefined>(undefined), picker = useRef<HTMLInputElement>(null);
+  const successTitle = useRef<HTMLHeadingElement>(null), previouslyReady = useRef(false);
+  const reviewTitle = useRef<HTMLHeadingElement>(null);
+  const readyToImport = Boolean(bundle?.complete && !busy && !accepted && !attempt && !recovery && !cancelConfirm);
+  useEffect(() => { if (readyToImport) reviewTitle.current?.focus(); }, [readyToImport]);
+  const cancelPrompt = useRef<HTMLElement>(null);
+  useEffect(() => { if (cancelConfirm) cancelPrompt.current?.focus(); }, [cancelConfirm]);
+  const readyToFinish = Boolean(verified && accepted && verified.reports.activeSetId === accepted.setId && !error);
   useEffect(() => {
-    const controller = new AbortController();
-    lifetime.current = controller;
-    cancelling.current = false;
-    if (initialStagingId || initialBundleId) {
-      void Promise.resolve().then(async () => {
-        if (controller.signal.aborted) return;
-        busy.current = true;
-        recovery.current = "resume";
-        changePhase("checking");
+    if (readyToFinish && !previouslyReady.current) successTitle.current?.focus();
+    previouslyReady.current = readyToFinish;
+  }, [readyToFinish]);
+  useLayoutEffect(() => {
+    const current = new AbortController(); lifetime.current = current;
+    return () => { current.abort(); operation.current?.abort(); };
+  }, []);
+  const failed = useCallback((cause: unknown, next?: Recovery, prefix = "") => {
+    if (cause instanceof ApiError && [401, 403].includes(cause.status)) {
+      setDenied(true); setFiles([]); setBundle(undefined); setAccepted(undefined); setVerified(undefined); setAttempt(undefined);
+      setSelection(undefined); setMetadata({}); receipts.current.clear(); setRecovery(undefined);
+    } else if (cause instanceof ApiError && cause.code === "staging_unavailable") {
+      setFiles([]); setBundle(undefined); setAttempt(undefined); setMetadata({});
+      receipts.current.clear(); setRecovery("fresh");
+    } else setRecovery(next);
+    setError(`${prefix}${cause instanceof Error ? cause.message : "The import could not be verified."}`);
+  }, []);
+  const begin = useCallback((kind: Busy, action: (signal: AbortSignal) => Promise<void>, failure: (cause: unknown) => void) => {
+    const life = lifetime.current;
+    if (!life || life.signal.aborted) return Promise.resolve();
+    operation.current?.abort();
+    const current = new AbortController(); operation.current = current;
+    setBusy(kind); setError(undefined);
+    const pending = (async () => {
+      try { await action(current.signal); }
+      catch (cause) { if (!life.signal.aborted && !current.signal.aborted) failure(cause); }
+      finally { if (!life.signal.aborted && operation.current === current) setBusy(undefined); }
+    })();
+    work.current = pending;
+    return pending;
+  }, []);
+  const remember = useCallback((row: OfficialReportPreview) => {
+    if (row.bundleId !== id.current || !receipts.current.has(row.id) && receipts.current.size >= 3
+      || [...receipts.current.values()].some(previous => previous.kind === row.kind && previous.id !== row.id)) {
+      throw new Error("The returned staging receipt does not belong to this bounded bundle.");
+    }
+    receipts.current.set(row.id, row);
+  }, []);
+  const checkedBundle = useCallback((value: OfficialReportBundlePreview) => {
+    if (value.bundleId !== id.current || value.stages.length > 3 || new Set(value.stages.map(stage => stage.kind)).size !== value.stages.length
+      || value.complete !== kinds.every(kind => value.stages.some(stage => stage.kind === kind))) throw new Error("The returned bundle does not contain a consistent set of companion kinds.");
+    return value;
+  }, []);
+  async function refreshBundle(signal: AbortSignal) {
+    const preview = checkedBundle(await previewReportBundle(id.current, signal));
+    signal.throwIfAborted(); setBundle(preview); setRecovery(undefined);
+    if (preview.stages[0]) onStaged?.(preview.stages[0].stagingId);
+    return preview;
+  }
+  const restore = useCallback(() => {
+    return begin("resuming", async signal => {
+      let first: OfficialReportPreview | undefined;
+      if (initialStagingId) {
+        first = await readReportStage(initialStagingId, signal); signal.throwIfAborted();
+        id.current = first.bundleId; remember(first);
+        setFiles([{ name: kindLabel(first.kind), size: first.wireBytes, preview: first }]);
+        setMetadata(companionMetadata(first)); setCorrection(first.correctionOfSetId ?? undefined);
+      }
+      const preview = checkedBundle(await previewReportBundle(id.current, signal)); signal.throwIfAborted();
+      receipts.current.clear();
+      const rows: CheckedFile[] = [];
+      for (const stage of preview.stages) {
+        const row = first?.id === stage.stagingId ? first : await readReportStage(stage.stagingId, signal);
+        signal.throwIfAborted(); remember(row); rows.push({ name: kindLabel(row.kind), size: row.wireBytes, preview: row });
+      }
+      setFiles(rows); setBundle(preview); setRecovery(undefined);
+      setMetadata(companionMetadata(first ?? rows[0]?.preview)); setCorrection((first ?? rows[0]?.preview)?.correctionOfSetId ?? correctionOfSetId);
+    }, cause => failed(cause, "resume"));
+  }, [begin, checkedBundle, correctionOfSetId, failed, initialStagingId, remember]);
+  useEffect(() => {
+    if (initialStagingId || initialBundleId) void restore();
+  }, [initialStagingId, initialBundleId, restore]);
+  function upload(selected: FileList | File[]) {
+    if (busy || denied || cancelConfirm || attempt || accepted || recovery === "resume" || recovery === "fresh") return;
+    if (!selected.length || selected.length + receipts.current.size > 3) {
+      setError("Select the remaining companion CSVs, at most three files per report set."); return;
+    }
+    const next = Array.from(selected);
+    const invalid = next.find(file => !file.size || file.size > 268435456 || !/\.csv$/i.test(file.name));
+    if (invalid) {
+      setError(`${invalid.name}: ${!invalid.size ? "This file is empty." : invalid.size > 268435456 ? "This file exceeds the 256 MiB limit." : "Choose a CSV file."}`); return;
+    }
+    setFiles(rows => rows.filter(row => row.preview)); setRecovery(undefined);
+    return begin("uploading", async signal => {
+      let rejected: unknown;
+      for (const file of next) {
+        setFiles(rows => [...rows.filter(row => row.preview), { name: file.name, size: file.size }]);
         try {
-          const state = await readSaved(["official-usage-admin"],
-            signal => getOfficialUsageAdminState({ signal }), controller.signal);
-          if (controller.signal.aborted) return;
-          const stage = initialStagingId
-            ? state.staging.find(item => item.id === initialStagingId && item.status === "active")
-            : undefined;
-          const set = initialBundleId
-            ? state.sets.find(item => item.bundleId === initialBundleId && !item.complete && !item.deletedAt)
-            : undefined;
-          if (!stage && !set) throw new Error("This saved import is no longer available. Choose the CSV files to start again.");
-          const bundleId = stage?.bundleId ?? set!.bundleId;
-          draft.current = { bundleId, correctionOfSetId: stage?.correctionOfSetId ?? set?.supersedesSetId ?? undefined,
-            metadata: companionMetadata(undefined, set, stage) };
-          const companions = state.staging.filter(item => item.bundleId === bundleId && item.status === "active");
-          for (const item of companions) {
-            stages.current.set(item.id, item);
-          }
-          setCorrecting(Boolean(draft.current.correctionOfSetId));
-          setRestored(true);
-          setFiles(companions.map(item => ({
-            file: { name: kindLabel(item.kind), size: 0 }, status: "validated", preview: item,
-          })));
-          const next = await previewOfficialUsageBundle(bundleId, { signal: controller.signal });
-          if (controller.signal.aborted || cancelling.current) return;
-          draft.current.metadata = companionMetadata(next, set, stage);
-          setPreview(next);
-          setFiles(next.staging.map(item => ({
-            file: { name: kindLabel(item.kind), size: 0 }, status: "validated", preview: item,
-          })));
-          changePhase("files");
-        } catch (error) {
-          if (!controller.signal.aborted) reportFailure(error);
-        } finally {
-          busy.current = false;
+          const row = await stageReport(file, { bundleId: id.current, correctionOfSetId: correction, rejectDuplicateKind: true }, metadata, signal);
+          remember(row);
+          signal.throwIfAborted();
+          setFiles(rows => [...rows.filter(row => row.preview), { name: file.name, size: file.size, preview: row }]);
+        } catch (cause) {
+          signal.throwIfAborted();
+          if (cause instanceof ApiError && [401, 403].includes(cause.status)) throw cause;
+          const message = `${file.name}: ${cause instanceof Error ? cause.message : "CSV validation failed."}`;
+          setFiles(rows => [...rows.filter(row => row.preview), { name: file.name, size: file.size, error: message }]);
+          rejected = cause instanceof ApiError ? new ApiError(cause.status, cause.code, message) : new Error(message);
+          break;
         }
-      });
-    }
-    return () => { controller.abort(); upload.current?.abort(); };
-    // A new dialog owns a new import; ordinary opening never resumes server staging.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialStagingId, initialBundleId, readSaved, restoreRevision]);
-
-  useEffect(() => {
-    if (phase === "complete" || problem) statusHeading.current?.focus({ preventScroll: true });
-  }, [phase, problem]);
-
-  async function verifyImport(allowSelectionChange = false) {
-    const result = saved.current;
-    if (!result) throw new Error("The import result is unavailable. Retry the import.");
-    recovery.current = "verify";
-    changePhase("verifying");
-    const signal = lifetime.current?.signal;
-    const [state, snapshot] = await Promise.all([
-      getOfficialUsageAdminState({ signal }),
-      getOfficialUsageAggregate({ setId: result.setId, limit: 1, offset: 0 }, { signal }),
-    ]);
-    if (!live()) return;
-    if (!result.complete || snapshot.activeSet?.id !== result.setId || !snapshot.activeSet.complete || snapshot.activeSet.deletedAt) {
-      throw new Error("This report set is no longer available. It may have been deleted.");
-    }
-    if (state.activeSetId !== result.setId) {
-      recovery.current = "select";
-      if (!allowSelectionChange && state.activeRevision !== result.activeRevision) {
-        throw new Error("The report selection changed. Select Use imported reports to view this set in Agents.");
       }
-      const selection = await previewOfficialUsageSetOperation(result.setId, "select");
-      if (!live()) return;
-      if (selection.expectedRevision !== state.activeRevision || selection.activeSetId !== state.activeSetId) {
-        throw new Error("The report selection changed. Try again to use your imported reports.");
+      if (receipts.current.size) {
+        try { await refreshBundle(signal); } catch (cause) { if (!rejected) throw cause; }
       }
-      await confirmOfficialUsageSetOperation(selection);
-      if (!live()) return;
-      onChanged();
-      const verified = await getOfficialUsageAdminState({ signal });
-      if (!live()) return;
-      if (verified.activeSetId !== result.setId) {
-        throw new Error("The report selection changed. Try again to use your imported reports.");
-      }
-    }
-    setReport(snapshot);
-    setProblem(undefined);
-    changePhase("complete");
+      signal.throwIfAborted();
+      if (rejected) throw rejected;
+    }, cause => failed(cause, receipts.current.size ? "bundle" : undefined));
   }
-
-  async function publish(next: OfficialUsageBundlePreview) {
-    if (!live() || cancelling.current) return;
-    receipt.current = next;
-    recovery.current = "accept";
-    changePhase("saving");
-    let result: Accepted;
-    try {
-      result = await acceptOfficialUsageBundle(next);
-    } catch (error) {
-      // An uncertain response must replay the same fenced request, not a new preview.
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
-        receipt.current = undefined;
-        recovery.current = "validate";
+  async function inspect(receipt: OfficialReportAccepted, signal: AbortSignal, finish = false) {
+    const data = await reportPages.agents({ setId: receipt.setId, limit: 1 }, signal); signal.throwIfAborted();
+    if (!receipt.complete || data.reports.setId !== receipt.setId || data.reports.lineages.length !== 3
+      || !kinds.every(kind => data.reports.lineages.some(lineage => lineage.kind === kind))) {
+      throw new Error("The complete accepted report set could not be verified. No current-report substitute is allowed.");
+    }
+    setVerified({ reports: data.reports, summary: data.summary }); setRecovery(undefined); setError(undefined);
+    if (!notified.current) { notified.current = true; onChanged(); }
+    if (finish) {
+      if (data.reports.activeSetId !== receipt.setId) setError("The shared report selection changed. Confirm use of the imported report before continuing.");
+      else onDone(receipt.setId);
+    }
+  }
+  function accept() {
+    if (busy || denied || cancelConfirm || !bundle?.complete && !attempt) return;
+    const admitted = attempt ?? { bundleId: bundle!.bundleId,
+      input: Object.freeze({ bundleHash: bundle!.bundleHash, expectedActiveRevision: bundle!.expectedActiveRevision }) };
+    setAttempt(admitted); setRecovery(undefined);
+    return begin("accepting", async signal => {
+      const receipt = await acceptReportBundle(admitted.bundleId, admitted.input, signal); signal.throwIfAborted();
+      setAccepted(receipt);
+      for (const [key, value] of receipts.current) receipts.current.set(key, { ...value, status: "accepted" });
+      try { await inspect(receipt, signal); }
+      catch (cause) {
+        signal.throwIfAborted(); setVerified(undefined); failed(cause, "verify", "Your reports were saved. ");
       }
-      throw error;
-    }
-    if (!live()) return;
-    saved.current = result;
-    receipt.current = undefined;
-    setAccepted(result);
-    setFiles([]);
-    onChanged();
-    await verifyImport();
-  }
-
-  async function validateAndImport() {
-    if (!draft.current || cancelling.current || !live()) return;
-    recovery.current = "validate";
-    changePhase("checking");
-    const next = await previewOfficialUsageBundle(draft.current.bundleId, { signal: lifetime.current?.signal });
-    if (!live() || cancelling.current) return;
-    setPreview(next);
-    if (next.missingKinds.length) {
-      changePhase("files");
-      return;
-    }
-    await publish(next);
-  }
-
-  async function uploadFiles(selected: File[]) {
-    if (!selected.length) return;
-    const kept = files.filter(item => item.status === "validated");
-    const available = 3 - kept.length - (preview?.acceptedVersions.length ?? 0);
-    if (selected.length > available) {
-      setProblem({ text: `Choose ${available === 3 ? "the three CSV exports" : `up to ${available} missing CSV ${available === 1 ? "export" : "exports"}`}, one per report type.` });
-      return;
-    }
-    draft.current ??= { bundleId: crypto.randomUUID(), metadata: {} };
-    const current = draft.current;
-    const controller = new AbortController();
-    upload.current = controller;
-    const entries: FileValidation[] = [...kept, ...selected.map(file => ({
-      file: { name: file.name, size: file.size }, status: "waiting" as const,
-    }))];
-    setFiles(entries);
-    changePhase("checking");
-    recovery.current = "validate";
-    for (const [index, file] of selected.entries()) {
-      if (!live() || cancelling.current) return;
-      const position = kept.length + index;
-      entries[position] = { ...entries[position], status: "validating" };
-      setFiles([...entries]);
-      try {
-        if (!file.name.toLowerCase().endsWith(".csv")) throw new Error("Choose a CSV file.");
-        if (!file.size) throw new Error("This file is empty. Export the report again.");
-        if (file.size > 8 * 1024 * 1024) throw new Error("This file exceeds the 8 MB limit.");
-        const stage = await stageOfficialUsageReport(file, {
-          bundleId: current.bundleId,
-          ...(current.correctionOfSetId ? { correctionOfSetId: current.correctionOfSetId } : {}),
-          ...current.metadata, rejectDuplicateKind: true,
-        }, { signal: controller.signal });
-        stages.current.set(stage.id, stage);
-        entries[position] = { file: entries[position].file, status: "validated", preview: stage };
-      } catch (error) {
-        if (!live() || cancelling.current) return;
-        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) throw error;
-        entries[position] = { file: entries[position].file, status: "rejected", error: errorMessage(error) };
-      }
-      if (!live() || cancelling.current) return;
-      setFiles([...entries]);
-    }
-    if (entries.some(item => item.status === "rejected")) {
-      changePhase("files");
-      return;
-    }
-    await validateAndImport();
-  }
-
-  async function discardDraft() {
-    if (!draft.current) return;
-    const state = await getOfficialUsageAdminState({ signal: lifetime.current?.signal });
-    if (!live()) return;
-    const active = [...new Map([
-      ...stages.current.values(),
-      ...state.staging.filter(item => item.bundleId === draft.current?.bundleId && item.status === "active"),
-    ].filter(item => !state.staging.some(known => known.id === item.id && known.status !== "active"))
-      .map(item => [item.id, item])).values()];
-    const outcomes = await Promise.allSettled(active.map(item => discardOfficialUsageStaging(item.id)));
-    if (!live()) return;
-    const failed = outcomes.flatMap((outcome, index) => {
-      if (outcome.status === "fulfilled") { stages.current.delete(active[index].id); return []; }
-      return [{ id: active[index].id, reason: outcome.reason }];
+    }, cause => {
+      if (cause instanceof ApiError && [400, 404, 409, 410, 413, 422, 429].includes(cause.status)) {
+        setAttempt(undefined); setBundle(undefined);
+        failed(cause, cause.code === "deleted_report_duplicate" ? "fresh" : "bundle");
+      } else failed(cause, "acceptance", "Acceptance may already have completed. ");
     });
-    if (failed.length) {
-      const refreshed = await getOfficialUsageAdminState({ signal: lifetime.current?.signal });
-      if (failed.some(item => !refreshed.staging.some(stage => stage.id === item.id && stage.status !== "active"))) {
-        throw new Error(`Some uploaded files could not be removed. ${errorMessage(failed[0].reason)}`);
+  }
+  function verify(finish = false) {
+    if (!accepted || busy || denied) return;
+    const receipt = accepted;
+    setVerified(undefined); setSelection(undefined);
+    return begin("verifying", signal => inspect(receipt, signal, finish), cause => failed(cause, "verify", "Your reports were saved. "));
+  }
+  function prepareImportedSelection() {
+    if (!accepted || !verified || busy || denied) return;
+    const expected = verified.reports, receipt = accepted;
+    return begin("selecting", async signal => {
+      const next = await previewReportOperation(receipt.setId, "select", signal); signal.throwIfAborted();
+      if (next.setId !== receipt.setId || next.operation !== "select" || next.activeRevision !== expected.activeRevision
+        || next.historyRevision !== expected.historyRevision || next.historyEpoch !== expected.historyEpoch) {
+        throw new Error("The shared report selection changed. Verify the saved import before preparing a new confirmation.");
       }
-    }
-    stages.current.clear();
-    draft.current = undefined;
+      setSelection(next);
+    }, cause => failed(cause, "verify"));
   }
-
-  async function cancelImport(restart = false) {
-    if (!live() || ["saving", "verifying", "cancelling"].includes(currentPhase.current)) return;
-    if (saved.current || receipt.current || problem?.denied) { onCancel(); return; }
-    cancelling.current = true;
-    changePhase("cancelling");
-    upload.current?.abort();
-    await pending.current;
-    if (!live()) return;
-    try {
-      await discardDraft();
-      if (!live()) return;
-      if (!restart) { onCancel(); return; }
-      cancelling.current = false;
-      setFiles([]);
-      setPreview(undefined);
-      setProblem(undefined);
-      setRestored(false);
-      setCorrecting(false);
-      changePhase("files");
-      requestAnimationFrame(() => pickerButton.current?.focus());
-    } catch (error) {
-      if (!live()) return;
-      setProblem({ text: `The import couldn't be cancelled. ${errorMessage(error)}`, recovery: "cancel" });
-      changePhase("files");
-    }
+  function confirmSelection() {
+    if (!accepted || !selection || busy || denied) return;
+    const confirmation = selection, receipt = accepted;
+    setSelection(undefined);
+    return begin("selecting", async signal => {
+      await confirmReportOperation(confirmation, signal); signal.throwIfAborted(); await inspect(receipt, signal);
+    }, cause => { setVerified(undefined); failed(cause, "verify", "Selection may already have changed. Verify its outcome; do not replay this confirmation. "); });
   }
-
   function dismiss() {
-    if (phase === "complete" && accepted) finish();
-    else void cancelImport();
+    if (accepted && busy) return;
+    if (busy === "accepting" || attempt && !accepted && !denied) {
+      setError("Acceptance may already have completed. Verify its outcome before discarding staged files."); return;
+    }
+    if (accepted && verified) {
+      if (verified.reports.activeSetId === accepted.setId) void verify(true);
+      else onCancel();
+      return;
+    }
+    if (!accepted && (receipts.current.size || busy)) setCancelConfirm(true); else onCancel();
   }
   useImperativeHandle(ref, () => ({ dismiss }));
-
-  function finish() {
-    run(async () => {
-      await verifyImport();
-      if (live() && saved.current) onDone(saved.current.setId);
-    });
+  function discard() {
+    if (busy === "accepting" || attempt && !accepted || denied) return;
+    const pending = work.current;
+    operation.current?.abort();
+    setBundle(undefined);
+    return begin("discarding", async signal => {
+      await pending; signal.throwIfAborted();
+      const current = checkedBundle(await previewReportBundle(id.current, signal)); signal.throwIfAborted();
+      for (const stage of current.stages) {
+        const receipt = await readReportStage(stage.stagingId, signal); signal.throwIfAborted();
+        if (receipt.bundleId !== id.current) throw new Error("Cancellation receipt belongs to another bundle.");
+        if (receipt.status !== "accepted") await discardReportStage(receipt.id, signal);
+        signal.throwIfAborted(); receipts.current.delete(receipt.id);
+        setFiles(rows => rows.filter(row => row.preview?.id !== receipt.id));
+      }
+      receipts.current.clear();
+      onCancel();
+    }, cause => failed(cause));
   }
-
-  function retry() {
-    if (problem?.recovery === "cancel") { void cancelImport(); return; }
-    if (problem?.recovery === "resume") {
-      setProblem(undefined);
-      setRestoreRevision(value => value + 1);
-      return;
-    }
-    run(async () => {
-      if (saved.current) await verifyImport(problem?.recovery === "select");
-      else if (receipt.current) await publish(receipt.current);
-      else if (draft.current) await validateAndImport();
-      else throw new Error("Choose the CSV files to start a new import.");
-    });
-  }
-
-  const working = phase !== "files" && phase !== "complete";
-  const uncertain = problem?.recovery === "accept";
-  const canChoose = phase === "files" && !accepted && !uncertain && !problem?.denied && problem?.recovery !== "cancel";
-  const rejected = files.some(item => item.status === "rejected");
-  const present = new Set([
-    ...files.flatMap(item => item.preview ? [item.preview.kind] : []),
-    ...(preview?.acceptedVersions.map(item => item.kind) ?? []),
-  ]);
-  const missing = reportKinds.filter(kind => !present.has(kind));
-  const reportingPeriod = report?.activeSet?.reportingPeriod;
-  const pickerLabel = rejected ? "Choose replacement CSVs" : files.length || restored ? "Add CSV files" : "Choose CSV files";
-  const status = phase === "checking" ? "Checking CSV files..."
-    : phase === "saving" ? "Importing reports..."
-      : phase === "verifying" ? "Verifying import..."
-        : phase === "cancelling" ? "Cancelling import..." : undefined;
-
-  return <section className="official-usage-import" aria-label="CSV report import" aria-busy={working}>
+  const present = files.filter(file => file.preview), missing = kinds.filter(kind => !present.some(file => file.preview?.kind === kind));
+  const selected = Boolean(verified && accepted && verified.reports.activeSetId === accepted.setId);
+  const summary = verified && selected && !error;
+  const canChoose = !accepted && !attempt && recovery !== "resume" && recovery !== "fresh" && missing.length > 0;
+  const status = busy === "uploading" ? "Checking CSV files..."
+    : busy === "resuming" ? "Loading your reports..."
+      : busy === "accepting" ? "Importing reports..."
+        : busy === "discarding" ? "Cancelling import..."
+          : busy ? "Verifying import..." : undefined;
+  if (denied) return <section className="official-usage-import" aria-label="Import CSV reports">
+    <div className="usage-import-body"><p role="alert">{error}</p></div>
+    <footer className="usage-import-footer"><button type="button" onClick={onCancel}>Back to Sync</button></footer></section>;
+  return <section className="official-usage-import" aria-label="Import CSV reports" aria-busy={Boolean(busy)}>
     <div className="usage-import-body">
-      {phase === "complete" ? <div className="usage-import-success">
-        <CheckCircle2 size={44} aria-hidden="true" />
-        <h3 ref={statusHeading} tabIndex={-1}>{accepted?.reusedExistingSet ? "Reports already imported" : "Reports imported"}</h3>
-        <p role="status">{accepted?.reusedExistingSet ? "No duplicate was created. " : ""}Your report set is ready in Agents.</p>
-        {report ? <dl className="usage-import-statistics" aria-label="Imported CSV summary">
-          <div><dt>Agents</dt><dd>{usageCount(report.lineages.find(lineage => lineage.kind === "agents")?.rowCount)}</dd></div>
-          <div><dt>Users</dt><dd>{usageCount(report.lineages.find(lineage => lineage.kind === "users")?.rowCount)}</dd></div>
-          <div><dt>Responses</dt><dd>{usageCount(report.summary.usage.totalResponses)}</dd></div>
-        </dl> : null}
-        {reportingPeriod?.startDate && reportingPeriod.endDate ? <p className="usage-import-dates">
-          {reportingPeriod.provenance === "activity_range" ? "Observed activity" : "Reporting period"}:{" "}
-          {usageDate(reportingPeriod.startDate)} to {usageDate(reportingPeriod.endDate)}
-        </p> : null}
+    {summary ? <div className="usage-import-success"><CheckCircle2 size={44} aria-hidden="true" /><h3 ref={successTitle} tabIndex={-1}>Reports imported</h3><p role="status">Your report set is ready in Agents.</p><section aria-label="Imported CSV summary"><dl className="usage-import-statistics">
+      <div><dt>Agents</dt><dd>{usageCount(verified.reports.lineages.find(lineage => lineage.kind === "agents")?.rowCount)}</dd></div>
+      <div><dt>Users</dt><dd>{usageCount(verified.reports.lineages.find(lineage => lineage.kind === "users")?.rowCount)}</dd></div>
+      <div><dt>Responses</dt><dd>{usageCount(verified.summary.reportedResponses)}</dd></div></dl></section>
       </div> : <>
-        {problem ? <div className="report-status error" role="alert">
-          <h3 ref={statusHeading} tabIndex={-1}>{accepted ? "Reports saved" : "Import needs attention"}</h3>
-          <p>{problem.text}</p>
-        </div> : null}
-        {status ? <p className="usage-import-progress" role="status"><LoaderCircle size={20} aria-hidden="true" />{status}</p> : null}
-        {files.length ? <ul className="usage-upload-files" aria-label="Selected CSV files">
-          {files.map((entry, index) => <li key={`${entry.file.name}-${index}`} data-status={entry.status}>
-            {entry.status === "validated" ? <CheckCircle2 size={20} aria-hidden="true" />
-              : entry.status === "rejected" ? <XCircle size={20} aria-hidden="true" />
-                : <FileText size={20} aria-hidden="true" />}
-            <div><strong>{entry.file.name}</strong>
-              <span>{entry.status === "validated" && entry.preview
-                ? `${kindLabel(entry.preview.kind)} · ${entry.preview.rowCount.toLocaleString()} rows`
-                : entry.status === "waiting" ? "Waiting" : entry.status === "validating" ? "Checking..." : "Could not import"}</span>
-              {entry.error ? <p role="alert">{entry.error}</p> : null}
-            </div>
-          </li>)}
-        </ul> : null}
-        {restored && preview?.acceptedVersions.length ? <p className="usage-import-hint">
-          Already saved: {preview.acceptedVersions.map(item => kindLabel(item.kind)).join(", ")}.
-        </p> : null}
-        {correcting ? <p className="usage-context-warning">
-          This saved import replaces an earlier report set. Start over to add a separate report set instead.
-        </p> : null}
-        {canChoose && missing.length ? <>
-          {files.length || restored ? <p className="usage-import-hint">Still needed: {missing.map(kindLabel).join(", ")}.</p> : null}
-          <div className={`usage-upload-zone${dragging ? " is-dragging" : ""}`}
-            onDragOver={event => { event.preventDefault(); setDragging(true); }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={event => {
-              event.preventDefault();
-              setDragging(false);
-              const selected = [...event.dataTransfer.files];
-              run(() => uploadFiles(selected));
-            }}>
-            <Upload size={28} aria-hidden="true" />
-            <strong>{files.length || restored ? "Add the remaining reports" : "Drop your three CSV exports here"}</strong>
-            <span>Agents, Users &amp; agents, and Users</span>
-            <input ref={fileInput} hidden aria-label="Official usage CSV files" type="file" accept=".csv,text/csv" multiple
-              onChange={event => {
-                const selected = [...(event.currentTarget.files ?? [])];
-                event.currentTarget.value = "";
-                run(() => uploadFiles(selected));
-              }} />
-            <button ref={pickerButton} type="button" onClick={() => fileInput.current?.click()}>{pickerLabel}</button>
-            <small>CSV files, up to 8 MB each</small>
-          </div>
-          <p className="usage-import-hint">Use the same Microsoft 365 reporting period for all three files. Valid reports import automatically and become the selected set in Agents and Users.</p>
-          <a className="usage-export-help" href={reportGuideUrl} target="_blank" rel="noreferrer">Where to download these reports</a>
-        </> : null}
-        {canChoose && !missing.length && rejected ? <p className="usage-import-hint">
-          An extra file duplicates a report type. Start over and choose one CSV for each report.
-        </p> : null}
-      </>}
+      {error ? <div className="report-status error" role="alert"><h3>{accepted ? "Reports saved" : "Import needs attention"}</h3><p>{error}</p>
+        {recovery === "fresh" ? <p>Cancel this import and add the three CSV files again.</p> : null}</div> : null}
+      {status ? <p className="usage-import-progress" role="status"><LoaderCircle size={20} aria-hidden="true" />{status}</p> : null}
+      {bundle && !accepted && !busy && !recovery ? <section aria-label="Confirm report import">
+        <h3 ref={reviewTitle} tabIndex={-1}>{bundle.complete ? "Ready to import" : "Add the remaining reports"}</h3>
+        <p className="usage-import-hint">{bundle.complete ? "All three reports are ready to add." : `Still needed: ${missing.map(kindLabel).join(", ")}.`}</p>
+      </section> : null}
+      {files.length && !accepted ? <ul className="usage-upload-files" aria-label="Selected CSV files">{files.map(file => <li key={file.preview?.id ?? file.name}
+        data-status={file.preview ? "validated" : file.error ? "rejected" : "validating"}>
+        {file.preview ? <CheckCircle2 size={20} aria-hidden="true" /> : file.error ? <XCircle size={20} aria-hidden="true" /> : <FileText size={20} aria-hidden="true" />}
+        <div><strong>{file.name}</strong><span>{file.preview
+          ? `${kindLabel(file.preview.kind)} - ${file.preview.rowCount.toLocaleString()} ${file.preview.rowCount === 1 ? "row" : "rows"}`
+          : file.error ? "Could not import" : "Checking..."}</span></div>
+      </li>)}</ul> : null}
+      {correction && !accepted ? <p className="usage-context-warning" role="status">This import replaces the saved report and invalidates its existing history and exports.</p> : null}
+      {canChoose ? <>
+        <div className={`usage-upload-zone${dragging ? " is-dragging" : ""}`}
+          onDragOver={event => { event.preventDefault(); if (!busy && !cancelConfirm) setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={event => { event.preventDefault(); setDragging(false); void upload(event.dataTransfer.files); }}>
+          <Upload size={28} aria-hidden="true" />
+          <strong>{present.length ? "Add the remaining reports" : "Drop your three CSV exports here"}</strong>
+          <span>Agents, Users &amp; agents, and Users</span>
+          <input ref={picker} type="file" accept=".csv,text/csv" multiple hidden disabled={Boolean(busy || cancelConfirm)}
+            aria-label="CSV report files" onChange={event => { if (event.target.files) void upload(event.target.files); event.target.value = ""; }} />
+          <button type="button" disabled={Boolean(busy || cancelConfirm)} onClick={() => picker.current?.click()}>Choose CSV files</button>
+          <small>CSV files, up to 256 MiB each</small>
+        </div>
+        <p className="usage-import-hint">Use the same Microsoft 365 reporting period for all three files.</p>
+        <a className="usage-export-help" href="https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide"
+          target="_blank" rel="noreferrer">How to download official CSV reports</a>
+      </> : null}
+      {verified && accepted && !selected ? <><p>The imported report is saved, but another report is currently selected.</p>
+        <button type="button" disabled={Boolean(busy)} onClick={() => void prepareImportedSelection()}>Use imported reports</button></> : null}
+      {selection ? <section className="usage-import-section" aria-label="Confirm imported report selection"><p>This changes the shared current report to {selection.setId}, not existing pinned pages.</p>
+        <button type="button" disabled={Boolean(busy)} onClick={() => void confirmSelection()}>Confirm use of imported reports</button>
+        <button type="button" disabled={Boolean(busy)} onClick={() => setSelection(undefined)}>Cancel selection</button></section> : null}
+      {cancelConfirm ? <section ref={cancelPrompt} tabIndex={-1} className="usage-import-section" role="alertdialog" aria-label="Discard staged import"><p>Discard staged files and cancel the upload? Accepted sets are not deleted.</p>
+        <button type="button" disabled={busy === "discarding"} onClick={() => void discard()}>Discard staged import</button>
+        <button type="button" disabled={busy === "discarding"} onClick={() => {
+          setCancelConfirm(false);
+          if (!bundle && present.length) void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"));
+        }}>Continue import</button></section> : null}
+    </>}
     </div>
     <footer className="usage-import-footer">
-      {phase === "complete" && accepted ? <button type="button" onClick={finish}>OK</button> : <>
-        <button type="button" className="secondary" disabled={phase === "saving" || phase === "verifying" || phase === "cancelling"}
-          onClick={() => void cancelImport()}>{accepted || uncertain || problem?.denied ? "Back to Sync" : "Cancel"}</button>
-        {canChoose && (files.length > 0 || restored) ? <button type="button" className="secondary" onClick={() => void cancelImport(true)}>Start over</button> : null}
-        {problem?.recovery ? <button type="button" disabled={working} onClick={retry}>
-          {problem.recovery === "select" ? "Use imported reports" : "Retry"}
-        </button> : canChoose && restored && !missing.length ? <button type="button" onClick={() => run(validateAndImport)}>Continue import</button> : null}
+      {summary ? <button type="button" disabled={Boolean(busy)} onClick={() => void verify(true)}>OK</button> : <>
+        <button type="button" className="secondary" disabled={cancelConfirm || busy === "accepting" || Boolean(accepted && busy || attempt && !accepted)} onClick={dismiss}>Cancel import</button>
+        {recovery === "resume" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void restore()}>Reload saved draft</button> : null}
+        {recovery === "bundle" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"))}>Refresh bundle validation</button> : null}
+        {recovery === "acceptance" ? <button type="button" disabled={Boolean(busy)} onClick={() => void accept()}>Verify acceptance</button> : null}
+        {recovery === "verify" ? <button type="button" disabled={Boolean(busy)} onClick={() => void verify()}>Verify saved import</button> : null}
+        {bundle?.complete && !accepted && !attempt && !recovery ? <button type="button" disabled={!readyToImport} onClick={() => void accept()}>
+          {present.length === 3 && present.every(file => file.preview?.status === "accepted") ? "Verify saved report set" : "Import reports"}</button> : null}
       </>}
     </footer>
   </section>;

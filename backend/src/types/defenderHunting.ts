@@ -198,7 +198,7 @@ export type DefenderHuntingJob = {
   tokenMode: DefenderHuntingTokenMode;
   status: DefenderHuntingJobStatus;
   filters: DefenderHuntingFilters;
-  queryVersion: 1 | 2 | 3;
+  queryVersion: 3;
   retainedScopeId: string | null;
   localRequestId: string;
   providerRequestId: string | null;
@@ -232,7 +232,7 @@ export type DefenderHuntingSnapshot = {
   resultScope: DefenderHuntingResultScope;
   filters: DefenderHuntingFilters;
   sourceTable: "AgentsInfo" | "CloudAppEvents";
-  queryVersion: 1 | 2 | 3;
+  queryVersion: 3;
   requestedRange: { startDateTime: string; endDateTime: string };
   observedRange: { startDateTime: string; endDateTime: string } | null;
   unobservedRange: { startDateTime: string; endDateTime: string } | null;

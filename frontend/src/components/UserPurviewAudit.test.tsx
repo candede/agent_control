@@ -1,16 +1,16 @@
 import { createRef } from "react";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getCopilotUsageUsers } from "../api/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readReportDetail, readReportPage } from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
-import { copilotUsageFixture } from "../test/copilotUsageFixture";
+import { combinedUser, reportPage, reports, reportUser, selectionId } from "../test/reportDataFixture";
 import { CopilotUsersView } from "./CopilotUsersView";
-import { ReportedUserDetail } from "./ReportedUserDetail";
+import { UserDetailModal } from "./UserDetailModal";
 import { UserPurviewAudit } from "./UserPurviewAudit";
 
-vi.mock("../api/client", async original => ({
-  ...await original<typeof import("../api/client")>(), getCopilotUsageUsers: vi.fn(),
+vi.mock("../api/reportData", async original => ({
+  ...await original<typeof import("../api/reportData")>(), readReportPage: vi.fn(), readReportDetail: vi.fn(),
 }));
 vi.mock("./UserAgentResponsibility", () => ({ UserAgentResponsibility: () => null }));
 vi.mock("./PurviewAuditView", () => ({
@@ -29,16 +29,23 @@ function panel(userPrincipalName?: string, access = capability) {
 }
 
 beforeEach(() => {
-  vi.mocked(getCopilotUsageUsers).mockResolvedValue(copilotUsageFixture);
+  const user = combinedUser();
+  user.directory.displayName = "Ada"; user.directory.userPrincipalName = "ada@example.invalid";
+  vi.mocked(readReportPage).mockImplementation(async path => path.endsWith("/service-plans") ? reportPage([{
+    servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97", service: "M365_COPILOT_APPS", displayName: "Copilot in Productivity Apps",
+    state: "enabled", assignedDateTime: null, capabilityStatus: "Enabled",
+  }]) : path.endsWith("/agents") ? reportPage([]) : reportPage([user]));
+  vi.mocked(readReportDetail).mockResolvedValue({ value: user, reports, sources: reportPage([]).sources, selection: reportPage([]).selection });
   HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
   HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
 });
+afterEach(() => vi.resetAllMocks());
 
 describe("user audit entry point", () => {
   it("uses consistent lazy tabs, keyboard navigation and retained user-agent filters", async () => {
     const view = render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
-    const element = screen.getByRole("dialog", { name: "Ada" });
+    const element = await screen.findByRole("dialog", { name: "Ada" });
     const dialog = within(element);
     expect(dialog.getAllByRole("tab").map(tab => tab.textContent)).toEqual([
       "Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit",
@@ -52,7 +59,7 @@ describe("user audit entry point", () => {
     expect(dialog.getByRole("tab", { name: "Usage & agents" })).toHaveFocus();
     await userEvent.type(dialog.getByRole("searchbox", { name: "Search this user's agents" }), "research");
     await userEvent.click(dialog.getByRole("tab", { name: "Licenses" }));
-    expect(dialog.getByRole("list", { name: "Paid feature states" })).toBeVisible();
+    expect(await dialog.findByRole("list", { name: "Paid feature states" })).toBeVisible();
     await userEvent.click(dialog.getByRole("tab", { name: "Usage & agents" }));
     expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
     view.rerender(<CapabilityContext value={capability}><CopilotUsersView dataRevision={1} /></CapabilityContext>);
@@ -62,36 +69,46 @@ describe("user audit entry point", () => {
     await userEvent.keyboard("{End}");
     expect(dialog.getByRole("tab", { name: "Purview audit" })).toHaveFocus();
     expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    expect(dialog.getByLabelText("Scoped user search").closest("details")).toBeNull();
     await userEvent.keyboard("{Home}");
     expect(overview).toHaveFocus();
     expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
-    expect(element.querySelector("details")).toBeNull();
   });
 
   it("starts in the paid-user details modal and passes its verified directory identity", async () => {
     render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
-    const dialog = within(screen.getByRole("dialog", { name: "Ada" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "Ada" }));
     await userEvent.click(dialog.getByRole("tab", { name: "Purview audit" }));
     expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
     expect(window.location.pathname).not.toBe("/audit");
   });
 
   it("uses the verified directory link in reported-user details and blocks unlinked report identities", async () => {
-    const directory = copilotUsageFixture.users[0];
+    const directory = combinedUser();
+    directory.directory.displayName = "Ada"; directory.directory.userPrincipalName = "ada@example.invalid";
+    const user = reportUser(1, { username: "ada@example.invalid", displayName: "Ada" });
+    vi.mocked(readReportDetail).mockImplementation(async path => ({
+      value: path.endsWith("/directory") ? directory : user, reports, sources: reportPage([]).sources, selection: reportPage([]).selection,
+    }));
     const props = {
-      user: directory.importedUsage!, hasRelationships: true,
+      identity: "ada@example.invalid", selectionId, closeLabel: "Close reported user details",
       filters: { responsesOnly: false }, returnFocusTo: createRef<HTMLInputElement>(),
       onClose: vi.fn(), onFocusAgent: vi.fn(),
     };
-    const view = render(<CapabilityContext value={capability}><ReportedUserDetail {...props} directoryUser={directory} /></CapabilityContext>);
-    const dialog = within(screen.getByRole("dialog", { name: "Ada" }));
+    const view = render(<CapabilityContext value={capability}><UserDetailModal {...props} kind="report" /></CapabilityContext>);
+    const dialog = within(await screen.findByRole("dialog", { name: "Ada" }));
     await userEvent.click(dialog.getByRole("tab", { name: "Purview audit" }));
-    expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
-    view.rerender(<CapabilityContext value={capability}><ReportedUserDetail {...props} /></CapabilityContext>);
-    expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
-    expect(screen.getByText(/verified directory user principal name is required/)).toBeVisible();
+    expect(await dialog.findByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    const unlinked = reportUser(2, { username: "opaque-report-identity", objectId: null });
+    vi.mocked(readReportDetail).mockResolvedValue({
+      value: unlinked, reports, sources: reportPage([]).sources, selection: reportPage([]).selection,
+    });
+    view.rerender(<CapabilityContext value={capability}><UserDetailModal {...props} kind="report" identity={unlinked.username} /></CapabilityContext>);
+    await waitFor(() => expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument());
+    expect(await screen.findByText(/verified directory user principal name is required/)).toBeVisible();
+    expect(vi.mocked(readReportDetail).mock.calls.filter(([path]) => path.includes("opaque-report-identity") && path.endsWith("/directory"))).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
   });
 

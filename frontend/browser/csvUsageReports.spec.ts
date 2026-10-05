@@ -3,8 +3,9 @@ import { expect, test, type Page } from "@playwright/test";
 import { fixtureLoginUrl, isExternalFixtureRequest } from "./permissionFixtures";
 import { mockAutomaticRefresh } from "./automaticRefreshFixtures";
 import { csvFilePayloads } from "./usageCsvFixture";
+import type { OfficialReportAccepted } from "../../backend/src/types/officialReportApi";
 
-async function uploadBundle(page: Page, dates: [string, string, string], identity: string, expectedDuplicate = false) {
+async function uploadBundle(page: Page, dates: [string, string, string], identity: string, selectImported = false) {
   const section = page.getByRole("region", { name: "CSV usage reports", exact: true });
   await section.getByRole("button", { name: "Add CSV reports" }).click();
   const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
@@ -17,16 +18,25 @@ async function uploadBundle(page: Page, dates: [string, string, string], identit
     `Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nrange-${identity},Range agent,Your org,range-${identity}@example.invalid,7,${dates[1]}`,
     `Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nrange-${identity}@example.invalid,Range user,1,7,${dates[2]}`,
   ];
-  const accepted = page.waitForResponse(response => response.request().method() === "POST"
-    && /\/api\/official-usage\/bundles\/[^/]+\/accept$/.test(new URL(response.url()).pathname));
-  await modal.getByLabel("Official usage CSV files").setInputFiles(csvFilePayloads(
+  await modal.getByLabel("CSV report files").setInputFiles(csvFilePayloads(
     csvs.map((content, index) => ({ name: `range-${index}.csv`, content })),
   ));
+  const accept = modal.getByRole("button", { name: "Import reports", exact: true });
+  await expect(accept).toBeEnabled();
+  const accepted = page.waitForResponse(response => response.request().method() === "POST"
+    && /\/api\/official-usage\/bundles\/[^/]+\/accept$/.test(new URL(response.url()).pathname));
+  await accept.click();
   const response = await accepted;
   expect(response.ok()).toBe(true);
-  const result: { setId: string; reusedExistingSet: boolean } = await response.json();
-  expect(result.reusedExistingSet).toBe(expectedDuplicate);
-  await expect(modal.getByRole("heading", { name: expectedDuplicate ? "Reports already imported" : "Reports imported", exact: true })).toBeVisible();
+  const result: OfficialReportAccepted = await response.json();
+  expect(Object.keys(result).sort()).toEqual(["activeRevision", "complete", "setId"]);
+  expect(result.complete).toBe(true);
+  if (selectImported) {
+    await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+    await modal.getByRole("button", { name: "Use imported reports", exact: true }).click();
+    await modal.getByRole("button", { name: "Confirm use of imported reports", exact: true }).click();
+  }
+  await expect(modal.getByRole("heading", { name: "Reports imported", exact: true })).toBeVisible();
   await expect(modal.getByRole("status")).toContainText("Your report set is ready in Agents.");
   await expect(modal.getByLabel("Imported CSV summary").locator("dd")).toHaveText(["1", "1", "7"]);
   await expect(modal.getByRole("button")).toHaveText(["OK"]);
@@ -57,7 +67,8 @@ test("CSV section reflects retained observed activity dates across history after
   test.setTimeout(45_000);
   await context.route(isExternalFixtureRequest, route => route.abort());
   await mockAutomaticRefresh(page);
-  await page.goto(fixtureLoginUrl("available"));
+  // Official history is tenant-owned, so each viewport needs its own synthetic tenant, not merely a different actor.
+  await page.goto(fixtureLoginUrl("available", `fixture@csv-${info.project.name}.example.invalid`));
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   const reports = page.getByRole("region", { name: "CSV usage reports", exact: true });
@@ -95,7 +106,9 @@ test("CSV section reflects retained observed activity dates across history after
   await selector.getByRole("combobox").selectOption(first);
   await expect(selector.getByRole("combobox")).toBeEnabled();
   await expect(selector.getByRole("combobox")).toHaveValue(first);
+  await expect(selector.getByRole("button", { name: "Confirm report selection" })).toHaveCount(0);
   await expect(selector.getByRole("button")).toHaveCount(0);
+  await expect(selector.getByRole("navigation")).toHaveCount(0);
   await expect(page).toHaveURL(/\/agents$/);
   await navigation.getByRole("button", { name: "Users", exact: true }).click();
   await expect(selector.getByRole("combobox")).toHaveValue(first);
@@ -114,7 +127,7 @@ test("CSV section reflects retained observed activity dates across history after
   const reimported = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name);
   expect(reimported).not.toBe(first);
   await expect(reports.getByRole("heading", { name: "1 saved report set", exact: true })).toBeVisible();
-  const duplicate = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name, true);
+  const duplicate = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name);
   expect(duplicate).toBe(reimported);
   await expect(reports.getByRole("heading", { name: "1 saved report set", exact: true })).toBeVisible();
   await deleteBundle(page, reimported, "2026-01-02");

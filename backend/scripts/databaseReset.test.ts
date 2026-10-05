@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { databaseSettings } from "../src/db/pool.js";
 import { verifySchema } from "../src/db/schema.js";
-import { bootstrap, databaseOperatorFailure, grantRuntime, migrate, preflightMigrations } from "./database.js";
+import { bootstrap, databaseOperatorFailure, grantRuntime, initializeSchema, preflightSchema } from "./database.js";
 import { DatabaseResetError, preflightDatabaseReset, resetDatabase } from "./databaseReset.js";
 import { fixturePassword, testDatabase } from "./testDatabase.js";
 
@@ -40,10 +40,10 @@ describe.sequential("explicit application database reset", () => {
       await useDatabase(sibling.name, database => database.query("CREATE TABLE sibling_probe(id integer); INSERT INTO sibling_probe VALUES (9)"));
       await useDatabase(fixture.name, async database => {
         await bootstrap(database, fixturePassword);
-        await migrate(database);
+        await initializeSchema(database);
         await grantRuntime(database);
         await database.query("CREATE TABLE reset_probe(id integer); INSERT INTO reset_probe VALUES (7)");
-        await database.query("UPDATE schema_migrations SET checksum='retired-schema' WHERE version IN (5,33)");
+        await database.query("UPDATE app_schema SET fingerprint=repeat('0',64)");
       });
       const roleBefore = (await maintenance.query("SELECT oid FROM pg_roles WHERE rolname='agentcontrol_app'")).rows;
       expect(await preflightDatabaseReset(maintenance, fixture.name, fixture.name)).toEqual({ database: fixture.name, exists: true });
@@ -56,10 +56,10 @@ describe.sequential("explicit application database reset", () => {
         event: "database_operator_command", command: "reset", outcome: "succeeded", database: fixture.name, state: "fresh",
       });
       await useDatabase(fixture.name, async database => {
-        expect(await preflightMigrations(database)).toMatchObject({ state: "fresh", currentVersion: 0 });
+        expect(await preflightSchema(database)).toMatchObject({ state: "fresh", currentFingerprint: null });
         expect((await database.query("SELECT count(*)::int AS count FROM pg_class WHERE relnamespace='public'::regnamespace")).rows[0].count).toBe(0);
       });
-      await command(fixture.name, "migrate");
+      await command(fixture.name, "initialize");
       const runtime = new pg.Pool({ ...settings, database: fixture.name, user: "agentcontrol_app", password: fixturePassword });
       try {
         await verifySchema(runtime);
@@ -117,7 +117,7 @@ describe.sequential("explicit application database reset", () => {
     await maintenance.query(`DROP DATABASE "${fixture.name}"`);
     expect(await preflightDatabaseReset(maintenance, fixture.name, fixture.name)).toEqual({ database: fixture.name, exists: false });
     expect(await resetDatabase(maintenance, fixture.name, fixture.name)).toEqual({ database: fixture.name, state: "fresh" });
-    expect(await useDatabase(fixture.name, preflightMigrations)).toMatchObject({ state: "fresh" });
+    expect(await useDatabase(fixture.name, preflightSchema)).toMatchObject({ state: "fresh" });
   });
 
   it("serializes simultaneous explicit resets of the same database", async () => {
@@ -129,7 +129,7 @@ describe.sequential("explicit application database reset", () => {
       { database: fixture.name, state: "fresh" },
       { database: fixture.name, state: "fresh" },
     ]);
-    expect(await useDatabase(fixture.name, preflightMigrations)).toMatchObject({ state: "fresh" });
+    expect(await useDatabase(fixture.name, preflightSchema)).toMatchObject({ state: "fresh" });
   });
 
   it("reports destructive-phase failures without suggesting that data was preserved", () => {

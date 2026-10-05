@@ -4,14 +4,15 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
 import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
-import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
-import { usageOverviewFixture } from "../src/test/usageInsightsFixture";
-import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
-import { createUnifiedVerification } from "../src/test/inventoryVerification";
-import { projectAgentResponsibility } from "../../backend/src/services/agentResponsibility";
+import { selectedFixtureQuery, selectedFixtureRead, selectedFixtureReports, selectedHistoryPage, selectedLicensedUser, selectedOverviewPage, selectedUsersPage } from "../src/test/selectedUsageFixture";
+import { historySet, overviewAgent, reportAgent, reportPage, reportUser } from "../src/test/reportDataFixture";
+import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, ReportUser } from "../../backend/src/types/officialReportData";
+import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
+import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
+import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
+import { encodeInventoryFacet } from "../../backend/src/types/inventoryFacets";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
-  OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageUserView,
   PackagePage, PurviewAuditCatalog, PurviewAuditJob, PurviewAuditRecordPage, SessionUser,
   WorkbenchJobsResponse, UnifiedAgentInventoryPage,
 } from "../src/api/client";
@@ -53,30 +54,26 @@ const packages: PackagePage = {
     agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
     createdDateTime: "2026-08-01T00:00:00.000Z", lastModifiedDateTime: observedAt,
   })),
-  count: 3, summary: { total: 3, allowed: 2, blocked: 1 },
-  filteredSummary: { total: 3, allowed: 2, blocked: 1 },
-  facets: {
-    publishers: ["Synthetic Finance", "Synthetic Operations"].map(value => ({ value, label: value })),
-    availability: [{ value: "available:some", label: "Some users" }],
-    hosts: ["Teams", "Microsoft 365"].map(value => ({ value, label: value })),
-    platforms: [{ value: "Copilot Studio", label: "Copilot Studio" }],
-  },
-  snapshot: {
-    id: "11111111-1111-4111-8111-111111111111", tokenMode: "delegated", requestedIds: [],
-    observedCount: 3, totalRecords: 3, pageCount: 1, observedAt, expiresAt, scopeKind: "broad",
-  },
+  counts: { total: 3, scoped: 3, filtered: 3 },
+  selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1", evaluatedAt: observedAt, expiresAt },
+  page: { limit: 50, nextCursor: null, previousCursor: null },
+  freshness: { state: "current", capturedRevision: "1", sources: [] },
+  mode: "delegated",
 };
 
 const graphObservation = {
-  id: packages.snapshot!.id, snapshotId: packages.snapshot!.id,
+  id: "22222222-2222-4222-8222-222222222222", snapshotId: "22222222-2222-4222-8222-222222222222",
   observedAt, expiresAt, current: true as const,
   tokenMode: "delegated" as const, scopeKind: "broad" as const,
-  observedCount: packages.count, totalRecords: packages.count,
+  observedCount: packages.counts.total, totalRecords: packages.counts.total,
 };
 const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
 export const unifiedAgents: UnifiedAgentInventoryPage = {
+  ...inventoryPageMetadata({ total: 3, scoped: 3, filtered: 3, packageTargets: 3 }, expiresAt),
   inventoryScope: "catalog", scopeSummary: agentSummary,
-  revision: "a".repeat(64),
+  selection: { id: "33333333-3333-4333-8333-333333333333", revision: "1", evaluatedAt: observedAt, expiresAt },
+  page: { limit: 50, nextCursor: null, previousCursor: null },
+  counts: { total: 3, scoped: 3, filtered: 3, packageTargets: 3 },
   verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 0, logicalAgentCount: 3 }, { sourceScopes: false }, layoutTime),
   value: packages.value.map(item => ({
     id: `graph_packages:${item.id}`, displayName: item.displayName,
@@ -84,11 +81,8 @@ export const unifiedAgents: UnifiedAgentInventoryPage = {
     identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "Matching metadata has not been observed." },
     observations: { graphPackages: graphObservation, packageSnapshots: {}, powerPlatform: null },
   })),
-  count: 3, offset: 0, limit: 50, summary: agentSummary, filteredSummary: agentSummary,
-  facets: { environments: [], platforms: packages.facets.platforms, types: [
-    { value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" },
-    { value: "shared", label: "Shared in your organization" },
-  ] },
+  summary: agentSummary, filteredSummary: agentSummary,
+  inventoryOverview: { availableToUsers: 2, organizationCreated: 0, teamsAvailable: 2, createdOrAvailable: 2 },
   sources: {
     graphPackages: { state: "available", observation: graphObservation, error: null },
     powerPlatform: { state: "unavailable", observation: null, error: {
@@ -98,123 +92,80 @@ export const unifiedAgents: UnifiedAgentInventoryPage = {
   partial: true,
   errors: [{ source: "power_platform", code: "snapshot_unavailable", message: "Power Platform saved inventory is unavailable." }],
 };
+export const inventoryFacetFixtures = { environments: [] as Array<{ value: string; label: string }>,
+  platforms: [{ value: "Copilot Studio", label: "Copilot Studio" }], types: [
+    { value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" },
+    { value: "shared", label: "Shared in your organization" },
+  ], publishers: [...new Set(packages.value.map(item => item.publisher!))].map(value => ({ value, label: value })),
+  hosts: ["Teams", "Microsoft 365"].map(value => ({ value, label: value })),
+  availability: ["some", "none"].map(value => ({ value, label: value })) };
 
-const activeSet: NonNullable<OfficialUsageAggregateView["activeSet"]> = {
-  id: "55555555-5555-4555-8555-555555555555", bundleId: "66666666-6666-4666-8666-666666666666",
-  reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", provenance: "operator_asserted" }, supersedesSetId: null,
-  complete: true, kinds: ["agents", "userAgents", "users"], acceptedAt: observedAt,
-  deletedAt: null, createdAt: observedAt, expiresAt,
+export async function mockInventoryFacets(page: Page, values: Partial<Record<string, Array<{ value: string; label: string }>>>) {
+  await page.route(url => url.pathname === "/api/agent-inventory/facets", route => {
+    const query = new URL(route.request().url()).searchParams;
+    if (!Object.hasOwn(values, query.get("field") ?? "")) return route.fallback();
+    const options = values[query.get("field") ?? ""] ?? [];
+    const search = (query.get("search") ?? "").toLowerCase();
+    const selected = query.get("selected") === "true" ? inventoryFixtureQuery(route).get(query.get("field")!) : undefined;
+    const filtered = options.filter(option => selected !== undefined
+      ? encodeInventoryFacet(option.value) === selected : `${option.value} ${option.label}`.toLowerCase().includes(search));
+    return route.fulfill({ json: { value: filtered.slice(0, 50), total: filtered.length, nextCursor: null } });
+  });
+}
+
+const activeSet = historySet(1, { id: "55555555-5555-4555-8555-555555555555",
+  bundleId: "66666666-6666-4666-8666-666666666666", reportingStart: "2026-08-01", reportingEnd: "2026-08-30", acceptedAt: observedAt });
+const layoutReports: ReportMetadata = { ...selectedFixtureReports, setId: activeSet.id, activeSetId: activeSet.id,
+  activeRevision: "1", historyRevision: "1", historyEpoch: "1", periodAgeDays: 13, acceptedAgeDays: 0, acceptedAt: observedAt,
+  reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", days: 30, provenance: "operator_asserted" },
+  lineages: selectedFixtureReports.lineages.map(row => ({ ...row, rowCount: row.kind === "userAgents" ? 4 : 2 })),
 };
-const lineage: Pick<OfficialUsageAggregateView, "authority" | "availability" | "staleAfterDays" | "periodAgeDays" | "acceptedAgeDays" | "activeSet" | "lineages"> = {
-  authority: "Microsoft 365 admin center Copilot Agents usage exports",
-  availability: "active", staleAfterDays: 35, periodAgeDays: 13, acceptedAgeDays: 0, activeSet,
-  lineages: activeSet.kinds.map((kind, index) => ({
-    kind, versionId: `layout-version-${index}`, fileHash: `${index}`.repeat(64), parserVersion: "1",
-    schemaVersion: "m365-observed-v1", reportingPeriod: { ...activeSet.reportingPeriod, days: 30, provenance: "operator_asserted" },
-    sourceAsOfProvenance: "absent", sourceFreshness: "unknown", acceptedAt: observedAt,
-    rowCount: 2, warnings: ["Source as-of is absent from this export."], reconciliation: {}, supersedesVersionId: null,
-  })),
-};
-const topAgents: OfficialUsageAggregateView["summary"]["usage"]["topAgentsByResponses"] = packageNames.slice(0, 2).map((name, index) => ({
-  id: `layout-report-agent-${index + 1}`, name, status: "Report only", responses: 120 - index * 40, activeUsers: 2,
-  activeUsersBasis: "users_and_agents_distinct_identity", lastActivityDateUtc: "2026-08-30",
-  creatorType: "Your org", creatorTypeSource: "agents_report", identityStatus: "unresolved",
+const directory = selectedUsersPage();
+directory.reports = layoutReports;
+directory.sources.directory.rowCount = 6;
+directory.sources.directory.attemptObservedCount = 6;
+directory.counts.total = 6;
+directory.summary.checkedUsers = 6;
+const unpaidPeople = ["Alex Example", "Jamie Example"].map((name, index) => {
+  const row = selectedLicensedUser(index + 5, name, 120 - index * 40), username = `reader${index + 1}@example.invalid`;
+  return { ...row, directory: { ...row.directory, userPrincipalName: username, companyName: null, department: null },
+    copilotServiceState: "disabled" as const, servicePlanCount: 0, entitlement: "no_paid" as const,
+    reportedUsername: username, reportedAgentsUsed: 2, relationshipCount: 2 };
+});
+unifiedAgents.usageContext = { revision: "b".repeat(64), reports: layoutReports, expiresAt: layoutReports.expiresAt };
+const agentRows = packageNames.slice(0, 2).map((agentName, index) => reportAgent(index + 1, {
+  agentId: `layout-report-agent-${index + 1}`, agentName, creatorType: "Your org", responses: 120 - index * 40,
+  reportResponses: 120 - index * 40, bridgeResponses: 120 - index * 40, activeUsers: 2, relationshipCount: 2,
+  licensedUserOccurrences: null, unlicensedUserOccurrences: null, lastActivityDateUtc: "2026-08-30",
 }));
-const aggregate: OfficialUsageAggregateView = {
-  ...lineage, missingKinds: [],
-  filters: { sortBy: "responses", sortDirection: "desc", creatorTypes: ["Your org"] },
-  rankings: { mostResponses: topAgents, leastResponses: [...topAgents].reverse(), zeroResponseAgents: 0 },
-  summary: {
-    catalog: {
-      totalAgents: 3, allowedAgents: 2, blockedAgents: 1, inactiveAgents: 1, noImportedUsageAgents: 1,
-      statusDistribution: [{ name: "Allowed", value: 2 }, { name: "Blocked", value: 1 }],
-      availabilityDistribution: [{ name: "Some users", value: 2 }, { name: "No users", value: 1 }],
-      hostDistribution: [{ name: "Teams", value: 3 }, { name: "Microsoft 365", value: 2 }],
-      publisherDistribution: [{ name: "Synthetic Operations", value: 2 }, { name: "Synthetic Finance", value: 1 }],
-      platformDistribution: [{ name: "Copilot Studio", value: 3 }], typeDistribution: [{ name: "Agent", value: 3 }],
-    },
-    usage: {
-      hasAgentUsage: true, totalResponses: 200, totalResponsesBasis: "agents_report", totalResponsesCoverage: "agents_report_only",
-      totalActiveUsers: 2, totalActiveUsersBasis: "users_and_users_agents_distinct_identity",
-      responseReconciliation: { status: "matching", difference: 0, sourceValues: { agents: 200, userAgents: 200, users: 200 } },
-      activeUserReconciliation: { status: "matching", difference: 0, sourceValues: { users: 2, userAgents: 2 } },
-      creatorTypeDistribution: [{ name: "Your org", value: 2 }],
-      topAgentsByResponses: topAgents, topAgentsByActiveUsers: topAgents,
-      lastActivityRange: { earliest: "2026-08-01", latest: "2026-08-30" }, activeUsersAreNonAdditive: true,
-      reportedLicensedActiveUserOccurrences: null, reportedUnlicensedActiveUserOccurrences: null,
-      activeUserOccurrenceNotice: "Independent non-additive source categories.",
-    },
-    activityWindow: {
-      anchorDateUtc: "2026-08-30", activeAgents: 2, totalAgents: 2, activeUsers: 2, totalActiveUsers: 2,
-      responses: 200, totalResponses: 200, responseBasis: "agents_report",
-      agentDistribution: [{ name: "Active", value: 2 }], activeUserDistribution: [{ name: "Active", value: 2 }],
-      creatorTypeDistribution: [{ name: "Your org", value: 2 }], topAgentsByResponses: topAgents,
-    },
-  },
-  agents: {
-    value: topAgents.map(agent => ({
-      agentId: agent.id, agentName: agent.name, creatorType: agent.creatorType, activeUsersLicensed: null,
-      activeUsersUnlicensed: null, activeUsersTotal: 2, responsesSentToUsers: agent.responses,
-      lastActivityDateUtc: agent.lastActivityDateUtc, sourceReport: "agents", sourceReports: ["agents", "userAgents"],
-      activeUsersIdentityCount: 2, activeUsersTotalBasis: "userAgents_distinct_identity",
-      responseComparison: { status: "matching", difference: 0, sourceValues: { agents: agent.responses, userAgents: agent.responses } },
-      creatorTypeSource: "agents_report", identityStatus: "unresolved",
-    })),
-    count: 2, limit: 100, offset: 0,
-  },
-};
-const users: OfficialUsageUserView = {
-  ...lineage, filters: { creatorTypes: ["Your org"], companies: [], departments: [], activity: "all", responsesOnly: false, lowResponseThreshold: 5, cohort: "all", licenseCohort: "active_without_paid", sortBy: "responses", sortDirection: "desc" },
-  licenseCoverage: { state: "available", observedAt, activeReportUsers: 2, paidUsers: 0, unpaidUsers: 2, unknownUsers: 0, message: null },
-  counts: { users: 2, filteredUsers: 2, userRows: 2, accessRows: 2, reportOnlyRows: 2, totalResponsesReceived: 200, mismatchCount: 0 },
-  cohorts: { zeroResponses: 0, lowResponses: 0, reviewCandidates: 0, unknownUserMetrics: 0, missingBridgeRows: 0, threshold: 5 },
-  recencyAnchorDateUtc: "2026-08-30",
-  decisionNotice: "Confirm license assignments and full Copilot activity before reassignment.",
-  leastUsersByResponses: [],
-  topUsersByResponses: ["Alex Example", "Jamie Example"].map((displayName, index) => ({
-    username: `reader${index + 1}@example.invalid`, displayName, responses: 120 - index * 40, agentsUsed: 1,
-    responsesSource: "users", agentsUsedSource: "users", userLastActivityDateUtc: "2026-08-30",
-  })),
-  users: {
-    count: 2, limit: 100, offset: 0,
-    value: ["Alex Example", "Jamie Example"].map((displayName, index) => ({
-      username: `reader${index + 1}@example.invalid`, displayName, reportedAgentsUsed: 1,
-      reportedResponsesReceived: 120 - index * 40, userLastActivityDateUtc: "2026-08-30",
-      agentsAccessedTotal: 1, responseProducingAgentCount: 1, bridgeResponsesSentToUsers: 120 - index * 40,
-      missingUserReport: false, hasReportMismatch: false, creatorTypes: ["Your org"],
-      reviewCohort: "outside_threshold", reviewCandidate: false, licenseAssignmentStatus: "no_active_paid_license",
-      rows: [{
-        agentId: topAgents[index].id, agentName: topAgents[index].name, displayAgentName: topAgents[index].name,
-        creatorType: "Your org", username: `reader${index + 1}@example.invalid`, responsesSentToUsers: 120 - index * 40,
-        lastActivityDateUtc: "2026-08-30", packageStatus: "report-only", hasResponses: true,
-        identityStatus: "unresolved", creatorTypeSource: "users_and_agents_report",
-      }],
-      searchableText: `${displayName} ${topAgents[index].name}`,
-      datasetScope: { reportSetId: activeSet.id, usersVersionId: "layout-version-2", userAgentsVersionId: "layout-version-1" },
-    })),
-  },
-};
-const usageAdmin: OfficialUsageAdminState = { activeSetId: activeSet.id, activeRevision: 1, staging: [], sets: [activeSet] };
-const usageHistory: OfficialUsageHistoryView = {
-  summary: {
-    importCount: 1, uniqueObservationCount: 3, observationRowCount: 6, uniquePayloadCount: 6, repeatedRowsReused: 0,
-    earliestObservedAt: observedAt, latestObservedAt: observedAt,
-    activityDateRange: { earliestDateUtc: "2026-08-01", latestDateUtc: "2026-08-30", provenance: "last_activity_dates", provesReportingCoverage: false },
-    reportingWindows: { earliestStartDateUtc: "2026-08-01", latestEndDateUtc: "2026-08-30", knownCount: 1, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
-    warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
-  },
-  bundles: {
-    value: [{
-      ...activeSet, isActive: true, observationCount: 3, rowCount: 6, uniquePayloadCount: 6, repeatedRowsReused: 0,
-      reportingWindowKnown: true, activityRangeIsCoverage: false,
-      observations: lineage.lineages.map(item => ({
-        versionId: item.versionId, kind: item.kind, contentHash: item.fileHash,
-        rowCount: item.rowCount, uniquePayloadCount: item.rowCount, repeatedRowsReused: 0, lineage: item,
-      })),
-    }],
-    count: 1, limit: 10, offset: 0,
-  },
-};
+const agentPage = reportPage(agentRows, { reports: layoutReports, sources: directory.sources, counts: { total: 2, filtered: 2 } });
+const rankings = agentRows.map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses }));
+const aggregate: ReportPage<ReportAgent> = { ...agentPage, summary: { ...agentPage.summary,
+  reportedResponses: 200, bridgeResponses: 200, userReportedResponses: 200, distinctActiveReportUsers: 2,
+  responseReconciliation: "matching", licensedOccurrences: null, unlicensedOccurrences: null,
+}, analytics: { ...agentPage.analytics, rowCount: 2, responses: 200, agents: {
+  inactive: 0, neverUsed: 0, anchorDateUtc: "2026-08-30", windowDays: 30, windowAgents: 2, windowResponses: 200,
+  windowDistinctActiveUsers: 2, mostResponses: rankings, leastResponses: [...rankings].reverse(),
+} } };
+const users: ReportPage<ReportUser> = { ...reportPage(["Alex Example", "Jamie Example"].map((displayName, index) => reportUser(index + 1, {
+  username: `reader${index + 1}@example.invalid`, displayName, objectId: unpaidPeople[index].directory.objectId, company: null, department: null, entitlement: "no_paid",
+  reportedResponses: 120 - index * 40, reportedAgentsUsed: 2, bridgeResponses: 120 - index * 40,
+  relationshipCount: 2, responseProducingAgentCount: 2, userLastActivityDateUtc: "2026-08-30", lastActivityDateUtc: "2026-08-30",
+  hasReportMismatch: false,
+})), { reports: layoutReports, sources: directory.sources, counts: { total: 2, filtered: 2 } }),
+summary: { ...aggregate.summary, activeWithoutPaidUsers: 2, unknownLicenseActiveReportUsers: 0 },
+analytics: { ...agentPage.analytics, rowCount: 2, responses: 200, zeroResponses: 0, unknownResponses: 0,
+  review: { zero: 0, low: 0, unknown: 0 } } };
+const relationshipRows: ReportRelationship[] = agentRows.flatMap((agent, index) => users.value.map((user, person) => ({
+  id: `layout-relationship-${index}-${person}`, agentId: agent.agentId, agentName: agent.agentName, creatorType: agent.creatorType,
+  username: user.username, responses: index ? person ? 30 : 50 : person ? 50 : 70,
+  lastActivityDateUtc: "2026-08-30", identityStatus: "unresolved",
+})));
+const historyPage = selectedHistoryPage([activeSet], activeSet.id);
+const usageHistory = { ...historyPage, reports: layoutReports, sources: directory.sources,
+  analytics: { ...historyPage.analytics, history: { ...historyPage.analytics.history!, observationRows: 8, uniquePayloads: 8,
+    earliestActivityDateUtc: "2026-08-01", latestActivityDateUtc: "2026-08-30",
+    earliestReportingStart: "2026-08-01", latestReportingEnd: "2026-08-30" } } };
 const auditEvents: AuditEvent[] = packageNames.slice(0, 2).map((agentDisplayName, index) => ({
   id: `layout-audit-${index}`, operationId: `layout-operation-${index}`, scope: "single",
   agentId: packages.value[index].id, agentDisplayName, actor, startedAt: observedAt, completedAt: observedAt,
@@ -230,7 +181,7 @@ const purviewJob: PurviewAuditJob = {
   filters: {
     presetId: "copilot_interactions", operations: ["CopilotInteraction"],
     startDateTime: "2026-09-12T09:00:00.000Z", endDateTime: observedAt,
-    userPrincipalNames: [copilotUsageFixture.users[0].directory.userPrincipalName], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
+    userPrincipalNames: [directory.value[0].directory.userPrincipalName], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
   },
   displayName: "Saved Copilot compliance investigation", providerQueryId: "layout-query", providerStatus: "succeeded",
   localRequestId: "layout-purview-request", providerRequestId: "layout-provider-request", projectionVersion: 1,
@@ -334,8 +285,8 @@ export async function mockLayoutApi(page: Page) {
     "/api/capabilities/check-progress": { progress: null },
     "/api/agents": packages,
     "/api/agents/bulk-jobs": { value: [] },
-    ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}`, item])),
-    "/api/agent-inventory": { ...unifiedAgents, inventoryOverview: summarizeAgentAvailability(unifiedAgents.value) },
+    ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}/detail`, item])),
+    "/api/agent-inventory": unifiedAgents,
     "/api/agent-inventory/investigations/context": {
       recordId: unifiedAgents.value[0].id, displayName: unifiedAgents.value[0].displayName,
       defender: { status: "available", entraAgentIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
@@ -351,10 +302,9 @@ export async function mockLayoutApi(page: Page) {
     "/api/agents/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/inventory/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/quarantine/jobs": { value: [] },
-    "/api/official-usage/admin": usageAdmin, "/api/official-usage/aggregate": aggregate, "/api/official-usage/users": users,
+    "/api/official-usage/aggregate": aggregate, "/api/official-usage/users": users,
     "/api/official-usage/history": usageHistory,
-    "/api/official-usage/overview": usageOverviewFixture(),
-    "/api/copilot-usage/users": copilotUsageFixture,
+    "/api/copilot-usage/users": directory,
     "/api/audit/events": { value: auditEvents, count: auditEvents.length },
     "/api/audit-search/catalog": purviewCatalog, "/api/audit-search/jobs": { value: [purviewJob], count: 1, limit: 20, offset: 0 },
     [`/api/audit-search/jobs/${purviewJob.id}`]: purviewJob, [`/api/audit-search/jobs/${purviewJob.id}/records`]: purviewRecords,
@@ -364,24 +314,46 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/agent-inventory/selections") return captureInventorySelection(route, unifiedAgents.selection);
+    if (path === "/api/agents/selections") return captureInventorySelection(route, packages.selection);
+    if (path === "/api/agents" && route.request().method() === "GET") {
+      const query = inventoryFixtureQuery(route);
+      const recordId = query.get("recordId");
+      const value = recordId ? packages.value.filter(item => recordId === `graph_packages:${encodeURIComponent(item.id)}`) : packages.value;
+      return route.fulfill({ json: { ...packages, value, selection: { ...packages.selection, id: query.get("selectionId") },
+        counts: { total: packages.counts.total, scoped: packages.counts.scoped, filtered: value.length } } });
+    }
+    const detail = /^\/api\/agent-inventory\/([^/]+)\/detail$/.exec(path);
+    if (detail) return fulfillInventoryDetail(route, decodeURIComponent(detail[1]));
+    const members = /^\/api\/agent-inventory\/([^/]+)\/members$/.exec(path);
+    if (members) return fulfillInventoryMembers(route, decodeURIComponent(members[1]));
     if (isAutomaticRefreshRequest(route.request())) {
       return route.fulfill({ json: automaticRefreshFixture({ users: observedAt, graph_packages: observedAt, power_platform: observedAt }) });
     }
+    if (path === "/api/agent-inventory/facets") {
+      const query = new URL(route.request().url()).searchParams, field = query.get("field");
+      const options = field === "type" ? inventoryFacetFixtures.types
+        : field === "platform" ? inventoryFacetFixtures.platforms
+        : field === "publisher" ? inventoryFacetFixtures.publishers
+        : field === "host" ? inventoryFacetFixtures.hosts
+        : field === "availableTo" ? inventoryFacetFixtures.availability : inventoryFacetFixtures.environments;
+      return route.fulfill({ json: { value: options, total: options.length, nextCursor: null } });
+    }
     if (path === "/api/agent-inventory" && route.request().method() === "GET") {
-      const recordId = new URL(route.request().url()).searchParams.get("recordId");
+      const recordId = inventoryFixtureQuery(route).get("recordId");
       if (recordId) {
         const value = unifiedAgents.value.filter(record => record.id === recordId);
-        return route.fulfill({ json: { ...unifiedAgents, value, count: value.length, offset: 0,
-          inventoryOverview: summarizeAgentAvailability(value) } });
+        return fulfillInventoryPage(route, { ...unifiedAgents, value, counts: { ...unifiedAgents.counts, filtered: value.length } });
       }
+      return fulfillInventoryPage(route, unifiedAgents);
     }
     if (path === "/api/agent-responsibility" && route.request().method() === "GET") {
       const query = new URL(route.request().url()).searchParams;
       const objectId = query.get("objectId") ?? undefined;
-      const user = copilotUsageFixture.users.find(user => user.directory.objectId === objectId);
+      const user = directory.value.find(user => user.directory.objectId === objectId);
       if (objectId && !user) return route.fulfill({ status: 404, json: { detail: "Exact saved person unavailable", code: "responsibility_person_unavailable" } });
       return route.fulfill({ json: projectAgentResponsibility(unifiedAgents, {
-        objectId, search: query.get("search") ?? undefined, offset: Number(query.get("offset") ?? 0), limit: Number(query.get("limit") ?? 50),
+        objectId, search: query.get("search") ?? undefined, cursor: query.get("cursor") ?? undefined, limit: Number(query.get("limit") ?? 50),
       }, user ? { ...user.directory, observedAt } : undefined) });
     }
     if (path === "/api/official-usage/users" && new URL(route.request().url()).searchParams.get("licenseCohort") !== "active_without_paid") {
@@ -389,13 +361,58 @@ export async function mockLayoutApi(page: Page) {
       return route.fulfill({ status: 400, json: { error: "Expected the active nonpaid cohort" } });
     }
     if (path === "/api/official-usage/overview") {
-      const params = new URL(route.request().url()).searchParams;
-      return route.fulfill({ json: usageOverviewFixture({
-        search: params.get("search") ?? undefined, startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
-        sortBy: params.get("sortBy") === "agentName" ? "agentName" : "lastActivity",
-        sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
-        limit: Number(params.get("limit") ?? 25), offset: Number(params.get("offset") ?? 0),
-      }) });
+      const query = selectedFixtureQuery(route.request().url());
+      const value = agentRows.filter(row => !query.search || `${row.agentName} ${row.agentId}`.toLowerCase().includes(query.search.toLowerCase()))
+        .map((row, index) => overviewAgent(index + 1, { agentId: row.agentId, agentName: row.agentName, observationCount: 1, creatorTypeCount: 1,
+          earliestActivityDateUtc: row.lastActivityDateUtc, lastActivityDateUtc: row.lastActivityDateUtc,
+          latestSetId: activeSet.id, latestAcceptedAt: observedAt }));
+      const data = selectedOverviewPage(query);
+      return route.fulfill({ json: { ...data, value, counts: { total: 2, filtered: value.length },
+        reports: { ...layoutReports, setId: query.setId ?? layoutReports.setId }, sources: directory.sources,
+        analytics: { ...data.analytics, rowCount: value.length, overview: { ...data.analytics.overview!,
+          earliestActivityDateUtc: "2026-08-30", latestActivityDateUtc: "2026-08-30" } } } });
+    }
+    if (route.request().method() === "GET" && path.startsWith("/api/official-usage/")) {
+      const url = new URL(route.request().url()), query = selectedFixtureQuery(url.href);
+      const selection = { ...aggregate.selection, id: url.searchParams.get("selectionId") ?? aggregate.selection.id };
+      const reports = { ...layoutReports, setId: query.setId ?? layoutReports.setId };
+      const selected = <T>(page: ReportPage<T>) => ({ ...page, selection, reports });
+      if (path === "/api/official-usage/aggregate/facets" || path === "/api/official-usage/users/facets") {
+        return route.fulfill({ json: { value: [{ value: url.searchParams.get("field") === "creatorType" ? "Your org" : null, count: 2 }],
+          selection, counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } } });
+      }
+      if (path === "/api/official-usage/aggregate") {
+        const value = aggregate.value.filter(row => (!query.search || row.agentName.toLowerCase().includes(query.search.toLowerCase()))
+          && (!query.startDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc >= query.startDate))
+          && (!query.endDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc <= query.endDate)));
+        return route.fulfill({ json: selected({ ...aggregate, value, counts: { total: aggregate.counts.total, filtered: value.length },
+          analytics: { ...aggregate.analytics, rowCount: value.length, responses: value.reduce((sum, row) => sum + row.responses, 0),
+            agents: { ...aggregate.analytics.agents!, windowDays: query.activityWindowDays ?? 30 } } }) });
+      }
+      if (path === "/api/official-usage/users") {
+        const value = users.value.filter(row => !query.search || `${row.displayName} ${row.username}`.toLowerCase().includes(query.search.toLowerCase()));
+        return route.fulfill({ json: selected({ ...users, value, counts: { total: users.counts.total, filtered: value.length } }) });
+      }
+      if (path === "/api/official-usage/history") return route.fulfill({ json: selected(usageHistory) });
+      const agent = /^\/api\/official-usage\/agents\/([^/]+)(?:\/(users))?$/.exec(path);
+      const person = /^\/api\/official-usage\/users\/([^/]+)(?:\/(agents|directory))?$/.exec(path);
+      if (agent || person) {
+        const id = decodeURIComponent((agent ?? person)![1]), child = (agent ?? person)![2];
+        if (child === "directory") {
+          const value = unpaidPeople.find(row => row.directory.userPrincipalName === id);
+          if (value) return route.fulfill({ json: { value, selection, reports, sources: directory.sources } });
+        } else if (child) {
+          const value = relationshipRows.filter(row => agent ? row.agentId === id : row.username === id);
+          return route.fulfill({ json: selected(reportPage(value, { sources: directory.sources, counts: { total: value.length, filtered: value.length } })) });
+        }
+        const value = agent ? aggregate.value.find(row => row.agentId === id) : users.value.find(row => row.username === id);
+        if (value) return route.fulfill({ json: { value, selection, reports, sources: directory.sources } });
+      }
+    }
+    if (route.request().method() === "GET") {
+      const read = selectedFixtureRead(route.request().url(), path === "/api/copilot-usage/users" ? directory
+        : { ...directory, value: [...directory.value, ...unpaidPeople] });
+      if (read) return route.fulfill({ json: read });
     }
     if (!path.startsWith("/api/")) return route.fallback();
     const method = route.request().method();

@@ -17,8 +17,3 @@
 artifacts
 backups
 plans
-!plans/
-plans/*
-!plans/admin-poc-production/
-plans/admin-poc-production/*
-!plans/admin-poc-production/README.md

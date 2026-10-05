@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
-import { AgentPeopleRepository, type AgentPersonObservation } from "../db/agentPeople.js";
-import { DataSyncRepository, type DataSyncScope, type UserSourcePublication } from "../db/dataSync.js";
+import { AgentPeopleRepository, type AgentPeopleGeneration, type AgentPersonObservation } from "../db/agentPeople.js";
+import type { DataSyncScope, UserSourcePublication } from "../db/dataSync.js";
 import { pool } from "../db/pool.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
@@ -11,13 +11,11 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { requireProviderAdmissions } from "./operationalState.js";
-import { directoryPeople } from "./savedAgentPeople.js";
 import { operationalLog } from "./telemetry.js";
 
 type Dependencies = {
-  repository: Pick<AgentPeopleRepository, "generation" | "referencedIds" | "read" | "save">;
+  repository: Pick<AgentPeopleRepository, "generation" | "referencedIds" | "directoryIds" | "read" | "save">;
   directory: Pick<DirectoryPrincipalsClient, "resolve">;
-  saved: Pick<DataSyncRepository, "getDirectorySource">;
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
@@ -27,7 +25,7 @@ type Dependencies = {
 };
 
 type ResolutionOptions = {
-  generation: string; publication?: UserSourcePublication; force?: boolean; skipLicensed?: boolean; incompleteOnly?: boolean;
+  generation: AgentPeopleGeneration; publication?: UserSourcePublication; force?: boolean; skipLicensed?: boolean; incompleteOnly?: boolean;
 };
 type ResolutionContext = ReturnType<typeof resolutionContext>;
 
@@ -37,7 +35,7 @@ export class AgentPeopleService {
   constructor(database: pg.Pool = pool, dependencies: Partial<Dependencies> = {}) {
     this.dependencies = {
       repository: new AgentPeopleRepository(database), directory: new DirectoryPrincipalsClient(),
-      saved: new DataSyncRepository(database), revalidateUser: revalidateAuthenticatedUser,
+      revalidateUser: revalidateAuthenticatedUser,
       delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, now: () => new Date(), ...dependencies,
@@ -55,9 +53,18 @@ export class AgentPeopleService {
       assertCurrent(context);
       const generation = await this.generation(context.scope);
       assertCurrent(context);
-      const ids = await this.dependencies.repository.referencedIds(context.scope);
-      assertCurrent(context);
-      return this.resolveCurrent(user, ids, { generation, publication, force: !options.useCache, skipLicensed: true, ...options }, context);
+      const total = { changed: false, resolved: 0, notFound: 0, failed: 0 };
+      let after = "", seen = 0;
+      for (;;) {
+        const ids = await this.dependencies.repository.referencedIds(context.scope, after);
+        assertCurrent(context);
+        if (!ids.length) return total;
+        seen += ids.length;
+        if (seen > 100000) throw new AppError(413, "agent_people_limit", "Agent references exceed 100000 identities.");
+        const result = await this.resolveCurrent(user, ids, { generation, publication, force: !options.useCache, skipLicensed: true, ...options }, context);
+        total.changed ||= result.changed; total.resolved += result.resolved; total.notFound += result.notFound; total.failed += result.failed;
+        after = ids.at(-1)!;
+      }
     });
   }
 
@@ -69,12 +76,12 @@ export class AgentPeopleService {
   private async resolveCurrent(user: AuthenticatedUser, ids: readonly string[], options: ResolutionOptions, context: ResolutionContext) {
     assertCurrent(context);
     const { scope, signal } = context;
-    if (ids.length > 10_000 || ids.some(id => !isDirectoryObjectId(id))) {
-      throw new AppError(400, "invalid_agent_people", "Resolve at most 10,000 exact agent user IDs.");
+    if (ids.length > 100 || ids.some(id => !isDirectoryObjectId(id))) {
+      throw new AppError(400, "invalid_agent_people", "Resolve at most 100 exact agent user IDs.");
     }
-    const directorySource = await this.dependencies.saved.getDirectorySource(scope);
+    const directoryIds = await this.dependencies.repository.directoryIds(scope, ids);
     assertCurrent(context);
-    const saved = directoryPeople(directorySource);
+    const saved = new Set(directoryIds);
     const unique = [...new Set(ids.map(id => id.toLowerCase()))];
     const cachedPeople = await this.dependencies.repository.read(scope, unique);
     assertCurrent(context);
@@ -96,7 +103,7 @@ export class AgentPeopleService {
   }
 
   private async resolvePending(context: ResolutionContext, pending: string[],
-    options: { generation: string; publication?: UserSourcePublication }, result: { changed: boolean; resolved: number; notFound: number; failed: number },
+    options: { generation: AgentPeopleGeneration; publication?: UserSourcePublication }, result: { changed: boolean; resolved: number; notFound: number; failed: number },
     reportFailure: (error: unknown) => void) {
     const { scope, signal, validation } = context;
     const fence = () => {
@@ -173,8 +180,6 @@ export class AgentPeopleService {
     return result;
   }
 }
-
-export const agentPeople = new AgentPeopleService();
 
 function resolutionContext(user: AuthenticatedUser, abortSignal?: AbortSignal) {
   const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(abortSignal ? [abortSignal] : [])]);
