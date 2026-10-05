@@ -13,11 +13,14 @@ export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<Re
 export function ReportPageControls({ data, previous, next, loading = false, disabled = false, label = "rows", compact = false }: {
   data?: Pick<ReportPage<unknown>, "page" | "counts" | "value">; previous: () => void; next: () => void; loading?: boolean; disabled?: boolean; label?: string; compact?: boolean;
 }) {
+  const previousDisabled = disabled || !data?.page.previousCursor, nextDisabled = disabled || !data?.page.nextCursor;
   return <nav className="copilot-users-pagination" aria-label={`${label} pages`} aria-busy={loading}>
     <span role="status">{usageCount(data?.counts.filtered)} matching {label}{data ? `; ${data.value.length} on this page` : ""}</span>
-    <button type="button" className="secondary" disabled={disabled || !data?.page.previousCursor} onClick={previous} aria-label={`Previous ${label}`}>
+    <button type="button" className="secondary" aria-disabled={previousDisabled}
+      onClick={() => { if (!previousDisabled) previous(); }} aria-label={`Previous ${label}`}>
       {compact ? <span aria-hidden="true">←</span> : <>Previous {label}</>}</button>
-    <button type="button" className="secondary" disabled={disabled || !data?.page.nextCursor} onClick={next} aria-label={`Next ${label}`}>
+    <button type="button" className="secondary" aria-disabled={nextDisabled}
+      onClick={() => { if (!nextDisabled) next(); }} aria-label={`Next ${label}`}>
       {compact ? <span aria-hidden="true">→</span> : <>Next {label}</>}</button>
   </nav>;
 }

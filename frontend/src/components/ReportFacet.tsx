@@ -11,9 +11,11 @@ export function ReportFacet({ path, selectionId, field, value, onChange, onResta
   compact?: boolean;
 }) {
   const [search, setSearch] = useState("");
+  const [searchOpened, setSearchOpened] = useState(false);
   const [page, setPage] = useState<{ key: string; cursor?: string }>({ key: "" });
   const principal = useReportPrincipalScope();
-  const key = JSON.stringify([principal, selectionId, search]), cursor = page.key === key ? page.cursor : undefined;
+  const key = JSON.stringify([principal, path, selectionId, field, search]), cursor = page.key === key ? page.cursor : undefined;
+  if (page.key !== key) setPage({ key });
   const read = useSavedQuery({
     queryKey: ["saved", "report-facet", path, field, key, cursor], enabled: Boolean(selectionId), gcTime: 0,
     queryFn: ({ signal }) => readReportFacet(path, selectionId!, field, { search, cursor, signal }),
@@ -38,8 +40,9 @@ export function ReportFacet({ path, selectionId, field, value, onChange, onResta
   </select>;
   if (compact) return <div className="inventory-facet" role="group" aria-label={`${label} options`}>
     <label><span>{label}</span>{control}</label>
-    {search || cursor || data?.page.nextCursor ? <label><span className="sr-only">Search {label.toLowerCase()} options</span>
-      <input type="search" placeholder="Search options" value={search} maxLength={256} onChange={event => setSearch(event.target.value)} /></label> : null}
+    {searchOpened || search || cursor || data?.page.nextCursor ? <label><span className="sr-only">Search {label.toLowerCase()} options</span>
+      <input type="search" placeholder="Search options" value={search} maxLength={256}
+        onFocus={() => setSearchOpened(true)} onChange={event => setSearch(event.target.value)} /></label> : null}
     {read.error ? <p role="alert">{invalidated ? "This selection changed or expired." : read.error.message}{" "}
       <button type="button" onClick={invalidated ? onRestartSelection : () => { void read.refetch(); }}>
         {invalidated ? "Restart selection" : "Retry options"}</button></p> : null}

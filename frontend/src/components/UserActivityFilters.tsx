@@ -57,7 +57,7 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
   if (agent && onClearAgent) chips.push({ key: "agent", label: "Agent", value: agent, remove: onClearAgent });
   const hasFilters = chips.length > 0 || Boolean(search.trim());
 
-  return <section className="catalog-controls user-activity-controls" aria-label="User filters">
+  return <section className="catalog-controls user-activity-controls agent-grid-toolbar" aria-label="User filters">
     <div className="agent-query-bar">
       <label className="agent-search-field">
         <Search size={17} aria-hidden="true" /><span className="sr-only">{searchLabel}</span>

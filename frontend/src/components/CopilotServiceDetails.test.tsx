@@ -52,7 +52,7 @@ describe("paid-feature evidence details", () => {
   it("does not turn a byte-short empty page into no assigned services", async () => {
     vi.mocked(readReportPage).mockResolvedValue(reportPage([], { counts: { total: 800, filtered: 800 }, page: { limit: 50, nextCursor: "next", previousCursor: null } }));
     render(<CopilotServiceDetails path={path} selectionId={selectionId} copilotServiceState="disabled" current />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Next plans" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Next plans" })).toHaveAttribute("aria-disabled", "false"));
     expect(screen.queryByText("No paid Copilot services are assigned.")).not.toBeInTheDocument();
   });
 });

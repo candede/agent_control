@@ -81,7 +81,8 @@
   color: var(--muted);
 }
 
-button.agent-sort-heading {
+button.agent-sort-heading,
+.user-directory-table .table-sort-heading {
   display: inline-flex;
   align-items: center;
   gap: 7px;

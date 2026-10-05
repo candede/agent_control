@@ -82,7 +82,9 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onCancelRequested,
 }, ref) {
   const [state, setState] = useState<DataSyncState>();
-  const [requestedRun, setRequestedRun] = useState<DataSyncRun>();
+  const [requestedRunResult, setRequestedRunResult] = useState<{ principalKey: string; run: DataSyncRun }>();
+  const requestedRun = requestedRunResult?.principalKey === principalKey && requestedRunResult.run.id === requestedRunId
+    ? requestedRunResult.run : undefined;
   const [requestedRunError, setRequestedRunError] = useState("");
   const [requestedRunLoading, setRequestedRunLoading] = useState(false);
   const [requestedRunReload, setRequestedRunReload] = useState(0);
@@ -113,7 +115,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const wasActive = useRef(active);
   const readSaved = useSavedRead();
   useEffect(() => {
-    onSetupRequiredChange?.(state?.onboardingRequired ?? false);
+    onSetupRequiredChange?.(state?.onboardingRequired ?? true);
   }, [onSetupRequiredChange, state?.onboardingRequired]);
 
   useEffect(() => {
@@ -158,7 +160,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     sourceStatuses.current = undefined;
     requestedSourceStatuses.current = undefined;
     setState(undefined);
-    setRequestedRun(undefined);
+    setRequestedRunResult(undefined);
     setRequestedRunError("");
     setRequestedRunLoading(false);
     setLoading(false);
@@ -280,7 +282,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     stopRequestedRunPolling();
     void Promise.resolve().then(() => {
       if (owner !== requestedRunGeneration.current) return;
-      setRequestedRun(undefined);
+      setRequestedRunResult(current => current?.principalKey === principalKey && current.run.id === requestedRunId
+        ? current : undefined);
       setRequestedRunError("");
       setRequestedRunLoading(Boolean(requestedRunId) && !accessDenied.current);
     });
@@ -296,7 +299,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
           controller.signal,
         );
         if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
-        setRequestedRun(run);
+        setRequestedRunResult({ principalKey, run });
         setRequestedRunError("");
         observeSources(run.sources, requestedSourceStatuses);
         if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
@@ -305,7 +308,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       } catch (reason) {
         if (controller.signal.aborted || owner !== requestedRunGeneration.current || (reason instanceof ApiError && reason.kind === "aborted")) return;
         if (clearDeniedState(reason)) return;
-        setRequestedRun(undefined);
+        if (reason instanceof ApiError && reason.status === 404) setRequestedRunResult(undefined);
         setRequestedRunError(requestError(reason, "The requested data sync run is unavailable."));
       } finally {
         if (requestedRunController.current === controller) requestedRunController.current = undefined;
@@ -342,7 +345,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       if (requestedRunIdRef.current === run.id) {
         requestedRunGeneration.current += 1;
         stopRequestedRunPolling();
-        setRequestedRun(run);
+        setRequestedRunResult({ principalKey, run });
         setRequestedRunError("");
         observeSources(run.sources, requestedSourceStatuses);
       } else if (updatesCurrentRun && current) {
@@ -371,7 +374,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         onRunsChangedRef.current?.();
       }
     }
-  }, [applyRun, clearDeniedState, observeSources, startPolling, stopPolling, stopRequestedRunPolling]);
+  }, [applyRun, clearDeniedState, observeSources, principalKey, startPolling, stopPolling, stopRequestedRunPolling]);
 
   const start = useCallback(async (mode: DataSyncMode, sources?: DataSyncSourceId[], clearSavedData = false) => {
     if (actionController.current || accessDenied.current || !stateRef.current
@@ -552,7 +555,9 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         fallbackFocusRef={heading}
         onClose={() => onRequestedRunChange(undefined)}>
         {requestedRunLoading ? <p role="status">Loading exact sync run {requestedRunId}...</p> : null}
-        {requestedRunError ? <div className="error-banner" role="alert">{requestedRunError}</div> : null}
+        {requestedRunError ? <div className="error-banner" role="alert">
+          {requestedRunError}{requestedRun ? " Showing the last reported run status." : null}
+        </div> : null}
         {error ? <div className="error-banner" role="alert">{error}</div> : null}
         {requestedRunError ? <button type="button" className="secondary" onClick={() => void refresh()}>Retry status check</button> : null}
         {requestedRun ? (

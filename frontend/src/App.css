@@ -638,7 +638,8 @@ button:hover,
   background: var(--ink-hover);
 }
 
-button:disabled {
+button:disabled,
+.copilot-users-pagination button[aria-disabled="true"] {
   cursor: not-allowed;
   opacity: 0.58;
 }

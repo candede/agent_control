@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode, type RefObject } from "react";
+import { useEffect, useEffectEvent, useId, useRef, type ReactNode, type RefObject } from "react";
 import { X } from "lucide-react";
 import { trapDialogFocus } from "../dialogFocus";
 import "./workbenchDialog.css";
@@ -25,19 +25,22 @@ export function WorkbenchDialog({ open, title, description, className = "", fall
   description?: string;
   className?: string;
   fallbackFocusRef?: RefObject<HTMLElement | null>;
-  onClose: () => void;
+  onClose?: () => void;
   children: ReactNode;
 }) {
   const id = useId();
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const focusFallback = useEffectEvent(() => {
+    const fallback = fallbackFocusRef?.current;
+    if (fallback?.isConnected) fallback.focus();
+  });
 
   useEffect(() => {
     if (!open || !dialog.current) return;
     const element = dialog.current;
     const document = element.ownerDocument;
     const opener = document.activeElement;
-    const fallback = fallbackFocusRef?.current;
     element.showModal();
     const unlockBodyScroll = lockBodyScroll(document.body);
     heading.current?.focus();
@@ -48,9 +51,9 @@ export function WorkbenchDialog({ open, title, description, className = "", fall
         opener.focus();
         if (document.activeElement === opener) return;
       }
-      if (fallback?.isConnected) fallback.focus();
+      focusFallback();
     };
-  }, [open, fallbackFocusRef]);
+  }, [open]);
 
   return (
     <dialog
@@ -58,17 +61,25 @@ export function WorkbenchDialog({ open, title, description, className = "", fall
       className={`workbench-dialog ${className}`}
       aria-labelledby={`${id}-title`}
       aria-describedby={description ? `${id}-description` : undefined}
-      onCancel={event => { event.preventDefault(); onClose(); }}
-      onKeyDown={event => trapDialogFocus(event, event.currentTarget)}
+      onCancel={event => {
+        if (event.target !== event.currentTarget) return;
+        event.preventDefault();
+        onClose?.();
+      }}
+      onKeyDown={event => {
+        if (event.target instanceof Element && event.target.closest("dialog") === event.currentTarget) {
+          trapDialogFocus(event, event.currentTarget);
+        }
+      }}
     >
       <header className="workbench-dialog-header">
         <div>
           <h2 ref={heading} id={`${id}-title`} tabIndex={-1}>{title}</h2>
           {description ? <p id={`${id}-description`}>{description}</p> : null}
         </div>
-        <button type="button" className="secondary workbench-dialog-close" aria-label={`Close ${title.toLowerCase()}`} onClick={onClose}>
+        {onClose ? <button type="button" className="secondary workbench-dialog-close" aria-label={`Close ${title.toLowerCase()}`} onClick={onClose}>
           <X size={20} aria-hidden="true" />
-        </button>
+        </button> : null}
       </header>
       <div className="workbench-dialog-body">{open ? children : null}</div>
     </dialog>

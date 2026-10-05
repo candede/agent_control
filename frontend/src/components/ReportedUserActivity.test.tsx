@@ -81,6 +81,10 @@ describe("selected active users without paid Copilot", () => {
     renderActivity();
     await screen.findByRole("button", { name: "Bridge only" });
     const table = screen.getByRole("region", { name: "Reported user activity" });
+    const surface = table.closest<HTMLElement>(".agent-table-stack")!;
+    expect(surface).toHaveClass("user-directory-table");
+    expect(within(surface).getByRole("region", { name: "User filters" })).toHaveClass("agent-grid-toolbar");
+    expect(within(surface).getByRole("navigation", { name: "users pages" })).toBeVisible();
     expect(within(table).getAllByRole("columnheader")).toHaveLength(6);
     expect(within(table).getAllByRole("row")).toHaveLength(4);
     expect(within(table).getByRole("row", { name: /Bridge only/ })).toHaveTextContent("Users report metric unknown");
@@ -158,12 +162,35 @@ describe("selected active users without paid Copilot", () => {
     vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [ada].slice(0, count), page: { limit: 50, nextCursor: "next", previousCursor: null } }));
     renderActivity();
     const next = await screen.findByRole("button", { name: "Next users" });
-    await waitFor(() => expect(next).toBeEnabled());
+    await waitFor(() => expect(next).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(next);
     await waitFor(() => assertQuery({ selectionId, cursor: "next" }));
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "cross-page-agent" } });
     await waitFor(() => assertQuery({ search: "cross-page-agent" }));
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.cursor).toBeUndefined();
+  });
+  it.each(["Next", "Previous"])("retains keyboard focus through a pending %s page and its cursor boundary", async direction => {
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page({ page: { limit: 50, nextCursor: "next", previousCursor: "previous" } }));
+    renderActivity();
+    await screen.findByRole("button", { name: "Ada" });
+    const button = screen.getByRole("button", { name: `${direction} users` });
+    const pending = deferred<ReportPage<ReportUser>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    button.focus();
+    await userEvent.keyboard("{Enter}");
+    assertQuery({ selectionId, cursor: direction.toLowerCase() });
+    expect(button).toHaveFocus();
+    expect(screen.getByRole("button", { name: `${direction} users` })).toBe(button);
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    await userEvent.keyboard("{Enter}");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(page({ value: [ben] })));
+    await screen.findByRole("button", { name: "Ben" });
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    await userEvent.keyboard("{Enter}");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
   it.each(["button", "Escape in a nonempty search"])("reads an exact detail, bounded licenses and relationships, then restores its trigger through %s", async close => {
     renderActivity();
@@ -184,6 +211,19 @@ describe("selected active users without paid Copilot", () => {
       await userEvent.keyboard("{Escape}");
     }
     expect(trigger).toHaveFocus();
+  });
+  it("keeps unavailable relationship paging in the detail dialog's keyboard focus cycle", async () => {
+    renderActivity();
+    const { modal } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    await modal.findByText("Researcher");
+    const next = modal.getByRole("button", { name: "Next agents" });
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    next.focus();
+    await userEvent.keyboard("{Tab}");
+    expect(modal.getByRole("button", { name: "Close reported user details" })).toHaveFocus();
+    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(next).toHaveFocus();
   });
   it.each(["disabled", "suspended", "locked_out"] as const)("preserves %s feature state independently of account enablement and active licensing", async state => {
     const saved = directory({ copilotServiceState: state });
@@ -263,14 +303,16 @@ describe("selected active users without paid Copilot", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Restart the selection before exporting");
     expect(api.reportExportStatus).not.toHaveBeenCalled();
   });
-  it("isolates revision readers while retaining same-selection controls and details until revalidation finishes", async () => {
+  it("clears old rows and details while a known revision loads a fresh selection", async () => {
     const pending = deferred<ReportPage<ReportUser>>();
     const view = render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
-    const { modal } = await open();
+    await open();
     vi.mocked(api.readReportPage).mockReturnValue(pending.promise);
     view.rerender(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} dataRevision={1} />);
-    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("215");
-    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/users",
+      expect.not.objectContaining({ selectionId }), expect.any(AbortSignal));
     await act(async () => pending.reject(new ApiError(403, "role_required", "Viewer revoked")));
     await screen.findByRole("alert");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -312,9 +354,10 @@ describe("selected active users without paid Copilot", () => {
   });
   it("rejects an envelope for a different explicitly requested report instead of adopting it silently", async () => {
     renderActivity({ ...initial, reportSetId: "a-different-set" });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole("alert")).toHaveTextContent(/selection/i);
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Restart selection" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Restart selection" })).toBeVisible();
   });
   it("offers an explicit parent restart after exact detail selection invalidation", async () => {
     vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(409, "selection_invalidated", "Selection expired"));

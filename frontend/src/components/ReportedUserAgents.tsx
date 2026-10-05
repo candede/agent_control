@@ -29,9 +29,8 @@ export function ReportedUserAgents({ path, selectionId, filters, onFocusAgent, o
         aria-label={`${row.agentName || row.agentId}: active users without paid Copilot`} title={`Show active users without paid Copilot for report agent ${row.agentId}`}
         onClick={() => onFocusAgent(row.agentId, data.reports.setId!)}>{row.agentName || row.agentId}</button> : row.agentName || row.agentId}<small>{row.agentId}</small></td>
         <td>{row.creatorType || "Unknown"}</td><td>{usageCount(row.responses)}</td><td>{usageDate(row.lastActivityDateUtc)}</td></tr>)}</tbody></table></div>
-    {data ? <>
-      {!data.value.length ? <p>{data.counts.filtered > 0 ? "No relationships on this page. Continue to the next page."
-        : data.reports.lineages.some(lineage => lineage.kind === "userAgents") ? "No agent relationships match." : "Agent relationships unavailable. Import Users & agents in Sync."}</p> : null}
-      <ReportPageControls {...read} label="agents" /></> : null}
+    {data && !data.value.length ? <p>{data.counts.filtered > 0 ? "No relationships on this page. Continue to the next page."
+      : data.reports.lineages.some(lineage => lineage.kind === "userAgents") ? "No agent relationships match." : "Agent relationships unavailable. Import Users & agents in Sync."}</p> : null}
+    {read.loading || data ? <ReportPageControls {...read} label="agents" /> : null}
   </section>;
 }

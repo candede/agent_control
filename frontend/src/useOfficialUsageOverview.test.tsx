@@ -49,16 +49,23 @@ describe("selected overview query freshness", () => {
     expect(result.current.loading).toBe(false);
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/overview", expect.objectContaining({ selectionId }), expect.any(AbortSignal));
   });
-  it("pins passive revision reads and requires an explicit restart after history invalidation", async () => {
+  it("recaptures history on a known revision and automatically recovers one concurrent invalidation", async () => {
     const { result, rerender } = renderHook(({ revision }) => useOfficialUsageOverview({ scope: "history" }, revision), { initialProps: { revision: 0 } });
     await waitFor(() => expect(result.current.data).toBeDefined());
+    const replacement = deferred<ReportPage<ReportOverviewAgent>>();
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed"));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(replacement.promise);
     rerender({ revision: 1 });
-    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
     expect(result.current.data).toBeUndefined();
-    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/overview", expect.objectContaining({ selectionId }), expect.any(AbortSignal));
-    act(() => result.current.restart());
-    await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/overview", expect.not.objectContaining({ selectionId }), expect.any(AbortSignal));
+    expect(result.current.loading).toBe(true);
+    for (const call of vi.mocked(api.readReportPage).mock.calls.slice(1)) {
+      expect(call[1]).toEqual({ scope: "history", limit: 50 });
+    }
+    const latest = { ...page, selection: { ...page.selection, id: "latest-history" } };
+    await act(async () => replacement.resolve(latest));
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("latest-history"));
+    expect(result.current.invalidated).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
   });
 });

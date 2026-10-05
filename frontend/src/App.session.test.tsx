@@ -809,14 +809,13 @@ describe("App session revalidation", () => {
     },
   );
 
-  it("keeps Users interactive during a minute-check read, then requires an explicit restart if its selection is invalidated", async () => {
+  it("loads a fresh Users selection after a known sync revision without replaying the stale selection", async () => {
     vi.useFakeTimers();
     window.history.replaceState({}, "", "/users");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
     let refreshing = false;
-    let replacement = false;
     const updated = selectedUsersPage();
     updated.value[1].reportedResponses = 4;
     updated.selection.id = "20000000-0000-4000-8000-000000000003";
@@ -824,7 +823,7 @@ describe("App session revalidation", () => {
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         revisions: { ...automaticRefreshResponse().revisions, users: refreshing ? "users-2" : "users-1" },
       }));
-      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/users") return refreshing ? pending.promise : Response.json(replacement ? updated : selectedUsersPage());
+      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/users") return refreshing ? pending.promise : Response.json(selectedUsersPage());
       if (input.startsWith("/api/agent-responsibility")) {
         return Response.json(responsibilityFixture(new URL(input, "http://localhost").searchParams.get("objectId") ?? undefined));
       }
@@ -833,14 +832,16 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await act(() => vi.advanceTimersByTimeAsync(500));
-    const summary = screen.getByLabelText("M365 Copilot license summary");
-    const original = summary.textContent;
     const search = screen.getByRole("searchbox", { name: "Search users or agents" });
     fireEvent.change(search, { target: { value: "Ben" } });
     search.focus();
     expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
     const reads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/copilot-usage/users").length;
     const before = reads();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Ben" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByRole("dialog", { name: "Ben" })).toBeVisible();
 
     refreshing = true;
     await act(() => vi.advanceTimersByTimeAsync(60_000));
@@ -848,29 +849,27 @@ describe("App session revalidation", () => {
     await act(() => vi.advanceTimersByTimeAsync(500));
     expect(screen.getByRole("status", { name: "Background refresh" })).toBeVisible();
     expect(screen.getByRole("status", { name: "Background refresh" }).textContent).toBe("");
-    expect(summary).toHaveTextContent(original!);
+    expect(screen.queryByRole("button", { name: "Ben" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
     expect(search).toHaveValue("Ben");
-    expect(search).toHaveFocus();
     expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Users and adoption" })).toHaveAttribute("aria-busy", "false");
-    fireEvent.click(screen.getByRole("button", { name: "Ben" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    const dialog = screen.getByRole("dialog", { name: "Ben" });
-    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("3");
-    await act(async () => pending.resolve(Response.json({ code: "selection_invalidated", detail: "The captured user source changed." }, { status: 409 })));
+    const request = transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/copilot-usage/users").at(-1)![0];
+    const params = new URL(request, "http://localhost").searchParams;
+    expect(params.has("selectionId")).toBe(false);
+    expect(params.has("cursor")).toBe(false);
+    expect(params.get("search")).toBe("Ben");
+    await act(async () => pending.resolve(Response.json(updated)));
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("This selection changed or expired. Restart to load a new consistent selection.");
-    expect(screen.getByRole("button", { name: "Restart selection" })).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
     expect(search).toHaveValue("Ben");
     expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(60_000));
     expect(reads()).toBe(before + 1);
-    refreshing = false; replacement = true;
-    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
     expect(screen.getByRole("cell", { name: "4" })).toBeVisible();
-    expect(reads()).toBe(before + 2);
+    expect(reads()).toBe(before + 1);
   });
 
   it.each(["block", "unblock"] as const)("keeps selected package actions usable during a background inventory read and reports an actual %s denial", async action => {
@@ -949,18 +948,18 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) =>
-      new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(2));
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1));
     await userEvent.click(await screen.findByRole("button", { name: "Select all 5000 matching published versions" }));
     await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
     const confirmation = await screen.findByRole("dialog", { name: "Block 5,000 packages?" });
-    expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
     await userEvent.click(within(confirmation).getByRole("button", { name: "Block 5,000 packages" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("No synthetic provider write is permitted.");
     const preview = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-preview")!;
     const submit = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/block")!;
     expect(JSON.parse(String(preview[1]?.body))).toEqual({ action: "block", selectionId: "server-filtered-selection", mutationScope: "bulk" });
     expect(JSON.parse(String(submit[1]?.body))).toEqual({ selectionId: "server-filtered-selection", confirmationHash: "a".repeat(64) });
-    expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("cursor=more-6001"))).toBe(false);
   });
@@ -995,11 +994,88 @@ describe("App session revalidation", () => {
     const submit = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/block")!;
     const counted = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-selection")!;
     expect(JSON.parse(String(counted[1]?.body))).toEqual({ selectionId: "group-read-selection", recordIds: [id] });
-    expect(JSON.parse(String(preview[1]?.body))).toEqual({ action: "block", recordIds: [id], mutationScope: "bulk" });
+    expect(JSON.parse(String(preview[1]?.body))).toEqual({
+      action: "block", selectionId: "group-read-selection", recordIds: [id], mutationScope: "bulk",
+    });
     expect(JSON.parse(String(submit[1]?.body))).toEqual({
       selectionId: "reviewed-group-selection", recordIds: [id], confirmationHash: "a".repeat(64),
     });
     expect(transport.fetchMock.mock.calls.some(([input]) => /\/members|\/children/.test(input))).toBe(false);
+  });
+
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)(
+    "clears grouped and exact export selections for %s without leaving saved targets",
+    async role => {
+      const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+        displayName: "Grouped export selection", packagesComplete: false, packageCount: 40 };
+      const single = { ...unifiedPage.value[0], id: "graph_packages:single-package",
+        displayName: "Exact export selection", packages: [{ ...agent, id: "single-package" }] };
+      const transport = appTransport({ initialRoles: [role], revalidatedRoles: [role],
+        unifiedResponse: unifiedRecordsPage([group, single]) });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      const grouped = await screen.findByRole("checkbox", { name: `Select ${group.displayName}` });
+      const exact = screen.getByRole("checkbox", { name: `Select ${single.displayName}` });
+      await userEvent.click(grouped);
+      await userEvent.click(exact);
+      if (role === "AgentControl.Admin") {
+        await waitFor(() => expect(new URLSearchParams(window.location.search).get("selectionState")).toBe("session"));
+      }
+      const storedCount = Number(new URLSearchParams(window.location.search).get("selectionCount"));
+      await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+      const dialog = screen.getByRole("dialog", { name: "Export agent inventory" });
+      await userEvent.click(within(dialog).getByRole("button", { name: "Clear selection" }));
+      expect(grouped).not.toBeChecked();
+      expect(exact).not.toBeChecked();
+      expect(within(dialog).getByRole("button", { name: /Download selected agents/ })).toBeDisabled();
+      expect(within(dialog).getByRole("button", { name: /Download matching agents/ })).toBeEnabled();
+      expect(window.location.search).not.toMatch(/selected|selectionState|selectionCount/);
+      expect(restorePackageSelection({ ...viewer, roles: [role] }, storedCount).status).not.toBe("restored");
+      expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/data-exports")).toBe(false);
+    },
+  );
+
+  it("preserves both job identities and the mode in combined package job bookmarks", async () => {
+    const jobId = waitingBulkJob().id;
+    window.history.replaceState({}, "", `/agents?controlJob=${jobId}&refreshJob=refresh-first-load&mode=application`);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/refresh-jobs/refresh-first-load?mode=application") {
+        return Response.json({ ...completedRefreshJob(), tokenMode: "application" });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith(
+      "/api/agents/refresh-jobs/refresh-first-load?mode=application", expect.anything(),
+    ));
+    expect(window.location.pathname).toBe("/agents");
+    expect(new URLSearchParams(window.location.search).get("controlJob")).toBe(jobId);
+    expect(new URLSearchParams(window.location.search).get("refreshJob")).toBe("refresh-first-load");
+    expect(new URLSearchParams(window.location.search).get("mode")).toBe("application");
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(new URLSearchParams(window.location.search).has("refreshJob")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(new URLSearchParams(window.location.search).get("controlJob")).toBe(jobId);
+    expect(new URLSearchParams(window.location.search).get("refreshJob")).toBe("refresh-first-load");
+    expect(new URLSearchParams(window.location.search).get("mode")).toBe("application");
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("does not copy a Sync package refresh bookmark into the Agents route", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=refresh-first-load");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Agents" }));
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    expect(window.location.pathname).toBe("/agents");
+    expect(new URLSearchParams(window.location.search).has("refreshJob")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(new URLSearchParams(window.location.search).get("refreshJob")).toBe("refresh-first-load");
   });
 
   it("pauses automatic work before a manual cancellation and keeps manual sync available", async () => {
@@ -2077,7 +2153,7 @@ describe("App session revalidation", () => {
     render(<App />);
 
     await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
-    await userEvent.click(screen.getByRole("button", { name: "View details for Reconciled detail" }));
+    await userEvent.click(await screen.findByRole("button", { name: "View details for Reconciled detail" }));
     await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Manage" }));
     expect(screen.getByText("No published version is available for availability or installation settings.")).toBeInTheDocument();
     reconciled = true;
@@ -3237,7 +3313,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(group.displayName);
-    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: `View details for ${group.displayName}` }));
     const dialog = await screen.findByRole("dialog", { name: group.displayName });
     await userEvent.click(await within(dialog).findByRole("button", { name: `Inspect published version (${nativeId})` }));
@@ -3246,7 +3322,7 @@ describe("App session revalidation", () => {
     const details = transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, nativeId));
     expect(details).toHaveLength(1);
     expect(new URL(details[0][0], "http://localhost").searchParams.get("selectionId")).toBe(currentInventorySelection(transport.fetchMock));
-    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.filter(([path]) => new URL(path, "http://localhost").pathname.endsWith("/members"))).toHaveLength(1);
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
@@ -3288,16 +3364,16 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
-    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
     await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
     const reload = await screen.findByRole("button", { name: "Reload saved agent inventory" });
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
-    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(1);
     await userEvent.click(reload);
     await screen.findByText(agent.displayName);
-    expect(agentListRequests(transport.fetchMock)).toHaveLength(3);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
     expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(1);
   });
 
@@ -4401,8 +4477,9 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
-    expect(screen.getByText(/No saved package catalog observation. Open Sync to collect it/)).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
+    expect(screen.queryByText(/No saved package catalog observation. Open Sync to collect it/)).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
@@ -4913,8 +4990,9 @@ describe("App session revalidation", () => {
     const download = mockCsvDownload();
     render(<App />);
     await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
-    const exportButton = await screen.findByRole("button", { name: kind === "official_agents" ? "Export agent CSV" : "Export users CSV" });
-    await waitFor(() => expect(exportButton).toBeEnabled());
+    const exportLabel = kind === "official_agents" ? "Export agent CSV" : "Export users CSV";
+    await waitFor(() => expect(screen.getByRole("button", { name: exportLabel })).toBeEnabled());
+    const exportButton = screen.getByRole("button", { name: exportLabel });
     await userEvent.click(exportButton);
     const creations = transport.fetchMock.mock.calls.filter(([path, init]) => path === "/api/data-exports" && init?.method === "POST");
     expect(creations).toHaveLength(1);

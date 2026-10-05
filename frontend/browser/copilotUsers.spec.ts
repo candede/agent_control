@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { mockLayoutApi } from "./layoutFixtures";
 import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
@@ -6,7 +6,7 @@ import type { ReportRelationship } from "../../backend/src/types/officialReportD
 import { reportExportColumns } from "../../backend/src/types/officialReportData";
 import { reportUser } from "../src/test/reportDataFixture";
 import { selectedFixtureReports, selectedLicensedUser, selectedPlansPage, selectedReportUsersPage, selectedUsersPage } from "../src/test/selectedUsageFixture";
-import { selectedCohortData, selectedCohortRead, type SelectedCohortData } from "./selectedCohortFixture";
+import { captureSelectedCohort, selectedCohortData, selectedCohortExportRows, type SelectedCohortData } from "./selectedCohortFixture";
 import { mockSelectedPaidUsers } from "./selectedPaidFixture";
 
 const usageFixtureSetId = selectedFixtureReports.setId!;
@@ -31,26 +31,27 @@ async function expectPaidSort(page: Page, value: string) {
 
 async function mockReportedUsers(page: Page, source: SelectedCohortData = selectedCohortData()) {
   const measurements: Array<{ path: string; cursor: string | null; users: number; relationships: number; bytes: number; projectionMs: number }> = [];
-  const captures = new Map<string, URLSearchParams>();
+  const captures = new Map<string, ReturnType<typeof captureSelectedCohort>>();
   await page.route(url => url.pathname === "/api/official-usage/users" || url.pathname.startsWith("/api/official-usage/users/"), route => {
     expect(route.request().method()).toBe("GET");
     const url = new URL(route.request().url()), params = url.searchParams, root = url.pathname === "/api/official-usage/users";
     if (root) expect(params.get("licenseCohort")).toBe("active_without_paid");
-    if (params.has("setId") && params.get("setId") !== source.directory.reports.setId) {
+    const requested = params.get("selectionId");
+    if (!requested && params.has("setId") && params.get("setId") !== source.directory.reports.setId) {
       return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
     }
-    const requested = params.get("selectionId");
     if (requested && !captures.has(requested)) return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "Unknown synthetic report selection." } });
     if (!root && !requested) throw new Error("An exact report child requires a captured selection");
     const id = requested ?? `80000000-0000-4000-8000-${String(captures.size + 1).padStart(12, "0")}`;
     if (!requested) {
       if (captures.size >= 128) throw new Error("Synthetic capture limit exceeded");
-      captures.set(id, new URLSearchParams(params));
+      captures.set(id, captureSelectedCohort(url.href, { ...source, directory: {
+        ...source.directory, selection: { ...source.directory.selection, id },
+      } }));
     }
     const started = performance.now();
-    const view = selectedCohortRead(url.href, { ...source, directory: {
-      ...source.directory, selection: { ...source.directory.selection, id },
-    } });
+    const capture = captures.get(id)!;
+    const view = capture.read(url.href);
     if (!view) return route.fulfill({ status: 404, json: { code: "synthetic_exact_not_found", detail: "No selected reported user." } });
     const body = JSON.stringify(view);
     measurements.push({
@@ -65,6 +66,100 @@ async function mockReportedUsers(page: Page, source: SelectedCohortData = select
 }
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
+test("users reuse the Agents summary strip and integrated table design at every breakpoint", async ({ page }, info) => {
+  test.setTimeout(60_000);
+  const unexpected = await mockLayoutApi(page);
+  const fixture = selectedUsersPage();
+  fixture.value.push(...Array.from({ length: 2196 }, (_, index) => selectedLicensedUser(index + 5, `Example user ${index + 5}`, 0)));
+  await mockSelectedPaidUsers(page, fixture);
+  const styles = (locator: Locator, properties: string[]) => locator.evaluate((element, properties) => {
+    const style = getComputedStyle(element);
+    return Object.fromEntries(properties.map(property => [property, style.getPropertyValue(property)]));
+  }, properties);
+  const surfaceProperties = ["border", "border-radius", "background-color", "box-shadow"];
+  const cellProperties = ["padding", "font-size", "font-weight", "color", "background-color", "border-bottom", "text-transform"];
+  const textProperties = ["font-size", "font-weight", "color", "line-height"];
+  for (const width of info.project.name === "desktop" ? [1920, 1280, 1000, 768] : [360]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto("/agents");
+    const agents = page.locator(".agent-workspace");
+    await expect(agents.locator("tbody tr").first()).toBeVisible();
+    const reference = {
+      strip: await styles(agents.locator(".agent-overview-metrics"), surfaceProperties),
+      metric: await styles(agents.locator(".metric").first(), ["padding", "gap", "border-right", "border-radius", "background-color"]),
+      label: await styles(agents.locator(".metric > span").first(), textProperties),
+      count: await styles(agents.locator(".metric > strong").first(), textProperties),
+      hint: await styles(agents.locator(".metric > small").first(), textProperties),
+      table: await styles(agents.locator(".agent-table-stack"), surfaceProperties),
+      toolbar: await styles(agents.locator(".agent-grid-toolbar"), ["padding", "gap"]),
+      header: await styles(agents.locator("thead th").nth(1), cellProperties),
+      sort: await styles(agents.locator(".agent-sort-heading").first(), ["min-height", "padding", "gap", ...textProperties]),
+      cell: await styles(agents.locator("tbody tr").first().locator("td").nth(2), cellProperties),
+      name: await styles(agents.locator(".agent-name-button").first(), [...textProperties, "text-underline-offset"]),
+      filters: await styles(agents.locator(".agent-filter-trigger"), ["min-height", "font-size", "border", "border-radius"]),
+      search: await styles(agents.locator(".agent-search-field"), surfaceProperties),
+    };
+    await page.goto("/users");
+    const users = page.locator(".copilot-users");
+    const summary = users.getByRole("group", { name: "M365 Copilot license summary" });
+    const surface = users.locator(".user-directory-table");
+    await expect(surface.locator("tbody tr").first()).toBeVisible();
+    expect(await styles(summary, surfaceProperties)).toEqual(reference.strip);
+    expect(await styles(summary.locator(".metric").first(), ["padding", "gap", "border-right", "border-radius", "background-color"])).toEqual(reference.metric);
+    expect(await styles(summary.locator(".metric > span").first(), textProperties)).toEqual(reference.label);
+    expect(await styles(summary.locator(".metric > strong").first(), textProperties)).toEqual(reference.count);
+    expect(await styles(summary.locator(".metric > small").first(), textProperties)).toEqual(reference.hint);
+    const cards = await summary.locator(".metric").evaluateAll(elements => elements.map(element => {
+      const { x, y, width, bottom } = element.getBoundingClientRect();
+      return { x, y, width, bottom };
+    }));
+    const context = await summary.locator(".agent-report-context").boundingBox();
+    expect(context).not.toBeNull();
+    if (width > 1000) {
+      expect(cards.every(card => Math.abs(card.y - context!.y) <= 1)).toBe(true);
+      expect(context!.x).toBeGreaterThan(cards[3].x);
+    } else {
+      expect(context!.y).toBeGreaterThanOrEqual(Math.max(...cards.map(card => card.bottom)) - 1);
+      const summaryBounds = await summary.boundingBox();
+      expect(Math.abs(context!.width - summaryBounds!.width + 2)).toBeLessThanOrEqual(1);
+    }
+    if (width <= 760) {
+      expect(cards[0].y).toBe(cards[1].y);
+      expect(cards[2].y).toBe(cards[3].y);
+      expect(cards[2].y).toBeGreaterThan(cards[0].y);
+    }
+    await expect(summary.getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
+    for (const cohort of ["licenses", "activity"]) {
+      await users.getByRole("combobox", { name: "User cohort", exact: true }).selectOption(cohort);
+      await expect(surface.locator("tbody tr").first()).toBeVisible();
+      expect(await styles(surface, surfaceProperties)).toEqual(reference.table);
+      expect(await styles(surface.locator(".agent-grid-toolbar"), ["padding", "gap"])).toEqual(reference.toolbar);
+      expect(await styles(surface.locator("thead th").first(), cellProperties)).toEqual(reference.header);
+      expect(await styles(surface.locator(".table-sort-heading").first(), ["min-height", "padding", "gap", ...textProperties])).toEqual(reference.sort);
+      expect(await styles(surface.locator("tbody tr").first().locator("td").nth(2), cellProperties)).toEqual(reference.cell);
+      expect(await styles(surface.locator(".user-name-button").first(), [...textProperties, "text-underline-offset"])).toEqual(reference.name);
+      for (const button of [surface.locator(".user-name-button").first(), surface.locator(".table-sort-heading").first()]) {
+        const inset = await button.evaluate(element => {
+          const cell = element.closest("th")!;
+          return element.getBoundingClientRect().left - cell.getBoundingClientRect().left - parseFloat(getComputedStyle(cell).paddingLeft);
+        });
+        expect(Math.abs(inset)).toBeLessThanOrEqual(1);
+      }
+      expect(await styles(surface.locator(".agent-filter-trigger"), ["min-height", "font-size", "border", "border-radius"])).toEqual(reference.filters);
+      expect(await styles(surface.locator(".agent-search-field"), surfaceProperties)).toEqual(reference.search);
+      const toolbar = await surface.locator(".agent-grid-toolbar").boundingBox();
+      const table = await surface.locator(".table-shell").boundingBox();
+      expect(Math.abs(table!.y - toolbar!.y - toolbar!.height)).toBeLessThanOrEqual(1);
+      await expect(surface.getByRole("button", { name: "Export users CSV" })).toBeVisible();
+      await expect(surface.getByRole("navigation", { name: "users pages" })).toBeVisible();
+      expect(await users.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      await page.screenshot({ path: info.outputPath(`users-${cohort}-${width}.png`) });
+    }
+  }
+  expect(unexpected).toEqual([]);
+});
 
 test("expanded data sources and coverage stays concise without disclaimer paragraphs", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
@@ -135,7 +230,13 @@ test("all user summary cards filter directly with readable selected, hover and k
       const left = element.getBoundingClientRect().left + parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth);
       return Array.from(element.children).map(child => child.getBoundingClientRect().left - left);
     });
-    for (const inset of contentInsets) expect(Math.abs(inset)).toBeLessThanOrEqual(1);
+    if (info.project.name === "desktop") {
+      for (const inset of contentInsets) expect(Math.abs(inset)).toBeLessThanOrEqual(1);
+    } else {
+      expect(contentInsets[0]).toBeGreaterThan(contentInsets[1]);
+      expect(Math.abs(contentInsets[1])).toBeLessThanOrEqual(1);
+      expect(Math.abs(contentInsets[2])).toBeLessThanOrEqual(1);
+    }
     const colors = await card.locator("span, strong, small").evaluateAll(elements => elements.map(element => getComputedStyle(element).color));
     await card.hover();
     expect(await card.locator("span, strong, small").evaluateAll(elements => elements.map(element => getComputedStyle(element).color))).toEqual(colors);
@@ -251,8 +352,9 @@ test("paid users remain searchable beyond four thousand without exposing checked
   const initialSnapshots = snapshots();
   expect(initialSnapshots).toBeGreaterThan(0);
   await page.getByRole("button", { name: "Next users", exact: true }).click();
+  await expect(table.locator("tbody tr").first()).toContainText("Person0050");
   await expect(page.getByLabel("users pages")).toContainText("4,053 matching users; 50 on this page");
-  expect(evidence.reads.at(-1)?.query.has("cursor")).toBe(true);
+  expect(evidence.reads.some(read => read.path === "/api/copilot-usage/users" && read.query.get("cursor") === "fixture:50")).toBe(true);
   const responsesHeading = table.getByRole("button", { name: "Agent responses", exact: true });
   await responsesHeading.click();
   await expect(page.getByRole("button", { name: "Previous users" })).toBeDisabled();
@@ -775,18 +877,9 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
       const input: { selectionId: string; kind: string } = request.postDataJSON();
       expect(input).toEqual({ selectionId: expect.any(String), kind: "official_users", idempotencyKey: expect.any(String) });
       expect(captures.has(input.selectionId)).toBe(true);
-      exported = new URLSearchParams(captures.get(input.selectionId));
-      const selected = selectedCohortRead(`/api/official-usage/users?${exported}`, source);
-      if (!selected || !("filters" in selected)) throw new Error("Expected a frozen reported-user page");
-      const rows = selected.value.flatMap(user => {
-        if (!("username" in user) || !("reportedResponses" in user)) throw new Error("Expected scalar reported-user facts");
-        const relationships = source.relationships.filter(row => row.username === user.username);
-        return (relationships.length ? relationships : [null]).map(row => ({
-          username: user.username, displayName: user.displayName, reportedResponsesReceived: user.reportedResponses,
-          licenseAssignmentStatus: "no_active_paid_license", entitlement: user.entitlement,
-          agentId: row?.agentId, responsesSentToUsers: row?.responses, reportSetId: source.directory.reports.setId,
-        }));
-      });
+      const capture = captures.get(input.selectionId)!;
+      exported = new URLSearchParams(capture.query);
+      const rows = selectedCohortExportRows(capture);
       csv = usageCsvFixture([...reportExportColumns.official_users], rows); exportRows = rows.length;
       return route.fulfill({ status: 202, json: { id: exportId } });
     }
@@ -837,6 +930,9 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
   await page.screenshot({ path: info.outputPath("nonpaid-user-filters.png") });
   await expect(page).toHaveURL(/\/users\?view=activity/);
   await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+  source.users.find(user => user.username === "emery@example.invalid")!.reportedResponses = 999;
+  source.relationships = [];
+  source.directory.reports.setId = "70000000-0000-4000-8000-000000000007";
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export users CSV" }).click();
   await page.getByRole("link", { name: "Download CSV", exact: true }).click();

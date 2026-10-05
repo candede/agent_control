@@ -33,9 +33,47 @@ function sortRows<T>(rows: T[], query: ReportQuery, value: (row: T) => string | 
     return (query.order === "asc" ? 1 : -1) * (typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right)));
   });
 }
-export function selectedCohortRead(input: string, data: SelectedCohortData):
+export function captureSelectedCohort(input: string, source: SelectedCohortData) {
+  const query = new URL(input, "http://localhost").searchParams, data = structuredClone(source);
+  const selectedQuery = selectedFixtureQuery(input);
+  return {
+    query, source: data,
+    read(request: string) {
+      const url = new URL(request, "http://localhost");
+      if (!url.pathname.endsWith("/facets") && !url.pathname.endsWith("/agents")
+        && Object.keys(selectedQuery).some(key => url.searchParams.has(key))
+        && JSON.stringify(selectedFixtureQuery(request)) !== JSON.stringify(selectedQuery)) {
+        throw new Error("Synthetic selection filters are immutable");
+      }
+      return selectedCohortRead(request, data, selectedQuery);
+    },
+  };
+}
+
+export function selectedCohortExportRows(capture: ReturnType<typeof captureSelectedCohort>) {
+  const url = new URL("/api/official-usage/users?limit=100", "http://localhost");
+  const rows: Array<Record<string, unknown>> = [];
+  for (;;) {
+    const page = capture.read(url.href);
+    if (!page || !("filters" in page)) throw new Error("Expected a frozen reported-user page");
+    for (const user of page.value) {
+      if (!("username" in user) || !("reportedResponses" in user)) throw new Error("Expected scalar reported-user facts");
+      const relationships = capture.source.relationships.filter(row => row.username === user.username);
+      rows.push(...(relationships.length ? relationships : [null]).map(row => ({
+        username: user.username, displayName: user.displayName, reportedResponsesReceived: user.reportedResponses,
+        licenseAssignmentStatus: "no_active_paid_license", entitlement: user.entitlement,
+        agentId: row?.agentId, responsesSentToUsers: row?.responses, reportSetId: capture.source.directory.reports.setId,
+      })));
+    }
+    if (!page.page.nextCursor) return rows;
+    url.searchParams.set("cursor", page.page.nextCursor);
+  }
+}
+
+export function selectedCohortRead(input: string, data: SelectedCohortData, selectionQuery?: ReportQuery):
   ReportPage<ReportRow> | OfficialReportDetail<CombinedUser | ReportUser> | OfficialReportFacetPage | undefined {
-  const url = new URL(input, "http://localhost"), query = selectedFixtureQuery(input), path = url.pathname;
+  const url = new URL(input, "http://localhost"), requestQuery = selectedFixtureQuery(input), path = url.pathname;
+  const query = selectionQuery ?? requestQuery;
   const reports = { ...data.directory.reports, setId: query.setId ?? data.directory.reports.setId };
   const selection = { ...data.directory.selection, id: url.searchParams.get("selectionId") ?? data.directory.selection.id };
   const current = data.directory.sources.directory.state === "available";
@@ -52,7 +90,7 @@ export function selectedCohortRead(input: string, data: SelectedCohortData):
   });
   const unpaid = users.filter(row => row.hasActivity && (row.entitlement === "no_paid" || row.entitlement === "paid_inactive"));
   const activeSince = new Date(selectedFixtureNow.getTime() - (query.activityWindowDays ?? 30) * 86_400_000).toISOString().slice(0, 10);
-  const selected = (query.licenseCohort ? unpaid : users).filter(row => {
+  const selectUsers = (query: ReportQuery) => (query.licenseCohort ? unpaid : users).filter(row => {
     const links = data.relationships.filter(link => link.username === row.username);
     return (!query.search || `${row.displayName} ${row.username} ${links.map(link => `${link.agentName} ${link.agentId}`).join(" ")}`.toLowerCase().includes(query.search.toLowerCase()))
       && (!query.agentId || links.some(link => link.agentId === query.agentId))
@@ -67,6 +105,7 @@ export function selectedCohortRead(input: string, data: SelectedCohortData):
         || query.reportActivity === "inactive" && Boolean(row.userLastActivityDateUtc && row.userLastActivityDateUtc < activeSince)
         || query.reportActivity === "no-activity" && !row.userLastActivityDateUtc);
   });
+  const selected = selectUsers(query);
   const selectedPage = <T>(rows: T[], total = rows.length): ReportPage<T> => {
     const base = reportPage(rows, { reports, selection, sources: data.directory.sources, filters: query,
       counts: { total, filtered: rows.length } });
@@ -76,11 +115,23 @@ export function selectedCohortRead(input: string, data: SelectedCohortData):
   };
   if (path === "/api/official-usage/users/facets") {
     const field = url.searchParams.get("field"), groups = new Map<string | null, number>();
-    for (const row of unpaid) {
-      const value = field === "department" ? row.department : row.company;
+    if (field !== "company" && field !== "department") throw new Error("Unexpected reported-user facet");
+    const facetQuery = { ...query };
+    delete facetQuery[field];
+    if (!selectionQuery) {
+      delete facetQuery.search;
+      facetQuery.licenseCohort ??= "active_without_paid";
+    }
+    const search = url.searchParams.get("search")?.normalize("NFKC").toLowerCase();
+    const valueOf = (row: ReportUser) => row[field]?.trim() || null;
+    for (const row of selectUsers(facetQuery)) {
+      const value = valueOf(row);
+      if (search && !(value ?? "").normalize("NFKC").toLowerCase().includes(search)) continue;
       groups.set(value, (groups.get(value) ?? 0) + 1);
     }
-    const page = selectedPage([...groups].map(([value, count]) => ({ value, count })));
+    const values = [...groups].sort(([a], [b]) => a === null ? 1 : b === null ? -1 : a.localeCompare(b))
+      .map(([value, count]) => ({ value, count }));
+    const page = selectedPage(values, new Set(users.map(valueOf)).size);
     return { value: page.value, counts: page.counts, page: page.page, selection };
   }
   if (path === "/api/official-usage/users") {
@@ -93,15 +144,15 @@ export function selectedCohortRead(input: string, data: SelectedCohortData):
   }
   if (path.startsWith("/api/official-usage/users/")) {
     const [encoded, child] = path.slice("/api/official-usage/users/".length).split("/"), username = decodeURIComponent(encoded);
-    const value = users.find(row => row.username === username);
+    const value = (selectionQuery ? selected : users).find(row => row.username === username);
     if (!value) return undefined;
     if (!child) return { value, reports, selection, sources: data.directory.sources };
     if (child === "agents") {
-      const rows = data.relationships.filter(row => row.username === username && (!query.agentId || row.agentId === query.agentId)
-        && (!query.creatorType || row.creatorType === query.creatorType) && (!query.responsesOnly || row.responses > 0)
-        && (!query.search || `${row.agentName} ${row.agentId} ${row.creatorType}`.toLowerCase().includes(query.search.toLowerCase())));
-      sortRows(rows, query, row => query.sort === "name" ? row.agentName : query.sort === "creatorType" ? row.creatorType
-        : query.sort === "lastActivity" ? row.lastActivityDateUtc : row.responses);
+      const rows = data.relationships.filter(row => row.username === username && (!requestQuery.agentId || row.agentId === requestQuery.agentId)
+        && (!requestQuery.creatorType || row.creatorType === requestQuery.creatorType) && (!requestQuery.responsesOnly || row.responses > 0)
+        && (!requestQuery.search || `${row.agentName} ${row.agentId} ${row.creatorType}`.toLowerCase().includes(requestQuery.search.toLowerCase())));
+      sortRows(rows, requestQuery, row => requestQuery.sort === "name" ? row.agentName : requestQuery.sort === "creatorType" ? row.creatorType
+        : requestQuery.sort === "lastActivity" ? row.lastActivityDateUtc : row.responses);
       return selectedPage(rows);
     }
     const identity = current && data.directory.value.find(row => row.directory.objectId === value.objectId);

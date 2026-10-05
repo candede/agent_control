@@ -255,7 +255,7 @@
   line-height: 1.5;
 }
 
-.agent-workspace .agent-overview-metrics {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(280px, 1.6fr);
   gap: 0;
@@ -264,7 +264,7 @@
   background: var(--surface);
 }
 
-.agent-workspace .agent-overview-metrics .metric {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric {
   min-height: 0;
   justify-content: start;
   align-items: stretch;
@@ -277,25 +277,25 @@
   color: var(--text);
 }
 
-.agent-workspace .agent-overview-metrics .metric:first-child {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric:first-child {
   border-radius: 9px 0 0 9px;
 }
 
-.agent-workspace .agent-overview-filter[aria-pressed="true"] {
+:is(.agent-workspace, .copilot-users) .agent-overview-filter[aria-pressed="true"] {
   box-shadow: inset 3px 0 var(--ink);
   background: #f8f7ff;
 }
 
-.agent-workspace .agent-overview-filter:hover {
+:is(.agent-workspace, .copilot-users) .agent-overview-filter:hover {
   background: #f0efff;
 }
 
-.agent-workspace .agent-overview-metrics .metric > span {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > span {
   font-size: 12px;
   line-height: 1.3;
 }
 
-.agent-workspace .agent-overview-metrics .metric > strong {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > strong {
   font-size: 26px;
   font-weight: 650;
   line-height: 1.2;
@@ -303,7 +303,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-.agent-workspace .agent-overview-metrics small {
+:is(.agent-workspace, .copilot-users) .agent-overview-metrics small {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
@@ -336,7 +336,7 @@
 }
 .agent-report-context .usage-report-selector { gap: 4px; }
 
-.agent-workspace .agent-table-stack {
+:is(.agent-workspace, .copilot-users) .agent-table-stack {
   border: 1px solid var(--border);
   border-radius: 11px;
   background: var(--surface);
@@ -390,7 +390,7 @@
   opacity: 0.55;
 }
 
-.agent-workspace .agent-grid-toolbar {
+:is(.agent-workspace, .copilot-users) .agent-grid-toolbar {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   justify-content: stretch;
@@ -433,6 +433,7 @@
 .agent-query-bar input,
 .agent-query-bar select,
 .agent-query-bar button,
+.copilot-users .agent-query-bar button,
 .agent-workspace .agent-column-picker > button {
   min-height: 36px;
   font-size: 12px;
@@ -654,20 +655,23 @@
   font-size: 11px;
 }
 
-.agent-workspace .table-shell {
+.agent-workspace .table-shell,
+.user-directory-table .table-shell {
   border: 0;
   border-top: 1px solid var(--border);
   border-radius: 0;
 }
 
-.agent-workspace th {
+.agent-workspace th,
+.user-directory-table .copilot-users-table thead th {
   padding-block: 9px;
   background: #f8f9fc;
   font-weight: 600;
   text-transform: none;
 }
 
-.agent-workspace tbody tr:hover {
+.agent-workspace tbody tr:hover,
+.user-directory-table tbody tr:hover {
   background: #fafaff;
 }
 
@@ -696,11 +700,11 @@
     --workspace-gutter: 20px;
   }
 
-  .agent-workspace .agent-overview-metrics {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
-  .agent-workspace .agent-overview-metrics .metric:nth-child(4) {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric:nth-child(4) {
     border-right: 0;
   }
 
@@ -717,7 +721,7 @@
     flex: 1 1 280px;
   }
 
-  .agent-workspace .agent-overview-metrics .metric {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric {
     padding: 10px 12px;
   }
 }
@@ -787,7 +791,8 @@
   }
 
   .agent-workspace button,
-  .user-activity-controls button {
+  .user-activity-controls button,
+  .user-directory-table button {
     width: auto;
   }
 
@@ -829,19 +834,19 @@
     font-size: 11px;
   }
 
-  .agent-workspace .agent-overview-metrics {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .agent-workspace .agent-overview-metrics .metric:nth-child(2) {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric:nth-child(2) {
     border-right: 0;
   }
 
-  .agent-workspace .agent-overview-metrics .metric:nth-child(n + 3) {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric:nth-child(n + 3) {
     border-top: 1px solid var(--border);
   }
 
-  .agent-workspace .agent-overview-metrics .metric {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
     column-gap: 9px;
@@ -849,19 +854,19 @@
     align-items: center;
   }
 
-  .agent-workspace .agent-overview-metrics .metric > span {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > span {
     grid-column: 2;
     grid-row: 1;
     font-size: 11px;
   }
 
-  .agent-workspace .agent-overview-metrics .metric > strong {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > strong {
     grid-column: 1;
     grid-row: 1;
     font-size: 23px;
   }
 
-  .agent-workspace .agent-overview-metrics .metric > small {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > small {
     grid-column: 1 / -1;
     font-size: 10px;
   }
@@ -875,7 +880,7 @@
     display: none;
   }
 
-  .agent-workspace .agent-grid-toolbar {
+  :is(.agent-workspace, .copilot-users) .agent-grid-toolbar {
     padding: 10px;
   }
 

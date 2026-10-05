@@ -7,7 +7,7 @@ import * as api from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import type { CombinedUser, ReportPage, ReportQuery } from "../../../backend/src/types/officialReportData";
 import type { UserSourcePlan } from "../../../backend/src/types/userSources";
-import { combinedUser, reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { combinedUser, reportPage, reports, reportUser, selectionId } from "../test/reportDataFixture";
 import { mockNativeDialogs } from "../test/dialog";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
@@ -68,6 +68,35 @@ beforeEach(() => {
 afterEach(() => vi.resetAllMocks());
 
 describe("record-backed paid M365 Copilot license dashboard", () => {
+  it("groups report context with the summary and keeps controls, rows and pagination in one table surface", async () => {
+    const onRouteChange = vi.fn();
+    render(<CopilotUsersView route={{ view: "licenses", search: "", page: 0, reportSetId: reports.setId! }} onRouteChange={onRouteChange}
+      reportSelector={<select aria-label="Report set"><option>Selected report</option></select>} />);
+    await screen.findByRole("button", { name: "Ada" });
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    expect(summary).toHaveClass("agent-overview-metrics");
+    expect(within(summary).getByRole("combobox", { name: "Report set" })).toBeVisible();
+    expect(within(summary).getAllByRole("button", { pressed: false })).toHaveLength(3);
+    const table = screen.getByRole("region", { name: "M365 Copilot license status" });
+    const surface = table.closest<HTMLElement>(".agent-table-stack")!;
+    expect(surface).toHaveClass("user-directory-table");
+    expect(within(surface).getByRole("region", { name: "User filters" })).toHaveClass("agent-grid-toolbar");
+    expect(within(surface).getByRole("searchbox", { name: "Search users or agents" })).toBeVisible();
+    expect(within(surface).getByRole("button", { name: "Export users CSV" })).toBeVisible();
+    expect(within(surface).getByRole("navigation", { name: "users pages" })).toBeVisible();
+    await userEvent.click(within(summary).getByRole("button", { name: "Use current reports" }));
+    expect(onRouteChange).toHaveBeenLastCalledWith(expect.objectContaining({ reportSetId: undefined, page: 0 }), false);
+  });
+  it("keeps report selection available for non-paid users but not responsibility", async () => {
+    render(<CopilotUsersView reportSelector={<select aria-label="Report set"><option>Selected report</option></select>} />);
+    await screen.findByRole("button", { name: "Ada" });
+    vi.mocked(api.readReportPage).mockResolvedValue(reportPage([reportUser(1)]));
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "activity");
+    expect(screen.queryByRole("group", { name: "M365 Copilot license summary" })).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Report set" })).toBeVisible();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "responsibility");
+    expect(screen.queryByRole("combobox", { name: "Report set" })).not.toBeInTheDocument();
+  });
   it("deep-links a responsible person absent from paid/report cohorts without loading license or report data", async () => {
     render(<CopilotUsersView route={{ view: "responsibility", personId: responsibilityOwnerId, search: "", page: 0 }} />);
     expect(await screen.findByText("Responsible only")).toBeVisible();
@@ -262,6 +291,32 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
     expect(rows()).toHaveLength(1);
   });
+  it.each(["Next", "Previous"])("preserves %s users keyboard focus while paging without admitting duplicate navigation", async direction => {
+    vi.mocked(api.readReportPage).mockResolvedValue(page([ada], {
+      page: { limit: 50, nextCursor: "next", previousCursor: "previous" },
+    }));
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    let finish!: (value: ReportPage<CombinedUser>) => void;
+    vi.mocked(api.readReportPage).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const button = screen.getByRole("button", { name: `${direction} users` });
+    button.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    assertQuery({ cohort: "licensed" });
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)![1]).toMatchObject({ cursor: direction.toLowerCase(), selectionId });
+    expect(button).toBeInTheDocument();
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    await userEvent.keyboard("{Enter}");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    await act(async () => finish(page([ben])));
+    await screen.findByRole("button", { name: "Ben" });
+    expect(screen.getByRole("button", { name: `${direction} users` })).toBe(button);
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+  });
   it("passes company/department filters exactly, obtains bounded facets, and does not enumerate options", async () => {
     render(<CopilotUsersView />); await screen.findByRole("button", { name: "Ada" });
     const popup = await filters();
@@ -381,8 +436,49 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     render(<CopilotUsersView />);
     expect(await screen.findByRole("heading", { name: "No users on this page" })).toBeVisible();
     expect(screen.getByText("Continue to the next page.")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Next users" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false");
     expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.some(([path]) => path.endsWith("/unresolved-identities"))).toBe(false);
+  });
+  it("aborts unresolved identity reads when source coverage closes and requires explicit reopening", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")
+      ? new Promise(() => {}) : Promise.resolve(page()));
+    render(<CopilotUsersView />);
+    const summary = await screen.findByText("Data sources and coverage");
+    await userEvent.click(summary);
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
+    expect(signal?.aborted).toBe(false);
+    await userEvent.click(summary);
+    await waitFor(() => expect(signal?.aborted).toBe(true));
+    expect(screen.queryByRole("region", { name: "Unresolved report identities", hidden: true })).not.toBeInTheDocument();
+    await userEvent.click(summary);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+  });
+  it("does not reopen unresolved identities inside collapsed coverage after a data revision", async () => {
+    const current = page([ben], { selection: { ...page().selection, id: "new-selection" } });
+    vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")
+      ? new Promise(() => {}) : Promise.resolve(page()));
+    const view = render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByText("Data sources and coverage"));
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
+    vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")
+      ? new Promise(() => {}) : Promise.resolve(current));
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    await screen.findByRole("button", { name: "Ben" });
+    expect(signal?.aborted).toBe(true);
+    const summary = screen.getByText("Data sources and coverage");
+    expect(summary.closest("details")).not.toHaveAttribute("open");
+    expect(screen.queryByRole("region", { name: "Unresolved report identities", hidden: true })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    await userEvent.click(summary);
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users/unresolved-identities",
+      expect.objectContaining({ selectionId: current.selection.id, limit: 50 }), expect.any(AbortSignal)));
   });
 });

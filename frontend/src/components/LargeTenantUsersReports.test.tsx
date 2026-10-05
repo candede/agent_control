@@ -92,19 +92,34 @@ describe("selected users and reports client boundary", () => {
     expect(result.current.loading).toBe(false);
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
-  it.each([401, 403, 409])("closes exact details on parent read failure %s and never revives them after recovery", async status => {
+  it.each([401, 403])("closes exact details on parent read failure %s and never revives them after recovery", async status => {
     render(<CopilotUsersView />);
     fireEvent.click(await screen.findByRole("button", { name: "User 1" }));
     const dialog = screen.getByRole("dialog");
     await within(dialog).findByRole("heading", { name: "User 1" });
-    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(status,
-      status === 409 ? "selection_invalidated" : "access_denied", "Read no longer authorized or current"));
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(status, "access_denied", "Read no longer authorized or current"));
     fireEvent.focus(window);
     await screen.findByRole("alert");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "User 1" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: status === 409 ? "Restart selection" : "Retry saved data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
     await screen.findByRole("button", { name: "User 1" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("automatically recaptures a top-level selection invalidated by a concurrent saved-data update", async () => {
+    render(<CopilotUsersView />);
+    fireEvent.click(await screen.findByRole("button", { name: "User 1" }));
+    await within(screen.getByRole("dialog")).findByRole("heading", { name: "User 1" });
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(
+      new ApiError(409, "selection_invalidated", "Saved data changed during the read"),
+    );
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users",
+      expect.not.objectContaining({ selectionId: expect.anything() }), expect.any(AbortSignal));
+    expect(await screen.findByRole("button", { name: "User 1" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -124,22 +139,25 @@ describe("selected users and reports client boundary", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("keeps valid cursor controls usable while a pinned revision is revalidated", async () => {
+  it("withdraws stale historical rows and cursors while a known revision is recaptured", async () => {
     const page = reportPage([combinedUser()], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
-    vi.mocked(api.readReportPage).mockResolvedValueOnce(page).mockReturnValueOnce(new Promise(() => {})).mockResolvedValueOnce(
-      reportPage([combinedUser(2)], { page: { limit: 50, nextCursor: null, previousCursor: "previous" } }));
-    const view = render(<CopilotUsersView />);
+    const replacement = deferred<ReturnType<typeof reportPage>>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page).mockReturnValueOnce(replacement.promise);
+    const route = { view: "licenses" as const, search: "", page: 0, reportSetId: reports.setId! };
+    const view = render(<CopilotUsersView route={route} />);
     await screen.findByRole("button", { name: "User 1" });
-    view.rerender(<CopilotUsersView dataRevision={1} />);
+    view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
-    expect(screen.queryByText("Loading saved data...")).not.toBeInTheDocument();
-    const stale = vi.mocked(api.readReportPage).mock.calls[1][2];
-    expect(screen.getByRole("button", { name: "Next users" })).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: "Next users" }));
+    expect(screen.getByText("Loading saved data...")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "User 1" })).not.toBeInTheDocument();
+    const next = screen.getByRole("button", { name: "Next users" });
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(next);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.readReportPage).mock.calls[1][1]).not.toHaveProperty("selectionId");
+    expect(vi.mocked(api.readReportPage).mock.calls[1][1]).not.toHaveProperty("cursor");
+    await act(async () => replacement.resolve(reportPage([combinedUser(2)])));
     await screen.findByRole("button", { name: "User 2" });
-    expect(stale?.aborted).toBe(true);
-    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users",
-      expect.objectContaining({ cursor: "next", selectionId }), expect.any(AbortSignal));
   });
 
   it("offers a real parent restart after an independently paged facet invalidates", async () => {
@@ -250,7 +268,7 @@ describe("selected users and reports client boundary", () => {
     const view = render(<QueryClientProvider client={client}><CopilotUsersView /></QueryClientProvider>);
     for (let index = 0; index < 6; index++) {
       await screen.findByRole("button", { name: "User 1" });
-      await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toBeEnabled());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false"));
       fireEvent.click(screen.getByRole("button", { name: "Next users" }));
       await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(index + 2));
     }
@@ -264,18 +282,18 @@ describe("selected users and reports client boundary", () => {
     pending.unmount();
     expect(signal?.aborted).toBe(true);
   });
-  it("requires an explicit restart after selection invalidation", async () => {
+  it("automatically recaptures after a paged root selection is invalidated", async () => {
     vi.mocked(api.readReportPage).mockResolvedValueOnce(reportPage([combinedUser()], { page: { limit: 50, nextCursor: "next", previousCursor: null } }))
       .mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Selection invalidated"))
       .mockResolvedValueOnce(reportPage([combinedUser(2)]));
     render(<CopilotUsersView />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
-    await screen.findByRole("button", { name: "Restart selection" });
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(screen.queryByRole("button", { name: "User 1" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await screen.findByRole("button", { name: "User 2" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(vi.mocked(api.readReportPage).mock.calls[2][1]?.selectionId).toBeUndefined();
+    expect(vi.mocked(api.readReportPage).mock.calls[2][1]?.cursor).toBeUndefined();
   });
   it("fetches exact details, then independently pages hundreds of service plans", async () => {
     vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("service-plans") ? reportPage([], { counts: { total: 800, filtered: 800 },
@@ -284,7 +302,7 @@ describe("selected users and reports client boundary", () => {
     await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledWith(`copilot-usage/users/${combinedUser().directory.objectId}`, selectionId, expect.any(AbortSignal)));
     fireEvent.click(screen.getByRole("tab", { name: "Licenses" }));
     await screen.findByText("800 matching plans; 0 on this page");
-    expect(screen.getByRole("button", { name: "Next plans" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Next plans" })).toHaveAttribute("aria-disabled", "false");
     expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/service-plans"), expect.objectContaining({ selectionId, limit: 50 }), expect.any(AbortSignal));
   });
   it("keeps one history selection across more than 32 sets and pages observations separately", async () => {
@@ -315,12 +333,43 @@ describe("selected users and reports client boundary", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(30000); });
     expect(api.reportExportStatus).toHaveBeenCalledTimes(1);
   });
-  it("revalidates a pinned selection on revision changes instead of silently capturing a new one", async () => {
-    const view = render(<CopilotUsersView dataRevision={0} />);
+  it("recaptures the same historical report set on revision changes", async () => {
+    const route = { view: "licenses" as const, search: "", page: 0, reportSetId: reports.setId! };
+    const view = render(<CopilotUsersView route={route} dataRevision={0} />);
     await screen.findByRole("button", { name: "User 1" });
-    view.rerender(<CopilotUsersView dataRevision={1} />);
+    view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
-    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", expect.objectContaining({ selectionId }), expect.any(AbortSignal));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users",
+      expect.objectContaining({ setId: reports.setId, limit: 50 }), expect.any(AbortSignal));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
+  });
+  it("recaptures current data after a known revision without replaying a selection or cursor", async () => {
+    const replacement = deferred<ReturnType<typeof reportPage>>();
+    const first = reportPage([combinedUser()], { page: { limit: 50, nextCursor: "page-two", previousCursor: null } });
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(first).mockReturnValueOnce(replacement.promise);
+    const query = { search: "User", sort: "name" as const, order: "asc" as const };
+    const { result, rerender } = renderHook(({ revision }) =>
+      useReportPage("copilot-usage/users", query, revision), { initialProps: { revision: 0 } });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    act(() => result.current.next());
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    rerender({ revision: 1 });
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.loading).toBe(true);
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", { ...query, limit: 50 }, expect.any(AbortSignal));
+    const latest = reportPage([combinedUser(2)], { selection: { ...first.selection, id: "new-selection" } });
+    await act(async () => replacement.resolve(latest));
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("new-selection"));
+    expect(result.current.invalidated).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
+  it("does not recapture explicit child selections on revision changes", async () => {
+    const { rerender } = renderHook(({ revision }) =>
+      useReportPage("copilot-usage/users", { selectionId }, revision), { initialProps: { revision: 0 } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledOnce());
+    rerender({ revision: 1 });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", { selectionId, limit: 50 }, expect.any(AbortSignal));
   });
   it("sorts from accessible table headers and retains the last valid threshold during editing", async () => {
     render(<CopilotUsersView />); await screen.findByRole("button", { name: "User 1" });

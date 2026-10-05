@@ -153,7 +153,7 @@ describe("focused selected official agent reporting", () => {
     expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("1,000,000");
     await act(async () => pending.resolve(page({ value: [], page: { limit: 50, nextCursor: null, previousCursor: "agent-previous" } })));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Previous agents" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Previous agents" })).toHaveAttribute("aria-disabled", "false"));
     expect(screen.getByRole("searchbox", { name: "Search agents" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Previous agents" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate",

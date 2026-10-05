@@ -1,6 +1,6 @@
 .copilot-users {
   display: grid;
-  gap: 12px;
+  gap: 14px;
   min-width: 0;
 }
 
@@ -66,6 +66,17 @@
 .copilot-users-table td small { display: block; margin-top: 3px; font-size: 12px; }
 .copilot-users-table td[data-numeric] { font-variant-numeric: tabular-nums; font-weight: 700; }
 .copilot-users-table .user-name-button { padding: 0; background: none; border: 0; color: var(--ink); text-align: left; text-decoration: underline; min-height: 32px; }
+.user-directory-table { min-width: 0; }
+.user-directory-table .copilot-users-table { font-size: inherit; }
+.user-directory-table .copilot-users-table th,
+.user-directory-table .copilot-users-table td { padding: 12px 14px; }
+.user-directory-table .copilot-users-table tbody th { background: transparent; font-size: inherit; }
+.user-directory-table tbody tr:last-child th { border-bottom: 0; }
+.user-directory-table .copilot-users-table td[data-numeric] { font-weight: 400; }
+.user-directory-table .user-name-button { min-height: 32px; }
+.user-directory-table .reported-users-empty { border: 0; border-top: 1px solid var(--border); border-radius: 0; }
+.user-directory-table > .copilot-users-pagination { justify-content: flex-end; padding: 12px 16px; border-top: 1px solid var(--border); }
+.user-directory-table > .copilot-users-pagination > span { margin-right: auto; color: var(--muted); font-size: 13px; }
 .copilot-users-provenance .copilot-users-toolbar { margin-block: 12px; }
 .copilot-users-provenance .copilot-users-pagination { margin-top: 12px; }
 .copilot-user-badge { display: inline-flex; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; color: #20573f; background: #e4f3eb; }
@@ -114,6 +125,7 @@
 .copilot-user-dialog footer p { flex: 1 1 240px; }
 
 @media (max-width: 760px) {
+  .copilot-users { gap: 12px; }
   .copilot-user-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .copilot-users-provenance dl { grid-template-columns: minmax(0, 1fr); }
   .copilot-user-dialog { padding: 16px; }

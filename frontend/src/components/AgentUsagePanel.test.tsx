@@ -226,7 +226,7 @@ describe("exact inventory report usage", () => {
     const search = screen.getByRole("searchbox", { name: "Search reported agent users" });
     fireEvent.change(search, { target: { value: "person" } });
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Next relationships" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Next relationships" })).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(screen.getByRole("button", { name: "Next relationships" }));
     await screen.findByText("person25@example.invalid");
     const table = screen.getByRole("table"), region = screen.getByRole("region", { name: "Exact reported agent details" });

@@ -205,17 +205,25 @@ describe("compact shared report-set selection", () => {
     await act(async () => pending.resolve(confirmation()));
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
   });
-  it("makes an invalidated history cursor explicitly restartable without silently loading another generation", async () => {
+  it.each([false, true])("recovers history invalidation once and offers explicit retry when persistent=%s", async persistent => {
     vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...page(), page: { limit: 50, nextCursor: "next", previousCursor: null } })
       .mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "A retained report was deleted"));
+    if (persistent) vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed again"));
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
     await userEvent.selectOptions(await ready(), "older-reports");
-    await screen.findByRole("alert");
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    if (persistent) {
+      await screen.findByRole("alert");
+      expect(api.readReportPage).toHaveBeenCalledTimes(3);
+      expect(screen.getByRole("combobox")).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    }
     await ready();
-    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
+    expect(api.readReportPage).toHaveBeenCalledTimes(persistent ? 4 : 3);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ sort: "acceptedAt", order: "desc", limit: 50 });
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
   });
   it("shows empty history in the selector without admitting an empty report operation", async () => {
     metadata = { ...metadata, activeSetId: null, setId: null, availability: "never_imported" };

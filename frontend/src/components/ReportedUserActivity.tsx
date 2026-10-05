@@ -31,7 +31,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
   const read = useReportPage<ReportUser>("official-usage/users", { ...filters, licenseCohort: "active_without_paid",
     search: route.search || undefined, agentId: route.agentId, setId: route.reportSetId, lowResponseThreshold: valid ? Number(threshold) : lastThreshold }, dataRevision);
   const data = read.data;
-  if (selected && (read.error || selected.reportSetId !== route.reportSetId || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
+  if (selected && (!data || selected.reportSetId !== route.reportSetId || data.selection.id !== selected.selectionId)) setSelected(undefined);
   function restartSelection() { setSelected(undefined); read.restart(); }
   return <section className="reported-users" aria-label="Non-paid user activity">
     <ReportReadStatus read={read} quietLoading />
@@ -40,7 +40,8 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
     {data && data.summary.unknownLicenseActiveReportUsers > 0 ? <p className="copilot-users-notice">{data.summary.unknownLicenseActiveReportUsers.toLocaleString()} active report{" "}
       {data.summary.unknownLicenseActiveReportUsers === 1 ? "user needs" : "users need"} a license check. Run Users sync.</p> : null}
     {data?.reports.availability === "stale" ? <p className="copilot-users-notice">Reports are out of date. Refresh reports in Sync.</p> : null}
-    <UserActivityFilters path="official-usage/users" selectionId={data?.selection.id} onRestartSelection={restartSelection}
+    <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
+      <UserActivityFilters path="official-usage/users" selectionId={data?.selection.id} onRestartSelection={restartSelection}
       values={{ company: filters.company, department: filters.department, cohort: filters.cohort ?? "all", lowResponseThreshold: threshold }}
       cohorts={[{ value: "all", label: "All response counts" }, { value: "low", label: "Low responses" }, { value: "zero", label: "Zero responses" }, { value: "review", label: "Zero or low responses" }]}
       defaultCohort="all" search={route.search} searchRef={focus} sort={`${filters.sort}:${filters.order}`}
@@ -54,12 +55,12 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
       onClear={() => { setFilters({ cohort: "all", sort: filters.sort, order: filters.order }); setThreshold("5"); onRouteChange({ ...route, search: "", agentId: undefined, page: 0 }); }}
       exportButton={<ReportExportButton key={data?.selection.id} kind="official_users" selectionId={data?.selection.id} label="Export users CSV"
         disabled={read.loading || !valid || data?.sources.directory.state !== "available" || !data?.reports.setId} />} />
-      {read.loading || data?.value.length ? <div className="copilot-users-table-shell" role="region" aria-label="Reported user activity" tabIndex={0}><table className="copilot-users-table reported-users-table">
+      {read.loading || data?.value.length ? <div className="table-shell copilot-users-table-shell" role="region" aria-label="Reported user activity" tabIndex={0}><table className="agent-table copilot-users-table reported-users-table">
         <thead><tr><ReportSortHeading label="User" sort="name" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agent responses" sort="responses" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agents used" sort="agentsUsed" query={filters} onChange={setFilters} />
           <th scope="col">Company</th><th scope="col">Department</th><ReportSortHeading label="Last activity" sort="lastActivity" query={filters} onChange={setFilters} /></tr></thead>
-        <tbody>{data?.value.map(user => <tr key={user.username}><th scope="row"><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={event => {
+        <tbody>{data?.value.map(user => <tr key={user.username}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
           trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, reportSetId: route.reportSetId });
         }}>
           {user.displayName || user.username}</button><small>{user.username}</small></th><td data-numeric>{usageCount(user.reportedResponses)}</td>
@@ -70,7 +71,8 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
         <p>{!data.reports.setId ? <>Select or import reports in <a href="/sync?reports=manage">Sync</a>.</>
           : data.counts.filtered ? "Continue to the next page." : "Try another search or clear filters."}</p>
       </div> : null}
-    {data && data.counts.filtered > 0 ? <ReportPageControls {...read} label="users" /> : null}
+      {read.loading || data && data.counts.filtered > 0 ? <ReportPageControls {...read} label="users" /> : null}
+    </div>
     {data ? <details className="copilot-users-provenance"><summary>Report sources</summary><UsageReportContext reports={data.reports} inlineSources /></details> : null}
     {selected ? <UserDetailModal key={selected.selectionId + selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
       filters={route.agentId ? { agentId: route.agentId } : undefined}

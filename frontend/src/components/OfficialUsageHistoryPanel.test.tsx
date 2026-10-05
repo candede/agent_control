@@ -124,14 +124,21 @@ describe("saved report history", () => {
 
   it("disables report actions while reloading or performing a mutation", async () => {
     const admin = { busy: false, onDelete: vi.fn() };
+    api.history.mockResolvedValueOnce(history(0, 51));
     const view = render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} admin={admin} />);
     await screen.findByRole("table");
     view.rerender(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} admin={{ ...admin, busy: true }} />);
-    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+    for (const button of screen.getAllByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })) expect(button).toBeDisabled();
+    for (const button of within(screen.getByRole("navigation", { name: "report sets pages" })).getAllByRole("button")) {
+      expect(button).toHaveAttribute("aria-disabled", "true");
+      await userEvent.click(button);
+    }
+    expect(api.history).toHaveBeenCalledOnce();
     let finish!: (value: HistoryPage) => void;
     api.history.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     view.rerender(<OfficialUsageHistoryPanel revision={1} onSelect={vi.fn()} admin={admin} />);
-    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading saved data");
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
     await act(async () => finish(history()));
     await waitFor(() => {
       for (const button of screen.getAllByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })) expect(button).toBeEnabled();
@@ -161,10 +168,10 @@ describe("saved report history", () => {
     expect(api.history).toHaveBeenLastCalledWith("official-usage/history", expect.objectContaining({
       selectionId, limit: 50, cursor: "page-50",
     }), expect.any(AbortSignal));
-    expect(screen.getByRole("button", { name: "Next report sets" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Next report sets" })).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("requires an explicit new selection after deletion invalidates the current page", async () => {
+  it("automatically captures current history after a known deletion", async () => {
     let count = 101;
     api.history.mockImplementation(async (_path, query) => {
       if (count === 51 && query.selectionId) throw new ApiError(409, "selection_invalidated", "History membership changed");
@@ -173,16 +180,13 @@ describe("saved report history", () => {
     const view = render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: "Next report sets" }));
     await waitFor(() => expect(api.history).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Next report sets" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Next report sets" })).toHaveAttribute("aria-disabled", "false"));
     await userEvent.click(screen.getByRole("button", { name: "Next report sets" }));
     await screen.findByText("101 matching report sets; 1 on this page");
     count = 51;
     view.rerender(<OfficialUsageHistoryPanel revision={1} onSelect={vi.fn()} />);
-    await screen.findByRole("button", { name: "Restart selection" });
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
-    expect(api.history).toHaveBeenCalledTimes(4);
-    await userEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await screen.findByText("51 matching report sets; 50 on this page");
+    expect(api.history).toHaveBeenCalledTimes(4);
     expect(api.history.mock.calls.at(-1)?.[1].selectionId).toBeUndefined();
     expect(api.history.mock.calls.at(-1)?.[1].cursor).toBeUndefined();
   });

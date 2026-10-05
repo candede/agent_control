@@ -1,9 +1,10 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReportRelationship } from "../../../backend/src/types/officialReportData";
+import type { ReportPage, ReportRelationship } from "../../../backend/src/types/officialReportData";
 import { readReportPage } from "../api/reportData";
 import { reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 import { ReportedUserAgents } from "./ReportedUserAgents";
 
 vi.mock("../api/reportData", async original => ({ ...await original<typeof import("../api/reportData")>(), readReportPage: vi.fn() }));
@@ -18,6 +19,28 @@ beforeEach(() => { vi.resetAllMocks(); vi.mocked(readReportPage).mockResolvedVal
 afterEach(cleanup);
 
 describe("reported user's selected agent pages", () => {
+  it.each(["Next", "Previous"])("retains keyboard focus while loading the %s relationship page", async direction => {
+    vi.mocked(readReportPage).mockResolvedValueOnce(reportPage([relationship(1)],
+      { page: { limit: 50, nextCursor: "next", previousCursor: "previous" } }));
+    render(<ReportedUserAgents path={path} selectionId={selectionId} />);
+    await screen.findByText("Agent 1");
+    const button = screen.getByRole("button", { name: `${direction} agents` });
+    const pending = deferred<ReportPage<ReportRelationship>>();
+    vi.mocked(readReportPage).mockReturnValueOnce(pending.promise);
+    button.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(readReportPage).toHaveBeenLastCalledWith(path, expect.objectContaining({ selectionId, cursor: direction.toLowerCase() }), expect.any(AbortSignal));
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("Agent 1")).not.toBeInTheDocument();
+    await userEvent.keyboard("{Enter}");
+    expect(readReportPage).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(reportPage([relationship(2)])));
+    await screen.findByText("Agent 2");
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+  });
+
   it.each([false, true])("preserves search, sort, pagination and optional cohort navigation over 1,005 relationships: %s", async navigable => {
     vi.mocked(readReportPage).mockImplementation(async (_path, query) => reportPage([
       relationship(query?.search ? 1004 : query?.sort === "name" ? 7 : query?.order === "asc" ? 0 : query?.cursor ? 954 : 1004),

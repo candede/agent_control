@@ -60,8 +60,8 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
     if (!open) return;
     let observer: MutationObserver | undefined;
     const focusFirst = () => {
-      const first = popover.current?.querySelector<HTMLElement>("select, input");
-      if (!first || first.matches(":disabled")) return false;
+      const first = popover.current?.querySelector<HTMLElement>("select:not(:disabled), input:not(:disabled)");
+      if (!first) return false;
       if (document.activeElement === triggerRef.current || document.activeElement === document.body) first.focus();
       observer?.disconnect();
       return true;

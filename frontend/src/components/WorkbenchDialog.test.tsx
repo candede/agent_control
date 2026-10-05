@@ -59,6 +59,49 @@ describe("WorkbenchDialog", () => {
     expect(dialog).toHaveAttribute("open");
   });
 
+  it("does not request a parent close when a nested dialog is cancelled", () => {
+    const onClose = vi.fn();
+    const onNestedClose = vi.fn();
+    render(<WorkbenchDialog open title="Parent" onClose={onClose}>
+      <WorkbenchDialog open title="Nested" onClose={onNestedClose}>Nested content</WorkbenchDialog>
+    </WorkbenchDialog>);
+    const nested = screen.getByRole("dialog", { name: "Nested" });
+    expect(fireEvent(nested, new Event("cancel", { cancelable: true }))).toBe(false);
+    expect(onNestedClose).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Parent" })).toHaveAttribute("open");
+  });
+
+  it("handles each nested dialog Tab only once", async () => {
+    render(<WorkbenchDialog open title="Parent" onClose={vi.fn()}>
+      <WorkbenchDialog open title="Nested" onClose={vi.fn()}>
+        <button type="button" tabIndex={1}>First nested action</button>
+        <button type="button" tabIndex={2}>Second nested action</button>
+        <button type="button" tabIndex={3}>Third nested action</button>
+      </WorkbenchDialog>
+    </WorkbenchDialog>);
+    const first = screen.getByRole("button", { name: "First nested action" });
+    first.focus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Second nested action" })).toHaveFocus();
+    await userEvent.tab({ shift: true });
+    expect(first).toHaveFocus();
+  });
+
+  it("keeps a blocking dialog open without close controls and traps keyboard focus", async () => {
+    render(<WorkbenchDialog open title="Preparing workspace">
+      <button type="button">Recovery action</button>
+    </WorkbenchDialog>);
+    const dialog = screen.getByRole("dialog", { name: "Preparing workspace" });
+    expect(screen.queryByRole("button", { name: /^Close/ })).not.toBeInTheDocument();
+    expect(fireEvent(dialog, new Event("cancel", { cancelable: true }))).toBe(false);
+    expect(dialog).toHaveAttribute("open");
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Recovery action" })).toHaveFocus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Recovery action" })).toHaveFocus();
+  });
+
   it("stays open through Strict Mode replay and does not reopen on content updates", () => {
     const onClose = vi.fn();
     const content = (text: string) => <StrictMode>
@@ -103,6 +146,43 @@ describe("WorkbenchDialog", () => {
     rerender(content(true));
     rerender(content(false));
     expect(screen.getByRole("heading", { name: "Page heading" })).toHaveFocus();
+  });
+
+  it.each(["replaced", "mounted"] as const)("uses the current fallback target when it is %s while open", state => {
+    const fallback = createRef<HTMLHeadingElement>();
+    const content = (open: boolean, updated: boolean) => <>
+      {updated ? <h2 key="current" ref={fallback} tabIndex={-1}>Current page heading</h2>
+        : state === "replaced" ? <h2 key="previous" ref={fallback} tabIndex={-1}>Previous page heading</h2> : null}
+      <WorkbenchDialog open={open} title="Details" fallbackFocusRef={fallback}>Content</WorkbenchDialog>
+    </>;
+    const { rerender } = render(content(true, false));
+    rerender(content(true, true));
+    rerender(content(false, true));
+    expect(screen.getByRole("heading", { name: "Current page heading" })).toHaveFocus();
+  });
+
+  it("updates the fallback ref without reopening or moving focus", () => {
+    const previousFallback = createRef<HTMLHeadingElement>();
+    const currentFallback = createRef<HTMLHeadingElement>();
+    const content = (open: boolean, updated: boolean) => <>
+      <h2 ref={previousFallback} tabIndex={-1}>Previous page heading</h2>
+      <h2 ref={currentFallback} tabIndex={-1}>Current page heading</h2>
+      <WorkbenchDialog open={open} title="Details" fallbackFocusRef={updated ? currentFallback : previousFallback}>
+        <button type="button">Dialog action</button>
+      </WorkbenchDialog>
+    </>;
+    const { rerender } = render(content(true, false));
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, "showModal");
+    const close = vi.spyOn(HTMLDialogElement.prototype, "close");
+    const action = screen.getByRole("button", { name: "Dialog action" });
+    action.focus();
+    rerender(content(true, true));
+    expect(action).toHaveFocus();
+    expect(showModal).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    expect(document.body.style.overflow).toBe("hidden");
+    rerender(content(false, true));
+    expect(screen.getByRole("heading", { name: "Current page heading" })).toHaveFocus();
   });
 
   it.each(["oldest", "newest"] as const)("keeps scrolling locked when the %s dialog closes first", first => {

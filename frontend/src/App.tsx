@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useDeferredValue,
   useEffect,
   useEffectEvent,
@@ -389,7 +390,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
   const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialAgentRoute.syncRunId);
-  const [syncSetupRequired, setSyncSetupRequired] = useState(false);
+  const [syncSetup, setSyncSetup] = useState<{ owner: string; required: boolean }>();
   const [syncHistoryRevision, setSyncHistoryRevision] = useState(0);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
@@ -446,6 +447,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const principalKey = user
     ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
     : `signed-out:${sessionEpoch}`;
+  const syncSetupRequired = syncSetup?.owner === principalKey ? syncSetup.required : true;
+  const waitingForInitialInventory = syncSetupRequired && activeView !== "sync";
+  const handleSyncSetupRequiredChange = useCallback((required: boolean) => {
+    setSyncSetup({ owner: principalKey, required });
+  }, [principalKey]);
   const agentDetail = savedAgentDetail?.owner === principalKey ? savedAgentDetail.detail : undefined;
   useEffect(() => () => savedQueries.clear(), [principalKey, savedQueries]);
   useEffect(() => () => { bulkJobRequestAbort.current?.abort(); }, [principalKey]);
@@ -687,6 +693,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       detailTab: agentDetailTab,
       selectedIds: [...selectedAgentIds],
       ...(inventory ? { selectionStorage: "session" as const, selectionCount: inventory.count } : {}),
+      refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
       controlJobId: requestedPackageControlJobId,
       source: "all",
@@ -989,21 +996,22 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       return;
     }
     if (activeView !== "agents" && activeView !== "sync" && activeView !== "audit") return;
+    if (waitingForInitialInventory) return;
     if (pendingStoredAgentSelectionCount !== undefined) return;
     const forceCurrentSnapshot = forceCurrentAgentReload.current;
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
+  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, waitingForInitialInventory]);
 
   useEffect(() => {
     if (!inventoryUnavailable || loadingAgents || !hasRole(user, "AgentControl.Viewer")
-      || !["agents", "sync", "audit"].includes(activeView)) return;
+      || !["agents", "sync", "audit"].includes(activeView) || waitingForInitialInventory) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible" && navigator.onLine) loadSavedAgents(true);
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [activeView, inventoryUnavailable, loadingAgents, user]);
+  }, [activeView, inventoryUnavailable, loadingAgents, user, waitingForInitialInventory]);
 
 
   useEffect(() => {
@@ -1112,6 +1120,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       })
     : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
+  const blockingFirstSync = hasRole(user, "AgentControl.Viewer") && syncSetupRequired
+    && visibleActiveView !== "sync" && visibleActiveView !== "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
   const automaticAction = workbenchMetadata?.actions.find(action => action.id === "data-sync.auto-refresh");
@@ -1163,6 +1173,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setRequestedPackageRefreshJobId(route.refreshJobId);
       setRequestedPackageRefreshMode(route.refreshMode);
       setSyncReportRoute(route.reports);
+    } else if (view === "agents") {
+      const route = parseAgentRoute(search.toString());
+      setRequestedPackageRefreshJobId(route.refreshJobId);
+      setRequestedPackageRefreshMode(route.refreshMode);
     } else if (view === "users") {
       setUsersRoute(parseUsersRoute(search.toString()));
     }
@@ -2026,7 +2040,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
     try {
       const targets = matchingPackageSelection ? { selectionId: matchingPackageSelection.id }
-        : selectedGroups.size ? { ids: scope.length ? scope : undefined, recordIds: [...selectedGroups.keys()] } : { ids: scope };
+        : selectedGroups.size ? { selectionId: groupPackageSelection!.id,
+          ids: scope.length ? scope : undefined, recordIds: [...selectedGroups.keys()] } : { ids: scope };
       const preview = await previewPackageMutation({ action: label, ...targets, mutationScope: "bulk" }, { signal: controller.signal });
       if (!ownsAgentFlowRequest(requestId, owner)) return;
       if (selectedGroups.size && !preview.selectionId) throw new Error("The server did not return the reviewed group selection.");
@@ -2783,9 +2798,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           principalKey={principalKey}
           canUploadUsage={canImportReports}
           active={visibleActiveView === "sync"}
-          onOpenSync={visibleActiveView === "agents" || visibleActiveView === "users" ? () => navigateToView("sync") : undefined}
+          onOpenSync={visibleActiveView !== "sync" && visibleActiveView !== "permissions" ? () => navigateToView("sync") : undefined}
           automaticRefresh={automaticRefresh}
-          onSetupRequiredChange={setSyncSetupRequired}
+          onSetupRequiredChange={handleSyncSetupRequiredChange}
           onRunsChanged={handleSyncRunsChanged}
           requestedRunId={requestedDataSyncRunId}
           onOpenUsageImport={() => openUsageImport()}
@@ -2823,7 +2838,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           label="Prepare inventory CSV" autoStart onSelectionInvalidated={handleInventoryExportInvalidation}
           onPendingChange={inventoryExport.kind === "power_platform_agents" ? setExportingPowerPlatformCsv : setExportingCsv} />
       </div> : null}
-      {visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
+      {blockingFirstSync ? null : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>
             <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} owner={principalKey} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
@@ -3070,7 +3085,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
-      {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
+      {!blockingFirstSync && selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
           selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}
@@ -3191,9 +3206,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onCancel={() => setExportChoiceOpen(false)}
           onClearSelection={() => {
             setSelectedAgentIds(new Set());
+            setServerPackageSelection(undefined);
+            setGroupPackageSelection(undefined);
+            setGroupTargetCount(undefined);
             setPendingStoredAgentSelectionCount(undefined);
             resetPowerPlatformSelection();
             setSelectionRouteNotice(undefined);
+            clearPackageSelection(user);
           }}
           onExport={scope => void handleExportCsv(scope)}
         />
