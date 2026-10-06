@@ -23,6 +23,7 @@ import { GraphPackagesClient } from "../services/graphPackages.js";
 import { checkpointQueries, observePeakMemory, observeQueryWork } from "../services/peakMemory.js";
 import { verifyInventoryCollectionRewindSchema } from "./inventoryCollectionRewindSchema.js";
 import { AuditLog } from "../services/auditLog.js";
+import { withTelemetryContext } from "../services/telemetry.js";
 
 describe("immutable inventory record storage", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -699,8 +700,21 @@ describe("immutable inventory record storage", () => {
   it("rejects the oversized child at actual staging and pages every legal multibyte child within the encoded budget", async () => {
     const oversized = packageInventoryRecord({ id: "oversized", displayName: "Oversized", isBlocked: false,
       elementDetails: [{ elementType: "Custom", elements: [{ id: "one", definition: "x".repeat(600_000) }] }] });
-    await expect(store.execute(inventoryInput(), { domain: "packages", mode: "delta", channel: "exact", targets: ["oversized"] },
-      lease => store.append(lease, [oversized]).then(() => {}), { authorize: async () => {} })).rejects.toMatchObject({ code: "data_residual_bytes" });
+    const payload = oversized.facts.find(fact => fact.kind === "element")!.payload;
+    const bytes = (await fixture.operator.query("SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify(payload)])).rows[0].bytes;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(withTelemetryContext({ requestId: "request-oversized", jobId: "job-oversized" }, () =>
+        store.execute(inventoryInput(), { domain: "packages", mode: "delta", channel: "exact", targets: ["oversized"] },
+          lease => store.append(lease, [oversized]).then(() => {}), { authorize: async () => {} })))
+        .rejects.toMatchObject({ code: "data_residual_bytes", details: { limit: 262_144, observed: bytes } });
+      expect(warn).toHaveBeenCalledOnce();
+      expect(JSON.parse(warn.mock.calls[0][0])).toEqual({
+        timestamp: expect.any(String), level: "warn", event: "data_residual_limit_exceeded",
+        requestId: "request-oversized", jobId: "job-oversized", errorCode: "data_residual_bytes",
+        stage: "database", field: "payload", bytes, maximumLength: 262_144,
+      });
+    } finally { warn.mockRestore(); }
     const input = inventoryInput(), record = packageRecord(0);
     const facts = Array.from({ length: 80 }, (_, i) => ({ kind: "wide-child", value: String(i).padStart(3, "0") + "😀".repeat(4093), payload: {} }));
     record.facts.push(...facts);

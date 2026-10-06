@@ -589,7 +589,12 @@ export class OfficialReportImports {
             await client.query(`UPDATE official_usage_sets SET complete=true,accepted_at=clock_timestamp(),content_hash=$2,reporting_start=$3,reporting_end=$4
               WHERE id=$1`, [setId, contentHash, starts[0] ?? null, ends.at(-1) ?? null]);
             await this.history.accepted(client, identity.tenantId, setId, prepared.correctionOf);
-            if (!prepared.correctionOf || !state.active_set_id || prepared.correctionOf === state.active_set_id) {
+            const activePeriod = state.active_set_id && !prepared.correctionOf ? (await client.query(
+              "SELECT reporting_start::text,reporting_end::text FROM official_usage_sets WHERE tenant_id=$1 AND id=$2",
+              [identity.tenantId, state.active_set_id])).rows[0] : undefined;
+            const backfill = activePeriod?.reporting_end && (!ends.length
+              || `${ends.at(-1)}/${starts[0] ?? ""}` < `${activePeriod.reporting_end}/${activePeriod.reporting_start ?? ""}`);
+            if (!state.active_set_id || prepared.correctionOf === state.active_set_id || !prepared.correctionOf && !backfill) {
               revision = (await client.query(`UPDATE official_usage_state SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp()
                 WHERE tenant_id=$1 RETURNING revision::text`, [identity.tenantId, setId])).rows[0].revision;
             }

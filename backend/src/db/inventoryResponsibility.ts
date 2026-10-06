@@ -33,15 +33,9 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
       OR strpos(lower(normalize(name,NFKC)),${searchParameter})>0 OR strpos(lower(normalize(upn,NFKC)),${searchParameter})>0
   )`;
   const values = [...relation.values, search];
-  const counts = (await client.query(`${sql}, known_roles AS (
-    SELECT generation_id,identity,count(DISTINCT kind) AS count FROM people
-    WHERE object_id ~ '${validObjectId}' GROUP BY generation_id,identity
-  ) SELECT
+  const counts = (await client.query(`${sql} SELECT
     (SELECT count(*)::text FROM responsible) AS total,(SELECT count(*)::text FROM filtered_people) AS filtered,
-    (SELECT count(*)::text FROM people WHERE object_id !~ '${validObjectId}') AS invalid,
-    (SELECT count(*)::text FROM inventory i LEFT JOIN known_roles known
-      ON known.generation_id=i.generation_id AND known.identity=i.identity
-      WHERE coalesce(known.count,0)<3) AS unknown`, values)).rows[0];
+    (SELECT count(*)::text FROM people WHERE object_id !~ '${validObjectId}') AS invalid`, values)).rows[0];
   const matching = objectId ? `SELECT f.identity AS id,f.display_name,f.presence,f.environment_id,
       ${roles} AS roles,f.sort_key,min(s.observed_at) AS observed_at
     FROM facts f JOIN people p ON p.generation_id=f.generation_id AND p.identity=f.identity AND p.object_id=${objectParameter}
@@ -103,7 +97,7 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
     counts: { total: exactCount(counts.total), filtered: exactCount(counts.filtered) },
     page: { limit, nextCursor: encode(pageRows.at(-1), "next", reverse ? Boolean(cursor) : more),
       previousCursor: encode(pageRows[0], "previous", reverse ? more : Boolean(cursor)) },
-    unknownAgentCount: exactCount(counts.unknown), invalidReferenceCount: exactCount(counts.invalid),
+    invalidReferenceCount: exactCount(counts.invalid),
     people: objectId ? [] : pageRows.map(person), selected,
   };
   encodeBatch([result]);

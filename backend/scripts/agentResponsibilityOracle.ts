@@ -12,12 +12,10 @@ export function projectAgentResponsibility(inventory: UnifiedAgentInventoryPage,
   }
   const people = new Map<string, ResponsibilityPerson>();
   const relationships = new Map<string, ResponsibilityAgent[]>();
-  let unknownAgentCount = 0;
   let invalidReferenceCount = 0;
   for (const record of inventory.value) {
     const resource = record.powerPlatformResource;
     const ids = { owner: resource?.details.ownerId, createdBy: resource?.createdBy, lastModifiedBy: resource?.details.lastModifiedBy };
-    if (responsibilityRoles.some(role => !ids[role] || !isDirectoryObjectId(ids[role]!))) unknownAgentCount++;
     const rolesByPerson = new Map<string, ResponsibilityAgent["roles"]>();
     for (const role of responsibilityRoles) {
       const id = ids[role];
@@ -43,8 +41,6 @@ export function projectAgentResponsibility(inventory: UnifiedAgentInventoryPage,
     }
   }
   const source = inventory.sources.powerPlatform;
-  const coverage = source.state === "unavailable" ? "unavailable"
-    : source.state === "partial" || unknownAgentCount > 0 ? "partial" : "available";
   const offset = query.cursor ? Number(query.cursor.replace(/^tiny-oracle:/, "")) : 0;
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) throw new Error("Invalid tiny responsibility oracle cursor.");
   const limit = Math.min(100, Math.max(1, query.limit ?? 50));
@@ -61,13 +57,13 @@ export function projectAgentResponsibility(inventory: UnifiedAgentInventoryPage,
       ? { objectId, evidence: selectedEvidence, agentCount: 0, roles: [] } : undefined);
     if (!person) throw new AppError(404, "responsibility_person_unavailable", "No authorized saved responsibility or directory evidence exists for this exact user. Reload Users or Sync.");
     const agents = (relationships.get(objectId) ?? []).sort((a, b) => a.displayName.localeCompare(b.displayName) || a.id.localeCompare(b.id));
-    selected = { person, state: coverage === "unavailable" ? "unavailable" : agents.length ? "reported" : "no_reported_relationships",
+    selected = { person, state: source.state === "unavailable" ? "unavailable" : agents.length ? "reported" : "no_reported_relationships",
       agents: agents.slice(offset, offset + limit), count: agents.length };
   }
   const count = selected?.count ?? sorted.length;
   return { selection: { id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", revision: inventory.selection.revision,
     evaluatedAt: "2026-09-12T10:00:00.000Z", expiresAt: "2099-09-12T10:00:00.000Z" },
-    sources: inventory.sources, coverage, unknownAgentCount, invalidReferenceCount,
+    sources: inventory.sources, invalidReferenceCount,
     people: objectId ? [] : sorted.slice(offset, offset + limit), counts: { total: people.size, filtered: sorted.length },
     page: { limit, nextCursor: offset + limit < count ? `tiny-oracle:${offset + limit}` : null,
       previousCursor: offset ? `tiny-oracle:${Math.max(0, offset - limit)}` : null }, selected };

@@ -1,3 +1,192 @@
+.agent-usage-trend {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.agent-usage-trend header,
+.agent-history-local,
+.agent-history-discovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-usage-trend h4,
+.agent-usage-trend p,
+.agent-history-discovery p {
+  margin: 0;
+}
+
+.agent-usage-trend header p,
+.agent-trend-caption,
+.agent-history-local {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.agent-usage-trend small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.agent-usage-trend svg {
+  display: block;
+  width: 100%;
+  max-width: 660px;
+  margin: 0 auto;
+  height: auto;
+  overflow: visible;
+}
+
+.trend-axis-label {
+  fill: var(--muted);
+  font-size: 15px;
+}
+
+.trend-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.trend-line {
+  stroke: #254f48;
+  stroke-width: 3;
+  pointer-events: none;
+}
+
+.trend-point {
+  fill: #254f48;
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.trend-missing {
+  stroke: var(--muted);
+}
+
+.trend-up {
+  color: #254f48;
+}
+
+.trend-down {
+  color: #9a4818;
+}
+
+.agent-trend-snapshots {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-trend-snapshots h5 {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.agent-usage-trend .agent-trend-table {
+  table-layout: fixed;
+  min-width: 0;
+}
+
+.agent-trend-table thead th:first-child {
+  width: 44%;
+}
+
+.agent-trend-table thead th:nth-child(2) {
+  width: 21%;
+}
+
+.agent-usage-trend .agent-trend-table th,
+.agent-usage-trend .agent-trend-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-usage-trend .agent-trend-table tbody th {
+  background: transparent;
+}
+
+.agent-trend-cell-label {
+  display: none;
+}
+
+.agent-history-discovery {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f0f6f3;
+}
+
+@media (max-width: 640px) {
+  .agent-usage-trend {
+    padding: 10px;
+  }
+
+  .trend-axis-label {
+    font-size: 30px;
+  }
+
+  .agent-usage-trend .agent-trend-table {
+    display: block;
+    font-size: 0.8125rem;
+  }
+
+  .agent-trend-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .agent-trend-table tbody {
+    display: block;
+  }
+
+  .agent-trend-table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr);
+    padding: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .agent-trend-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .agent-usage-trend .agent-trend-table tbody th,
+  .agent-usage-trend .agent-trend-table tbody td {
+    min-width: 0;
+    padding: 6px;
+    border-bottom: 0;
+  }
+
+  .agent-trend-table tbody th {
+    grid-column: 1 / -1;
+  }
+
+  .agent-trend-cell-label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+}
+
 .agent-usage-insights {
   display: grid;
   gap: 16px;
@@ -137,6 +326,7 @@
   background: #fff;
 }
 
+.agent-insight-actions,
 .agent-insight-toolbar,
 .agent-insight-pagination {
   display: flex;
@@ -155,6 +345,32 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
+
+.agent-usage-date-range,
+.agent-usage-users {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.agent-usage-date-range > span,
+.agent-usage-date-range > small { color: var(--muted); font-size: 12px; }
+.agent-usage-users h4 { margin: 0; }
+.unified-agent-detail-modal > header > div:first-child { margin-right: auto; }
+.agent-usage-users input { flex: 1; min-width: 150px; }
+.agent-usage-users td { overflow-wrap: anywhere; }
+.agent-usage-users th:first-child { width: 70%; }
+.agent-usage-users th:last-child,
+.agent-usage-users td:last-child { text-align: right; }
+.agent-usage-association-list { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.agent-usage-association-list li,
+.agent-usage-confirmation { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 7px; min-width: 0; overflow-wrap: anywhere; }
+.agent-usage-association-list li > div:first-child,
+.agent-usage-confirmation dl { display: grid; gap: 6px; min-width: 0; }
+.agent-usage-association-list code,
+.agent-usage-confirmation code { display: block; overflow-wrap: anywhere; }
+.agent-usage-confirmation dd { margin: 0; }
+.agent-usage-confirm-checkbox { display: flex; align-items: flex-start; gap: 8px; }
+.agent-usage-confirm-checkbox input { flex: none; width: auto; }
 
 .agent-usage-metric {
   display: grid;

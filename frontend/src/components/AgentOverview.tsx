@@ -8,12 +8,14 @@ import { usageDate } from "../usageInsights";
 import { AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
 import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 import { CapabilityContext } from "../capabilityContext";
+import { AgentConnectorOperations, SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
 
 const connectorPageSize = 10;
 type Property = { label: string; value: ReactNode; wide?: boolean };
 
-export function AgentOverview({ record, selectedPackage, packageDetail, peopleState, onOpenPerson }: {
+export function AgentOverview({ record, selectionId, selectedPackage, packageDetail, peopleState, onOpenPerson }: {
   record: UnifiedAgentRecord;
+  selectionId?: string;
   selectedPackage?: CopilotPackage;
   packageDetail?: CopilotPackageDetail;
   peopleState: ReturnType<typeof useAgentPeople>;
@@ -67,7 +69,8 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
     { label: "Authentication", value: resource?.details.authentication },
     { label: "Orchestration", value: resource?.details.orchestration },
     { label: "Web search for knowledge", value: resource?.details.isWebSearchEnabledForKnowledge },
-    { label: "Channels", value: resource?.details.channels === undefined ? undefined
+    { label: "Channels", value: resource?.details.channels === undefined ? selectionId && resource?.savedSource
+      ? <SavedAgentChannels key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id} source={resource.savedSource} /> : undefined
       : resource.details.channels.map(formatPackageFacetLabel).join(", ") || "None reported" },
     { label: "Managed solution", value: resource?.details.isManaged },
     { label: "Agent region", value: resource?.location?.toLowerCase() !== environment?.region?.toLowerCase() ? resource?.location : undefined },
@@ -131,10 +134,8 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
     {resource ? <section className="agent-overview-section" aria-label="Configured connectors and operations">
       <h3>Configured connectors and operations</h3>
       <Properties values={properties([
-        { label: "Connectors", value: connectorCount },
-        { label: "Operations", value: operationCount },
-        { label: "Saved connectors", value: savedConnectors?.connectors },
-        { label: "Saved operations", value: savedConnectors?.operations },
+        { label: "Connectors", value: connectorCount ?? savedConnectors?.connectors },
+        { label: "Operations", value: operationCount ?? savedConnectors?.operations },
       ])} />
       {record.observations.powerPlatform && !(Date.parse(record.observations.powerPlatform.expiresAt) > now)
         ? <p className="notice">Configuration details have expired. Refresh them in Sync.</p> : null}
@@ -142,18 +143,7 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
         <ul className="agent-service-list" aria-label="Configured connector details">
           {connectors.slice(offset, offset + connectorPageSize).map((connector, index) => <li key={`${offset + index}:${connector.connectorId}`}>
             <strong>{connector.connectorId}</strong>
-            {connector.operations?.length ? <ul>{connector.operations.map((operation, operationIndex) => <li key={operationIndex}>
-              <strong>{operation.operationId}</strong>
-              <Properties values={properties([
-                { label: "Used as", value: operation.usedAs },
-                { label: "Enabled", value: operation.isEnabled },
-                { label: "End-user consent required", value: operation.requiresEndUserConsent },
-                { label: "Connection provided by", value: operation.connectionProvider },
-                { label: "When available", value: operation.whenCanBeUsed
-                  ? formatPackageFacetLabel(operation.whenCanBeUsed) : undefined },
-                { label: "Operation configured by (ID)", value: operation.createdBy, wide: true },
-              ])} />
-            </li>)}</ul> : <span>{connector.operations
+            {connector.operations?.length ? <AgentConnectorOperations operations={connector.operations} /> : <span>{connector.operations
               ? partialConnectors ? "Operation details are incomplete." : "No operations reported."
               : "Operation details not supplied."}</span>}
           </li>)}
@@ -163,8 +153,8 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
           <button type="button" className="secondary" disabled={offset === 0} onClick={() => setConnectorOffset(offset - connectorPageSize)}>Previous connectors</button>
           <button type="button" className="secondary" disabled={offset + connectorPageSize >= connectors.length} onClick={() => setConnectorOffset(offset + connectorPageSize)}>Next connectors</button>
         </div> : null}
-      </> : savedConnectors && (savedConnectors.connectors > 0 || savedConnectors.operations > 0)
-        ? <p>Saved configuration is available in the paged source members above.</p>
+      </> : selectionId && resource.savedSource && savedConnectors
+        ? <SavedAgentConnectors key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id} source={resource.savedSource} />
         : <p>{connectorCount === 0 && !partialConnectors || connectorCount === undefined && connectors !== undefined && !partialConnectors
           ? "No configured connectors were reported."
           : "Configured connector details are unavailable. Refresh inventory in Sync."}</p>}

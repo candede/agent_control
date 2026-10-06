@@ -42,7 +42,7 @@ export class LiveInventory {
         selected AS (SELECT DISTINCT agent_id,control_revision FROM current WHERE ${where} LIMIT 2)
         SELECT r.identity,r.generation_id,r.display_name,r.environment_id,r.link_state,r.residual
         FROM selected s JOIN unified_agent_rows r ON r.generation_id=s.control_revision AND r.identity=s.agent_id`, values)).rows;
-      if (!records.length) throw new AppError(404, "agent_not_found", "The current saved agent is unavailable. Refresh Agents.");
+      if (!records.length) throw new AppError(404, "agent_not_found", "This agent is not available in the current saved inventory.");
       if (records.length !== 1) throw new AppError(409, "inventory_identity_ambiguous", "The exact source has multiple current canonical memberships.");
       const row = records[0];
       const sources = (await client.query(`WITH current AS (${currentInventorySourcesSql})

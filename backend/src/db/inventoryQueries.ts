@@ -44,10 +44,11 @@ function inventoryCriteria(input: Record<string, unknown>) {
 const assignedAccessSql = `regexp_replace(lower(x.value),'[^a-z0-9]','','g') IN (${[
   ...packageStatusAliases.all, ...packageStatusAliases.some,
 ].map(value => `'${value}'`).join(",")})`;
-type Context = { data: ReportCurrentData; selectionId: string;expiresAt: number;scopeId: string; baselineId: string; revision: string; source: string; query: InventoryQuery };
+type Context = { data: ReportCurrentData; selectionId: string;expiresAt: number;scopeId: string; baselineId: string; revision: string; source: string;
+  tokenMode: "delegated" | "application"; query: InventoryQuery };
 type PageOptions = { limit?: number; cursor?: string; recordId?: string; expectedQuery?: InventoryQuery; explicitExportId?: string;
   exportKind?: "unified_agents" | "graph_packages" | "power_platform_agents" };
-const primaryMembersSql = `SELECT f.identity,member.domain,member.native_id,member.environment_id,member.scope_id,
+const primaryMembersSql = `SELECT f.identity,member.identity AS source_identity,member.domain,member.native_id,member.environment_id,member.scope_id,
   member.residual,member.observed_at,member.expires_at,member.generation_id,member.catalog_generation,member.detail_generation,
   member.evidence,member.total,
   (SELECT channel FROM inventory_attempts attempt WHERE attempt.generation_id=coalesce(member.catalog_generation,member.generation_id)) AS source_channel,
@@ -198,7 +199,7 @@ export class InventoryQueries {
       : { ...criteria, availableTo: decodeInventoryFacet(String(criteria.availableTo)) };
     return { data,selectionId: id,expiresAt: new Date(selected.selection.expires_at).getTime(),
       scopeId: saved.root_scope_id, baselineId: pin.generation_id, revision: pin.revision,
-      source: saved.source, query: query as InventoryQuery };
+      source: saved.source, tokenMode: saved.token_mode, query: query as InventoryQuery };
   }
 
   private sourceOwners(identity: Pick<SelectionIdentity, "tenantId" | "principalId">) {
@@ -1013,26 +1014,26 @@ export class InventoryQueries {
   }
 
   children(id: string, identity: SelectionIdentity, recordId: string, options: {
-    kind: string; cursor?: string; limit?: number; sourceScopeId?: string; sourceIdentity?: string;
+    kind: string; cursor?: string; limit?: number; sourceScopeId?: string; sourceIdentity?: string; value?: string;
   }) {
     const limit = pageLimit(options.limit);
     return this.read(id, identity, async (client, context, selection) => {
       if (Boolean(options.sourceScopeId) !== Boolean(options.sourceIdentity)) throw new SelectionError("invalid_cursor");
       const cursor = this.continuation(id, identity, selection, "children", [recordId, options.kind,
-        options.sourceScopeId ?? null, options.sourceIdentity ?? null], options.cursor);
+        options.sourceScopeId ?? null, options.sourceIdentity ?? null, ...(options.value === undefined ? [] : [options.value])], options.cursor);
       const selected = `SELECT m.generation_id,m.identity FROM inventory_memberships m
         WHERE ${inventoryAsOf()} AND m.identity=$3 AND $6::uuid IS NULL
         UNION ALL SELECT s.source_generation_id,s.source_identity FROM inventory_memberships m
         JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
         WHERE ${inventoryAsOf()} AND m.identity=$3 AND s.source_scope_id=$6 AND s.source_identity=$7`;
       const parameters = [context.baselineId, context.revision, recordId, options.kind, cursor.after === undefined ? -1 : Number(cursor.after),
-        options.sourceScopeId ?? null, options.sourceIdentity ?? null];
+        options.sourceScopeId ?? null, options.sourceIdentity ?? null, options.value ?? null];
       const total = exactCount((await client.query(`WITH selected AS (${selected}) SELECT count(*)::text AS total
         FROM selected s JOIN inventory_facts f ON f.generation_id=s.generation_id AND f.identity=s.identity
-        WHERE f.kind=$4 AND ($5::int IS NULL OR $5::int IS NOT NULL)`, parameters)).rows[0].total);
+        WHERE f.kind=$4 AND ($5::int IS NULL OR $5::int IS NOT NULL) AND ($8::text IS NULL OR f.value=$8)`, parameters)).rows[0].total);
       const rows = (await client.query(`WITH selected AS (${selected}), candidates AS (SELECT f.ordinal,f.kind,f.value,f.payload FROM selected s
         JOIN inventory_facts f ON f.generation_id=s.generation_id AND f.identity=s.identity
-        WHERE f.kind=$4 AND f.ordinal>$5 ORDER BY f.ordinal LIMIT ${limit + 1}),
+        WHERE f.kind=$4 AND f.ordinal>$5 AND ($8::text IS NULL OR f.value=$8) ORDER BY f.ordinal LIMIT ${limit + 1}),
         sized AS (SELECT *,count(*) OVER() AS candidate_count,
           sum(octet_length(row_to_json(c)::text)+1) OVER(ORDER BY ordinal) AS bytes FROM candidates c)
         SELECT ordinal,kind,value,CASE WHEN bytes<=524288 THEN payload END AS payload,candidate_count,bytes

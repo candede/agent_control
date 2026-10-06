@@ -120,6 +120,11 @@
   min-width: 0;
 }
 
+.agent-workspace .agent-catalog-heading,
+.copilot-users-header {
+  min-height: 50px;
+}
+
 .agent-workspace .agent-catalog-heading {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -127,12 +132,17 @@
   align-items: center;
 }
 
+.agent-catalog-title h2,
+.copilot-users-header h2 {
+  margin: 0;
+  font-size: 25px;
+  letter-spacing: -0.7px;
+}
+
 .agent-catalog-title h2 {
   display: flex;
   align-items: center;
   gap: 9px;
-  font-size: 25px;
-  letter-spacing: -0.7px;
 }
 
 .agent-catalog-heading h2 span {
@@ -307,6 +317,14 @@
   color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
+}
+
+@media (min-width: 761px) {
+  :is(.agent-workspace, .copilot-users) .agent-overview-metrics .metric > :is(span, small) {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
 }
 
 .agent-report-context {
@@ -680,14 +698,22 @@
     display: none;
   }
 
-  .agent-workspace .agent-catalog-heading {
+  .agent-workspace .agent-catalog-heading,
+  .copilot-users-header {
+    display: grid;
     grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: minmax(42px, auto) minmax(50px, auto);
     gap: 12px;
   }
 
-  .agent-workspace .agent-inventory-scopes {
+  .agent-workspace .agent-inventory-scopes,
+  .copilot-users-header-actions {
     grid-column: 1 / -1;
     grid-row: 2;
+  }
+
+  .copilot-users-header-actions {
+    justify-content: flex-start;
   }
 
   .agent-workspace .agent-catalog-actions {
@@ -796,7 +822,8 @@
     width: auto;
   }
 
-  .agent-catalog-title h2 {
+  .agent-catalog-title h2,
+  .copilot-users-header h2 {
     font-size: 23px;
   }
 

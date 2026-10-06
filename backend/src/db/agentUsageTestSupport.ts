@@ -151,7 +151,7 @@ export async function awaitUsageInventoryExpiry(database: pg.Pool, scope: AgentU
 }
 
 export async function publishUsageReports(database: pg.Pool, scope: AgentUsageScope, responses = 10,
-  transform?: (kind: OfficialUsageReportKind, content: string) => string) {
+  transform?: (kind: OfficialUsageReportKind, content: string) => string, options: { correctionOfSetId?: string } = {}) {
   const reports = new OfficialReportImports(database), identity = await usageIdentity(database, scope);
   const bundleId = randomUUID();
   const csvs = [
@@ -176,7 +176,7 @@ BridgeUser,Bridge,1,77,2026-09-18`,
   ];
   const kinds = ["agents", "userAgents", "users"] as const;
   for (const [index, csv] of csvs.entries()) {
-    await reports.stage(identity, { bundleId }, (async function* () { yield Buffer.from(transform?.(kinds[index], csv) ?? csv); })());
+    await reports.stage(identity, { bundleId, ...options }, (async function* () { yield Buffer.from(transform?.(kinds[index], csv) ?? csv); })());
   }
   return reports.acceptBundle(identity, bundleId, await reports.bundle(identity, bundleId));
 }

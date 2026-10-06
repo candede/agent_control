@@ -1,6 +1,6 @@
 import type { OfficialUsageReportKind, OfficialUsageReportBase, AgentUsageRow, UserAgentUsageRow, UserUsageRow } from "./officialReportRecords.js";
 import type { UserSourceSelection, UserSourceMetadata } from "./userSources.js";
-import type { ReportAgent, ReportMetadata } from "./officialReportData.js";
+import type { ReportAgent, ReportListPage, ReportMetadata } from "./officialReportData.js";
 import type { AgentUsageTarget } from "./agentUsageTarget.js";
 
 export type OfficialReportImportIntent = { bundleId: string; correctionOfSetId?: string; rejectDuplicateKind?: boolean };
@@ -41,6 +41,17 @@ export type OfficialReportDetail<T> = { value: T; selection: UserSourceSelection
 export type CandidateAgentUsageContext = { selectionId: string; reportSetId: string | null; usageRevision: string; inventoryRevision: string; reports: ReportMetadata };
 export type CandidateAgentUsageSummary = { recordId: string; status: "unavailable" | "unlinked" | "linked"; responses: number | null;
   activeUsers: number | null; lastActivityDateUtc: string | null; associationCount: number; context: CandidateAgentUsageContext };
+export type AgentUsageHistoryPoint = {
+  setId: string; reportingStart: string | null; reportingEnd: string | null; periodProvenance: string; acceptedAt: string;
+  status: "linked" | "unlinked"; responses: number | null; lastActivityDateUtc: string | null;
+  associationCount: number;
+};
+export type CandidateAgentUsageHistory = {
+  recordId: string; context: CandidateAgentUsageContext; value: AgentUsageHistoryPoint[];
+  latestReportSetId: string | null;
+  latestReported: AgentUsageHistoryPoint | null;
+  counts: { total: number; filtered: number }; page: OfficialReportFacetPage["page"];
+};
 export type CandidateAgentUsageMutation = Pick<CandidateAgentUsageContext, "selectionId" | "reportSetId" | "usageRevision" | "inventoryRevision">
   & { reportAgentId: string; confirmed: true; target?: AgentUsageTarget };
 export type CandidateAgentUsageCandidates = { value: Array<ReportAgent & { associated: boolean }>; context: CandidateAgentUsageContext;
@@ -48,3 +59,5 @@ export type CandidateAgentUsageCandidates = { value: Array<ReportAgent & { assoc
 export type CandidateAgentUsageAssociations = { value: Array<{ reportAgentId: string; agentName: string; responses: number;
   basis: "reviewed" | "exact_package_id"; target: AgentUsageTarget & { snapshotId: string } }>;
   context: CandidateAgentUsageContext; page: OfficialReportFacetPage["page"]; counts: OfficialReportFacetPage["counts"] };
+export type AgentUsageUser = { username: string; displayName: string; responses: number };
+export type CandidateAgentUsageUsers = ReportListPage<AgentUsageUser> & { context: CandidateAgentUsageContext };

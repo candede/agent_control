@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import pg from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { DefenderHuntingRepository, huntingTargetScopeHash, type DefenderHuntingReadScope } from "./defenderHunting.js";
 import { PurviewAuditRepository } from "./purviewAudit.js";
+import { LiveInventory } from "./liveInventory.js";
 import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
 
 const entra = "11111111-1111-4111-8111-111111111111";
@@ -28,6 +30,16 @@ function expectExactFilter(sql: string, values: unknown[], column: string) {
 }
 
 describe("agent-scoped saved-query isolation", () => {
+  it("reports an unavailable saved agent without suggesting refresh will restore it", async () => {
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const query = vi.spyOn(client, "query").mockResolvedValue({ rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] });
+    await expect(new LiveInventory().record({ tenantId: "tenant-a", principalId: "reader-a" }, `agent:${entra}`,
+      { client, evaluatedAt: new Date() })).rejects.toMatchObject({
+      status: 404, code: "agent_not_found", message: "This agent is not available in the current saved inventory.",
+    });
+    expect(query).toHaveBeenCalledOnce();
+  });
+
   it("separates object-ID inventory jobs from application-ID runtime jobs before pagination", async () => {
     const db = database();
     const repository = new DefenderHuntingRepository(db as never);

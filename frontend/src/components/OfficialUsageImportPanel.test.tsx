@@ -232,8 +232,8 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.discardReportStage).not.toHaveBeenCalled();
   });
   it.each([
-    ["duplicate", "Cancel import"], ["duplicate", "Escape"],
-    ["correction", "Cancel import"], ["correction", "Escape"],
+    ["duplicate", "Keep current report"], ["duplicate", "Escape"],
+    ["correction", "Keep current report"], ["correction", "Escape"],
   ] as const)("dismisses a conclusively saved non-active %s via %s without selecting or discarding it", async (mode, action) => {
     const correctionOfSetId = mode === "correction" ? "60000000-0000-4000-8000-000000000002" : undefined;
     const saved = reportPage([reportAgent()], { reports: { ...reports, activeSetId: "another-active-set" } });

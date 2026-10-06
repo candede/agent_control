@@ -1,5 +1,5 @@
 import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type ReactNode } from "react";
-import { X } from "lucide-react";
+import { RefreshCw, X } from "lucide-react";
 import {
   type AppRole,
   type BulkActionResult,
@@ -19,14 +19,15 @@ import { AgentAccessManagement } from "./AgentAccessManagement";
 import { AgentUsagePanel } from "./AgentUsagePanel";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { WorkbenchActionGate, useWorkbenchAction } from "../workbenchActionContext";
-import { InventoryMembers } from "./InventoryMembers";
+import { AgentPublishedVersions } from "./AgentPublishedVersions";
 import "./agentInsights.css";
 
-const tabs = ["identities", "reports", "controls", "audit-security"] as const;
+const tabs = ["identities", "reports", "users", "controls", "audit-security"] as const;
 type DetailTab = typeof tabs[number];
 const tabLabels: Record<DetailTab, string> = {
   identities: "Overview",
-  reports: "Usage & users",
+  reports: "Usage",
+  users: "Users",
   "audit-security": "Activity",
   controls: "Manage",
 };
@@ -95,6 +96,7 @@ export function UnifiedAgentDetailModal({
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
   const dialog = useRef<HTMLDialogElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
   const dialogMounted = useRef(false);
   const panel = useRef<HTMLElement>(null);
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
@@ -182,6 +184,7 @@ export function UnifiedAgentDetailModal({
     dialogMounted.current = true;
     if (typeof element?.showModal === "function") element.showModal();
     else element?.setAttribute("open", "");
+    closeButton.current?.focus();
     return () => {
       dialogMounted.current = false;
       if (element?.open && typeof element.close === "function") element.close();
@@ -221,7 +224,10 @@ export function UnifiedAgentDetailModal({
     >
       <header>
         <div><p className="eyebrow">Agent management</p><h2 id="unified-agent-detail-title">{record.displayName}</h2></div>
-        <button type="button" className="icon-button" aria-label="Close unified agent details" onClick={close}><X aria-hidden="true" /></button>
+        {!inventoryError && onRetryInventory ? <button type="button" className="secondary icon-button" aria-label="Reload saved inventory"
+          title="Reload saved inventory" disabled={packageInventoryPending || packageActionsBusy || hasPackageConfirmation}
+          onClick={onRetryInventory}><RefreshCw size={18} aria-hidden="true" /></button> : null}
+        <button ref={closeButton} type="button" className="icon-button" aria-label="Close unified agent details" onClick={close}><X aria-hidden="true" /></button>
       </header>
       <div className="detail-tabs" role="tablist" aria-label="Agent details">
         {tabs.map(tab => <button key={tab} id={`unified-agent-tab-${tab}`} type="button" role="tab" disabled={hasPackageConfirmation} aria-selected={selectedTab === tab} aria-controls={`unified-agent-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)} onKeyDown={event => {
@@ -246,14 +252,12 @@ export function UnifiedAgentDetailModal({
           onClick={onRetryInventory}>Retry saved inventory</button> : null}
       </div> : null}
       <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
-        {!inventoryError && onRetryInventory ? <div className="table-actions"><button type="button" className="secondary"
-          disabled={packageInventoryPending || packageActionsBusy || hasPackageConfirmation}
-          onClick={onRetryInventory}>Reload saved inventory</button></div> : null}
-        {selectedTab === "identities" && selectionId ? <InventoryMembers key={record.id}
-          selectionId={selectionId} recordId={record.id}
-          onInspectPackage={canInspectPackage ? id => onInspectPackage({ id }) : undefined} /> : null}
         {usesPackageDetails && (selectedPackage || missingPackageSelection) ? <>
-          {record.packages.length > 1 || missingPackageSelection ? <div className="agent-version-selector">
+          {record.packagesComplete === false && selectionId ? <AgentPublishedVersions key={`${selectionId}:${record.id}`}
+            selectionId={selectionId} record={record} selectedId={preferredPackageId}
+            disabled={!canInspectPackage || packageActionsBusy || packageInventoryPending || hasPackageConfirmation}
+            onSelect={id => onInspectPackage({ id })} />
+            : record.packages.length > 1 || missingPackageSelection ? <div className="agent-version-selector">
             <label htmlFor={packageSelectId}>Published version details</label>
             <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || hasPackageConfirmation}
               onChange={event => setPackageSelection(current => ({ ...current, recordId: record.id, packageId: event.target.value }))}>
@@ -266,7 +270,7 @@ export function UnifiedAgentDetailModal({
           {missingPackageSelection && packageDetailLoading ? <p role="status">Loading selected published version...</p> : null}
           {missingPackageSelection && !packageDetailLoading ? <p className="error-banner" role="alert">
             The selected published version <code>{preferredPackageId}</code> {record.packagesComplete === false
-              ? "is not in the loaded version preview. Inspect it from the paged source members." : "is no longer in this saved agent inventory."}
+              ? "is not in the loaded version list. Choose it from Published version details." : "is no longer in this saved agent inventory."}
             {packageDetailError ? ` ${packageDetailError}` : ""}
             Choose an available version explicitly or <a href="/sync">refresh agent inventory</a>.
           </p> : null}
@@ -277,9 +281,11 @@ export function UnifiedAgentDetailModal({
             : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional details require package read access.</p> : null}
         </> : null}
         {selectedTab === "identities" ? <AgentOverview onOpenPerson={onOpenPerson} key={overviewKey}
-          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
-        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, selectionId, usageContext?.reports.setId])}
+          record={record} selectionId={selectionId} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
+        {selectedTab === "reports" || selectedTab === "users" ? <AgentUsagePanel key={record.id}
+          view={selectedTab === "reports" ? "usage" : "users"}
           record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId, inventoryRevision])} dataRevision={dataRevision}
+          inventorySelectionId={selectionId} onReloadInventory={onRetryInventory}
           canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy || packageInventoryPending || Boolean(inventoryError)} onChanged={onUsageChanged} /> : null}
         {selectedTab === "audit-security" ?

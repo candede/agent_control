@@ -504,10 +504,11 @@ export function getInventoryFacets(selectionId: string, field: InventoryFacetFie
     return request<{ value: InventoryMember[]; total: number; nextCursor: string | null }>(
       `/api/agent-inventory/${encodeURIComponent(recordId)}/members?${params}`, { signal: options.signal });
   }
-  export function getInventoryChildren(selectionId: string, recordId: string, member: InventoryMember, kind: string,
-    cursor?: string, options: { signal?: AbortSignal } = {}) {
+  export function getInventoryChildren(selectionId: string, recordId: string, member: Pick<InventoryMember, "source_scope_id" | "source_identity">, kind: string,
+    cursor?: string, options: { signal?: AbortSignal; value?: string; limit?: number } = {}) {
     const params = new URLSearchParams({ selectionId, kind, sourceScopeId: member.source_scope_id,
-      sourceIdentity: member.source_identity, limit: "50", ...cursor ? { cursor } : {} });
+      sourceIdentity: member.source_identity, limit: String(options.limit ?? 50), ...cursor ? { cursor } : {},
+      ...options.value !== undefined ? { value: options.value } : {} });
     return request<{ value: { ordinal: number; kind: string; value: string; payload: Record<string, unknown> }[]; total: number; nextCursor: string | null }>(
       `/api/agent-inventory/${encodeURIComponent(recordId)}/children?${params}`, { signal: options.signal });
   }

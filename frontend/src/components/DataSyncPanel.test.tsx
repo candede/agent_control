@@ -5,6 +5,7 @@ import { QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   DataSyncPanelHandle,
+  WorkspaceSetupStatus,
 } from "./DataSyncPanel";
 import type {
   DataSyncRun,
@@ -94,7 +95,7 @@ function renderPanel(options: {
   canUploadUsage?: boolean;
   onOpenUsageImport?: () => void;
   onRequestedRunChange?: (runId: string | undefined) => void;
-  onSetupRequiredChange?: (required: boolean) => void;
+  onSetupStatusChange?: (status: WorkspaceSetupStatus) => void;
   onOpenSync?: () => void;
   automaticRefresh?: AutomaticRefreshStatus;
   onSourcesChanged?: (sources: DataSyncSourceId[]) => void;
@@ -111,7 +112,7 @@ function renderPanel(options: {
     requestedRunId: options.requestedRunId,
     onOpenUsageImport: options.onOpenUsageImport ?? vi.fn(),
     onRequestedRunChange: options.onRequestedRunChange ?? vi.fn(),
-    onSetupRequiredChange: options.onSetupRequiredChange,
+    onSetupStatusChange: options.onSetupStatusChange,
     onOpenSync: options.onOpenSync,
     automaticRefresh: options.automaticRefresh,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
@@ -138,6 +139,41 @@ describe("DataSyncPanel", () => {
     vi.useRealTimers();
   });
 
+  it.each([true, false])("does not assume setup is required before saved status resolves to %s", async onboardingRequired => {
+    let resolveState!: (value: DataSyncState) => void;
+    api.getState.mockReturnValueOnce(new Promise<DataSyncState>(resolve => { resolveState = resolve; }));
+    const onSetupStatusChange = vi.fn();
+    const view = renderPanel({ active: false, onSetupStatusChange, onOpenSync: vi.fn() });
+    await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("checking"));
+    expect(view.container).toBeEmptyDOMElement();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    await act(async () => resolveState(syncState({ onboardingRequired })));
+    expect(onSetupStatusChange.mock.calls.map(([status]) => status)).toEqual(["checking", onboardingRequired ? "required" : "ready"]);
+    if (onboardingRequired) expect(screen.getByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    else expect(view.container).toBeEmptyDOMElement();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("shows an inline status error and retries without assuming first sync", async () => {
+    api.getState.mockRejectedValueOnce(new ApiError(503, "unavailable", "Saved status could not be read."));
+    const onSetupStatusChange = vi.fn();
+    const onOpenSync = vi.fn();
+    renderPanel({ active: false, onSetupStatusChange, onOpenSync });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved status could not be read.");
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("error");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
+    expect(onOpenSync).toHaveBeenCalledOnce();
+    api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false }));
+    await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
+    await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])("keeps CSV management outside automatic sync with upload permission %s", async canUploadUsage => {
     api.getState.mockResolvedValue(syncState());
     renderPanel({ canUploadUsage });
@@ -150,12 +186,12 @@ describe("DataSyncPanel", () => {
 
   it("blocks first-sync setup outside Sync without starting duplicate work and allows recovery navigation", async () => {
     api.getState.mockResolvedValue(syncState());
-    const onSetupRequiredChange = vi.fn();
+    const onSetupStatusChange = vi.fn();
     const overflow = document.body.style.overflow;
     const onOpenSync = vi.fn();
-    const view = renderPanel({ active: false, onSetupRequiredChange, onOpenSync });
+    const view = renderPanel({ active: false, onSetupStatusChange, onOpenSync });
 
-    await waitFor(() => expect(onSetupRequiredChange).toHaveBeenLastCalledWith(true));
+    await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("required"));
     expect(screen.getByRole("heading", { name: "Set up your workspace" })).toBeVisible();
     expect(screen.getByRole("progressbar", { name: "First sync sources saved" })).toHaveAttribute("value", "0");
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
@@ -217,7 +253,7 @@ describe("DataSyncPanel", () => {
     let resolveState!: (value: DataSyncState) => void;
     api.getState.mockReturnValueOnce(new Promise<DataSyncState>(resolve => { resolveState = resolve; }));
     renderPanel({ active: false, onOpenSync: vi.fn() });
-    expect(await screen.findByRole("heading", { name: "Checking workspace setup" })).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
     await act(async () => resolveState(syncState({ run: run("running", [source("users", "running")]) })));
     api.getState.mockRejectedValueOnce(new ApiError(503, "unavailable", "Status endpoint unavailable.", { requestId: "sync-status-request" }));
@@ -1276,8 +1312,8 @@ describe("DataSyncPanel", () => {
         run: run("completed", finished), sources: finished,
       }));
     const onChanged = vi.fn();
-    const onSetupRequiredChange = vi.fn();
-    const view = renderPanel({ onSourcesChanged: onChanged, onSetupRequiredChange });
+    const onSetupStatusChange = vi.fn();
+    const view = renderPanel({ onSourcesChanged: onChanged, onSetupStatusChange });
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByText("Syncing graph packages, power platform")).toBeVisible();
     expect(screen.queryByText("Sync in progress")).not.toBeInTheDocument();
@@ -1287,7 +1323,7 @@ describe("DataSyncPanel", () => {
     expect(screen.getByRole("progressbar")).toHaveAttribute("max", "3");
     expect(screen.getByText(/1 of 3 automatic sources complete/)).toBeVisible();
     expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
-    expect(onSetupRequiredChange).toHaveBeenLastCalledWith(true);
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("required");
     await act(async () => { view.rerenderPanel({ active: false }); });
     expect(view.container).toBeEmptyDOMElement();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -1296,7 +1332,7 @@ describe("DataSyncPanel", () => {
     expect(api.start).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
     expect(onChanged).toHaveBeenCalledWith(["graph_packages", "power_platform", "usage_reports"]);
-    expect(onSetupRequiredChange).toHaveBeenLastCalledWith(false);
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready");
     expect(view.container).toBeEmptyDOMElement();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await act(async () => { view.rerenderPanel({ active: true }); });
@@ -1432,10 +1468,10 @@ describe("DataSyncPanel", () => {
       sources: successful,
     }));
     const panelRef = createRef<DataSyncPanelHandle>();
-    const onSetupRequiredChange = vi.fn();
-    const view = renderPanel({ ref: panelRef, active: false, onSetupRequiredChange });
+    const onSetupStatusChange = vi.fn();
+    const view = renderPanel({ ref: panelRef, active: false, onSetupStatusChange });
     await act(async () => { await Promise.resolve(); });
-    expect(onSetupRequiredChange).toHaveBeenLastCalledWith(false);
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready");
     expect(view.container).toBeEmptyDOMElement();
 
     api.getState.mockResolvedValue(syncState());
@@ -1443,7 +1479,7 @@ describe("DataSyncPanel", () => {
       await panelRef.current?.refresh();
     });
 
-    expect(onSetupRequiredChange).toHaveBeenLastCalledWith(true);
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("required");
     expect(view.container).toBeEmptyDOMElement();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(api.start).not.toHaveBeenCalled();
@@ -1878,9 +1914,9 @@ describe("DataSyncPanel", () => {
     api.getState.mockReturnValue(new Promise(resolve => { resolveState = resolve; }));
     api.getRun.mockReturnValue(new Promise(resolve => { resolveRun = resolve; }));
     const onChanged = vi.fn();
-    const onSetupRequiredChange = vi.fn();
+    const onSetupStatusChange = vi.fn();
     const view = renderPanel({
-      active: false, requestedRunId: "exact-run", onSourcesChanged: onChanged, onSetupRequiredChange,
+      active: false, requestedRunId: "exact-run", onSourcesChanged: onChanged, onSetupStatusChange,
     });
     await act(async () => { await Promise.resolve(); });
     const stateSignal = api.getState.mock.calls[0][0].signal as AbortSignal;
@@ -1890,7 +1926,7 @@ describe("DataSyncPanel", () => {
     view.unmount();
     expect(stateSignal.aborted).toBe(true);
     expect(runSignal.aborted).toBe(true);
-    const setupNotifications = onSetupRequiredChange.mock.calls.length;
+    const setupNotifications = onSetupStatusChange.mock.calls.length;
     await act(async () => {
       resolveState(syncState());
       resolveRun(run("running", [source("users", "running")], { id: "exact-run" }));
@@ -1899,7 +1935,7 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledOnce();
     expect(api.getRun).toHaveBeenCalledOnce();
     expect(onChanged).not.toHaveBeenCalled();
-    expect(onSetupRequiredChange).toHaveBeenCalledTimes(setupNotifications);
+    expect(onSetupStatusChange).toHaveBeenCalledTimes(setupNotifications);
     expect(api.cancel).not.toHaveBeenCalled();
   });
 

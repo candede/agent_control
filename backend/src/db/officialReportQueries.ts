@@ -1,5 +1,8 @@
 import { userSourceFactsSql } from "./userSources.js";
 
+export const reportPeriodSortKey = `reporting_end::text || '/' || COALESCE(reporting_start::text,'') || '/'
+  || to_char(accepted_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US')`;
+
 export const officialAgentsSql = `
     SELECT agent_id AS identity,agent_id,
       COALESCE(max(agent_name) FILTER(WHERE kind='agents'),min(agent_name)) AS name,

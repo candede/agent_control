@@ -113,7 +113,8 @@ export function AgentSyncTools({
                 </button>
               </WorkbenchActionGate>
               <WorkbenchActionGate actionId="packages.refresh.identities">
-                <button type="button" className="secondary" disabled={refreshingPackages || selectedPackageCount < 1 || selectedPackageCount > 5000} onClick={onRefreshMatchingDetails}>
+                <button type="button" className="secondary" disabled={refreshingPackages || verifyingInventory || Boolean(inventoryError)
+                  || selectedPackageCount < 1 || selectedPackageCount > 5000} onClick={onRefreshMatchingDetails}>
                   Refresh matching details
                 </button>
               </WorkbenchActionGate>

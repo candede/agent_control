@@ -301,7 +301,8 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
         <a className="usage-export-help" href="https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide"
           target="_blank" rel="noreferrer">How to download official CSV reports</a>
       </> : null}
-      {verified && accepted && !selected ? <><p>The imported report is saved, but another report is currently selected.</p>
+      {verified && accepted && !selected ? <>{!error ? <h3>Reports saved</h3> : null}<p>The imported report is saved, but another report is currently selected.</p>
+        <p>You can keep the current selection or explicitly select the imported report. Older historical uploads do not replace a newer selected report.</p>
         <button type="button" disabled={Boolean(busy)} onClick={() => void prepareImportedSelection()}>Use imported reports</button></> : null}
       {selection ? <section className="usage-import-section" aria-label="Confirm imported report selection"><p>This changes the shared current report to {selection.setId}, not existing pinned pages.</p>
         <button type="button" disabled={Boolean(busy)} onClick={() => void confirmSelection()}>Confirm use of imported reports</button>
@@ -316,7 +317,8 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
     </div>
     <footer className="usage-import-footer">
       {summary ? <button type="button" disabled={Boolean(busy)} onClick={() => void verify(true)}>OK</button> : <>
-        <button type="button" className="secondary" disabled={cancelConfirm || busy === "accepting" || Boolean(accepted && busy || attempt && !accepted)} onClick={dismiss}>Cancel import</button>
+        <button type="button" className="secondary" disabled={cancelConfirm || busy === "accepting" || Boolean(accepted && busy || attempt && !accepted)} onClick={dismiss}>
+          {accepted && verified && !selected ? "Keep current report" : "Cancel import"}</button>
         {recovery === "resume" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void restore()}>Reload saved draft</button> : null}
         {recovery === "bundle" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"))}>Refresh bundle validation</button> : null}
         {recovery === "acceptance" ? <button type="button" disabled={Boolean(busy)} onClick={() => void accept()}>Verify acceptance</button> : null}

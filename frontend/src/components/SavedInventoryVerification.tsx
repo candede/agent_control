@@ -21,7 +21,7 @@ export function SavedAgentInventoryVerification({
       <h3>Saved inventory verification</h3>
       <button type="button" className="secondary" disabled={loading || !onVerify} onClick={onVerify}
         title="Recheck existing saved source counts and identity accounting. No provider sync or clearing.">
-        <RefreshCw size={15} aria-hidden="true" />{loading ? "Verifying saved inventory..." : "Verify saved inventory"}
+        <RefreshCw size={15} aria-hidden="true" />{loading ? "Verifying saved inventory..." : error ? "Reload saved inventory" : "Verify saved inventory"}
       </button>
     </div>
     <p>Saved inventory is checked automatically. No manual verification or administrator approval is required after sync.</p>

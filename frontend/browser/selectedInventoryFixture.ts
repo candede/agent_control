@@ -15,10 +15,15 @@ export function isInventorySelectionRequest(request: Request) {
 }
 
 function selected(route: Route) {
-  const id = new URL(route.request().url()).searchParams.get("selectionId");
+  const query = new URL(route.request().url()).searchParams;
+  const id = query.get("inventorySelectionId") ?? query.get("selectionId");
   const capture = id ? captures.get(route.request().frame().page())?.get(id) : undefined;
   if (!capture) throw new Error(`Unknown synthetic inventory selection: ${id}`);
   return capture;
+}
+
+export function inventoryFixtureSelection(route: Route) {
+  return selected(route).selection;
 }
 
 export async function captureInventorySelection(route: Route, metadata: UnifiedAgentInventoryPage["selection"]) {

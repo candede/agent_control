@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { buildRecords } from "./inventoryComponent.js";
 import { canonicalRecord, packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord } from "./inventoryRecordProjection.js";
@@ -14,7 +14,25 @@ const native: PowerPlatformResource = {
 };
 const retiredKinds = ["presence", "linkState", "availability", "management"];
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("inventory record projections", () => {
+  it("diagnoses an oversized projected residual without logging its contents", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const displayName = "private-display-name-" + "x".repeat(262_144);
+    expect(() => powerPlatformInventoryRecord({ ...native, displayName })).toThrow(expect.objectContaining({
+      code: "data_residual_bytes",
+    }));
+    expect(warn).toHaveBeenCalledOnce();
+    expect(JSON.parse(warn.mock.calls[0][0])).toEqual({
+      timestamp: expect.any(String), level: "warn", event: "data_residual_limit_exceeded",
+      errorCode: "data_residual_bytes", stage: "inventory_projection", field: "residual",
+      bytes: expect.any(Number), maximumLength: 262_144,
+    });
+    expect(JSON.parse(warn.mock.calls[0][0]).bytes).toBeGreaterThan(262_144);
+    expect(warn.mock.calls[0][0]).not.toContain("private-display-name");
+  });
+
   it("stores classifications once and preserves unknown provider status values", () => {
     const record = packageInventoryRecord(allowlistedPackage({
       id: "opaque-package", displayName: "Package", isBlocked: false, availableTo: "future-scope",

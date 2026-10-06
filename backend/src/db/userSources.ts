@@ -176,7 +176,7 @@ export class UserSourcesRepository {
       const state = !available ? "unavailable"
         : row.source === "app_activity" && row.report_refresh_date !== null && !isCopilotAppActivityFresh(row.report_refresh_date, evaluatedAt) ? "stale"
           : row.source === "app_activity" && row.report_refresh_date === null ? "partial"
-          : row.attempt_status === "available" ? "available" : "partial";
+          : row.attempt_status === "available" || row.attempt_status === "running" ? "available" : "partial";
       const value: UserSourceMetadata = {
         source: row.source, generationId: row.generation_id, scopeId: row.scope_id,
         revision: row.generation_id ? row.revision : null, expiresAt: row.expires_at?.toISOString() ?? null,

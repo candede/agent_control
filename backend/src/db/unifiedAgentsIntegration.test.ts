@@ -220,10 +220,16 @@ describe("typed unified inventory integration", () => {
     const native = selected.page.value.find(row => row.powerPlatformResource?.nativeId === botId)!;
     const members = await selected.queries.members(selected.selection.id, selected.identity, native.id.slice(6));
     const member = members.value.find(row => row.domain === "power_platform")!;
+    expect(native.powerPlatformResource?.savedSource).toEqual({ scopeId: member.source_scope_id, identity: member.source_identity });
     const children = await selected.queries.children(selected.selection.id, selected.identity, native.id.slice(6),
       { kind: "connectorOperation", sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity });
     expect(children.total).toBe(1);
     expect(children.value[0].payload).toMatchObject({ operationId: "RunScriptProd", createdBy: creator, isEnabled: false, requiresEndUserConsent: false });
+    const filtered = await selected.queries.children(selected.selection.id, selected.identity, native.id.slice(6),
+      { kind: "connectorOperation", sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity, value: "0" });
+    expect(filtered).toEqual(children);
+    expect((await selected.queries.children(selected.selection.id, selected.identity, native.id.slice(6),
+      { kind: "connectorOperation", sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity, value: "1" })).total).toBe(0);
     expect(JSON.stringify([selected.page, children])).not.toMatch(/secret-connection|private.invalid|flowIds/);
     const rows = await exportRows(selected), exported = rows.find(row => row.recordType === "agent" && row.agentId === native.id)!;
     expect(exported).toMatchObject({ environmentName: "Finance production", managedEnvironment: "false",

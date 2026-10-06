@@ -22,7 +22,7 @@ function reportLabel(set: ReportHistorySet) {
   return `${set.periodProvenance === "activity_range" ? "Observed activity" : "Reporting window"}: ${dates} | ${set.id.slice(0, 8)}`;
 }
 function Selector({ revision, onChanged }: { revision: number; onChanged: (selected: boolean) => void }) {
-  const read = useReportPage<ReportHistorySet, ReportListPage<ReportHistorySet>>("official-usage/history/options", { sort: "acceptedAt", order: "desc" }, revision);
+  const read = useReportPage<ReportHistorySet, ReportListPage<ReportHistorySet>>("official-usage/history/options", { sort: "reportingPeriod", order: "desc" }, revision);
   const capability = useContext(CapabilityContext), canManage = !capability || hasRole(capability.user, "AgentControl.Admin");
   const [candidate, setCandidate] = useState("");
   const [busy, setBusy] = useState(false), [error, setError] = useState<string>();

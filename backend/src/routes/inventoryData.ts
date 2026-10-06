@@ -150,10 +150,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const read = await selected(request, false, ["objectId"], true);
     const { sourceRows, selected: person, ...result } = await inventory.responsibility(read.id, read.identity, query);
     const sources = inventorySourceStatuses(sourceRows);
-    const coverage = sources.powerPlatform.state === "unavailable" ? "unavailable"
-      : sources.powerPlatform.state === "partial" || result.unknownAgentCount > 0 ? "partial" : "available";
-    response.json({ ...result, sources, coverage, selected: person ? { ...person,
-      state: coverage === "unavailable" ? "unavailable" : person.count ? "reported" : "no_reported_relationships" } : null });
+    response.json({ ...result, sources, selected: person ? { ...person,
+      state: sources.powerPlatform.state === "unavailable" ? "unavailable" : person.count ? "reported" : "no_reported_relationships" } : null });
   });
   policyRoute(router, "get", "/agent-inventory/facets", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
@@ -203,14 +201,15 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "get", "/agent-inventory/:recordId/children", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
-    const read = await selected(request, true, ["kind", "sourceScopeId", "sourceIdentity"]);
+    const read = await selected(request, true, ["kind", "sourceScopeId", "sourceIdentity", "value"]);
     if (request.query.sourceScopeId !== undefined && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(String(request.query.sourceScopeId))) {
       throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     }
     response.json(await inventory.children(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
       { ...read.options, kind: scalar(request.query.kind, "kind", 128),
         sourceScopeId: request.query.sourceScopeId === undefined ? undefined : scalar(request.query.sourceScopeId, "sourceScopeId", 36),
-        sourceIdentity: request.query.sourceIdentity === undefined ? undefined : scalar(request.query.sourceIdentity, "sourceIdentity", 512) }));
+        sourceIdentity: request.query.sourceIdentity === undefined ? undefined : scalar(request.query.sourceIdentity, "sourceIdentity", 512),
+        value: request.query.value === undefined ? undefined : scalar(request.query.value, "value", 512) }));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/members", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],

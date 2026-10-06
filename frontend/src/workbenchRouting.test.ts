@@ -29,13 +29,22 @@ describe("workbench routing", () => {
     expect(parseAgentRoute(query.toString())).toMatchObject({ selectionStorage: "session", selectionCount: 5_000, selectedIds: [] });
   });
 
-  it("round trips exact Users responsibility context and leaves invalid identities explicitly invalid", () => {
-    const route = { view: "responsibility" as const, personId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", search: "", page: 2 };
+  it("round trips the exact user modal and leaves invalid identities explicitly invalid", () => {
+    const route = { view: "licenses" as const, detailId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", detailTab: "responsibility" as const, search: "", page: 0 };
     const query = usersRouteSearch(route);
-    expect(query.toString()).toBe("view=responsibility&person=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&page=3");
-    expect(parseUsersRoute(query.toString())).toMatchObject({ ...route, personId: route.personId.toLowerCase() });
-    expect(parseUsersRoute("view=responsibility&person=Alice")).toMatchObject({ view: "responsibility", personId: "Alice" });
-    expect(usersRouteSearch({ ...route, personId: "Alice" }).get("person")).toBe("invalid");
+    expect(query.toString()).toBe("detail=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&tab=responsibility");
+    expect(parseUsersRoute(query.toString())).toMatchObject({ ...route, detailId: route.detailId.toLowerCase() });
+    expect(parseUsersRoute("detail=Alice&tab=responsibility")).toMatchObject({ view: "licenses", detailId: "invalid" });
+    expect(usersRouteSearch({ ...route, detailId: "Alice" }).get("detail")).toBe("invalid");
+    expect(parseUsersRoute(`detail=${route.detailId}&tab=invalid`).detailTab).toBe("overview");
+  });
+  it("maps retired responsibility bookmarks to user details without reviving the cohort or its pagination", () => {
+    const route = parseUsersRoute("view=responsibility&person=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA&selection=retired&cursor=old");
+    expect(route).toMatchObject({ view: "licenses", detailId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", detailTab: "responsibility" });
+    expect(usersRouteSearch(route).toString()).toBe("detail=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&tab=responsibility");
+    expect(parseUsersRoute("view=responsibility&person=Alice").detailId).toBe("invalid");
+    expect(parseUsersRoute("view=responsibility")).toMatchObject({ view: "licenses" });
+    expect(parseUsersRoute("view=responsibility")).not.toHaveProperty("detailId");
   });
   it.each(["available", "unavailable", "unknown"] as const)("round trips the %s end-user access filter", endUserAccess => {
     const state = { ...parseAgentRoute(""), endUserAccess };
@@ -205,16 +214,16 @@ describe("workbench routing", () => {
     expect(parseAgentRoute("detail=power_platform%3Aenv-1%3A%250A").detailId).toBeUndefined();
   });
 
-  it("round trips canonical details and legacy canonical selections alongside exact source targets", () => {
+  it.each(["reports", "users", "controls"])("round trips the %s tab and canonical selections alongside exact source targets", detailTab => {
     const canonical = "agent:11111111-1111-4111-8111-111111111111";
     const native = "power_platform:environment-a:native%2Fagent";
     const route = parseAgentRoute(new URLSearchParams({
-      detail: canonical, detailTab: "controls", inventorySnapshot: "snapshot-a",
+      detail: canonical, detailTab, inventorySnapshot: "snapshot-a",
     }).toString());
     route.selectedIds = ["package-a", "package-b"];
     route.selectedPowerPlatformIds = [canonical, native];
     expect(parseAgentRoute(agentRouteSearch(route).toString())).toMatchObject({
-      detailId: canonical, detailTab: "controls", inventorySnapshotId: "snapshot-a",
+      detailId: canonical, detailTab, inventorySnapshotId: "snapshot-a",
       selectedIds: ["package-a", "package-b"], selectedPowerPlatformIds: [canonical, native],
     });
     expect(parseAgentRoute("detail=agent%3Ainvalid&selectedResource=agent%3Ainvalid")).toMatchObject({

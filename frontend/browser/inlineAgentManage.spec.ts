@@ -95,6 +95,11 @@ test("edits access and installation and reviews blocking inside one agent modal"
   await page.getByRole("button", { name: `View details for ${agent.displayName}`, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: agent.displayName });
   await dialog.getByRole("tab", { name: "Manage", exact: true }).click();
+  const heading = dialog.locator(".agent-access-heading");
+  await expect(heading.getByText(`Package ID: ${agent.id}`, { exact: true })).toBeVisible();
+  await expect(heading.locator("details")).toHaveCount(0);
+  expect(await heading.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
+    "The inline package ID must fit the management header").toBe(true);
   await expect(dialog.getByRole("radio", { name: /All users/ })).toBeChecked();
   await expect(dialog.getByRole("radio", { name: /All users/ })).toBeDisabled();
   await expect(dialog.getByRole("button", { name: /Manage access for|Manage installation for/ })).toHaveCount(0);

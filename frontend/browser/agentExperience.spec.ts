@@ -44,7 +44,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await mockUsageReports(page, unexpected);
   const reportReads: string[] = [];
   const otherReportRequests: string[] = [];
-  const overviewReads = ["/api/official-usage/history", "/api/official-usage/overview"];
+  const overviewReads = ["/api/official-usage/history/options", "/api/official-usage/overview"];
   page.on("request", request => {
     const path = new URL(request.url()).pathname;
     if (path.startsWith("/api/official-usage/") && !overviewReads.includes(path)) otherReportRequests.push(request.url());
@@ -64,7 +64,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await page.screenshot({ path: info.outputPath("agents-inventory.png"), fullPage: true });
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
-  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & users", "Manage", "Activity"]);
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage", "Users", "Manage", "Activity"]);
   await expect(dialog.getByText("Representative saved catalog observation; no live provider requests.")).toBeVisible();
   await expect(dialog.getByRole("button", { name: /Review usage|Review access|Details & services/ })).toHaveCount(0);
   await expect(dialog.getByText("Tenant adoption snapshot")).toHaveCount(0);
@@ -73,9 +73,9 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(dialog.getByLabel("Find a reported agent")).toHaveCount(0);
   const bounds = await dialog.boundingBox();
   await page.screenshot({ path: info.outputPath("agent-overview.png") });
-  await dialog.getByRole("tab", { name: "Usage & users" }).click();
+  await dialog.getByRole("tab", { name: "Usage" }).click();
   await expect(dialog.getByRole("alert")).toContainText("Report data is unavailable. Restart usage to try again.");
-  await expect(dialog.getByRole("button", { name: "Restart usage selection" })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "Reload usage" })).toBeEnabled();
   await expect(dialog.getByText(/Missing usage data does not mean zero usage/)).toHaveCount(0);
   await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);
   await expect(dialog.getByLabel("Selected agent report metrics")).toHaveCount(0);
@@ -125,14 +125,14 @@ test("users can switch cohorts and traverse nonpaid activity without losing rout
   await expect(page).toHaveURL(/\/users\?view=activity$/);
   const activity = page.getByRole("region", { name: "Reported user activity", exact: true }).and(page.locator(".copilot-users-table-shell"));
   await expect(activity.locator("tbody tr")).toHaveCount(2);
-  await expect(activity.getByRole("columnheader")).toHaveCount(7);
+  await expect(activity.getByRole("columnheader")).toHaveText(["User", "Agent responses", "Agents used", "Company", "Department", "Last activity"]);
   await expect(activity.getByRole("row", { name: /Concealed report user|Ada|Ben|Cleo/ })).toHaveCount(0);
-  await expect(activity.getByRole("row", { name: /Emery/ })).toContainText("No active M365 Copilot license");
   await expect(activity.getByRole("row", { name: /Finley/ })).toContainText("Not reported");
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("reported-user-activity.png"), fullPage: true });
   await activity.getByRole("button", { name: "Emery", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Emery" }).getByLabel("User summary")).toContainText("No active M365 Copilot license");
   await page.getByRole("dialog", { name: "Emery" }).getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await page.getByRole("dialog", { name: "Emery" }).getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
   const selectedAgentUrl = new RegExp(`agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`);
@@ -182,9 +182,9 @@ for (const state of ["missing", "unavailable"] as const) {
     await expect(page.getByRole("region", { name: "Tenant adoption insights" })).toHaveCount(0);
     await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
-    await dialog.getByRole("tab", { name: "Usage & users" }).click();
+    await dialog.getByRole("tab", { name: "Usage" }).click();
     await expect(dialog.getByRole("alert")).toContainText("Report data is unavailable. Restart usage to try again.");
-    await expect(dialog.getByRole("button", { name: "Restart usage selection" })).toBeEnabled();
+    await expect(dialog.getByRole("button", { name: "Reload usage" })).toBeEnabled();
     await expect(dialog.getByRole("link", { name: "Open usage reports" })).toHaveCount(0);
     await expect(dialog.getByRole("alert")).toHaveCount(1);
     await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);

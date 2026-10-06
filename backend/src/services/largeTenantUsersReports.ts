@@ -4,7 +4,7 @@ import { dataLimits, digest, encodeBatch } from "../db/dataBounds.js";
 import { officialReportCount as exactCount } from "../db/officialReportBounds.js";
 import { UserSourcesRepository, facts, userSourceSqlParameters, type UserSourceMetadataSet } from "../db/userSources.js";
 import { OfficialReportHistory, readableHistorySql } from "../db/officialReportHistory.js";
-import { reportRelationsSql, selectedDirectoryReportRelationsSql, selectedOfficialReportRelationsSql } from "../db/officialReportQueries.js";
+import { reportRelationsSql, reportPeriodSortKey, selectedDirectoryReportRelationsSql, selectedOfficialReportRelationsSql } from "../db/officialReportQueries.js";
 import { reportUuid } from "../db/officialReportImports.js";
 import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
 import type { ReportEndpoint, ReportMetadata, ReportPage, ReportQuery, ReportRow, ReportSummary } from "../types/officialReportData.js";
@@ -23,7 +23,7 @@ const sorts = {
   official_users: ["name", "responses", "agentsUsed", "lastActivity"],
   official_agents: ["name", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"],
   relationships: ["name", "responses", "lastActivity", "creatorType"],
-  history: ["acceptedAt"], overview: ["name", "lastActivity"], unresolved: ["name", "responses"], plans: ["name"], observations: ["name"],
+  history: ["reportingPeriod", "acceptedAt"], overview: ["name", "lastActivity"], unresolved: ["name", "responses"], plans: ["name"], observations: ["name"],
 } as const;
 export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportQuery {
   if (!(endpoint in sorts) || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
@@ -54,7 +54,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
     if (query[key] !== undefined && (!Number.isSafeInteger(query[key]) || query[key]! < 1 || query[key]! > maximum)) throw new SelectionError("invalid_cursor");
     query[key] ??= fallback;
   }
-  query.sort ??= endpoint === "history" ? "acceptedAt" : endpoint === "official_agents" ? "responses" : "name";
+  query.sort ??= endpoint === "history" ? "reportingPeriod" : endpoint === "official_agents" ? "responses" : "name";
   if (!(sorts[endpoint] as readonly string[]).includes(query.sort)) throw new SelectionError("invalid_cursor");
   query.order ??= endpoint === "history" || endpoint === "official_agents" ? "desc" : "asc";
   if (query.search !== undefined) query.search = reportSearch(query.search);
@@ -165,6 +165,17 @@ export class LargeTenantUsersReports {
           [selection.id, identity.tenantId, tokenMode, JSON.stringify(metadata), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
         } };
     });
+  }
+
+  async reportForSelection(client: pg.PoolClient, context: ReportReadContext, setId?: string): Promise<ReportMetadata> {
+    if (!setId || setId === context.report.setId) return context.report;
+    const member = await client.query(`SELECT 1 FROM (${readableHistorySql}) history
+      WHERE history.id=$3::uuid AND history.visibility='retained'`,
+    [context.identity.tenantId, context.report.historyRevision, setId]);
+    if (!member.rowCount) throw new SelectionError("selection_invalidated");
+    const report = await this.metadata(client, context.identity.tenantId, setId, context.evaluatedAt);
+    return { ...report, activeSetId: context.report.activeSetId, activeRevision: context.report.activeRevision,
+      historyRevision: context.report.historyRevision, historyEpoch: context.report.historyEpoch };
   }
 
   private async metadata(client: pg.PoolClient, tenant: string, setId: string | undefined, now: Date): Promise<ReportMetadata> {
@@ -716,7 +727,7 @@ function sortKey(sort: NonNullable<ReportQuery["sort"]>, endpoint: ReportEndpoin
     responses: "lpad(responses::text,16,'0')", agentsUsed: "lpad(agents_used::text,16,'0')",
     lastActivity: ["official_users", "copilot_users"].includes(endpoint) ? "user_last_activity::text" : "last_activity::text",
     activeUsers: "lpad(active_users::text,16,'0')", licensedUsers: "lpad(licensed_users::text,16,'0')",
-    unlicensedUsers: "lpad(unlicensed_users::text,16,'0')", acceptedAt: "accepted_at::text",
+    unlicensedUsers: "lpad(unlicensed_users::text,16,'0')", acceptedAt: "accepted_at::text", reportingPeriod: reportPeriodSortKey,
     creatorType: 'lower(normalize(NULLIF(btrim(creator_type),\'\'),NFKC) COLLATE "default")' };
   return keys[sort];
 }

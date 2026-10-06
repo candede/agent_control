@@ -318,6 +318,16 @@ button.agent-sort-heading,
 
 .unified-agent-detail-modal .agent-overview-facts {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--border);
+}
+
+.unified-agent-detail-modal .agent-overview-facts > div {
+  border: 0;
+  background: #fff;
 }
 
 .agent-property-grid > div {
@@ -550,16 +560,18 @@ button.agent-sort-heading,
 
   .unified-agent-detail-modal .detail-tabs {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(5, auto);
+    gap: 0;
+    padding: 0 8px;
   }
 
-  .unified-agent-detail-modal .detail-tabs button {
+  .unified-agent-detail-modal .detail-tabs [role="tab"] {
     box-sizing: border-box;
     height: 44px;
     min-height: 44px;
     padding: 4px;
     font-size: 0.82rem;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
   }
 
   .unified-agent-detail-modal .agent-overview-facts {

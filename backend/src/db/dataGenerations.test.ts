@@ -134,14 +134,22 @@ describe("bounded generation batches", () => {
     it("admits the exact persisted JSONB residual size and diagnoses normalization overflow before a check-constraint error", async () => {
       const lease = await store.begin(generationInput());
       const residual = { value: "x".repeat(262144 - Buffer.byteLength('{"value": ""}')) };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         await expect(store.append(lease, "directory", 0, [directoryRecord("residual-exact", { residual })])).resolves.toMatchObject({ replay: false });
+        expect(warn).not.toHaveBeenCalled();
         await expect(store.append(lease, "directory", 1, [directoryRecord("residual-over",
           { residual: { value: residual.value + "x" } })])).rejects.toMatchObject({
           code: "data_residual_bytes", details: { limit: 262144, observed: 262145 },
         });
+        expect(warn).toHaveBeenCalledOnce();
+        expect(JSON.parse(warn.mock.calls[0][0])).toEqual({
+          timestamp: expect.any(String), level: "warn", event: "data_residual_limit_exceeded",
+          errorCode: "data_residual_bytes", stage: "database", field: "residual",
+          bytes: 262_145, maximumLength: 262_144,
+        });
         expect((await fixture.runtime.query("SELECT row_count FROM data_generations WHERE id=$1", [lease.id])).rows[0].row_count).toBe(1);
-      } finally { await store.abort(lease, true); }
+      } finally { warn.mockRestore(); await store.abort(lease, true); }
     });
 
     it("takes the sync mutex before generation locks while a source status transaction owns its child row", async () => {

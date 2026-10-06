@@ -30,12 +30,12 @@ describe("purposeful saved agent context", () => {
       powerPlatformResource: { ...resource, connectorCounts: { connectors: 400, operations: 9000 },
         details: { connectorDetailsStatus: "partial", distinctPowerPlatformConnectors: 401, distinctPowerPlatformConnectorsOperations: 9999 } } }}
       peopleState={peopleState} />);
-    expect(field("Saved connectors")).toHaveTextContent("400");
-    expect(field("Saved operations")).toHaveTextContent("9000");
+    expect(field("Connectors")).toHaveTextContent("401");
+    expect(field("Operations")).toHaveTextContent("9999");
     expect(screen.getByText("Status and access summarize all 6,000 published versions.")).toBeVisible();
-    expect(screen.getByText("Saved configuration is available in the paged source members above.")).toBeVisible();
+    expect(screen.queryByText(/source members/)).not.toBeInTheDocument();
     expect(screen.queryByRole("list", { name: "Configured connector details" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Configured connector details are unavailable. Refresh inventory in Sync.")).not.toBeInTheDocument();
+    expect(screen.getByText("Configured connector details are unavailable. Refresh inventory in Sync.")).toBeVisible();
   });
   it("shows server-owned aggregate status, access, installation and authoring values instead of the source preview", () => {
     render(<AgentOverview record={{ ...record, columns: { status: "4 blocked · 96 not blocked", availability: "Specific users or groups",

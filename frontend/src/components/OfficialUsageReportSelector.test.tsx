@@ -50,7 +50,7 @@ describe("compact shared report-set selection", () => {
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
     expect(api.readReportPage).toHaveBeenCalledExactlyOnceWith("official-usage/history/options",
-      { sort: "acceptedAt", order: "desc", limit: 50 }, expect.any(AbortSignal));
+      { sort: "reportingPeriod", order: "desc", limit: 50 }, expect.any(AbortSignal));
     expect(screen.getAllByRole("option")).toHaveLength(3);
   });
   it("applies the chosen report through an exact fenced preview without adding a confirmation panel", async () => {
@@ -262,7 +262,7 @@ describe("compact shared report-set selection", () => {
     await ready();
     expect(api.readReportPage).toHaveBeenCalledTimes(persistent ? 4 : 3);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ sort: "acceptedAt", order: "desc", limit: 50 });
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ sort: "reportingPeriod", order: "desc", limit: 50 });
     expect(api.previewReportOperation).not.toHaveBeenCalled();
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
   });

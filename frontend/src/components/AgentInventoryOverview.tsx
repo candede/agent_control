@@ -4,6 +4,7 @@ import type { UnifiedAgentAccessFilter, UnifiedAgentInventoryScope, UnifiedAgent
 import { agentInventoryScopeOptions, inventoryScopeAgentCount } from "../agentColumns";
 import { useOfficialUsageOverview } from "../useOfficialUsageOverview";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate } from "../usageInsights";
+import "./workspaceSkeleton.css";
 
 function scopeCount(inventory: UnifiedAgentInventoryPage | undefined, scope: UnifiedAgentInventoryScope) {
   const hasCatalog = inventory?.sources.graphPackages.state !== undefined && inventory.sources.graphPackages.state !== "unavailable";
@@ -12,8 +13,9 @@ function scopeCount(inventory: UnifiedAgentInventoryPage | undefined, scope: Uni
     ? inventoryScopeAgentCount(inventory.summary, scope) : null;
 }
 
-export function AgentInventoryScopes({ inventory, value, onChange }: {
+export function AgentInventoryScopes({ inventory, value, onChange, loading = false }: {
   inventory?: UnifiedAgentInventoryPage;
+  loading?: boolean;
   value: UnifiedAgentInventoryScope;
   onChange: (scope: UnifiedAgentInventoryScope) => void;
 }) {
@@ -22,13 +24,13 @@ export function AgentInventoryScopes({ inventory, value, onChange }: {
       className="agent-inventory-scope" aria-pressed={value === option.value}
       aria-label={option.label} title={option.description} onClick={() => onChange(option.value)}>
       <span>{option.value === "catalog" ? "Microsoft 365 catalog" : "Power Platform"}{option.value === "power_platform_only" ? <small>Additional</small> : null}</span>
-      <strong>{usageCount(scopeCount(inventory, option.value))}</strong>
+      <strong>{loading && !inventory ? <span className="skeleton-block skeleton-count" aria-label="Loading count" /> : usageCount(scopeCount(inventory, option.value))}</strong>
     </button>)}
   </div>;
 }
 
 export function AgentInventoryOverview({ inventory, revision, allSelected, onClearFilters,
-  endUserAccess = "all", reportedUsage = "all", onAccessChange, onUsageChange, inventoryScope = "catalog", reportSelector }: {
+  endUserAccess = "all", reportedUsage = "all", onAccessChange, onUsageChange, inventoryScope = "catalog", reportSelector, loadingInventory = false }: {
   inventory?: UnifiedAgentInventoryPage;
   revision: number;
   allSelected?: boolean;
@@ -39,6 +41,7 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   onUsageChange?: (value: UnifiedAgentUsageFilter) => void;
   inventoryScope?: UnifiedAgentInventoryScope;
   reportSelector?: ReactNode;
+  loadingInventory?: boolean;
 }) {
   const usageContext = inventory?.usageContext;
   const { data, loading, error, retry, invalidated, restart } = useOfficialUsageOverview({
@@ -57,15 +60,19 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
     </p> : null}
     <div className="agent-overview-metrics">
       <Metric label={selectedScope.metric} value={scopeCount(inventory, inventoryScope)}
+        loading={loadingInventory && !inventory}
         hint={inventory?.partial ? "Includes unavailable agents · Partial data" : "Includes unavailable agents"}
         selected={allSelected} onClick={onClearFilters} />
       <Metric label="Available to end users" value={hasInventory ? scopedInventory?.inventoryOverview?.availableToUsers ?? null : null}
+        loading={loadingInventory && !scopedInventory}
         hint={inventory?.partial ? "In this view · Partial data" : "All or selected users"}
         selected={endUserAccess === "available"} onClick={onAccessChange ? () => onAccessChange(endUserAccess === "available" ? "all" : "available") : undefined} />
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
+        loading={loading && !data || loadingInventory && !inventory}
         hint={reports ? "In selected report set" : "No selected report data"}
         selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
       <Metric label="Reported active · 30 days" value={reports?.active30Days ?? null}
+        loading={loading && !data || loadingInventory && !inventory}
         hint={reports ? `${usageDate(reports.activeSinceDateUtc)} - ${usageDate(reports.asOf)} (UTC)` : "No selected report data"} />
       <div className="agent-report-context" title="Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero.">
         <span className="agent-context-label">Report context</span>
@@ -79,10 +86,11 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   </section>;
 }
 
-function Metric({ label, value, hint, selected, onClick }: {
-  label: string; value: number | null; hint: string; selected?: boolean; onClick?: () => void;
+function Metric({ label, value, hint, selected, onClick, loading = false }: {
+  label: string; value: number | null; hint: string; selected?: boolean; onClick?: () => void; loading?: boolean;
 }) {
-  const content = <><span>{label}</span><strong>{usageCount(value)}</strong><small>{hint}</small></>;
+  const content = <><span title={label}>{label}</span><strong>{loading
+    ? <span className="skeleton-block skeleton-count" aria-label="Loading count" /> : usageCount(value)}</strong><small title={hint}>{hint}</small></>;
   return onClick
     ? <button type="button" className="metric agent-overview-filter" aria-label={`Show ${label.toLowerCase()}`}
       aria-pressed={selected} disabled={value === null} onClick={onClick}>{content}</button>

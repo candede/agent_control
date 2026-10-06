@@ -1,4 +1,4 @@
-import { digest, dataLimitError, dataLimits } from "../db/dataBounds.js";
+import { assertResidualBytes, digest, dataLimitError } from "../db/dataBounds.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import { formatAgentAuthoringTool, normalizePackageAuthoringTool } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
@@ -31,7 +31,7 @@ export const nativeInventoryKey = (value: PowerPlatformResource) =>
 function bounded(record: InventoryRecord) {
   if (record.facts.length > inventoryLimits.factsPerRecord) throw dataLimitError("inventory_facts", inventoryLimits.factsPerRecord, record.facts.length);
   const bytes = Buffer.byteLength(JSON.stringify(record.residual));
-  if (bytes > dataLimits.residualBytes) throw dataLimitError("data_residual_bytes", dataLimits.residualBytes, bytes);
+  assertResidualBytes(bytes, "inventory_projection");
   return record;
 }
 

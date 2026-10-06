@@ -76,6 +76,8 @@ async function fixture(page: Page, records = [record]) {
       objectId, search: query.get("search") ?? undefined, limit: Number(query.get("limit") ?? 50), cursor: query.get("cursor") ?? undefined,
     }, paid ? { ...paid.directory, observedAt: layoutTime } : undefined) });
   });
+  await page.route(url => [owner, other].some(id => url.pathname === `/api/copilot-usage/users/${id}`),
+    route => route.fulfill({ status: 404, json: { code: "data_record_not_found", detail: "Record is not in the selected cohort." } }));
   await page.route("**/api/inventory/resources/native-responsibility/related*", route => route.fulfill({ json: {
     source: "power_platform", nativeId: "native-responsibility", resourceType: "microsoft.copilotstudio/agents",
     environmentId: "environment", snapshotId: observation.snapshotId, observedAt: layoutTime, expiresAt: observation.expiresAt,
@@ -92,27 +94,31 @@ test("agent to exact responsible user outside paid/report cohorts and back to cu
   await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
   const ownerField = page.getByRole("dialog").locator("dt").filter({ hasText: /^Owner$/ }).locator("..");
   await ownerField.getByRole("button", { name: "View responsibility for Same name", exact: true }).click();
-  await expect(page).toHaveURL(new RegExp(`/users\\?view=responsibility&person=${owner}`));
-  await expect(page.getByText(`ID: ${owner}`, { exact: true })).toBeVisible();
-  await expect(page.getByText("Owner · Last modified by", { exact: true })).toBeVisible();
-  await expect(page.getByText(/License and observed usage are not established by responsibility/)).toBeVisible();
-  await expect(page.getByText("Created by", { exact: true })).toHaveCount(0);
-  expect(evidence.requests).not.toContain("/api/copilot-usage/users");
+  await expect(page).toHaveURL(new RegExp(`/users\\?detail=${owner}&tab=responsibility`));
+  const user = page.getByRole("dialog", { name: "Same name", exact: true });
+  await expect(user.getByRole("tab", { name: "Responsibility", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(user.getByText("responsible.only@example.invalid", { exact: true })).toBeVisible();
+  await expect(user.getByText("Owner", { exact: true })).toBeVisible();
+  await expect(user.getByText("Last modified by", { exact: true })).toBeVisible();
+  await expect(user.getByText(/profile, license and usage details are unavailable/)).toBeVisible();
+  await expect(user.getByText("Created by", { exact: true })).toHaveCount(0);
+  expect(evidence.requests).toContain(`/api/copilot-usage/users/${owner}`);
   expect(evidence.requests).not.toContain("/api/official-usage/users");
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
-  expect(await page.locator("body").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
-  await page.screenshot({ path: info.outputPath("exact-user-responsibility.png"), fullPage: true });
+  expect(await user.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await user.getByRole("tabpanel").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await user.screenshot({ path: info.outputPath("exact-user-responsibility.png") });
   await page.getByRole("button", { name: "Open agent Responsibility review agent", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Responsibility review agent" })).toBeVisible();
   await expect(page).toHaveURL(/\/agents\?.*detail=agent%3Abbbbbbbb/);
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute("aria-selected", "true");
   await page.goBack();
-  await expect(page.getByText(`ID: ${owner}`, { exact: true })).toBeVisible();
+  await expect(user.getByText("responsible.only@example.invalid", { exact: true })).toBeVisible();
   expect(evidence.writes).toEqual(["/api/capabilities/check"]);
   expect(evidence.unexpected).toEqual([]);
 });
 
-test("Users responsibility cohort preserves same-name different IDs and creator role without changing paid usage", async ({ page }, info) => {
+test("Users keeps two cohorts and creator links open the exact user's Responsibility tab", async ({ page }, info) => {
   const evidence = await fixture(page);
   await page.goto("/users");
   const metrics = page.getByLabel("M365 Copilot license summary");
@@ -121,20 +127,86 @@ test("Users responsibility cohort preserves same-name different IDs and creator 
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText("200", { exact: true }).first()).toBeVisible();
   await dialog.getByRole("tab", { name: "Responsibility", exact: true }).click();
-  await expect(dialog.getByText("No responsibilities reported for this user in the available inventory.", { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/No responsibilities reported for this user in the available inventory/)).toBeVisible();
   await dialog.getByRole("button", { name: "Close user details" }).click();
-  await page.getByRole("combobox", { name: "User cohort" }).selectOption("responsibility");
-  await expect(page.getByRole("button", { name: "View responsibility for Same name", exact: true })).toHaveCount(2);
-  const creator = page.getByRole("listitem").filter({ hasText: other });
-  await creator.getByRole("button").click();
-  await expect(page).toHaveURL(new RegExp(`person=${other}`));
-  await expect(page.getByText("Created by", { exact: true })).toBeVisible();
-  await expect(page.getByText("Owner · Last modified by", { exact: true })).toHaveCount(0);
-  await page.screenshot({ path: info.outputPath("creator-responsibility.png"), fullPage: true });
-  await page.getByRole("combobox", { name: "User cohort" }).selectOption("licenses");
+  await expect(page.getByRole("combobox", { name: "User cohort" }).locator("option")).toHaveText([
+    "Paid M365 Copilot users", "Active users without paid Copilot",
+  ]);
+  await page.goto("/agents?inventory=power_platform_only");
+  await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
+  const creator = page.getByRole("dialog").locator("dt").filter({ hasText: /^Created by$/ }).locator("..");
+  await creator.getByRole("button", { name: "View responsibility for Same name", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/users\\?detail=${other}&tab=responsibility`));
+  const user = page.getByRole("dialog", { name: "Same name", exact: true });
+  await expect(user.getByText("different.person@example.invalid", { exact: true })).toBeVisible();
+  await expect(user.getByText("Created by", { exact: true })).toBeVisible();
+  await expect(user.getByText("Owner", { exact: true })).toHaveCount(0);
+  await expect(user.getByText("Last modified by", { exact: true })).toHaveCount(0);
+  await user.screenshot({ path: info.outputPath("creator-responsibility.png") });
+  await user.getByRole("button", { name: "Close user details" }).click();
+  await expect(page.getByRole("combobox", { name: "User cohort" })).toBeFocused();
+  await expect(page.getByRole("button", { name: "All responsible people" })).toHaveCount(0);
   await expect(metrics.getByText("4", { exact: true })).toBeVisible();
-  expect(evidence.writes).toEqual(["/api/capabilities/check"]);
+  expect(evidence.writes.every(path => path === "/api/capabilities/check")).toBe(true);
   expect(evidence.unexpected).toEqual([]);
+});
+
+test("responsibility rows wrap long agent names and distinguish all saved roles without coverage banners or disclosures", async ({ page }, info) => {
+  const longName = `Long agent ${"identifier".repeat(20)}`;
+  const longRecord = { ...record, displayName: longName,
+    powerPlatformResource: { ...record.powerPlatformResource!, createdBy: owner },
+    people: { ...record.people, createdBy: record.people!.owner },
+  };
+  const evidence = await fixture(page, [longRecord]);
+  const data = projectAgentResponsibility(inventory([longRecord]), { objectId: owner });
+  data.sources.powerPlatform = { state: "partial", observation: { ...observation, coverage: "not_requested", coveredCount: null },
+    error: { source: "power_platform", code: "coverage_unknown", message: "The saved agent query is incomplete." } };
+  await page.route("**/api/agent-responsibility*", route => route.fulfill({ json: data }));
+  await page.goto(`/users?detail=${owner}&tab=responsibility`);
+  const dialog = page.getByRole("dialog", { name: "Same name", exact: true });
+  const agents = dialog.getByRole("list", { name: "Agents with saved responsibility", exact: true });
+  await expect(agents.getByRole("button", { name: `Open agent ${longName}`, exact: true })).toBeVisible();
+  await expect(dialog.getByText("1 agent", { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/Partial agent inventory|Some relationships may be missing|Refresh agent inventory/)).toHaveCount(0);
+  await expect(dialog.getByRole("region", { name: "Agent responsibility", exact: true }).locator(".copilot-users-notice")).toHaveCount(0);
+  for (const role of ["Owner", "Created by", "Last modified by"]) await expect(agents.getByText(role, { exact: true })).toBeVisible();
+  for (const region of [dialog, dialog.getByRole("tabpanel"), agents]) {
+    expect(await region.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  }
+  await expect(dialog.locator("details")).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
+  await dialog.screenshot({ path: info.outputPath("responsibility-long-name.png") });
+  expect(evidence.unexpected).toEqual([]);
+});
+
+test("creator links use the full saved user modal independently of cohort membership", async ({ page }, info) => {
+  const evidence = await fixture(page);
+  const directory = selectedUsersPage();
+  const profile = { ...directory.value[0], entitlement: "no_paid", copilotServiceState: "disabled",
+    directory: { ...directory.value[0].directory, objectId: other, displayName: "Exact creator", userPrincipalName: "different.person@example.invalid" } };
+  await page.route(url => url.pathname === `/api/copilot-usage/users/${other}`, route => {
+    expect(new URL(route.request().url()).searchParams.has("selectionId")).toBe(false);
+    return route.fulfill({ json: { value: profile, selection: directory.selection, reports: directory.reports, sources: directory.sources } });
+  });
+  await page.goto("/agents?inventory=power_platform_only");
+  await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
+  const creator = page.getByRole("dialog").locator("dt").filter({ hasText: /^Created by$/ }).locator("..");
+  await creator.getByRole("button", { name: "View responsibility for Same name", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Exact creator", exact: true });
+  await expect(dialog.getByRole("tab", { name: "Responsibility", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(dialog.getByRole("button", { name: "Open agent Responsibility review agent", exact: true })).toBeVisible();
+  await expect(dialog.getByText(/profile, license and usage details are unavailable/)).toHaveCount(0);
+  await expect(dialog.getByText("Created by", { exact: true })).toBeVisible();
+  await dialog.screenshot({ path: info.outputPath("synced-creator-responsibility.png") });
+  await dialog.getByRole("tab", { name: "Overview", exact: true }).click();
+  await expect(dialog.getByRole("region", { name: "Saved directory organization", exact: true })).toContainText("Contoso Health");
+  await expect(dialog.getByRole("group", { name: "User summary", exact: true })).toContainText("200");
+  await page.goBack();
+  await expect(dialog.getByRole("tab", { name: "Responsibility", exact: true })).toHaveAttribute("aria-selected", "true");
+  await dialog.getByRole("button", { name: "Close user details" }).click();
+  await expect(page.getByRole("region", { name: "M365 Copilot license status", exact: true }).getByText("Exact creator", { exact: true })).toHaveCount(0);
+  expect(evidence.unexpected).toEqual([]);
+  expect(evidence.writes.every(path => path === "/api/capabilities/check")).toBe(true);
 });
 
 test("unresolved people retain negative evidence, invalid deep links do not request guessed profiles, and denied reads retry explicitly", async ({ page }) => {
@@ -148,9 +220,9 @@ test("unresolved people retain negative evidence, invalid deep links do not requ
   await expect(page.getByRole("dialog").getByRole("button", { name: /View responsibility/ })).toHaveCount(0);
   await expect(page.getByText("User not found at the last directory lookup.")).toBeVisible();
   await page.goto("/users?view=responsibility&person=Alice");
-  await expect(page.getByText(/Responsibility unavailable: no exact verified/)).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("an exact directory object ID is required");
   expect(evidence.requests).not.toContain("/api/agent-responsibility");
-  await page.goto(`/users?view=responsibility&person=${owner}`);
+  await page.goto(`/users?detail=${owner}&tab=responsibility`);
   await expect(page.getByText("User not found at the last directory lookup.")).toBeVisible();
   await page.route("**/api/agent-responsibility*", route => route.fulfill({ status: 403, json: { detail: "Saved responsibility access denied", code: "forbidden" } }));
   await page.reload();
@@ -165,11 +237,10 @@ test("unresolved people retain negative evidence, invalid deep links do not requ
 test("unavailable sources and removed canonical agents fail explicitly rather than guessing by name", async ({ page }) => {
   const evidence = await fixture(page);
   const data = projectAgentResponsibility(inventory(), { objectId: owner });
-  data.coverage = "unavailable";
   data.sources.powerPlatform = { state: "unavailable", observation: null, error: { source: "power_platform", code: "snapshot_unavailable", message: "No current source." } };
   data.selected = { ...data.selected!, agents: [], count: 0, state: "unavailable" };
   await page.route("**/api/agent-responsibility*", route => route.fulfill({ json: data }));
-  await page.goto(`/users?view=responsibility&person=${owner}`);
+  await page.goto(`/users?detail=${owner}&tab=responsibility`);
   await expect(page.getByText(/relationships are unknown, not zero/)).toBeVisible();
   await expect(page.getByRole("button", { name: /Open agent/ })).toHaveCount(0);
   await page.route("**/api/agent-responsibility*", route => route.fulfill({ json: projectAgentResponsibility(inventory(), { objectId: owner }) }));

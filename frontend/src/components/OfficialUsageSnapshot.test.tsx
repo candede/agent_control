@@ -59,7 +59,7 @@ describe("exact selected snapshot inspection", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(before);
     expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
   });
-  it.each([401, 403])("removes all private snapshot evidence after status %s and retries the same exact selection", async status => {
+  it.each([401, 403])("removes all private snapshot evidence after status %s and retries the exact report without an obsolete selection", async status => {
     const view = render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
     await screen.findByRole("button", { name: "Researcher" });
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(status, "forbidden", "Snapshot access denied"));
@@ -73,7 +73,8 @@ describe("exact selected snapshot inspection", () => {
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     await act(async () => pending.resolve(page()));
     await screen.findByRole("button", { name: "Researcher" });
-    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", expect.objectContaining({ setId: reportSetId, selectionId }), expect.any(AbortSignal));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", expect.objectContaining({ setId: reportSetId }), expect.any(AbortSignal));
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
   });
   it("honors changed controlled windows and report IDs while ignoring an obsolete transport", async () => {
     const pending = deferred<ReportPage<ReportAgent>>(); vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
@@ -158,6 +159,7 @@ describe("exact selected snapshot inspection", () => {
     await screen.findByRole("button", { name: "Restart selection" });
     expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.readReportPage).mock.calls.every(([, query]) => query?.setId === "retained")).toBe(true);
   });
 });

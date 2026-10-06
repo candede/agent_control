@@ -7,6 +7,32 @@ export const currentInventorySourcesSql = `SELECT * FROM inventory_live_sources
   WHERE tenant_id=$1 AND principal_id=$2 AND ($3::text IS NULL OR agent_id=$3)
     AND authority_expires_at>GREATEST($4::timestamptz,clock_timestamp())`;
 
+// Only use inside a validated inventory selection read, never as mutation authority.
+export function selectedInventorySourcesSql(tenant: string, principal: string, agent: string, selection: string) {
+  return `SELECT canonical.identity AS agent_id,canonical.generation_id AS control_revision,
+      CASE WHEN source.domain='packages' THEN 'graph_packages' ELSE 'power_platform' END AS source,
+      source.native_id,coalesce(source.environment_id,'') AS environment_id,
+      CASE WHEN source.domain='power_platform' AND source.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
+        THEN lower(source.native_id) ELSE source.native_id END AS normalized_native_id,
+      CASE WHEN source.domain='packages' THEN '' ELSE coalesce(lower(source.environment_id),'') END AS normalized_environment_id,
+      CASE WHEN source.domain='packages' THEN source.generation_id END AS package_snapshot_id,
+      CASE WHEN source.domain='power_platform' THEN source.generation_id END AS power_platform_snapshot_id
+    FROM inventory_read_contexts context
+    JOIN data_read_selections selected ON selected.id=context.selection_id
+    JOIN data_scope_epochs scope ON scope.id=context.root_scope_id
+    JOIN data_generation_pins pin ON pin.selection_id=selected.id AND pin.scope_id=context.root_scope_id
+    JOIN inventory_memberships membership ON membership.baseline_id=pin.generation_id
+      AND membership.valid_from_revision<=pin.revision AND (membership.valid_to_revision IS NULL OR membership.valid_to_revision>pin.revision)
+    JOIN unified_agent_rows canonical ON canonical.generation_id=membership.generation_id AND canonical.identity=membership.identity
+    JOIN unified_agent_memberships member ON member.generation_id=canonical.generation_id AND member.identity=canonical.identity
+    JOIN inventory_records source ON source.generation_id=member.source_generation_id AND source.identity=member.source_identity
+    WHERE selected.id=${selection}::uuid AND selected.tenant_id=${tenant} AND selected.principal_id=${principal}
+      AND scope.tenant_id=${tenant} AND scope.principal_id=${principal}
+      AND scope.source='inventory_canonical' AND scope.token_mode='delegated'
+      AND (${agent}::text IS NULL OR canonical.identity=${agent})
+      AND canonical.expires_at>selected.evaluated_at AND source.expires_at>selected.evaluated_at`;
+}
+
 export async function lockInventorySelection(client: pg.PoolClient, identity: SelectionIdentity, selectionId: string) {
   return lockInventorySources(client, identity, { id: selectionId, authorizationHash: identity.authorizationHash });
 }

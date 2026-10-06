@@ -2,6 +2,7 @@ import { expect, test, type Locator } from "@playwright/test";
 import { capabilityViews, layoutTime, mockLayoutApi } from "./layoutFixtures";
 import { mockSelectedImport } from "./selectedImportFixture";
 import { csvFilePayloads } from "./usageCsvFixture";
+import AxeBuilder from "@axe-core/playwright";
 
 async function expectInsets(container: Locator, minimum = 16) {
   const padding = await container.evaluate(element => {
@@ -18,6 +19,40 @@ async function expectContained(container: Locator) {
 }
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
+test("user details restore all five task-focused tabs without exposing storage diagnostics", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.goto("/users");
+  const trigger = page.getByRole("button", { name: "Ada", exact: true });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "Ada", exact: true });
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit"]);
+  await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "User reported activity" })).toBeVisible();
+  await expect(dialog.getByText("Agent report dates", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "Report provenance" })).toHaveCount(0);
+  for (const tab of ["Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit"]) {
+    await dialog.getByRole("tab", { name: tab, exact: true }).click();
+    const panel = dialog.getByRole("tabpanel", { name: tab, exact: true });
+    await expect(panel).toBeVisible();
+    await expectContained(dialog);
+    await expectContained(panel);
+    if (tab === "Usage & agents") {
+      await expect(panel.getByRole("region", { name: "User agent activity" })).toBeVisible();
+      await expect(panel.getByRole("region", { name: "User Office app activity" })).toBeVisible();
+      await expect(panel.locator(".copilot-app-activity > li")).toHaveCount(8);
+      await expect(panel.getByRole("combobox", { name: "Sort relationships" })).toHaveCount(0);
+    }
+    if (tab === "Licenses") await expect(panel.getByRole("list", { name: "Paid feature states" })).toBeVisible();
+    if (tab === "Responsibility") await expect(panel.getByRole("heading", { name: "Agent responsibility" })).toBeVisible();
+    if (tab === "Purview audit") await expect(panel.getByText(/Purview/).first()).toBeVisible();
+    expect((await new AxeBuilder({ page }).include(".user-detail-modal").analyze()).violations).toEqual([]);
+    await dialog.screenshot({ path: info.outputPath(`user-${tab.replaceAll(" ", "-")}.png`) });
+  }
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+  expect(unexpected).toEqual([]);
+});
 
 test("CSV import keeps compact file summaries padded and actions reachable without expandable sections", async ({ page }, info) => {
   const state = await mockSelectedImport(page, []);
@@ -104,8 +139,9 @@ for (const scenario of [
       expect(value.y - label.y - label.height).toBeGreaterThanOrEqual(4);
     }
     if (scenario.name === "agent details") {
-      await expect(dialog.getByRole("tabpanel")).toContainText("Reload saved inventory");
-      await expectInsets(dialog.getByRole("region", { name: "Inventory source members" }));
+      await expect(dialog.getByRole("tabpanel")).not.toContainText("Reload saved inventory");
+      await expect(dialog.getByRole("region", { name: "Inventory source members" })).toHaveCount(0);
+      await expect(dialog.getByRole("region", { name: "About", exact: true })).toBeVisible();
     }
     await dialog.screenshot({ path: info.outputPath(`${scenario.name.replaceAll(" ", "-")}.png`) });
     expect(unexpected).toEqual([]);

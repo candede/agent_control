@@ -35,6 +35,9 @@ const page: CandidateAgentUsageCandidates = { context, selection, value: [], cou
 const database = { options: { max: 4 }, query: vi.fn(), connect: vi.fn() };
 const reports = new LargeTenantUsersReports(database as unknown as pg.Pool, "native-agent-usage-route-fixture-secret", 35);
 const candidates = vi.fn<OfficialAgentUsage["candidates"]>(), mutate = vi.fn<OfficialAgentUsage["mutate"]>();
+const users = vi.fn<OfficialAgentUsage["users"]>();
+const history = vi.fn<OfficialAgentUsage["history"]>();
+const summaries = vi.fn<OfficialAgentUsage["summaries"]>(), associations = vi.fn<OfficialAgentUsage["associations"]>();
 const capture = vi.fn<LargeTenantUsersReports["capture"]>(), provider = vi.fn();
 let server: Server;
 
@@ -70,10 +73,19 @@ beforeEach(() => {
   database.connect.mockReset().mockRejectedValue(new Error("Unexpected direct database connection"));
   candidates.mockReset().mockResolvedValue(page);
   mutate.mockReset().mockResolvedValue(context);
+  users.mockReset().mockResolvedValue({ ...page, value: [], reports: context.reports });
+  history.mockReset().mockResolvedValue({ recordId, context, value: [], latestReportSetId: context.reportSetId, latestReported: null, counts: page.counts, page: page.page });
+  summaries.mockReset().mockResolvedValue([{ recordId, status: "unavailable", responses: null, activeUsers: null,
+    lastActivityDateUtc: null, associationCount: 0, context }]);
+  associations.mockReset().mockResolvedValue({ value: [], context, page: page.page, counts: page.counts });
   capture.mockReset().mockResolvedValue(selection);
   provider.mockReset().mockRejectedValue(new Error("No provider calls are allowed"));
   vi.spyOn(OfficialAgentUsage.prototype, "candidates").mockImplementation(candidates);
   vi.spyOn(OfficialAgentUsage.prototype, "mutate").mockImplementation(mutate);
+  vi.spyOn(OfficialAgentUsage.prototype, "users").mockImplementation(users);
+  vi.spyOn(OfficialAgentUsage.prototype, "history").mockImplementation(history);
+  vi.spyOn(OfficialAgentUsage.prototype, "summaries").mockImplementation(summaries);
+  vi.spyOn(OfficialAgentUsage.prototype, "associations").mockImplementation(associations);
   vi.spyOn(reports, "capture").mockImplementation(capture);
   vi.stubGlobal("fetch", provider);
 });
@@ -87,11 +99,58 @@ afterEach(() => {
 afterAll(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
 
 describe("native Admin reviewed usage routes", () => {
+  it.each(["usage", "usage-associations", "usage-users", "usage-history"])("uses the explicit inventory pin for Viewer %s without capturing another report", async path => {
+    expect(await request("GET", `/${path}?inventorySelectionId=${selectionId}&selectionId=${selectionId}`, undefined, { role: "viewer" }))
+      .toMatchObject({ status: 200 });
+    expect(capture).not.toHaveBeenCalled();
+    const calls = path === "usage" ? summaries : path === "usage-associations" ? associations : path === "usage-history" ? history : users;
+    expect(calls).toHaveBeenCalledOnce();
+    expect(calls.mock.calls[0].slice(0, 2)).toEqual([selectionId, identity]);
+    expect(calls.mock.contexts[0]).toMatchObject({ inventory: expect.anything() });
+  });
+  it.each(["inventorySelectionId=invalid", `inventorySelectionId=${selectionId}&selectionId=66666666-6666-4666-8666-666666666666`,
+    `inventorySelectionId=${selectionId}&inventorySelectionId=${selectionId}`, `inventorySelectionId=${selectionId}&setId=invalid`,
+    `inventorySelectionId=${selectionId}&search=a&search=b`, `inventorySelectionId=${selectionId}&limit=101`])(
+    "rejects mixed or malformed selected usage query %s", async query => {
+      expect(await request("GET", `/usage-users?${query}`)).toMatchObject({ status: 400 });
+      expect(capture).not.toHaveBeenCalled(); expect(users).not.toHaveBeenCalled();
+    });
+  it.each(["usage", "usage-users", "usage-associations"])("binds a local report override to the same saved inventory for %s", async path => {
+    const setId = "66666666-6666-4666-8666-666666666666";
+    expect(await request("GET", `/${path}?inventorySelectionId=${selectionId}&selectionId=${selectionId}&setId=${setId}`, undefined, { role: "viewer" }))
+      .toMatchObject({ status: 200 });
+    if (path === "usage") expect(summaries).toHaveBeenCalledWith(selectionId, identity, [recordId], setId);
+    else expect(path === "usage-users" ? users : associations)
+      .toHaveBeenCalledWith(selectionId, identity, recordId, expect.objectContaining({ setId }));
+    expect(capture).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
+  });
+  it("keeps the requested report on an initial legacy capture for its subsequent child reads", async () => {
+    const setId = "66666666-6666-4666-8666-666666666666";
+    expect(await request("GET", `/usage?setId=${setId}`, undefined, { role: "viewer" })).toMatchObject({ status: 200 });
+    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", { setId }));
+    expect(summaries).toHaveBeenCalledWith(selectionId, identity, [recordId], setId);
+  });
+  it("rejects unauthorized and unsupported history requests before reading evidence", async () => {
+    expect(await request("GET", "/usage-history", undefined, { role: null })).toMatchObject({ status: 401 });
+    expect(await request("GET", "/usage-history", undefined, { role: "unassigned" })).toMatchObject({ status: 403 });
+    expect(await request("GET", `/usage-history?setId=${selectionId}`)).toMatchObject({ status: 400 });
+    expect(history).not.toHaveBeenCalled();
+  });
+  it("binds reviewed removal to the displayed inventory pin without accepting it as a candidate attachment", async () => {
+    const { target: _target, ...remove } = input();
+    expect(await request("DELETE", `/usage-associations?inventorySelectionId=${selectionId}`, remove)).toMatchObject({ status: 200 });
+    expect(mutate.mock.contexts[0]).toMatchObject({ inventory: expect.anything() });
+    expect(await request("POST", `/usage-associations?inventorySelectionId=${selectionId}`, input())).toMatchObject({ status: 400 });
+    expect(await request("DELETE", "/usage-associations?inventorySelectionId=66666666-6666-4666-8666-666666666666", remove))
+      .toMatchObject({ status: 400 });
+    expect(mutate).toHaveBeenCalledOnce();
+  });
+
   it("declares Admin candidates, Viewer reads, and CSRF-protected Admin mutations", () => {
     expect(declaredRoutePolicies.get("GET /agent-inventory/:recordId/usage-candidates")).toEqual({
       access: "authenticated", dataClass: "official_usage_association_candidates", roles: ["AgentControl.Admin"],
     });
-    for (const path of ["usage", "usage-associations"]) expect(declaredRoutePolicies.get(`GET /agent-inventory/:recordId/${path}`))
+    for (const path of ["usage", "usage-associations", "usage-users", "usage-history"]) expect(declaredRoutePolicies.get(`GET /agent-inventory/:recordId/${path}`))
       .toEqual({ access: "authenticated", dataClass: "official_usage_association", roles: ["AgentControl.Viewer"] });
     for (const method of ["POST", "DELETE"]) expect(declaredRoutePolicies.get(`${method} /agent-inventory/:recordId/usage-associations`))
       .toEqual({ access: "authenticated", dataClass: "official_usage_association", roles: ["AgentControl.Admin"], csrf: true });
@@ -114,6 +173,22 @@ describe("native Admin reviewed usage routes", () => {
     expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", { search: "Report A" }));
     expect(candidates).toHaveBeenCalledExactlyOnceWith(selectionId, identity, recordId, { limit: 20 });
     expect(mutate).not.toHaveBeenCalled();
+  });
+  it("allows Viewer to page agent users without candidate or management access", async () => {
+    expect(await request("GET", "/usage-users?search=Exact%20User&limit=25", undefined, { role: "viewer" }))
+      .toEqual({ status: 200, body: { ...page, value: [], reports: context.reports } });
+    expect(users).toHaveBeenCalledExactlyOnceWith(selectionId, identity, recordId, { search: "exact user", limit: 25 });
+    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", {}));
+    expect(candidates).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
+  });
+  it.each(["agentId=other", "search=a&search=b", "limit=101", "limit=1.5", "offset=0", "inventoryRevision=anything", "sort=name"])(
+    "rejects unsupported agent-user query %s", async query => {
+      expect(await request("GET", `/usage-users?${query}`)).toMatchObject({ status: 400 });
+      expect(users).not.toHaveBeenCalled(); expect(capture).not.toHaveBeenCalled();
+    });
+  it.each([[null, 401], ["unassigned", 403]] as const)("rejects unauthorized agent-user read for %s", async (role, status) => {
+    expect(await request("GET", "/usage-users", undefined, { role })).toMatchObject({ status });
+    expect(users).not.toHaveBeenCalled();
   });
   it.each(["limit=0", "limit=101", "limit=251", "limit=1&limit=2", "offset=0", "offset=-1", "search=a&search=b", "search=a%C2%85b",
     "target=secret", "limit=1.5", "inventoryRevision=bad"])("rejects query %s before capturing or reading reports", async query => {

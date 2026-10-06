@@ -25,15 +25,19 @@ export function createSavedQueryClient() {
   });
   client.getQueryCache().subscribe(event => {
     if (event.type !== "observerRemoved" || !event.query.meta?.retainReportPage) return;
+    // QueryObserver switches its current query before detaching from the old one.
+    const currentQuery = event.observer.getCurrentQuery();
+    const incomingQuery = currentQuery !== event.query ? currentQuery : undefined;
     const idle = client.getQueryCache().getAll()
-      .filter(query => query.meta?.retainReportPage && query.getObserversCount() === 0)
+      .filter(query => query !== incomingQuery && query.meta?.retainReportPage && query.getObserversCount() === 0
+        && query.state.status !== "pending" && query.state.fetchStatus === "idle")
       .sort((left, right) => right.state.dataUpdatedAt - left.state.dataUpdatedAt);
     for (const query of idle.slice(4)) client.removeQueries({ queryKey: query.queryKey, exact: true });
   });
   return client;
 }
 
-function useSavedQueryClient() {
+export function useSavedQueryClient() {
   const shared = useContext<QueryClient | undefined>(QueryClientContext);
   // Standalone panels own an isolated client; the signed-in workbench shares one.
   const [owned] = useState(() => shared ? undefined : createSavedQueryClient());

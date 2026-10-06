@@ -4,25 +4,37 @@ import type { ReportAgent, ReportRelationship } from "../../backend/src/types/of
 import type { UnifiedAgentInventoryPage } from "../../backend/src/types/unifiedAgents";
 import { reportAgent, reportPage, selectionId } from "../src/test/reportDataFixture";
 import { selectedFixtureWindow } from "../src/test/selectedUsageFixture";
+import { inventoryFixtureSelection } from "./selectedInventoryFixture";
+import { agentUsageHistoryFixture } from "../src/test/automaticAgentUsageFixture";
 
 export async function mockSelectedInventoryUsage(page: Page, inventory: () => UnifiedAgentInventoryPage,
   relationships: () => ReportRelationship[], callbacks: { users?: (query: URLSearchParams) => void; candidates?: () => void } = {}) {
-  function context(): CandidateAgentUsageContext {
+  function context(id = selectionId): CandidateAgentUsageContext {
     const data = inventory(), reports = data.usageContext!.reports;
     if (!data.selection.revision) throw new Error("Selected inventory fixture requires its captured revision");
-    return { selectionId, reportSetId: reports.setId, reports, usageRevision: data.usageContext!.revision, inventoryRevision: data.selection.revision };
+    return { selectionId: id, reportSetId: reports.setId, reports, usageRevision: data.usageContext!.revision, inventoryRevision: data.selection.revision };
   }
-  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage(?:-associations|-candidates)?$/.test(url.pathname), route => {
+  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage(?:-associations|-candidates|-users|-history)?$/.test(url.pathname), route => {
     expect(route.request().method()).toBe("GET");
     const url = new URL(route.request().url()), recordId = decodeURIComponent(url.pathname.split("/")[3]);
     const record = inventory().value.find(value => value.id === recordId);
     expect(record, "Exact inventory evidence must exist").toBeDefined();
-    const selected = context(), usage = record!.usage;
-    if (!selected.reportSetId || usage?.reportSetId !== selected.reportSetId) {
-      return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: !selected.reportSetId
-        ? "Select a complete report in Sync to see usage." : "The selected report changed. Restart usage selection." } });
+    const selected = context(inventoryFixtureSelection(route).id), usage = selected.reportSetId ? record!.usage
+      : { reportSetId: null, status: "unavailable" as const, responses: null, activeUsers: null, lastActivityDateUtc: null, associationCount: 0 };
+    expect(url.searchParams.get("inventorySelectionId")).toBe(selected.selectionId);
+    if (usage?.reportSetId !== selected.reportSetId) {
+      return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The selected report changed. Restart usage selection." } });
     }
     const pageInfo = { limit: 50, nextCursor: null, previousCursor: null };
+    if (url.pathname.endsWith("/usage-history")) {
+      const period = selected.reports.reportingPeriod;
+      return route.fulfill({ json: agentUsageHistoryFixture(selected, recordId, selected.reportSetId ? [{
+        setId: selected.reportSetId, reportingStart: period?.startDate ?? null, reportingEnd: period?.endDate ?? null,
+        periodProvenance: period?.provenance ?? "activity_range", acceptedAt: selected.reports.acceptedAt!,
+        status: usage.status === "linked" ? "linked" : "unlinked", responses: usage.responses,
+        lastActivityDateUtc: usage.lastActivityDateUtc, associationCount: usage.associationCount,
+      }] : []) });
+    }
     if (url.pathname.endsWith("/usage")) {
       const body: CandidateAgentUsageSummary = { recordId, status: usage.status, responses: usage.responses,
         activeUsers: usage.activeUsers, lastActivityDateUtc: usage.lastActivityDateUtc,
@@ -34,6 +46,19 @@ export async function mockSelectedInventoryUsage(page: Page, inventory: () => Un
       const body: CandidateAgentUsageCandidates = { value: [], context: selected, selection: reportPage([]).selection,
         page: pageInfo, counts: { total: 0, filtered: 0 } };
       return route.fulfill({ json: body });
+    }
+    if (url.pathname.endsWith("/usage-users")) {
+      expect(url.searchParams.get("selectionId")).toBe(selected.selectionId);
+      callbacks.users?.(url.searchParams);
+      const users = new Map<string, { username: string; displayName: string; responses: number }>();
+      for (const row of relationships().filter(row => record!.packages.some(item => item.id === row.agentId))) {
+        const user = users.get(row.username) ?? { username: row.username, displayName: row.username, responses: 0 };
+        user.responses += row.responses; users.set(row.username, user);
+      }
+      const rows = [...users.values()], search = url.searchParams.get("search")?.toLowerCase();
+      const base = reportPage(rows, { reports: selected.reports, selection: { ...reportPage([]).selection, id: selected.selectionId },
+        counts: { total: rows.length, filtered: rows.length } });
+      return route.fulfill({ json: { ...selectedFixtureWindow(url.href, rows.filter(row => !search || row.username.toLowerCase().includes(search)), base), context: selected } });
     }
     const body: CandidateAgentUsageAssociations = { value: usage.status === "linked" ? [{
       reportAgentId: record!.packages[0].id, agentName: record!.displayName, responses: usage.responses ?? 0, basis: "exact_package_id",

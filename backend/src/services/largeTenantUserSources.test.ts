@@ -787,6 +787,35 @@ describe("dormant user-source foundation", () => {
     });
   });
 
+  it.each(["available", "stale", "partial"] as const)("preserves %s app-activity evidence during a running refresh", async state => {
+    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId, source: "app_activity" } });
+    const stages = new UserSourceStages(fixture.runtime);
+    await stages.execute({ ...input, scope: { ...input.scope, source: "directory" } }, async lease => {
+      const key = await stages.query(lease, "discovery", "synthetic:directory");
+      await stages.page(lease, key, "synthetic:directory", 1, 1);
+      await stages.directory(lease, key, [sourceUser(firstId)]);
+      await stages.finishQuery(lease, key);
+    }, { beforePublish: async () => {} });
+    const body = state === "available" ? csv() : state === "stale" ? csv().replaceAll(date, "2020-01-01") : reportHeaders.join(",") + "\n";
+    await new UserSourceProvider(async () => new Response(body)).refresh(stages, input,
+      { authorize: async () => "synthetic-token" });
+    const generations = new DataGenerations(fixture.runtime), lease = await generations.begin(input);
+    try {
+      await fixture.runtime.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source)
+        VALUES($1,$2,$3,'app_activity')`, [lease.id, lease.scopeId, identity.tenantId]);
+      const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
+      await repository.connections.selectedRead(async client => {
+        const scope = { ...identity, tokenMode: "delegated" as const };
+        const current = await repository.metadataInRead(client, scope, new Date());
+        expect(current.app_activity).toMatchObject({ state, attemptStatus: "running" });
+        expect(current.app_activity.generationId).not.toBeNull();
+        const expired = await repository.metadataInRead(client, scope, new Date(Date.now() + 2 * 86_400_000));
+        expect(expired.app_activity).toMatchObject({ state: "unavailable", attemptStatus: "running", generationId: null });
+      });
+    } finally { await generations.abort(lease); }
+  });
+
   it("enforces exact 64-MiB streamed wire bytes plus one without holding a report array", async () => {
     const limit = 64 * 1024 ** 2;
     for (const total of [limit, limit + 1]) {

@@ -12,10 +12,13 @@ import { parseRecordId } from "../services/agentUsageIdentity.js";
 import { canonicalQuery, SelectionError, type SelectionIdentity } from "../services/dataSelections.js";
 import type { ReportUser, ReportEndpoint, ReportQuery } from "../types/officialReportData.js";
 import { officialReportMultipart } from "./officialReportMultipart.js";
+import { InventoryQueries } from "../db/inventoryQueries.js";
+import { config } from "../config.js";
 
 export type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
 export type ReportHandlerOptions = {
   reports: LargeTenantUsersReports;
+  inventory?: InventoryQueries;
   identity: (request: Request) => Promise<ReportHandlerIdentity>;
   enqueueExport: (job: { id: string; identity: SelectionIdentity; kind: OfficialExportKind; producer: OfficialReportExports }) => Promise<void>;
 };
@@ -59,6 +62,8 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     return who;
   } };
   const router = Router(), reports = options.reports, imports = new OfficialReportImports(reports.database), usage = new OfficialAgentUsage(reports);
+  const inventoryUsage = new OfficialAgentUsage(reports, options.inventory ?? new InventoryQueries(reports.database,
+    config.sessionSecret, reports.staleAfterDays, undefined, { source: "inventory_canonical", tokenMode: "delegated" }));
   router.use((_request, response, next) => { response.setHeader("Cache-Control", "private, no-store"); next(); });
   const route = (method: RouteMethod, path: string, access: "read" | "admin", ...handlers: RequestHandler[]) => {
     const dataClass = path.startsWith("/copilot-usage/") ? "licensed_copilot_usage"
@@ -80,10 +85,11 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       if (response.headersSent) response.destroy(mapped instanceof Error ? mapped : undefined); else next(mapped);
     }
   };
-  async function selected(request: Request, endpoint: ReportEndpoint, facet = false, candidate = false, child = false) {
+  async function selected(request: Request, endpoint: ReportEndpoint, facet = false, candidate = false, child = false, localReport = false) {
     pageOptions(request.query);
     const who = await options.identity(request);
     const raw = { ...request.query };
+    if (localReport && (raw.selectionId !== undefined || raw.cursor !== undefined)) delete raw.setId;
     if (facet) { delete raw.search; delete raw.field; }
     if (candidate) delete raw.inventoryRevision;
     let childQuery: ReportQuery | undefined;
@@ -108,6 +114,18 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       if (mismatch) throw new AppError(400, "invalid_cursor", "Selection filters are immutable.");
     });
     return { ...who, id, childQuery };
+  }
+  async function selectedAgentUsage(request: Request, users = false) {
+    const setId = request.query.setId === undefined ? undefined : reportUuid(request.query.setId);
+    if (request.query.inventorySelectionId === undefined) return { ...await selected(request, "official_agents", false, false, users, true), reader: usage, setId };
+    const allowed = ["inventorySelectionId", "selectionId", "cursor", "limit", "setId", ...(users ? ["search"] : [])];
+    if (Object.keys(request.query).some(key => !allowed.includes(key))) throw new AppError(400, "invalid_usage_query", "Unsupported selected inventory usage query.");
+    pageOptions(request.query);
+    const who = await options.identity(request), id = reportUuid(request.query.inventorySelectionId);
+    if (who.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires delegated inventory.");
+    if (request.query.selectionId !== undefined && reportUuid(request.query.selectionId) !== id) throw new SelectionError("invalid_cursor");
+    const childQuery = users ? requestQuery("relationships", request.query.search === undefined ? {} : { search: request.query.search }) : undefined;
+    return { ...who, id, childQuery, reader: inventoryUsage, setId };
   }
   const lists: Array<[string, ReportEndpoint]> = [
     ["/copilot-usage/users", "copilot_users"], ["/official-usage/aggregate", "official_agents"], ["/official-usage/users", "official_users"],
@@ -224,8 +242,16 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   }));
   route("get", "/agent-inventory/:recordId/usage", "read", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
-    const who = await selected(request, "official_agents");
-    response.json((await usage.summaries(who.id, who.identity, [recordId]))[0]);
+    const who = await selectedAgentUsage(request);
+    response.json((await who.reader.summaries(who.id, who.identity, [recordId], who.setId))[0]);
+  }));
+  route("get", "/agent-inventory/:recordId/usage-history", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["inventorySelectionId", "selectionId", "cursor", "limit"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Unsupported agent history query parameter.");
+    }
+    const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
+    const who = await selectedAgentUsage(request);
+    response.json(await who.reader.history(who.id, who.identity, recordId, pageOptions(request.query)));
   }));
   route("get", "/agent-inventory/:recordId/usage-candidates", "admin", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
@@ -237,14 +263,26 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   }));
   route("get", "/agent-inventory/:recordId/usage-associations", "read", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
-    const who = await selected(request, "official_agents");
-    response.json(await usage.associations(who.id, who.identity, recordId, pageOptions(request.query)));
+    const who = await selectedAgentUsage(request);
+    response.json(await who.reader.associations(who.id, who.identity, recordId,
+      { ...pageOptions(request.query), ...(who.setId ? { setId: who.setId } : {}) }));
+  }));
+  route("get", "/agent-inventory/:recordId/usage-users", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["inventorySelectionId", "selectionId", "cursor", "limit", "search", "setId"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Unsupported agent users query parameter.");
+    }
+    const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
+    const who = await selectedAgentUsage(request, true);
+    response.json(await who.reader.users(who.id, who.identity, recordId, { ...pageOptions(request.query), search: who.childQuery?.search,
+      ...(who.setId ? { setId: who.setId } : {}) }));
   }));
   for (const method of ["post", "delete"] as const) route(method, "/agent-inventory/:recordId/usage-associations", "admin", failSafe(async (request, response) => {
     const input = officialAgentUsageMutation(request.body);
-    if (Object.keys(request.query).length || method === "post" && !input.target || method === "delete" && input.target) throw new AppError(400, "invalid_agent_usage", "Association action mismatch.");
+    if (Object.keys(request.query).some(key => key !== "inventorySelectionId") || method === "post" && !input.target || method === "delete" && input.target) throw new AppError(400, "invalid_agent_usage", "Association action mismatch.");
+    const inventoryId = request.query.inventorySelectionId === undefined ? undefined : reportUuid(request.query.inventorySelectionId);
+    if (inventoryId && (method !== "delete" || inventoryId !== input.selectionId)) throw new SelectionError("invalid_cursor");
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
-    response.json(await usage.mutate((await options.identity(request)).identity, recordId, input, request.session.user!));
+    response.json(await (inventoryId ? inventoryUsage : usage).mutate((await options.identity(request)).identity, recordId, input, request.session.user!));
   }));
   const producer = (request: Request) => new OfficialReportExports(reports, request.session.user!);
   route("post", "/data-exports", "read", failSafe(async (request, response) => {

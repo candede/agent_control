@@ -6,7 +6,6 @@ import type { UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/c
 import type { InventoryReportContext } from "../../backend/src/types/unifiedAgents";
 import type { ReportRelationship } from "../../backend/src/types/officialReportData";
 import { selectedFixtureReports } from "../src/test/selectedUsageFixture";
-import { selectionId } from "../src/test/reportDataFixture";
 import { automaticAgentUsageFixture, automaticUsageContext, automaticUsagePackageId, automaticUsageReportName } from "../src/test/automaticAgentUsageFixture";
 import { agentColumns } from "../src/agentColumns";
 import { usageCoverageLabel } from "../src/usageInsights";
@@ -400,7 +399,9 @@ test("party filters, server sorting and remembered columns stay usable and acces
     queries.push(query);
     cacheReads.push({ phase, parameters: Object.fromEntries(query) });
     const type = inventoryFixtureFacet(query, "type");
-    const value = records.filter(record => type === undefined || record.packages.some(item => item.type === type));
+    const value = records.filter(record => (type === undefined || record.packages.some(item => item.type === type))
+      && (query.get("reportedUsage") !== "used" || matchesAgentView(record, "used"))
+      && (query.get("relevance") !== "unknown" || matchesAgentView(record, "unknown")));
     if (query.get("sortBy") === "responses") {
       value.sort((left, right) => (right.usage?.responses ?? -1) - (left.usage?.responses ?? -1));
     }
@@ -662,23 +663,28 @@ test("exact saved-package matches show selected-report usage in the table and mo
   }
   await table.getByRole("button", { name: record.displayName, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: record.displayName, exact: true });
-  await dialog.getByRole("tab", { name: "Usage & users" }).click();
+  await dialog.getByRole("tab", { name: "Users" }).click();
   await expect(dialog.getByLabel("Selected agent report metrics").getByText("181", { exact: true })).toBeVisible();
-  await expect(dialog.getByRole("region", { name: "Report provenance" })).toContainText("2026-08-14 to 2026-09-12");
+  await expect(dialog.getByLabel("CSV report dates")).toContainText("Aug 14, 2026 - Sep 12, 2026");
   await expect(dialog.getByText("person0@example.invalid", { exact: true })).toBeVisible();
   await expect(dialog.getByText("Person 0", { exact: true })).toHaveCount(0);
   await expect(dialog.getByRole("cell", { name: "175", exact: true })).toBeVisible();
-  await expect(dialog.getByText("7 matching relationships; 7 on this page", { exact: true })).toBeVisible();
-  expect(userReads.at(-1)!.get("selectionId")).toBe(selectionId);
+  await expect(dialog.getByText("7 matching users; 7 on this page", { exact: true })).toBeVisible();
+  expect(await dialog.getByRole("columnheader", { name: "Responses", exact: true }).evaluate(header => {
+    const text = document.createRange();
+    text.selectNodeContents(header);
+    return text.getClientRects().length;
+  })).toBe(1);
+  expect(userReads.at(-1)!.get("selectionId")).toBe(userReads.at(-1)!.get("inventorySelectionId"));
   expect(userReads.at(-1)!.has("agentIds")).toBe(false);
   expect(userReads.every(query => !query.has("licenseCohort"))).toBe(true);
   await expect(dialog.getByText(/matched automatically|not lifetime|Selected report snapshot:/i)).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: "View active users without paid Copilot" })).toHaveCount(0);
-  await dialog.getByRole("searchbox", { name: "Search reported agent users" }).fill("person3@");
-  await expect(dialog.getByText("1 matching relationships; 1 on this page", { exact: true })).toBeVisible();
+  await dialog.getByRole("searchbox", { name: "Search agent users" }).fill("person3@");
+  await expect(dialog.getByText("1 matching users; 1 on this page", { exact: true })).toBeVisible();
   await expect(dialog.getByText("person0@example.invalid", { exact: true })).toHaveCount(0);
-  await dialog.getByRole("searchbox", { name: "Search reported agent users" }).fill("");
-  await expect(dialog.getByText("7 matching relationships; 7 on this page", { exact: true })).toBeVisible();
+  await dialog.getByRole("searchbox", { name: "Search agent users" }).fill("");
+  await expect(dialog.getByText("7 matching users; 7 on this page", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: /Remove association/ })).toHaveCount(0);
   await expect(dialog.getByRole("region", { name: "Usage report candidates" })).toHaveCount(0);
@@ -691,10 +697,14 @@ test("exact saved-package matches show selected-report usage in the table and mo
 
   await table.getByRole("button", { name: unmatchedRecord.displayName, exact: true }).click();
   const unmatchedDialog = page.getByRole("dialog", { name: unmatchedRecord.displayName, exact: true });
-  await unmatchedDialog.getByRole("tab", { name: "Usage & users" }).click();
-  await expect(unmatchedDialog.getByText("This agent has no linked evidence in the selected report. Unknown is not zero.")).toBeVisible();
+  await unmatchedDialog.getByRole("tab", { name: "Users" }).click();
+  await expect(unmatchedDialog.getByText("This agent is not included in the latest CSV report.")).toBeVisible();
+  await expect(unmatchedDialog.getByRole("heading", { name: "Usage not reported", exact: true })).toBeVisible();
+  await expect(unmatchedDialog.getByRole("button", { name: "Reload usage" })).toHaveCount(0);
+  await expect(unmatchedDialog.getByRole("alert")).toHaveCount(0);
   await expect(unmatchedDialog.getByRole("region", { name: "Exact reported agent details" })).toHaveCount(0);
   await expect(unmatchedDialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
+  await unmatchedDialog.screenshot({ path: info.outputPath("agent-usage-not-reported.png") });
   await closeDetails();
 
   snapshot = "older";
@@ -702,11 +712,11 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await expect(excelRow.getByRole("cell", { name: "179", exact: true })).toBeVisible();
   await expect(excelRow.getByRole("cell", { name: "360", exact: true })).toHaveCount(0);
   await table.getByRole("button", { name: record.displayName, exact: true }).click();
-  await dialog.getByRole("tab", { name: "Usage & users" }).click();
+  await dialog.getByRole("tab", { name: "Users" }).click();
   await expect(dialog.getByLabel("Selected agent report metrics").getByText("179", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("Reports are out of date. Historical totals remain visible, not current activity.")).toBeVisible();
+  await expect(dialog.getByText("Saved report is out of date. Refresh reports in Sync.")).toBeVisible();
   await expect(dialog.getByRole("cell", { name: "173", exact: true })).toBeVisible();
-  expect(userReads.at(-1)!.get("selectionId")).toBe(selectionId);
+  expect(userReads.at(-1)!.get("selectionId")).toBe(userReads.at(-1)!.get("inventorySelectionId"));
   await closeDetails();
 
   for (const unavailableSnapshot of ["mismatched", "unavailable"] as const) {
@@ -714,10 +724,16 @@ test("exact saved-package matches show selected-report usage in the table and mo
     await page.reload();
     await expect(excelRow.getByRole("cell", { name: "Unavailable", exact: true })).toHaveCount(2);
     await table.getByRole("button", { name: record.displayName, exact: true }).click();
-    await dialog.getByRole("tab", { name: "Usage & users" }).click();
+    await dialog.getByRole("tab", { name: "Users" }).click();
     await expect(dialog.getByLabel("Selected agent report metrics")).toHaveCount(0);
-    await expect(dialog.getByRole("alert")).toContainText(snapshot === "mismatched" ? "The selected report changed. Restart usage selection." : "Select a complete report in Sync to see usage.");
-    await expect(dialog.getByRole("button", { name: "Restart usage selection" })).toBeEnabled();
+    if (snapshot === "mismatched") {
+      await expect(dialog.getByRole("alert")).toContainText("The selected report changed. Restart usage selection.");
+      await expect(dialog.getByRole("button", { name: "Reload usage" })).toBeEnabled();
+    } else {
+      await expect(dialog.getByRole("heading", { name: "No CSV reports available", exact: true })).toBeVisible();
+      await expect(dialog.getByText("Import a complete CSV report in Sync to see usage.")).toBeVisible();
+      await expect(dialog.getByRole("button", { name: "Reload usage" })).toHaveCount(0);
+    }
     await expect(dialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
     await closeDetails();
   }
@@ -741,21 +757,83 @@ test("agent users paginate all 53 exact report identities without leaving the mo
   await page.goto("/agents");
   await page.getByRole("button", { name: record.displayName, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: record.displayName, exact: true });
-  await dialog.getByRole("tab", { name: "Usage & users" }).click();
+  await dialog.getByRole("tab", { name: "Users" }).click();
   const list = dialog.getByRole("region", { name: "Agent users", exact: true });
-  await expect(list.getByRole("rowheader")).toHaveCount(50);
+  await expect(list.getByRole("rowheader")).toHaveCount(25);
   await expect(list.getByText("report.user1@example.invalid", { exact: true })).toBeVisible();
-  await expect(list.getByText("53 matching relationships; 50 on this page")).toBeVisible();
-  await list.getByRole("button", { name: "Next relationships" }).click();
+  await expect(list.getByText("53 matching users; 25 on this page")).toBeVisible();
+  await list.getByRole("button", { name: "Next users" }).click();
+  await expect(list.getByText("report.user26@example.invalid", { exact: true })).toBeVisible();
+  await list.getByRole("button", { name: "Next users" }).click();
   await expect(list.getByRole("rowheader")).toHaveCount(3);
   await expect(list.getByText("report.user53@example.invalid", { exact: true })).toBeVisible();
-  await expect(list.getByRole("button", { name: "Next relationships" })).toBeDisabled();
-  await list.getByRole("searchbox", { name: "Search reported agent users" }).fill("report.user1@");
-  await expect(list.getByText("1 matching relationships; 1 on this page")).toBeVisible();
+  await expect(list.getByRole("button", { name: "Next users" })).toBeDisabled();
+  await list.getByRole("searchbox", { name: "Search agent users" }).fill("report.user1@");
+  await expect(list.getByText("1 matching users; 1 on this page")).toBeVisible();
   await expect(list.getByText("report.user1@example.invalid", { exact: true })).toBeVisible();
-  await expect(list.getByRole("button", { name: "Previous relationships" })).toBeDisabled();
+  await expect(list.getByRole("button", { name: "Previous users" })).toBeDisabled();
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".unified-agent-detail-modal").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("agent-53-users.png"), fullPage: true });
+  expect(unexpected).toEqual([]);
+});
+
+test("usage recovers expired inventory and report changes in place, and Reload usage obtains a new table selection", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  let responses = 181, reportId = reportSetId, failSummary = true, failUsers = false;
+  const record = () => ({ ...unifiedAgents.value[0],
+    usage: automaticAgentUsageFixture({ recordId: unifiedAgents.value[0].id, responses, reportSetId: reportId }) });
+  const inventory = (): UnifiedAgentInventoryPage => ({ ...unifiedAgents, value: [record()],
+    counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 1 },
+    usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, setId: reportId } } });
+  const tableSelections: string[] = [], usageSelections: string[] = [];
+  await page.route("**/api/agent-inventory?*", route => {
+    tableSelections.push(inventoryFixtureQuery(route).get("selectionId")!);
+    return fulfillInventoryPage(route, inventory());
+  });
+  await mockSelectedInventoryUsage(page, inventory, () => [{
+    id: "usage-recovery-user", agentId: record().packages[0].id, agentName: record().displayName, creatorType: "Microsoft",
+    username: "usage.user@example.invalid", responses, lastActivityDateUtc: null, identityStatus: "unresolved",
+  }]);
+  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage$/.test(url.pathname), route => {
+    const query = new URL(route.request().url()).searchParams;
+    usageSelections.push(query.get("inventorySelectionId")!);
+    if (!failSummary) return route.fallback();
+    failSummary = false;
+    return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The saved inventory selection expired." } });
+  });
+  await page.route(url => url.pathname.endsWith("/usage-users"), route => {
+    if (!failUsers) return route.fallback();
+    failUsers = false; responses = 202; reportId = "44444444-4444-4444-8444-444444444444";
+    return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The selected report was deleted." } });
+  });
+  await page.goto("/agents");
+  await page.getByRole("button", { name: record().displayName, exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: record().displayName, exact: true });
+  await dialog.getByRole("tab", { name: "Users" }).click();
+  await expect(dialog.getByText("usage.user@example.invalid", { exact: true })).toBeVisible();
+  expect(new Set(usageSelections).size).toBe(2);
+  expect(usageSelections[0]).not.toBe(usageSelections.at(-1));
+  expect(usageSelections.at(-1)).toBe(tableSelections.at(-1));
+  await expect(dialog.getByLabel("Selected agent report metrics")).toContainText("181");
+
+  const beforeReportChange = new Set(tableSelections).size;
+  failUsers = true;
+  await dialog.getByRole("searchbox", { name: "Search agent users" }).fill("usage");
+  await expect(dialog.getByLabel("Selected agent report metrics")).toContainText("202");
+  await expect(dialog.getByText("usage.user@example.invalid", { exact: true })).toBeVisible();
+  expect(new Set(tableSelections).size).toBe(beforeReportChange + 1);
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+
+  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage$/.test(url.pathname), route =>
+    route.fulfill({ status: 503, json: { code: "temporary_usage_failure", detail: "Temporary saved-data failure." } }), { times: 1 });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(dialog.getByRole("alert")).toContainText("Temporary saved-data failure.");
+  const beforeManualReload = new Set(tableSelections).size;
+  await dialog.getByRole("button", { name: "Reload usage", exact: true }).click();
+  await expect(dialog.getByText("usage.user@example.invalid", { exact: true })).toBeVisible();
+  expect(new Set(tableSelections).size).toBe(beforeManualReload + 1);
+  await expect(dialog.getByRole("tab", { name: "Users" })).toHaveAttribute("aria-selected", "true");
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });

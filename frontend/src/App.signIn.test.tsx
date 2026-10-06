@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
+const usernameStorageKey = "agent-control:signin-username:v1";
+
 function loginTransport({
   authConfigured = true,
   login = async () => Response.json({ code: "tenant_not_configured", detail: "Your organization is not configured for sign-in." }, { status: 400 }),
@@ -43,6 +45,8 @@ describe("username-first sign-in", () => {
     expect(input).toHaveAttribute("autocomplete", "username");
     expect(input).toHaveAttribute("type", "email");
     expect(input).toBeRequired();
+    expect(input).toHaveValue("");
+    expect(screen.getByRole("checkbox", { name: "Remember my email on this browser" })).toBeChecked();
     expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
     expect(screen.getByRole("form", { name: "Sign in" })).toHaveAttribute("aria-busy", "false");
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
@@ -91,6 +95,85 @@ describe("username-first sign-in", () => {
     app.unmount();
     expect(signal?.aborted).toBe(true);
     await act(async () => release(Response.json({ authorizationUrl: "https://login.microsoftonline.com/example/oauth2/v2.0/authorize" })));
+    expect(window.localStorage.getItem(usernameStorageKey)).toBeNull();
+  });
+
+  it("restores an editable routing username without submitting or replacing it with an account alias", async () => {
+    window.localStorage.setItem(usernameStorageKey, "Admin+ops@Example.com");
+    const fetchMock = loginTransport();
+    render(<App />);
+    const input = await screen.findByRole("textbox", { name: "Work or school username" });
+    expect(input).toHaveValue("Admin+ops@Example.com");
+    expect(screen.getByRole("checkbox", { name: "Remember my email on this browser" })).toBeChecked();
+    await userEvent.clear(input);
+    await userEvent.type(input, "other@example.com");
+    expect(window.localStorage.getItem(usernameStorageKey)).toBe("Admin+ops@Example.com");
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/auth/login")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Sign in with Entra ID" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Your organization is not configured for sign-in.");
+    expect(window.localStorage.getItem(usernameStorageKey)).toBe("Admin+ops@Example.com");
+  });
+
+  it("immediately forgets the saved email and preserves the opt-out across visits", async () => {
+    window.localStorage.setItem(usernameStorageKey, "reader@example.com");
+    loginTransport();
+    const app = render(<App />);
+    const input = await screen.findByRole("textbox", { name: "Work or school username" });
+    await userEvent.click(screen.getByRole("checkbox", { name: "Remember my email on this browser" }));
+    expect(window.localStorage.getItem(usernameStorageKey)).toBe("");
+    expect(input).toHaveValue("reader@example.com");
+    app.unmount();
+    render(<App />);
+    expect(await screen.findByRole("textbox", { name: "Work or school username" })).toHaveValue("");
+    const remember = screen.getByRole("checkbox", { name: "Remember my email on this browser" });
+    expect(remember).not.toBeChecked();
+    await userEvent.click(remember);
+    expect(remember).toBeChecked();
+    expect(window.localStorage.getItem(usernameStorageKey)).toBeNull();
+  });
+
+  it.each(["not-an-email", " name@example.com ", `${"a".repeat(310)}@example.com`])(
+    "does not populate an invalid saved email: %j",
+    async saved => {
+      window.localStorage.setItem(usernameStorageKey, saved);
+      const fetchMock = loginTransport();
+      render(<App />);
+      expect(await screen.findByRole("textbox", { name: "Work or school username" })).toHaveValue("");
+      expect(screen.getByRole("status")).toHaveTextContent("The saved email is not valid.");
+      expect(fetchMock.mock.calls.some(([path]) => path === "/api/auth/login")).toBe(false);
+    },
+  );
+
+  it("reports blocked browser storage while leaving manual sign-in available", async () => {
+    const getItem = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, key) {
+      if (key === usernameStorageKey) throw new DOMException("Storage blocked", "SecurityError");
+      return getItem.call(this, key);
+    });
+    loginTransport();
+    render(<App />);
+    const input = await screen.findByRole("textbox", { name: "Work or school username" });
+    expect(screen.getByRole("status")).toHaveTextContent("Browser storage is unavailable.");
+    expect(screen.getByRole("checkbox", { name: "Remember my email on this browser" })).not.toBeChecked();
+    await userEvent.type(input, "reader@example.com{Enter}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Your organization is not configured for sign-in.");
+    expect(input).toBeEnabled();
+  });
+
+  it.each(["setItem", "removeItem"] as const)("reports failed %s preference changes without claiming the email was removed", async method => {
+    window.localStorage.setItem(usernameStorageKey, method === "setItem" ? "reader@example.com" : "");
+    const original = Storage.prototype[method];
+    vi.spyOn(Storage.prototype, method).mockImplementation(function (this: Storage, key: string, value?: string) {
+      if (key === usernameStorageKey) throw new DOMException("Storage blocked", "SecurityError");
+      return original.call(this, key, value ?? "");
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    loginTransport();
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Remember my email on this browser" }));
+    expect(screen.getByRole("status")).toHaveTextContent("clear this site's browser data to remove any previously saved email.");
+    expect(warning).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
   });
 
   it.each([

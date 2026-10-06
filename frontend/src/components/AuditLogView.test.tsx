@@ -40,7 +40,7 @@ describe("AuditLogView routing", () => {
   it("bounds typed searches to the accepted audit search length", async () => {
     window.history.replaceState({}, "", "/audit");
     render(<AuditLogView agents={[]} />);
-    const search = screen.getByRole("searchbox", { name: "Search" });
+    const search = await screen.findByRole("searchbox", { name: "Search" });
     expect(search).toHaveAttribute("maxlength", "200");
     await userEvent.click(search);
     await userEvent.paste("a".repeat(201));
@@ -79,7 +79,7 @@ describe("AuditLogView routing", () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{ ...associationEvent, action }] });
     render(<AuditLogView agents={[]} />);
     expect(await screen.findByRole("region", { name: "Audit events" })).toHaveTextContent(label);
-    expect(screen.getByRole("combobox", { name: "Action" })).toHaveValue(action);
+    expect(await screen.findByRole("combobox", { name: "Action" })).toHaveValue(action);
     expect(getAuditEvents).toHaveBeenCalledWith(expect.objectContaining({ action }), expect.anything());
     expect(new URLSearchParams(window.location.search).get("action")).toBe(action);
   });
@@ -100,7 +100,7 @@ describe("AuditLogView routing", () => {
       expect.objectContaining({ action, status: "succeeded" }),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     ));
-    expect(screen.getByRole("combobox", { name: "Action" })).toHaveValue(action);
+    expect(await screen.findByRole("combobox", { name: "Action" })).toHaveValue(action);
     const events = await screen.findByRole("region", { name: "Audit events" });
     expect(screen.getAllByText(label).length).toBeGreaterThan(1);
     expect(within(events).queryByText("Unrelated native package")).not.toBeInTheDocument();
@@ -118,7 +118,7 @@ describe("AuditLogView routing", () => {
     await waitFor(() => expect(getAuditEvents).toHaveBeenCalledWith(expect.objectContaining({
       action: "export-agent-inventory", status: "succeeded",
     }), expect.objectContaining({ signal: expect.any(AbortSignal) })));
-    expect(screen.getByRole("combobox", { name: "Action" })).toHaveValue("export-agent-inventory");
+    expect(await screen.findByRole("combobox", { name: "Action" })).toHaveValue("export-agent-inventory");
     await screen.findByRole("region", { name: "Audit events" });
     expect(screen.getAllByText("Export agent inventory").length).toBeGreaterThan(1);
     expect(new URLSearchParams(window.location.search).get("action")).toBe("export-agent-inventory");
@@ -280,7 +280,11 @@ describe("AuditLogView routing", () => {
       .mockResolvedValueOnce({ count: 1, value: [{ ...associationEvent, action: "remove-agent-usage-association" }] });
     render(<AuditLogView agents={[]} />);
     await waitFor(() => expect(getAuditEvents).toHaveBeenCalledOnce());
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Action" }), "remove-agent-usage-association");
+    expect(screen.getByRole("region", { name: "Loading audit" })).toBeVisible();
+    act(() => {
+      window.history.pushState({}, "", "/audit?q=saved+actor&action=remove-agent-usage-association&status=failed");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
     const events = await screen.findByRole("region", { name: "Audit events" });
     expect(obsoleteSignal.aborted).toBe(true);
     expect(events).toHaveTextContent("Remove usage association");
@@ -377,7 +381,7 @@ describe("AuditLogView routing", () => {
       window.history.pushState({}, "", "/audit?source=purview&job=old&action=unblock&status=succeeded");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    expect(screen.getByLabelText("Action")).toHaveValue("unblock");
+    expect(await screen.findByLabelText("Action")).toHaveValue("unblock");
     expect(window.location.search).toBe("?action=unblock&status=succeeded");
     window.history.back();
     await waitFor(() => expect(screen.getByLabelText("Action")).toHaveValue("block"));

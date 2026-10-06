@@ -49,6 +49,8 @@ import "./dataSync.css";
 
 const pollIntervalMs = 1_000;
 
+export type WorkspaceSetupStatus = "checking" | "required" | "ready" | "error";
+
 export type DataSyncPanelHandle = {
   refresh: () => Promise<void>;
   start: (mode: DataSyncMode, sources?: DataSyncSourceId[]) => Promise<void>;
@@ -60,7 +62,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   active?: boolean;
   onOpenSync?: () => void;
   automaticRefresh?: AutomaticRefreshStatus;
-  onSetupRequiredChange?: (required: boolean) => void;
+  onSetupStatusChange?: (status: WorkspaceSetupStatus) => void;
   onRunsChanged?: () => void;
   requestedRunId?: string;
   onOpenUsageImport: () => void;
@@ -73,7 +75,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   active = true,
   onOpenSync,
   automaticRefresh,
-  onSetupRequiredChange,
+  onSetupStatusChange,
   onRunsChanged,
   requestedRunId,
   onOpenUsageImport,
@@ -114,9 +116,11 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const onRunsChangedRef = useRef(onRunsChanged);
   const wasActive = useRef(active);
   const readSaved = useSavedRead();
+  const setupStatus: WorkspaceSetupStatus = state ? state.onboardingRequired ? "required" : "ready"
+    : error ? "error" : "checking";
   useEffect(() => {
-    onSetupRequiredChange?.(state?.onboardingRequired ?? true);
-  }, [onSetupRequiredChange, state?.onboardingRequired]);
+    onSetupStatusChange?.(setupStatus);
+  }, [onSetupStatusChange, setupStatus]);
 
   useEffect(() => {
     onSourcesChangedRef.current = onSourcesChanged;
@@ -455,12 +459,28 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     );
   }
 
-  if (!active) return onOpenSync && (!state || state.onboardingRequired) ? (
-    <FirstSyncNotice state={state} loading={loading} busy={Boolean(busy)} error={error}
+  if (!active) {
+    if (!onOpenSync) return null;
+    if (state?.onboardingRequired) return <FirstSyncNotice state={state} loading={loading} busy={Boolean(busy)} error={error}
       automaticRefresh={automaticRefresh} cannotStart={cannotStart}
       onStart={sources => void start("initial", sources)}
-      onCheckStatus={() => void refresh()} onOpenSync={onOpenSync} />
-  ) : null;
+      onCheckStatus={() => void refresh()} onOpenSync={onOpenSync} />;
+    if (!state && error) return <section className="data-sync-panel" aria-label="Workspace status">
+      <h2>Workspace status is unavailable</h2>
+      <p>We could not check whether your workspace is ready. Retry the status check, or open Sync for details.</p>
+      <div className="error-banner" role="alert">{error}</div>
+      <div className="first-sync-actions">
+        <WorkbenchActionGate actionId="data-sync.read" compact>
+          <button type="button" disabled={loading || Boolean(busy)} onClick={() => void refresh()}>
+            {loading ? "Checking status..." : "Retry status check"}
+          </button>
+        </WorkbenchActionGate>
+        <button type="button" className="secondary" onClick={onOpenSync}>View sync details</button>
+        <a href="/permissions">Review permissions</a>
+      </div>
+    </section>;
+    return null;
+  }
 
   return (
     <section className="data-sync-panel" aria-labelledby="data-sync-heading" aria-busy={loading || Boolean(busy)}>

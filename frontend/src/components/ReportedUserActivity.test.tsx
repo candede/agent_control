@@ -77,6 +77,16 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("selected active users without paid Copilot", () => {
+  it("keeps valid non-paid users and export available without a routine refresh banner", async () => {
+    const saved = page();
+    saved.sources.directory.attemptStatus = "running";
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    renderActivity();
+    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    expect(screen.queryByText(/Refreshing license data|Showing the last saved data|License data unavailable/)).not.toBeInTheDocument();
+  });
+
   it("renders bounded server membership in the original six columns without eagerly reading detail", async () => {
     renderActivity();
     await screen.findByRole("button", { name: "Bridge only" });
@@ -124,10 +134,13 @@ describe("selected active users without paid Copilot", () => {
     await userEvent.selectOptions(controls.getByLabelText("Department"), "~string:Sales");
     assertQuery({ company: "Contoso", department: "Sales", sort: "name", order: "desc" });
     expect(api.readReportFacet).toHaveBeenCalledWith("official-usage/users", selectionId, "company", expect.anything());
+    const readsBeforeReset = vi.mocked(api.readReportPage).mock.calls.length;
     await userEvent.click(controls.getByRole("button", { name: "Reset filters" }));
-    await waitFor(() => assertQuery({ sort: "name", order: "desc" }));
-    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.company).toBeUndefined();
-    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.department).toBeUndefined();
+    expect(controls.getByLabelText("Company")).toHaveValue("");
+    expect(controls.getByLabelText("Department")).toHaveValue("");
+    expect(controls.getByLabelText("Sort")).toHaveValue("name:desc");
+    expect(api.readReportPage).toHaveBeenCalledTimes(readsBeforeReset);
+    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
     await userEvent.keyboard("{Escape}");
     expect(trigger).toHaveFocus();
     fireEvent.click(screen.getByText("Report sources", { selector: "summary" }));
@@ -139,9 +152,10 @@ describe("selected active users without paid Copilot", () => {
     const controls = await filters();
     for (const order of ["asc", "desc"]) {
       await userEvent.selectOptions(controls.getByLabelText("Sort"), `${sort}:${order}`);
-      await waitFor(() => assertQuery({ sort, order: order as ReportQuery["order"] }));
+      if (sort !== "responses" || order !== "desc") await waitFor(() => assertQuery({ sort, order: order as ReportQuery["order"] }));
+      else expect(controls.getByLabelText("Sort")).toHaveValue("responses:desc");
     }
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(api.readReportPage).toHaveBeenCalledTimes(sort === "responses" ? 2 : 3);
   });
   it("keeps threshold validation out of server queries and export while retaining the last valid threshold", async () => {
     renderActivity();
@@ -245,6 +259,7 @@ describe("selected active users without paid Copilot", () => {
     const { modal } = await open();
     expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
     expect(modal.getByText("Agents used").parentElement).toHaveTextContent("Unknown");
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
     expect(modal.getByText(/Responses across reported agents:/)).toHaveTextContent("220");
     await userEvent.click(modal.getByRole("tab", { name: "Licenses" }));
     expect(await modal.findByText("No paid Copilot services are assigned.")).toBeVisible();
@@ -385,13 +400,13 @@ describe("selected active users without paid Copilot", () => {
     expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
   });
-  it("clears old rows and details while a known revision loads a fresh selection", async () => {
+  it("keeps the pinned dialog during revalidation but clears it immediately when access is revoked", async () => {
     const pending = deferred<ReportPage<ReportUser>>();
     const view = render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
     await open();
     vi.mocked(api.readReportPage).mockReturnValue(pending.promise);
     view.rerender(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} dataRevision={1} />);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/users",
       expect.not.objectContaining({ selectionId }), expect.any(AbortSignal));
@@ -399,6 +414,20 @@ describe("selected active users without paid Copilot", () => {
     await screen.findByRole("alert");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+  });
+  it("closes pinned details when an invalidated parent selection is automatically recaptured", async () => {
+    const pending = deferred<ReportPage<ReportUser>>();
+    render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
+    await open();
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Saved data changed"))
+      .mockReturnValueOnce(pending.promise);
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(page()));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
   it("does not replace another observer's revision with its delayed predecessor", async () => {
     const pending = deferred<ReportPage<ReportUser>>();

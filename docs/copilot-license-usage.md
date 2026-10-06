@@ -27,6 +27,13 @@ search and paging appear only when needed for larger option lists. Table pages,
 facet options, details and CSV exports remain bound to server-side selections;
 the restored layout does not load whole tenant datasets.
 
+The Users heading and paid-user summary share the Agents page's vertical sizing
+and spacing, keeping the title, cards and table surface aligned when switching
+pages on desktop and tablet. The cohort label sits beside its selector, with
+the cohort explanation retained as an accessible description instead of a
+subtitle. Desktop card labels and hints stay on one line; full wording remains
+available on hover and to assistive technology. Small screens retain wrapping.
+
 An incomplete-source retry skips a successful source only while its saved snapshot is still available. Expired or missing snapshots are collected again even if their last attempt succeeded; valid empty snapshots remain successful.
 
 Session-driven automatic refresh uses the same delegated reads and publication fences. Directory/license evidence is due after 15 minutes and app activity after six hours; their original observation timestamps remain independent. A recent failure backs off rather than being reported as a successful refresh. Missing snapshots are collected when eligible, including authorized empty results. Automatic owner/creator reference enrichment reuses unexpired cached identities instead of forcing every exact lookup. Explicit Users sync still refreshes both source types and referenced people.
@@ -140,6 +147,14 @@ scrollable tab panel beneath the heading and tabs. Loading and error messages,
 including retry actions, stay inside that panel rather than touching the dialog
 edges or pushing navigation out of view on narrow screens.
 
+The dialog retains the presentation from `7e2be0b6`: **Overview** shows license
+and Users-report metrics, report dates, organization, and last reported agent
+activity. **Usage & agents** keeps the searchable agent breakdown and separate
+Office-app activity cards; **Licenses**, **Responsibility**, and **Purview audit**
+remain dedicated tabs. These views use the current selection-scoped, paginated
+APIs. Database storage details and provenance controls do not replace the user
+summary, and missing evidence is never presented as zero.
+
 Missing relationship evidence is not a mismatch with the Users report: discrepancy labels require both a Users row and a reported relationship breakdown. A missing companion is labeled unavailable, separately from a present report containing no rows for that person. Report-wide Users response totals are `null` when the Users report is absent; a present report can total zero, including a known-empty export. The 50-row presentation limits do not cap relationship payloads: each returned user retains their complete relationship array, and server filtering examines the full accepted snapshot before paging.
 
 The scoped response marks returned users `licenseAssignmentStatus=no_active_paid_license` from the current verified directory source; unfiltered report rows retain `unavailable`. Exact directory matching is shared with paid adoption, rejects ambiguous case-distinct identities and multiple report aliases for one directory object, and never joins by display name. Retained report periods do not affect current license classification. Optional richer user details still require the same report-set/version linkage as the saved paid-user response. **License not verified** never means basic or unlicensed, and neither cohort establishes whether agent usage was free.
@@ -148,23 +163,34 @@ CSV export pins the displayed `activeSet.id`, includes `licenseCohort=active_wit
 
 CSV retains a row for matching people without relationships. Absent Users metrics have `userMetricSource=unknown`; absent relationship response totals are `Unknown`, not inferred zero. Saved-user refreshes invalidate verified entitlement labels and opened details even when the revision returns to an earlier value. Switching Users subviews also closes licensed-user details rather than reopening them on browser-history return.
 
-The signed-in workbench retains at most four inactive first-page cohort reads
-in memory for 30 seconds. Returning to a recently loaded paid/nonpaid cohort
-can reuse that page without another capture or aggregate calculation. Cache
+The signed-in workbench retains at most four inactive first-page reads
+(user cohorts, report summaries and report-selector options) in memory for
+30 seconds. Returning to a recently loaded page or filter can reuse it without
+another capture or aggregate calculation. Cache
 keys include account/tenant/roles, report, filters and data revision; selection
 expiry, source/report revision changes, explicit restart and session teardown
 prevent reuse. Focus revalidates the selected evidence. Continuations and detail
-pages are not retained by this cache, and filter changes still start a fresh
+pages are not retained by this cache; uncached filters start a fresh
 selection. Nothing is saved to browser storage. During a replacement read,
 old source-freshness notices are withheld; genuine stale/unavailable results
-and persistent read errors remain visible after the read settles. An in-progress
-source sync is labeled as refreshing rather than prompting another sync.
+and persistent read errors remain visible after the read settles. Routine
+source refreshes do not show warning banners. A running attempt does not
+downgrade an unexpired, successfully published source: its saved counts and
+rows remain usable until replacement data is published. Missing or expired
+sources, incomplete coverage and failed/unauthorized attempts remain explicit.
+Sync and the expandable source details retain collection progress.
 
 Canonical links use `/users?view=activity`; old `view=matrix` links are still accepted and preserve exact agent, search, page and snapshot values. New links emit `view=activity`. Users owns licensing and reported-user activity; Agents owns current agent usage. Collection belongs to **Sync**, and manual imports to **Sync > Import reports** (`/sync?reports=import`); history and selection belong to **Sync > Manage reports** (`/sync?reports=manage`). Exact retained source links open its read-only snapshot inspector (`/sync?reports=snapshot&snapshot=ID`), not a standalone Official usage page. Old Official usage bookmarks migrate without deleting source data. Connection recovery belongs to **Permissions**. Users has no duplicate generic body or modal links to these pages. Timestamped event investigation is separately available through **Audit** in the top navigation under the existing `AuditLogsQuery.Read.All` prerequisites; audit metadata is not an official usage counter and does not expose prompt/response content.
 
-## Agent responsibility is separate
+## Agent responsibility in user details
 
-Users also provides an **Agent responsibility** cohort from exact saved Power Platform owner, creator and last-modifier object IDs. It includes referenced people outside the paid-license and active-report rosters via the existing private saved people cache. It does not change license candidate collection, paid-feature metrics, observed-use counts, report filters or CSV exports, and does not imply license or usage status. Paid/report user details can show responsibility only after an exact saved directory identity is established; unresolved or concealed report identities remain unavailable. Browsing this context does not query a provider or initiate a tenant-wide directory sync.
+The **User cohort** selector contains only paid M365 Copilot users and active users without paid Copilot. The former **Agent responsibility** cohort and standalone people list are removed. Responsibility lives in the user modal's **Responsibility** tab, showing an agent count, compact linked agent rows, explicit **Owner**, **Created by** and **Last modified by** badges, source observation dates, and paged results. A last modifier is not necessarily an owner or ongoing maintainer; these relationships do not grant access or management permissions.
+
+Partial inventory coverage alone does not show a warning banner or direct the user to refresh manually. Saved relationships remain visible, and scheduled inventory refresh is unchanged. Failed reads and unavailable responsibility data still have explicit error or unavailable states.
+
+Collection coverage comes only from the saved source metadata. Missing owner, creator or last-modifier fields do not make a successfully collected inventory partial, and Graph-only agents are not required to provide Power Platform relationships. Reported roles remain available independently; malformed identity references are counted separately and never guessed into user relationships.
+
+Agent-person links open `/users?detail=<exact-object-id>&tab=responsibility`. Old `view=responsibility&person=<object-id>` bookmarks open the same modal without restoring the retired cohort. Exact saved Power Platform references and the private saved people cache preserve access to responsibility for people outside both rosters. The modal reads their saved directory profile independently of the displayed cohort; when that profile is absent, responsibility remains available while profile, license and usage details are explicitly unavailable. Unresolved or concealed report identities are never matched by name. This does not change license candidate collection, paid-feature metrics, observed-use counts, report filters or CSV exports. Browsing the modal does not query a provider or initiate a directory sync.
 
 ## Dormant combined-query handoff
 

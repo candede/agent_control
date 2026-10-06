@@ -42,6 +42,94 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
+for (const { route, view, dataPath } of [
+  { route: "/agents", view: "agents", dataPath: "/api/agent-inventory" },
+  { route: "/users", view: "users", dataPath: "/api/copilot-usage/users" },
+  { route: "/users?view=activity", view: "users", dataPath: "/api/official-usage/users" },
+  { route: "/audit", view: "audit", dataPath: "/api/audit/events" },
+]) {
+  test(`returning users see the ${route} skeleton until status and page data are ready`, async ({ page }, info) => {
+    const fixture = await mockSync(page, completedState());
+    let releaseStatus!: () => void, releaseData!: () => void;
+    const statusReady = new Promise<void>(resolve => { releaseStatus = resolve; });
+    const dataReady = new Promise<void>(resolve => { releaseData = resolve; });
+    await page.route("**/api/data-sync/state", async route => { await statusReady; await route.fallback(); });
+    await page.route(url => url.pathname === dataPath, async route => { await dataReady; await route.fallback(); });
+    let dataReads = 0;
+    page.on("request", request => { if (new URL(request.url()).pathname === dataPath) dataReads += 1; });
+    try {
+      await page.goto(route);
+      const skeleton = page.getByRole("region", { name: `Loading ${view}`, exact: true });
+      await expect(skeleton).toBeVisible();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect(primarySync(page)).not.toContainText("Setup needed");
+      await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
+      expect(dataReads).toBe(0);
+      expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      expect((await new AxeBuilder({ page }).include(".app-shell").analyze()).violations).toEqual([]);
+      await page.emulateMedia({ reducedMotion: "reduce" });
+      expect(await skeleton.locator(".skeleton-block").first().evaluate(element => getComputedStyle(element).animationName)).toBe("none");
+      await page.screenshot({ path: info.outputPath(`${view}-loading.png`) });
+      releaseStatus();
+      await expect.poll(() => dataReads).toBeGreaterThan(0);
+      await expect(skeleton).toBeVisible();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      releaseData();
+      await expect(skeleton).toHaveCount(0);
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      expect(fixture.starts).toEqual([]);
+      expect(fixture.unexpected).toEqual([]);
+    } finally {
+      releaseStatus();
+      releaseData();
+    }
+  });
+}
+
+test("unknown setup shows a skeleton before confirmed first sync opens the dialog", async ({ page }) => {
+  const fixture = await mockSync(page, initial);
+  let releaseStatus!: () => void;
+  const statusReady = new Promise<void>(resolve => { releaseStatus = resolve; });
+  await page.route("**/api/data-sync/state", async route => { await statusReady; await route.fallback(); });
+  try {
+    await page.goto("/agents");
+    await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(primarySync(page)).not.toContainText("Setup needed");
+    releaseStatus();
+    await expect(page.getByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Loading agents" })).toHaveCount(0);
+    await expect(primarySync(page)).toContainText("Setup needed");
+    expect(fixture.starts).toEqual([]);
+    expect(fixture.unexpected).toEqual([]);
+  } finally {
+    releaseStatus();
+  }
+});
+
+for (const destination of ["Sync", "Permissions"]) {
+  test(`${destination} remains reachable while setup status is unknown`, async ({ page }) => {
+    const fixture = await mockSync(page, completedState());
+    let releaseStatus!: () => void;
+    const statusReady = new Promise<void>(resolve => { releaseStatus = resolve; });
+    await page.route("**/api/data-sync/state", async route => { await statusReady; await route.fallback(); });
+    try {
+      await page.goto("/agents");
+      await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+      await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: new RegExp(`^${destination}`) }).click();
+      await expect(page).toHaveURL(new RegExp(`/${destination.toLowerCase()}$`));
+      await expect(page.getByRole("region", { name: "Loading agents" })).toHaveCount(0);
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      if (destination === "Sync") await expect(page.getByRole("region", { name: "Data sync", exact: true })).toBeVisible();
+      expect(fixture.starts).toEqual([]);
+      expect(fixture.unexpected).toEqual([]);
+    } finally {
+      releaseStatus();
+    }
+  });
+}
+
 test("automatic first sync blocks dashboards across reloads and opens fresh Users data on completion", async ({ page }, info) => {
   const running: DataSyncRun = {
     id: "55555555-5555-4555-8555-555555555555", mode: "incremental", automatic: true, status: "running",
@@ -106,10 +194,14 @@ test("first-sync status failure and permission recovery stay visible outside Syn
     : route.fallback());
   await page.goto("/agents");
   const notice = page.getByRole("dialog");
-  await expect(notice.getByRole("alert")).toContainText("Saved sync status is temporarily unavailable.");
-  await expect(notice.getByRole("button", { name: "Start initial sync" })).toHaveCount(0);
+  const statusError = page.getByRole("region", { name: "Workspace status", exact: true });
+  await expect(statusError.getByRole("alert")).toContainText("Saved sync status is temporarily unavailable.");
+  await expect(notice).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Loading agents" })).toHaveCount(0);
+  await expect(primarySync(page)).not.toContainText("Setup needed");
+  expect((await new AxeBuilder({ page }).include(".app-shell").analyze()).violations).toEqual([]);
   statusUnavailable = false;
-  await notice.getByRole("button", { name: "Retry status check" }).click();
+  await statusError.getByRole("button", { name: "Retry status check" }).click();
   await expect(notice.getByRole("heading", { name: "First sync needs attention" })).toBeVisible();
   await expect(notice.getByRole("link", { name: "Review permissions" })).toHaveAttribute("href", "/permissions");
   await expect(notice.getByRole("link", { name: "Sign in again" })).toHaveCount(2);

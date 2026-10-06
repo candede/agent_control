@@ -68,11 +68,25 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe("record-backed paid M365 Copilot license dashboard", () => {
+  it("keeps saved counts and rows quiet while license and app-activity sources refresh", async () => {
+    const saved = page();
+    saved.sources.directory.attemptStatus = "running";
+    saved.sources.app_activity.attemptStatus = "running";
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<CopilotUsersView />);
+    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("4");
+    expect(screen.queryByText(/Refreshing license data|Refreshing Office app activity|Showing the last saved data/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Run Users sync|Review the connection/)).not.toBeInTheDocument();
+  });
+
   it("groups report context with the summary and keeps controls, rows and pagination in one table surface", async () => {
     const onRouteChange = vi.fn();
     render(<CopilotUsersView route={{ view: "licenses", search: "", page: 0, reportSetId: reports.setId! }} onRouteChange={onRouteChange}
       reportSelector={<select aria-label="Report set"><option>Selected report</option></select>} />);
     await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByRole("combobox", { name: "User cohort" }))
+      .toHaveAccessibleDescription("Effective paid M365 Copilot licenses and adoption.");
     const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
     expect(summary).toHaveClass("agent-overview-metrics");
     expect(within(summary).getByRole("combobox", { name: "Report set" })).toBeVisible();
@@ -87,22 +101,92 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     await userEvent.click(within(summary).getByRole("button", { name: "Use current reports" }));
     expect(onRouteChange).toHaveBeenLastCalledWith(expect.objectContaining({ reportSetId: undefined, page: 0 }), false);
   });
-  it("keeps report selection available for non-paid users but not responsibility", async () => {
+  it("keeps report selection available for both cohorts and removes the responsibility option", async () => {
     render(<CopilotUsersView reportSelector={<select aria-label="Report set"><option>Selected report</option></select>} />);
     await screen.findByRole("button", { name: "Ada" });
     vi.mocked(api.readReportPage).mockResolvedValue(reportPage([reportUser(1)]));
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "activity");
+    expect(screen.getByRole("combobox", { name: "User cohort" }))
+      .toHaveAccessibleDescription("Agent activity by users without paid Copilot.");
     expect(screen.queryByRole("group", { name: "M365 Copilot license summary" })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Report set" })).toBeVisible();
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "responsibility");
-    expect(screen.queryByRole("combobox", { name: "Report set" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Agent responsibility" })).not.toBeInTheDocument();
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
   });
-  it("deep-links a responsible person absent from paid/report cohorts without loading license or report data", async () => {
-    render(<CopilotUsersView route={{ view: "responsibility", personId: responsibilityOwnerId, search: "", page: 0 }} />);
-    expect(await screen.findByText("Responsible only")).toBeVisible();
-    expect(api.readReportPage).not.toHaveBeenCalled();
+  it("deep-links a responsible person absent from paid/report cohorts into the user modal", async () => {
+    vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Record is not in the selected cohort."));
+    const change = vi.fn();
+    render(<CopilotUsersView route={{ view: "licenses", detailId: responsibilityOwnerId, detailTab: "responsibility", search: "", page: 0 }}
+      onRouteChange={change} onOpenAgent={vi.fn()} />);
+    const modal = within(await screen.findByRole("dialog", { name: "Responsible only" }));
+    expect(modal.getByRole("tab", { name: "Responsibility" })).toHaveAttribute("aria-selected", "true");
+    expect(modal.getByText(/profile, license and usage details are unavailable/)).toBeVisible();
+    expect(modal.getByRole("button", { name: "Open agent Responsible agent" })).toBeVisible();
+    expect(api.readReportDetail).toHaveBeenCalledWith(`copilot-usage/users/${responsibilityOwnerId}`, undefined, expect.any(AbortSignal));
     expect(getAgentResponsibility).toHaveBeenCalledWith(expect.objectContaining({ objectId: responsibilityOwnerId }), expect.anything());
-    expect(screen.queryByLabelText("M365 Copilot license summary")).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "User cohort" })).toHaveValue("licenses");
+    expect(modal.queryByText("Paid license")).not.toBeInTheDocument();
+    await userEvent.click(modal.getByRole("button", { name: "Close user details" }));
+    expect(change).toHaveBeenCalledWith(expect.objectContaining({ detailId: undefined, detailTab: undefined }), false);
+  });
+  it("opens a synced user outside the paid roster with an independent exact selection", async () => {
+    const unlicensed = { ...ben, entitlement: "no_paid" as const, copilotServiceState: "disabled" as const };
+    const exact = page([unlicensed]);
+    exact.selection = { ...exact.selection, id: "exact-user-selection" };
+    detail(unlicensed, exact);
+    const route = { view: "licenses" as const, detailId: ben.directory.objectId, search: "", page: 0 };
+    const view = render(<CopilotUsersView route={route} />);
+    const modal = within(await screen.findByRole("dialog", { name: "Ben" }));
+    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("4");
+    expect(api.readReportDetail).toHaveBeenCalledWith(`copilot-usage/users/${ben.directory.objectId}`, undefined, expect.any(AbortSignal));
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
+    vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/service-plans") ? reportPage([plan]) : page());
+    view.rerender(<CopilotUsersView route={{ ...route, detailTab: "licenses" }} />);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledWith(
+      `copilot-usage/users/${ben.directory.objectId}/service-plans`, expect.objectContaining({ selectionId: exact.selection.id }), expect.any(AbortSignal)));
+  });
+  it("does not fetch guessed identities from an invalid user-modal link", async () => {
+    render(<CopilotUsersView route={{ view: "licenses", detailId: "invalid", detailTab: "responsibility", search: "", page: 0 }} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("an exact directory object ID is required");
+    expect(api.readReportDetail).not.toHaveBeenCalled();
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
+  });
+  it("restarts an expired direct-user selection without changing the user or active tab", async () => {
+    const original = page();
+    const refreshed = { ...original, selection: { ...original.selection, id: "refreshed-exact-selection" } };
+    vi.mocked(api.readReportDetail).mockResolvedValueOnce({ value: ada, reports: original.reports, sources: original.sources, selection: original.selection })
+      .mockResolvedValue({ value: ada, reports: refreshed.reports, sources: refreshed.sources, selection: refreshed.selection });
+    vi.mocked(api.readReportPage).mockImplementation(async (path, query) => {
+      if (!path.endsWith("/service-plans")) return page();
+      if (query?.selectionId === original.selection.id) throw new ApiError(409, "selection_invalidated", "Selection expired.");
+      return reportPage([plan], { selection: refreshed.selection });
+    });
+    render(<CopilotUsersView route={{ view: "licenses", detailId: ada.directory.objectId, detailTab: "licenses", search: "", page: 0 }} />);
+    const modal = within(await screen.findByRole("dialog", { name: "Ada" }));
+    await userEvent.click(await modal.findByRole("button", { name: "Restart selection" }));
+    await modal.findByRole("list", { name: "Paid feature states" });
+    expect(modal.getByRole("tab", { name: "Licenses" })).toHaveAttribute("aria-selected", "true");
+    expect(api.readReportDetail).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledWith(`copilot-usage/users/${ada.directory.objectId}/service-plans`,
+      expect.objectContaining({ selectionId: refreshed.selection.id }), expect.any(AbortSignal));
+  });
+  it.each(["not_found", "lookup_failed", "expired"] as const)("keeps %s identity evidence explicit for an unsynced responsible user", async state => {
+    vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Record is not in the selected cohort."));
+    const responsibility = responsibilityFixture(responsibilityOwnerId);
+    responsibility.selected!.person.evidence = { ...responsibility.selected!.person.evidence!,
+      ...(state === "expired" ? { expiresAt: "2000-01-01T00:00:00Z" } : { status: state }) };
+    vi.mocked(getAgentResponsibility).mockResolvedValue(responsibility);
+    render(<CopilotUsersView route={{ view: "licenses", detailId: responsibilityOwnerId, detailTab: "responsibility", search: "", page: 0 }} />);
+    const modal = within(await screen.findByRole("dialog", { name: "Responsible only" }));
+    expect(modal.getByText(state === "not_found" ? /User not found at the last directory lookup/
+      : state === "lookup_failed" ? /Directory lookup failed/ : /Saved directory identity is out of date/)).toBeVisible();
+    expect(modal.queryByText("Identity from saved agent inventory.")).not.toBeInTheDocument();
+  });
+  it("rejects another user's detail response without displaying their profile", async () => {
+    render(<CopilotUsersView route={{ view: "licenses", detailId: responsibilityOwnerId, search: "", page: 0 }} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Exact user evidence does not match");
+    expect(within(screen.getByRole("dialog")).queryByText("Ada")).not.toBeInTheDocument();
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
   });
   it("adds exact responsibility alongside paid user's unchanged usage and license totals", async () => {
     const onOpenAgent = vi.fn();
@@ -144,7 +228,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(screen.getByText("Data sources and coverage").closest("details")).not.toHaveAttribute("open");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     const cohort = screen.getByRole("combobox", { name: "User cohort" });
-    expect(within(cohort).getAllByRole("option").map(option => option.getAttribute("value"))).toEqual(["licenses", "activity", "responsibility"]);
+    expect(within(cohort).getAllByRole("option").map(option => option.getAttribute("value"))).toEqual(["licenses", "activity"]);
     expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Using agents" })).toHaveAccessibleDescription("2. Licensed users with agent responses");
     const headings = within(screen.getByRole("region", { name: "M365 Copilot license status" })).getAllByRole("columnheader");
@@ -366,7 +450,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     detail(user, data);
     render(<CopilotUsersView />); const { trigger, modal } = await open();
     expect(api.readReportDetail).toHaveBeenCalledWith(`copilot-usage/users/${ada.directory.objectId}`, selectionId, expect.any(AbortSignal));
-    expect(modal.getByText(/Last reported agent activity Jan 28, 2026/)).toBeVisible();
+    expect(modal.getByRole("region", { name: "User reported activity" })).toHaveTextContent("Last reported agent activityJan 28, 2026");
     vi.mocked(api.readReportPage).mockResolvedValue(reportPage([]));
     await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
     expect(modal.getByRole("region", { name: "User Office app activity" })).toHaveTextContent("Jan 30, 2026");

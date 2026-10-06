@@ -5,7 +5,7 @@ import { usageCount, usageDate } from "../usageInsights";
 import { ReportPageControls, ReportReadStatus } from "./ReportPageControls";
 export type ReportHistoryAdminControls = { busy: boolean; onDelete: (report: ReportHistorySet, evidence: ReportMetadata) => void };
 export function OfficialUsageHistoryPanel({ revision, onSelect, admin }: { revision: number; onSelect?: (setId: string) => void; admin?: ReportHistoryAdminControls }) {
-  const read = useReportPage<ReportHistorySet>("official-usage/history", { sort: "acceptedAt", order: "desc" }, revision);
+  const read = useReportPage<ReportHistorySet>("official-usage/history", { sort: "reportingPeriod", order: "desc" }, revision);
   const [observations, setObservations] = useState<string>();
   const data = read.data, history = data?.analytics.history;
   const busy = read.loading || Boolean(admin?.busy);

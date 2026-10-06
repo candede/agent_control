@@ -8,7 +8,7 @@ import { WorkbenchDialog } from "./WorkbenchDialog";
 export function FirstSyncNotice({
   state, loading, busy, error, automaticRefresh, cannotStart, onStart, onCheckStatus, onOpenSync,
 }: {
-  state?: DataSyncState;
+  state: DataSyncState;
   loading: boolean;
   busy: boolean;
   error: string;
@@ -18,38 +18,36 @@ export function FirstSyncNotice({
   onCheckStatus: () => void;
   onOpenSync: () => void;
 }) {
-  const attempts = state?.run?.sources.filter(source => automaticSyncSources.some(id => id === source.source)) ?? [];
+  const attempts = state.run?.sources.filter(source => automaticSyncSources.some(id => id === source.source)) ?? [];
   const sources = automaticSyncSources.map(id => {
-    const saved = state?.sources.find(source => source.source === id);
+    const saved = state.sources.find(source => source.source === id);
     return { id, saved: saved?.status === "succeeded",
       observation: saved?.status === "succeeded" ? saved : attempts.find(source => source.source === id) ?? saved };
   });
   const savedCount = sources.filter(source => source.saved).length;
-  const progressing = state?.run?.status === "running" || state?.run?.status === "waiting";
+  const progressing = state.run?.status === "running" || state.run?.status === "waiting";
   const collecting = progressing && attempts.some(source => source.status === "running" || source.status === "queued");
   const needsAttention = (progressing ? attempts : sources.map(source => source.observation)).some(observation => observation
     && ["failed", "partial", "waiting_authorization", "permission_required"].includes(observation.status))
     || automaticRefresh?.phase === "sign_in_required" || automaticRefresh?.phase === "permission_required" || automaticRefresh?.phase === "failed";
   const needsSignIn = automaticRefresh?.phase === "sign_in_required"
     || progressing && attempts.some(source => source.status === "waiting_authorization");
-  const preparing = !state && loading || busy || !state?.run && automaticRefresh?.checking;
+  const preparing = busy || !state.run && automaticRefresh?.checking;
   const title = error ? "Sync status is unavailable"
-    : !state ? "Checking workspace setup"
-      : needsAttention ? "First sync needs attention"
-        : collecting ? "Your first sync is in progress"
-          : state.run?.status === "cancelled" ? "First sync was cancelled"
-            : preparing ? "Preparing your first sync" : "Set up your workspace";
+    : needsAttention ? "First sync needs attention"
+      : collecting ? "Your first sync is in progress"
+        : state.run?.status === "cancelled" ? "First sync was cancelled"
+          : preparing ? "Preparing your first sync" : "Set up your workspace";
   const automaticMessage = automaticRefresh?.paused ? "Automatic sync is paused for this session. You can still start a sync below."
     : automaticRefresh && !automaticRefresh.online ? "You are offline. Reconnect to continue syncing."
       : automaticRefresh?.message
         ?? (automaticRefresh && !automaticRefresh.enabled ? "Automatic sync is waiting for workbench access."
-          : !state?.run ? "Automatic sync starts when this page is visible, online, and authorized." : undefined);
+          : !state.run ? "Automatic sync starts when this page is visible, online, and authorized." : undefined);
 
   return <WorkbenchDialog open title={title} className="first-sync-dialog"
     description="We're preparing your users and agent inventory. This can take several minutes, especially for large tenants. Your workspace will open automatically when all three sources are saved.">
     <div className="first-sync-notice">
-    {error ? <div className="error-banner" role="alert">{error} {state ? "Progress below is the last reported status." : null}</div> : null}
-    {state ? <>
+    {error ? <div className="error-banner" role="alert">{error} Progress below is the last reported status.</div> : null}
       <div className="first-sync-completion">
         <span role="status">{!error && (collecting || preparing)
           ? <LoaderCircle size={18} className="data-sync-spinning" aria-hidden="true" /> : null}
@@ -69,13 +67,12 @@ export function FirstSyncNotice({
           {observation?.status === "permission_required" ? <a href="/permissions">Review permissions</a> : null}
         </li>)}
       </ul>
-    </> : null}
     {automaticMessage ? <p>{automaticMessage}</p> : null}
     {progressing && !collecting ? <p>Resolve the waiting step, or cancel the run in Sync before trying again.</p> : null}
     <p>Sync only reads Microsoft data; it does not change settings.
       CSV usage reports are a separate step in Sync and do not block this collection.</p>
     <div className="first-sync-actions">
-      {state && !progressing ? <WorkbenchActionGate actionId="data-sync.start">
+      {!progressing ? <WorkbenchActionGate actionId="data-sync.start">
         <button type="button" disabled={cannotStart || Boolean(error) || automaticRefresh?.checking || automaticRefresh?.online === false}
           onClick={() => onStart(sources.filter(source => !source.saved).map(source => source.id))}>
           {busy ? "Starting sync..." : state.run ? "Retry incomplete sources" : "Start initial sync"}

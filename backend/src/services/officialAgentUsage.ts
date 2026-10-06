@@ -6,32 +6,62 @@ import { normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { digest, encodeBatch } from "../db/dataBounds.js";
 import { officialReportCount as exactCount } from "../db/officialReportBounds.js";
 import { reportRelationsSql } from "../db/officialReportQueries.js";
-import { LargeTenantUsersReports, bounded, type ReportReadContext, type ReportCurrentData } from "./largeTenantUsersReports.js";
+import { LargeTenantUsersReports, bounded, reportQuery, reportQueryFields, type ReportReadContext, type ReportCurrentData } from "./largeTenantUsersReports.js";
 import type { InventoryReportSummary } from "../types/unifiedAgents.js";
-import { SelectionError, type SelectionIdentity } from "./dataSelections.js";
+import { canonicalQuery, SelectionError, type SelectionIdentity } from "./dataSelections.js";
 import type { AuditActor } from "../types/audit.js";
 import { AuditLog } from "./auditLog.js";
 import { officialAgentUsageMutation } from "./officialAgentUsageInput.js";
 import { requireAdmissions } from "./maintenance.js";
-import type { CandidateAgentUsageSummary, CandidateAgentUsageMutation } from "../types/officialReportApi.js";
-import { currentInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
+import type { CandidateAgentUsageSummary, CandidateAgentUsageMutation, CandidateAgentUsageUsers } from "../types/officialReportApi.js";
+import { currentInventorySourcesSql, selectedInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
+import type { InventoryQueries } from "../db/inventoryQueries.js";
+import { readAgentHistory, reportAgentLinksSql } from "./officialAgentHistory.js";
 export type { CandidateAgentUsageContext, CandidateAgentUsageSummary, CandidateAgentUsageMutation } from "../types/officialReportApi.js";
 
 const authorizedSourcesSql = currentInventorySourcesSql;
+type UsageReadContext = ReportReadContext & { inventorySelectionId?: string };
 
 export class OfficialAgentUsage {
-  constructor(readonly reports: LargeTenantUsersReports) {}
+  constructor(readonly reports: LargeTenantUsersReports, readonly inventory?: InventoryQueries) {}
 
-  private async target(client: pg.PoolClient, context: ReportReadContext, recordId: string) {
+  private get selections() { return this.inventory?.selections ?? this.reports.selections; }
+
+  private async contextInRead(client: pg.PoolClient, identity: SelectionIdentity, id: string): Promise<UsageReadContext> {
+    if (!this.inventory) return this.reports.contextInRead(client, identity, id);
+    const { context, selection } = await this.inventory.contextInRead(client, id, identity);
+    if (selection.endpoint !== "inventory" || context.source !== "inventory_canonical" || context.tokenMode !== "delegated") throw new SelectionError("invalid_cursor");
+    const query = reportQuery("official_agents", {});
+    return { ...context.data, identity, tokenMode: "delegated", endpoint: "official_agents", query,
+      queryHash: canonicalQuery(query, reportQueryFields), inventorySelectionId: id,
+      selection: { id, revision: selection.revision, evaluatedAt: new Date(selection.evaluated_at).toISOString(),
+        expiresAt: new Date(selection.expires_at).toISOString() } };
+  }
+
+  private read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: UsageReadContext) => Promise<T>, setId?: string) {
+    const selectedWork = async (client: pg.PoolClient, context: UsageReadContext) =>
+      work(client, { ...context, report: await this.reports.reportForSelection(client, context, setId) });
+    if (!this.inventory) return this.reports.read(id, identity, selectedWork);
+    return this.selections.connections.selectedRead(async client => {
+      const result = await selectedWork(client, await this.contextInRead(client, identity, id));
+      await this.selections.assert(client, id, identity);
+      return result;
+    });
+  }
+
+  private async target(client: pg.PoolClient, context: UsageReadContext, recordId: string) {
     if (context.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires current delegated inventory evidence.");
     const target = parseRecordId(recordId), { tenantId, principalId } = context.identity;
     const native = target.source === "graph_packages" ? target.packageId : target.source === "power_platform" ? normalizeNativeIdentity(target.nativeId) : null;
     const environment = target.source === "power_platform" ? (target.environmentId ?? "").toLowerCase() : "";
-    const matches = (await client.query(`WITH sources AS (${authorizedSourcesSql})
+    const sources = context.inventorySelectionId ? selectedInventorySourcesSql("$1", "$2", "$3", "$4") : authorizedSourcesSql;
+    const matches = (await client.query(`WITH sources AS (${sources})
       SELECT DISTINCT agent_id,control_revision FROM sources WHERE $5::text='canonical'
         OR source=$5 AND normalized_native_id=$6 AND normalized_environment_id=$7 LIMIT 2`,
-    [tenantId, principalId, target.source === "canonical" ? target.agentId : null, context.evaluatedAt, target.source, native, environment])).rows;
-    if (!matches.length) throw new AppError(404, "agent_not_found", "Exact current delegated inventory evidence is unavailable. Refresh inventory and wait for reconciliation.");
+    [tenantId, principalId, target.source === "canonical" ? target.agentId : null, context.inventorySelectionId ?? context.evaluatedAt, target.source, native, environment])).rows;
+    if (!matches.length) throw new AppError(404, "agent_not_found", context.inventorySelectionId
+      ? "This agent is absent from the saved inventory selection. Reload saved inventory."
+      : "Exact current delegated inventory evidence is unavailable. Refresh inventory and wait for reconciliation.");
     if (matches.length !== 1) throw new AppError(409, "agent_identity_ambiguous", "The exact source belongs to multiple current agents.");
     const row = matches[0];
     const values = [tenantId, principalId, row.agent_id, context.evaluatedAt];
@@ -43,19 +73,16 @@ export class OfficialAgentUsage {
     } };
   }
 
-  private links(context: ReportCurrentData, agentId: string) {
+  private links(context: UsageReadContext, agentId: string) {
     const values = this.reports.parameters(context);
-    values.push(context.identity.principalId, agentId, context.evaluatedAt);
-    const sourceSql = `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND principal_id=$7 AND agent_id=$8
+    values.push(context.identity.principalId, agentId, context.inventorySelectionId ?? context.evaluatedAt);
+    const sourceSql = context.inventorySelectionId ? selectedInventorySourcesSql("$4", "$7", "$8", "$9")
+      : `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND principal_id=$7 AND agent_id=$8
       AND authority_expires_at>GREATEST($9::timestamptz,clock_timestamp())`;
     return { values, sql: `${reportRelationsSql}, sources AS (${sourceSql}),
       linked AS (
         SELECT a.* FROM official_agents a WHERE a.response_source='agents' AND
-        (EXISTS(SELECT 1 FROM agent_usage_associations reviewed JOIN sources s ON s.source=reviewed.source
-          AND s.normalized_native_id=reviewed.normalized_native_id AND s.normalized_environment_id=reviewed.normalized_environment_id
-          WHERE reviewed.tenant_id=$4 AND reviewed.report_set_id=$5 AND reviewed.report_agent_id=a.agent_id)
-        OR NOT EXISTS(SELECT 1 FROM agent_usage_associations reviewed WHERE reviewed.tenant_id=$4 AND reviewed.report_set_id=$5 AND reviewed.report_agent_id=a.agent_id)
-          AND EXISTS(SELECT 1 FROM sources s WHERE s.source='graph_packages' AND s.native_id=a.agent_id))
+        a.agent_id IN (${reportAgentLinksSql("$4", "$5")})
       )` };
   }
 
@@ -112,10 +139,15 @@ export class OfficialAgentUsage {
     }));
   }
 
-  summaries(selectionId: string, identity: SelectionIdentity, recordIds: readonly string[]) {
+  history(selectionId: string, identity: SelectionIdentity, recordId: string, options: { limit?: number; cursor?: string } = {}) {
+    return this.read(selectionId, identity, async (client, context) =>
+      readAgentHistory(client, this.reports, context, await this.target(client, context, recordId), recordId, options));
+  }
+
+  summaries(selectionId: string, identity: SelectionIdentity, recordIds: readonly string[], setId?: string) {
     if (recordIds.length > 100 || new Set(recordIds).size !== recordIds.length) throw new AppError(400, "data_exact_ids_limit", "At most 100 unique exact agent IDs.");
     encodeBatch(recordIds);
-    return this.reports.read(selectionId, identity, async (client, context) => {
+    return this.read(selectionId, identity, async (client, context) => {
       const results: CandidateAgentUsageSummary[] = [];
       for (const recordId of recordIds) {
         const target = await this.target(client, context, recordId), { sql, values } = this.links(context, target.id);
@@ -129,11 +161,11 @@ export class OfficialAgentUsage {
           lastActivityDateUtc: row.last_activity === null ? null : new Date(row.last_activity).toISOString(), associationCount: count, context: target.context });
       }
       return bounded(results);
-    });
+    }, setId);
   }
 
   candidates(selectionId: string, identity: SelectionIdentity, recordId: string, options: { limit?: number; cursor?: string; inventoryRevision?: string }) {
-    return this.reports.read(selectionId, identity, async (client, context) => {
+    return this.read(selectionId, identity, async (client, context) => {
       if (context.endpoint !== "official_agents") throw new AppError(400, "agent_usage_selection", "Candidates require an official_agents selection.");
       const target = await this.target(client, context, recordId);
       if (options.cursor && options.inventoryRevision !== target.context.inventoryRevision) throw new AppError(409, "inventory_changed", "Exact source references changed.");
@@ -147,10 +179,53 @@ export class OfficialAgentUsage {
     });
   }
 
-  associations(selectionId: string, identity: SelectionIdentity, recordId: string, options: { limit?: number; cursor?: string }) {
+  users(selectionId: string, identity: SelectionIdentity, recordId: string,
+    options: { limit?: number; cursor?: string; search?: string; setId?: string }): Promise<CandidateAgentUsageUsers> {
+    const limit = options.limit ?? 25;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError(400, "invalid_cursor", "Page limit must be 1..100.");
+    const search = options.search?.trim().toLowerCase() ?? "";
+    if (search.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(search)) throw new AppError(400, "invalid_usage_query", "User search must be a bounded text value.");
+    return this.read(selectionId, identity, async (client, context) => {
+      if (context.endpoint !== "official_agents") throw new AppError(400, "agent_usage_selection", "Agent users require an official_agents selection.");
+      const target = await this.target(client, context, recordId), linked = this.links(context, target.id);
+      const expected = { identity, endpoint: "agent-usage-users", selectionId, revision: context.selection.revision,
+        queryHash: digest(JSON.stringify([recordId, target.context, search])) };
+      const cursor = options.cursor ? this.reports.codec.decode(options.cursor, expected) : undefined;
+      const previous = cursor?.direction === "previous";
+      const values = [...linked.values, search];
+      const sql = `${linked.sql}, agent_users AS (
+        SELECT r.username,sum(r.responses) AS responses FROM reports r JOIN linked a ON a.agent_id=r.agent_id
+        WHERE r.kind='userAgents' GROUP BY r.username
+      ), named_users AS (
+        SELECT u.username,u.responses,COALESCE(NULLIF(o.name,''),u.username) AS name
+        FROM agent_users u LEFT JOIN official_users o ON o.username=u.username
+      ), filtered_users AS (
+        SELECT * FROM named_users WHERE $10::text='' OR strpos(lower(username),$10)>0 OR strpos(lower(name),$10)>0
+      )`;
+      const counts = (await client.query(`${sql} SELECT (SELECT count(*) FROM named_users)::text AS total,
+        count(*)::text AS filtered FROM filtered_users`, values)).rows[0];
+      values.push(cursor?.boundary.key ?? null, cursor?.boundary.id ?? "", limit + 1);
+      const rows = (await client.query(`${sql} SELECT username,name,responses::text FROM filtered_users
+        WHERE $11::bigint IS NULL OR responses ${previous ? ">" : "<"} $11::bigint
+          OR responses=$11::bigint AND username COLLATE "C" ${previous ? "<" : ">"} $12::text COLLATE "C"
+        ORDER BY filtered_users.responses ${previous ? "ASC" : "DESC"},username COLLATE "C" ${previous ? "DESC" : "ASC"} LIMIT $13`, values)).rows;
+      encodeBatch(rows);
+      const more = rows.length > limit, page = rows.slice(0, limit);
+      if (previous) page.reverse();
+      const encode = (row: pg.QueryResultRow, direction: "next" | "previous") => this.reports.codec.encode({ ...expected, direction,
+        boundary: { key: String(row.responses), id: row.username, nullRank: 0 } });
+      return bounded({ value: page.map(row => ({ username: row.username as string, displayName: row.name as string, responses: exactCount(row.responses) })),
+        context: target.context, selection: context.selection, reports: context.report,
+        counts: { total: exactCount(counts.total), filtered: exactCount(counts.filtered) }, page: { limit,
+          nextCursor: page.length && (previous ? Boolean(cursor) : more) ? encode(page.at(-1)!, "next") : null,
+          previousCursor: page.length && (previous ? more : Boolean(cursor)) ? encode(page[0], "previous") : null } });
+    }, options.setId);
+  }
+
+  associations(selectionId: string, identity: SelectionIdentity, recordId: string, options: { limit?: number; cursor?: string; setId?: string }) {
     const limit = options.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError(400, "invalid_cursor", "Page limit must be 1..100.");
-    return this.reports.read(selectionId, identity, async (client, context) => {
+    return this.read(selectionId, identity, async (client, context) => {
       const target = await this.target(client, context, recordId), { sql, values } = this.links(context, target.id);
       const expected = { identity, endpoint: "agent-usage-associations", selectionId, revision: context.selection.revision,
         queryHash: digest(JSON.stringify([recordId, target.context])) };
@@ -177,7 +252,7 @@ export class OfficialAgentUsage {
       context: target.context, counts: { total: count, filtered: count }, page: { limit,
         nextCursor: page.length && (previous ? Boolean(cursor) : more) ? encode(page.at(-1)!, "next") : null,
         previousCursor: page.length && (previous ? more : Boolean(cursor)) ? encode(page[0], "previous") : null } });
-    });
+    }, options.setId);
   }
 
   async mutate(identity: SelectionIdentity, recordId: string, input: CandidateAgentUsageMutation, actor: AuditActor) {
@@ -194,8 +269,10 @@ export class OfficialAgentUsage {
     // Ordinary writer transaction; all source locks precede the selected read fences.
     try { return await this.reports.history.connections.run(async client => {
       await lockInventorySelection(client, identity, input.selectionId);
-      await this.reports.selections.assert(client, input.selectionId, identity);
-      const context = await this.reports.contextInRead(client, identity, input.selectionId);
+      await this.selections.assert(client, input.selectionId, identity);
+      const selected = await this.contextInRead(client, identity, input.selectionId);
+      // A saved read is not proof that a management target is still current.
+      const context: UsageReadContext = { ...selected, inventorySelectionId: undefined };
       const now = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
       const active = (await client.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1 FOR UPDATE", [identity.tenantId])).rows[0];
       const target = await this.target(client, { ...context, evaluatedAt: now }, recordId);
@@ -234,7 +311,7 @@ export class OfficialAgentUsage {
       const resulting = await this.target(client, { ...context, evaluatedAt: now }, recordId);
       await new AuditLog(identity, client).completeEvent(event.id, { status: "succeeded",
         metadata: { ...metadata, changed, revision: resulting.context.usageRevision, targetSelectionHash } });
-      await this.reports.selections.assert(client, input.selectionId, identity);
+      await this.selections.assert(client, input.selectionId, identity);
       return (await this.target(client, { ...context, evaluatedAt: now }, recordId)).context;
     }); } catch (error) {
       if ((await audit.getEvent(event.id))?.status !== "succeeded") await audit.completeEvent(event.id, {

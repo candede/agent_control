@@ -47,7 +47,7 @@ describe("report page selection lifetimes", () => {
     await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("replacement");
   });
-  it.each(["copilot-usage/users", "official-usage/users"])("reuses a recent first %s page on remount without another capture", async path => {
+  it.each(["copilot-usage/users", "official-usage/users", "official-usage/overview", "official-usage/history/options"])("reuses a recent first %s page on remount without another capture", async path => {
     const wrapper = sharedQueries();
     const first = renderHook(() => useReportPage<string>(path), { wrapper });
     await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
@@ -60,6 +60,21 @@ describe("report page selection lifetimes", () => {
     act(() => window.dispatchEvent(new Event("focus")));
     await waitFor(() => expect(returned.result.current.data?.value).toEqual(["focused"]));
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBe("initial");
+  });
+
+  it.each(["copilot-usage/users", "official-usage/users", "official-usage/overview"])("reuses a recent %s filter visit without an empty intermediate result", async path => {
+    const { result, rerender } = renderHook(({ search }) => useReportPage<string>(path, { search }),
+      { wrapper: sharedQueries(), initialProps: { search: "" } });
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("filtered"));
+    rerender({ search: "Ada" });
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("filtered"));
+    rerender({ search: "" });
+    expect(result.current.data?.selection.id).toBe("initial");
+    expect(result.current.loading).toBe(false);
+    rerender({ search: "Ada" });
+    expect(result.current.data?.selection.id).toBe("filtered");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
 
   it.each(["ttl", "expiry", "revision"] as const)("reloads a retained cohort after its %s boundary", async boundary => {
@@ -109,6 +124,51 @@ describe("report page selection lifetimes", () => {
     expect(returned.result.current.loading).toBe(true);
     await act(async () => pending.resolve(page("returned")));
     await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
+  });
+
+  it.each(["manual", "automatic"] as const)("retires standalone cached evidence across filter visits after %s restart", async kind => {
+    const { result, rerender } = renderHook(({ search }) =>
+      useReportPage<string>("copilot-usage/users", { search }), { initialProps: { search: "" } });
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("initial"));
+    if (kind === "automatic") vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => kind === "manual" ? result.current.restart() : result.current.next());
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("restarted"));
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("filtered"));
+    rerender({ search: "Ada" });
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("filtered"));
+
+    const pending = deferred<ReturnType<typeof page>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    rerender({ search: "" });
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.loading).toBe(true);
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ search: "", limit: 50 });
+    await act(async () => pending.resolve(page("returned")));
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("returned"));
+  });
+
+  it.each(["selectionId", "setId"] as const)("accepts a case-equivalent %s UUID without recapturing evidence", async field => {
+    const id = "abcdef12-abcd-4abc-8abc-abcdef123456";
+    const response = { ...page(id), reports: { ...page(id).reports, setId: id } };
+    vi.mocked(api.readReportPage).mockResolvedValue(response);
+    const { result } = renderHook(() => useReportPage<string>("official-usage/users", { [field]: id.toUpperCase() }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.error).toBeNull();
+    expect(result.current.data).toEqual(response);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+  });
+
+  it.each(["selectionId", "setId"] as const)("rejects a genuinely mismatched %s UUID", async field => {
+    const id = "abcdef12-abcd-4abc-8abc-abcdef123456";
+    const response = { ...page(id), reports: { ...page(id).reports, setId: id } };
+    vi.mocked(api.readReportPage).mockResolvedValue(response);
+    const { result } = renderHook(() => useReportPage<string>("official-usage/users",
+      { [field]: "abcdef12-abcd-4abc-8abc-abcdef123457" }));
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.error).toMatchObject({ code: "selection_invalidated" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(field === "selectionId" ? 1 : 2);
   });
 
   it("does not let another observer's pending retry hide a restarted selection or settle its retry", async () => {
@@ -246,6 +306,45 @@ describe("report page selection lifetimes", () => {
     await waitFor(() => expect(client.getQueryCache().getAll()).toHaveLength(4));
   });
 
+  it("does not evict a newly admitted query while switching through more than four filters", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => page(query?.search ?? "initial"));
+    const { result, rerender } = renderHook(({ search }) => useReportPage<string>("copilot-usage/users", { search }),
+      { wrapper: sharedQueries(), initialProps: { search: "0" } });
+    for (let index = 0; index < 8; index++) {
+      rerender({ search: String(index) });
+      await waitFor(() => expect(result.current.data?.selection.id).toBe(String(index)));
+      expect(result.current.loading).toBe(false);
+    }
+    expect(api.readReportPage).toHaveBeenCalledTimes(8);
+  });
+
+  it("keeps a revisited cached page attached when switching at the inactive-page limit", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => page(query?.search ?? "initial"));
+    const wrapper = sharedQueries(), client = clients.at(-1)!;
+    const hook = renderHook(({ search }) => useReportPage<string>("copilot-usage/users", { search }),
+      { wrapper, initialProps: { search: "0" } });
+    for (let index = 0; index < 5; index++) {
+      hook.rerender({ search: String(index) });
+      await waitFor(() => expect(hook.result.current.data?.selection.id).toBe(String(index)));
+    }
+    for (const search of ["0", "4", "1", "3", "2"]) {
+      hook.rerender({ search });
+      expect(hook.result.current.data?.selection.id).toBe(search);
+      expect(hook.result.current.loading).toBe(false);
+      const active = client.getQueryCache().getAll().find(query => query.state.data === hook.result.current.data);
+      expect(active?.getObserversCount()).toBe(1);
+      expect(client.getQueryCache().getAll().filter(query => query.getObserversCount() === 0)).toHaveLength(4);
+      const peer = renderHook(() => useReportPage<string>("copilot-usage/users", { search }), { wrapper });
+      expect(peer.result.current.data).toBe(hook.result.current.data);
+      expect(active?.getObserversCount()).toBe(2);
+      peer.unmount();
+    }
+    expect(api.readReportPage).toHaveBeenCalledTimes(5);
+    hook.unmount();
+    expect(client.getQueryCache().getAll()).toHaveLength(4);
+    expect(client.getQueryCache().getAll().every(query => query.getObserversCount() === 0)).toBe(true);
+  });
+
   it("does not expose a recoverable invalidation as an error while capturing its replacement", async () => {
     const pending = deferred<ReturnType<typeof page>>(), errors: unknown[] = [];
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockReturnValueOnce(pending.promise);
@@ -254,11 +353,15 @@ describe("report page selection lifetimes", () => {
       if (read.error) errors.push(read.error);
       return read;
     });
+    expect(result.current.recoveryRevision).toBe(-1);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(errors).toEqual([]);
     expect(result.current.loading).toBe(true);
+    const recoveryRevision = result.current.recoveryRevision;
+    expect(recoveryRevision).toBeGreaterThan(-1);
     await act(async () => pending.resolve(page("replacement")));
     await waitFor(() => expect(result.current.data?.selection.id).toBe("replacement"));
+    expect(result.current.recoveryRevision).toBe(recoveryRevision);
   });
   it.each(["manual", "automatic"] as const)("does not reuse another observer's cached selection on %s restart", async kind => {
     const replacement = deferred<ReturnType<typeof page>>();

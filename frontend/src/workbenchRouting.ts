@@ -60,11 +60,13 @@ export type SyncReportRouteState = {
   activityWindowDays: number;
 };
 
+export const userDetailTabs = ["overview", "usage", "licenses", "responsibility", "purview"] as const;
+export type UserDetailTab = typeof userDetailTabs[number];
+
 export type UsersRouteState = {
-  view: "licenses" | "activity" | "responsibility";
-  personId?: string;
-  selectionId?: string;
-  cursor?: string;
+  view: "licenses" | "activity";
+  detailId?: string;
+  detailTab?: UserDetailTab;
   search: string;
   agentId?: string;
   reportSetId?: string;
@@ -332,15 +334,14 @@ export function migrateOfficialUsageRoute(pathname: string, search: string): URL
 
 export function parseUsersRoute(search: string): UsersRouteState {
   const params = new URLSearchParams(search);
+  const legacyResponsibility = params.get("view") === "responsibility";
+  const detailId = params.get("detail") ?? (legacyResponsibility ? params.get("person") : null);
   return {
-    view: params.get("view") === "responsibility" ? "responsibility"
-      : params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
-    ...(params.get("view") === "responsibility" && params.has("person")
-      ? { personId: bounded(params.get("person"), 128) || "invalid" } : {}),
-    ...(params.get("view") === "responsibility" && params.has("selection")
-      ? { selectionId: bounded(params.get("selection"), 64) || "invalid" } : {}),
-    ...(params.get("view") === "responsibility" && params.has("cursor")
-      ? { cursor: bounded(params.get("cursor"), 4096) || "invalid" } : {}),
+    view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
+    ...(detailId !== null ? {
+      detailId: isDirectoryObjectId(detailId) ? detailId.toLowerCase() : "invalid",
+      detailTab: userDetailTabs.find(tab => tab === params.get("tab")) ?? (legacyResponsibility ? "responsibility" : "overview"),
+    } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: bounded(params.get("snapshot"), 512),
@@ -350,16 +351,12 @@ export function parseUsersRoute(search: string): UsersRouteState {
 
 export function usersRouteSearch(state: UsersRouteState) {
   const params = new URLSearchParams();
-  if (state.view === "licenses") return params;
-  params.set("view", state.view);
-  if (state.view === "responsibility") {
-    if (state.personId) params.set("person", isDirectoryObjectId(state.personId) ? state.personId.toLowerCase() : "invalid");
-    if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
-    if (state.selectionId) params.set("selection", state.selectionId);
-    if (state.cursor && state.selectionId) params.set("cursor", state.cursor);
-    if (state.page > 0) params.set("page", String(Math.min(601, state.page + 1)));
-    return params;
+  if (state.view === "activity") params.set("view", state.view);
+  if (state.detailId) {
+    params.set("detail", isDirectoryObjectId(state.detailId) ? state.detailId.toLowerCase() : "invalid");
+    if (state.detailTab && state.detailTab !== "overview") params.set("tab", state.detailTab);
   }
+  if (state.view === "licenses") return params;
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
   if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);

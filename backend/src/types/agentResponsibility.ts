@@ -24,8 +24,6 @@ export type AgentResponsibilityPage = {
   counts: { total: number; filtered: number };
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   sources: UnifiedAgentInventoryPage["sources"];
-  coverage: "available" | "partial" | "unavailable";
-  unknownAgentCount: number;
   invalidReferenceCount: number;
   people: ResponsibilityPerson[];
   selected: null | {

@@ -3,9 +3,9 @@ import type { ReportQuery, CombinedUser, ReportUser, ReportAgent, ReportHistoryS
 import type { OfficialReportDetail, OfficialReportExportRequest, OfficialReportExportStatus, OfficialReportFacetPage,
   OfficialReportImportIntent, OfficialReportPreview, OfficialReportBundlePreview, OfficialReportBundleAcceptance, OfficialReportAccepted,
   OfficialReportConfirmation, OfficialReportConfirmed, OfficialReportDiagnostics,
-  CandidateAgentUsageSummary, CandidateAgentUsageAssociations, CandidateAgentUsageCandidates, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
+  CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageCandidates, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
 
-export type ReportPageRequest = ReportQuery & { selectionId?: string; cursor?: string; limit?: number };
+export type ReportPageRequest = ReportQuery & { selectionId?: string; inventorySelectionId?: string; cursor?: string; limit?: number };
 export function encodeReportFacetValue(value: string | null): string {
   return value === null ? "~null" : `~string:${value}`;
 }
@@ -29,7 +29,7 @@ export const reportPages = {
   history: (query: ReportPageRequest, signal?: AbortSignal) => readReportPage<ReportHistorySet>("official-usage/history", query, signal),
   overview: (query: ReportPageRequest, signal?: AbortSignal) => readReportPage<ReportOverviewAgent>("official-usage/overview", query, signal),
 };
-export function readReportDetail<T>(path: string, selectionId: string, signal?: AbortSignal) {
+export function readReportDetail<T>(path: string, selectionId: string | undefined, signal?: AbortSignal) {
   return request<OfficialReportDetail<T>>(`/api/${path}${reportQueryString({ selectionId })}`, { signal });
 }
 export function readReportFacet(path: string, selectionId: string, field: "company" | "department" | "creatorType",
@@ -72,10 +72,13 @@ async function retryExportSetup<T>(operation: () => Promise<T>, signal?: AbortSi
 export function reportExportDownload(id: string) {
   return `/api/data-exports/${encodeURIComponent(id)}/download`;
 }
-export function readAgentReportSummary(recordId: string, query: { selectionId?: string; setId?: string }, signal?: AbortSignal) {
+export function readAgentReportSummary(recordId: string, query: { selectionId?: string; inventorySelectionId?: string; setId?: string }, signal?: AbortSignal) {
   return request<CandidateAgentUsageSummary>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage${reportQueryString(query)}`, { signal });
 }
-export function readAgentReportAssociations(recordId: string, query: { selectionId: string; limit?: number; cursor?: string }, signal?: AbortSignal) {
+export function readAgentReportHistory(recordId: string, query: { selectionId: string; inventorySelectionId?: string; limit?: number; cursor?: string }, signal?: AbortSignal) {
+  return request<CandidateAgentUsageHistory>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-history${reportQueryString(query)}`, { signal });
+}
+export function readAgentReportAssociations(recordId: string, query: { selectionId: string; inventorySelectionId?: string; setId?: string; limit?: number; cursor?: string }, signal?: AbortSignal) {
   return request<CandidateAgentUsageAssociations>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations${reportQueryString(query)}`, { signal });
 }
 export function readAgentReportCandidates(recordId: string,
@@ -84,8 +87,8 @@ export function readAgentReportCandidates(recordId: string,
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
   return request<CandidateAgentUsageCandidates>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-candidates${params.size ? `?${params}` : ""}`, { signal });
 }
-export function mutateAgentReportAssociation(recordId: string, input: CandidateAgentUsageMutation, operation: "associate" | "remove", signal?: AbortSignal) {
-  return request<CandidateAgentUsageContext>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
+export function mutateAgentReportAssociation(recordId: string, input: CandidateAgentUsageMutation, operation: "associate" | "remove", signal?: AbortSignal, inventorySelectionId?: string) {
+  return request<CandidateAgentUsageContext>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations${reportQueryString({ inventorySelectionId })}`, {
     method: operation === "associate" ? "POST" : "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal,
   });
 }

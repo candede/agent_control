@@ -25,6 +25,7 @@ import {
 import { downloadFile } from "../downloadFile";
 import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
 import { auditDefaultPageSize, auditMaximumSearchLength } from "../../../backend/src/types/audit";
 
@@ -149,6 +150,8 @@ function LocalAuditLogView({
   const readError = exportDenial ?? (deferredMatches && auditRead.error ? errorMessage(auditRead.error) : undefined);
   const loading = !page && !readError;
   const error = readError ?? (exportError?.key === key ? exportError.message : undefined);
+  const [initialReadComplete, setInitialReadComplete] = useState(false);
+  if (!initialReadComplete && (page || readError)) setInitialReadComplete(true);
   const syncClampedPage = useEffectEvent((page: number) => {
     onRouteChange({ ...route, page });
   });
@@ -211,6 +214,8 @@ function LocalAuditLogView({
       if (!controller.signal.aborted) setExportKey(undefined);
     }
   }
+
+  if (!initialReadComplete && loading) return <WorkspaceSkeleton view="audit" contentOnly />;
 
   return (
     <section className="audit-view" aria-label="Audit log">

@@ -11,6 +11,7 @@ import { ReportSortHeading } from "./ReportSortHeading";
 import { ReportExportButton } from "./ReportExportButton";
 import { UsageReportContext } from "./UsageReportContext";
 import { UserDetailModal } from "./UserDetailModal";
+import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import "./reportedUsers.css";
 
 type Props = { route: UsersRouteState; onRouteChange: (route: UsersRouteState, replace?: boolean) => void;
@@ -24,24 +25,30 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
   const [filters, setFilters] = useState<ReportQuery>({ cohort: "all", sort: "responses", order: "desc" });
   const [threshold, setThreshold] = useState("5");
   const [lastThreshold, setLastThreshold] = useState(5);
-  const [selected, setSelected] = useState<{ username: string; selectionId: string; reportSetId?: string }>();
+  const [selected, setSelected] = useState<{ username: string; selectionId: string; queryKey: string }>();
   const [invalidatedSelectionId, setInvalidatedSelectionId] = useState<string>();
   const focus = useRef<HTMLInputElement>(null), valid = isValidLowResponseThreshold(threshold);
   const trigger = useRef<HTMLButtonElement>(null);
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
-  const pageRead = useReportPage<ReportUser>("official-usage/users", { ...filters, licenseCohort: "active_without_paid",
-    search: route.search || undefined, agentId: route.agentId, setId: route.reportSetId, lowResponseThreshold: valid ? Number(threshold) : lastThreshold }, dataRevision);
+  const query: ReportQuery = { ...filters, licenseCohort: "active_without_paid",
+    search: route.search || undefined, agentId: route.agentId, setId: route.reportSetId, lowResponseThreshold: valid ? Number(threshold) : lastThreshold };
+  const pageRead = useReportPage<ReportUser>("official-usage/users", query, dataRevision);
+  const queryKey = JSON.stringify([query, pageRead.recoveryRevision]);
   const read = pageRead.data && pageRead.data.selection.id === invalidatedSelectionId
     ? { ...pageRead, data: undefined, invalidated: true } : pageRead;
   const data = read.data;
-  if (selected && (!data || selected.reportSetId !== route.reportSetId || data.selection.id !== selected.selectionId)) setSelected(undefined);
+  const [initialReadComplete, setInitialReadComplete] = useState(false);
+  if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
+  if (selected && (selected.queryKey !== queryKey || read.error || read.invalidated || !data && !read.loading
+    || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
   function restartSelection() { setSelected(undefined); setInvalidatedSelectionId(undefined); pageRead.restart(); }
   function resetFilters() { setFilters({ cohort: "all", sort: filters.sort, order: filters.order }); setThreshold("5"); }
+  if (!initialReadComplete && read.loading && !data && !read.error && !read.invalidated) {
+    return <WorkspaceSkeleton view="users" contentOnly showSummary={false} />;
+  }
   return <section className="reported-users" aria-label="Non-paid user activity">
     <ReportReadStatus read={{ ...read, restart: restartSelection }} quietLoading />
-    {data && !read.loading && data.sources.directory.attemptStatus === "running" ? <p className="copilot-users-notice" role="status">
-      Refreshing license data. Showing the last saved data until sync completes.</p>
-      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data unavailable.{" "}
+    {data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data unavailable.{" "}
       {data.sources.directory.message ?? "Current directory verification is required."} Run Users sync to verify licensing.</p> : null}
     {data && !read.loading && data.sources.directory.attemptStatus !== "running" && data.summary.unknownLicenseActiveReportUsers > 0 ? <p className="copilot-users-notice">{data.summary.unknownLicenseActiveReportUsers.toLocaleString()} active report{" "}
       {data.summary.unknownLicenseActiveReportUsers === 1 ? "user needs" : "users need"} a license check. Run Users sync.</p> : null}
@@ -68,7 +75,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
           <ReportSortHeading label="Agents used" sort="agentsUsed" query={filters} onChange={setFilters} />
           <th scope="col">Company</th><th scope="col">Department</th><ReportSortHeading label="Last activity" sort="lastActivity" query={filters} onChange={setFilters} /></tr></thead>
         <tbody>{data?.value.map(user => <tr key={user.username}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
-          trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, reportSetId: route.reportSetId });
+          trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, queryKey });
         }}>
           {user.displayName || user.username}</button><small>{user.username}</small></th><td data-numeric>{usageCount(user.reportedResponses)}</td>
           <td data-numeric>{usageCount(user.reportedAgentsUsed)}</td><td>{user.company?.trim() || "Not set"}</td><td>{user.department?.trim() || "Not set"}</td><td>{usageDate(user.userLastActivityDateUtc)}

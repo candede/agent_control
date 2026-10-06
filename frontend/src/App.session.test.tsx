@@ -331,6 +331,126 @@ describe("App session revalidation", () => {
     vi.unstubAllGlobals();
   });
 
+  it("reuses recent Users, Agents, report summaries and selector reads across navigation", async () => {
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    await waitFor(() => expect(screen.queryByText("Loading selected report evidence...")).not.toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    const paths = ["/api/agent-inventory/selections", "/api/agent-inventory", "/api/copilot-usage/users",
+      "/api/official-usage/overview", "/api/official-usage/history/options"];
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) => paths.includes(new URL(input, "http://localhost").pathname)).length;
+    const before = reads();
+    for (let index = 0; index < 3; index++) {
+      fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+      expect(screen.getByText(agent.displayName)).toBeVisible();
+      expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled();
+      expect(screen.queryByText("Loading selected report evidence...")).not.toBeInTheDocument();
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Users" }));
+      expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("4");
+      expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled();
+      await act(async () => {});
+    }
+    expect(reads()).toBe(before);
+  });
+
+  it("restores recent catalog and additional Power Platform rows synchronously without new captures", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Additional native agent");
+    const transport = appTransport({ revalidatedRoles: viewer.roles,
+      unifiedResponse: unifiedRecordsPage([unifiedPage.value[0], native]), inventoryReadAuthorized: true });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
+    await screen.findByText(native.displayName);
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      ["/api/agent-inventory", "/api/agent-inventory/selections"].includes(new URL(input, "http://localhost").pathname)).length;
+    const before = reads();
+    for (let index = 0; index < 3; index++) {
+      fireEvent.click(screen.getByRole("button", { name: "Microsoft 365 catalog" }));
+      expect(screen.getByText(agent.displayName)).toBeVisible();
+      expect(screen.queryByText(native.displayName)).not.toBeInTheDocument();
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
+      expect(screen.getByText(native.displayName)).toBeVisible();
+      expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+      await act(async () => {});
+    }
+    expect(reads()).toBe(before);
+  });
+
+  it.each([
+    { route: "/agents", view: "agents", path: "/api/agent-inventory" },
+    { route: "/users", view: "users", path: "/api/copilot-usage/users" },
+    { route: "/users?view=activity", view: "users", path: "/api/official-usage/users" },
+    { route: "/audit", view: "audit", path: "/api/audit/events" },
+  ])("keeps the $view skeleton from unknown setup through the first data read at $route", async ({ route, view, path }) => {
+    window.history.replaceState({}, "", route);
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const status = deferredResponse(), data = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/state") return status.promise;
+      if (new URL(input, "http://localhost").pathname === path) return data.promise;
+      return base(input, init);
+    });
+    const pageReads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === path);
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, "showModal");
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<StrictMode><App /></StrictMode>);
+
+    expect(await screen.findByRole("region", { name: `Loading ${view}` })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("navigation", { name: "Primary views" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
+    expect(screen.queryByText("Setup needed")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(pageReads()).toHaveLength(0);
+
+    await act(async () => status.resolve(await base("/api/data-sync/state")));
+    await waitFor(() => expect(pageReads().length).toBeGreaterThan(0));
+    expect(screen.getByRole("region", { name: `Loading ${view}` })).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Setup needed")).not.toBeInTheDocument();
+
+    const [input, init] = pageReads()[0];
+    await act(async () => data.resolve(path === "/api/audit/events" ? Response.json({ value: [], count: 0 }) : await base(input, init)));
+    await waitFor(() => expect(screen.queryByRole("region", { name: `Loading ${view}` })).not.toBeInTheDocument());
+    if (view === "agents") expect(await screen.findByText("Sensitive cached agent")).toBeVisible();
+    else if (view === "users") expect(screen.getByRole("region", { name: "Users and adoption" })).toBeVisible();
+    else expect(screen.getByRole("heading", { name: "No audit events" })).toBeVisible();
+    expect(showModal).not.toHaveBeenCalled();
+  });
+
+  it("replaces unknown setup with an inline status error and retries without opening onboarding", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let failing = true;
+    transport.fetchMock.mockImplementation(async (input, init) => input === "/api/data-sync/state" && failing
+      ? Response.json({ code: "unavailable", detail: "Workspace status could not be read." }, { status: 503 })
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, "showModal");
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Workspace status is unavailable" })).toBeVisible();
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument());
+    expect(screen.getByRole("alert")).toHaveTextContent("Workspace status could not be read.");
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
+    expect(screen.queryByText("Setup needed")).not.toBeInTheDocument();
+    failing = false;
+    await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
+    expect(await screen.findByText("Sensitive cached agent")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(showModal).not.toHaveBeenCalled();
+  });
+
   it.each(["not_collected", "preparing"] as const)("shows first-login %s inventory without errors and recovers without a click", async state => {
     vi.useFakeTimers();
     const transport = appTransport({ revalidatedRoles: viewer.roles });
@@ -832,6 +952,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await act(() => vi.advanceTimersByTimeAsync(500));
+    await act(() => vi.advanceTimersByTimeAsync(0));
     const search = screen.getByRole("searchbox", { name: "Search users or agents" });
     fireEvent.change(search, { target: { value: "Ben" } });
     search.focus();
@@ -850,7 +971,7 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("status", { name: "Background refresh" })).toBeVisible();
     expect(screen.getByRole("status", { name: "Background refresh" }).textContent).toBe("");
     expect(screen.queryByRole("button", { name: "Ben" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Ben" })).toBeVisible();
     expect(search).toHaveValue("Ben");
     expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Users and adoption" })).toHaveAttribute("aria-busy", "false");
@@ -1160,7 +1281,7 @@ describe("App session revalidation", () => {
       directory.value[1] = { ...directory.value[1], copilotServiceState: "disabled", entitlement: "no_paid", reportedResponses: reportUser.reportedResponses };
       const personId = surface === "responsibility" ? responsibilityOwnerId
         : directory.value[surface === "licenses" ? 0 : 1].directory.objectId;
-      const url = surface === "responsibility" ? `/users?view=responsibility&person=${personId}`
+      const url = surface === "responsibility" ? `/users?detail=${personId}&tab=responsibility`
         : surface === "activity" ? "/users?view=activity" : "/users";
       window.history.replaceState({}, "", url);
       const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
@@ -1177,6 +1298,9 @@ describe("App session revalidation", () => {
             ? { ...value, updatedAt: "2026-09-15T08:01:00.000Z", lastSuccessAt: event === "reset" ? null : "2026-09-15T08:01:00.000Z",
               ...(event === "reset" ? { count: null, status: "not_started" } : {}) } : value);
           return Response.json(state);
+        }
+        if (input === `/api/copilot-usage/users/${responsibilityOwnerId}`) {
+          return Response.json({ code: "data_record_not_found", detail: "Record is not in the selected cohort." }, { status: 404 });
         }
         const reportData = selectedFixtureRead(input, directory);
         if (reportData) return Response.json(reportData);
@@ -1204,7 +1328,7 @@ describe("App session revalidation", () => {
       }
       await screen.findByText("Previous responsibility");
       const beforeResponsibilityReads = responsibilityReads;
-      const dialog = surface === "responsibility" ? undefined : screen.getByRole("dialog", { name: surface === "licenses" ? "Ada" : reportUser.displayName! });
+      const dialog = screen.getByRole("dialog", { name: surface === "responsibility" ? "Responsible only" : surface === "licenses" ? "Ada" : reportUser.displayName! });
       const directoryReads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/copilot-usage/users").length;
       const reportReads = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/users")).length;
       const beforeReads = [directoryReads(), reportReads()];
@@ -1212,14 +1336,13 @@ describe("App session revalidation", () => {
       await waitFor(() => expect(screen.getByText("Current responsibility after sync")).toBeVisible(), { timeout: 2_500 });
       expect(screen.queryByText("Previous responsibility")).not.toBeInTheDocument();
       expect(screen.getByText("Created by", { exact: true })).toBeVisible();
-      expect(screen.getByRole("combobox", { name: "User cohort" })).toHaveValue(surface);
+      expect(screen.getByRole("combobox", { name: "User cohort" })).toHaveValue(surface === "responsibility" ? "licenses" : surface);
       expect(window.location.pathname + window.location.search).toBe(url);
       expect(responsibilityReads).toBe(beforeResponsibilityReads + 1);
       expect([directoryReads(), reportReads()]).toEqual(beforeReads);
-      if (surface === "responsibility") expect(beforeReads).toEqual([0, 0]);
-      if (dialog) {
-        expect(dialog).toBeInTheDocument();
-        expect(dialog).toHaveAttribute("open");
+      expect(dialog).toBeInTheDocument();
+      expect(dialog).toHaveAttribute("open");
+      if (surface !== "responsibility") {
         expect(within(dialog).getByText("Agent responses").parentElement)
           .toHaveTextContent(String(surface === "licenses" ? directory.value[0].reportedResponses : reportUser.reportedResponses));
       }
@@ -2195,9 +2318,23 @@ describe("App session revalidation", () => {
       if (unifiedDetailId(input) === record.id) return Response.json(record);
       if (isPackageDetailRequest(input, target.packageId)) return Response.json(record.packages[0]);
       if (url.pathname.endsWith("/usage")) {
-        expect(url.searchParams.get("setId")).toBe(report.reports.setId);
+        expect(url.searchParams.has("setId")).toBe(false);
+        expect(url.searchParams.get("inventorySelectionId")).toBe(currentInventorySelection(transport.fetchMock));
+        selectedContext.selectionId = url.searchParams.get("inventorySelectionId")!;
         return Response.json({ ...record.usage, recordId: record.id, context: selectedContext });
       }
+      if (url.pathname.endsWith("/usage-history")) {
+        selectedContext.selectionId = url.searchParams.get("inventorySelectionId")!;
+        return Response.json({
+          recordId: record.id, context: selectedContext, value: [], latestReportSetId: selectedContext.reportSetId, latestReported: null,
+          counts: { total: 0, filtered: 0 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+        });
+      }
+      if (url.pathname.endsWith("/usage-users")) return Response.json({
+        value: [{ username: "usage@example.invalid", displayName: "Usage user", responses: 215 }],
+        reports: report.reports, selection: { ...report.selection, id: selectedContext.selectionId }, context: selectedContext,
+        counts: { total: 1, filtered: 1 }, page: { limit: 25, nextCursor: null, previousCursor: null },
+      });
       if (url.pathname.endsWith("/usage-associations")) return Response.json(init?.method === "DELETE" ? selectedContext : {
         value: [{ reportAgentId: "synthetic-researcher", agentName: "Researcher", responses: 215,
           target: { ...target, snapshotId: "exact-package-snapshot" }, basis: "reviewed" }],
@@ -2210,18 +2347,19 @@ describe("App session revalidation", () => {
     await screen.findByText(agent.displayName);
     await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
     await act(async () => {
-      window.history.pushState({}, "", `/agents?detail=${encodeURIComponent(record.id)}&detailTab=reports`);
+      window.history.pushState({}, "", `/agents?detail=${encodeURIComponent(record.id)}&detailTab=users`);
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     const detail = await screen.findByRole("dialog", { name: record.displayName });
     expect(await within(detail).findByLabelText("Selected agent report metrics")).toHaveTextContent("215");
     const exactReads = () => transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === record.id);
     expect(exactReads()).toHaveLength(1);
-    await userEvent.click(await within(detail).findByRole("button", { name: "Remove reviewed association" }));
-    await userEvent.click(within(detail).getByRole("checkbox", { name: "I confirm this exact report association removal" }));
+    await userEvent.click(await within(detail).findByText("Reviewed report links"));
+    await userEvent.click(await within(detail).findByRole("button", { name: "Remove association for Researcher (synthetic-researcher)" }));
+    await userEvent.click(within(detail).getByRole("checkbox", { name: "I confirm this reporting association should be removed." }));
     await userEvent.click(within(detail).getByRole("button", { name: "Confirm removal" }));
     await waitFor(() => expect(transport.fetchMock.mock.calls.find(([input, init]) =>
-      input.endsWith("/usage-associations") && init?.method === "DELETE")?.[1]).toMatchObject({
+      new URL(input, "http://localhost").pathname.endsWith("/usage-associations") && init?.method === "DELETE")?.[1]).toMatchObject({
         body: JSON.stringify({
           selectionId: selectedContext.selectionId, reportSetId: report.reports.setId,
           usageRevision: selectedContext.usageRevision, inventoryRevision: selectedContext.inventoryRevision,
@@ -2839,7 +2977,7 @@ describe("App session revalidation", () => {
     const retryReceipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     await waitFor(() => expect(retryReceipt.getByRole("alert")).toHaveTextContent(message));
     fail = false;
-    await userEvent.click(retryReceipt.getByRole("button", { name: "Verify saved inventory" }));
+    await userEvent.click(retryReceipt.getByRole("button", { name: "Reload saved inventory" }));
     await retryReceipt.findByText("Saved inventory verified");
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
@@ -2900,11 +3038,13 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
-    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("button")).toHaveLength(1);
+    expect(within(screen.getByRole("region", { name: "Sign in" })).getAllByRole("button")).toHaveLength(1);
     expect(screen.getByRole("textbox", { name: "Work or school username" })).toBeVisible();
-    expect(screen.getByText("Understand and manage your organization's AI agents in one place.")).toBeInTheDocument();
-    expect(screen.getByText(/Discover agents across Microsoft 365 and Copilot Studio, explore Copilot usage and service insights, and investigate activity/)).toBeInTheDocument();
-    expect(screen.getByText(/Make informed decisions about adoption and access, with the controls to take action/)).toBeInTheDocument();
+    const overview = within(screen.getByRole("region", { name: "Agent administration. A single workspace." }));
+    expect(overview.getByText("Understand and manage your organization's AI agents, from adoption to access.")).toBeInTheDocument();
+    expect(overview.getByRole("heading", { name: "Know your agent inventory" })).toBeInTheDocument();
+    expect(overview.getByRole("heading", { name: "Understand adoption" })).toBeInTheDocument();
+    expect(overview.getByRole("heading", { name: "Manage access and investigate" })).toBeInTheDocument();
     expect(screen.queryByText(/outstanding delegated permissions|Consent does not run investigations/)).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/capabilities"))).toBe(false);
   });
@@ -2916,7 +3056,7 @@ describe("App session revalidation", () => {
     render(<App />);
     expect(await screen.findByRole("status")).toHaveTextContent("Microsoft permission setup was cancelled or denied. Retry or contact your tenant administrator.");
     expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
-    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("button")).toHaveLength(1);
+    expect(within(screen.getByRole("region", { name: "Sign in" })).getAllByRole("button")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/auth/consent"))).toBe(false);
   });
 
@@ -2996,6 +3136,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     window.localStorage.setItem(activeBulkJobStorageKey(viewer), "current-tenant-job");
     window.localStorage.setItem(activeBulkJobStorageKey(otherTenant), "other-tenant-job");
+    window.localStorage.setItem("agent-control:signin-username:v1", "routing@example.com");
     storePackageSelection(viewer, ["current-tenant-package"]);
     storePackageSelection(otherTenant, ["other-tenant-package"]);
     render(<App />);
@@ -3003,7 +3144,8 @@ describe("App session revalidation", () => {
     const privateQuery = ["saved", "private-tenant-report", viewer.tenantId, viewer.homeAccountId];
     client.setQueryData(privateQuery, { value: ["Private report"] });
     await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
-    expect(await screen.findByRole("textbox", { name: "Work or school username" })).toBeVisible();
+    expect(await screen.findByRole("textbox", { name: "Work or school username" })).toHaveValue("routing@example.com");
+    expect(window.localStorage.getItem("agent-control:signin-username:v1")).toBe("routing@example.com");
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     expect(client.getQueryData(privateQuery)).toBeUndefined();
     expect(window.localStorage.getItem(activeBulkJobStorageKey(viewer))).toBeNull();
@@ -3316,7 +3458,8 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: `View details for ${group.displayName}` }));
     const dialog = await screen.findByRole("dialog", { name: group.displayName });
-    await userEvent.click(await within(dialog).findByRole("button", { name: `Inspect published version (${nativeId})` }));
+    await within(dialog).findByRole("option", { name: "Off-preview version" });
+    await userEvent.selectOptions(within(dialog).getByRole("combobox", { name: "Published version details" }), nativeId);
     expect(await within(dialog).findByText("Exact saved off-preview description")).toBeVisible();
     expect(within(dialog).getByRole("combobox", { name: "Published version details" })).toHaveValue(nativeId);
     const details = transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, nativeId));
@@ -4194,7 +4337,7 @@ describe("App session revalidation", () => {
     expect(screen.getByText("Total").nextElementSibling).toHaveTextContent("1");
   });
 
-  it("ignores Power Platform history failures from a superseded inventory read", async () => {
+  it("renders inventory without waiting for history and ignores superseded history failures", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     let historyRequests = 0;
@@ -4207,8 +4350,12 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await waitFor(() => expect(historyRequests).toBe(1));
-    await userEvent.click(screen.getByRole("searchbox", { name: "Search" }));
-    await userEvent.paste("Sensitive");
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    act(() => {
+      window.history.pushState({}, "", "/agents?q=Sensitive");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
     expect(await screen.findByText(agent.displayName)).toBeVisible();
 
     await act(async () => {
@@ -4220,6 +4367,61 @@ describe("App session revalidation", () => {
     expect(screen.queryByText(/Unable to load Power Platform agent refresh history/)).not.toBeInTheDocument();
     expect(screen.getByText(agent.displayName)).toBeVisible();
   });
+
+  it.each(["selection_invalidated", "inventory_changed"] as const)(
+    "invalidates a rejected matching-detail selection and permits saved-only recovery for %s",
+    async code => {
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const attempts: { selectionId: string; ids?: string[]; recordIds?: string[] }[] = [];
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === "/api/agents/refresh-selection" && init?.method === "POST") {
+          attempts.push(JSON.parse(String(init.body)));
+          if (attempts.length === 1) return Response.json({ code, detail: code }, { status: 409 });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("View diagnostics"));
+      const dialog = screen.getByRole("dialog", { name: "Inventory diagnostics" });
+      const refresh = within(dialog).getByRole("button", { name: "Refresh matching details" });
+      await waitFor(() => expect(refresh).toBeEnabled());
+      await userEvent.click(refresh);
+      const receipt = within(dialog).getByRole("region", { name: "Saved agent inventory verification" });
+      await waitFor(() => expect(within(receipt).getByRole("alert"))
+        .toHaveTextContent("The saved inventory selection is no longer available. Reload saved inventory."));
+      expect(within(dialog).getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
+      expect(attempts).toHaveLength(1);
+
+      const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+      const before = captures();
+      const recoveryStart = transport.fetchMock.mock.calls.length;
+      await userEvent.click(within(receipt).getByRole("button", { name: "Reload saved inventory" }));
+      await waitFor(() => expect(captures()).toBeGreaterThan(before));
+      await waitFor(() => expect(within(receipt).queryByRole("alert")).not.toBeInTheDocument());
+      expect(within(dialog).getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
+      expect(transport.fetchMock.mock.calls.slice(recoveryStart)
+        .filter(([path, init]) => init?.method === "POST" && path !== "/api/agent-inventory/selections")).toEqual([]);
+      expect(attempts).toHaveLength(1);
+
+      await userEvent.click(within(dialog).getByRole("button", { name: "Browse agents" }));
+      const checkbox = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+      expect(checkbox).not.toBeChecked();
+      await userEvent.click(checkbox);
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("View diagnostics"));
+      const retry = screen.getByRole("button", { name: "Refresh matching details" });
+      await waitFor(() => expect(retry).toBeEnabled());
+      await userEvent.click(retry);
+      await waitFor(() => expect(attempts).toHaveLength(2));
+      expect(attempts[1]).toEqual({ ...attempts[0], selectionId: expect.any(String) });
+      expect(attempts[1].selectionId).not.toBe(attempts[0].selectionId);
+    },
+  );
 
   it.each(["matching details", "Power Platform inventory"] as const)(
     "preserves selection and filters across Sync navigation when a delayed %s refresh completes",
@@ -6088,6 +6290,78 @@ describe("App session revalidation", () => {
     expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeInTheDocument();
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     expect(screen.getByText(/Unable to clear the saved package job/)).toBeInTheDocument();
+  });
+
+  it.each(["filter change", "clear filters", "selection invalidation"] as const)(
+    "clears cancelled access preparation after %s without reopening a stale editor",
+    async boundary => {
+      if (boundary === "clear filters") window.history.replaceState({}, "", "/agents?q=Sensitive");
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      transport.exactResponse = () => pending.promise;
+      let invalidateFacets = false;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (invalidateFacets && new URL(input, "http://localhost").pathname === "/api/agent-inventory/facets") {
+          return Response.json({ code: "selection_invalidated", detail: "The selected inventory expired." }, { status: 409 });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` }));
+      expect(screen.getByText("Loading agent details...")).toBeVisible();
+
+      if (boundary === "filter change") {
+        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+      } else if (boundary === "clear filters") {
+        await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+      } else {
+        invalidateFacets = true;
+        await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+        await screen.findByRole("button", { name: "Reload saved agent inventory" });
+      }
+
+      await waitFor(() => expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument());
+      await act(async () => pending.resolve(Response.json(completedRefreshJob())));
+      expect(screen.queryByRole("dialog", { name: "Manage agent access" })).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.some(([path]) => isPackageDetailRequest(path, agent.id))).toBe(false);
+
+      invalidateFacets = false;
+      transport.exactResponse = undefined;
+      if (boundary === "selection invalidation") {
+        await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+      }
+      await userEvent.click(await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` }));
+      expect(await screen.findByRole("dialog", { name: "Manage agent access" })).toBeVisible();
+      expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["details", "access"] as const)("clears a pending block preview when opening %s", async destination => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let preview: Response | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/mutation-preview") {
+        preview = await base(input, init);
+        return pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+    await waitFor(() => expect(preview).toBeDefined());
+    await userEvent.click(screen.getByRole("button", {
+      name: `${destination === "details" ? "View details" : "Manage access"} for ${agent.displayName}`,
+    }));
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => isPackageDetailRequest(path, agent.id))).toBe(true));
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeEnabled();
+    await act(async () => pending.resolve(preview!));
+    expect(screen.queryByRole("dialog", { name: /block package/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: destination === "details" ? agent.displayName : "Manage agent access" })).toBeVisible();
   });
 
   it("clears superseded detail loading when preparing a bulk preview", async () => {

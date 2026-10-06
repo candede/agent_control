@@ -53,6 +53,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
       packagesComplete: packages.every(member => Number(member.total) === 1),
       packages: packages.map(member => member.residual as CopilotPackage),
       powerPlatformResource: resource ? { ...resource.residual, identifiers: resource.identifiers,
+        savedSource: { scopeId: resource.scope_id, identity: resource.source_identity },
         connectorCounts: resource.connector_counts,
         identifierCount: resource.identifier_count, identifiersComplete: resource.identifier_count === resource.identifiers.length,
         quarantineIdentity: resource.quarantine_identity } as PowerPlatformResource : null,

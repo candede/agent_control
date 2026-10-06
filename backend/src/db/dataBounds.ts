@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { AppError } from "../errors.js";
 import { peakCheckpoint } from "../services/peakMemory.js";
+import { operationalLog } from "../services/telemetry.js";
 import type pg from "pg";
 
 export const dataLimits = Object.freeze({
@@ -13,6 +14,16 @@ export const dataLimits = Object.freeze({
 
 export function dataLimitError(code: string, limit: number, observed: number) {
   return new AppError(413, code, code, { limit, observed });
+}
+
+export function assertResidualBytes(bytes: number, stage: "inventory_projection" | "generation_batch" | "database",
+  field: "residual" | "payload" = "residual") {
+  if (bytes > dataLimits.residualBytes) {
+    operationalLog("warn", "data_residual_limit_exceeded", {
+      errorCode: "data_residual_bytes", stage, field, bytes, maximumLength: dataLimits.residualBytes,
+    });
+    throw dataLimitError("data_residual_bytes", dataLimits.residualBytes, bytes);
+  }
 }
 
 export function dataAdmissionError(code: string, status: 429 | 503 = 429) {
@@ -63,5 +74,5 @@ export async function assertResidualDatabaseBounds(client: pg.PoolClient, json: 
   const result = await client.query(`SELECT max(octet_length(${field}::text))::text AS observed
     FROM jsonb_to_recordset($1::jsonb) AS record(${field} jsonb,deleted boolean) WHERE NOT coalesce(deleted,false)`, [json]);
   const bytes = Number(result.rows[0].observed ?? 0);
-  if (bytes > dataLimits.residualBytes) throw dataLimitError("data_residual_bytes", dataLimits.residualBytes, bytes);
+  assertResidualBytes(bytes, "database", field);
 }

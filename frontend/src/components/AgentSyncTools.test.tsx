@@ -168,6 +168,24 @@ describe("AgentSyncTools", () => {
     expect(screen.getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
   });
 
+  it.each(["loading", "failed"] as const)("prevents matching refresh against %s saved inventory", async state => {
+    const actions = props({ inventory: inventory(), selectedPackageCount: 1,
+      verifyingInventory: state === "loading",
+      inventoryError: state === "failed" ? "The saved inventory selection is no longer available. Reload saved inventory." : undefined });
+    render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByText("View diagnostics"));
+    const refresh = screen.getByRole("button", { name: "Refresh matching details" });
+    expect(refresh).toBeDisabled();
+    await userEvent.click(refresh);
+    expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
+    if (state === "failed") {
+      await userEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+      expect(actions.onVerifyInventory).toHaveBeenCalledOnce();
+      expect(actions.onRefreshPackages).not.toHaveBeenCalled();
+      expect(actions.onRefreshPowerPlatform).not.toHaveBeenCalled();
+    }
+  });
+
   it("verifies measured collection and 1x source accounting without a partial warning for absent wids", async () => {
     render(<AgentSyncTools {...props({ inventory: inventory() })} />);
     await userEvent.click(screen.getByText("View diagnostics"));
@@ -246,7 +264,7 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
     expect(screen.queryByText(/package detail checks current;/)).not.toBeInTheDocument();
     expect(within(screen.getByRole("region", { name: "Saved agent inventory verification" })).getByRole("alert")).toHaveTextContent("Saved total and normalized identities disagree.");
-    expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reload saved inventory" })).toBeEnabled();
   });
 
   it("distinguishes checked packages, invalid metadata and linked agents with an explicit recovery action", async () => {

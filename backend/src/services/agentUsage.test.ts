@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { awaitUsageInventoryExpiry, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope } from "../db/agentUsageTestSupport.js";
+import { awaitUsageInventoryExpiry, deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope } from "../db/agentUsageTestSupport.js";
 import type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { AuditLog } from "./auditLog.js";
@@ -10,6 +10,8 @@ import { officialAgentUsageMutation } from "./officialAgentUsageInput.js";
 import { parseRecordId } from "./agentUsageIdentity.js";
 import { LargeTenantUsersReports, reportQuery } from "./largeTenantUsersReports.js";
 import * as maintenance from "./maintenance.js";
+import { inventorySelectionFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryPresentation } from "./inventoryPresentation.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let reports: LargeTenantUsersReports, usage: OfficialAgentUsage;
@@ -36,6 +38,84 @@ async function count(scope: AgentUsageScope) {
 }
 
 describe("native report-backed exact inventory usage", () => {
+  it.each(["reconciliation", "source-refresh"] as const)("keeps table, metrics and users on the same saved selection during %s without enabling writes", async transition => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Report-A" }));
+    const selected = await inventorySelectionFixture(fixture.runtime, scope);
+    const savedUsage = new OfficialAgentUsage(reports, selected.queries);
+    const before = (await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0];
+    const remove: CandidateAgentUsageMutation = { selectionId: before.context.selectionId, reportSetId: before.context.reportSetId,
+      usageRevision: before.context.usageRevision, inventoryRevision: before.context.inventoryRevision, reportAgentId: "Report-A", confirmed: true };
+    if (transition === "reconciliation") await fixture.operator.query(`UPDATE inventory_reconciliation SET status='catching_up'
+      WHERE tenant_id=$1`, [scope.tenantId]);
+    else await streamedPackageFixture(fixture.runtime, scope, [{ id: "Report-A", displayName: "Refreshed", isBlocked: false }]);
+    await expect(read(scope, [records[0].id])).rejects.toMatchObject({ code: "agent_not_found" });
+    const table = inventoryPresentation(await selected.queries.page(selected.selection.id, selected.identity));
+    const summary = (await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0];
+    expect(summary).toEqual(before);
+    expect(summary).toMatchObject({ status: "linked", responses: table.value[0].usage!.responses,
+      activeUsers: table.value[0].usage!.activeUsers, associationCount: 2, context: { selectionId: selected.selection.id } });
+    expect((await savedUsage.associations(selected.selection.id, selected.identity, records[0].id, {})).value.map(row => row.reportAgentId))
+      .toEqual(["Report-A", "Report-B"]);
+    const first = await savedUsage.users(selected.selection.id, selected.identity, records[0].id, { limit: 1 });
+    const second = await savedUsage.users(selected.selection.id, selected.identity, records[0].id, { limit: 1, cursor: first.page.nextCursor! });
+    expect(first.value[0].username).not.toBe(second.value[0].username);
+    expect(first.context).toEqual(summary.context);
+    expect((await savedUsage.users(selected.selection.id, selected.identity, records[0].id, { limit: 1, cursor: second.page.previousCursor! })).value)
+      .toEqual(first.value);
+    await expect(savedUsage.mutate(selected.identity, records[0].id, remove, usageAudit(scope).actor)).rejects.toMatchObject({ code: "agent_not_found" });
+    expect(await count(scope)).toBe(1);
+    if (transition === "reconciliation") {
+      await fixture.operator.query("UPDATE inventory_reconciliation SET status='idle' WHERE tenant_id=$1", [scope.tenantId]);
+      await savedUsage.mutate(selected.identity, records[0].id, remove, usageAudit(scope).actor);
+      expect(await count(scope)).toBe(0);
+      await expect(savedUsage.users(selected.selection.id, selected.identity, records[0].id, {})).rejects.toMatchObject({ code: "selection_invalidated" });
+    }
+  });
+
+  it("pins the report through replacement, matches a new table selection, and rejects deletion and foreign selections", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    const firstReport = await publishUsageReports(fixture.runtime, scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope), savedUsage = new OfficialAgentUsage(reports, selected.queries);
+    const initial = (await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0];
+    await publishUsageReports(fixture.runtime, scope, 11);
+    expect((await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0]).toEqual(initial);
+    const current = await inventorySelectionFixture(fixture.runtime, scope);
+    expect((await savedUsage.summaries(current.selection.id, current.identity, [records[0].id]))[0])
+      .toMatchObject({ responses: 11, context: { reportSetId: inventoryPresentation(current.raw).usageContext!.reports.setId } });
+    for (const foreign of [{ ...selected.identity, principalId: "another-reader" }, { ...selected.identity, tenantId: "another-tenant" },
+      { ...selected.identity, authorizationHash: "changed" }]) {
+      await expect(savedUsage.users(selected.selection.id, foreign, records[0].id, {})).rejects.toMatchObject({ code: "selection_invalidated" });
+    }
+    await deleteUsageSet(fixture.runtime, scope, firstReport.setId);
+    await expect(savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id])).rejects.toMatchObject({ code: "selection_invalidated" });
+  });
+
+  it("does not substitute a newly imported report for a table selection that had no report", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope), savedUsage = new OfficialAgentUsage(reports, selected.queries);
+    await publishUsageReports(fixture.runtime, scope);
+    expect((await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0])
+      .toMatchObject({ status: "unavailable", responses: null, activeUsers: null, context: { reportSetId: null } });
+    expect((await savedUsage.associations(selected.selection.id, selected.identity, records[0].id, {})).value).toEqual([]);
+    expect((await savedUsage.users(selected.selection.id, selected.identity, records[0].id, {})).value).toEqual([]);
+  });
+
+  it.each(["source", "session", "selection"] as const)("never falls back to live evidence after the saved %s authority is invalidated", async boundary => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope), savedUsage = new OfficialAgentUsage(reports, selected.queries);
+    if (boundary === "source") await fixture.operator.query("UPDATE data_scope_epochs SET epoch=epoch+1 WHERE tenant_id=$1 AND source='inventory_packages'", [scope.tenantId]);
+    if (boundary === "session") await fixture.operator.query("UPDATE data_principal_epochs SET epoch=epoch+1 WHERE tenant_id=$1", [scope.tenantId]);
+    if (boundary === "selection") await selected.queries.selections.invalidate(selected.selection.id, selected.identity);
+    for (const read of [
+      () => savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]),
+      () => savedUsage.associations(selected.selection.id, selected.identity, records[0].id, {}),
+      () => savedUsage.users(selected.selection.id, selected.identity, records[0].id, {}),
+    ]) await expect(read()).rejects.toMatchObject({ code: "selection_invalidated" });
+  });
+
   it.each(["name", "guid-fragment", "prefix", "case", "manifest", "app", "asset"] as const)("does not infer an exact package identity from %s", async kind => {
     const scope = newUsageScope(), guid = "11111111-1111-4111-8111-111111111111", packageId = `T_${guid}`;
     const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: [packageId],
@@ -85,6 +165,36 @@ describe("native report-backed exact inventory usage", () => {
     await publishUsageReports(fixture.runtime, scope);
     await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Report-A" }));
     expect((await read(scope, [records[0].id]))[0]).toMatchObject({ responses: 30, activeUsers: 3, associationCount: 2 });
+  });
+
+  it("pages the restored users table across every linked version with exact case-sensitive user totals", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B", "Report-Zero"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const first = await usage.users(selection.id, identity, records[0].id, { limit: 2 });
+    expect(first.value).toEqual([{ username: "Shared", displayName: "Shared", responses: 21 }, { username: "caseuser", displayName: "Two", responses: 5 }]);
+    expect(first.counts).toEqual({ total: 4, filtered: 4 });
+    expect(first.context).toEqual((await usage.summaries(selection.id, identity, [records[0].id]))[0].context);
+    expect(first.selection.id).toBe(selection.id);
+    const second = await usage.users(selection.id, identity, records[0].id, { limit: 2, cursor: first.page.nextCursor! });
+    expect(second.value).toEqual([{ username: "CaseUser", displayName: "One", responses: 4 }, { username: "ZeroUser", displayName: "Zero", responses: 0 }]);
+    expect(second.page.nextCursor).toBeNull();
+    expect((await usage.users(selection.id, identity, records[0].id, { limit: 2, cursor: second.page.previousCursor! })).value).toEqual(first.value);
+    const searched = await usage.users(selection.id, identity, records[0].id, { search: "tWo", limit: 2 });
+    expect(searched.value).toEqual([first.value[1]]);
+    expect(searched.counts).toEqual({ total: 4, filtered: 1 });
+    await expect(usage.users(selection.id, identity, records[0].id, { search: "changed", cursor: first.page.nextCursor! })).rejects.toMatchObject({ code: "invalid_cursor" });
+    await expect(usage.users(selection.id, { ...identity, principalId: "another-user" }, records[0].id, {})).rejects.toBeDefined();
+  });
+  it("keeps concealed names literal and invalidates user cursors when reviewed associations change", async () => {
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }, { packages: ["Other"] }]);
+    await publishUsageReports(fixture.runtime, scope, 10, (_kind, text) => text.replaceAll("CaseUser", "concealed-identity"));
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const page = await usage.users(selection.id, identity, records[0].id, { limit: 1 });
+    expect((await usage.users(selection.id, identity, records[0].id, { search: "concealed" })).value)
+      .toMatchObject([{ username: "concealed-identity", responses: 4 }]);
+    await mutate(scope, records[1].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Other" }));
+    await expect(usage.users(selection.id, identity, records[0].id, { cursor: page.page.nextCursor! })).rejects.toMatchObject({ code: "invalid_cursor" });
   });
 
   it("uses Agents response/activity authority rather than Users and bridge response totals", async () => {

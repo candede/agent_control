@@ -17,14 +17,21 @@ function scope(children: ReactNode, principal = "reader", roles: api.AppRole[] =
 }
 
 describe("saved Users responsibility", () => {
-  it("keeps compact user details focused on agents and roles without duplicate identity or source disclosures", async () => {
-    vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
+  it.each(["available", "partial"] as const)("presents reported relationships from %s sources without requiring all roles or a refresh", async state => {
+    const data = responsibilityFixture(responsibilityOwnerId);
+    if (data.sources.powerPlatform.state !== "partial") throw new Error("Expected a partial source fixture.");
+    if (state === "available") data.sources.powerPlatform = { state, observation: data.sources.powerPlatform.observation, error: null };
+    vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
     const open = vi.fn();
-    render(scope(<UserAgentResponsibility compact objectId={responsibilityOwnerId} onOpenAgent={open} />));
+    render(scope(<UserAgentResponsibility objectId={responsibilityOwnerId} onOpenAgent={open} />));
     await userEvent.click(await screen.findByRole("button", { name: "Open agent Responsible agent" }));
     expect(open).toHaveBeenCalledWith(responsibilityAgentId);
     expect(screen.getByText("Owner")).toBeVisible();
-    expect(screen.getByText("Partial agent inventory")).toBeVisible();
+    expect(screen.queryByText(/Partial agent inventory|Some relationships may be missing|Refresh agent inventory/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("1 agent")).toBeVisible();
+    expect(screen.getByText(/Source observed/)).toBeVisible();
     expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
     expect(screen.queryByText(/not usage, access assignments|Responsibility source coverage|ID:/)).not.toBeInTheDocument();
     expect(document.querySelector("details")).toBeNull();
@@ -39,14 +46,13 @@ describe("saved Users responsibility", () => {
     expect(open).toHaveBeenCalledWith(responsibilityAgentId);
     expect(read).toHaveBeenCalledOnce();
     expect(lookup).not.toHaveBeenCalled();
-    expect(screen.getByText(/Partial responsibility coverage/)).toBeVisible();
-    expect(screen.getByText(/not usage, access assignments or permission/)).toBeVisible();
+    expect(screen.getByText(/do not grant access or permission/)).toBeVisible();
   });
 
   it.each([undefined, "Alice", "alice@example.invalid", "aaaaaaaa"])("does not guess directory IDs for %s", async objectId => {
     const read = vi.spyOn(api, "getAgentResponsibility");
     render(<UserAgentResponsibility objectId={objectId} />);
-    expect(screen.getByText(/Responsibility unavailable: no exact verified directory object ID/)).toBeVisible();
+    expect(screen.getByText(/Link this user to a directory identity/)).toBeVisible();
     expect(read).not.toHaveBeenCalled();
   });
 
@@ -54,20 +60,24 @@ describe("saved Users responsibility", () => {
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selected!.person.evidence = { ...data.selected!.person.evidence!, displayName: null, userPrincipalName: null, status, errorCode: "provider_error" };
     vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
-    render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
-    expect(await screen.findByText(status === "not_found" ? /User not found at the last/ : /Directory lookup failed \(provider_error\)/)).toBeVisible();
-    expect(screen.queryByText("Resolved saved directory identity.")).not.toBeInTheDocument();
+    const personLoaded = vi.fn();
+    render(<UserAgentResponsibility objectId={responsibilityOwnerId} onPersonLoaded={personLoaded} />);
+    await waitFor(() => expect(personLoaded).toHaveBeenLastCalledWith(data.selected!.person));
+    expect(personLoaded.mock.lastCall?.[0].evidence.status).toBe(status);
   });
 
   it.each(["unavailable", "no_reported_relationships"] as const)("does not convert %s into confirmed absence", async state => {
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selected = { ...data.selected!, state, agents: [], count: 0 };
-    data.coverage = state === "unavailable" ? "unavailable" : "partial";
+    if (state === "unavailable") data.sources.powerPlatform = { state: "unavailable", observation: null,
+      error: { source: "power_platform", code: "snapshot_unavailable", message: "No saved agent inventory." } };
     vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(responsibilityFixture(responsibilityOwnerId)).mockResolvedValueOnce(data);
     const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
     await screen.findByText("Responsible agent");
     view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
-    expect(await screen.findByText(state === "unavailable" ? /relationships are unknown, not zero/ : /This is not proof of no responsibility elsewhere/)).toBeVisible();
+    expect(await screen.findByText(state === "unavailable" ? /relationships are unknown, not zero/ : /does not rule out relationships/)).toBeVisible();
+    expect(screen.queryByText(/Partial agent inventory|Some relationships may be missing/)).not.toBeInTheDocument();
+    if (state === "unavailable") expect(screen.queryByText("0 agents")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Open agent/ })).not.toBeInTheDocument();
     expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
   });
@@ -77,9 +87,9 @@ describe("saved Users responsibility", () => {
     data.selected!.person.evidence!.expiresAt = "2000-01-01T00:00:00Z";
     const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
     const lookup = vi.spyOn(api, "resolveAgentPeople");
-    render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
-    expect(await screen.findByText(/Saved lookup expired; identity is unverified/)).toBeVisible();
-    expect(screen.queryByText("Resolved saved directory identity.")).not.toBeInTheDocument();
+    const personLoaded = vi.fn();
+    render(<UserAgentResponsibility objectId={responsibilityOwnerId} onPersonLoaded={personLoaded} />);
+    await waitFor(() => expect(personLoaded).toHaveBeenLastCalledWith(data.selected!.person));
     expect(read).toHaveBeenCalledOnce();
     expect(lookup).not.toHaveBeenCalled();
   });
@@ -92,13 +102,13 @@ describe("saved Users responsibility", () => {
     await waitFor(() => expect(read).toHaveBeenCalledOnce());
     const signal = read.mock.calls[0][1]!.signal!;
     view.rerender(scope(<UserAgentResponsibility objectId="cccccccc-cccc-4ccc-8ccc-cccccccccccc" />, "other-reader"));
-    await screen.findByText("Responsible only");
+    await screen.findByText("Responsible agent");
     expect(signal.aborted).toBe(true);
     await act(async () => finish(responsibilityFixture(responsibilityOwnerId)));
     expect(screen.queryByText(`ID: ${responsibilityOwnerId}`)).not.toBeInTheDocument();
     view.rerender(scope(<UserAgentResponsibility objectId="cccccccc-cccc-4ccc-8ccc-cccccccccccc" />, "other-reader", []));
     expect(screen.getByRole("alert")).toHaveTextContent("current Viewer access");
-    expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
+    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
     expect(read).toHaveBeenCalledTimes(2);
   });
 
@@ -108,13 +118,13 @@ describe("saved Users responsibility", () => {
         .mockRejectedValueOnce(failure)
         .mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
       const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
-      await screen.findByText("Responsible only");
+      await screen.findByText("Responsible agent");
       view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
-      expect(screen.getByText("Responsible only")).toBeVisible();
+      expect(screen.getByText("Responsible agent")).toBeVisible();
       expect(await screen.findByRole("alert")).toHaveTextContent(failure.message);
-      expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
+      expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
       await userEvent.click(screen.getByRole("button", { name: "Retry saved responsibility" }));
-      expect(await screen.findByText("Responsible only")).toBeVisible();
+      expect(await screen.findByText("Responsible agent")).toBeVisible();
       expect(read).toHaveBeenCalledTimes(3);
     },
   );
@@ -155,23 +165,31 @@ describe("saved Users responsibility", () => {
     },
   );
 
-  it("pages both people and agents server-side and rejects cross-person responses", async () => {
-    const data = responsibilityFixture();
-    data.counts = { total: 51, filtered: 51 };
+  it("pages one user's agents server-side and rejects cross-person responses", async () => {
+    const data = responsibilityFixture(responsibilityOwnerId);
+    data.selected!.count = 51;
     data.page.nextCursor = "next-responsibility-page";
     const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
-    const change = vi.fn();
-    const route = { view: "responsibility" as const, search: "", page: 0 };
-    const view = render(<UserAgentResponsibility route={route} onRouteChange={change} />);
+    const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
     await userEvent.click(await screen.findByRole("button", { name: "Next" }));
-    expect(change).toHaveBeenCalledWith({ ...route, page: 1, selectionId: data.selection.id, cursor: data.page.nextCursor });
-    view.rerender(<UserAgentResponsibility route={change.mock.calls[0][0]} onRouteChange={change} />);
     await waitFor(() => expect(read).toHaveBeenLastCalledWith(expect.objectContaining({
-      selectionId: data.selection.id, cursor: data.page.nextCursor, limit: 50,
+      objectId: responsibilityOwnerId, selectionId: data.selection.id, cursor: data.page.nextCursor, limit: 50,
     }), expect.anything()));
     expect(read.mock.calls[1][0]).not.toHaveProperty("offset");
     read.mockResolvedValue(responsibilityFixture("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
-    view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
+    view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("did not match the exact requested user");
+  });
+
+  it("rejects a page from a different inventory selection", async () => {
+    const data = responsibilityFixture(responsibilityOwnerId);
+    data.page.nextCursor = "next";
+    vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(data).mockResolvedValue({
+      ...data, selection: { ...data.selection, id: "different-selection" },
+    });
+    render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("did not match the selected inventory");
+    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
   });
 });

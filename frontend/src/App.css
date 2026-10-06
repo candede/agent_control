@@ -16,68 +16,226 @@
 }
 
 .signed-out {
-  max-width: 1520px;
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0;
+  padding: 0 clamp(24px, 5vw, 80px);
+  background: var(--bg);
+}
+
+.signin-header {
+  display: flex;
   align-items: center;
-  justify-items: start;
-  background:
-    radial-gradient(
-      circle at 20% 24%,
-      rgba(41, 111, 102, 0.16),
-      transparent 32%
-    ),
-    linear-gradient(135deg, #f4f0e3 0%, #fbf9f1 48%, #e7f0ee 100%);
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 88px;
+  border-bottom: 1px solid var(--border);
+}
+
+.signin-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.signin-brand h1 {
+  font-size: 19px;
+  line-height: 1.3;
+  letter-spacing: -0.5px;
+}
+
+.signin-platforms {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.signin-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 424px;
+  align-items: center;
+  gap: clamp(48px, 7vw, 112px);
+  width: min(1080px, 100%);
+  flex: 1;
+  margin: 0 auto;
+  padding: 64px 0;
+}
+
+.signin-overview .eyebrow {
+  margin-bottom: 20px;
+  color: var(--ink);
+  font-size: 11px;
+  letter-spacing: 1.2px;
+}
+
+.signin-overview h2 {
+  margin: 0;
+  font-size: clamp(30px, 3.1vw, 44px);
+  font-weight: 650;
+  line-height: 1.16;
+  letter-spacing: -1.4px;
 }
 
 .signin-lede {
-  max-width: 560px;
-  color: #45504d;
-  font-size: 17px;
-  line-height: 1.5;
+  max-width: 430px;
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.65;
+}
+
+.signin-capabilities {
+  display: grid;
+  gap: 24px;
+  margin: 36px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.signin-capabilities li {
+  display: flex;
+  align-items: start;
+  gap: 14px;
+}
+
+.signin-capability-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.signin-capabilities h3 {
+  margin: 0 0 4px;
+  color: var(--text-h);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.signin-capabilities p {
+  max-width: 360px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .signin-panel {
-  width: min(680px, 100%);
   min-width: 0;
-  max-width: calc(100% - clamp(0px, 7vw, 112px));
   display: grid;
-  gap: 18px;
-  margin-left: clamp(0px, 7vw, 112px);
-  margin-bottom: clamp(24px, 8vh, 96px);
+  gap: 28px;
+  padding: 36px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgb(24 35 56 / 4%), 0 1px 3px rgb(24 35 56 / 3%);
   text-align: left;
+}
+
+.signin-panel-heading h2 {
+  margin-bottom: 10px;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.6px;
+}
+
+.signin-panel-heading p {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
 }
 
 .signed-out .app-footer {
   width: 100%;
+  padding: 20px 0;
+  font-size: 11px;
+  gap: 12px;
+}
+
+.signed-out .app-footer-credit,
+.signed-out .app-footer-email,
+.signed-out .app-footer a {
+  color: var(--muted);
+  font-weight: 500;
+  font-style: normal;
+}
+
+.signed-out .app-footer-email em {
+  font-style: normal;
+}
+
+.signed-out .app-footer a:hover {
+  color: var(--ink);
 }
 
 .signin-form {
   display: grid;
-  gap: 12px;
-  width: min(440px, 100%);
+  gap: 22px;
   min-width: 0;
+  font-size: 14px;
+}
+
+.signin-field {
+  display: grid;
+  gap: 9px;
 }
 
 .signin-form label {
   color: var(--text-h);
-  font-weight: 700;
+  font-weight: 600;
 }
 
-.signin-form input {
-  min-height: 44px;
+.signin-field input {
+  min-height: 48px;
+}
+
+.signin-field input::placeholder {
+  color: var(--muted);
+}
+
+.signin-field input[aria-invalid="true"] {
+  border-color: var(--danger);
 }
 
 .signin-hint {
-  color: #45504d;
-  font-size: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.signin-form .signin-remember {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 24px;
+  font-size: 13px;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.signin-remember input {
+  margin: 0;
+}
+
+.signin-preference .signin-hint {
+  margin: 6px 0 0 27px;
 }
 
 .signin-button {
-  justify-self: start;
-  margin-top: 2px;
-  min-height: 44px;
-  font-weight: 800;
+  width: 100%;
+  min-height: 48px;
+  font-size: 14px;
+  font-weight: 600;
+  border-color: transparent;
+}
+
+.signin-button svg {
+  margin-left: 4px;
+}
+
+.signed-out :is(button, a):focus-visible {
+  outline: 3px solid #d8d4fa;
+  outline-offset: 3px;
 }
 
 .signin-button:disabled {
@@ -85,8 +243,98 @@
   cursor: not-allowed;
 }
 
-.signin-panel code {
+.signin-panel :is(code, .error-banner),
+.signin-notice,
+.signin-storage-notice {
   overflow-wrap: anywhere;
+}
+
+.signin-notice,
+.signin-storage-notice {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+.signin-panel .error-banner {
+  border-radius: 7px;
+  font-size: 13px;
+}
+
+.signin-trust {
+  display: flex;
+  align-items: start;
+  gap: 10px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.signin-trust svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+@media (max-width: 960px) {
+  .signin-content {
+    grid-template-columns: minmax(0, 1fr) 380px;
+    gap: 40px;
+  }
+
+  .signin-panel {
+    padding: 28px;
+  }
+}
+
+@media (max-width: 840px) {
+  .signed-out {
+    padding-inline: 20px;
+  }
+
+  .signin-header {
+    min-height: 72px;
+  }
+
+  .signin-platforms {
+    display: none;
+  }
+
+  .signin-content {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 40px;
+    width: min(440px, 100%);
+    padding: 36px 0;
+  }
+
+  .signin-panel {
+    order: -1;
+    padding: 28px 24px;
+  }
+
+  .signin-overview h2 {
+    font-size: 30px;
+    letter-spacing: -0.8px;
+  }
+
+  .signin-overview .eyebrow {
+    margin-bottom: 14px;
+  }
+
+  .signin-capabilities {
+    gap: 20px;
+    margin-top: 24px;
+  }
+
+  .signed-out .app-footer-meta {
+    justify-content: flex-start;
+    text-align: left;
+  }
 }
 
 .top-bar,
@@ -3031,14 +3279,6 @@ button.audit-result-button:focus-visible {
 }
 
 @media (max-width: 760px) {
-  .signed-out {
-    align-items: start;
-  }
-
-  .signin-panel {
-    margin: clamp(32px, 12vh, 88px) 0 0;
-  }
-
   .top-bar,
   .bulk-panel,
   .bulk-buttons,

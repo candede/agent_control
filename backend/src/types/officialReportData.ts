@@ -12,7 +12,7 @@ export type ReportQuery = {
   licenseCohort?: "active_without_paid"; creatorType?: string; agentId?: string; username?: string;
   responsesOnly?: boolean; startDate?: string; endDate?: string;
   lowResponseThreshold?: number; inactiveDays?: number; activityWindowDays?: number;
-  sort?: "name" | "upn" | "company" | "department" | "service" | "appActivity" | "responses" | "agentsUsed" | "lastActivity" | "creatorType" | "activeUsers" | "licensedUsers" | "unlicensedUsers" | "acceptedAt";
+  sort?: "name" | "upn" | "company" | "department" | "service" | "appActivity" | "responses" | "agentsUsed" | "lastActivity" | "creatorType" | "activeUsers" | "licensedUsers" | "unlicensedUsers" | "acceptedAt" | "reportingPeriod";
   order?: "asc" | "desc";
 };
 export type ReportMetadata = {

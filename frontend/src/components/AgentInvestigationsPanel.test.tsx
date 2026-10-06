@@ -84,6 +84,21 @@ describe("agent investigations", () => {
     expect(screen.getByText("An AgentControl.Viewer role is required to view agent logs.")).toBeVisible();
   });
 
+  it("states saved-agent unavailability without recommending refresh or implying logs are empty", async () => {
+    vi.mocked(getAgentInvestigationContext).mockRejectedValue(new ApiError(404, "agent_not_found",
+      "This agent is not available in the current saved inventory."));
+    render(panel());
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("This agent is not available in the current saved inventory.");
+    expect(alert).not.toHaveTextContent(/refresh|sync|retry/i);
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(alert).toBeVisible();
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    expect(getAgentPurviewRecords).not.toHaveBeenCalled();
+    expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
+  });
+
   it("explains a missing identity without falling back to a tenant-wide hunt", async () => {
     vi.mocked(getAgentInvestigationContext).mockResolvedValue({
       ...investigation, defender: { status: "unavailable", reason: "No verified Entra agent identity.", entraAgentIds: [] },

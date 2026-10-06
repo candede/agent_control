@@ -10,12 +10,14 @@ import { InventoryRefreshTargets } from "./components/InventoryRefreshTargets";
 import {
   ArrowRight,
   Ban,
+  BarChart3,
   Bot,
   CircleCheck,
   ExternalLink,
   Globe2,
   LogOut,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 import {
   ApiError,
@@ -39,7 +41,6 @@ import {
   reconcileBulkActionJob,
   resumeBulkActionJob,
   signOut,
-  startSignIn,
   startExactPackageRefresh,
   startPackageRefresh,
   refreshPackageIdentityDetails,
@@ -103,7 +104,8 @@ import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuara
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
 import { OfficialUsageReportSelector } from "./components/OfficialUsageReportSelector";
 import { CsvUsageReportsSection } from "./components/CsvUsageReportsSection";
-import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
+import { DataSyncPanel, type DataSyncPanelHandle, type WorkspaceSetupStatus } from "./components/DataSyncPanel";
+import { WorkspaceSkeleton } from "./components/WorkspaceSkeleton";
 import { AgentSyncTools } from "./components/AgentSyncTools";
 import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { SyncHistoryView } from "./components/SyncHistoryView";
@@ -128,6 +130,7 @@ import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionC
 import { SavedQueryProvider } from "./components/SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 import { trapDialogFocus } from "./dialogFocus";
+import { SignInForm } from "./components/SignInForm";
 import "./components/agentWorkspace.css";
 
 const activeBulkJobStoragePrefix = "agent-control:active-bulk-job:v2:";
@@ -224,83 +227,6 @@ function App() {
   return <SavedQueryProvider client={savedQueries}><Workbench savedQueries={savedQueries} /></SavedQueryProvider>;
 }
 
-function SignInForm({ disabled }: { disabled: boolean }) {
-  const [username, setUsername] = useState("");
-  const [validationError, setValidationError] = useState<string>();
-  const [signInError, setSignInError] = useState<string>();
-  const [pending, setPending] = useState(false);
-  const usernameInput = useRef<HTMLInputElement>(null);
-  const request = useRef<AbortController | undefined>(undefined);
-  useEffect(() => () => request.current?.abort(), []);
-
-  async function handleSubmit() {
-    if (disabled || request.current) return;
-    const value = username.trim();
-    setSignInError(undefined);
-    if (!value || value.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-      setValidationError("Enter your work or school username, such as name@organization.com.");
-      usernameInput.current?.focus();
-      return;
-    }
-    setValidationError(undefined);
-    const controller = new AbortController();
-    request.current = controller;
-    setPending(true);
-    const search = new URLSearchParams(window.location.search);
-    search.delete("authorization");
-    search.delete("returnTo");
-    const returnTo = isWorkbenchPath(window.location.pathname) && !window.location.pathname.startsWith("//")
-      ? `${window.location.pathname}${search.size ? `?${search}` : ""}` : "/agents";
-    try {
-      const { authorizationUrl } = await startSignIn({ username: value, returnTo }, { signal: controller.signal });
-      if (!controller.signal.aborted) window.location.assign(authorizationUrl);
-    } catch (requestError) {
-      if (controller.signal.aborted) return;
-      setSignInError(requestError instanceof Error ? requestError.message : "Unable to start sign-in. Please try again.");
-      setPending(false);
-      request.current = undefined;
-    }
-  }
-
-  return (
-    <form className="signin-form" aria-label="Sign in" aria-busy={pending} noValidate onSubmit={event => {
-      event.preventDefault();
-      void handleSubmit();
-    }}>
-      <label htmlFor="signin-username">Work or school username</label>
-      <input
-        ref={usernameInput}
-        id="signin-username"
-        name="username"
-        type="email"
-        inputMode="email"
-        autoComplete="username"
-        autoCapitalize="none"
-        spellCheck={false}
-        maxLength={320}
-        required
-        disabled={disabled || pending}
-        aria-invalid={Boolean(validationError)}
-        aria-describedby={`signin-hint${validationError || signInError ? " signin-error" : ""}`}
-        value={username}
-        onChange={event => {
-          setUsername(event.target.value);
-          setValidationError(undefined);
-          setSignInError(undefined);
-        }}
-      />
-      <p id="signin-hint" className="signin-hint">
-        Use your organization&apos;s email address. You&apos;ll continue to Microsoft to sign in.
-      </p>
-      {validationError || signInError ? <div id="signin-error" className="error-banner" role="alert">{validationError ?? signInError}</div> : null}
-      <button className="signin-button" type="submit" disabled={disabled || pending}>
-        {pending ? "Preparing sign-in..." : "Sign in with Entra ID"}
-      </button>
-      {pending ? <p role="status">Preparing Microsoft sign-in...</p> : null}
-    </form>
-  );
-}
-
 function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSavedQueryClient> }) {
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
   const [initialAgentRoute] = useState(readInitialAgentRoute);
@@ -342,6 +268,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [loadingSession, setLoadingSession] = useState(true);
   const [signingOut, setSigningOut] = useState(false);
   const [loadingAgents, setLoadingAgents] = useState(false);
+  const [initialAgentReadOwner, setInitialAgentReadOwner] = useState<string>();
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState(initialAgentRoute.search);
   const [agentInventoryScope, setAgentInventoryScope] = useState(initialAgentRoute.inventoryScope);
@@ -390,7 +317,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
   const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialAgentRoute.syncRunId);
-  const [syncSetup, setSyncSetup] = useState<{ owner: string; required: boolean }>();
+  const [syncSetup, setSyncSetup] = useState<{ owner: string; status: WorkspaceSetupStatus }>();
   const [syncHistoryRevision, setSyncHistoryRevision] = useState(0);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
@@ -447,10 +374,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const principalKey = user
     ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
     : `signed-out:${sessionEpoch}`;
-  const syncSetupRequired = syncSetup?.owner === principalKey ? syncSetup.required : true;
-  const waitingForInitialInventory = syncSetupRequired && activeView !== "sync";
-  const handleSyncSetupRequiredChange = useCallback((required: boolean) => {
-    setSyncSetup({ owner: principalKey, required });
+  const syncSetupStatus = syncSetup?.owner === principalKey ? syncSetup.status : "checking";
+  const syncSetupRequired = syncSetupStatus === "required";
+  const waitingForInitialInventory = syncSetupStatus !== "ready" && activeView !== "sync";
+  const handleSyncSetupStatusChange = useCallback((status: WorkspaceSetupStatus) => {
+    setSyncSetup({ owner: principalKey, status });
   }, [principalKey]);
   const agentDetail = savedAgentDetail?.owner === principalKey ? savedAgentDetail.detail : undefined;
   useEffect(() => () => savedQueries.clear(), [principalKey, savedQueries]);
@@ -553,11 +481,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     function restoreRoute() {
       if (!isWorkbenchPath(window.location.pathname)) return;
       readInitialAgentRoute();
-      agentDetailRequestId.current += 1;
-      agentDetailAbortController.current?.abort();
+      cancelAgentDetailRequest();
       packageRefreshRequestId.current += 1;
-      setLoadingAgentDetailId(undefined);
-      setBusyAgentId(undefined);
       setSingleAccessAgentDetail(undefined);
       setBulkAccessAgentIds(undefined);
       setBulkConfirmation(undefined);
@@ -1120,7 +1045,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       })
     : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
-  const blockingFirstSync = hasRole(user, "AgentControl.Viewer") && syncSetupRequired
+  const blockingWorkspace = hasRole(user, "AgentControl.Viewer") && syncSetupStatus !== "ready"
     && visibleActiveView !== "sync" && visibleActiveView !== "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
@@ -1151,10 +1076,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [activeView, user, visibleActiveView]);
 
   function navigateToView(view: WorkbenchViewId) {
-    agentDetailRequestId.current += 1;
-    agentDetailAbortController.current?.abort();
-    setLoadingAgentDetailId(undefined);
-    setBusyAgentId(undefined);
+    cancelAgentDetailRequest();
     savedViewSearches.current.set(activeView, window.location.search);
     setAgentDetail(undefined);
     setSelectedUnifiedAgent(undefined);
@@ -1367,8 +1289,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setGroupTargetCount(undefined);
     agentScopeEpochRef.current += 1;
     setAgentScopeEpoch(agentScopeEpochRef.current);
-    agentDetailRequestId.current += 1;
-    agentDetailAbortController.current?.abort();
+    cancelAgentDetailRequest();
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
     verificationOnlyAgentReload.current = false;
@@ -1409,9 +1330,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setBulkAccessAgentIds(undefined);
     setAgentDetail(undefined);
     setSingleAccessAgentDetail(undefined);
-    setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
-    setBusyAgentId(undefined);
     setBusyBulkAction(undefined);
     setExportChoiceOpen(false);
     setExportingPowerPlatformCsv(false);
@@ -1435,8 +1354,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setInventoryUnavailable(undefined);
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
-    agentDetailRequestId.current += 1;
-    agentDetailAbortController.current?.abort();
+    cancelAgentDetailRequest();
     agentInventoryQueries.clear();
     agentDetailsCache.current.clear();
     inventoryNavigation.current = { key: "" };
@@ -1522,29 +1440,35 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLoadingAgents(true);
     setError(undefined);
 
+    void readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision],
+      signal => getInventoryRefreshJobs({ signal }), controller.signal).then(history => {
+      if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
+      const latest = history.value.find(job => job.requestedTypes.includes("microsoft.copilotstudio/agents"));
+      if (latest) setPowerPlatformAgentRefreshJob(current => current === powerPlatformAgentRefreshJob ? latest : current);
+    }).catch(requestError => {
+      if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
+      if (isAccessDenied(requestError)) {
+        clearAgentState();
+        setInitialAgentReadOwner(principalKey);
+        setUnifiedAgentReadError(errorMessage(requestError));
+      }
+      setError(`Unable to load Power Platform agent refresh history: ${errorMessage(requestError)}`);
+    });
+
     try {
       const inventoryKey = JSON.stringify([principalKey, currentUnifiedAgentQuery()]);
       if (forceCurrentSnapshot || inventoryNavigation.current.key !== inventoryKey) {
         inventoryNavigation.current = { key: inventoryKey };
         if (agentPageIndex !== 0) setAgentPageIndex(0);
       }
-      const [unifiedResponse, inventoryRefreshJobs] = await Promise.all([
-        agentInventoryQueries.read(principalKey, {
-          ...currentUnifiedAgentQuery(),
-          limit: agentDisplayPageSize,
-          selectionId: inventoryNavigation.current.selectionId,
-          cursor: inventoryNavigation.current.cursor,
-        }, controller.signal),
-        readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision],
-          signal => getInventoryRefreshJobs({ signal }), controller.signal).catch(requestError => {
-          if (isAccessDenied(requestError)) throw requestError;
-          if (requestId === agentListRequestId.current && !controller.signal.aborted) {
-            setError(`Unable to load Power Platform agent refresh history: ${errorMessage(requestError)}`);
-          }
-          return undefined;
-        }),
-      ]);
+      const unifiedResponse = await agentInventoryQueries.read(principalKey, {
+        ...currentUnifiedAgentQuery(),
+        limit: agentDisplayPageSize,
+        selectionId: inventoryNavigation.current.selectionId,
+        cursor: inventoryNavigation.current.cursor,
+      }, controller.signal);
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
+      setInitialAgentReadOwner(principalKey);
       if ("state" in unifiedResponse) {
         invalidateAgentSelection();
         setInventoryUnavailable(unifiedResponse);
@@ -1560,20 +1484,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setUnifiedAgentPage(unifiedResponse);
       setUnifiedAgentReadError(undefined);
       setAgentExportError(current => current === agentExportError ? undefined : current);
-      const latestPowerPlatformAgentJob = inventoryRefreshJobs?.value.find((job) =>
-        job.requestedTypes.includes("microsoft.copilotstudio/agents"),
-      );
-      if (latestPowerPlatformAgentJob) {
-        // History must not replace a refresh, resume or poll result received while the read was in flight.
-        setPowerPlatformAgentRefreshJob(current =>
-          current === powerPlatformAgentRefreshJob ? latestPowerPlatformAgentJob : current);
-      }
       const graph = unifiedResponse.sources.graphPackages.observation;
       setLastAgentListRefreshAt(graph ? new Date(graph.observedAt) : undefined);
       setPackageSnapshotExpiresAt(graph ? new Date(graph.expiresAt) : undefined);
       agentDetailsCache.current.clear();
     } catch (requestError) {
       if (requestId === agentListRequestId.current && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+        if (!controller.signal.aborted) setInitialAgentReadOwner(principalKey);
         setInventoryUnavailable(undefined);
         if (isAccessDenied(requestError)) clearAgentState();
         else if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
@@ -1627,7 +1544,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!isCurrentAgentScope()) return;
     const count = matchingPackageSelection ? matchingPackageCount : selectedPackageCount;
     const selectionId = visibleUnifiedAgentPage?.selection?.id;
-    if (!selectionId || groupCountPending || count < 1 || count > 5000 || !user || sessionRevalidationInFlight.current) return;
+    if (!selectionId || loadingAgents || unifiedAgentReadError || groupCountPending
+      || count < 1 || count > 5000 || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
     setRefreshingAgents(true);
@@ -1655,7 +1573,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
       requestCurrentAgentReload();
     } catch (requestError) {
-      if (ownsPackageRefreshRequest(requestId, owner)) setError(errorMessage(requestError));
+      if (ownsPackageRefreshRequest(requestId, owner)) {
+        if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
+          invalidateAgentSelection();
+        }
+        setError(errorMessage(requestError));
+      }
     } finally {
       if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
     }
@@ -1713,10 +1636,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setQuery(nextQuery);
   }
 
-  async function handleViewAgentDetails(agent: Pick<CopilotPackage, "id">) {
-    if (!isCurrentAgentScope()) return;
+  function cancelAgentDetailRequest() {
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
+    setLoadingAgentDetailId(undefined);
+    setBusyAgentId(undefined);
+    return requestId;
+  }
+
+  async function handleViewAgentDetails(agent: Pick<CopilotPackage, "id">) {
+    if (!isCurrentAgentScope()) return;
+    const requestId = cancelAgentDetailRequest();
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
     const owner = principalKey;
@@ -1761,11 +1691,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleViewUnifiedAgentDetails(record: UnifiedAgentRecord) {
     if (!isCurrentAgentScope()) return;
-    const requestId = ++agentDetailRequestId.current;
-    agentDetailAbortController.current?.abort();
+    const requestId = cancelAgentDetailRequest();
     if (!ownsAgentFlowRequest(requestId, principalKey)) return;
     setUnifiedAgentDetailPage({ listPage: unifiedAgentPage, sourcePage: unifiedAgentPage });
-    setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
     setAgentDetail(undefined);
     setAgentPackageSelection(undefined);
@@ -1803,9 +1731,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   async function handleManageAgentAccess(agent: CopilotPackage, target: PackageAccessTarget = "availability") {
     if (!isCurrentAgentScope()) return;
-    const requestId = agentDetailRequestId.current + 1;
-    agentDetailRequestId.current = requestId;
-    agentDetailAbortController.current?.abort();
+    const requestId = cancelAgentDetailRequest();
 
     setAgentDetailError(undefined);
     setSingleAccessAgentDetail(undefined);
@@ -1840,11 +1766,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   ) {
     if (!isCurrentAgentScope()) return;
     const returnFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
-    const requestId = ++agentDetailRequestId.current;
-    agentDetailAbortController.current?.abort();
+    const requestId = cancelAgentDetailRequest();
     const owner = principalKey;
     if (loadingAgentDetailId) setRequestedAgentDetailId(undefined);
-    setLoadingAgentDetailId(undefined);
     setBusyAgentId(agent.id);
     setError(undefined);
     setPackageControlError(undefined);
@@ -1872,11 +1796,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!selectedUnifiedAgent?.packages.some(item => item.id === agent.id)) {
       throw new Error("This published version is no longer selected. Reopen the agent before changing access.");
     }
-    const requestId = ++agentDetailRequestId.current;
+    const requestId = cancelAgentDetailRequest();
     const owner = principalKey;
     if (!ownsAgentFlowRequest(requestId, owner)) return;
-    agentDetailAbortController.current?.abort();
-    setLoadingAgentDetailId(undefined);
     setBusyAgentId(agent.id);
     setAgentDetailError(undefined);
     setPackageControlError(undefined);
@@ -2030,13 +1952,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       return;
     }
 
-    const requestId = ++agentDetailRequestId.current;
-    agentDetailAbortController.current?.abort();
+    const requestId = cancelAgentDetailRequest();
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
     const owner = principalKey;
     if (loadingAgentDetailId) setRequestedAgentDetailId(undefined);
-    setLoadingAgentDetailId(undefined);
     setError(undefined);
     try {
       const targets = matchingPackageSelection ? { selectionId: matchingPackageSelection.id }
@@ -2152,7 +2072,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     setError(undefined);
     setBulkResult(undefined);
-    const requestId = ++agentDetailRequestId.current;
+    const requestId = cancelAgentDetailRequest();
 
     try {
       if (bulkAccessSelection) {
@@ -2391,8 +2311,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
-    agentDetailAbortController.current?.abort();
-    agentDetailRequestId.current += 1;
+    cancelAgentDetailRequest();
     setBulkConfirmation(undefined);
     setServerPackageSelection(undefined);
     if (values.search !== undefined) handleSearchQueryChange(values.search);
@@ -2417,8 +2336,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleClearAgentFilters() {
-    agentDetailAbortController.current?.abort();
-    agentDetailRequestId.current += 1;
+    cancelAgentDetailRequest();
     setBulkConfirmation(undefined);
     setServerPackageSelection(undefined);
     setPackageType(undefined);
@@ -2440,19 +2358,19 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleInventoryScopeChange(scope: UnifiedAgentInventoryScope) {
     if (scope === agentInventoryScope) return;
-    agentDetailRequestId.current += 1;
-    agentDetailAbortController.current?.abort();
     handleClearAgentFilters();
     setAgentInventoryScope(scope);
     setSelectedAgentIds(new Set());
     setPendingStoredAgentSelectionCount(undefined);
     setSelectionRouteNotice(undefined);
     setExportChoiceOpen(false);
-    setUnifiedAgentPage(undefined);
+    const cached = agentInventoryQueries.getCached(principalKey, {
+      inventoryScope: scope, sortBy: agentSortBy, sortDirection: agentSortDirection, limit: agentDisplayPageSize,
+    });
+    setUnifiedAgentPage(cached);
+    setLoadingAgents(!cached);
     setAgentDetail(undefined);
     setAgentDetailError(undefined);
-    setLoadingAgentDetailId(undefined);
-    setBusyAgentId(undefined);
     setSelectedUnifiedAgent(undefined);
     setUnifiedAgentDetailPage(undefined);
     setAgentPackageSelection(undefined);
@@ -2667,24 +2585,52 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           ? "Microsoft did not complete sign-in or permission setup. Retry or contact your tenant administrator." : undefined;
     return (
       <main className="signed-out">
-        <section className="signin-panel" aria-labelledby="signin-title">
-          <p className="eyebrow">Microsoft 365 Copilot administration</p>
-          <h1 id="signin-title">Agent Control</h1>
-          <p className="signin-lede">
-            Understand and manage your organization's AI agents in one place.
-          </p>
-          <p>
-            Discover agents across Microsoft 365 and Copilot Studio, explore
-            Copilot usage and service insights, and investigate activity. Make
-            informed decisions about adoption and access, with the controls to
-            take action.
-          </p>
-          {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
-          {error ? <div className="error-banner" role="alert">{error}</div> : null}
-          {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
-          {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
-          <SignInForm disabled={authSetup?.authConfigured === false} />
-        </section>
+        <header className="signin-header">
+          <div className="signin-brand">
+            <span className="brand-mark"><Bot size={21} aria-hidden="true" /></span>
+            <h1>Agent Control</h1>
+          </div>
+          <span className="signin-platforms">Microsoft 365 &amp; Copilot Studio</span>
+        </header>
+        <div className="signin-content">
+          <section className="signin-overview" aria-labelledby="signin-overview-title">
+            <p className="eyebrow">Your agent administration workspace</p>
+            <h2 id="signin-overview-title">Agent administration.<br /> A single workspace.</h2>
+            <p className="signin-lede">
+              Understand and manage your organization&apos;s AI agents,
+              from adoption to access.
+            </p>
+            <ul className="signin-capabilities">
+              <li>
+                <span className="signin-capability-icon"><Bot size={20} aria-hidden="true" /></span>
+                <div><h3>Know your agent inventory</h3><p>Discover agents, owners, and environments across Microsoft 365 and Copilot Studio.</p></div>
+              </li>
+              <li>
+                <span className="signin-capability-icon"><BarChart3 size={20} aria-hidden="true" /></span>
+                <div><h3>Understand adoption</h3><p>Review Copilot licenses, usage, and agent activity.</p></div>
+              </li>
+              <li>
+                <span className="signin-capability-icon"><ShieldCheck size={20} aria-hidden="true" /></span>
+                <div><h3>Manage access and investigate</h3><p>Control agent access and investigate activity with Purview and Defender.</p></div>
+              </li>
+            </ul>
+          </section>
+          <section className="signin-panel" aria-labelledby="signin-title">
+            <div className="signin-panel-heading">
+              <h2 id="signin-title">Sign in</h2>
+              <p>Use your work or school account to continue.</p>
+            </div>
+            {authorizationNotice ? <p className="signin-notice" role="status">{authorizationNotice}</p> : null}
+            {error ? <div className="error-banner" role="alert">{error}</div> : null}
+            {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
+            {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
+            <SignInForm disabled={authSetup?.authConfigured === false} />
+            <div className="signin-trust">
+              <ShieldCheck size={18} aria-hidden="true" />
+              <p>Authentication is handled by Microsoft Entra ID. Your organization&apos;s access policies apply.</p>
+            </div>
+          </section>
+        </div>
         <AppFooter />
       </main>
     );
@@ -2800,7 +2746,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           active={visibleActiveView === "sync"}
           onOpenSync={visibleActiveView !== "sync" && visibleActiveView !== "permissions" ? () => navigateToView("sync") : undefined}
           automaticRefresh={automaticRefresh}
-          onSetupRequiredChange={handleSyncSetupRequiredChange}
+          onSetupStatusChange={handleSyncSetupStatusChange}
           onRunsChanged={handleSyncRunsChanged}
           requestedRunId={requestedDataSyncRunId}
           onOpenUsageImport={() => openUsageImport()}
@@ -2838,7 +2784,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           label="Prepare inventory CSV" autoStart onSelectionInvalidated={handleInventoryExportInvalidation}
           onPendingChange={inventoryExport.kind === "power_platform_agents" ? setExportingPowerPlatformCsv : setExportingCsv} />
       </div> : null}
-      {blockingFirstSync ? null : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
+      {blockingWorkspace ? syncSetupStatus === "checking"
+        && (visibleActiveView === "agents" || visibleActiveView === "users" || visibleActiveView === "audit")
+        ? <WorkspaceSkeleton view={visibleActiveView} showSummary={visibleActiveView === "users" ? usersRoute.view !== "activity"
+          : visibleActiveView === "audit" || canReadSensitiveUsage} /> : null
+        : visibleActiveView === "agents" && hasRole(user, "AgentControl.Viewer")
+          && initialAgentReadOwner !== principalKey
+          ? <WorkspaceSkeleton view="agents" showSummary={canReadSensitiveUsage} />
+        : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>
             <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} owner={principalKey} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
@@ -2861,6 +2814,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             </div>
             {canReadSensitiveUsage ? <AgentInventoryScopes
               inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}
+              loading={loadingAgents}
               value={agentInventoryScope} onChange={handleInventoryScopeChange} /> : null}
             <div className="agent-catalog-actions">
               <span className="last-refresh" aria-live="polite">
@@ -2895,6 +2849,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
           {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
             inventory={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage} revision={officialUsageDashboardRevision}
+            loadingInventory={loadingAgents}
             inventoryScope={agentInventoryScope}
             reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
               principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
@@ -3085,7 +3040,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
-      {!blockingFirstSync && selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
+      {!blockingWorkspace && selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
           selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}
@@ -3093,7 +3048,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onOpenPerson={personId => {
             if (!ownsAgentScope(principalKey)) return;
             navigateToView("users");
-            handleUsersRouteChange({ view: "responsibility", personId, search: "", page: 0 });
+            handleUsersRouteChange({ view: "licenses", detailId: personId, detailTab: "responsibility", search: "", page: 0 }, true);
           }}
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
           inventoryRevision={unifiedAgentDetailPage?.sourcePage?.selection.revision}
@@ -3108,23 +3063,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           dataRevision={officialUsageDashboardRevision}
           activeTab={agentDetailTab}
           onTabChange={tab => {
-            if (busyAgentId) {
-              agentDetailRequestId.current += 1;
-              agentDetailAbortController.current?.abort();
-              setBusyAgentId(undefined);
-            }
+            if (busyAgentId) cancelAgentDetailRequest();
             setAgentDetailTab(tab);
           }}
           roles={user?.roles ?? []}
           onClose={() => {
-            agentDetailRequestId.current += 1;
-            agentDetailAbortController.current?.abort();
-            setLoadingAgentDetailId(undefined);
+            cancelAgentDetailRequest();
             setAgentDetail(undefined);
             setSelectedUnifiedAgent(undefined);
             setAgentPackageSelection(undefined);
             setRequestedAgentDetailId(undefined);
-            setBusyAgentId(undefined);
             if (inlinePackageConfirmation) setBulkConfirmation(undefined);
           }}
           onInspectPackage={item => {
@@ -3164,7 +3112,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           initialStatus={singleAccessTarget === "availability" ? singleAccessAgentDetail.availableTo : singleAccessAgentDetail.deployedTo}
           initialPrincipals={singleAccessTarget === "availability" ? singleAccessAgentDetail.allowedUsersAndGroups : singleAccessAgentDetail.acquireUsersAndGroups}
           onCancel={() => {
-            agentDetailRequestId.current += 1;
+            cancelAgentDetailRequest();
             setSingleAccessAgentDetail(undefined);
           }}
           onSubmit={async (update) => {
@@ -3180,7 +3128,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           context="bulk"
           agentCount={bulkAccessSelection?.count ?? bulkAccessAgentIds.length}
           onCancel={() => {
-            agentDetailRequestId.current += 1;
+            cancelAgentDetailRequest();
             setBulkAccessAgentIds(undefined);
             setBulkAccessSelection(undefined);
           }}

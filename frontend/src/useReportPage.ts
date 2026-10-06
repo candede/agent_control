@@ -1,20 +1,23 @@
 import { useContext, useEffect, useId, useState } from "react";
-import { QueryClientContext, type QueryClient, type QueryKey } from "@tanstack/react-query";
+import { useQuery, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { CapabilityContext } from "./capabilityContext";
 import { ApiError } from "./api/client";
 import { readReportPage, type ReportPageRequest } from "./api/reportData";
-import { useSavedQuery } from "./savedQueries";
+import { useSavedQueryClient } from "./savedQueries";
 import type { ReportListPage, ReportPage } from "../../backend/src/types/officialReportData";
 
 const cohortCacheMs = 30_000;
+const retainedPagePaths = new Set([
+  "copilot-usage/users", "official-usage/users", "official-usage/overview", "official-usage/history/options",
+]);
 // Cache-owned key objects keep retirement alive across responses, but not beyond query collection.
 const retiredCaptures = new WeakMap<QueryKey, object>();
 
-function invalidateReportPages(client: QueryClient | undefined, key: string, revision: number, excludeRestartKey?: string | number) {
-  for (const cached of client?.getQueryCache().findAll({
+function invalidateReportPages(client: QueryClient, key: string, revision: number, excludeRestartKey?: string | number) {
+  for (const cached of client.getQueryCache().findAll({
     queryKey: ["saved", "record-page", key, revision],
     predicate: query => query.queryKey[4] !== excludeRestartKey,
-  }) ?? []) {
+  })) {
     retiredCaptures.set(cached.queryKey, {});
     cached.invalidate();
   }
@@ -24,7 +27,8 @@ async function readCurrentReportPage<T, Page extends ReportListPage<T>>(path: st
   const retirement = retiredCaptures.get(cachedKey);
   const result = await readReportPage<T, Page>(path, request, signal);
   signal.throwIfAborted();
-  if (request.selectionId && result.selection.id !== request.selectionId || request.setId && result.reports.setId !== request.setId) {
+  if (request.selectionId && result.selection.id.toLowerCase() !== request.selectionId.toLowerCase()
+    || request.setId && result.reports.setId?.toLowerCase() !== request.setId.toLowerCase()) {
     throw new ApiError(409, "selection_invalidated", "The returned evidence does not match the requested selection.");
   }
   const expiresAt = Date.parse(result.selection.expiresAt);
@@ -42,7 +46,7 @@ export function useReportPrincipalScope() {
 
 export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>(path: string, query: ReportPageRequest = {}, revision = 0, enabled = true, restartParent?: () => void) {
   const scope = useReportPrincipalScope();
-  const client = useContext<QueryClient | undefined>(QueryClientContext);
+  const client = useSavedQueryClient();
   const owner = useId();
   const key = JSON.stringify([scope, path, query, query.selectionId ? undefined : revision]);
   const [highestRevision, setHighestRevision] = useState(revision);
@@ -51,7 +55,8 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const [manualRetry, setManualRetry] = useState<{ key: string; token: object }>();
   const [automaticallyRestartedThrough, setAutomaticallyRestartedThrough] = useState(-1);
   const [now, setNow] = useState(Date.now);
-  const current = navigation.key === key ? navigation : { key, restart: navigation.restart + 1, shared: revision > highestRevision };
+  const reusablePage = retainedPagePaths.has(path) && !query.selectionId;
+  const current = navigation.key === key ? navigation : { key, restart: navigation.restart + 1, shared: reusablePage || revision > highestRevision };
   if (revision > highestRevision) setHighestRevision(revision);
   if (navigation.key !== key) {
     setNavigation(current);
@@ -60,14 +65,13 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const selectionId = current.selectionId ?? (captured?.key === key && captured.restart === current.restart ? captured.id : undefined);
   const request = { ...query, ...(selectionId ? { selectionId } : {}),
     ...(current.cursor ? { cursor: current.cursor } : {}), limit: query.limit ?? 50 };
-  // A new revision can share its first capture; revisits and restarts stay observer-owned.
+  // Recent top-level reads can be reused; explicit restarts and details stay observer-owned.
   const restartKey = current.shared ? 0 : `${owner}:${current.restart}`;
-  const retain = enabled && restartKey === 0 && !query.selectionId && !current.cursor
-    && (path === "copilot-usage/users" || path === "official-usage/users");
+  const retain = enabled && restartKey === 0 && reusablePage && !current.cursor;
   const queryKey = ["saved", "record-page", key, revision, restartKey, current.selectionId, current.cursor, enabled];
   const retryKey = JSON.stringify(queryKey);
   if (manualRetry && manualRetry.key !== retryKey) setManualRetry(undefined);
-  const read = useSavedQuery<Page>({
+  const read = useQuery<Page>({
     queryKey,
     queryFn: ({ signal, queryKey: cachedKey }) => readCurrentReportPage<T, Page>(path, request, signal, cachedKey), enabled,
     placeholderData: (previous, previousQuery) => previousQuery?.queryKey[2] === key
@@ -77,7 +81,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       Date.parse(cached.state.data?.selection.expiresAt ?? "") - cached.state.dataUpdatedAt) || 0) : Infinity,
     gcTime: retain ? cohortCacheMs : 0,
     meta: { retainReportPage: retain },
-  });
+  }, client);
   const refetch = read.refetch;
   useEffect(() => {
     if (!enabled) return;
@@ -86,7 +90,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     return () => window.removeEventListener("focus", revalidate);
   }, [enabled, refetch]);
   const awaitingCapture = captured?.key !== key || captured.restart !== current.restart;
-  const retiredCapture = retain && awaitingCapture && Boolean(client?.getQueryCache().find({
+  const retiredCapture = retain && awaitingCapture && Boolean(client.getQueryCache().find({
     queryKey, exact: true, predicate: cached => retiredCaptures.has(cached.queryKey),
   }));
   if (read.data && !read.isFetching && !retiredCapture && (awaitingCapture || captured?.id !== read.data.selection.id)) {
@@ -120,6 +124,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   return {
     data, loading: enabled && (read.isPending || read.isFetching || recovering),
     error: recovering ? null : error, invalidated: invalidated && !recovering,
+    recoveryRevision: automaticallyRestartedThrough,
     next: () => move(data?.page.nextCursor), previous: () => move(data?.page.previousCursor),
     restartable: !query.selectionId || Boolean(restartParent),
     restart: () => {

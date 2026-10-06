@@ -46,6 +46,12 @@ Normal start does **not** run the regression suite or create a test database. It
 
 Open **[http://localhost:3001](http://localhost:3001)** and sign in with your work or school account. If you choose another port, update the redirect URI and use that port in the browser.
 
+The sign-in page remembers your last email on this browser after Microsoft sign-in
+is started, so you do not need to enter it on every visit. You can edit it to use
+another account. Uncheck **Remember my email on this browser** on shared devices;
+this immediately removes the saved email and retains your opt-out. This preference
+does not keep you signed in or save credentials.
+
 ## Using the app
 
 Start with **Permissions** to check access, then **Sync** to collect your first inventory.

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { observeDataWork } from "../services/dataMetrics.js";
 import { measurePublication } from "../services/peakMemory.js";
-import { BatchResidency, assertResidualDatabaseBounds, dataAdmissionError, dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { BatchResidency, assertResidualBytes, assertResidualDatabaseBounds, dataAdmissionError, dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { dataConnections } from "./dataConnections.js";
 import { admitGeneration } from "./generationAdmission.js";
 import type { CopilotServicePlan, CopilotServiceState, CopilotServiceSummaryState } from "../types/copilotUsage.js";
@@ -51,7 +51,7 @@ export function prepareGenerationBatch(lease: GenerationLease, rows: readonly Re
   try {
     const records = rows.map(row => {
       const bytes = Buffer.byteLength(JSON.stringify(row.residual));
-      if (bytes > dataLimits.residualBytes) throw dataLimitError("data_residual_bytes", dataLimits.residualBytes, bytes);
+      assertResidualBytes(bytes, "generation_batch");
       return { ...row, content_hash: digest(JSON.stringify(row)), schema_version: lease.schemaVersion };
     });
     releaseNormalized = residency.track(records);

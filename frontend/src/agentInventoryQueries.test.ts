@@ -91,6 +91,149 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(5);
   });
 
+  it("reuses the first page under its pinned selection without a duplicate read", async () => {
+    const query = { inventoryScope: "catalog" as const, limit: 50 };
+    const first = await queries.read("owner", query, signal());
+    if ("state" in first) throw new Error("Expected inventory");
+    const pinned = { ...query, selectionId: first.selection.id };
+    expect(queries.getCached("owner", pinned)).toBe(first);
+    expect(await queries.read("owner", pinned, signal())).toBe(first);
+    expect(read).toHaveBeenCalledOnce();
+    vi.advanceTimersByTime(30_001);
+    expect(queries.getCached("owner", pinned)).toBeUndefined();
+    await queries.read("owner", pinned, signal());
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not return a recaptured selection under the old pinned request key", async () => {
+    const original = page();
+    const refreshed = { ...page(), selection: { ...page().selection, id: "new-selection" } };
+    read.mockResolvedValueOnce(original).mockResolvedValueOnce(refreshed);
+    const pinned = { selectionId: original.selection.id };
+    await queries.read("owner", pinned, signal());
+    vi.advanceTimersByTime(30_001);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(refreshed);
+
+    expect(queries.getCached("owner", pinned)).toBeUndefined();
+    const cached = queries.getCached("owner", {});
+    expect(cached).toEqual(refreshed);
+    expect(queries.getCached("owner", { selectionId: refreshed.selection.id })).toBe(cached);
+    read.mockResolvedValueOnce(original);
+    await expect(queries.read("owner", pinned, signal())).resolves.toBe(original);
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not let a cached read restore a replaced selection family", async () => {
+    const original = page();
+    const replacement = { ...page(), selection: { ...page().selection, id: "replacement-selection" } };
+    read.mockResolvedValueOnce(original).mockResolvedValueOnce(replacement);
+    const pinned = { selectionId: original.selection.id };
+    await queries.read("owner", pinned, signal());
+
+    const superseded = expect(queries.read("owner", pinned, signal())).rejects.toMatchObject({
+      code: "request_aborted", kind: "aborted",
+    });
+    const current = expect(queries.read("owner", { selectionId: replacement.selection.id }, signal())).resolves.toBe(replacement);
+    await Promise.all([superseded, current]);
+    expect(queries.getCached("owner", {})).toBe(replacement);
+    expect(queries.getCached("owner", pinned)).toBeUndefined();
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an old family's abort cancel a re-admitted read of the same selection", async () => {
+    read.mockImplementationOnce(() => new Promise(() => {}))
+      .mockImplementationOnce(() => new Promise(() => {}));
+    const original = new AbortController();
+    const pinned = { selectionId: page().selection.id };
+    const superseded = expect(queries.read("owner", pinned, original.signal)).rejects.toMatchObject({
+      code: "request_aborted",
+    });
+    const replaced = expect(queries.read("owner", { selectionId: "replacement-selection" }, signal())).rejects.toMatchObject({
+      code: "request_aborted",
+    });
+    const current = expect(queries.read("owner", pinned, signal())).resolves.toEqual(page());
+    original.abort();
+
+    await Promise.all([superseded, replaced, current]);
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(read.mock.calls[2][1]?.signal?.aborted).toBe(false);
+    expect(queries.getCached("owner", pinned)).toEqual(page());
+  });
+
+  it("cancels an unfinished capture when an explicit selection replaces its family", async () => {
+    read.mockImplementationOnce(() => new Promise(() => {}));
+    const capturing = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({
+      code: "request_aborted",
+    });
+    const pinned = { selectionId: page().selection.id };
+    const current = expect(queries.read("owner", pinned, signal())).resolves.toEqual(page());
+
+    await Promise.all([capturing, current]);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(read.mock.calls[1][1]?.signal?.aborted).toBe(false);
+    expect(queries.getCached("owner", pinned)).toEqual(page());
+  });
+
+  it("keeps recent catalog and Power Platform families with their own filters and selection pins", async () => {
+    read.mockImplementation(async query => ({
+      ...page(), inventoryScope: query?.inventoryScope ?? "catalog",
+      selection: { ...page().selection, id: `${query?.inventoryScope}:${query?.search ?? ""}` },
+    }));
+    const catalog = { inventoryScope: "catalog" as const, limit: 50 };
+    const platform = { inventoryScope: "power_platform_only" as const, limit: 50 };
+    const first = await queries.read("owner", catalog, signal());
+    const second = await queries.read("owner", platform, signal());
+    await queries.read("owner", { ...catalog, search: "filtered" }, signal());
+    expect(queries.getCached("owner", catalog)).toBe(first);
+    expect(queries.getCached("owner", platform)).toBe(second);
+    expect(await queries.read("owner", catalog, signal())).toBe(first);
+    expect(await queries.read("owner", platform, signal())).toBe(second);
+    expect(read).toHaveBeenCalledTimes(3);
+    queries.clear();
+    expect(queries.getCached("owner", catalog)).toBeUndefined();
+    expect(queries.getCached("other-owner", platform)).toBeUndefined();
+    await queries.read("owner", catalog, signal());
+    expect(read).toHaveBeenCalledTimes(4);
+  });
+
+  it("bounds retained inventory families and evicts the least recently used family", async () => {
+    for (let index = 0; index < 4; index++) await queries.read("owner", { search: String(index) }, signal());
+    await queries.read("owner", { search: "0" }, signal());
+    await queries.read("owner", { search: "4" }, signal());
+    expect(read).toHaveBeenCalledTimes(5);
+    expect(queries.getCached("owner", { search: "0" })).toBeDefined();
+    expect(queries.getCached("owner", { search: "1" })).toBeUndefined();
+    await queries.read("owner", { search: "1" }, signal());
+    expect(read).toHaveBeenCalledTimes(6);
+  });
+
+  it("does not recreate an evicted family while an expired read awaits invalidation", async () => {
+    read.mockResolvedValueOnce(page("2026-09-20T12:00:05.000Z"));
+    await queries.read("owner", { search: "expired" }, signal());
+    vi.advanceTimersByTime(5_000);
+
+    const evicted = expect(queries.read("owner", { search: "expired" }, signal())).rejects.toMatchObject({
+      code: "request_aborted", kind: "aborted",
+    });
+    await Promise.all([evicted, ...Array.from({ length: 4 }, (_, index) =>
+      queries.read("owner", { search: String(index) }, signal()))]);
+    expect(read).toHaveBeenCalledTimes(5);
+    expect(queries.getCached("owner", { search: "expired" })).toBeUndefined();
+    for (let index = 0; index < 4; index++) {
+      expect(queries.getCached("owner", { search: String(index) })).toBeDefined();
+    }
+  });
+
+  it("clears every retained family on access denial", async () => {
+    await queries.read("owner", { inventoryScope: "catalog" }, signal());
+    await queries.read("owner", { inventoryScope: "power_platform_only" }, signal());
+    read.mockRejectedValueOnce(new ApiError(403, "forbidden", "Access denied."));
+    await expect(queries.read("owner", { search: "new" }, signal())).rejects.toMatchObject({ status: 403 });
+    expect(queries.getCached("owner", { inventoryScope: "catalog" })).toBeUndefined();
+    expect(queries.getCached("owner", { inventoryScope: "power_platform_only" })).toBeUndefined();
+  });
+
   it.each(["not_collected", "preparing"] as const)("does not pin or retain a %s result as an empty inventory", async state => {
     const unavailable = { state, message: "Waiting for inventory." };
     read.mockResolvedValueOnce(unavailable);
@@ -162,7 +305,7 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(7);
     await queries.read("owner", { selectionId: selected, publisher: "different-filter" }, signal());
     await queries.read("owner", { selectionId: selected, cursor: "forward-2" }, signal());
-    expect(read).toHaveBeenCalledTimes(9);
+    expect(read).toHaveBeenCalledTimes(8);
   });
 
   it("separates quick-view and independent evidence filters in the saved query cache", async () => {
@@ -219,6 +362,22 @@ describe("AgentInventoryQueries", () => {
 
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
     await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ selection: { revision: "1" } });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a cache hit that expires before the async read completes", async () => {
+    read.mockResolvedValueOnce(page("2026-09-20T12:00:05.000Z"));
+    await queries.read("owner", {}, signal());
+    vi.advanceTimersByTime(4_999);
+
+    const expired = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({
+      status: 409, code: "inventory_changed",
+    });
+    vi.advanceTimersByTime(1);
+    await expired;
+    expect(read).toHaveBeenCalledOnce();
+    expect(queries.getCached("owner", {})).toBeUndefined();
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(page());
     expect(read).toHaveBeenCalledTimes(2);
   });
 

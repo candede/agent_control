@@ -67,9 +67,10 @@ function sourceUser(n: number, state: CopilotServiceSummaryState = "enabled"): C
   ...(state === "partially_enabled" ? [{ servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS",
     displayName: "Teams", state: "disabled" as const, capabilityStatus: null, assignedDateTime: null }] : [])] };
 }
-async function directory(database: Parameters<typeof saveUsageInventory>[0], identity: SelectionIdentity, users: CopilotDirectoryUser[]) {
+async function directory(database: Parameters<typeof saveUsageInventory>[0], identity: SelectionIdentity, users: CopilotDirectoryUser[], expiresAt?: Date) {
   const stages = new UserSourceStages(database);
-  return stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+  return stages.execute(generationInput({ ...(expiresAt ? { expiresAt } : {}),
+    scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
     const key = await stages.query(lease, "discovery", "synthetic:combined");
     await stages.page(lease, key, "synthetic:combined", users.length, users.length);
     for (let n = 0; n < users.length; n += 250) await stages.directory(lease, key, users.slice(n, n + 250));
@@ -81,6 +82,63 @@ describe("live selected users and reports", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
   beforeAll(async () => { fixture = await testDatabase(); }, 30_000);
   afterAll(async () => { await fixture?.close(); });
+
+  it.each(["running", "failed", "permission_required", "waiting_authorization"] as const)(
+    "keeps valid saved license metrics during a running refresh but preserves %s attempt semantics",
+    async status => {
+      const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
+      await directory(fixture.runtime, identity, [sourceUser(1), sourceUser(2, "disabled")]);
+      await publish(new OfficialReportImports(fixture.runtime), identity, {
+        users: [`user1@example.invalid,One,1,5,${today}`, `user2@example.invalid,Two,1,3,${today}`],
+        agents: [`agent,Agent,User,1,1,8,${today}`],
+        userAgents: [`agent,Agent,User,user1@example.invalid,5,${today}`, `agent,Agent,User,user2@example.invalid,3,${today}`],
+      });
+      const generations = new DataGenerations(fixture.runtime);
+      const lease = await generations.begin(generationInput({
+        scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId },
+      }));
+      try {
+        await fixture.runtime.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source,status)
+          VALUES($1,$2,$3,'directory',$4)`, [lease.id, lease.scopeId, identity.tenantId, status]);
+        const reader = new LargeTenantUsersReports(fixture.runtime, secret, 30);
+        const selection = await reader.capture(identity, "delegated", "copilot_users", { cohort: "licensed" });
+        const saved = await reader.page(selection.id, identity);
+        expect(saved.sources.directory).toMatchObject({ state: status === "running" ? "available" : "partial", attemptStatus: status, rowCount: 2 });
+        expect(saved.summary).toMatchObject({
+          licensedUsers: status === "running" ? 1 : null, usingAgentsUsers: status === "running" ? 1 : null,
+          noAgentActivityUsers: status === "running" ? 0 : null,
+        });
+        expect(saved.value).toHaveLength(1);
+        const unpaid = await reader.capture(identity, "delegated", "official_users", { licenseCohort: "active_without_paid" });
+        expect((await reader.page(unpaid.id, identity)).value).toHaveLength(status === "running" ? 1 : 0);
+      } finally { await generations.abort(lease); }
+    },
+  );
+
+  it.each(["missing", "expired"])("does not invent license metrics when a refresh has %s saved directory evidence", async evidence => {
+    const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
+    if (evidence === "expired") {
+      const expiresAt = new Date(Date.now() + 5_000);
+      await directory(fixture.runtime, identity, [sourceUser(1)], expiresAt);
+      await vi.waitFor(async () => {
+        const result = await fixture.runtime.query("SELECT clock_timestamp()>$1::timestamptz AS expired", [expiresAt]);
+        expect(result.rows[0].expired).toBe(true);
+      }, { timeout: 6_000 });
+    }
+    const generations = new DataGenerations(fixture.runtime);
+    const lease = await generations.begin(generationInput({
+      scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId },
+    }));
+    try {
+      await fixture.runtime.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source)
+        VALUES($1,$2,$3,'directory')`, [lease.id, lease.scopeId, identity.tenantId]);
+      const reader = new LargeTenantUsersReports(fixture.runtime, secret, 30);
+      const selection = await reader.capture(identity, "delegated", "copilot_users");
+      const saved = await reader.page(selection.id, identity);
+      expect(saved.sources.directory).toMatchObject({ state: "unavailable", attemptStatus: "running", generationId: null });
+      expect(saved.summary.licensedUsers).toBeNull();
+    } finally { await generations.abort(lease); }
+  }, 10_000);
 
   it.each(["official_users","official_agents","relationships"] as const)("bounds warm %s name pages without truncating wide names or cursor order",async endpoint => {
     const identity = { ...selectionIdentity,tenantId: randomUUID(),principalId: randomUUID() };

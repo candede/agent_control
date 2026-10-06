@@ -117,7 +117,11 @@ test("users reuse the Agents summary strip and integrated table design at every 
   const surfaceProperties = ["border", "border-radius", "background-color", "box-shadow"];
   const cellProperties = ["padding", "font-size", "font-weight", "color", "background-color", "border-bottom", "text-transform"];
   const textProperties = ["font-size", "font-weight", "color", "line-height"];
-  for (const width of info.project.name === "desktop" ? [1920, 1280, 1000, 768] : [360]) {
+  const verticalBounds = (locator: Locator) => locator.evaluate(element => {
+    const { y, height } = element.getBoundingClientRect();
+    return { y, height };
+  });
+  for (const width of info.project.name === "desktop" ? [1920, 1440, 1280, 1160, 1000, 768] : [360]) {
     await page.setViewportSize({ width, height: 1000 });
     await page.goto("/agents");
     const agents = page.locator(".agent-workspace");
@@ -137,11 +141,38 @@ test("users reuse the Agents summary strip and integrated table design at every 
       filters: await styles(agents.locator(".agent-filter-trigger"), ["min-height", "font-size", "border", "border-radius"]),
       search: await styles(agents.locator(".agent-search-field"), surfaceProperties),
     };
-    await page.goto("/users");
+    const referenceBounds = {
+      heading: await verticalBounds(agents.locator(".agent-catalog-heading")),
+      title: await verticalBounds(agents.getByRole("heading", { name: /^Agents/ })),
+      summary: await verticalBounds(agents.locator(".agent-overview-metrics")),
+      card: await verticalBounds(agents.locator(".metric").first()),
+      tableSurface: await verticalBounds(agents.locator(".agent-table-stack")),
+      table: await verticalBounds(agents.locator(".table-shell")),
+    };
+    await page.getByRole("button", { name: "Users", exact: true }).click();
     const users = page.locator(".copilot-users");
     const summary = users.getByRole("group", { name: "M365 Copilot license summary" });
     const surface = users.locator(".user-directory-table");
     await expect(surface.locator("tbody tr").first()).toBeVisible();
+    if (width > 760) {
+      const userBounds = {
+        heading: await verticalBounds(users.locator(".copilot-users-header")),
+        title: await verticalBounds(users.getByRole("heading", { name: "Users & adoption", exact: true })),
+        summary: await verticalBounds(summary),
+        card: await verticalBounds(summary.locator(".metric").first()),
+        tableSurface: await verticalBounds(surface),
+        table: await verticalBounds(surface.locator(".table-shell")),
+      };
+      await info.attach(`page-alignment-${width}`, {
+        body: JSON.stringify({ agents: referenceBounds, users: userBounds }), contentType: "application/json",
+      });
+      for (const key of ["heading", "title", "summary", "card", "tableSurface"] as const) {
+        for (const dimension of key === "tableSurface" ? ["y"] as const : ["y", "height"] as const) {
+          expect.soft(Math.abs(userBounds[key][dimension] - referenceBounds[key][dimension]), `${width}px ${key}.${dimension}`).toBeLessThanOrEqual(1);
+        }
+      }
+      if (width > 1150) expect.soft(Math.abs(userBounds.table.y - referenceBounds.table.y), `${width}px table.y`).toBeLessThanOrEqual(1);
+    }
     expect(await styles(summary, surfaceProperties)).toEqual(reference.strip);
     expect(await styles(summary.locator(".metric").first(), ["padding", "gap", "border-right", "border-radius", "background-color"])).toEqual(reference.metric);
     expect(await styles(summary.locator(".metric > span").first(), textProperties)).toEqual(reference.label);
@@ -341,7 +372,7 @@ test("no reported activity includes identifiable absence and follows the selecte
   const detail = page.getByRole("dialog", { name: "Drew", exact: true });
   await expect(detail.getByText("No reported agent activity", { exact: true })).toBeVisible();
   await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
-  await expect(detail.getByText("No agent relationships match.", { exact: true })).toBeVisible();
+  await expect(detail.getByText("No agent activity in the selected reports.", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   fixture.value[3] = selectedLicensedUser(4, "Drew", 20);
   fixture.reports = { ...fixture.reports, setId: "70000000-0000-4000-8000-000000000007",
@@ -378,7 +409,7 @@ test("paid users remain searchable beyond four thousand without exposing checked
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
   await expect(cohort).toHaveValue("licenses");
-  await expect(cohort.locator("option")).toHaveText(["Paid M365 Copilot users", "Active users without paid Copilot", "Agent responsibility"]);
+  await expect(cohort.locator("option")).toHaveText(["Paid M365 Copilot users", "Active users without paid Copilot"]);
   const active = page.getByText("Active M365 Copilot licensed users", { exact: true }).locator("..");
   await expect(active.locator("strong")).toHaveText("4,053");
   await expect(table.locator("tbody tr")).toHaveCount(50);

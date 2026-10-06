@@ -12,7 +12,7 @@ export function responsibilityFixture(objectId?: string): AgentResponsibilityPag
     selection: { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", revision: "a".repeat(64),
       evaluatedAt: "2026-09-12T10:00:00Z", expiresAt: "2099-09-12T10:00:00Z" },
     counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
-    coverage: "partial", unknownAgentCount: 1, invalidReferenceCount: 0,
+    invalidReferenceCount: 0,
     sources: {
       graphPackages: { state: "unavailable", observation: null, error: { source: "graph_packages", code: "snapshot_unavailable", message: "No saved packages." } },
       powerPlatform: { state: "partial", observation: {

@@ -127,6 +127,23 @@ describe("inventory HTTP selected-read boundary", () => {
     if (server) await new Promise<void>(resolve => server.close(() => resolve()));
     await fixture?.close();
   });
+  it("keeps unavailable responsibility explicit when only the Graph catalog is available", async () => {
+    const objectId = randomUUID();
+    await fixture.runtime.query(`INSERT INTO agent_people_cache(tenant_id,principal_id,object_id,revision,status,
+      display_name,user_principal_name,checked_at,resolved_at,expires_at)
+      VALUES($1,$2,$3,$4,'resolved','Saved person',NULL,clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '10 minutes')`,
+    [config.tenants[0].tenantId, principalId, objectId, randomUUID()]);
+    const response = await fetch(`${base}/agent-responsibility?objectId=${objectId}`, { headers: { cookie } });
+    expect(response.status, await response.clone().text()).toBe(200);
+    const result = await response.json();
+    expect(result).toMatchObject({
+      sources: { graphPackages: { state: "available" }, powerPlatform: { state: "unavailable" } },
+      selected: { state: "unavailable", count: 0, agents: [], person: { objectId } },
+      invalidReferenceCount: 0,
+    });
+    expect(result).not.toHaveProperty("coverage");
+    expect(result).not.toHaveProperty("unknownAgentCount");
+  });
   it("distinguishes first-login availability from an empty published inventory and real invalidation", async () => {
     const freshPrincipal = randomUUID(), sessionId = randomUUID();
     const signature = createHmac("sha256", config.sessionSecret).update(sessionId).digest("base64").replace(/=+$/g, "");
@@ -578,7 +595,7 @@ describe("inventory HTTP selected-read boundary", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_keys WHERE generation_id=(SELECT id FROM data_generations WHERE job_id=$1)", [job.id])).rows[0].count).toBe(21);
   });
 
-  it("selects counted responsibility and exact people evidence in SQL with independently pinned agent pages", async () => {
+  it("keeps responsibility source health independent of missing roles and invalid references while paging exact people", async () => {
     const a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const c = "cccccccc-cccc-4ccc-8ccc-cccccccccccc", d = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     const type = "microsoft.copilotstudio/agents";
@@ -594,6 +611,7 @@ describe("inventory HTTP selected-read boundary", () => {
         { name: "Shared", owner: a, creator: a, modifier: "invalid-reference" },
         { name: "Zülü", owner: b, creator: c, modifier: null },
         { name: "Tail", owner: a, creator: c, modifier: b },
+        { name: "Unreported roles", owner: null, creator: null, modifier: null },
       ].map((value, index) => powerPlatformInventoryRecord({
         sourceSystem: "power_platform", nativeId: `responsibility-${index}`, type, environmentId: "owner-environment",
         tenantId: input.scope.tenantId, displayName: value.name, location: null, createdAt: null, createdBy: value.creator,
@@ -627,7 +645,8 @@ describe("inventory HTTP selected-read boundary", () => {
     const inventoryResponse = await fetch(`${base}/agent-inventory?source=power_platform&limit=50`, { headers: { cookie } });
     expect(inventoryResponse.status, await inventoryResponse.clone().text()).toBe(200);
     const inventoryPage = await inventoryResponse.json();
-    expect(inventoryPage.value).toHaveLength(4);
+    expect(inventoryPage.value).toHaveLength(5);
+    expect(inventoryPage.value).toContainEqual(expect.objectContaining({ displayName: "Unreported roles" }));
     const tail = inventoryPage.value.find((row: { displayName: string }) => row.displayName === "Tail");
     expect(tail).toMatchObject({
       environment: { id: "owner-environment", displayName: "Saved owner environment", region: "europe",
@@ -652,7 +671,9 @@ describe("inventory HTTP selected-read boundary", () => {
     expect(first.counts).toEqual({ total: 3, filtered: 3 });
     expect(first.people).toEqual([{ objectId: a, agentCount: 3, roles: ["owner", "createdBy"],
       evidence: expect.objectContaining({ objectId: a, displayName: "Same", userPrincipalName: null, status: "resolved" }) }]);
-    expect(first.coverage).toBe("partial");
+    expect(first.sources.powerPlatform.state).toBe("available");
+    expect(first).not.toHaveProperty("coverage");
+    expect(first).not.toHaveProperty("unknownAgentCount");
     expect(first.invalidReferenceCount).toBe(1);
     expect(first.page.previousCursor).toBeNull();
     const second = await get({ selectionId: first.selection.id, limit: "1", cursor: first.page.nextCursor });
@@ -666,6 +687,7 @@ describe("inventory HTTP selected-read boundary", () => {
     expect(search.counts).toEqual({ total: 3, filtered: 1 });
     expect(search.people[0].objectId).toBe(c);
     const selected = await get({ objectId: a, limit: "1" });
+    expect(selected.sources.powerPlatform.state).toBe("available");
     expect(selected.selected).toMatchObject({ count: 3, state: "reported",
       person: { objectId: a, agentCount: 3, roles: ["owner", "createdBy"] } });
     expect(selected.selected.agents).toHaveLength(1);
@@ -676,12 +698,13 @@ describe("inventory HTTP selected-read boundary", () => {
     const previousAgent = await get({ objectId: a, selectionId: selected.selection.id, limit: "1", cursor: nextAgent.page.previousCursor });
     expect(previousAgent.selected.agents).toEqual(selected.selected.agents);
     const empty = await get({ objectId: d });
+    expect(empty.sources.powerPlatform.state).toBe("available");
     expect(empty.selected).toMatchObject({ state: "no_reported_relationships", count: 0, agents: [], person: { objectId: d, roles: [] } });
     expect((await fetch(`${base}/agent-responsibility?offset=1`, { headers: { cookie } })).status).toBe(400);
     expect((await fetch(`${base}/agent-responsibility?${new URLSearchParams({ selectionId: first.selection.id, cursor: first.page.nextCursor,
       objectId: a, limit: "1" })}`, { headers: { cookie } })).status).toBe(400);
     const all = await fetch(`${base}/agent-inventory?limit=1`, { headers: { cookie } }).then(response => response.json());
-    expect(first.unknownAgentCount).toBe(all.counts.total - 2);
+    expect(all.summary.graphOnly).toBeGreaterThan(0);
     const investigation = await fetch(`${base}/agent-inventory/investigations/context?${new URLSearchParams({
       recordId: unifiedAgentRecordId({ source: "power_platform", nativeId: "responsibility-3", environmentId: "owner-environment" }),
     })}`, { headers: { cookie } });
