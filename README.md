@@ -4,91 +4,88 @@ Discover and manage Microsoft 365 and Copilot Studio agents from one dashboard.
 
 - Browse agents, owners, environments, and access assignments.
 - Track Copilot licenses, adoption, and agent usage.
-- Block or unblock packages, change access, and quarantine Studio agents.
+- Manage package availability and Copilot Studio quarantine.
 - Investigate activity with Microsoft Purview and Defender.
-
-Built with React, Express, Microsoft Graph, Power Platform, and PostgreSQL.
 
 ## Quick start
 
-### 1. Get the project
+### 1. Install the prerequisites
+
+Install:
+
+- Git
+- PowerShell 7
+- Docker Desktop, or Docker Engine with Compose v2
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/candede/agent_control.git
 cd agent_control
 ```
 
-Install **Git** and **PowerShell 7**, and start **Docker Desktop** (or Docker Engine with Compose v2). Keep the Git checkout: deployment uses it to snapshot build inputs, including non-ignored uncommitted files. Node.js and PostgreSQL run in containers; no host Node.js installation is needed.
+Node.js and PostgreSQL run in containers. You do not need to install them on the
+host.
 
-### 2. Set up Microsoft sign-in
+### 2. Configure Microsoft Entra ID
 
-Follow the [Entra setup guide](docs/deployment-setup.md#entra-application) to configure the app registration, user assignments, API permissions, and admin consent.
+Create or select an Entra app registration, then follow the
+[setup guide](docs/deployment-setup.md) to configure:
 
-Use this **Web redirect URI** for the default local port:
+- the callback URL;
+- the Viewer and Admin app roles;
+- user or group assignments;
+- Microsoft API permissions and admin consent.
+
+For the default local port, use this Web redirect URI:
 
 ```text
 http://localhost:3001/api/auth/callback
 ```
 
-Have your **tenant ID**, **client ID**, **client secret value**, and **accepted username domains** (for example, `contoso.com`) ready for the setup wizard.
+Have the tenant ID, client ID, client secret value, and accepted sign-in domains
+ready.
 
-Microsoft Agent 365 licensing is required for the Copilot package APIs. See [Microsoft roles by action](docs/user-roles-and-permissions.md) for feature-specific access.
-
-### 3. Start the app
+### 3. Start Agent Control
 
 ```powershell
 pwsh ./deploy-local.ps1 start
 ```
 
-This validates configuration, builds the app, and starts it with PostgreSQL. A first-run wizard collects your settings and port before building; saved configuration lives in `.local/agent-control/`. No `.env` file is needed.
+The first start opens a setup wizard and saves configuration under
+`.local/agent-control/`. It then builds and starts the app with PostgreSQL.
 
-Normal start does **not** run the regression suite or create a test database. It reuses Docker build layers, checks database compatibility and readiness, and leaves an unchanged healthy app running. Full validation is explicit: run `pwsh ./deploy-local.ps1 check`, or `start -ForceChecks` to validate and then deploy the same source snapshot. Full checks can still take several minutes. See [start versus full checks](docs/deployment-setup.md#start-versus-full-checks).
+Open [http://localhost:3001](http://localhost:3001), or the port selected in the
+wizard, and sign in with an assigned work or school account.
 
-Open **[http://localhost:3001](http://localhost:3001)** and sign in with your work or school account. If you choose another port, update the redirect URI and use that port in the browser.
+### 4. Collect data
 
-The sign-in page remembers your last email on this browser after Microsoft sign-in
-is started, so you do not need to enter it on every visit. You can edit it to use
-another account. Uncheck **Remember my email on this browser** on shared devices;
-this immediately removes the saved email and retains your opt-out. This preference
-does not keep you signed in or save credentials.
+Open **Permissions** to check access, then open **Sync** to collect agent,
+environment, user, license, and activity data.
 
-## Using the app
-
-Start with **Permissions** to check access, then **Sync** to collect your first inventory.
-After a fresh installation or database reset, Agents shows collection guidance
-while the first inventory is collected and prepared. Results appear automatically
-when ready; missing inventory is not reported as zero matching agents or an export
-failure. Open **Sync** to review progress or permission issues.
-
-| Page | What to do |
-| --- | --- |
-| **Agents** | Search agents, inspect details and usage, manage access, and investigate activity. |
-| **Users** | Review Copilot licenses, activity, and agent relationships. |
-| **Sync** | Refresh source data, import usage CSVs, and review sync history. |
-| **Audit** | Review administrative actions performed through this app. |
-| **Permissions** | Check access and find the Microsoft roles, API permissions, and log setup you need. |
-
-Inventory and user data refresh automatically while you are signed in and the app is active. For agent usage reports, export **Agents**, **Users & agents**, and **Users** CSVs for the same period from Microsoft 365, then choose **Sync > Add CSV reports**. See the [import guide](docs/official-usage-import.md).
+To add Microsoft 365 Copilot agent usage, export the **Agents**,
+**Users & agents**, and **Users** CSV reports for the same period and import them
+from **Sync > Add CSV reports**. See the
+[usage import guide](docs/official-usage-import.md).
 
 ## Common commands
 
 ```powershell
 pwsh ./deploy-local.ps1 start        # Start or update
-pwsh ./deploy-local.ps1 stop         # Stop; keep data and settings
-pwsh ./deploy-local.ps1 edit-config  # Change settings
-pwsh ./deploy-local.ps1 check        # Full software validation; do not deploy
+pwsh ./deploy-local.ps1 stop         # Stop and keep data
+pwsh ./deploy-local.ps1 edit-config  # Change saved settings
+pwsh ./deploy-local.ps1 check        # Run software checks
 ```
 
-Run `start` again after changing settings. To keep a separate installation, add `-Project <name>` to each command.
+Add `-Project <name>` to keep separate installations.
 
 ## Documentation
 
 | Guide | Covers |
 | --- | --- |
-| [Setup](docs/deployment-setup.md) | Entra registration, API permissions, multiple tenants, and dev tunnels |
-| [Microsoft roles](docs/user-roles-and-permissions.md) | Roles needed for each action |
-| [Usage reports](docs/official-usage-import.md) | CSV exports and imports |
-| [Copilot licenses and usage](docs/copilot-license-usage.md) | License detection and activity data |
-| [Operations](docs/operations.md) | Troubleshooting, tests, backups, and recovery |
+| [Setup](docs/deployment-setup.md) | Entra ID, permissions, local setup, and multiple tenants |
+| [Microsoft roles](docs/user-roles-and-permissions.md) | Roles required for each feature |
+| [Usage reports](docs/official-usage-import.md) | Exporting and importing Microsoft 365 reports |
+| [Operations](docs/operations.md) | Updates, troubleshooting, backups, and recovery |
 | [Security](docs/security-model.md) | Authentication, authorization, and data isolation |
-| [Azure deployment](docs/azure-production-deployment.md) | Azure requirements and release steps |
+| [Azure deployment](docs/azure-production-deployment.md) | Production requirements and deployment |

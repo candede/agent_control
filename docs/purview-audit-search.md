@@ -1,145 +1,81 @@
 # Microsoft Purview Audit Search
 
-Microsoft Purview Audit Search is compliance and security evidence. It is **not** official Microsoft 365 Copilot Agents usage. Agent Control keeps Purview records, local administrative audit, official usage reports, package inventory and Power Platform inventory as separate source authorities.
+Agent Control uses Microsoft Graph Audit Search for explicit, bounded Purview
+queries. Purview records are investigation evidence, not Microsoft 365 Copilot
+usage totals.
 
-## Entity entry points
+## Where to use it
 
-- **Users > individual user details > Purview audit** displays the search workflow directly, without an extra open/close control or expandable sections. Opening the tab does not run a query. The verified directory UPN is read-only for new searches and qualification. History is restricted server-side to authorized jobs with that single UPN before counting or pagination, excluding broad and multi-user searches. Both paid-user and reported-user modals provide this entry point when a current exact directory link exists; concealed or unlinked report identities remain unavailable.
-- **Agents > individual agent details > Activity > Purview audit** retains search, operation filtering, pagination and details for saved Studio administrative records. The exact bot/environment identity is required. This is saved evidence, not live agent-scoped collection; unsupported mappings stay unavailable rather than running an unscoped search.
-- **Audit** shows only local administrative actions taken through this app. Old `source=purview`, `job` and `user` query parameters no longer select provider content and are removed while retaining valid local filters. Select an entity in Users or Agents to investigate and recover its searches there; there is no standalone Jobs page. Legacy broad/multi-user jobs are not presented as one user's history.
+- **Users > user details > Purview audit** runs a search for the selected
+  directory user.
+- **Agents > agent details > Activity > Purview audit** displays saved
+  Copilot Studio administrative records associated with the selected agent.
+- **Audit** contains only administrative actions performed through Agent
+  Control.
 
-The embedded user panel requires the selected directory UPN. It has no standalone unscoped mode, editable user selector, or bookmark-selected job entry point. Jobs created or resumed within the panel still retain their exact selection and recovery controls. The provider service, authorized saved-job APIs and retention remain shared infrastructure, not retired page code.
+Opening a tab does not start a Microsoft query. Select the filters and run the
+search explicitly.
 
-The adapter and product workflow are fixture-qualified. No approved tenant lifecycle was run in Phase 07, so no live provider access is claimed. An automatic Permission Center check acquires the scoped token only, reports token verification, and never creates or runs a Microsoft query. Opening the view also creates no query. For delegated Viewer/Admin use, current capability authorization plus the user's explicit bounded search submission gates the selected create, poll and records lifecycle; that request establishes evidence for its principal without a separate approve/start qualification ritual. Application/shared mode remains separately Admin-approved and qualified.
+## Requirements
 
-## Coverage And Setup In The User Tab
+- Microsoft Graph delegated `AuditLogsQuery.Read.All`
+- Tenant-wide admin consent
+- Purview Audit enabled for the tenant
+- Purview **Audit Logs** or **View-Only Audit Logs** access
+- `AgentControl.Viewer` or `AgentControl.Admin`
 
-The tab puts authorization, preset and date inputs first, followed by compact coverage/setup cards (side by side where space permits). Human-readable log labels, access state, current verification, required Graph permission, filters and result metadata remain directly visible; raw service/record-type identifiers are reserved for result metadata and this contract reference:
+Recommended user access is **Security Reader** in Entra ID plus **Audit Reader**
+in Purview. See [Microsoft roles](user-roles-and-permissions.md).
 
-| Preset | Selected service and record type | Coverage |
-| --- | --- | --- |
-| Copilot interactions | `Copilot` / `copilotInteraction` | `CopilotInteraction` events with actor, app/host and message identifiers when the provider supplies them. Not prompt or response text, transcripts, or usage-report totals. |
-| Copilot Studio administration | `PowerPlatform` / `powerPlatformAdministratorActivity` | The catalog's allowlisted bot create/delete/update/publish/share operations, component and component-collection changes, AI-plugin-operation changes, and environment-variable changes. Not bot conversations or general Power Platform activity. |
+## Available searches
 
-**Check permissions** runs the same readiness refresh used by Permissions. For Purview delegated access, this checks token readiness, not the provider query lifecycle or complete Microsoft role/license entitlement. The tab distinguishes token verification from provider verification; **Run Audit Search** is the explicit functional create/poll/records check. Missing `AuditLogsQuery.Read.All` consent, Microsoft Purview Audit enablement, and the Audit Logs or View-Only Audit Logs role are surfaced as setup requirements, not empty results. **Open Permissions** remains available for configuration when access is not ready.
-
-Application mode requires configured application identity/credentials, the application permission, Admin-enabled mode and an approved shared data scope. **Check permissions** does not run application qualification. An Admin selects a window of at most one hour, approves it, then explicitly starts the qualification. Ordinary searches allow up to 168 hours; collection remains bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
-
-`PurviewAuditView` accepts `active?: boolean` (default `true`) for visited tabs that stay mounted. While inactive it renders no content, stops saved-history polling and aborts its owned reads/actions. Form fields and selected-job state are retained in memory for the same account, roles, selected UPN and meaningful capability access/configuration state. Capability timestamp, freshness and verification-only renewals do not remount the form.
-
-On return, the tab reloads the catalog and scoped history, revalidates the exact selected job, and reloads a previously viewed saved record page before displaying it. Saved-query keys include the account/access/user scope so another observer cannot retain a prior account's request for the new account. Denied, deleted, expired or mismatched selections fail closed. Switching tabs neither submits nor resumes provider work, and does not reset the five-minute/150-attempt UI polling budget; an explicit history refresh can restart that budget. Aborting a browser request does not undo an already accepted server query; its saved job can be recovered from history.
-
-Editing draft filters clears the selected results and cancels that selection's pending exact-job or record read, including revalidation on tab return, manual refresh or polling. Independent catalog/history reads and already admitted saved-job commands continue; a retired selection response cannot clear their state or leave the history loading indicator stuck.
-
-Capability responses include the application configuration revision as part of the saved-data authority. A revision change retires prior records, approvals and in-flight commands even when enablement, shared-scope flags and readiness remain unchanged. Diagnostic-only updates still preserve the current view. Manual history refresh hides selected results during revalidation, then preserves the loaded page when the authorized job ID and saved version are unchanged; a different version requires loading current minimized results.
-
-Saved record reads share pending requests only for the same authorized job, saved version and page. A reader that has observed a newer job version cannot join an older reader's pending record request. Exact-job and record responses also update the corresponding history row, so its status and actions use the newly observed evidence without another history request. If export, resume, cancellation or local deletion reports that the job is missing, its application scope changed, or its saved state no longer permits the command, the panel withdraws its saved evidence and actions. Explicit history refresh revalidates availability without replaying the failed command; transient command failures and provider-consent failures do not by themselves invalidate authorized saved records.
-
-## Selected Graph Contract
-
-Microsoft references were rechecked on 2026-09-09. Agent Control implements one global-cloud Microsoft Graph v1.0 contract:
-
-| Operation | Request | Accepted response |
-| --- | --- | --- |
-| Create query | `POST /v1.0/security/auditLog/queries` with singular `serviceFilter` | `201` and a direct `auditLogQuery` object |
-| Reconcile an uncertain create | `GET /v1.0/security/auditLog/queries`, at most five pages per attempt | `200` and a collection envelope with `value` |
-| Poll one query | `GET /v1.0/security/auditLog/queries/{auditLogQueryId}` | `200` and a direct `auditLogQuery` object |
-| Read records | `GET /v1.0/security/auditLog/queries/{auditLogQueryId}/records` | `200` and a collection envelope with `value` and an optional validated `@odata.nextLink` |
-
-The query status allowlist is `notStarted`, `running`, `succeeded`, `failed`, `cancelled` and `unknownFutureValue`. Unknown fields, envelope shapes and malformed provider timestamps fail closed as provider-schema errors, not caller-input errors. Redirects and pagination links outside the exact Graph origin and path family are rejected before an authorization header is attached. Empty, malformed or repeated continuation links also fail closed, including on the last allowed page; a local limit never makes an invalid link trustworthy.
-
-The selected request properties are `displayName`, `filterStartDateTime`, `filterEndDateTime`, `recordTypeFilters`, singular `serviceFilter`, `operationFilters`, `userPrincipalNameFilters`, `ipAddressFilters`, `objectIdFilters` and `administrativeUnitIdFilters`. Agent Control requires a nonempty caller-selected subset of the selected preset's code-owned operation allowlist. It does not send arbitrary provider JSON, `keywordFilter`, operations outside that allowlist or plural `serviceFilters`.
-
-The Microsoft references remain inconsistent:
-
-- [Create auditLogQuery](https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0), [list auditLogQueries](https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-list-auditlogqueries?view=graph-rest-1.0) and [list auditLogRecords](https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-list-records?view=graph-rest-1.0) describe the `AuditLogsQuery-*` permission family. Create examples use singular `serviceFilter`.
-- [Get auditLogQuery](https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-get?view=graph-rest-1.0) still lists `ThreatIntelligence.Read.All`, despite addressing the same query lifecycle.
-- That GET page describes a direct query object in its response prose, but its example wraps one object in `value` and includes `keywordFilter`. This implementation accepts only the direct selected query shape; the example envelope and unsupported query property are rejected.
-- The [auditLogQuery resource](https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogquery?view=graph-rest-1.0) describes plural `serviceFilters` while the create operation describes singular `serviceFilter`.
-
-Agent Control therefore requests only `AuditLogsQuery.Read.All` for its cross-workload curated searches and requires live proof of the complete selected lifecycle. It does not add `ThreatIntelligence.Read.All`, try alternate property shapes at runtime or treat a documentation page as tenant evidence.
-
-## Projection Contract And Sources
-
-Projection version 1 combines two documented layers without conflating them:
-
-- The Graph [auditLogRecord resource](https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogrecord?view=graph-rest-1.0) is the outer `#microsoft.graph.security.auditLogRecord` wrapper. Its `userType` is a string enum and its `auditData` property is an abstract audit-data object.
-- The Graph [defaultAuditData resource](https://learn.microsoft.com/en-us/graph/api/resources/security-defaultauditdata?view=graph-rest-1.0) documents only the `#microsoft.graph.security.defaultAuditData` type shell. It explicitly lists no properties, so it is not a specification for the native child fields observed inside `auditData`.
-- The Office [Management Activity common schema](https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema) is the source for native audit fields. It assigns record type `256` to `PowerPlatformAdministratorActivity`, record type `261` to `CopilotInteraction`, and defines native `UserType` as `Edm.Int32` values 0 through 10. Agent Control validates that integer when present but does not expose it in the public projection or substitute it for Graph's wrapper `userType`.
-- The Office [CopilotInteraction schema](https://learn.microsoft.com/en-us/office/office-365-management-api/copilot-schema) places Copilot metadata under `CopilotEventData`. The current Purview [Copilot audit reference](https://learn.microsoft.com/en-us/purview/audit-copilot) documents `AgentId`, `AppIdentity`, `AppHost` and `Messages`; its emitted JSON example uses `Messages[].ID` and lowercase `Messages[].isPrompt`. Projection version 1 accepts that emitted casing exactly and does not add `Id` or `IsPrompt` aliases.
-- The current [Copilot Studio audit reference](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-logging-copilot-studio) documents the administrative operation labels, native logical `ID` as a GUID, and `BotId`, `BotComponentId` and `AIPluginOperationId`. Projection version 1 selects uppercase native `ID`; the generic Office common schema's `Id` spelling is not an alias. Missing native identity remains absent rather than being replaced by the Graph wrapper ID. The Studio reference also confirms that audit records contain metadata, not chat text.
-
-The Copilot references have a casing gap: older schema XML names the message identifier `Id`, while the newer reference prose calls the boolean `IsPrompt`; the newer emitted JSON example uses `ID` and `isPrompt`. Agent Control selects the emitted JSON contract and fails closed on alternate casing. Only message IDs and prompt/response flags are retained. Prompt text, response text, transcript content and other unrestricted message content are never projected, stored or exported.
-
-## Authorization And Eligibility
-
-- Viewer and Admin with current or safely read-through-refreshed capability readiness may directly submit their own bounded delegated search and access, export, cancel, or locally delete only results authorized for their principal. The actual successful search establishes delegated principal provider evidence; there is no preceding qualification approval/start ritual. Explicit delegated qualification APIs may remain optional but are not prerequisites. Application-mode qualification and shared-scope controls require `AgentControl.Admin`; Admin inherits the delegated Viewer workflow.
-- Delegated mode is private to the authorizing principal and requires that user to hold the Purview **Audit Logs** or **View-Only Audit Logs** role.
-- Application mode is separately disabled by default. It requires explicit Admin enablement, approved shared data scope and application permission qualification; it does not convert delegated results into tenant-shared data and is never an automatic fallback. Delegated-only deployments keep it disabled.
-- Both modes use `AuditLogsQuery.Read.All`. Personal Microsoft accounts and non-global clouds are unsupported by this implementation.
-- Microsoft Purview licensing, unified audit logging, workload support, retention, service limits and tenant rollout independently control whether a query can run and what it can observe.
-
-Microsoft's [Audit comparison](https://learn.microsoft.com/en-us/purview/audit-solutions-overview) lists the Audit Search Graph API for both Audit (Standard) and Audit (Premium); Premium adds capabilities such as longer retention and higher Management Activity API bandwidth. That bandwidth statement is not a Graph Audit Search quota guarantee. The [Copilot audit reference](https://learn.microsoft.com/en-us/purview/audit-copilot) describes Microsoft and Copilot Studio applications as included in Audit Standard, but [Get started with auditing](https://learn.microsoft.com/en-us/purview/audit-get-started) also includes Copilot Studio in its non-Microsoft 365 AI pay-as-you-go discussion. Do not infer universal entitlement or absence of billing from either statement; the tenant administrator must confirm the exact workload's current license and billing prerequisites.
-
-The get-started guide maps the Purview Audit Reader and Audit Manager role groups to **View-Only Audit Logs** and **Audit Logs**; Graph application permissions are a separate requirement. [Audit retention policies](https://learn.microsoft.com/en-us/purview/audit-log-retention-policies) describe typical 180-day retention, with eligible Premium workloads/users and configured policies potentially retaining records longer. These source policies are not the application's seven-day query limit or 30-day local cache lifetime.
-
-A successful explicit search lifecycle proves only the selected API contract and effective access for that exact identity, mode and configuration at that time. A token-only automatic check does not prove provider-operation or license access. In particular, a successful empty query does not prove licensing for every workload, event emission, historical retention or comprehensive source coverage. Verify those prerequisites separately and keep absent or unobserved records explicit.
-
-Missing grant, Purview role, application-scope approval, tenant support, license or a failed explicit lifecycle leaves the capability visible with a bounded error category and correlation ID. Interactive consent, MFA and Conditional Access are reported as interaction needed, not missing permission. Unknown, unprobed and checking are not failures. Do not grant broader permissions to clear an unavailable state; repair the exact prerequisite and retry the ordinary bounded search when appropriate.
-
-## Curated Searches And Bounds
-
-The UI exposes two code-owned presets:
-
-- **Copilot interactions:** service `Copilot`, record type `copilotInteraction`, operation `CopilotInteraction`.
-- **Copilot Studio administration:** service `PowerPlatform`, record type `powerPlatformAdministratorActivity`, and explicit bot, bot-component, AI-plugin-operation and environment-variable create/update/delete or publish/share/auth/name/icon operations.
-
-Users may narrow a preset with exact UTC start/end times, user principal names, IP addresses, object IDs and administrative-unit UUIDs. Each filter array accepts at most 20 unique validated values. Delegated searches cover at most the most recent seven days. A separately configured application/shared qualification remains bounded to at most one hour.
-
-| Boundary | Limit |
+| Preset | Coverage |
 | --- | --- |
-| Active in-process search activations | 4 |
-| Unfinished jobs | 5 per principal; 10 per tenant |
-| Durable activations per job | 12 |
-| Physical provider attempts per job | 64; reserved immediately before every `fetch` attempt |
-| Create dispatch | Once; never blindly retried |
-| Ambiguous-create reconciliation | 3 attempts; at most 5 query-list pages per attempt |
-| One physical provider attempt | 10 seconds; 2,000,000 response bytes |
-| One logical provider request | At most 3 attempts and 30 seconds total for throttling/server/network failures |
-| One activation | 60 seconds; 6 single-query GETs total, including the initial resume or lifecycle-verification GET; subsequent polls use 1-3 second jitter |
-| Final publication authorization | Separate 10-second bound; still aborted by cancellation/logout; no further Audit Search requests |
-| Record retrieval | 20 pages; 5,000 stored rows; 8,000,000 aggregate bytes |
-| Durable execution deadline | 48 hours |
-| Local result lifetime | 30 days |
+| Copilot interactions | Copilot interaction metadata supplied by Purview |
+| Copilot Studio administration | Supported bot, component, plugin, publishing, sharing, and environment-variable administration events |
 
-Reaching a page, row, byte or time boundary publishes only minimized rows already observed and marks the job `partial`, provided current publication authorization succeeds. Activation timeout uses `audit_activation_timeout`; the separate final authorization allowance does not extend provider execution. The UI reports the requested range as unobserved rather than claiming complete coverage. A provider failure, unsupported schema or deadline never fabricates an empty successful result.
+Results can include actor, operation, time, result, target, and correlation
+metadata when Microsoft supplies those values. Agent Control does not collect
+prompt text, response text, or conversation transcripts.
 
-If final publication authorization times out, the job returns to `waiting_authorization` without publishing records or provider-failure evidence. Explicit resume continues from the saved provider query ID, subject to the durable execution limits. Delegated searches and approved qualifications always verify the single-query GET before publishing lifecycle evidence, even when create or reconciliation already reports success.
+## Run a user search
 
-An exact row or byte boundary reports `audit_row_limit` or `audit_byte_limit` when a continuation remains; a fully consumed final page remains complete even at the boundary. Durable request-admission and response-recording callbacks share the attempt deadline. Unexpected local bookkeeping failures, including callback timeouts, stop with `internal_error`; they are not retried as network errors or published as partial provider results. A record-body attempt timeout is `provider_error`, not `audit_activation_timeout`; only expiry of the enclosing activation uses the latter category. Query responses recheck cancellation and attempt deadlines after JSON consumption, before accepting a returned query or page. An interrupted create remains `audit_create_inconclusive` and requires reconciliation, never an automatic second POST. Rejected and redirected response bodies are cancelled before returning or retrying, without waiting for cleanup that could stall indefinitely or replace the authoritative response status.
+1. Open the selected user's **Purview audit** tab.
+2. Select a preset and date range.
+3. Review the access and coverage summary.
+4. Select **Run Audit Search**.
+5. Monitor the saved job and review its result pages.
 
-## Stored Data And Identity
+Searches are limited to 168 hours, 20 result pages, and 5,000 stored rows.
+Provider limits can produce partial coverage, which remains visible with the
+saved job.
 
-Agent Control discards provider response bodies after validation. It stores only the provider query ID/status/correlation ID, coverage counts, and an allowlist of typed record metadata: native and wrapper IDs, event time, operation, service/workload, record type, result, actor identifiers, object ID, client IP, administrative units, correlation ID, agent/app/host IDs, Bot ID, environment ID, bot-component ID, AI-plugin-operation ID, and bounded Copilot `Messages[].ID` identifiers with their lowercase `isPrompt` flag.
+## Authorization
 
-**Content not present in Purview audit:** message identifiers are evidence metadata. Prompt text, response text, transcript content and unrestricted `auditData` are never stored or exported. Unknown fields are counted and discarded. Native event identity deduplicates only within one result while query provenance remains attached; tenant/principal scope is applied before records, counts, paging and export. Tenant UUID comparison is case-insensitive, and native event UUIDs are projected in lowercase so casing cannot bypass duplicate or conflict detection.
+Delegated searches belong to the authorizing account. Optional application mode
+requires separate application permission, Agent Control Admin enablement, and an
+approved shared data scope.
 
-Cross-source association uses only exact `BotId` plus environment against the initiating principal's current private Power Platform snapshot. An Agent ID alone, a package ID, app ID, name, owner or timestamp cannot establish that relation. Missing, unmatched and multiply matched records remain unresolved or ambiguous and stay separately usable.
+**Permissions > Check status** verifies token readiness. It does not run a
+Purview query or prove that a query will return records.
 
-Identity reads reselect the authorized snapshots after loading and verifying candidates, and check expiry again before returning them. Replacement, withdrawal, newly selected resource types or expiry during the read returns `snapshot_invalidated` rather than a stale exact association; retry against refreshed inventory.
+## Jobs and retention
 
-Authorized record views and CSV exports append content-free local audit events with the job ID, source and resulting count. Result bodies are never copied into local administrative audit. CSV export applies the same principal-private or current configured application-shared result scope as retrieval, caps at 5,000 records and neutralizes spreadsheet formula prefixes.
+Search jobs support status, paging, export, cancellation, and local deletion.
+Closing the browser does not cancel an accepted Microsoft query.
 
-## Recovery, Cancellation And Retention
+Run the supported [retention workflow](operations.md#run-retention) to remove
+expired saved jobs and results.
 
-Submission returns promptly after persisting the code-owned `agent-control-audit:{jobId}` marker. A timeout or connection loss during create records an unknown outcome and reconciles by exact marker and filters; it never issues a second POST. Only a complete bounded listing can establish a unique reconciliation match. Create and poll responses must match the durable marker and filters, and polling must also return the stored provider ID. Provider query ID is stored before polling, and the latest allowlisted provider request ID is retained separately from the local request ID. Execution owner/version fences reject stale writes after recovery, cancellation or replacement.
+## Troubleshooting
 
-Shutdown and startup perform no Graph work. Interrupted `running` or `reconciling_create` jobs return to `waiting_authorization`, including reservations that finish committing after cancellation; explicit resume revalidates current identity, role, capability and token before exactly one bounded continuation. Active reservations are shared only by requests for the same job UUID, tenant, principal and token mode; rejected starts cannot displace another worker. Jobs with a provider ID poll that ID. Jobs with only an attempted marker reconcile. Terminal provider failures remain terminal even on the last allowed poll; qualification create and reconciliation failures stop before the otherwise mandatory lifecycle GET. Completed and inconclusive work does not replay.
+| Problem | Check |
+| --- | --- |
+| Search is unavailable | Confirm app role, Graph consent, Purview role, and tenant Audit availability. |
+| Search returns no records | Confirm the user, preset, date range, and Microsoft source coverage. |
+| Search is partial | Review the stored page and row limits and any provider error. |
+| Agent records are unavailable | Refresh inventory and confirm the exact bot and environment association. |
+| A saved job disappeared | Confirm it was not deleted, expired, or removed by a scope change. |
 
-Capability-evidence publication is fenced by the validated account session, cancellation and provider admissions. Shutdown joins already-started evidence writes; it neither starts evidence writes after cancellation nor abandons in-flight persistence.
-
-Cancel stops local polling/download and records that Microsoft Graph may continue the remote query. Delete removes only a non-running local job and its cached rows. A rejected cancel or delete does not interrupt the active worker. The selected Microsoft contract exposes no remote cancel or delete operation, so the product never claims either action changes the provider query or source events. Failed and inconclusive local jobs report possible remote continuation from the attempted request and last provider status, not from the local failure category.
-
-Jobs and dependent records expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive, preserving whether an attempted remote create may continue. Separately configured application/shared qualification approval expires after one day; detached expired qualification history is removed after the additional finite cleanup window. Delegated searches have no preceding qualification approval record. View/export audit expires under the ordinary 90-day local audit policy. Microsoft source-event retention and any remote query lifetime are separate provider policies and are never inferred from local expiry.
-
-Run [operator retention](operations.md#retention) at least daily for an active installation, using the existing internal helper and its exact project/database confirmation, preview and bounded-batch safeguards. Retention is not a `deploy-local.ps1` argument and makes no provider calls.
+Microsoft reference:
+[Audit log query resource](https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogquery?view=graph-rest-1.0).

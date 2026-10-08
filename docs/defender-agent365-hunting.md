@@ -1,196 +1,93 @@
 # Defender and Agent 365 hunting
 
-Agent Control runs only explicit, curated Microsoft Graph advanced-hunting requests. It does not expose arbitrary KQL, run a collector, schedule snapshots, select a workspace, reconstruct conversations, emit telemetry, or treat hunting metadata as official usage.
+Agent Control runs explicit, curated Microsoft Graph advanced-hunting queries for
+the selected agent. It does not expose arbitrary KQL or collect telemetry.
 
-## Agent-first investigations (23 September 2026)
+## Where to use it
 
-The entry point is **Agents > select an agent > Activity**. The standalone Security page and navigation item are removed. Old `/security` bookmarks go to `/agents` without carrying arbitrary IDs, filters, or broad investigation jobs into an agent. Permissions and Sync link to Agents.
+Open **Agents > agent details > Activity**. The page keeps Defender runtime,
+tool, and inventory evidence separate from saved Purview administration records.
 
-The embedded panel requires saved agent context and no longer accepts a standalone bookmark-selected job. Its provider service, authorized saved history and job lifecycle remain active dependencies of agent investigations; removing the old page does not retire those workflows.
+Opening Activity does not run a hunt.
 
-The integration follows four boundaries:
+## Requirements
 
-1. Resolve the current authorized saved agent on the server before enabling an investigation. Do not use display names, a canonical registry ID, a package ID, or a shared blueprint as a provider identity.
-2. Embed the existing three fixed Defender templates, bounded dates/operations, application-scope approval, history, paging, resume/cancel, minimized CSV export, local deletion and scope revocation in the modal. Provider execution remains explicit. Saved history is filtered to the exact agent before counting and paging; a broad historical hunt is not an agent-specific result.
-3. Provide searchable, paged **saved Purview audit** records with an exact retained `BotId` and environment association. Show event metadata in place rather than sending the user to a separate in-app audit search. Missing associations remain unavailable, not zero activity.
-4. Keep full incident investigation, arbitrary KQL, compliance review, policy changes and sensitive content outside the embedded metadata workflow. Activity does not offer generic provider-portal handoffs.
+- Microsoft Graph delegated `ThreatHunting.Read.All`
+- Tenant-wide admin consent
+- Defender access to the queried data and device groups
+- Entra **Security Reader**, or equivalent Defender Unified RBAC access
+- `AgentControl.Viewer` or `AgentControl.Admin`
 
-Activity presents separate source cards for Defender runtime/tool/inventory queries and saved Purview administrative changes. Coverage and setup requirements are visible without technical-detail accordions. The Log type selector defaults to runtime activity when its verified mapping is available. Source choice and search fields survive inventory refreshes and permission timestamp renewals; account, role and actual authorization/identity changes still isolate private state. Inactive Defender views abort requests and pause polling. Returning revalidates the saved history page and selected job before displaying results, without running a provider hunt.
+Resolving a Copilot Studio agent's Entra identity also requires delegated
+`AgentIdentity.Read.All`. A user who does not own that identity needs
+**Agent ID Administrator**.
 
-### What Microsoft actually exposes
+See [Microsoft roles](user-roles-and-permissions.md).
 
-| Source | Useful embedded evidence | Boundary |
-| --- | --- | --- |
-| [`AgentsInfo`](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-agentsinfo-table) | Latest bounded inventory observation, platform, model, publication/lifecycle, source identifiers and minimized metadata counts | An inventory snapshot, not an execution log or a risk score. `EntraAgentId` is the enterprise-application **object ID**. Dynamic configuration does not establish a documented nested risk schema. |
-| [`CloudAppEvents` / Agent 365 mapping](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-attribute-reference) | Invocation, inference and tool-call metadata; spans, conversation references, operation-dependent actor/error/completion fields | `AgentId` / `TargetAgentId` represent the telemetry **application/client ID**, not the enterprise-application object ID. Runtime hunting requires its own verified mapping; object IDs must never be substituted. Missing errors do not imply success. |
-| [Purview Audit Search](https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogquery?view=graph-rest-1.0) | Exact authorized saved Copilot Studio audit associations, operation/time/actor/result/correlation | No documented agent-ID or nested bot-and-environment filter. `objectIdFilters` is not a universal agent filter; keyword search is not an arbitrary nested JSON predicate. The modal does not silently collect a broad tenant search. |
-| [Agent 365 direct observability](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/direct-open-telemetry-integration) | Existing telemetry through the documented hunting destination | Public direct endpoints document OTLP ingestion. A named `OtelRead` scope alone is not a documented query API. No speculative GET-traces endpoint or new write permission is added. |
-| [Defender agent alerts and behaviors](https://learn.microsoft.com/en-us/defender-xdr/security-for-ai/ai-agent-detection-protection) | Not embedded | Generic alert/behavior evidence lacks a universal documented agent join. Owner, IP, shared blueprint and arbitrary `AdditionalFields` matches do not prove the selected agent caused an event. |
+## Data sources
 
-Purview's [Agent 365 audit operations](https://learn.microsoft.com/en-us/purview/audit-log-activities#agent-365-activities) use names such as `AIInvokeAgent`, `AIExecuteTool`, and `AIInferenceCall`, distinct from Defender actions. The current saved Copilot audit projection is not relabeled as a complete Agent 365 audit collector. Optional Copilot Studio `BotId` fields are matched exactly with the environment; prefixed Copilot interaction IDs are not parsed into guessed bot identities.
-
-Saved ResourceQuery `properties.entraAgentId` is a **candidate**, not an automatically trusted crosswalk. **Resolve log identity** explicitly verifies that candidate through `GET /v1.0/servicePrincipals/{id}/microsoft.graph.agentIdentity`, using delegated `AgentIdentity.Read.All`. An administrator must add this permission and grant tenant consent in the existing app registration before use; it is not an in-app enable/consent action. Opening the modal does not make that provider request. The lookup validates the returned object ID and agent-identity type, then saves short-lived, tenant/principal/source-bound evidence. Current source visibility and identity are rechecked before publication and on subsequent use. Persistence requires the exact current development schema; no old-schema conversion runs during identity resolution.
-
-Session revocation and provider admission are rechecked after awaited source and authorization reads, including the final saved-context read and operation-evidence recording. The 25-second resolution budget and client cancellation bound dependency waits as well as Graph requests; late reads cannot publish an identity mapping, and in-flight database writes retain account serialization until their publication fences and transaction cleanup finish. While identity refresh is pending, the modal hides the previous Defender scope. It reloads saved context after both successful and failed lookups, so a persisted denial or missing identity replaces the old verified state before hunts are available again.
-
-Each typed Graph attempt has an 8-second deadline covering headers and body consumption. A stalled error body preserves the observed HTTP status and `Retry-After`: denials and not-found results retain their saved outcome, while transient HTTP failures permit at most one freshly admitted retry with a wait of no more than 2 seconds. Successful-body timeouts and transport failures report sanitized provider errors, not a whole-resolution timeout or an internal error. Caller cancellation remains authoritative through the final body read.
-
-Saved investigation context rechecks the unified inventory revision after reading identity candidates and cached directory evidence. A source that changes or expires during these reads fails with `agent_identity_source_changed`, including legacy runtime and saved Purview associations. Cache evidence expiring before the final check is reported as expired without returning its verified IDs; independently valid legacy identities retain their separate eligibility.
-
-There is an important documented exception to the ordinary service-principal namespace rule: for a verified **agentIdentity**, Microsoft explicitly states that its [object ID and app ID always have the same value](https://learn.microsoft.com/en-us/entra/agent-id/agent-identities#authorizing-agent-identities). The [Agent 365 authentication recipes](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/direct-open-telemetry-integration#s2s-blueprint-derived-agent-identity) identify the final resource token's `appid`/`azp` as that child agent's app ID, and the [observability identity binding](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-concepts#agent-identity-is-bound-to-the-url) binds it to `gen_ai.agent.id`. Consequently, a verified agentIdentity enables both the object-ID-based inventory template and the client-ID-based runtime templates without requiring a separately returned `appId` or a legacy `entraAppId`. This equality must **not** be generalized to ordinary service principals, blueprint IDs, native inventory IDs, or package IDs.
-
-Legacy runtime mappings still use the separately documented [`properties.entraAppId`](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-agent-inventory#entra-identity-properties), with exact saved-agent resolution and retained provenance. Directory verification establishes a supported identity for querying, not proof of ingestion or activity. The modal honors each template's availability independently.
-
-Agent Builder can emit telemetry without Entra application IDs. `AgentsInfo` has provider-native `AgentId`, `Platform`, and `SourceAgentId`; runtime telemetry has operation-specific platform-ID/type fields. However, the reviewed public contracts do not establish a universal conversion from ResourceQuery/package IDs to those fields. This integration therefore labels unsupported crosswalks explicitly rather than claiming Agent Builder has no logs or that connector setup will repair an absent mapping. Purview similarly remains **saved-only** and requires a verified Studio BotId plus environment; turning on auditing does not collect records into this app or establish that association.
-
-### Purview status and enablement
-
-**Open Audit Search** points to `https://purview.microsoft.com/audit/auditsearch`. This is the search experience, not a permanent auditing-settings switch. A conditional **Start recording user and admin activity** banner can enable auditing. An absent banner or an empty search history is not a definitive ingestion-status check.
-
-The expanded Permissions setup uses the [documented Exchange Online check](https://learn.microsoft.com/en-us/purview/audit-log-enable-disable):
-
-```powershell
-Connect-ExchangeOnline
-Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled
-```
-
-Use the [Exchange Online PowerShell module/session](https://learn.microsoft.com/en-us/powershell/exchange/connect-to-exchange-online-powershell), **not Security & Compliance PowerShell**, which can report False even when auditing is enabled. True means enabled; False means disabled; a failed command leaves status unknown. Only when disabled, an authorized Exchange Online Audit Logs administrator can enable it:
-
-```powershell
-Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled $true
-```
-
-Allow up to 60 minutes and recheck; searchable events can take several additional hours. Portal searches do not populate the app's saved audit records.
-
-Agent-scoped submission and qualification requests send only template, operations and time range plus the saved agent reference. The backend derives provider identities itself; identity overrides are rejected. All reads, lifecycle operations and exports also carry the saved agent reference, with current principal/role/configuration checks retained.
-
-### Access, limits and acceptance
-
-Agent 365 commercial availability does not make every agent-security table or feature generally available. Check [Agent 365 eligibility](https://learn.microsoft.com/en-us/defender-xdr/security-for-ai/transition-agent-security-to-agent-365), Defender roles/data-source scope, Microsoft 365 connectivity and tenant rollout. Graph hunting requires `ThreatHunting.Read.All`; audit search permissions and licensing are separate. A successful empty result proves neither ingestion completeness nor agent safety.
-
-The app's local limits remain seven days per ordinary hunt, 200 retained rows, 2 MB per response and 30-day local retention. These are application limits, not Graph service quotas or a promise of provider retention. Native Defender data normally covers 30 days; Purview retention depends on workload, actor type, licensing and policy. Page-local metadata filtering is labelled as such; exported CSV contains the entire bounded saved result, not just the displayed page/filter.
-
-Production acceptance should use one known agent with source-verified identities, one known invocation/tool event and one known saved audit record. Verify exact identity scope, delegated/private and approved shared access, missing-identity and denied-source states, bounded/no-data/partial results, record paging, CSV, role changes, and navigation between agents. Local fixtures and anonymous backend health checks do not prove tenant licensing, ingestion, Microsoft response schemas or production browser behavior.
-
-## Selected provider contract
-
-The selected global contract is exactly:
-
-- `POST https://graph.microsoft.com/v1.0/security/runHuntingQuery`
-- delegated or application `ThreatHunting.Read.All`
-- request body `{ "Query": "<code-owned KQL>", "Timespan": "<UTC start>/<UTC end>" }`
-- `200` response with exact `schema` and `results` arrays
-
-The [Graph operation](https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery?view=graph-rest-1.0) documents optional `workspaceId` behavior, including fallback to a primary workspace. Agent Control does not accept or send `workspaceId`. It labels only the Graph-selected Defender result scope and never promises requested-workspace isolation.
-
-Every query has both an explicit KQL `Timestamp between (...)` predicate and the same bounded Graph `Timespan`. UTC values have a trailing `Z`. Request bounds must be real calendar instants with hours `00`–`23`; impossible dates and next-day `24:00:00` normalization are rejected. Whole seconds and one to three fractional digits are accepted and normalized to milliseconds. The adapter binds returned rows to the requested source table, tenant, operation, exact identity filters, and time range before publication. Exact identifiers are never truncated; only bounded descriptive strings may be shortened.
-
-The adapter permits at most three safe attempts for transport, `429`, or `5xx` failures. Each logical query has a 30-second request budget, including abort races for admission/response hooks, response reads, transports, and retry waits that ignore `AbortSignal`. Cancellation and deadlines are rechecked after body completion, before parsing or returning a successful result. Local hook failures are not retried as transport failures. Response disposal is best effort and cannot delay completion; responses arriving after cancellation are discarded. Redirects fail closed. Every physical request is durably admitted before dispatch. A response is capped at 2 MB. Queries request at most 201 rows, retain at most 200, and use the 201st row only to prove incomplete coverage. Ordinary delegated requests cover at most the most recent seven days; separately approved application/shared qualification covers at most one hour.
-
-Blueprint and actor object UUID filters compare case-insensitively in KQL, returned-row validation, and snapshot publication. Actor filters match only `AccountObjectId`; the separately projected human-user identity is not a substitute. Native agent IDs and operation names retain their exact case-sensitive semantics. Filter spelling is preserved for existing saved-scope bindings. Optional provider request IDs are retained only when they fit the repository's 256-character bound; invalid correlation metadata is omitted rather than failing otherwise valid results.
-
-Delegated consent does not establish data visibility. Defender [advanced-hunting RBAC](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-rbac) and [unified RBAC assignments](https://learn.microsoft.com/en-us/defender-xdr/manage-rbac) can constrain the sources and data visible to the signed-in principal. Application mode additionally requires administrator-enabled application access and the exact current approved shared-data-scope and configuration revision.
-
-## Fixed templates and projection v3
-
-Every new job and row uses query/projection version 3. Provider schema order, names, types, envelope fields, and row fields must match the selected projection exactly. The KQL computes a value-free `ProjectionValid` signal, requires object-shaped `RawEventData`/`CopilotEventData` wrappers where selected, and permits only scalar selected fields. Exact filters run after validity is computed but before invalid values are nulled, so a malformed selected row cannot disappear as `no_data`; if it matches the requested native filter, its false signal reaches the adapter and fails closed. Unknown source keys are never projected. The repository independently permits only typed primitives plus the two exact state objects, so a caller cannot persist a dynamic object in a known scalar field.
-
-The three generated templates are regression-compiled with Microsoft's semantic Kusto language service against independent `AgentsInfo` and `CloudAppEvents` table declarations. The check requires zero syntax or semantic diagnostics and exact string output names, types, and order. It also compiles every `format_datetime` call and the documented [`iff()`](https://learn.microsoft.com/en-us/kusto/query/iff-function) and [verbatim string](https://learn.microsoft.com/en-us/kusto/query/scalar-data-types/string#verbatim-string-literals) forms used by guards and escaped exact filters. This compiler test is local and makes no provider request.
-
-### `agents_inventory`
-
-`agents_inventory` reads the preview [`AgentsInfo` table](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-agentsinfo-table), never retired `AIAgentsInfo`. It retains:
-
-- observation time and exact agent, source-agent, Entra agent, blueprint, and observability identifiers;
-- bounded name, platform, description, version, model, publication, lifecycle, and availability strings;
-- nullable creation, publication, and update times and instance count;
-- counts only for owner, sharing, permission-metadata, and authentication-metadata structures.
-
-The exact queried source fields are `Timestamp`, `AgentId`, `AgentName`, `Platform`, `AgentDescription`, `Version`, `SourceAgentId`, `EntraAgentId`, `EntraBlueprintId`, `ObservabilityId`, `PublishedStatus`, `LifecycleStatus`, `Availability`, `CreatedDateTime`, `LastPublishedDateTime`, `LastUpdatedDateTime`, `InstanceCount`, `Model`, `Owners`, `SharedWith`, `Permissions`, and `ToolsAuthenticationType`. The returned projection contains only `ObservationTime`; those exact scalar identifiers/descriptions/statuses/dates/counts; the five detail states; and the value-free validity signal, which is consumed and not persisted.
-
-Original owner, sharing, permission, authentication, and risk structures are not retained. As reviewed on 2026-09-09, the published `AgentsInfo` contract documents `Owners`, `Permissions`, and `ToolsAuthenticationType` only as `dynamic`; it does not publish a nested owner-identity, permission-risk, or authentication layout. Top-level fixture counts do not identify an owner and do not qualify permission/authentication risk. Those detail capabilities therefore remain disabled as `present_unqualified_shape` when nonempty; risk remains `not_exposed`. Each detail has an explicit state:
-
-- `not_supplied`: the provider value was null or absent from the documented projection source;
-- `empty`: the provider supplied an empty string, array, or object;
-- `present_unqualified_shape`: a structure existed, but only its bounded count was retained and its nested meaning was not qualified;
-- `not_exposed`: the selected hunting contract does not expose this detail.
-
-Risk is always `not_exposed`; Agent Control does not infer risk from lifecycle, permissions, authentication, or activity.
-
-### `agent_activity` and `agent_tools`
-
-Both templates read [`CloudAppEvents`](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-cloudappevents-table). The code-owned operation sets are:
-
-| Template | Allowed `ActionType` values |
+| Source | Evidence |
 | --- | --- |
-| `agent_activity` | `InvokeAgent`, `InferenceCall` |
-| `agent_tools` | `ExecuteToolBySDK`, `ExecuteToolByGateway`, `ExecuteToolByMCPServer` |
+| `AgentsInfo` | Agent inventory metadata, platform, model, publication state, and source identifiers |
+| `CloudAppEvents` | Agent invocation, inference, tool-call, actor, error, and completion metadata when available |
+| Purview Audit Search | Saved Copilot Studio administration records associated with the exact bot and environment |
 
-Projection v3 follows the documented Agent 365 IA/ET/CH source distinctions:
+Agent Control does not treat missing errors as proof of success and does not
+reconstruct prompts, responses, or conversations.
 
-| Meaning | `InvokeAgent` (IA) | `InferenceCall` (CH) | Tool actions (ET) |
-| --- | --- | --- | --- |
-| Platform agent ID | `Event.PlatformTargetAgentId` | `Event.PlatformAgentId` | `Event.PlatformAgentId` |
-| Platform agent type | `Event.PlatformTargetAgentType` | `Event.CopilotEventData.PlatformAgentType` | `Event.PlatformAgentType` |
-| Conversation | `Event.ConversationId` | `Event.CopilotEventData.ConversationId` | `Event.ConversationId` |
-| Thread | unavailable | `Event.CopilotEventData.ThreadId` | unavailable |
-| Channel | `Event.ChannelName` | unavailable | `Event.ChannelName` |
-| Human identity | `Event.UserKey` / `Event.UserId` | unavailable | unavailable |
-| Agent identity | unavailable | `Event.UserKey` / `Event.UserId` | `Event.UserKey` / `Event.UserId` |
-| Target-agent identity | `Event.TargetAgentUserKey` | unavailable | unavailable |
-| Completion/error | `Event.CompletionTime` / `Event.ErrorType` | `CopilotEventData.CompletionTime` / `CopilotEventData.ErrorType` | completion from `Event`; error unavailable |
+## Resolve log identity
 
-The exact direct `CloudAppEvents` source fields are `Timestamp`, `ActionType`, `Application`, `ApplicationId`, `AppInstanceId`, `AccountObjectId`, `AccountId`, `ObjectId`, `ReportId`, and `OAuthAppId`. The exact selected `RawEventData` fields are `Operation`, `OrganizationId`, `TargetAgentId`, `TargetAgentName`, `TargetAgentBlueprintID`, `AgentId`, `AgentName`, `AgentBlueprintId`, `PlatformTargetAgentId`, `PlatformAgentId`, `PlatformTargetAgentType`, `PlatformAgentType`, `ConversationId`, `SessionIdentity`, `ChannelName`, `UserKey`, `UserId`, `TargetAgentUserKey`, `OpId`, `ParentId`, `CreationTime`, `CompletionTime`, `ErrorType`, `ToolName`, `ToolType`, `ToolId`, `InvokeSource`, and the `CopilotEventData` wrapper. Only `PlatformAgentType`, `ConversationId`, `ThreadId`, `CompletionTime`, and `ErrorType` are selected from that nested wrapper. Optional projected dates are formatted as exact millisecond UTC values ending in `Z`.
+Defender sources use specific Entra object and application identifiers. Agent
+Control verifies the identity before enabling a hunt.
 
-`OpId` and `ParentId` are validated as 16-character hexadecimal span IDs. `rootSpanObserved` is true only for `ActionType=InvokeAgent`, `Operation=invoke_agent`, a valid nonempty `OpId`, and no parent. It is always false for child-only or unresolved rows. This metadata does not prove downstream admin-center ingestion, complete root-tree collection, or conversation availability. Child spans are not combined into sessions or conversations. Outcome is only `error` when an exposed error type exists, otherwise `unknown`; success is never inferred from a missing error.
+1. Open the agent's **Activity** tab.
+2. Review the saved inventory identity.
+3. Select **Resolve log identity** when required.
+4. Confirm the verified mapping before running a hunt.
 
-The ten action-dependent fields carry a separate `value`, `null`, `empty`, or `unavailable` state. `null` means the applicable provider field was null, `empty` means it was an applicable empty string, and `unavailable` means that field is not part of that action's selected mapping. The projected value and state are validated together. Empty optional activity creation/completion dates are accepted as missing dates, with completion's `empty` state retained and no duration inferred. Nonempty invalid dates and non-scalar values still fail the projection guard.
+Names, owners, package IDs, and shared blueprints are not used as identity
+substitutes.
 
-The Agent 365 [observability concepts](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-concepts), [attribute reference](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-attribute-reference), [direct OpenTelemetry integration](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/direct-open-telemetry-integration), and [troubleshooting guidance](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/direct-open-telemetry-troubleshooting) define the source boundary. The current attribute reference does not expose usable CloudAppEvents mappings for model/provider names or input/output/total token counts, so those activity fields are intentionally absent rather than blank or inferred. Inputs, outputs, messages, instructions, memory, tool arguments/results, model content, unknown fields, original `RawEventData`, and complete provider bodies are discarded. `contentAvailable` is always false.
+## Run a hunt
 
-Defender for AI [setup](https://learn.microsoft.com/en-us/defender-xdr/security-for-ai/get-started-defender-security-for-ai), applicable licensing, Microsoft 365 activities connectivity, rollout, RBAC, and table population are independent prerequisites. A valid empty response is `no_data`. It proves only that the exact request completed at that time, not tenant-wide coverage and not which prerequisite is missing.
+1. Select a supported log type.
+2. Choose the bounded date range and available filters.
+3. Review the exact selected agent and source identity.
+4. Run the hunt.
+5. Monitor the saved job and review paged results.
 
-## Evidence and visibility
+Queries use fixed templates and bounded result storage. Provider throttling,
+partial pages, and source coverage are shown with the job.
 
-Viewer and Admin with current or safely read-through-refreshed capability authorization may directly submit their own bounded delegated hunt and access, export, cancel, or locally delete only results authorized for their principal. There is no separate delegated qualification approval/start ritual. The agent modal requires a server-resolved exact identity; it exposes no free-form agent, blueprint or actor-ID entry. Legacy source APIs retain their structured-filter contracts but are no longer a standalone app workflow. Qualification requires an exact target. A successful delegated provider request establishes provider readiness evidence for that principal. Exact identity/mode/template/target/query/permission/contract/configuration evidence and retained-scope approval belong to the optional qualification workflow.
+## Authorization
 
-Automatic Permission Center checks acquire only the scoped delegated token and report token verification. They never run KQL, create a hunting job or prove Defender licensing, RBAC/data-source visibility, table rollout or exact operation access. Opening the view also creates no hunt. Global capability status or evidence for a sibling template, target, old query version or old contract cannot authorize or widen a hunt.
+Delegated hunts belong to the authorizing account. Optional application mode
+requires separate application permission, Agent Control Admin enablement, and an
+approved shared data scope.
 
-Ordinary delegated jobs have no retained-scope binding. They remain exactly tenant/principal-scoped and visible only to that current principal under the saved-data policy. The worker revalidates Viewer access, session identity and delegated token before provider execution. Current account, role, and applicable qualification/shared-scope authority are checked again before each physical provider request, including retries. Explicit delegated qualification APIs may remain available for optional retained-scope workflows, but they are never a prerequisite for an ordinary hunt. Revoking optional delegated principal-owned scope remains available to its owner. Revoking application/shared retained scope requires Admin, and application-mode qualification remains Admin-only because it binds approved shared scope.
+**Permissions > Check status** verifies token readiness. It does not run a hunt
+or prove that Defender has data for the selected agent.
 
-Delegated results are tenant/principal-private. Admin does not gain access to another user's private cached jobs or results. Application results are visible to another current Viewer or Admin only through the exact current application identity, explicitly enabled shared scope, configuration revision, qualification, and nonrevoked retained approval. Those application bindings are revalidated before provider work and again before publication; current local revocation or configuration change invalidates sends and saved reads immediately. Qualification publication locks the current configuration row, so an older application qualification cannot race and authorize a newer configuration. There is no delegated-to-application fallback or newer-approval fallback for an older application job; delegated-only deployments keep application mode disabled.
+## Jobs and retention
 
-This is an explicit local trust boundary. An ordinary provider outage does not make locally authorized principal-private saved data unreadable. Agent Control can immediately enforce its current app roles, principal scope, optional retained-scope revocation, and application configuration, but it cannot discover an external Defender RBAC/data-source assignment revocation while offline. A later explicit bounded hunt revalidates external authority when connectivity returns; saved data or optional retained scope does not prove current provider visibility.
+Hunt jobs support status, paging, minimized CSV export, cancellation, local
+deletion, and recovery of accepted work. Closing the browser does not cancel an
+accepted provider request.
 
-Exact cross-source association is permitted only for documented typed identifiers. An inventory Entra object identifier can resolve to one current Power Platform resource within the initiating principal's existing visibility scope. Runtime application/client identifiers are a separate namespace and must not resolve through that object-ID join. Blueprint identifiers remain parent relationships, not child equivalence. Parentage considers both agent and target blueprint identifiers within the same tenant; UUID casing does not change the relationship, while opaque identifiers remain case-sensitive. Missing, ambiguous, differently scoped, and unmatched records remain explicit.
+Run the supported [retention workflow](operations.md#run-retention) to remove
+expired saved jobs and results.
 
-## Jobs, coverage, and retention
+## Troubleshooting
 
-Submission promptly creates a durable job. Startup, navigation and automatic permission checking make zero hunting requests. Polling observes an existing request and is not a recurring collector. Interrupted work may return to `waiting_authorization`, but explicit resume revalidates the exact current account, role, token mode, request evidence and application scope.
+| Problem | Check |
+| --- | --- |
+| Hunting is unavailable | Confirm app role, Graph consent, Security Reader or Defender RBAC, and data scope. |
+| Identity cannot be verified | Confirm current inventory, `AgentIdentity.Read.All`, consent, and Agent ID access. |
+| No records are returned | Confirm the date range, selected template, telemetry ingestion, and exact agent mapping. |
+| Results are partial | Review provider throttling, paging limits, and the saved job status. |
 
-Each job has:
+Microsoft references:
 
-- a 15-minute durable deadline;
-- at most four activations and 12 physical provider requests;
-- at most five unfinished jobs per principal and ten per tenant;
-- exact local and provider correlation identifiers and durable execution fencing.
-
-Deadline or budget exhaustion becomes terminal `inconclusive`; it cannot remain waiting indefinitely. Logout, account change, cancellation, recovery, and publication all fence late results. Completed work never replays after restart.
-
-Activation is reserved before saved-agent and qualification lookups, and draining rejects new starts. UUID casing does not create a separate local worker or bypass cancellation. One initiating session generation fences the whole activation, including awaited request admission; a replacement sign-in cannot revive old work. Each physical request passes its own deadline to authority checks, so a timed-out hook cannot perform late admission. Saved-agent identity is checked after awaited qualification/capability reads before dispatch.
-
-Cancellation during database activation waits for that bounded activation to settle and releases its exact execution ownership before the worker exits. Audit creation and publication writes also remain joined until they settle: a late audit event is closed, and publication checks session, cancellation, maintenance and deadline fences after locking and again before commit. Cancellation winning a concurrent failure write still closes the query audit. Failure-evidence lookups and recording honor the activation cancellation/deadline and must still belong to the initiating account. Local audit or snapshot failures do not become provider readiness failures; unexpected worker persistence errors are logged without raw error details.
-
-Requested, observed, and unobserved ranges remain distinct. A 201-row response publishes 200 minimized rows as `partial` and marks the requested interval unobserved rather than claiming a complete total. Provider, schema, scope, or access failures cannot become empty success. A later failed attempt does not replace an earlier same-scope successful snapshot and exposes a direct link to that retained result.
-
-Jobs, snapshots, and rows expire after 30 days with dependent export data. Capability evidence established by an explicit delegated provider request follows the finite five-minute readiness TTL. Optional qualification/retained-scope records retain their separate finite lifecycle; those records do not bind ordinary delegated jobs. Source retention remains a Microsoft policy. CSV is formula-hardened, source-safe, and bounded to the retained rows.
-
-Only current `CloudAppEvents` projections are stored. Legacy rows and actor aliases are not repaired, relabeled or converted into fresh provider evidence. An incompatible development database requires explicit owned-target reset followed by new authorized collection. Static/mocked checks do not establish database execution or provider success.
-
-## Audit and fixture boundary
-
-Application/shared approval and qualification, optional delegated qualification and retained-scope revocation, delegated request evidence, submission, provider query, cancellation, view, deletion, and export produce immutable local lifecycle records. Audit metadata is allowlisted to safe source, mode, template, count, status, and correlation fields. It never stores KQL, typed filters, requested target IDs, time ranges, provider bodies, or result rows.
-
-Protocol, persistence, HTTP, component, browser, restart, and export fixtures are synthetic. They contain no provider tokens, tenant records, prompt/response text, instructions, memory, tool arguments/results, raw body archives, or live endpoint responses.
-
-Live capability evidence is not part of fixture validation. With retained authentication unconfigured, no live Graph call is allowed. Live verification must first confirm tenant licensing, rollout, connector, table population and delegated RBAC, then submit ordinary explicitly authorized bounded delegated hunts for exact `AgentsInfo` and `CloudAppEvents` targets; there is no separate delegated approve/start ritual. Application/shared verification remains separately Admin-approved and qualified. Do not broaden grants, enable application scope, emit telemetry, or infer tenant readiness from fixture success.
+- [Advanced hunting overview](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-overview)
+- [AgentsInfo table](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-agentsinfo-table)
+- [Agent 365 observability attributes](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-attribute-reference)

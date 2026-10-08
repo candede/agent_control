@@ -1,47 +1,79 @@
 # Disaster recovery
 
-Production recovery is an approved maintenance action, never normal initialization. Keep a prior ZIP only if its compiled schema fingerprint exactly matches the database. There is no old-schema conversion or upgrade-on-restore. Development schema changes require an explicit reset; never start a mismatched writer or replay uncertain writes. No database, deployment, reset or restore was executed for this code-only change.
+Production recovery is an approved maintenance action. Use an isolated restore
+target, verify the current application schema, and keep provider changes disabled
+until review is complete.
 
-The schema is one current DDL definition with a singleton `app_schema` fingerprint marker, not a migration history. Only current-schema dump/receipt pairs are supported for backup and restore. Existing dumps were not read, rewritten or deleted. SQLite audit import and old Static Web App retirement are no longer recovery or deployment steps.
+## Local recovery rehearsal
 
-Use the current [Azure approval contract](../docs/azure-production-deployment.md#approval-file-and-preview): only `fresh`/`existing` installation modes are supported. `expectedSchemaVersion`, `legacyAuditBackupPath`, `legacyAuditBackupSha256` and `legacyStaticWebApp` must be absent, not merely empty or null. Old modes, parameters and receipts recording removed workflow steps fail closed. Reconcile unfinished retired workflows separately; do not edit receipts to force resume. No existing Static Web App is deleted by deploy or recovery.
-
-## Local logical rehearsal
-
-Use only an isolated `agentcontrol_restore_*` database and a protected dump/receipt pair. These are existing operator-only PowerShell helpers, not `deploy-local.ps1` arguments or a separate maintenance executable. In PowerShell 7 at the repository root:
+Load the operator helpers from the repository root:
 
 ```powershell
 . ./scripts/local-deployment.ps1
-$context = New-LocalContext -Root $PWD.Path -Project agent-control-phase01
+$context = New-LocalContext -Root $PWD.Path -Project agent-control
+```
+
+Restore a protected backup to a new review database:
+
+```powershell
 Invoke-LocalDeployment $context 'Restore' `
-  -BackupFile "$PWD/.local/agent-control-phase01/backups/<protected>.dump" `
-  -RestoreDatabase agentcontrol_restore_operator_review
+  -BackupFile "$PWD/.local/agent-control/backups/operator-verified.dump" `
+  -RestoreDatabase agentcontrol_restore_review
+```
+
+Verify:
+
+- backup checksum and schema fingerprint;
+- expected tenants and report selection;
+- current user, role, and provider scope;
+- audit and job integrity;
+- no active sessions or provider execution owners.
+
+Reopen the reviewed database:
+
+```powershell
 Invoke-LocalDeployment $context 'Reopen' `
-  -RestoreDatabase agentcontrol_restore_operator_review
+  -RestoreDatabase agentcontrol_restore_review
 ```
 
-The context reads saved configuration and port from the fixed repository-root `.local/agent-control-phase01/` directory. Follow the [backup and restore runbook](../docs/operations.md#backup-and-isolated-restore), including operator review before `Reopen`. Restore verifies the archive checksum, table fingerprints and exact current `schemaFingerprint` without upgrading; invalidates sessions, provider qualifications, previews and execution owners; preserves uncertain sent writes as inconclusive; reconciles current deletion/access scope; runs retention to convergence; and leaves provider work disabled. Reopen repeats review transactionally. It never changes the retained app database. Remove only the exact reviewed synthetic target.
+The restore workflow does not switch the running application to the review
+database. See the [operations runbook](../docs/operations.md#restore-for-review).
 
-## Future native Azure PITR drill
+## Azure point-in-time restore
 
-After explicit approval of the source server, UTC restore point, temporary server name/cost, maintenance window and cleanup owner:
+Obtain approval for the source server, UTC restore point, temporary server,
+maintenance window, cost, and cleanup owner.
 
 ```powershell
-pwsh ./deploy-azure.ps1 -Action PointInTimeRestore -TargetFile <approved-target.json> `
+pwsh ./deploy-azure.ps1 -Action PointInTimeRestore `
+  -TargetFile <approved-target.json> `
   -RestorePoint <approved-UTC-timestamp>
 ```
 
-The wizard restores to one isolated PostgreSQL Flexible Server, never a duplicate app stack. It keeps provider dispatch closed, runs the same session/qualification invalidation, current deletion/access review and convergent retention contract, does not repoint the serving app, and deletes only the run-owned restored server after validation. Its receipt must distinguish local rehearsal, mock orchestration and actual Azure PITR. The local-only Phase 12 session ran only deterministic mocks; no native restore occurred.
+The workflow creates an isolated PostgreSQL Flexible Server for review. It does
+not repoint the application.
 
-## Future serving recovery
+## Serving recovery
 
-An actual switch additionally requires explicit approval of the RPO/data-loss boundary, reviewed restored-server identity, retained old-server ownership and canonical app:
+Switching the application requires separate approval of the restore point,
+expected data loss, reviewed server identity, release, network rules, Key Vault
+references, and rollback ownership.
 
 ```powershell
-pwsh ./deploy-azure.ps1 -Action Recover -TargetFile <approved-target.json> `
+pwsh ./deploy-azure.ps1 -Action Recover `
+  -TargetFile <approved-target.json> `
   -RestorePoint <approved-UTC-timestamp>
 ```
 
-Recovery closes admission, drains without replay, backs up the current server, restores and reviews the isolated server while it remains in maintenance, then changes only `PGHOST` with `MAINTENANCE_MODE=true`. It starts the exact release contained, performs read-only route/configuration checks and requires the exact-run human login/callback/session receipt. Only then does it transactionally reopen the restored database with provider work disabled and remove application maintenance before bounded readiness/auth verification. The old server is retained until separate backup/retention approval; the verified restored server is transferred out of temporary cleanup ownership. Any post-switch failure reapplies maintenance, stops the app and records containment; it never silently falls back.
+Before reopening:
 
-Before reopening, verify the exact compiled schema fingerprint, runtime/admin privilege separation, every selected vault reference, login/callback/session invalidation, current report selection and source-scoped deletion/access, static/deep-link/API behavior and no execution owners. Record restored/source IDs, restore point, schema fingerprint, backup and release checksum, cleanup and operator approval without data or secret values.
+1. Confirm the application schema and release checksum.
+2. Confirm runtime and operator database privileges.
+3. Confirm every Key Vault reference.
+4. Confirm sign-in, callback, and session invalidation.
+5. Review report selection and tenant data scope.
+6. Confirm no provider job can replay an uncertain write.
+7. Verify health, readiness, static routes, and API routes.
+
+If verification fails, keep maintenance enabled, stop the application, and
+contain the reviewed restore target.
