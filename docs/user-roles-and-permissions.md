@@ -1,6 +1,6 @@
 # Signed-in user roles and permissions
 
-Microsoft access for actions performed with your signed-in account. The same reference appears in **Permissions > Signed-in user roles**. [App API permissions](deployment-setup.md#4-add-api-permissions) are configured separately.
+Microsoft access for actions performed with your signed-in account. The same reference appears in **Permissions > Signed-in user roles**. [App API permissions](deployment-setup.md#5-add-api-permissions) are configured separately.
 
 ## Agents and agent controls
 

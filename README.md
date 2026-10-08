@@ -29,22 +29,17 @@ host.
 
 ### 2. Configure Microsoft Entra ID
 
-Create or select an Entra app registration, then follow the
-[setup guide](docs/deployment-setup.md) to configure:
+Follow the [setup guide](docs/deployment-setup.md) to register Agent Control in
+Microsoft Entra ID. The guide covers:
 
+- creating the app registration;
 - the callback URL;
+- creating a client secret;
 - the Viewer and Admin app roles;
 - user or group assignments;
 - Microsoft API permissions and admin consent.
 
-For the default local port, use this Web redirect URI:
-
-```text
-http://localhost:3001/api/auth/callback
-```
-
-Have the tenant ID, client ID, client secret value, and accepted sign-in domains
-ready.
+The normal local setup uses `http://localhost:3001`.
 
 ### 3. Start Agent Control
 

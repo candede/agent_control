@@ -7,35 +7,49 @@ This guide configures Microsoft Entra ID and starts Agent Control locally.
 - PowerShell 7
 - Docker Desktop, or Docker Engine with Compose v2
 - Git and a checkout of this repository
-- An Entra app registration for each tenant
-- An Entra administrator who can configure the app registration and grant consent
-
-For each tenant, collect:
-
-- tenant ID;
-- application (client) ID;
-- client secret value;
-- accepted username domains, such as `contoso.com`.
+- An Entra administrator who can register applications and grant consent
 
 ## Configure the Entra application
 
-Complete these steps for every tenant used by Agent Control.
+Complete these steps once for the tenant. The local configuration runs on
+`localhost`.
 
-### 1. Add the callback URL
+### 1. Register Agent Control
 
-In **Entra admin center > App registrations > your application >
-Authentication**, add a **Web** redirect URI.
+1. Open the **Microsoft Entra admin center**.
+2. Go to **Identity > Applications > App registrations**.
+3. Select **New registration**.
+4. Enter `Agent Control` as the name.
+5. Under **Supported account types**, select **Accounts in this organizational
+   directory only**.
+6. Under **Redirect URI**, select **Web** and enter:
 
-For the default local port:
+   ```text
+   http://localhost:3001/api/auth/callback
+   ```
 
-```text
-http://localhost:3001/api/auth/callback
-```
+7. Select **Register**.
 
-If you use another port or deploy to Azure, register that origin followed by
-`/api/auth/callback`.
+On the registration's **Overview** page, copy:
 
-### 2. Add the app roles
+- **Directory (tenant) ID**
+- **Application (client) ID**
+
+You will enter both values in the Agent Control setup wizard.
+
+### 2. Create a client secret
+
+1. Open **Certificates & secrets** in the new app registration.
+2. Select **New client secret**.
+3. Enter a description and choose an expiry that follows your organization's
+   credential policy.
+4. Select **Add**.
+5. Copy the secret **Value** immediately.
+
+Store the value securely. The setup wizard needs the secret value, not the
+secret ID.
+
+### 3. Add the app roles
 
 Import only the `appRoles` array from
 [`infra/entra-app-manifest.json`](../infra/entra-app-manifest.json), or create
@@ -49,7 +63,7 @@ these roles manually:
 The roles must be enabled and allow **Users/Groups**. Admin already includes
 Viewer access, so each user or group needs only one role.
 
-### 3. Require assignment
+### 4. Require assignment
 
 Open **Enterprise applications > your application > Properties** and set
 **Assignment required?** to **Yes**.
@@ -57,7 +71,7 @@ Open **Enterprise applications > your application > Properties** and set
 Assign each approved user or group either **Agent Control Viewer** or
 **Agent Control Admin**. Sign out and back in after changing assignments.
 
-### 4. Add API permissions
+### 5. Add API permissions
 
 Open **App registrations > your application > API permissions**. Add only the
 permissions needed for the features you plan to use.
@@ -99,7 +113,8 @@ pwsh ./deploy-local.ps1 start
 ```
 
 The first start asks for the tenant ID, client ID, client secret, accepted
-domains, and local port. Configuration is saved under
+sign-in domains such as `contoso.com`, and local port. Use the values copied
+from the Entra app registration. Configuration is saved under
 `.local/agent-control/`; no `.env` file is required.
 
 Open:
@@ -151,16 +166,6 @@ the same callback URL for the deployment.
 Users enter their work or school username. Agent Control routes sign-in by an
 exact configured domain. Domains cannot overlap and do not include subdomains
 automatically.
-
-## Use a development tunnel
-
-1. Start Agent Control locally.
-2. Create an HTTPS tunnel to the selected local port.
-3. Run `pwsh ./deploy-local.ps1 edit-config` and set the tunnel URL as the public
-   URL.
-4. Add `<tunnel-url>/api/auth/callback` as a Web redirect URI in each Entra app
-   registration.
-5. Start Agent Control again.
 
 ## Run software checks
 
