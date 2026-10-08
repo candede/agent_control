@@ -113,6 +113,59 @@ afterEach(() => {
 });
 
 describe("DefenderHuntingView", () => {
+  it("shows the documented human caller rather than the provider account and retires rows on user changes", async () => {
+    const human = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const account = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const selected = job({ filters: { ...job().filters, templateId: "agent_activity", operations: ["InvokeAgent"], userObjectId: human } });
+    const page = inventoryPage(selected, "unused");
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [selected], count: 1, limit: 20, offset: 0 });
+    vi.mocked(getDefenderHuntingRows).mockResolvedValue({ ...page, snapshot: { ...page.snapshot!, sourceTable: "CloudAppEvents" },
+      value: [{
+        projectionVersion: 3, sourceTable: "CloudAppEvents", timestamp: "2026-09-09T10:30:00.000Z", actionType: "InvokeAgent",
+        cloudApplication: null, cloudApplicationId: null, cloudAppInstanceId: null, actorAccountObjectId: account, actorProviderAccountId: null,
+        objectId: null, reportId: "report-a", oauthAppId: null, operation: "invoke_agent", organizationId: null, targetAgentId: applicationId,
+        targetAgentName: "Selected agent", targetAgentBlueprintId: null, agentId: null, agentName: null, agentBlueprintId: null,
+        alternatePlatformAgentId: null, platformAgentType: null, conversationId: null, conversationThreadId: null, sessionIdentity: null, channelName: null,
+        humanActorUserObjectId: human, humanActorUserPrincipalName: "human@example.invalid", agentUserObjectId: null, agentUserPrincipalName: null,
+        targetAgentUserObjectId: null, spanId: "span-a", parentSpanId: null, creationTime: null, completionTime: null, errorType: null,
+        toolName: null, toolType: null, toolCallId: null, invokeSource: null, durationMilliseconds: null,
+        outcome: "unknown", spanRole: "root_invoke_agent", rootSpanObserved: true, contentAvailable: false,
+        fieldStates: { conversationId: "null", conversationThreadId: "unavailable", channelName: "null",
+          humanActorUserObjectId: "value", agentUserObjectId: "unavailable", targetAgentUserObjectId: "null",
+          completionTime: "null", errorType: "null", platformAgentId: "null", platformAgentType: "null" },
+      }] });
+    const view = render(<CapabilityContext value={context()}><AgentDefenderHuntingView userObjectId={human} /></CapabilityContext>);
+    fireEvent.click(await screen.findByRole("button", { name: /View hunt/ }));
+    const rows = within(await screen.findByRole("region", { name: "Minimized hunting rows" }));
+    expect(rows.getByText("Human caller")).toBeVisible();
+    expect(rows.getByText("human@example.invalid")).toBeVisible();
+    expect(rows.getByText(human)).toBeVisible();
+    expect(rows.queryByText(account)).not.toBeInTheDocument();
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
+    view.rerender(<CapabilityContext value={context()}><AgentDefenderHuntingView userObjectId={account} /></CapabilityContext>);
+    expect(screen.queryByText("human@example.invalid")).not.toBeInTheDocument();
+    await screen.findByText("No hunting history");
+    expect(getDefenderHuntingJobs).toHaveBeenLastCalledWith(20, 0, expect.objectContaining({ userObjectId: account }));
+  });
+
+  it.each([undefined, agentRecordId])("scopes a human invocation search and its history to user plus agent %s", async selectedAgent => {
+    const userObjectId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    vi.mocked(submitDefenderHunt).mockRejectedValue(new ApiError(403, "provider_denied", "Defender access denied by the provider."));
+    render(<CapabilityContext value={context()}><AgentDefenderHuntingView userObjectId={userObjectId}
+      agentRecordId={selectedAgent} entraAgentApplicationIds={selectedAgent ? [applicationId] : []} /></CapabilityContext>);
+    await screen.findByText("No hunting history");
+    expect(getDefenderHuntingJobs).toHaveBeenCalledWith(20, 0, expect.objectContaining({ agentRecordId: selectedAgent, userObjectId }));
+    expect(getDefenderHuntingCatalog).toHaveBeenCalledWith(expect.objectContaining({ agentRecordId: selectedAgent, userObjectId }));
+    expect(within(screen.getByLabelText("Log type")).getAllByRole("option")).toHaveLength(1);
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_activity" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
+    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledWith("delegated", expect.objectContaining({
+      templateId: "agent_activity", userObjectId, operations: ["InvokeAgent"],
+      entraAgentApplicationIds: selectedAgent ? [applicationId] : [],
+    }), expect.objectContaining({ agentRecordId: selectedAgent, userObjectId })));
+    expect(await screen.findByText("Defender access denied by the provider.")).toBeVisible();
+  });
+
   it.each(["history", "exact job"] as const)(
     "settles terminal %s polling and reads qualification evidence after completion without duplicate job reads", async location => {
       vi.useFakeTimers();
@@ -756,7 +809,6 @@ describe("DefenderHuntingView", () => {
     const rendered = render(view());
     await screen.findByText("No hunting history");
     fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_tools" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: "ExecuteToolBySDK" }));
     fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
     fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-09T11:00" } });
     const renewed = { ...access, views: access.views.map(item => ({ ...item, decision: {
@@ -775,7 +827,7 @@ describe("DefenderHuntingView", () => {
     expect(screen.getByLabelText("Log type")).toHaveValue("agent_tools");
     expect(screen.getByLabelText("Start")).toHaveValue("2026-09-09T10:30");
     expect(screen.getByLabelText("End")).toHaveValue("2026-09-09T11:00");
-    expect(screen.getByRole("checkbox", { name: "ExecuteToolBySDK" })).not.toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: "ExecuteToolBySDK" })).not.toBeInTheDocument();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
@@ -1147,19 +1199,18 @@ describe("DefenderHuntingView", () => {
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     expect(vi.mocked(submitDefenderHunt).mock.calls[0][1]).toMatchObject({ templateId: "agent_activity", entraAgentApplicationIds: [applicationId], agentIds: [] });
     expect(vi.mocked(submitDefenderHunt).mock.calls[0][1]).not.toHaveProperty("entraAgentIds");
-    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agents_inventory" } });
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(screen.getByRole("alert")).toHaveTextContent("No verified enterprise-application object ID.");
+    expect(screen.queryByRole("option", { name: "Defender agent inventory" })).not.toBeInTheDocument();
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
   });
 
   it("loads only catalog and saved history and explains the selected log type without portal links or disclosures", async () => {
     renderView();
     expect(await screen.findByRole("heading", { name: "Search Defender logs" })).toBeVisible();
-    expect(screen.getByText("AgentsInfo (preview)")).toBeVisible();
+    expect(screen.getByLabelText("Log type")).toHaveValue("agents_inventory");
     expect(screen.getByText(/This is an inventory snapshot, not a log of conversations/)).toBeVisible();
     expect(screen.queryByText("Not independently proven")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Microsoft Defender hunting" }).querySelector("details")).toBeNull();
-    expect(screen.getByText("Run a hunt to collect results for this agent.")).toBeVisible();
+    expect(screen.getByText("Run a hunt to collect results for this selection.")).toBeVisible();
     expect(screen.queryByText("Selected agent", { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByText(/Opening this view does not run a provider query|Delegated results remain principal-private|authorization permits an explicit bounded hunt/)).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Tenant Defender portal" })).not.toBeInTheDocument();
@@ -1285,7 +1336,8 @@ describe("DefenderHuntingView", () => {
           username: "security@example.invalid", roles: ["AgentControl.Admin"],
         },
         loading: false, pending: false, error: undefined, now: Date.parse("2026-09-09T11:02:00.000Z"),
-        reload: vi.fn(async () => undefined), openPermissions: vi.fn(), views: [],
+        reload: vi.fn(async () => undefined), openPermissions: vi.fn(),
+        views: context(false).views.map(view => ({ ...view, enabled: true, configuration: { enabled: true, sharedDataScope: true, revision: 1 } })),
       }}><DefenderHuntingView /></CapabilityContext>);
 
       await screen.findByText("No hunting history");
@@ -1674,11 +1726,14 @@ describe("DefenderHuntingView", () => {
     value.views = value.views.map(view => view.definition.mode === "application" ? {
       ...view, enabled: false, configuration: { enabled: false, sharedDataScope: false, revision: 1 },
     } : view);
-    render(<CapabilityContext value={value}><DefenderHuntingView /></CapabilityContext>);
+    const initial = context();
+    const rendered = render(<CapabilityContext value={initial}><DefenderHuntingView /></CapabilityContext>);
     await screen.findByText("No hunting history");
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
+    rendered.rerender(<CapabilityContext value={value}><DefenderHuntingView /></CapabilityContext>);
+    await screen.findByText("No hunting history");
+    expect(screen.queryByLabelText("Authorization")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 

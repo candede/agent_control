@@ -6,14 +6,17 @@ import { UserSourcesRepository, facts, userSourceSqlParameters, type UserSourceM
 import { OfficialReportHistory, readableHistorySql } from "../db/officialReportHistory.js";
 import { reportRelationsSql, reportPeriodSortKey, selectedDirectoryReportRelationsSql, selectedOfficialReportRelationsSql } from "../db/officialReportQueries.js";
 import { reportUuid } from "../db/officialReportImports.js";
-import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
+import { CursorCodec, DataSelections, SelectionError, assertSelectionIdentity, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
 import type { ReportEndpoint, ReportMetadata, ReportPage, ReportQuery, ReportRow, ReportSummary } from "../types/officialReportData.js";
-import type { UserSourceScope, UserSourceSelection } from "../types/userSources.js";
+import type { UserSourceScope } from "../types/userSources.js";
 import type { GenerationLease } from "../db/dataGenerations.js";
 import type { UserSourceStages } from "../db/userSourceStages.js";
 import { officialReportAnalytics, officialReportAnalyticsQuery, projectReportAnalytics, type ReportSql } from "./officialReportAnalytics.js";
 import { peakCheckpoint } from "./peakMemory.js";
 import { readableReportVersionSql } from "../db/reportCapacitySchema.js";
+import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisions.js";
+import type { PublicationRevisions, PublishedSelectedRead } from "../types/dataSelection.js";
+import { isPublicationRevisions } from "../types/dataSelection.js";
 
 export const reportQueryFields = ["setId", "scope", "search", "company", "department", "entitlement", "serviceState", "appActivity",
   "reportActivity", "cohort", "licenseCohort", "creatorType", "agentId", "username", "responsesOnly", "startDate", "endDate",
@@ -72,10 +75,11 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
 
 export type ReportReadContext = {
   identity: SelectionIdentity; tokenMode: UserSourceScope["tokenMode"]; endpoint: ReportEndpoint; query: ReportQuery; queryHash: string;
-  metadata: UserSourceMetadataSet; report: ReportMetadata; evaluatedAt: Date; selection: UserSourceSelection;
+  metadata: UserSourceMetadataSet; report: ReportMetadata; evaluatedAt: Date; selection: PublishedSelectedRead;
 };
 export type ReportCurrentData = Pick<ReportReadContext, "metadata" | "report" | "evaluatedAt" | "query"> & {
   identity: Pick<SelectionIdentity, "tenantId" | "principalId">;
+  publicationRevisions: PublicationRevisions;
 };
 
 type SelectedAggregate = {
@@ -138,19 +142,18 @@ export class LargeTenantUsersReports {
   }
 
   async capture(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"], endpoint: ReportEndpoint, input: ReportQuery = {}) {
-    const query = reportQuery(endpoint, input), sourceScope = await this.sources.ensureScope(identity, tokenMode);
+    assertSelectionIdentity(identity);
+    const query = reportQuery(endpoint, input);
     await this.prepareHistoryCapture(identity.tenantId);
     return this.selections.captureWith(identity, endpoint, { values: query, allowed: reportQueryFields }, async (client, evaluatedAt) => {
       const metadata = await this.sources.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
-      const state = (await client.query("SELECT epoch::text FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0];
       const history = await this.history.root(client, identity.tenantId, evaluatedAt);
       const report = await this.metadata(client, identity.tenantId, query.setId, evaluatedAt);
-      const cache = (await client.query(`SELECT min(expires_at) AS expiry FROM agent_people_cache
-        WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>$3`, [identity.tenantId, identity.principalId, evaluatedAt])).rows[0].expiry as Date | null;
-      const roots: DependencyRoot[] = [history, { kind: "user_sources", scopeId: sourceScope, revision: state.epoch,
-        expiresAt: new Date(Math.min(evaluatedAt.getTime() + 1800000, cache?.getTime() ?? Infinity)) }];
+      const publicationRevisions = await readAutomaticInventoryRevisions(identity, client);
+      const roots: DependencyRoot[] = [history];
       for (const source of Object.values(metadata)) if (source.generationId) roots.push({
-        kind: "generation", generationId: source.generationId, scopeId: source.scopeId!, revision: source.revision!, expiresAt: new Date(source.expiresAt!),
+        kind: "generation", generationId: source.generationId, scopeId: source.scopeId!, revision: source.revision!,
+        expiresAt: new Date(evaluatedAt.getTime() + 30 * 60_000),
       });
       const transitions = [
         metadata.app_activity.reportRefreshDate ? Date.parse(`${metadata.app_activity.reportRefreshDate}T23:59:59.999Z`) + 4 * 86400000 : Infinity,
@@ -162,7 +165,7 @@ export class LargeTenantUsersReports {
         persist: async (connection, selection) => {
           await connection.query(`INSERT INTO official_usage_read_contexts(selection_id,tenant_id,token_mode,metadata,report_metadata,set_id,history_revision,history_epoch)
             VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8)`,
-          [selection.id, identity.tenantId, tokenMode, JSON.stringify(metadata), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
+          [selection.id, identity.tenantId, tokenMode, JSON.stringify({ ...metadata, publicationRevisions }), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
         } };
     });
   }
@@ -217,15 +220,18 @@ export class LargeTenantUsersReports {
   }
 
   async contextInRead(client: pg.PoolClient, identity: SelectionIdentity, selectionId: string): Promise<ReportReadContext> {
-    const row = (await client.query(`SELECT s.endpoint,s.query_json,s.query_hash,s.evaluated_at,s.expires_at,s.revision,c.*
+    const row = (await client.query(`SELECT s.endpoint,s.query_json,s.query_hash,s.evaluated_at,s.expires_at,s.revision,c.*,clock_timestamp() AS validated_at
       FROM data_read_selections s JOIN official_usage_read_contexts c ON c.selection_id=s.id
       WHERE s.id=$1 AND s.tenant_id=$2 AND s.principal_id=$3`, [selectionId, identity.tenantId, identity.principalId])).rows[0];
     if (!row) throw new SelectionError("selection_invalidated");
     const query = reportQuery(row.endpoint, row.query_json);
     if (canonicalQuery(query, reportQueryFields) !== row.query_hash) throw new SelectionError("invalid_cursor");
-    return { identity, tokenMode: row.token_mode, endpoint: row.endpoint, query, queryHash: row.query_hash, metadata: row.metadata,
+    const { publicationRevisions, ...metadata } = row.metadata;
+    if (!isPublicationRevisions(publicationRevisions)) throw new SelectionError("selection_invalidated", "unavailable");
+    return { identity, tokenMode: row.token_mode, endpoint: row.endpoint, query, queryHash: row.query_hash, metadata,
       report: row.report_metadata, evaluatedAt: row.evaluated_at,
-      selection: { id: selectionId, revision: row.revision, expiresAt: row.expires_at.toISOString(), evaluatedAt: row.evaluated_at.toISOString() } };
+      selection: { id: selectionId, revision: row.revision, expiresAt: row.expires_at.toISOString(), evaluatedAt: row.evaluated_at.toISOString(),
+        validatedAt: row.validated_at.toISOString(), publicationRevisions } };
   }
   read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: ReportReadContext) => Promise<T>) {
     return this.selections.read(id, identity, async client => {
@@ -239,11 +245,17 @@ export class LargeTenantUsersReports {
     if (state.isolation !== "repeatable read") throw new Error("inventory_report_repeatable_read_required");
     const evaluatedAt = at ?? state.now as Date;
     await this.history.prepareRead(client, scope.tenantId);
+    const metadata = await this.sources.metadataInRead(client, { ...scope, tokenMode: "delegated" }, evaluatedAt);
+    metadata.app_activity = { source: "app_activity", generationId: null, scopeId: null, revision: null,
+      expiresAt: null, observedAt: null, attemptedAt: null, attemptStatus: null, attemptObservedCount: null,
+      errorCode: null, message: "App activity is not captured for agent inventory.", rowCount: null, state: "unavailable",
+      reportRefreshDate: null, period: null, reportVersion: null };
     return { identity: scope, evaluatedAt, query: { lowResponseThreshold: 5 },
-      metadata: await this.sources.metadataInRead(client, { ...scope, tokenMode: "delegated" }, evaluatedAt),
+      publicationRevisions: await readAutomaticInventoryRevisions(scope, client),
+      metadata,
       report: await this.metadata(client, scope.tenantId, undefined, evaluatedAt) };
   }
-  parameters(context: ReportCurrentData) {
+  parameters(context: Omit<ReportCurrentData, "publicationRevisions">) {
     return [...userSourceSqlParameters(context), context.identity.tenantId, context.report.setId, context.query.lowResponseThreshold];
   }
 

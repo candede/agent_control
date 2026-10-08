@@ -6,11 +6,11 @@ import { AppError, errorTelemetry } from "../errors.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
-import type { PurviewAuditJob, PurviewAuditTokenMode, PurviewProviderQuery } from "../types/purviewAudit.js";
+import type { PurviewAuditJob, PurviewAuditTokenMode, PurviewProviderQuery, PurviewAuditFilters } from "../types/purviewAudit.js";
 import { capabilities } from "./capabilities.js";
-import { GraphAuditSearchClient, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
+import { GraphAuditSearchClient, providerQueryMatches, scopePurviewAuditResult, validatePurviewAuditFilters } from "./graphAuditSearch.js";
 import { operationalLog } from "./telemetry.js";
-import { agentInvestigations } from "./agentInvestigations.js";
+import { agentInvestigations, investigationRecordId } from "./agentInvestigations.js";
 import type { AgentPurviewQuery, AgentPurviewRecordPage } from "../types/agentInvestigations.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 
@@ -76,10 +76,10 @@ export class PurviewAuditService {
     private readonly dependencies: AuditDependencies = defaultDependencies,
   ) {}
 
-  async submit(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; idempotencyKey: string }) {
+  async submit(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; idempotencyKey: string; agentRecordId?: unknown }) {
     requireViewer(user);
     requireProviderAdmissions();
-    const filters = validatePurviewAuditFilters(input.filters);
+    const filters = await this.bindFilters(user, input.filters, input.agentRecordId);
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
@@ -88,9 +88,9 @@ export class PurviewAuditService {
     return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)), { idempotencyKey: input.idempotencyKey, filters });
   }
 
-  async approveQualification(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown }) {
+  async approveQualification(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; agentRecordId?: unknown }) {
     requireQualificationRole(user, input.tokenMode);
-    const filters = validatePurviewAuditFilters(input.filters, { qualification: true });
+    const filters = await this.bindFilters(user, input.filters, input.agentRecordId, true);
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
@@ -191,18 +191,33 @@ export class PurviewAuditService {
     return job;
   }
 
-  async list(user: AuthenticatedUser, limit = 20, offset = 0, userPrincipalName?: unknown) {
+  async list(user: AuthenticatedUser, limit = 20, offset = 0, userPrincipalName?: unknown, agentRecordId?: unknown) {
     requireViewer(user);
     if (userPrincipalName !== undefined && (typeof userPrincipalName !== "string"
       || !userPrincipalName.includes("@") || userPrincipalName.length > 320 || /[\s\0]/.test(userPrincipalName))) {
       throw new AppError(400, "invalid_request", "A single valid user principal name is required for user-scoped Audit Search history.");
     }
-    return this.repository.listJobs(await this.readScope(user), limit, offset, userPrincipalName);
+    return this.repository.listJobs(await this.readScope(user), limit, offset, userPrincipalName,
+      agentRecordId === undefined ? undefined : investigationRecordId(agentRecordId));
   }
 
   async records(user: AuthenticatedUser, id: string, limit = 100, offset = 0) {
     requireViewer(user);
     return this.repository.listRecords(await this.readScope(user), id, limit, offset);
+  }
+
+  private async bindFilters(user: AuthenticatedUser, input: unknown, recordId: unknown, qualification = false) {
+    if (input && typeof input === "object" && "agent" in input) {
+      throw new AppError(400, "invalid_audit_filters", "Agent audit identities are selected from the saved agent, not supplied by the caller.");
+    }
+    if (recordId === undefined) return validatePurviewAuditFilters(input, { qualification });
+    if (!input || typeof input !== "object" || Array.isArray(input)) return validatePurviewAuditFilters(input, { qualification });
+    const resolve = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations);
+    const current = await resolve(actorScope(user), investigationRecordId(recordId));
+    if (!current.purviewTarget) throw new AppError(409, "agent_investigation_unavailable", current.context.purview.reason!);
+    const { botId, environmentId, applicationId } = current.purviewTarget;
+    return validatePurviewAuditFilters({ ...input, agent: { recordId: current.context.recordId, botId, environmentId,
+      ...("presetId" in input && input.presetId === "copilot_interactions" && applicationId ? { applicationId } : {}) } }, { qualification });
   }
 
   async relatedInventoryRecords(user: AuthenticatedUser, target: { environmentId: string; botId: string }, limit = 20) {
@@ -281,7 +296,7 @@ export class PurviewAuditService {
     let authorizationSignal = signal;
     try {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal);
+      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal, current.filters);
       const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
         : this.dependencies.applicationToken(actor.tenantId, capabilityId), signal), { signal, clearOnSuccess: false });
@@ -297,7 +312,10 @@ export class PurviewAuditService {
       const providerOptions = {
         signal,
         correlationId: current.localRequestId,
-        beforeRequest: () => this.authorizeProviderRequest(scope, current.id, execution, signal),
+        beforeRequest: async () => {
+          await this.validateAgentTarget(freshUser, current.filters, signal);
+          await this.authorizeProviderRequest(scope, current.id, execution, signal);
+        },
         onResponse: (providerRequestId: string | null) => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId),
       };
       let query: PurviewProviderQuery | undefined;
@@ -344,8 +362,14 @@ export class PurviewAuditService {
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
       const completedQueryId = query.id;
-      const result = await this.dependencies.observeOperation(capabilityId, freshUser,
-        () => this.dependencies.listRecords(token, completedQueryId, actor.tenantId, providerOptions), { signal, clearOnSuccess: result => result.complete });
+      const providerResult = await this.dependencies.observeOperation(capabilityId, freshUser,
+        () => this.dependencies.listRecords(token, completedQueryId, actor.tenantId, providerOptions),
+        { signal, clearOnSuccess: result => result.complete && !query.isRecordCountLimitExceeded });
+      const result = scopePurviewAuditResult(providerResult, current.filters);
+      if (query.isRecordCountLimitExceeded) {
+        result.complete = false;
+        result.partialReason = "provider_result_limit";
+      }
       throwIfCancelled(signal);
       if (signal.aborted) {
         result.complete = false;
@@ -354,7 +378,7 @@ export class PurviewAuditService {
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
       authorizationSignal = publicationSignal;
       const publicationValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal);
+      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal, current.filters);
       const job = await commitAccountSessionValidation(publicationValidation, async () => {
         publicationSignal.throwIfAborted();
         requireProviderAdmissions();
@@ -415,6 +439,7 @@ export class PurviewAuditService {
     scope: PurviewAuditScope,
     qualification: Awaited<ReturnType<PurviewAuditRepository["getQualification"]>>,
     signal: AbortSignal,
+    filters: PurviewAuditFilters,
   ) {
     signal.throwIfAborted();
     requireProviderAdmissions();
@@ -428,9 +453,22 @@ export class PurviewAuditService {
     if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
     if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
     else await abortable(this.dependencies.requireAvailable(capabilityId, freshUser), signal);
+    await this.validateAgentTarget(freshUser, filters, signal);
     signal.throwIfAborted();
     requireProviderAdmissions();
     return { user: freshUser, capabilityId };
+  }
+
+  private async validateAgentTarget(user: AuthenticatedUser, filters: PurviewAuditFilters, signal: AbortSignal) {
+    if (!filters.agent) return;
+    const resolve = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations);
+    const current = await abortable(resolve(actorScope(user), filters.agent.recordId), signal);
+    const target = current.purviewTarget;
+    if (!target || current.context.recordId !== filters.agent.recordId || target.botId !== filters.agent.botId
+      || target.environmentId !== filters.agent.environmentId
+      || filters.presetId === "copilot_interactions" && target.applicationId !== filters.agent.applicationId) {
+      throw new AppError(409, "agent_identity_changed", "The selected agent identity changed. Start a new search from the current agent.");
+    }
   }
 
   private async authorizeProviderRequest(scope: PurviewAuditScope, id: string, execution: PurviewAuditExecution, signal: AbortSignal) {

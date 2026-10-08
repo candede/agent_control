@@ -270,22 +270,24 @@ describe("license evidence read ownership", () => {
     saved.selection.expiresAt = expiresAt;
     vi.mocked(readReportDetail).mockResolvedValue(saved);
     render(<UserDetailModal {...modalProps()} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent(/expired/);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/incomplete or inconsistent saved-read metadata/);
     expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Restart selection" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry user details" })).toBeVisible();
   });
 
-  it("retires an expiring direct-user selection without a reload loop and explicitly captures fresh evidence", async () => {
+  it("retains a direct-user selection at lease end and only explicitly captures fresh evidence", async () => {
     vi.useFakeTimers();
     const saved = evidence(combinedUser());
+    saved.selection.validatedAt = new Date().toISOString();
     saved.selection.expiresAt = new Date(Date.now() + 5000).toISOString();
     vi.mocked(readReportDetail).mockResolvedValue(saved);
     await act(async () => { render(<UserDetailModal {...modalProps()} />); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
     await act(async () => { await vi.advanceTimersByTimeAsync(5001); });
-    expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent(/expired/);
+    expect(screen.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
+    expect(screen.getByText(/Showing previously loaded user details/)).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(readReportDetail).toHaveBeenCalledOnce();
     vi.mocked(readReportDetail).mockResolvedValue(evidence({ ...combinedUser(), copilotServiceState: "disabled", entitlement: "no_paid" }));
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Restart selection" })); });
@@ -317,7 +319,7 @@ describe("license evidence read ownership", () => {
     expect(screen.queryByText("No active M365 Copilot license", { exact: true })).not.toBeInTheDocument();
   });
 
-  it("expires linked license evidence on focus even when the capability clock has not advanced", async () => {
+  it("retains linked license evidence on monotonic lease end without cancelling an admitted detail", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const report = evidence(reportUser()), pending = deferred<OfficialReportDetail<CombinedUser>>();
     report.selection.expiresAt = new Date(Date.now() + 5000).toISOString();
@@ -332,13 +334,14 @@ describe("license evidence read ownership", () => {
     await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(2));
     const signal = vi.mocked(readReportDetail).mock.calls[1][2];
     expect(screen.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
-    vi.setSystemTime(Date.now() + 6000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(report.selection.expiresAt) - Date.parse(report.selection.validatedAt) + 1);
     fireEvent.focus(window);
-    expect(screen.getByRole("alert")).toHaveTextContent(/expired/);
-    expect(signal?.aborted).toBe(true);
+    expect(screen.getByText(/Showing previously loaded user details/)).toBeVisible();
+    expect(signal?.aborted).toBe(false);
     await act(async () => pending.resolve(evidence(combinedUser())));
-    expect(screen.queryByText("No active M365 Copilot license", { exact: true })).not.toBeInTheDocument();
-    expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
+    expect(await screen.findByText("Contoso")).toBeVisible();
+    expect(screen.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(readReportDetail).toHaveBeenCalledTimes(2);
   });
 

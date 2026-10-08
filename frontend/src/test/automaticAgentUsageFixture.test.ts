@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { AgentUsageHistoryPoint, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
 import { agentUsageHistoryFixture, automaticUsageContext } from "./automaticAgentUsageFixture";

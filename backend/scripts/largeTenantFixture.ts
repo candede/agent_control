@@ -2,7 +2,29 @@ import { spawnSync, type SpawnSyncOptionsWithBufferEncoding, type SpawnSyncRetur
 import { pathToFileURL } from "node:url";
 import { browserFixtureTestFiles } from "./fixtureSupport.js";
 
+const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
+
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "production-frontend") return [
+    ["run", "test", "--workspace", "frontend"],
+  ];
+  if (suite === "lifecycle-publication-contract") return [
+    ["run", "test", "--workspace", "backend", "--", "src/db/publishedInventoryLifecycle.test.ts",
+      "scripts/databasePreflight.test.ts", "scripts/databaseReset.test.ts", "src/db/packageInventoryUnifiedSource.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "lifecycle-read-contract") return [
+    ["run", "test", "--workspace", "backend", "--", "src/db/selectedLifecycle.test.ts", "src/db/publishedInventoryLifecycle.test.ts",
+      "scripts/databasePreflight.test.ts", "scripts/databaseReset.test.ts", "src/db/dataGenerations.test.ts", "src/db/inventoryGenerations.test.ts",
+      "src/db/schema.test.ts", "src/services/largeTenantUserSources.test.ts", "scripts/database.test.ts",
+      "src/services/dataSelections.test.ts", "src/services/dataExports.test.ts", "src/services/inventoryExports.test.ts",
+      "src/services/inventoryReconciliation.test.ts", "src/db/packageInventoryUnifiedSource.test.ts",
+      "src/services/largeTenantUsersReports.test.ts", "src/db/officialUsageHistorySelection.test.ts",
+      "src/db/dataRetention.test.ts", "src/routes/largeTenantInventory.test.ts",
+      "src/db/packageControlState.test.ts", "src/db/copilotStudioQuarantine.test.ts",
+      "src/db/automaticRevisions.unit.test.ts", "src/services/officialReportQuery.test.ts", "scripts/largeTenantFixture.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
   if (suite === "production-publication") return [
     ["run","test","--workspace","backend","--","src/db/inventoryGenerations.test.ts",
       "src/services/automaticRefreshIntegration.test.ts","src/services/packageInventory.test.ts","src/services/powerPlatformInventory.test.ts"],
@@ -15,6 +37,10 @@ export function fixtureCommands(suite: string): string[][] {
       "src/services/officialReportReads.test.ts","src/services/providerJson.test.ts",
       "src/services/inventoryProjectionMetadata.test.ts","src/db/inventoryGenerations.test.ts",
       "src/services/packageInventory.test.ts","src/services/powerPlatformInventory.test.ts",
+      "src/db/publishedInventoryLifecycle.test.ts","src/db/powerPlatformInventory.test.ts","src/db/dataSync.test.ts",
+      "src/services/copilotUsage.test.ts","src/routes/dataPages.test.ts","src/services/officialUsageViews.test.ts",
+      "scripts/dataSyncPersistence.test.ts","src/db/agentControlIdentity.test.ts","src/db/packageInventory.test.ts",
+      "src/db/savedAgentPeople.test.ts","src/routes/policy.test.ts","src/services/capabilityArtifacts.test.ts",
       "scripts/largeTenantCapacity.test.ts","scripts/largeTenantFixture.test.ts"],
     ["run","typecheck","--workspace","backend"],
   ];
@@ -102,7 +128,7 @@ export function fixtureCommands(suite: string): string[][] {
       "src/db/dataRetention.test.ts", "src/db/officialUsageHistorySelection.test.ts", "src/services/dataExports.test.ts",
       "src/db/jobs.test.ts", "src/db/inventoryGenerations.test.ts", "src/db/schema.test.ts", "src/routes/dataPages.test.ts"],
     ["run", "test", "--workspace", "frontend", "--", "src/components/AutomaticRefreshStatus.test.tsx", "src/components/DataSyncPanel.test.tsx",
-      "src/components/SyncHistoryView.test.tsx", "src/components/OfficialUsageManageReports.test.tsx", "src/App.session.test.tsx", "src/savedQueries.test.tsx",
+      "src/components/SyncHistoryView.test.tsx", "src/components/OfficialUsageManageReports.test.tsx", ...appSessionFiles, "src/savedQueries.test.tsx",
       "src/api/reportData.test.ts", "src/components/ReportExportButton.test.tsx"],
     ["run", "typecheck", "--workspace", "backend"],
     ["run", "lint", "--workspace", "frontend"],
@@ -128,7 +154,7 @@ export function fixtureCommands(suite: string): string[][] {
       "src/services/copilotStudioQuarantineJobs.test.ts", "src/services/copilotStudioQuarantineJobs.unit.test.ts",
       "src/routes/quarantineJobReads.test.ts", "src/routes/packageCanaryAuthorization.test.ts",
       "src/services/packageCanaryMutation.unit.test.ts", "src/server.test.ts"],
-    ["run", "test", "--workspace", "frontend", "--", "src/agentInventoryQueries.test.ts", "src/App.session.test.tsx"],
+    ["run", "test", "--workspace", "frontend", "--", "src/agentInventoryQueries.test.ts", ...appSessionFiles],
     ["run", "typecheck", "--workspace", "backend"],
     ["run", "lint", "--workspace", "frontend"],
     ["run", "build", "--workspace", "frontend"],
@@ -189,7 +215,7 @@ export function fixtureCommands(suite: string): string[][] {
       "src/services/bulkJobs.test.ts", "src/routes/agents.test.ts", "src/routes/packageCanaryAuthorization.test.ts", "src/routes/policy.test.ts",
       "src/app.test.ts", "src/server.test.ts"],
     ["run", "typecheck", "--workspace", "backend"],
-    ["run", "test", "--workspace", "frontend", "--", "src/components/LargeTenantInventory.test.tsx", "src/components/BulkActions.test.tsx", "src/App.session.test.tsx"],
+    ["run", "test", "--workspace", "frontend", "--", "src/components/LargeTenantInventory.test.tsx", "src/components/BulkActions.test.tsx", ...appSessionFiles],
     ["run", "build", "--workspace", "frontend"],
   ];
   if (suite === "inventory-route") return [
@@ -257,7 +283,7 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "test", "--workspace", "backend", "--", "src/routes/largeTenantInventory.test.ts", "-t", "serves an exact counted page|selected saved package details|counted responsibility|selected refresh targets"],
     ["run", "typecheck", "--workspace", "backend"],
     ["run", "test", "--workspace", "frontend", "--", "src/api/client.test.ts", "src/components/LargeTenantInventory.test.tsx"],
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "-t", "durable inventory export|invalidates an export selection|off-preview published"],
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "-t", "durable inventory export|invalidates an export selection|off-preview published"],
     ["run", "build", "--workspace", "frontend"],
     ["run", "lint", "--workspace", "frontend"],
   ];
@@ -272,7 +298,7 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "test", "--workspace", "frontend", "--", "src/agentInventoryQueries.test.ts", "src/components/SavedInventoryVerification.test.tsx",
       "src/components/AgentSyncTools.test.tsx", "src/useOfficialUsageOverview.test.tsx", "src/components/LargeTenantInventory.test.tsx",
       "src/packageSelectionSession.test.ts", "src/workbenchRouting.test.ts", "src/components/UnifiedAgentTable.test.tsx"],
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "-t",
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "-t",
       "5000 all-matching|logical package group|restores all 5000|restores pinned|rejects a restored group"],
     ["run", "build", "--workspace", "frontend"],
     ["run", "lint", "--workspace", "frontend"],
@@ -302,7 +328,7 @@ export function fixtureCommands(suite: string): string[][] {
   if (suite === "inventory-staging") return [
     ["run", "test", "--workspace", "backend", "--", "src/db/inventoryMutationStages.test.ts", "src/routes/largeTenantInventory.test.ts"],
     ["run", "typecheck", "--workspace", "backend"],
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "--reporter=json", "--outputFile=/evidence/inventory-staging-app.json"],
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "--reporter=json", "--outputFile=/evidence/inventory-staging-app.json"],
     ["run", "build", "--workspace", "frontend"],
   ];
   if (suite === "inventory-foundation") return [
@@ -334,7 +360,7 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "test", "--workspace", "backend", "--", "src/db/inventoryMutationStages.test.ts", "src/services/inventoryReconciliation.test.ts",
       "src/db/automaticRevisions.unit.test.ts"],
     ["run", "typecheck", "--workspace", "backend"],
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "-t", "confirms.*(?:all-matching|logical package group)"],
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "-t", "confirms.*(?:all-matching|logical package group)"],
     ["run", "build", "--workspace", "frontend"],
     ["run", "lint", "--workspace", "frontend"],
   ];
@@ -448,11 +474,11 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "typecheck", "--workspace", "backend"], ["run", "build", "--workspace", "frontend"],
   ];
   if (suite === "cutover-app-contract") return [
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "src/test/permissionFixtures.test.ts"],
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "src/test/permissionFixtures.test.ts"],
     ["run", "lint", "--workspace", "frontend"],
   ];
   if (suite === "inventory-app-exports") return [
-    ["run", "test", "--workspace", "frontend", "--", "src/App.session.test.tsx", "--testNamePattern", "export|bulk-reference|off-preview"],
+    ["run", "test", "--workspace", "frontend", "--", ...appSessionFiles, "--testNamePattern", "export|bulk-reference|off-preview"],
     ["run", "lint", "--workspace", "frontend"],
   ];
   if (suite === "cutover-people-fences") return [
@@ -530,7 +556,8 @@ type FixtureExecutor = (command: string, args: string[], options: SpawnSyncOptio
 export function runFixtureCommand(args: string[], environment: NodeJS.ProcessEnv,
   execute: FixtureExecutor = spawnSync, kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill) {
   const result = execute("npm", args, {
-    env: environment, stdio: "inherit", timeout: 600_000, cwd: "/app", detached: true,
+    env: environment, stdio: "inherit",
+    timeout: args.join(" ") === "run test --workspace frontend" ? 300_000 : 600_000, cwd: "/app", detached: true,
   });
   if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
     if (!Number.isSafeInteger(result.pid) || result.pid <= 0) throw new Error("fixture_timeout_process_group_missing", { cause: result.error });

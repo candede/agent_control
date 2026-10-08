@@ -10,6 +10,7 @@ import { ApiError } from "../api/client";
 import { useSavedQueryClient } from "../savedQueries";
 import { CapabilityContext } from "../capabilityContext";
 import { useReportPrincipalScope } from "../useReportPage";
+import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "../selectedRead";
 import type { UserDetailTab } from "../workbenchRouting";
 import { usageCount, usageDate } from "../usageInsights";
 import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
@@ -20,7 +21,7 @@ import { ReportedUserAgents, type UserRelationshipFilters, type UserRelationship
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
 import { UserPurviewAudit } from "./UserPurviewAudit";
 
-const tabs = [["overview", "Overview"], ["usage", "Usage & agents"], ["licenses", "Licenses"], ["responsibility", "Responsibility"], ["purview", "Purview audit"]] as const;
+const tabs = [["overview", "Overview"], ["usage", "Usage & agents"], ["licenses", "Licenses"], ["responsibility", "Responsibility"], ["purview", "Logs"]] as const;
 const defaultRelationshipQuery: UserRelationshipQuery = { search: "", showAll: false, sort: "responses", order: "desc" };
 const appLabels = {
   copilotChatLastActivityDate: "Copilot Chat", microsoftTeamsCopilotLastActivityDate: "Teams",
@@ -28,21 +29,23 @@ const appLabels = {
   outlookCopilotLastActivityDate: "Outlook", onenoteCopilotLastActivityDate: "OneNote", loopCopilotLastActivityDate: "Loop",
 } as const;
 type Props = { identity: string; selectionId?: string; kind: "directory" | "report"; filters?: UserRelationshipFilters;
+  investigationAgent?: { recordId: string; name: string };
+  initialTab?: UserDetailTab;
   activeTab?: UserDetailTab; onTabChange?: (tab: UserDetailTab) => void;
   returnFocusTo: RefObject<HTMLElement | null>; closeLabel: string; onClose: () => void;
   onRestartSelection?: () => void; onSelectionInvalidated?: () => void;
   onFocusAgent?: (agentId: string, reportSetId: string) => void; onOpenAgent?: (id: string) => void; dataRevision?: number; agentInventoryRevision?: number };
-export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, kind, filters, activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
+export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, kind, filters, investigationAgent, initialTab = "overview", activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
   const identity = kind === "directory" ? requestedIdentity.toLowerCase() : requestedIdentity;
   const selectionId = requestedSelectionId?.toLowerCase();
   const dialog = useRef<HTMLDialogElement>(null), close = useRef<HTMLButtonElement>(null), id = useId();
-  const [internalTab, setTab] = useState<UserDetailTab>("overview");
+  const [internalTab, setTab] = useState<UserDetailTab>(initialTab);
   const tab = activeTab ?? internalTab;
   const [visited, setVisited] = useState<readonly UserDetailTab[]>([tab]);
   const [relationshipQuery, setRelationshipQuery] = useState<UserRelationshipQuery>(defaultRelationshipQuery);
   const [responsibilityPerson, setResponsibilityPerson] = useState<ResponsibilityPerson>();
-  const [observedNow, setObservedNow] = useState(Date.now);
-  const now = Math.max(observedNow, useContext(CapabilityContext)?.now ?? 0);
+  const [openedAt] = useState(Date.now);
+  const now = useContext(CapabilityContext)?.now ?? openedAt;
   const principal = useReportPrincipalScope(), client = useSavedQueryClient();
   const interactionScope = JSON.stringify([principal, kind, identity]);
   const [interactionOwner, setInteractionOwner] = useState(interactionScope);
@@ -66,39 +69,26 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     [principal, kind, identity, selectionId, dataRevision]);
   const read = useQuery<OfficialReportDetail<CombinedUser | ReportUser>>({
     queryKey, enabled: cached => validIdentity && rejected?.owner !== owner
-      && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status)))
-      && (!cached.state.data || Date.parse(cached.state.data.selection.expiresAt) > now),
-    gcTime: 0, staleTime: Infinity,
+      && (!cached.state.data || selectedReadRemaining(cached.state.data.selection) > 0)
+      && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
+    gcTime: 0, staleTime: Infinity, structuralSharing: false,
     queryFn: async ({ signal }) => {
-      const cached = client.getQueryData<OfficialReportDetail<CombinedUser | ReportUser>>(queryKey);
-      if (selectionId && cached && !(Date.parse(cached.selection.expiresAt) > Date.now())) {
-        throw new ApiError(409, "selection_invalidated", "The user selection has expired. Load a new selection.");
-      }
+      const startedAt = performance.now();
       const result = await readReportDetail<CombinedUser | ReportUser>(path, selectionId, signal);
       signal.throwIfAborted();
       const exactIdentity = "directory" in result.value ? result.value.directory.objectId.toLowerCase() : result.value.username;
       if (selectionId && result.selection.id.toLowerCase() !== selectionId || exactIdentity !== identity || (kind === "directory") !== ("directory" in result.value)) {
         throw new ApiError(409, "selection_invalidated", "Exact user evidence does not match this selection.");
       }
-      if (!(Date.parse(result.selection.expiresAt) > Date.now())) {
-        throw new ApiError(409, "selection_invalidated", "The user selection has expired. Load a new selection.");
-      }
-      return result;
+      return acceptSelectedRead(result, startedAt);
     },
   }, client);
-  const expiresAt = read.data ? Date.parse(read.data.selection.expiresAt) : undefined;
-  useEffect(() => {
-    const checkExpiry = () => setObservedNow(Date.now());
-    window.addEventListener("focus", checkExpiry);
-    const timer = expiresAt !== undefined && expiresAt > now
-      ? window.setTimeout(checkExpiry, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now()))) : undefined;
-    return () => { window.removeEventListener("focus", checkExpiry); window.clearTimeout(timer); };
-  }, [expiresAt, now]);
-  const readError = (rejected?.owner === owner ? rejected.error : null) ?? (expiresAt !== undefined && !(expiresAt > now)
-    ? new ApiError(409, "selection_invalidated", "The user selection has expired. Load a new selection.") : null)
+  const leaseActive = useSelectedReadLease(read.data?.selection);
+  const leaseEnded = Boolean(read.data && !leaseActive) || isExpiredSelection(read.error);
+  const readError = (rejected?.owner === owner ? rejected.error : null)
     ?? read.error ?? (!read.isFetching && (read.isPending || read.isStale)
       ? new Error(read.isPending ? "The user detail read was cancelled. Retry user details." : "User details need reloading. Retry user details.") : null);
-  const selectionInvalidated = readError instanceof ApiError && readError.code === "selection_invalidated";
+  const selectionInvalidated = readError instanceof ApiError && readError.code === "selection_invalidated" && !isExpiredSelection(readError);
   useEffect(() => {
     if (selectionInvalidated) onSelectionInvalidated?.();
   }, [selectionInvalidated, onSelectionInvalidated]);
@@ -112,18 +102,16 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     void read.refetch({ cancelRefetch: false });
   } : undefined);
   function rejectSelection(error: Error) { setRejected({ owner, error }); }
-  const detail = readError || read.isFetching ? undefined : read.data;
+  const detail = readError && !isExpiredSelection(readError) || read.isFetching ? undefined : read.data;
   const reported = detail && "username" in detail.value ? detail.value : undefined;
   const directoryEnabled = kind === "report" && Boolean(reported?.objectId);
   const directoryRead = useQuery<OfficialReportDetail<CombinedUser>>({
     queryKey: ["saved", "report-directory-detail", principal, identity, detail?.selection.id.toLowerCase(), dataRevision, reported?.objectId],
     enabled: cached => directoryEnabled
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
-    gcTime: 0, staleTime: Infinity,
+    gcTime: 0, staleTime: Infinity, structuralSharing: false,
     queryFn: async ({ signal }) => {
-      if (detail && !(Date.parse(detail.selection.expiresAt) > Date.now())) {
-        throw new ApiError(409, "selection_invalidated", "The user selection has expired. Load a new selection.");
-      }
+      const startedAt = performance.now();
       const result = await readReportDetail<CombinedUser>(`${path}/directory`, detail?.selection.id, signal);
       signal.throwIfAborted();
       const sourcesMatch = (["directory", "app_activity"] as const).every(kind => {
@@ -138,13 +126,10 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
         || result.reports.setId !== detail?.reports.setId || !lineagesMatch || !sourcesMatch) {
         throw new ApiError(409, "selection_invalidated", "Selected directory evidence does not match this exact report identity.");
       }
-      if (!(Date.parse(result.selection.expiresAt) > Date.now())) {
-        throw new ApiError(409, "selection_invalidated", "The user selection has expired. Load a new selection.");
-      }
-      return result;
+      return acceptSelectedRead(result, startedAt);
     },
   }, client);
-  if (!readError && directoryRead.error instanceof ApiError && directoryRead.error.code === "selection_invalidated") {
+  if (!readError && directoryRead.error instanceof ApiError && directoryRead.error.code === "selection_invalidated" && !isExpiredSelection(directoryRead.error)) {
     setRejected({ owner, error: directoryRead.error });
   }
   const directoryError = directoryEnabled ? directoryRead.error ?? (!directoryRead.isFetching && (directoryRead.isPending || directoryRead.isStale)
@@ -220,17 +205,25 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
       }}>{label}</button>)}</div>
     {tabs.map(([panel]) => <section key={panel} hidden={tab !== panel} role="tabpanel" id={`${id}-panel-${panel}`} aria-labelledby={`${id}-${panel}`} className="user-detail-panel" tabIndex={0}>
       {tab === panel ? <>
+        {leaseEnded ? <p role="status" className="copilot-users-notice">
+          Showing previously loaded user details{detail ? ` evaluated ${usageDate(detail.selection.evaluatedAt)}` : ""}.
+          {restartSelection ? <>{" "}<button type="button" onClick={restartSelection}>Restart selection</button> before reading more details.</> : " Restart the parent selection before reading more details."}
+        </p> : null}
         {!validIdentity ? <p role="alert">User details unavailable: an exact directory object ID is required.</p>
           : read.isFetching ? <p role="status">Loading exact user details...</p>
           : missingProfile ? <p className="copilot-users-notice" role="status">This user is not in the saved Users directory. Responsibility is shown from agent inventory; profile, license and usage details are unavailable. Run Users sync to refresh user data.</p>
           : readError && !(selectionInvalidated && onSelectionInvalidated) ? <div className="user-detail-card" role="alert"><p>{readError.message}</p>
           {readError instanceof ApiError && readError.code === "selection_invalidated" && restartSelection
             ? <button type="button" onClick={restartSelection}>Restart selection</button>
-            : <button type="button" onClick={() => { void read.refetch({ cancelRefetch: false }); }}>Retry user details</button>}</div> : null}
+            : <button type="button" disabled={leaseEnded} onClick={() => {
+              if (!read.data || selectedReadRemaining(read.data.selection)) void read.refetch({ cancelRefetch: false });
+            }}>Retry user details</button>}</div> : null}
         {directoryLoading ? <p role="status">Loading directory details...</p> : directoryError ? <div className="user-detail-card" role="alert"><p>{directoryError.message}</p>
           {directoryError instanceof ApiError && directoryError.code === "selection_invalidated" && restartSelection
             ? <button type="button" onClick={restartSelection}>Restart selection</button>
-            : <button type="button" onClick={() => { void directoryRead.refetch({ cancelRefetch: false }); }}>Retry directory details</button>}</div> : null}
+            : <button type="button" disabled={leaseEnded} onClick={() => {
+              if (!read.data || selectedReadRemaining(read.data.selection)) void directoryRead.refetch({ cancelRefetch: false });
+            }}>Retry directory details</button>}</div> : null}
       </> : null}
       {(visited.includes(panel) || tab === panel) && detail ? <>
         {panel === "overview" ? <><div className="copilot-user-metrics" role="group" aria-label="User summary"><div className="copilot-user-metric"><span>M365 Copilot license</span>
@@ -267,7 +260,9 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
           </> : directoryLoading ? null : <p>Office app activity is unavailable for this user. Check Users sync and reporting permissions.</p>}</section></> : null}
         {panel === "licenses" ? directory ? <CopilotServiceDetails path={`${path}/service-plans`} selectionId={detail.selection.id}
           copilotServiceState={directory.copilotServiceState} current={current} onRestartSelection={restartSelection} onSelectionInvalidated={rejectSelection} /> : directoryLoading ? null : <p>Detailed license assignments are unavailable for this report identity.</p> : null}
-        {panel === "purview" && !directoryLoading ? <UserPurviewAudit active={tab === "purview"} userPrincipalName={current ? directory?.directory.userPrincipalName : undefined} /> : null}
+        {panel === "purview" && !directoryLoading ? <UserPurviewAudit active={tab === "purview"}
+          userPrincipalName={current ? directory?.directory.userPrincipalName : undefined}
+          userObjectId={current ? directory?.directory.objectId : undefined} agent={investigationAgent} /> : null}
       </> : null}
       {(visited.includes(panel) || tab === panel) && panel === "responsibility" && !directoryLoading && (detail || directUser) ? <>
         {identityNotice ? <p className="reported-users-note">{identityNotice}</p> : null}

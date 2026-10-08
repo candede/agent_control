@@ -5,6 +5,7 @@ import { normalizeReportSearch, readReportDetail } from "../api/reportData";
 import { ApiError } from "../api/client";
 import { useSavedQuery } from "../savedQueries";
 import { useReportPage, useReportPrincipalScope } from "../useReportPage";
+import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease, withdrawsSelectedRead } from "../selectedRead";
 import { usageAvailabilityLabel, usageCount, usageDate } from "../usageInsights";
 import { ReportPageControls, ReportReadStatus } from "./ReportPageControls";
 import { ReportExportButton } from "./ReportExportButton";
@@ -22,7 +23,7 @@ export function ReportingView(props: Props) {
 function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revision = 0 }: Props) {
   const setId = requestedSetId?.toLowerCase();
   const [query, setQuery] = useState<AgentFilters>({ sort: "responses", order: "desc" });
-  const [detail, setDetail] = useState<{ agentId: string; selectionId: string; owner: string }>();
+  const [detail, setDetail] = useState<{ agentId: string; selectionId: string; owner: string; replacing?: boolean }>();
   const trigger = useRef<HTMLButtonElement>(null);
   const [windowDays, setWindow] = useState(activityWindowDays);
   const [requestedWindow, setRequestedWindow] = useState(activityWindowDays);
@@ -31,33 +32,24 @@ function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revi
   const request = { ...query, search: normalizeReportSearch(query.search ?? "") || undefined, setId, activityWindowDays: windowDays };
   const read = useReportPage<ReportAgent>("official-usage/aggregate", request, revision, !dateError);
   const data = read.data, agents = data?.analytics.agents;
-  const principal = useReportPrincipalScope(), owner = JSON.stringify([principal, request, revision, read.recoveryRevision]);
-  const snapshotKey = JSON.stringify([principal, setId, setId ? undefined : request, windowDays, revision, read.recoveryRevision]);
-  const [snapshot, setSnapshot] = useState<{ key: string; summary: ReportSummary; total: number; reports: ReportMetadata; expiresAt: number }>();
-  const [now, setNow] = useState(Date.now);
-  const expiresAt = snapshot?.expiresAt;
-  useEffect(() => {
-    if (expiresAt === undefined) return;
-    // Totals can outlive a filter request, but not the evidence that supplied them.
-    const checkExpiry = () => setNow(Date.now());
-    window.addEventListener("focus", checkExpiry);
-    const timer = expiresAt > now
-      ? window.setTimeout(checkExpiry, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now()))) : undefined;
-    return () => { window.removeEventListener("focus", checkExpiry); window.clearTimeout(timer); };
-  }, [expiresAt, now]);
+  const principal = useReportPrincipalScope(), owner = JSON.stringify([principal, request, revision, read.selectionRevision]);
+  const snapshotKey = JSON.stringify([principal, setId, setId ? undefined : request, windowDays, revision]);
+  const [snapshot, setSnapshot] = useState<{ key: string; summary: ReportSummary; total: number; reports: ReportMetadata }>();
   const retainedTotals = Boolean(setId && read.error && (!(read.error instanceof ApiError) || read.error.status === 0));
-  const retiredSnapshot = snapshot && (snapshot.key !== snapshotKey || snapshot.expiresAt <= now
-    || read.invalidated || read.error && !retainedTotals);
+  const retiredSnapshot = snapshot && (snapshot.key !== snapshotKey
+    || read.invalidated || read.error && !isExpiredSelection(read.error) && !retainedTotals);
   if (data && (snapshot?.key !== snapshotKey || snapshot.summary !== data.summary || snapshot.reports !== data.reports
-    || snapshot.total !== data.counts.total || snapshot.expiresAt !== Date.parse(data.selection.expiresAt))) {
-    setSnapshot({ key: snapshotKey, summary: data.summary, total: data.counts.total, reports: data.reports,
-      expiresAt: Date.parse(data.selection.expiresAt) });
+    || snapshot.total !== data.counts.total)) {
+    setSnapshot({ key: snapshotKey, summary: data.summary, total: data.counts.total, reports: data.reports });
   } else if (retiredSnapshot) setSnapshot(undefined);
   const context = !retiredSnapshot && !dateError ? snapshot : undefined;
   const hasEvidence = Boolean(context?.reports.setId && context.reports.lineages.some(lineage => lineage.kind === "agents" || lineage.kind === "userAgents"));
-  if (detail && (detail.owner !== owner || read.error || read.invalidated || !data && !read.loading
-    || data && detail.selectionId !== data.selection.id.toLowerCase())) setDetail(undefined);
-  function restartSelection() { setDetail(undefined); read.restart(); }
+  if (detail && withdrawsSelectedRead(read.error)) setDetail(undefined);
+  else if (detail?.replacing && data && !read.loading && data.selection.id !== detail.selectionId) {
+    setDetail({ agentId: detail.agentId, selectionId: data.selection.id, owner });
+  } else if (detail && !detail.replacing && (detail.owner !== owner || read.error && !isExpiredSelection(read.error)
+    || read.invalidated || !data && !read.loading || data && detail.selectionId !== data.selection.id.toLowerCase())) setDetail(undefined);
+  function restartSelection() { setSnapshot(undefined); setDetail(current => current ? { ...current, replacing: true } : undefined); read.restart(); }
   const table = useRef<HTMLDivElement>(null);
   function sort(column: NonNullable<ReportQuery["sort"]>) { setQuery({ ...query, sort: column, order: query.sort === column && query.order === "desc" ? "asc" : "desc" }); }
   return <section className="reporting-view" aria-label="Agent activity report">
@@ -75,7 +67,7 @@ function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revi
     </> : context ? <><h4>{context.reports.setId ? "Agent usage evidence unavailable" : usageAvailabilityLabel(context.reports.availability)}</h4>
       <p>Missing reports are not zero activity.</p></> : null}
     <div className="report-filters"><label>Search agents<input type="search" value={query.search ?? ""} maxLength={256} onChange={event => setQuery({ ...query, search: event.target.value || undefined })} /></label>
-      <ReportFacet path="official-usage/aggregate" selectionId={read.selectionId} field="creatorType" value={query.creatorType}
+      <ReportFacet path="official-usage/aggregate" selectionId={read.frozenData?.selection.id} field="creatorType" value={query.creatorType}
         onChange={creatorType => setQuery({ ...query, creatorType: creatorType ?? undefined })} onRestartSelection={restartSelection}
         onSelectionInvalidated={read.invalidateSelection} />
       <label>Activity start date<input type="date" value={query.startDate ?? ""} onChange={event => setQuery({ ...query, startDate: event.target.value || undefined })} /></label>
@@ -89,8 +81,10 @@ function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revi
       }}>{(["responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity", "name"] as const).flatMap(column => ["asc", "desc"].map(order =>
         <option key={`${column}:${order}`} value={`${column}:${order}`}>{column} {order === "asc" ? "ascending" : "descending"}</option>))}</select></label>
       <button type="button" className="secondary" onClick={() => setQuery({ sort: "responses", order: "desc" })}>Clear filters</button>
-      <ReportExportButton key={read.selectionId} selectionId={read.selectionId} kind="official_agents" label="Export agent CSV"
-        onSelectionInvalidated={read.invalidateSelection} disabled={dateError || !hasEvidence || !read.selectionId} />
+      <ReportExportButton key={read.frozenData?.selection.id} selectionId={read.frozenData?.selection.id} kind="official_agents" label="Export agent CSV"
+        onOwnSelection={read.ownPublication}
+        admissionAllowed={() => read.isCurrentData(true)}
+        onSelectionInvalidated={read.invalidateSelection} disabled={dateError || !hasEvidence || !read.frozenData} />
     </div>
     {data && hasEvidence ? <p role="status">{data.counts.filtered.toLocaleString()} matching agents</p> : null}
       <div ref={table} className="table-shell report-agent-table" role="region" aria-label="Reported agent activity" aria-busy={read.loading} tabIndex={0}><table><thead><tr>
@@ -98,7 +92,7 @@ function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revi
           <button type="button" className="table-sort-heading" onClick={() => sort(column)}>{column === "name" ? "Agent" : column === "responses" ? "Responses" : column === "activeUsers" ? "Active users" : "Last reported activity"}</button></th>)}
         <th>Creator</th><th>Licensed / unlicensed occurrences</th><th>Comparison</th></tr></thead><tbody>{data?.value.map(row => <tr key={row.agentId}>
           <td><button type="button" className="usage-agent-name" onClick={event => { trigger.current = event.currentTarget;
-            setDetail(detail?.agentId === row.agentId ? undefined : { agentId: row.agentId, selectionId: data.selection.id.toLowerCase(), owner });
+            read.ownPublication(); setDetail(detail?.agentId === row.agentId ? undefined : { agentId: row.agentId, selectionId: data.selection.id.toLowerCase(), owner });
           }} aria-expanded={detail?.agentId === row.agentId}>{row.agentName || row.agentId}</button><small>{row.agentId}</small></td>
           <td>{usageCount(row.responses)}{row.responseSource === "userAgents" ? <small>Users &amp; agents only</small> : null}</td>
           <td>{usageCount(row.activeUsers)}<small>{row.activeUsersBasis === "unknown" ? "Reach not reported" : "Distinct report identities"}</small></td><td>{usageDate(row.lastActivityDateUtc)}</td>
@@ -112,7 +106,7 @@ function ReportingSession({ setId: requestedSetId, activityWindowDays = 30, revi
           {" "}Full-snapshot totals for those agents: {usageCount(agents.windowResponses)} responses; {agents.windowDistinctActiveUsers.toLocaleString()} distinct active users.</p>
         <h4>Most responses</h4><ol>{agents.mostResponses.map(item => <li key={item.agentId}>{item.name}: {usageCount(item.responses)}</li>)}</ol>
         <h4>Least responses</h4><ol>{agents.leastResponses.map(item => <li key={item.agentId}>{item.name}: {usageCount(item.responses)}</li>)}</ol></details> : null}
-      {detail ? <ReportAgentDetail key={detail.selectionId + detail.agentId} selectionId={detail.selectionId} agentId={detail.agentId}
+      {detail ? <ReportAgentDetail key={detail.agentId} selectionId={detail.selectionId} agentId={detail.agentId}
         revision={revision}
         onClose={() => { setDetail(undefined); trigger.current?.focus(); }} onRestartSelection={restartSelection}
         onSelectionInvalidated={read.invalidateSelection} /> : null}
@@ -125,47 +119,42 @@ export function ReportAgentDetail({ selectionId: requestedSelectionId, agentId, 
   const principal = useReportPrincipalScope(), selectionId = requestedSelectionId.toLowerCase();
   const owner = JSON.stringify([principal, selectionId, agentId, revision]);
   const [rejected, setRejected] = useState<{ owner: string; error: Error }>();
-  const [now, setNow] = useState(Date.now);
   if (rejected && rejected.owner !== owner) setRejected(undefined);
   const path = `official-usage/agents/${encodeURIComponent(agentId)}`;
-  const detail = useSavedQuery<OfficialReportDetail<ReportAgent>>({ queryKey: ["saved", "report-agent-detail", principal, selectionId, agentId, revision], gcTime: 0, staleTime: Infinity,
+  const detail = useSavedQuery<OfficialReportDetail<ReportAgent>>({ queryKey: ["saved", "report-agent-detail", principal, selectionId, agentId, revision], gcTime: 0, staleTime: Infinity, structuralSharing: false,
+    enabled: cached => (!cached.state.data || selectedReadRemaining(cached.state.data.selection) > 0)
+      && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
     queryFn: async ({ signal }) => {
+      const startedAt = performance.now();
       const result = await readReportDetail<ReportAgent>(path, selectionId, signal);
       signal.throwIfAborted();
       if (result.selection.id.toLowerCase() !== selectionId || result.value.agentId !== agentId) {
         throw new ApiError(409, "selection_invalidated", "Exact agent evidence does not match this selection.");
       }
-      if (!(Date.parse(result.selection.expiresAt) > Date.now())) {
-        throw new ApiError(409, "selection_invalidated", "The agent selection has expired. Load a new selection.");
-      }
-      return result;
+      return acceptSelectedRead(result, startedAt);
     } });
-  const expiresAt = detail.data ? Date.parse(detail.data.selection.expiresAt) : undefined;
-  useEffect(() => {
-    const checkExpiry = () => setNow(Date.now());
-    window.addEventListener("focus", checkExpiry);
-    const timer = expiresAt !== undefined && expiresAt > now
-      ? window.setTimeout(checkExpiry, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now()))) : undefined;
-    return () => { window.removeEventListener("focus", checkExpiry); window.clearTimeout(timer); };
-  }, [expiresAt, now]);
-  const error = detail.error ?? (rejected?.owner === owner ? rejected.error : null) ?? (expiresAt !== undefined && expiresAt <= now
-    ? new ApiError(409, "selection_invalidated", "The agent selection has expired. Load a new selection.") : null);
-  const invalidated = error instanceof ApiError && error.code === "selection_invalidated";
+  const leaseActive = useSelectedReadLease(detail.data?.selection);
+  const error = detail.error ?? (rejected?.owner === owner ? rejected.error : null);
+  const invalidated = error instanceof ApiError && error.code === "selection_invalidated" && !isExpiredSelection(error);
   useEffect(() => {
     if (invalidated) onSelectionInvalidated?.();
   }, [invalidated, onSelectionInvalidated]);
-  const data = error || detail.isFetching ? undefined : detail.data;
+  const data = error && !isExpiredSelection(error) || detail.isFetching ? undefined : detail.data;
   const [search, setSearch] = useState("");
   const children = useReportPage<ReportRelationship>(`${path}/users`, { selectionId, search: normalizeReportSearch(search) || undefined, sort: "responses", order: "desc" },
     revision, Boolean(data), onRestartSelection);
   if (!error && children.invalidated && children.error) setRejected({ owner, error: children.error });
   return <section className="usage-agent-detail" aria-label="Exact reported agent details"><h4>{data ? data.value.agentName : agentId}</h4>
     <button type="button" onClick={onClose}>Close agent details</button>
+    {data && !leaseActive ? <p role="status">Showing previously loaded saved agent details. Restart the parent selection before paging or acting.</p> : null}
     {detail.isPending || detail.isFetching ? <p role="status">Loading exact agent details...</p>
       : error && !(invalidated && onSelectionInvalidated) ? <p role="alert">{error.message}{" "}
         {invalidated ? onRestartSelection ? <button type="button" onClick={onRestartSelection}>Restart selection</button>
           : "Close this detail and restart its parent selection."
-          : <button type="button" onClick={() => { void detail.refetch({ cancelRefetch: false }); }}>Retry agent details</button>}</p> : null}
+          : <button type="button" onClick={() => {
+            if (detail.data && !selectedReadRemaining(detail.data.selection)) return;
+            void detail.refetch({ cancelRefetch: false });
+          }}>Retry agent details</button>}</p> : null}
     {data ? <><p>Exact report identity: {data.value.agentId}; inventory identity unresolved until linked.</p>
       <p>Responses: {usageCount(data.value.responses)}. Distinct active users: {usageCount(data.value.activeUsers)}.</p>
       <p>Licensed occurrences: {usageCount(data.value.licensedUserOccurrences)}. Unlicensed occurrences: {usageCount(data.value.unlicensedUserOccurrences)}.

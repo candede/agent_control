@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "v
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { inventoryInput, packageRecord } from "../../scripts/inventoryFixtures.js";
 import { InventoryGenerations, inventorySelector } from "../db/inventoryGenerations.js";
+import { DataGenerations } from "../db/dataGenerations.js";
 import { InventoryReconciliation } from "../services/inventoryReconciliation.js";
 import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
 import { publishPackageReadback, readPackageInventoryGeneration } from "../db/packageControls.js";
@@ -157,13 +158,13 @@ describe("inventory HTTP selected-read boundary", () => {
     const headers = { cookie: `agent-control.sid=${encodeURIComponent(`s:${sessionId}.${signature}`)}`,
       Origin: config.frontendOrigin, "Content-Type": "application/json", "X-CSRF-Token": "fresh-inventory-csrf" };
     const capture = () => fetch(`${base}/agent-inventory/selections`, { method: "POST", headers, body: JSON.stringify({ query: {} }) });
-    async function expectUnavailable(state: string) {
+    async function expectUnavailable(state: string, selections = 0) {
       const guard = forbidAuthorityWrites(fixture.runtime);
       try {
         const response = await capture();
         expect(response.status, await response.clone().text()).toBe(200);
         expect(await response.json()).toEqual({ state, message: expect.any(String) });
-        expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_read_selections WHERE principal_id=$1", [freshPrincipal])).rows[0].count).toBe(0);
+        expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_read_selections WHERE principal_id=$1", [freshPrincipal])).rows[0].count).toBe(selections);
       } finally { guard.restore(); }
     }
     await expectUnavailable("not_collected");
@@ -192,6 +193,10 @@ describe("inventory HTTP selected-read boundary", () => {
     const invalidated = await fetch(`${base}/agent-inventory?selectionId=${selected.id}`, { headers });
     expect(invalidated.status).toBe(409);
     expect(await invalidated.json()).toMatchObject({ code: "selection_invalidated" });
+    const scopeId = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
+      AND source='inventory_canonical'`, [input.scope.tenantId, freshPrincipal])).rows[0].id;
+    await new DataGenerations(fixture.runtime).invalidate(scopeId, input.scope.tenantId);
+    await expectUnavailable("unavailable", 1);
   });
   it("serves an exact counted page without source-wide reads or GET reconciliation", async () => {
     for (const module of ["packageInventory", "powerPlatformInventory", "unifiedAgentRegistry", "unifiedInventoryRevision"]) {
@@ -520,7 +525,8 @@ describe("inventory HTTP selected-read boundary", () => {
       }
     }
     expect(back.value).toEqual(historical);
-    expect(back.selection).toEqual(first.selection);
+    expect(back.selection).toEqual({ ...first.selection, validatedAt: expect.any(String) });
+    expect(Date.parse(back.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(first.selection.validatedAt));
     const fresh = await fetch(`${base}/agent-inventory?limit=50`, { headers: { cookie } }).then(response => response.json());
     expect(fresh.counts.total).toBe(102);
     selected.set("selectionId", fresh.selection.id);
@@ -642,7 +648,7 @@ describe("inventory HTTP selected-read boundary", () => {
         VALUES($1,$2,$3,$4,'resolved',$5,NULL,clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '10 minutes')`,
       [input.scope.tenantId, principalId, objectId, randomUUID(), displayName]);
     }
-    const inventoryResponse = await fetch(`${base}/agent-inventory?source=power_platform&limit=50`, { headers: { cookie } });
+    const inventoryResponse = await fetch(`${base}/agent-inventory?source=power_platform&sortBy=owner&limit=50`, { headers: { cookie } });
     expect(inventoryResponse.status, await inventoryResponse.clone().text()).toBe(200);
     const inventoryPage = await inventoryResponse.json();
     expect(inventoryPage.value).toHaveLength(5);

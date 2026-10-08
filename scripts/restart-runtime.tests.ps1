@@ -14,7 +14,16 @@ if (Test-Path -LiteralPath $receipt) { throw 'Prior runtime fixture receipt exis
 Invoke-DockerCommand ($context.Compose + @('exec','-T','postgres','psql','-U','agentcontrol_admin','-d','agentcontrol','-v','ON_ERROR_STOP=1','-c',"CREATE DATABASE `"$controlDatabase`""))
 try {
     Invoke-DockerCommand ($seed + @('seed','/evidence/runtime-fixture.json'))
-    $runtime=@('run','--name',$container,'--network',$context.Network,'--read-only','--mount',"type=bind,source=$($context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",'--mount',"type=bind,source=$($context.State)/secrets/session,target=/run/secrets/session,readonly",'--mount',"type=bind,source=$receipt,target=/evidence/restart-fixture.json,readonly",'--mount',"type=bind,source=$root/backend/scripts/restart-runtime.mjs,target=/fixture.mjs,readonly",'--user',"$((& id -u).Trim()):$((& id -g).Trim())",'-e','PGHOST=postgres','-e','PGUSER=agentcontrol_app','-e','PGPASSWORD_FILE=/run/secrets/postgres-app','-e','SESSION_SECRET_FILE=/run/secrets/session','-e','TENANTS_JSON=[{"tenantId":"11111111-1111-4111-8111-111111111111","clientId":"22222222-2222-4222-8222-222222222222","clientSecret":"synthetic-restart-client-secret","domains":["example.invalid"]}]','--entrypoint','node',$context.Image,'/fixture.mjs')
+    $runtime=@('run','--name',$container,'--network',$context.Network,'--read-only',
+        '--mount',"type=bind,source=$($context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",
+        '--mount',"type=bind,source=$($context.State)/secrets/session,target=/run/secrets/session,readonly",
+        '--mount',"type=bind,source=$receipt,target=/evidence/restart-fixture.json,readonly",
+        '--mount',"type=bind,source=$root/backend/scripts/restart-runtime.mjs,target=/fixture.mjs,readonly",
+        '--mount',"type=bind,source=$root/backend/scripts/officialReportFingerprint.ts,target=/app/backend/scripts/officialReportFingerprint.ts,readonly",
+        '--user',"$((& id -u).Trim()):$((& id -g).Trim())",'-e','PGHOST=postgres','-e','PGUSER=agentcontrol_app',
+        '-e','PGPASSWORD_FILE=/run/secrets/postgres-app','-e','SESSION_SECRET_FILE=/run/secrets/session',
+        '-e','TENANTS_JSON=[{"tenantId":"11111111-1111-4111-8111-111111111111","clientId":"22222222-2222-4222-8222-222222222222","clientSecret":"synthetic-restart-client-secret","domains":["example.invalid"]}]',
+        '--entrypoint','node',$context.Image,'/fixture.mjs')
     foreach ($mode in @('crash-quarantine','crash-canary','crash-bulk')) {
         & docker @runtime $mode
         if ($LASTEXITCODE -ne 17) { throw "Fixture must exit exactly after persisting the $mode dispatch." }

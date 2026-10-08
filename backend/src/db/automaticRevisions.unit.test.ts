@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataSyncRepository } from "./dataSync.js";
@@ -37,7 +36,7 @@ function fixture() {
   const database = new pg.Pool({ max: 4 });
   pools.add(database);
   const state: { markers: Marker[]; users: UserSource[] } = {
-    markers: ["agent_people", "canonical", "directory", "graph_packages", "power_platform"].map(source => ({
+    markers: ["agent_people", "app_activity", "authorization", "canonical", "directory", "graph_packages", "power_platform"].map(source => ({
       source, id: `${source}-snapshot`, observed_at: observedAt, expires_at: expiresAt,
     })),
     users: (["app_activity", "directory"] as const).map(source => ({
@@ -54,9 +53,10 @@ function fixture() {
     if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "COMMIT", "ROLLBACK"].includes(text)) return response([]);
     if (text === "SELECT clock_timestamp() AS now") return response([{ now: vi.isFakeTimers() ? new Date() : observedAt }]);
     if (text.includes("WITH markers AS")) {
-      const afterSource = String(values![3]), afterId = String(values![4]);
+      const afterSource = String(values![2]), afterId = String(values![3]);
       return response(state.markers.filter(row => row.source > afterSource || row.source === afterSource && row.id > afterId)
-        .toSorted((left, right) => left.source.localeCompare(right.source) || left.id.localeCompare(right.id)).slice(0, 250));
+        .toSorted((left, right) => left.source.localeCompare(right.source) || left.id.localeCompare(right.id))
+        .slice(0, 250).map(({ source, id }) => ({ source, id })));
     }
     if (text.includes("SELECT requested.source")) return response((["directory", "app_activity"] as const).map(source =>
       state.users.find(row => row.source === source) ?? { source, generation_id: null, scope_id: null, revision: null,
@@ -72,7 +72,7 @@ function fixture() {
 }
 
 describe("automatic saved-data revision boundaries", () => {
-  it("uses native source metadata and one captured clock on the same repeatable-read client", async () => {
+  it("uses stored publication identities on the same repeatable-read client without a wall clock", async () => {
     const f = fixture();
     const before = await f.repository.automaticRevisions(scope);
     expect(await f.repository.automaticRevisions(scope)).toEqual(before);
@@ -80,17 +80,13 @@ describe("automatic saved-data revision boundaries", () => {
     for (const revision of Object.values(before)) expect(revision).toMatch(/^[a-f0-9]{64}$/);
     expect(f.database.query).not.toHaveBeenCalled();
     expect(f.query.mock.calls.filter(([text]) => text === "BEGIN ISOLATION LEVEL REPEATABLE READ")).toHaveLength(2);
-    expect(f.query.mock.calls.filter(([text]) => text === "SELECT clock_timestamp() AS now")).toHaveLength(2);
-    const [usersQuery, parameters] = f.query.mock.calls.find(([text]) => String(text).includes("SELECT requested.source"))!;
-    expect(parameters).toEqual([scope.tenantId, scope.principalId, "delegated", observedAt]);
+    expect(f.query.mock.calls.filter(([text]) => text === "SELECT clock_timestamp() AS now")).toHaveLength(0);
     const inventoryParameters = f.query.mock.calls.filter(([text]) => String(text).includes("WITH markers AS"));
-    for (const [, values] of inventoryParameters) expect(values!.slice(0, 3)).toEqual([scope.tenantId, scope.principalId, observedAt]);
-    expect(usersQuery).toContain("g.id=h.generation_id");
-    expect(usersQuery).toContain("g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>$4");
-    expect(usersQuery).toContain("proof.status='available'");
-    expect(usersQuery).toContain("latest.status AS attempt_status");
-    expect(usersQuery).not.toContain("snapshot_data");
-    expect(usersQuery).not.toMatch(/package_inventory|package_detail|power_platform|agent_people/);
+    for (const [sql, values] of inventoryParameters) {
+      expect(values!.slice(0, 2)).toEqual([scope.tenantId, scope.principalId]);
+      expect(sql).toContain("g.id=h.generation_id");
+      expect(sql).not.toMatch(/clock_timestamp|expires_at|attempt_status|observed_at/);
+    }
   });
 
   it.each(["graph_packages", "graph_package_details", "power_platform", "agent_people"])(
@@ -104,7 +100,8 @@ describe("automatic saved-data revision boundaries", () => {
       const changed = source.startsWith("graph_") ? "graph_packages" : "power_platform";
       const unchanged = changed === "graph_packages" ? "power_platform" : "graph_packages";
       expect(after[changed]).not.toBe(before[changed]);
-      expect(after[unchanged]).toBe(before[unchanged]);
+      if (source === "agent_people") expect(after[unchanged]).not.toBe(before[unchanged]);
+      else expect(after[unchanged]).toBe(before[unchanged]);
       expect(after.users).toBe(before.users);
       expect(await readAutomaticInventoryRevisions(scope, f.database)).not.toEqual(observed);
     },
@@ -114,30 +111,31 @@ describe("automatic saved-data revision boundaries", () => {
     const f = fixture();
     const before = await f.repository.automaticRevisions(scope);
     f.state.users.find(row => row.source === source)!.generation_id += "-updated";
-    if (source === "directory") f.state.markers.find(row => row.source === source)!.id += "-updated";
+    f.state.markers.find(row => row.source === source)!.id += "-updated";
     const after = await f.repository.automaticRevisions(scope);
     expect(after.users).not.toBe(before.users);
-    expect(after.graph_packages).toBe(before.graph_packages);
+    if (source === "directory") expect(after.graph_packages).not.toBe(before.graph_packages);
+    else expect(after.graph_packages).toBe(before.graph_packages);
     if (source === "directory") expect(after.power_platform).not.toBe(before.power_platform);
     else expect(after.power_platform).toBe(before.power_platform);
   });
 
-  it.each(["directory", "app_activity"] as const)("detects %s failures with retained data, without invalidating saved people", async source => {
+  it.each(["directory", "app_activity"] as const)("keeps %s failures and progress separate from retained publications", async source => {
     const f = fixture();
     const before = await f.repository.automaticRevisions(scope);
     const row = f.state.users.find(value => value.source === source)!;
     row.attempt_status = "permission_required";
     row.message = "Refresh permission is unavailable; saved data remains.";
     const failed = await f.repository.automaticRevisions(scope);
-    expect(failed.users).not.toBe(before.users);
+    expect(failed.users).toBe(before.users);
     expect(failed.graph_packages).toBe(before.graph_packages);
     expect(failed.power_platform).toBe(before.power_platform);
     expect(await f.repository.automaticRevisions(scope)).toEqual(failed);
     row.message = "A different source failure is now shown.";
-    expect((await f.repository.automaticRevisions(scope)).users).not.toBe(failed.users);
+    expect((await f.repository.automaticRevisions(scope)).users).toBe(failed.users);
   });
 
-  it("detects initial source failures and authorization changes without a successful snapshot", async () => {
+  it("ignores initial attempt failures but detects actual authorization retirement", async () => {
     const f = fixture();
     const row = f.state.users[0];
     f.state.users = [];
@@ -145,12 +143,14 @@ describe("automatic saved-data revision boundaries", () => {
     f.state.users = [{ ...row, generation_id: null, observed_at: null, report_refresh_date: null,
       attempt_status: "permission_required", message: "No saved source or delegated permission." }];
     const failed = await f.repository.automaticRevisions(scope);
-    expect(failed.users).not.toBe(before.users);
+    expect(failed.users).toBe(before.users);
     f.state.users[0].attempt_status = "waiting_authorization";
+    expect((await f.repository.automaticRevisions(scope)).users).toBe(failed.users);
+    f.state.markers.find(row => row.source === "authorization")!.id += "-retired";
     expect((await f.repository.automaticRevisions(scope)).users).not.toBe(failed.users);
   });
 
-  it.each(["directory", "app_activity"] as const)("detects %s expiry and remains stable after the boundary", async source => {
+  it.each(["directory", "app_activity"] as const)("detects actual %s retirement and remains stable afterward", async source => {
     const f = fixture();
     const before = await f.repository.automaticRevisions(scope);
     const row = f.state.users.find(value => value.source === source)!;
@@ -160,7 +160,8 @@ describe("automatic saved-data revision boundaries", () => {
     f.state.markers = f.state.markers.filter(value => value.source !== source);
     const expired = await f.repository.automaticRevisions(scope);
     expect(expired.users).not.toBe(before.users);
-    expect(expired.graph_packages).toBe(before.graph_packages);
+    if (source === "directory") expect(expired.graph_packages).not.toBe(before.graph_packages);
+    else expect(expired.graph_packages).toBe(before.graph_packages);
     if (source === "directory") expect(expired.power_platform).not.toBe(before.power_platform);
     else expect(expired.power_platform).toBe(before.power_platform);
     expect(await f.repository.automaticRevisions(scope)).toEqual(expired);
@@ -180,7 +181,7 @@ describe("automatic saved-data revision boundaries", () => {
     },
   );
 
-  it("invalidates Users once when retained app metrics become stale, not on every minute check", async () => {
+  it("does not publish when retained app metrics age", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const boundary = Date.parse("2026-09-28T23:59:59.999Z");
     vi.setSystemTime(boundary - 60_001);
@@ -190,7 +191,7 @@ describe("automatic saved-data revision boundaries", () => {
     expect(await f.repository.automaticRevisions(scope)).toEqual(fresh);
     vi.setSystemTime(boundary);
     const stale = await f.repository.automaticRevisions(scope);
-    expect(stale.users).not.toBe(fresh.users);
+    expect(stale.users).toBe(fresh.users);
     expect(stale.graph_packages).toBe(fresh.graph_packages);
     expect(stale.power_platform).toBe(fresh.power_platform);
     vi.setSystemTime(boundary + 60_000);
@@ -199,13 +200,7 @@ describe("automatic saved-data revision boundaries", () => {
 
   it("hashes only current typed heads and scoped people metadata, never predecessor payloads", async () => {
     const f = fixture();
-    const observed = await readAutomaticInventoryRevisions(scope, f.database);
-    for (const source of ["graph_packages", "power_platform"] as const) {
-      const hash = createHash("sha256").update(JSON.stringify(["inventory-observer-v3", source, scope.tenantId, scope.principalId]));
-      for (const row of f.state.markers.filter(row => row.source === "canonical"
-        || (row.source === "graph_packages") === (source === "graph_packages"))) hash.update(JSON.stringify(row));
-      expect(observed[source]).toBe(hash.digest("hex"));
-    }
+    await readAutomaticInventoryRevisions(scope, f.database);
     const sql = f.query.mock.calls.map(([text]) => String(text)).join("\n");
     expect(sql).toContain("data_generation_heads");
     expect(sql).toContain("inventory_people_revisions");
@@ -225,7 +220,7 @@ describe("automatic saved-data revision boundaries", () => {
   it("propagates serialization conflicts without replay or weaker pool reads", async () => {
     const f = fixture(), implementation = f.query.getMockImplementation()!;
     f.query.mockImplementation(async (text, values) => {
-      if (String(text).includes("SELECT requested.source")) throw Object.assign(new Error("changed source"), { code: "40001" });
+      if (String(text).includes("WITH markers AS")) throw Object.assign(new Error("changed source"), { code: "40001" });
       return implementation(text, values);
     });
     await expect(f.repository.automaticRevisions(scope)).rejects.toMatchObject({ status: 503, code: "data_read_conflict" });

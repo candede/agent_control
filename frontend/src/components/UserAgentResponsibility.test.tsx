@@ -9,6 +9,7 @@ import { createSavedQueryClient } from "../savedQueries";
 import { deferred } from "../test/deferred";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
+import { PublicationContext } from "../publicationContext";
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -230,13 +231,13 @@ describe("saved Users responsibility", () => {
     const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
     const personLoaded = vi.fn();
     render(<UserAgentResponsibility objectId={responsibilityOwnerId} onPersonLoaded={personLoaded} onOpenAgent={vi.fn()} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent(/selection.*expired/i);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/saved-read metadata/i);
     expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
     expect(personLoaded).toHaveBeenLastCalledWith(undefined);
     expect(read).toHaveBeenCalledOnce();
   });
 
-  it("expires responsibility while the next page is pending and retries with a fresh first-page selection", async () => {
+  it("retains responsibility after an admitted page reports lease end, replacing only explicitly", async () => {
     const original = responsibilityFixture(responsibilityOwnerId);
     original.selection.expiresAt = new Date(Date.now() + 60_000).toISOString();
     original.page.nextCursor = "next";
@@ -247,14 +248,14 @@ describe("saved Users responsibility", () => {
     render(<UserAgentResponsibility objectId={responsibilityOwnerId} onPersonLoaded={personLoaded} onOpenAgent={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: "Next" }));
     const signal = read.mock.calls[1][1]!.signal!;
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(original.selection.expiresAt) + 1);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + 60_001);
     fireEvent(window, new Event("focus"));
-    expect(await screen.findByRole("alert")).toHaveTextContent(/selection.*expired/i);
-    expect(signal.aborted).toBe(true);
-    expect(personLoaded).toHaveBeenLastCalledWith(undefined);
+    expect(signal.aborted).toBe(false);
     expect(read).toHaveBeenCalledTimes(2);
-    await act(async () => pending.resolve(original));
-    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
+    await act(async () => pending.reject(new api.ApiError(409, "selection_invalidated", "Selection lease expired.", { details: { reason: "expired" } })));
+    expect(await screen.findByText("Responsible agent")).toBeVisible();
+    expect(personLoaded).toHaveBeenLastCalledWith(original.selected?.person);
+    clock.mockRestore();
     await userEvent.click(screen.getByRole("button", { name: "Retry saved responsibility" }));
     expect(await screen.findByText("Responsible agent")).toBeVisible();
     expect(read).toHaveBeenCalledTimes(3);
@@ -268,12 +269,12 @@ describe("saved Users responsibility", () => {
     const open = vi.fn();
     render(<UserAgentResponsibility objectId={responsibilityOwnerId} onOpenAgent={open} />);
     await screen.findByText("Responsible agent");
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(data.selection.expiresAt) + 1);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 600_001);
     fireEvent.click(screen.getByRole("button", { name: action }));
     expect(open).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledOnce();
-    expect(await screen.findByRole("alert")).toHaveTextContent(/selection.*expired/i);
-    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Responsible agent")).toBeVisible();
   });
 
   it("discards the previous account's cursor even when returning to that account", async () => {
@@ -310,10 +311,50 @@ describe("saved Users responsibility", () => {
     client.clear();
   });
 
+  it("shares one frozen publication revalidation, ignores unrelated publication and preserves a departing reader's peer and ended lease", async () => {
+    vi.useFakeTimers();
+    const client = createSavedQueryClient();
+    const selected = responsibilityFixture(responsibilityOwnerId);
+    const pending = deferred<api.AgentResponsibilityPage>();
+    const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(selected).mockReturnValueOnce(pending.promise);
+    let revisions = selected.selection.publicationRevisions;
+    const admit = vi.fn();
+    const panels = (first = true) => <SavedQueryProvider client={client}>
+      <PublicationContext value={{ admit, revisions }}>
+        {first ? <UserAgentResponsibility key="first" objectId={responsibilityOwnerId} /> : null}
+        <UserAgentResponsibility key="second" objectId={responsibilityOwnerId} />
+      </PublicationContext>
+    </SavedQueryProvider>;
+    const view = render(panels());
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(read).toHaveBeenCalledOnce();
+    expect(admit).toHaveBeenCalledWith(selected.selection.publicationRevisions);
+    revisions = { ...revisions, users: "4".repeat(64) };
+    view.rerender(panels());
+    expect(read).toHaveBeenCalledOnce();
+    revisions = { ...revisions, graph_packages: "5".repeat(64) };
+    view.rerender(panels());
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.lastCall?.[0]?.selectionId).toBe(selected.selection.id);
+    const signal = read.mock.lastCall?.[1]?.signal;
+    view.rerender(panels(false));
+    expect(signal?.aborted).toBe(false);
+    await act(async () => { pending.resolve(selected); await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByText("Responsible agent")).toBeVisible();
+    await act(() => vi.advanceTimersByTimeAsync(11 * 60_000));
+    revisions = { ...revisions, power_platform: "6".repeat(64) };
+    view.rerender(panels(false));
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Responsible agent")).toBeVisible();
+    view.unmount();
+    client.clear();
+  });
+
   it("revalidates shared saved responsibility without duplicate reads or reloads on equivalent renders", async () => {
     const client = createSavedQueryClient();
     const next = deferred<api.AgentResponsibilityPage>();
-    const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(responsibilityFixture(responsibilityOwnerId))
+    const original = responsibilityFixture(responsibilityOwnerId);
+    const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(original)
       .mockReturnValueOnce(next.promise);
     const panels = (second: boolean) => <SavedQueryProvider client={client}>
       <section key="first" aria-label="First reader"><UserAgentResponsibility objectId={responsibilityOwnerId} /></section>
@@ -325,6 +366,7 @@ describe("saved Users responsibility", () => {
     await waitFor(() => expect(screen.getAllByText("Responsible agent")).toHaveLength(2));
     expect(read).toHaveBeenCalledOnce();
     const current = responsibilityFixture(responsibilityOwnerId);
+    current.selection = original.selection;
     current.selected!.agents[0].displayName = "Current responsibility";
     await act(async () => { void client.invalidateQueries({ queryKey: ["saved"] }); });
     expect(read).toHaveBeenCalledTimes(2);
@@ -338,7 +380,7 @@ describe("saved Users responsibility", () => {
     client.clear();
   });
 
-  it("expires mounted evidence on its timer without silently reloading or leaving identity labels", async () => {
+  it("keeps mounted evidence and identity labels when its lease timer ends without silently reloading", async () => {
     vi.useFakeTimers();
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selection.expiresAt = new Date(Date.now() + 1_000).toISOString();
@@ -348,13 +390,13 @@ describe("saved Users responsibility", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10); });
     expect(screen.getByText("Responsible agent")).toBeVisible();
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-    expect(screen.getByRole("alert")).toHaveTextContent(/selection.*expired/i);
-    expect(personLoaded).toHaveBeenLastCalledWith(undefined);
-    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Showing previously loaded saved responsibility");
+    expect(personLoaded).toHaveBeenLastCalledWith(data.selected?.person);
+    expect(screen.getByText("Responsible agent")).toBeVisible();
     expect(read).toHaveBeenCalledOnce();
   });
 
-  it.each(["revision", "cache"] as const)("withdraws an expired retained page without cancelling a fresh %s capture", async refresh => {
+  it.each(["revision", "cache"] as const)("retains an aged page without cancelling a pending %s read", async refresh => {
     vi.useFakeTimers();
     const client = createSavedQueryClient();
     const original = responsibilityFixture(responsibilityOwnerId);
@@ -371,13 +413,14 @@ describe("saved Users responsibility", () => {
     else await act(async () => { void client.invalidateQueries({ queryKey: ["saved"] }); await vi.advanceTimersByTimeAsync(10); });
     expect(screen.getByText("Responsible agent")).toBeVisible();
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("Loading saved responsibility");
+    expect(screen.getByText("Responsible agent")).toBeVisible();
+    expect(screen.getByText(/Showing previously loaded saved responsibility/)).toBeVisible();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(personLoaded).toHaveBeenLastCalledWith(undefined);
+    expect(personLoaded).toHaveBeenLastCalledWith(original.selected?.person);
     expect(read.mock.calls[1][1]!.signal!.aborted).toBe(false);
+    expect(read.mock.calls[1][0]?.selectionId).toBe(refresh === "cache" ? original.selection.id : undefined);
     await act(async () => {
-      pending.resolve(responsibilityFixture(responsibilityOwnerId));
+      pending.resolve(refresh === "cache" ? original : responsibilityFixture(responsibilityOwnerId));
       await vi.advanceTimersByTimeAsync(10);
     });
     expect(screen.getByText("Responsible agent")).toBeVisible();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { packageDetailRevision, projectPackageDetails } from "./packageDetailProjection.js";
+import { packageDetailRevision, projectPackageDetailAge, projectPackageDetails } from "./packageDetailProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 
@@ -23,6 +23,19 @@ const observation = {
 };
 
 describe("separate package detail projection", () => {
+  it("evaluates age at the supplied snapshot time without changing stored evidence", () => {
+    const saved = projectPackageDetails(summary, observation, false, now);
+    const afterExpiry = Date.parse(observation.expiresAt) + 1;
+    const aged = projectPackageDetailAge(saved, afterExpiry);
+    expect(aged).toMatchObject({
+      longDescription: detailed.longDescription, elementDetails: detailed.elementDetails,
+      detailFreshness: { state: "stale", expiresAt: observation.expiresAt },
+    });
+    expect(aged).not.toHaveProperty("identityDetailsCollected");
+    expect(projectPackageDetailAge(saved, now)).toBe(saved);
+    expect(saved).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+  });
+
   it("enriches descriptions, access and identity without replacing catalog summary/control fields", () => {
     expect(projectPackageDetails(summary, observation, false, now)).toMatchObject({
       displayName: summary.displayName, isBlocked: true, availableTo: "some",

@@ -27,7 +27,8 @@ function readContext(endpoint: ReportEndpoint, search: string): ReportReadContex
   return { identity, tokenMode: "delegated", endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
     evaluatedAt: new Date("2026-01-01T00:00:00Z"),
     selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1",
-      evaluatedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-01T00:10:00Z" },
+      evaluatedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-01T00:10:00Z", validatedAt: "2026-01-01T00:00:00Z",
+      publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
     metadata: { directory: sourceMetadata("directory"), app_activity: sourceMetadata("app_activity") },
     report: { setId: null, activeSetId: null, activeRevision: "1", historyRevision: "0", historyEpoch: "0",
       availability: "never_imported", staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: null,
@@ -81,8 +82,8 @@ it.each([" \u00a8 ", "J\u030c", "\ud835\udc09\u030c", "\u337f".repeat(64), "\u01
       command: "SELECT", rowCount: 1, oid: 0, fields: [],
       rows: [{
         endpoint: saved.endpoint, query_json: saved.query, query_hash: saved.queryHash, revision: saved.selection.revision,
-        evaluated_at: saved.evaluatedAt, expires_at: new Date(saved.selection.expiresAt),
-        token_mode: saved.tokenMode, metadata: saved.metadata, report_metadata: saved.report,
+        evaluated_at: saved.evaluatedAt, expires_at: new Date(saved.selection.expiresAt), validated_at: saved.evaluatedAt,
+        token_mode: saved.tokenMode, metadata: { ...saved.metadata, publicationRevisions: saved.selection.publicationRevisions }, report_metadata: saved.report,
       }],
     });
     const context = await reports.contextInRead(client, identity, saved.selection.id);

@@ -6,6 +6,7 @@ import { normalizeReportSearch } from "../api/reportData";
 import type { UsersRouteState } from "../workbenchRouting";
 import { isValidLowResponseThreshold, usageAvailabilityLabel, usageCount, usageDate } from "../usageInsights";
 import { useReportPage, useReportPrincipalScope } from "../useReportPage";
+import { isExpiredSelection, withdrawsSelectedRead } from "../selectedRead";
 import { ReportReadStatus, ReportPageControls } from "./ReportPageControls";
 import { UserActivityFilters } from "./UserActivityFilters";
 import { ReportSortHeading } from "./ReportSortHeading";
@@ -27,40 +28,44 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
   const [filters, setFilters] = useState<ReportQuery>({ cohort: "all", sort: "responses", order: "desc" });
   const [threshold, setThreshold] = useState("5");
   const [lastThreshold, setLastThreshold] = useState(5);
-  const [selected, setSelected] = useState<{ username: string; selectionId: string; queryKey: string }>();
+  const [selected, setSelected] = useState<{ username: string; selectionId: string; queryKey: string; replacing?: boolean }>();
   const focus = useRef<HTMLInputElement>(null), valid = isValidLowResponseThreshold(threshold);
   const trigger = useRef<HTMLButtonElement>(null);
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
   const query: ReportQuery = { ...filters, licenseCohort: "active_without_paid",
     search: normalizeReportSearch(route.search) || undefined, agentId: route.agentId, setId: route.reportSetId?.toLowerCase(), lowResponseThreshold: valid ? Number(threshold) : lastThreshold };
   const read = useReportPage<ReportUser>("official-usage/users", query, dataRevision);
-  const queryKey = JSON.stringify([query, dataRevision, read.recoveryRevision]);
+  const queryKey = JSON.stringify([query, dataRevision, read.selectionRevision]);
   const data = read.data;
-  const [exportableSelectionId, setExportableSelectionId] = useState<string>();
-  const hasCohortEvidence = Boolean(data?.sources.directory.state === "available" && data.reports.setId);
-  const eligibleSelectionId = hasCohortEvidence ? read.selectionId : undefined;
-  if (data && exportableSelectionId !== eligibleSelectionId) setExportableSelectionId(eligibleSelectionId);
+  const hasCohortEvidence = Boolean(data && ["available", "stale"].includes(data.sources.directory.state) && data.reports.setId);
   const [initialReadComplete, setInitialReadComplete] = useState(false);
   if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
   const [hasShownPageControls, setHasShownPageControls] = useState(false);
   const showPageControls = Boolean(read.loading || read.error || read.invalidated || data && data.counts.filtered > 0);
   if (!hasShownPageControls && initialReadComplete && showPageControls) setHasShownPageControls(true);
-  if (selected && (selected.queryKey !== queryKey || read.error || read.invalidated || !data && !read.loading
-    || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
-  function restartSelection() { setSelected(undefined); read.restart(); }
+  if (selected && withdrawsSelectedRead(read.error)) setSelected(undefined);
+  else if (selected?.replacing && data && !read.loading && data.selection.id !== selected.selectionId) {
+    setSelected({ username: selected.username, selectionId: data.selection.id, queryKey });
+  } else if (selected && !selected.replacing && (selected.queryKey !== queryKey || read.error && !isExpiredSelection(read.error)
+    || read.invalidated || !data && !read.loading || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
+  function restartSelection() {
+    setSelected(current => current ? { ...current, replacing: true } : undefined);
+    read.restart();
+  }
   function resetFilters() { setFilters({ cohort: "all", sort: filters.sort, order: filters.order }); setThreshold("5"); }
   if (!initialReadComplete && read.loading && !data && !read.error && !read.invalidated) {
     return <WorkspaceSkeleton view="users" contentOnly showSummary={false} />;
   }
   return <section className="reported-users" aria-label="Non-paid user activity">
     <ReportReadStatus read={{ ...read, restart: restartSelection }} quietLoading />
-    {data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data unavailable.{" "}
+    {data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">{data.sources.directory.state === "stale"
+      ? "Saved directory data is out of date; current licensing is unverified." : "License data unavailable."}{" "}
       {data.sources.directory.message ?? "Current directory verification is required."} Run Users sync to verify licensing.</p> : null}
     {data && !read.loading && data.sources.directory.attemptStatus !== "running" && data.summary.unknownLicenseActiveReportUsers > 0 ? <p className="copilot-users-notice">{data.summary.unknownLicenseActiveReportUsers.toLocaleString()} active report{" "}
       {data.summary.unknownLicenseActiveReportUsers === 1 ? "user needs" : "users need"} a license check. Run Users sync.</p> : null}
     {data && !read.loading && data.reports.availability === "stale" ? <p className="copilot-users-notice">Reports are out of date. Refresh reports in Sync.</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
-      <UserActivityFilters path="official-usage/users" selectionId={read.selectionId} onRestartSelection={restartSelection}
+      <UserActivityFilters path="official-usage/users" selectionId={read.frozenData?.selection.id} onRestartSelection={restartSelection}
       onSelectionInvalidated={read.invalidateSelection}
       values={{ company: filters.company, department: filters.department, cohort: filters.cohort ?? "all", lowResponseThreshold: threshold }}
       cohorts={[{ value: "all", label: "All response counts" }, { value: "low", label: "Low responses" }, { value: "zero", label: "Zero responses" }, { value: "review", label: "Zero or low responses" }]}
@@ -73,16 +78,18 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
       }} onSort={value => { const [sort, order] = value.split(":"); setFilters({ ...filters, sort: sort as ReportQuery["sort"], order: order as ReportQuery["order"] }); }}
       onClear={() => { resetFilters(); onRouteChange({ ...route, search: "", agentId: undefined, page: 0 }); }}
-      exportButton={<ReportExportButton key={read.selectionId} kind="official_users" selectionId={read.selectionId} label="Export users CSV"
+      exportButton={<ReportExportButton key={read.frozenData?.selection.id} kind="official_users" selectionId={read.frozenData?.selection.id} label="Export users CSV"
+        onOwnSelection={read.ownPublication}
+        admissionAllowed={() => read.isCurrentData(true)}
         onSelectionInvalidated={read.invalidateSelection}
-        disabled={!read.selectionId || !valid || exportableSelectionId !== read.selectionId} />} />
+        disabled={!valid || !read.frozenData?.reports.setId || !["available", "stale"].includes(read.frozenData.sources.directory.state)} />} />
       <div className="table-shell copilot-users-table-shell" role="region" aria-label="Reported user activity" tabIndex={0}><table className="agent-table copilot-users-table reported-users-table">
         <thead><tr><ReportSortHeading label="User" sort="name" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agent responses" sort="responses" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agents used" sort="agentsUsed" query={filters} onChange={setFilters} />
           <th scope="col">Company</th><th scope="col">Department</th><ReportSortHeading label="Last activity" sort="lastActivity" query={filters} onChange={setFilters} /></tr></thead>
         <tbody>{data?.value.map(user => <tr key={user.username}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
-          trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, queryKey });
+          read.ownPublication(); trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, queryKey });
         }}>
           {user.displayName || user.username}</button><small>{user.username}</small></th><td data-numeric>{usageCount(user.reportedResponses)}</td>
           <td data-numeric>{usageCount(user.reportedAgentsUsed)}</td><td>{user.company?.trim() || "Not set"}</td><td>{user.department?.trim() || "Not set"}</td><td>{usageDate(user.userLastActivityDateUtc)}
@@ -98,12 +105,12 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
       {showPageControls || hasShownPageControls ? <ReportPageControls {...read} label="users" /> : null}
     </div>
     {data ? <details className="copilot-users-provenance"><summary>Report sources</summary><UsageReportContext reports={data.reports} inlineSources /></details> : null}
-    {selected ? <UserDetailModal key={selected.selectionId + selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
+    {selected ? <UserDetailModal key={selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
       filters={route.agentId ? { agentId: route.agentId } : undefined}
       returnFocusTo={trigger} closeLabel="Close reported user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
       onFocusAgent={(agentId, reportSetId) => {
         if (!read.isCurrentData(true)) return;
-        restartSelection(); resetFilters(); onRouteChange({ ...route, search: "", agentId, reportSetId, page: 0 });
+        setSelected(undefined); read.restart(); resetFilters(); onRouteChange({ ...route, search: "", agentId, reportSetId, page: 0 });
       }}
       dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
       onSelectionInvalidated={read.invalidateSelection} /> : null}

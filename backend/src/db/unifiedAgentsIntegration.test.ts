@@ -130,7 +130,10 @@ describe("typed unified inventory integration", () => {
     await reconcileInventoryFixture(fixture.runtime, scope);
     await cache.save(scope, [{ objectId: manifestId, status: "resolved", displayName: "Outside paid roster",
       userPrincipalName: "owner@example.invalid", checkedAt: new Date().toISOString() }], { generation: await cache.generation(scope) });
-    const selected = await read(scope);
+    const optional = await read(scope);
+    expect((await optional.queries.responsibility(optional.selection.id, optional.identity, { objectId: manifestId }))
+      .selected?.person.evidence).toBeNull();
+    const selected = await read(scope, { sortBy: "owner" });
     const result = await selected.queries.responsibility(selected.selection.id, selected.identity, { objectId: manifestId, limit: 1 });
     expect(result.selected?.person.evidence?.displayName).toBe("Outside paid roster");
     expect(result.selected?.count).toBe(2);
@@ -143,9 +146,13 @@ describe("typed unified inventory integration", () => {
     expect((await selected.queries.exact(selected.selection.id, selected.identity, ids.map(id => id.slice(6))))).toHaveLength(2);
     await expect(selected.queries.responsibility(selected.selection.id, { ...selected.identity, principalId: "different-reader" },
       { objectId: manifestId })).rejects.toMatchObject({ code: "selection_invalidated" });
+    await cache.save(scope, [{ objectId: manifestId, status: "resolved", displayName: "Renamed outside paid roster",
+      userPrincipalName: "owner@example.invalid", checkedAt: new Date().toISOString() }], { generation: await cache.generation(scope) });
+    await expect(selected.queries.responsibility(selected.selection.id, selected.identity, { objectId: manifestId }))
+      .rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "changed" } });
     await nativeInventoryFixture(fixture.runtime, scope, values);
     await reconcileInventoryFixture(fixture.runtime, scope);
-    const refreshed = await read(scope);
+    const refreshed = await read(scope, { sortBy: "owner" });
     expect((await refreshed.queries.responsibility(refreshed.selection.id, refreshed.identity, { objectId: manifestId }))
       .selected?.agents.map(row => row.id).sort()).toEqual(ids.sort());
   });
@@ -174,11 +181,15 @@ describe("typed unified inventory integration", () => {
     });
     it("independently pages all 301 owner relationships and exact final-creator navigation", async () => {
       const agents = new Set<string>();
+      const milliseconds: number[] = [], bytes: number[] = [];
       let cursor: string | undefined;
       do {
         const started = performance.now();
         const page = await selected.queries.responsibility(selected.selection.id, selected.identity, { objectId: manifestId, limit: 100, cursor });
-        expect(performance.now() - started).toBeLessThan(15_000);
+        milliseconds.push(performance.now() - started);
+        bytes.push(Buffer.byteLength(JSON.stringify(page)));
+        expect(milliseconds.at(-1)).toBeLessThan(15_000);
+        expect(bytes.at(-1)).toBeLessThanOrEqual(524_288);
         expect(page.selected?.count).toBe(301);
         expect(page.selected!.agents.length).toBeLessThanOrEqual(100);
         for (const agent of page.selected!.agents) { expect(agents.has(agent.id)).toBe(false); agents.add(agent.id); }
@@ -188,7 +199,11 @@ describe("typed unified inventory integration", () => {
       const started = performance.now();
       expect((await selected.queries.responsibility(selected.selection.id, selected.identity, { objectId: creator(300), limit: 1 }))
         .selected?.count).toBe(1);
-      expect(performance.now() - started).toBeLessThan(15_000);
+      milliseconds.push(performance.now() - started);
+      expect(milliseconds.at(-1)).toBeLessThan(15_000);
+      expect(milliseconds).toHaveLength(5);
+      process.stdout.write(`RESPONSIBILITY_PAGE_RECEIPT ${JSON.stringify({ people: 302, relationships: agents.size,
+        requests: milliseconds.length, milliseconds, maximumBytes: Math.max(...bytes) })}\n`);
     }, 30_000);
   });
 

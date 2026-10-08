@@ -45,6 +45,9 @@ function Get-OwnedFixtureMounts {
         if ($Service -eq 'test-db' -and $mount.Type -eq 'bind' -and -not $mount.RW) {
             $expected = if ($mount.Destination -ceq '/evidence/restart-fixture.json') { Join-Path $Directory 'restart-fixture.json' }
                 elseif ($mount.Destination -ceq '/fixture.mjs') { Join-Path (Split-Path $PSScriptRoot -Parent) 'backend/scripts/restart-runtime.mjs' }
+                elseif ($mount.Destination -ceq '/app/backend/scripts/officialReportFingerprint.ts') {
+                    Join-Path (Split-Path $PSScriptRoot -Parent) 'backend/scripts/officialReportFingerprint.ts'
+                }
                 else { $null }
             if ($expected -and [IO.Path]::GetFullPath($mount.Source) -ceq [IO.Path]::GetFullPath($expected)) { continue }
         }
@@ -99,7 +102,7 @@ function Write-FixtureDiagnostics {
             $counters = if ($running) {
                 try {
                     Invoke-DockerCommand @('exec',$id,'sh','-c',
-                        'for f in memory.current memory.peak memory.events memory.stat; do printf "%s\n" "$f"; if [ -r "/sys/fs/cgroup/$f" ]; then cat "/sys/fs/cgroup/$f"; else printf "unavailable\n"; fi; done') -Capture
+                        'for f in memory.current memory.peak memory.max memory.events memory.stat cpu.max cpu.stat; do printf "%s\n" "$f"; if [ -r "/sys/fs/cgroup/$f" ]; then cat "/sys/fs/cgroup/$f"; else printf "unavailable\n"; fi; done') -Capture
                 } catch {
                     $latest = (Invoke-DockerCommand @('inspect','--format','{{json .State}}',$id) -Capture) | ConvertFrom-Json
                     if ($latest.Running) { throw }

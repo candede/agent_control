@@ -28,7 +28,7 @@ describe.each(["history", "overview"] as const)("%s query admission", endpoint =
   });
   it("normalizes literal search and uses the frozen cursor-order defaults", () => {
     expect(reportQuery(endpoint, { search: "  %_Name " })).toEqual({ search: "%_name",
-      sort: endpoint === "history" ? "acceptedAt" : "name", order: endpoint === "history" ? "desc" : "asc",
+      sort: endpoint === "history" ? "reportingPeriod" : "name", order: endpoint === "history" ? "desc" : "asc",
       lowResponseThreshold: 5, inactiveDays: 30, activityWindowDays: 30 });
     if (endpoint === "overview") expect(reportQuery(endpoint, { startDate: "2024-02-29", endDate: "2024-02-29", scope: "selected" }))
       .toMatchObject({ startDate: "2024-02-29", endDate: "2024-02-29", scope: "selected" });
@@ -75,7 +75,9 @@ describe("native history/overview snapshot execution", () => {
     try {
       const options = await reports.historyOptions(selection.id, identity);
       expect(Object.keys(options).sort()).toEqual(["counts", "page", "reports", "selection", "value"]);
-      expect(options).toEqual({ value: full.value, page: full.page, counts: full.counts, selection: full.selection, reports: full.reports });
+      expect(Date.parse(options.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(full.selection.validatedAt));
+      expect(options).toEqual({ value: full.value, page: full.page, counts: full.counts,
+        selection: { ...full.selection, validatedAt: options.selection.validatedAt }, reports: full.reports });
       expect(tape.statements.some(sql => /directory_user_rows|official_usage_row_facts|envelope_summary/.test(sql))).toBe(false);
       expect(tape.connect).toHaveBeenCalledOnce();
       expect(tape.statements[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ");

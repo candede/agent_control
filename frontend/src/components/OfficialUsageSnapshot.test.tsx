@@ -25,7 +25,7 @@ beforeEach(() => {
   vi.mocked(api.readReportFacet).mockResolvedValue({ value: [], counts: { total: 0, filtered: 0 },
     page: { limit: 50, nextCursor: null, previousCursor: null }, selection: page().selection });
 });
-afterEach(() => { cleanup(); vi.resetAllMocks(); vi.useRealTimers(); });
+afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("exact selected snapshot inspection", () => {
   it("loads the exact set and requested activity window, tenant totals and lazy detail without changing the active set", async () => {
@@ -176,10 +176,10 @@ describe("exact selected snapshot inspection", () => {
     expect(api.createReportExport).toHaveBeenCalledOnce();
   });
   it.each(["revision", "report", "account", "roles", "session", "search", "dates", "failure", "invalidation", "expiry"] as const)(
-    "retires preserved snapshot work on a %s boundary during pagination, ignoring late responses", async boundary => {
+    "preserves lease-end work but retires it on a %s boundary during pagination", async boundary => {
       vi.useFakeTimers();
       const initial = page(), next = deferred<ReportPage<ReportAgent>>(), replacement = deferred<ReportPage<ReportAgent>>();
-      if (boundary === "expiry") initial.selection = { ...initial.selection, expiresAt: new Date(Date.now() + 1000).toISOString() };
+      if (boundary === "expiry") initial.selection = { ...initial.selection, validatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 1000).toISOString() };
       const options = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>(), exact = deferred<Awaited<ReturnType<typeof api.readReportDetail>>>();
       const admission = deferred<{ id: string }>();
       vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(next.promise).mockReturnValue(replacement.promise);
@@ -215,6 +215,24 @@ describe("exact selected snapshot inspection", () => {
         else view.rerender(panel(true));
         await vi.advanceTimersByTimeAsync(1);
       });
+      if (boundary === "expiry") {
+        expect(pageSignal?.aborted).toBe(false);
+        expect(facetSignal?.aborted).toBe(false);
+        expect(detailSignal?.aborted).toBe(false);
+        expect(exportSignal?.aborted).toBe(false);
+        expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
+        expect(screen.getByRole("button", { name: "Cancel export" })).toBeVisible();
+        await act(async () => {
+          next.resolve(initial);
+          exact.resolve({ value: reportAgent(1), reports, sources: initial.sources, selection: initial.selection });
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(screen.getByRole("button", { name: "Researcher" })).toBeVisible();
+        expect(screen.getByRole("region", { name: "Exact reported agent details" })).toBeVisible();
+        expect(api.readReportPage).toHaveBeenCalledTimes(3);
+        expect(api.createReportExport).toHaveBeenCalledOnce();
+        return;
+      }
       if (boundary !== "failure" && boundary !== "invalidation") expect(pageSignal?.aborted).toBe(true);
       expect(facetSignal?.aborted).toBe(true);
       expect(detailSignal?.aborted).toBe(true);
@@ -246,21 +264,21 @@ describe("exact selected snapshot inspection", () => {
     expect(vi.mocked(api.readReportPage).mock.calls.every(call => call[1]?.setId === "retained")).toBe(true);
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
   });
-  it("does not let focus bypass explicit restart after its bounded snapshot recovery fails", async () => {
+  it("does not let focus bypass explicit replacement after snapshot invalidation", async () => {
     vi.mocked(api.readReportPage).mockRejectedValue(new ApiError(409, "selection_invalidated", "Retained snapshot expired"));
     render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
     await screen.findByRole("button", { name: "Restart selection" });
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
     fireEvent.focus(window);
     await act(async () => {});
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(screen.getByRole("region", { name: "Reported agent activity" })).toHaveAttribute("aria-busy", "false");
     expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
     expect(api.readReportFacet).not.toHaveBeenCalled();
     vi.mocked(api.readReportPage).mockResolvedValue(page());
     fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await screen.findByRole("button", { name: "Researcher" });
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toMatchObject({ setId: reportSetId });
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
   });
@@ -277,7 +295,7 @@ describe("exact selected snapshot inspection", () => {
   });
   it.each([
     { phase: "pending", clock: "timer" }, { phase: "failed", clock: "timer" }, { phase: "pending", clock: "focus" },
-  ] as const)("expires retained totals on $clock while the replacement filter read is $phase without replaying it", async ({ phase, clock }) => {
+  ] as const)("retains authorized historical totals on $clock while the replacement filter read is $phase without replaying it", async ({ phase, clock }) => {
     vi.useFakeTimers();
     const initial = page(), replacement = deferred<ReportPage<ReportAgent>>();
     initial.selection = { ...initial.selection, expiresAt: new Date(Date.now() + 1000).toISOString() };
@@ -293,11 +311,11 @@ describe("exact selected snapshot inspection", () => {
     expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
     await act(async () => {
       if (clock === "timer") await vi.advanceTimersByTimeAsync(1000);
-      else { vi.setSystemTime(Date.now() + 1000); fireEvent.focus(window); }
+      else { vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1000); fireEvent.focus(window); }
     });
-    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
-    expect(screen.queryByText(/previously read snapshot totals/)).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     if (phase === "pending") {
       expect(signal?.aborted).toBe(false);
@@ -370,7 +388,7 @@ describe("exact selected snapshot inspection", () => {
     await screen.findByRole("button", { name: "Restart selection" });
     expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.every(([, query]) => query?.setId === "retained")).toBe(true);
   });
 });

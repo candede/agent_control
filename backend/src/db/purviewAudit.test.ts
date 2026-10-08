@@ -36,6 +36,31 @@ async function submitAndBegin(key: string, owner = scope) {
 }
 
 describe.sequential("Purview audit repository", () => {
+  it("intersects agent and human history and rejects keyword hits for a different agent at publication", async () => {
+    const agent = { recordId: "agent:scoped", botId: "33333333-3333-4333-8333-333333333333", environmentId: "environment" };
+    const selected: PurviewAuditFilters = { ...filters, presetId: "copilot_studio_admin", operations: ["BotCreate"],
+      userPrincipalNames: ["employee@example.invalid"], agent };
+    const matching = await repository.submit(scope, { idempotencyKey: "bound-agent", filters: selected });
+    const execution = await repository.begin(scope, matching.id);
+    await repository.recordProviderQuery(scope, matching.id, execution, "bound-query", "succeeded");
+    const exact = record({ botId: agent.botId, environmentId: agent.environmentId, service: "PowerPlatform", operation: "BotCreate",
+      actorUserPrincipalName: selected.userPrincipalNames[0], auditLogRecordType: "powerPlatformAdministratorActivity" });
+    await expect(repository.publish(scope, matching.id, execution, result([{ ...exact, botId: "44444444-4444-4444-8444-444444444444" }])))
+      .rejects.toThrow();
+    await repository.publish(scope, matching.id, execution, result([exact]));
+    for (const [index, changed] of [
+      { ...selected, agent: { ...agent, recordId: "agent:other" } },
+      { ...selected, userPrincipalNames: ["other@example.invalid"] },
+      { ...selected, agent: undefined },
+    ].entries()) {
+      const submitted = await repository.submit(scope, { idempotencyKey: `unbound-agent-${index}`, filters: changed });
+      await repository.cancel(scope, submitted.id);
+    }
+    const read = { tenantId: scope.tenantId, resultScopes: [scope.resultScope] };
+    const page = await repository.listJobs(read, 1, 0, selected.userPrincipalNames[0], agent.recordId);
+    expect(page.count).toBe(1);
+    expect(page.value.map(job => job.id)).toEqual([matching.id]);
+  });
   it("scopes user history before counts and pagination, excluding broad, multi-user and unauthorized jobs", async () => {
     const owner: PurviewAuditScope = { ...scope, authorizationPrincipalId: "user-history-reader",
       resultScope: { kind: "principal", scopeId: "user-history-reader", configurationRevision: null } };

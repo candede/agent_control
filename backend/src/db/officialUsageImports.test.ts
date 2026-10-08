@@ -79,6 +79,74 @@ async function releaseSelections(identity: SelectionIdentity) {
 }
 
 describe("native automatic import and semantic reuse", () => {
+  it.each([false, true])("selects the first complete wizard report once (previous partial acceptance=%s)", async partial => {
+    const identity = owner(), draft = await bundle(identity);
+    if (partial) expect(await single(identity, draft.stages[0])).toMatchObject({ complete: false, activeRevision: "1" });
+    expect((await agents(identity)).reports.activeSetId).toBeNull();
+    const input = { ...await imports.bundle(identity, draft.bundleId), preserveSelection: true };
+    const accepted = await imports.acceptBundle(identity, draft.bundleId, input);
+    expect(accepted).toMatchObject({ complete: true, activeRevision: "2" });
+    expect((await agents(identity)).reports).toMatchObject({ setId: accepted.setId, activeSetId: accepted.setId });
+    expect(await imports.acceptBundle(identity, draft.bundleId, input)).toEqual(accepted);
+    expect((await agents(identity)).reports.activeRevision).toBe("2");
+
+    const next = await bundle(identity, { responses: 9 });
+    const saved = await imports.acceptBundle(identity, next.bundleId, { ...next.preview, preserveSelection: true });
+    expect((await agents(identity)).reports.setId).toBe(accepted.setId);
+    const selected = await operation(identity, saved.setId, "select");
+    expect(await imports.acceptBundle(identity, draft.bundleId, input)).toEqual(accepted);
+    expect((await agents(identity)).reports).toMatchObject({
+      setId: saved.setId, activeSetId: saved.setId, activeRevision: selected.activeRevision,
+    });
+  });
+
+  it.each(["new", "duplicate", "correction"] as const)(
+    "saves a wizard %s import without changing selection, including receipt retries", async scenario => {
+      const identity = owner();
+      const previous = await (await bundle(identity)).accept();
+      const draft = await bundle(identity, {
+        responses: scenario === "duplicate" ? 4 : 9,
+        correctionOfSetId: scenario === "correction" ? previous?.setId : undefined,
+      });
+      const state = async () => (await fixture.runtime.query(
+        "SELECT active_set_id,revision::text,updated_at FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows;
+      const before = await state(), input = { ...draft.preview, preserveSelection: true };
+      const accepted = await imports.acceptBundle(identity, draft.bundleId, input);
+      expect(accepted).toMatchObject({ complete: true, activeRevision: draft.preview.expectedActiveRevision });
+      expect(await state()).toEqual(before);
+      expect((await agents(identity, accepted.setId)).reports).toMatchObject({
+        setId: accepted.setId, activeSetId: previous?.setId ?? null,
+      });
+      expect(await imports.acceptBundle(identity, draft.bundleId, input)).toEqual(accepted);
+      expect(await state()).toEqual(before);
+      if (scenario === "duplicate") expect(accepted.setId).toBe(previous?.setId);
+      else expect(accepted.setId).not.toBe(previous?.setId);
+      await operation(identity, accepted.setId, "select");
+      expect((await agents(identity)).reports.activeSetId).toBe(accepted.setId);
+    });
+
+  it("selects only one racing first import and preserves it when the competing import is retried", async () => {
+    const identity = owner();
+    const drafts = [await bundle(identity), await bundle(identity, { responses: 9 })];
+    const outcomes = await Promise.allSettled(drafts.map(draft =>
+      imports.acceptBundle(identity, draft.bundleId, { ...draft.preview, preserveSelection: true })));
+    const accepted = outcomes.find(outcome => outcome.status === "fulfilled");
+    expect(accepted?.status).toBe("fulfilled");
+    expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
+    const rejectedIndex = outcomes.findIndex(outcome => outcome.status === "rejected");
+    expect(outcomes[rejectedIndex]).toMatchObject({ status: "rejected", reason: {
+      code: expect.stringMatching(/^(active_revision_mismatch|bundle_fence_mismatch)$/),
+    } });
+    if (accepted?.status !== "fulfilled") throw new Error("Expected one accepted first report.");
+    const retry = drafts[rejectedIndex];
+    const saved = await imports.acceptBundle(identity, retry.bundleId, {
+      ...await imports.bundle(identity, retry.bundleId), preserveSelection: true,
+    });
+    expect(saved.setId).not.toBe(accepted.value.setId);
+    expect(saved.activeRevision).toBe(accepted.value.activeRevision);
+    expect((await agents(identity)).reports.setId).toBe(accepted.value.setId);
+  });
+
   it("returns the durable acceptance after cleanup fails and resumes its indexed bounded deletion",async () => {
     const identity = owner(), prepared = await bundle(identity);
     const cleanup = vi.spyOn(imports,"cleanupIngestion").mockRejectedValue(new Error("synthetic_cleanup_unavailable"));
@@ -189,7 +257,10 @@ describe("native automatic import and semantic reuse", () => {
     await expect(single(identity, duplicate.stages[0])).rejects.toMatchObject({ status: 409 });
   });
 
-  it.each([false, true])("reimports deleted bytes as a new set without reviving old receipts (purged=%s)", async purged => {
+  it.each([
+    { purged: false, preserveSelection: false }, { purged: true, preserveSelection: false },
+    { purged: false, preserveSelection: true }, { purged: true, preserveSelection: true },
+  ])("reimports deleted bytes without reviving old receipts (purged=$purged, preserveSelection=$preserveSelection)", async ({ purged, preserveSelection }) => {
     const identity = owner(), original = await bundle(identity), removed = await original.accept(), originalPage = await agents(identity);
     const deletion = await operation(identity, removed.setId, "delete");
     if (purged) {
@@ -199,14 +270,18 @@ describe("native automatic import and semantic reuse", () => {
       await retainUntilConverged(fixture.operator, { batchSize: 250 });
     }
     await expect(original.accept()).rejects.toMatchObject({ code: purged ? "bundle_fence_mismatch" : "deleted_report_duplicate" });
-    const reimported = await bundle({ ...identity, principalId: "reimport-administrator" }, { reformatted: purged });
-    const [accepted, retried] = await Promise.all([reimported.accept(), reimported.accept()]);
+    const reimportIdentity = { ...identity, principalId: "reimport-administrator" };
+    const reimported = await bundle(reimportIdentity, { reformatted: purged });
+    const accept = () => imports.acceptBundle(reimportIdentity, reimported.bundleId, { ...reimported.preview, preserveSelection });
+    const [accepted, retried] = await Promise.all([accept(), accept()]);
     expect(retried).toEqual(accepted);
-    expect(accepted).toMatchObject({ complete: true, activeRevision: String(BigInt(deletion.activeRevision) + 1n) });
+    expect(accepted).toMatchObject({ complete: true,
+      activeRevision: preserveSelection ? deletion.activeRevision : String(BigInt(deletion.activeRevision) + 1n) });
     expect(accepted.setId).not.toBe(removed.setId);
-    const current = await agents(identity);
+    const current = await agents(identity, accepted.setId);
     expect(current.value).toEqual(originalPage.value); expect(current.reports.acceptedAt).not.toBe(originalPage.reports.acceptedAt);
     expect(current.reports.setId).toBe(accepted.setId);
+    expect((await agents(identity)).reports.activeSetId).toBe(preserveSelection ? null : accepted.setId);
     expect((await fixture.runtime.query("SELECT bundle_id,deleted_at FROM official_usage_sets WHERE id=$1", [removed.setId])).rows)
       .toEqual(purged ? [] : [{ bundle_id: original.bundleId, deleted_at: expect.any(Date) }]);
     await expect(agents(identity, removed.setId)).rejects.toMatchObject({ status: 409 });

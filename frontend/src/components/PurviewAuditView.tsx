@@ -33,7 +33,8 @@ import {
   type PurviewAuditTokenMode,
 } from "../api/client";
 import { hasRole } from "../authorization";
-import { capabilityExplanation, currentOperationFailure, currentVerification, providerActionAllowed, statusLabels } from "../capabilityState";
+import { capabilityExplanation, capabilityModeEnabled, currentOperationFailure, providerActionAllowed, statusLabels } from "../capabilityState";
+import { purviewAuditPresets } from "../../../backend/src/types/purviewAudit";
 import { useCapabilityContext } from "../capabilityContext";
 import { downloadFile } from "../downloadFile";
 import { useSavedRead } from "../savedQueries";
@@ -71,14 +72,18 @@ function purviewCapabilityKey(views: ReturnType<typeof useCapabilityContext>["vi
     .join("|");
 }
 
-export function PurviewAuditView({ userPrincipalName, active = true }: { userPrincipalName: string; active?: boolean }) {
+type PurviewProps = { userPrincipalName?: string; agentRecordId?: string; active?: boolean; contextCurrent?: boolean;
+  presets?: PurviewAuditFilters["presetId"][] };
+
+export function PurviewAuditView(props: PurviewProps) {
   const capability = useCapabilityContext();
   const accountKey = JSON.stringify([capability.user?.tenantId, capability.user?.homeAccountId, [...(capability.user?.roles ?? [])].sort()]);
-  const scopeKey = `${accountKey}:${purviewCapabilityKey(capability.views)}:${userPrincipalName}`;
-  return <PurviewAuditSession key={scopeKey} scopeKey={scopeKey} userPrincipalName={userPrincipalName} active={active} />;
+  const scopeKey = JSON.stringify([accountKey, purviewCapabilityKey(capability.views), props.userPrincipalName, props.agentRecordId, props.presets]);
+  if (!props.userPrincipalName && !props.agentRecordId) return <p role="alert">Select a user or agent to search audit logs.</p>;
+  return <PurviewAuditSession key={scopeKey} scopeKey={scopeKey} {...props} />;
 }
 
-function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrincipalName: string; active: boolean; scopeKey: string }) {
+function PurviewAuditSession({ userPrincipalName, agentRecordId, presets, active = true, contextCurrent = true, scopeKey }: PurviewProps & { scopeKey: string }) {
   const capability = useCapabilityContext();
   const readSaved = useSavedRead();
   const searchAction = useWorkbenchAction("purview.search");
@@ -103,17 +108,14 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   const [tokenMode, setTokenMode] =
     useState<PurviewAuditTokenMode>("delegated");
   const [presetId, setPresetId] =
-    useState<PurviewAuditFilters["presetId"]>("copilot_interactions");
-  const [operations, setOperations] = useState(["CopilotInteraction"]);
+    useState<PurviewAuditFilters["presetId"]>(presets?.[0] ?? "copilot_interactions");
+  const [operations, setOperations] = useState<string[]>(() => [...purviewAuditPresets[presetId].operationFilters]);
   const [startDateTime, setStartDateTime] = useState(() =>
     localDateTime(new Date(Date.now() - 60 * 60_000)),
   );
   const [endDateTime, setEndDateTime] = useState(() =>
     localDateTime(new Date()),
   );
-  const [ipAddresses, setIpAddresses] = useState("");
-  const [objectIds, setObjectIds] = useState("");
-  const [administrativeUnitIds, setAdministrativeUnitIds] = useState("");
   const [qualification, setQualification] =
     useState<PurviewAuditQualification>();
   const [approvalAcknowledged, setApprovalAcknowledged] = useState(false);
@@ -126,7 +128,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
 
   function selectJob(job: PurviewAuditJob | undefined, origin: "history" | "action" = "history") {
     if (job) {
-      assertUserJobs([job], userPrincipalName);
+      assertUserJobs([job], userPrincipalName, agentRecordId);
       updateSelectedJob(job);
     } else {
       selectedRef.current = undefined;
@@ -230,7 +232,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   }
 
   function commitHistory(history: Awaited<ReturnType<typeof getPurviewAuditJobs>>) {
-    assertUserJobs(history.value, userPrincipalName);
+    assertUserJobs(history.value, userPrincipalName, agentRecordId);
     setJobs(history.value);
     setHistoryCount(history.count);
     setHistoryOffset(history.offset);
@@ -253,8 +255,8 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   ): Promise<Awaited<ReturnType<typeof getPurviewAuditJobs>> | undefined> {
     const historyRequest = ++historyGeneration.current;
     const history = await readSavedData(
-      ["purview-audit-jobs", { limit: historyPageSize, offset, userPrincipalName }],
-      requestSignal => getPurviewAuditJobs(historyPageSize, offset, { signal: requestSignal, userPrincipalName }),
+      ["purview-audit-jobs", { limit: historyPageSize, offset, userPrincipalName, agentRecordId }],
+      requestSignal => getPurviewAuditJobs(historyPageSize, offset, { signal: requestSignal, userPrincipalName, agentRecordId }),
       signal,
     );
     if (signal.aborted || !currentRequest(generation, action) || historyRequest !== historyGeneration.current) {
@@ -268,7 +270,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   }
 
   const pollHistory = useEffectEvent(async (signal: AbortSignal) => {
-    if (!active || historyLoading || busy || actionRequest.current && !actionRequest.current.controller.signal.aborted) return;
+    if (!active || !contextCurrent || historyLoading || busy || actionRequest.current && !actionRequest.current.controller.signal.aborted) return;
     const generation = requestGeneration.current;
     try {
       const history = await loadHistory(historyOffset, generation, signal);
@@ -278,7 +280,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         && !history.value.some(job => job.id === current.id)) {
         const job = await readSavedSelection(["purview-audit-job", current.id], requestSignal => getPurviewAuditJob(current.id, { signal: requestSignal }), signal);
         if (job && !signal.aborted && currentRequest(generation) && selectedRef.current?.id === current.id) {
-          assertExactJob(job, current.id, userPrincipalName);
+          assertExactJob(job, current.id, userPrincipalName, agentRecordId);
           updateSelectedJob(job);
         }
       }
@@ -304,8 +306,8 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     const [catalogResult, history, exactJob] = await Promise.all([
       readSavedData(["purview-audit-catalog"], requestSignal => getPurviewAuditCatalog({ signal: requestSignal }), signal),
       readSavedData(
-        ["purview-audit-jobs", { limit: historyPageSize, offset: historyOffset, userPrincipalName }],
-        requestSignal => getPurviewAuditJobs(historyPageSize, historyOffset, { signal: requestSignal, userPrincipalName }),
+        ["purview-audit-jobs", { limit: historyPageSize, offset: historyOffset, userPrincipalName, agentRecordId }],
+        requestSignal => getPurviewAuditJobs(historyPageSize, historyOffset, { signal: requestSignal, userPrincipalName, agentRecordId }),
         signal,
       ),
       previous ? readSavedSelection(["purview-audit-job", previous.id],
@@ -313,8 +315,8 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         "The selected search is expired, deleted, or unavailable to this account. ") : undefined,
     ]);
     if (signal.aborted || !currentRequest(generation)) return;
-    assertUserJobs(history.value, userPrincipalName);
-    if (exactJob && previous) assertExactJob(exactJob, previous.id, userPrincipalName);
+    assertUserJobs(history.value, userPrincipalName, agentRecordId);
+    if (exactJob && previous) assertExactJob(exactJob, previous.id, userPrincipalName, agentRecordId);
     const lastOffset = Math.max(Math.ceil(history.count / historyPageSize) - 1, 0) * historyPageSize;
     if (historyOffset > lastOffset) await loadHistory(lastOffset, generation, signal);
     else commitHistory(history);
@@ -327,7 +329,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         const page = await readSavedSelection(["purview-audit-records", exactJob.id, { limit: recordPageSize, offset: previousOffset, updatedAt: exactJob.updatedAt }],
           requestSignal => getPurviewAuditRecords(exactJob.id, recordPageSize, previousOffset, { signal: requestSignal }), signal);
         if (page && currentRequest(generation, action) && draftGeneration.current === draft) {
-          assertExactJob(page.job, exactJob.id, userPrincipalName);
+          assertExactJob(page.job, exactJob.id, userPrincipalName, agentRecordId);
           updateSelectedJob(page.job);
           setRecords(page);
           setRecordOffset(page.offset);
@@ -361,7 +363,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
       setHistoryLoading(true);
       setBusy(undefined);
     };
-  }, [active, failSavedRead, readSavedData, userPrincipalName]);
+  }, [active, failSavedRead, readSavedData, userPrincipalName, agentRecordId]);
 
   useEffect(() => () => actionRequest.current?.controller.abort(), []);
 
@@ -380,7 +382,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   }, [capability.now, qualification]);
 
   useEffect(() => {
-    if (!active || historyLoading || !hasProgressingJobs && pollCycle === 0) return;
+    if (!active || !contextCurrent || historyLoading || !hasProgressingJobs && pollCycle === 0) return;
     // Only explicit restarts clear the budget; passive visibility changes reuse it.
     const budget = pollBudget.current ?? { deadline: Date.now() + 5 * 60_000, attempts: 0 };
     pollBudget.current = budget;
@@ -404,7 +406,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [active, hasProgressingJobs, historyLoading, pollCycle, pollPaused]);
+  }, [active, contextCurrent, hasProgressingJobs, historyLoading, pollCycle, pollPaused]);
 
   useEffect(() => {
     const qualificationJob = qualification?.jobId
@@ -434,7 +436,6 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     capability.now,
   );
   const applicationMode = tokenMode === "application";
-  const verification = capabilityView ? currentVerification(capabilityView, capability.now) : undefined;
   const operationFailure = capabilityView ? currentOperationFailure(capabilityView, capability.now) : undefined;
   const setupIssue = capabilityView && !available
     ? !applicationMode && decision?.status === "unknown" && !decision.evidence?.category
@@ -443,14 +444,14 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     : undefined;
   const canQualify = applicationMode && hasRole(capability.user, "AgentControl.Admin");
   const filters = makeFilters({
-    administrativeUnitIds,
+    administrativeUnitIds: "",
     endDateTime,
-    ipAddresses,
-    objectIds,
+    ipAddresses: "",
+    objectIds: "",
     operations,
     presetId,
     startDateTime,
-    userPrincipalNames: userPrincipalName,
+    userPrincipalNames: userPrincipalName ?? "",
   });
   const rangeError = getRangeError(filters, catalog);
   const operationError = operations.length ? undefined : "Select at least one supported operation.";
@@ -464,8 +465,8 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     setHistoryLoading(true);
     const [nextCatalog, history, exactJob] = await Promise.all([
       readSavedData(["purview-audit-catalog"], requestSignal => getPurviewAuditCatalog({ signal: requestSignal }), signal),
-      readSavedData(["purview-audit-jobs", { limit: historyPageSize, offset: historyOffset, userPrincipalName }],
-        requestSignal => getPurviewAuditJobs(historyPageSize, historyOffset, { signal: requestSignal, userPrincipalName }), signal),
+      readSavedData(["purview-audit-jobs", { limit: historyPageSize, offset: historyOffset, userPrincipalName, agentRecordId }],
+        requestSignal => getPurviewAuditJobs(historyPageSize, historyOffset, { signal: requestSignal, userPrincipalName, agentRecordId }), signal),
       exactId ? readSavedSelection(["purview-audit-job", exactId],
         requestSignal => getPurviewAuditJob(exactId, { signal: requestSignal }), signal,
         "The exact Audit Search job is expired, deleted, or unavailable to this account. ") : undefined,
@@ -476,7 +477,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     if (historyOffset > lastOffset) await loadHistory(lastOffset, generation, signal, action);
     else commitHistory(history);
     if (exactJob && exactId && currentRequest(generation, action) && draftGeneration.current === draft) {
-      assertExactJob(exactJob, exactId, userPrincipalName);
+      assertExactJob(exactJob, exactId, userPrincipalName, agentRecordId);
       updateSelectedJob(exactJob);
     }
     if (currentRequest(generation, action) && draftGeneration.current === draft && qualification?.jobId
@@ -496,7 +497,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     }
 
     await perform("search", async (generation, action, signal) => {
-      const job = await submitPurviewAuditSearch(tokenMode, filters, { signal });
+      const job = await submitPurviewAuditSearch(tokenMode, filters, { signal, agentRecordId });
       if (!currentRequest(generation, action)) {
         return;
       }
@@ -507,7 +508,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   }
 
   async function handleApproveQualification() {
-    if (!active || historyLoading || !canQualify || !approvalAcknowledged || !catalog || busy || !filters || rangeError || operationError
+    if (!active || !contextCurrent || historyLoading || !canQualify || !approvalAcknowledged || !catalog || busy || !filters || rangeError || operationError
       || Date.parse(filters.endDateTime) - Date.parse(filters.startDateTime) > catalog.limits.qualificationWindowHours * 3_600_000) {
       return;
     }
@@ -516,7 +517,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
       const approved = await approvePurviewAuditQualification(
         tokenMode,
         filters,
-        { signal },
+        { signal, agentRecordId },
       );
       if (!currentRequest(generation, action)) {
         return;
@@ -529,7 +530,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
 
   async function handleRunQualification() {
     if (
-      !active || historyLoading || !canQualify || busy || !qualification ||
+      !active || !contextCurrent || historyLoading || !canQualify || busy || !qualification ||
       qualification.status !== "approved" ||
       !(Date.parse(qualification.expiresAt) > Math.max(Date.now(), capability.now))
     ) {
@@ -566,7 +567,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         return;
       }
 
-      assertExactJob(page.job, job.id, userPrincipalName);
+      assertExactJob(page.job, job.id, userPrincipalName, agentRecordId);
       updateSelectedJob(page.job);
       setRecords(page);
       setRecordOffset(page.offset);
@@ -582,7 +583,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         return;
       }
 
-      assertExactJob(resumed, job.id, userPrincipalName);
+      assertExactJob(resumed, job.id, userPrincipalName, agentRecordId);
       if (draftGeneration.current === draft) selectJob(resumed, "action");
       await loadHistory(historyOffset, generation, signal, action);
     });
@@ -596,14 +597,14 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         return;
       }
 
-      assertExactJob(cancelled, job.id, userPrincipalName);
+      assertExactJob(cancelled, job.id, userPrincipalName, agentRecordId);
       if (draftGeneration.current === draft) selectJob(cancelled, "action");
       await loadHistory(historyOffset, generation, signal, action);
     });
   }
 
   async function handleDelete(job: PurviewAuditJob) {
-    if (!active || historyLoading || actionRequest.current && !actionRequest.current.controller.signal.aborted) return;
+    if (!active || !contextCurrent || historyLoading || actionRequest.current && !actionRequest.current.controller.signal.aborted) return;
     if (
       !window.confirm(
         "Delete this local Audit Search cache? The remote query and source audit events are not deleted.",
@@ -641,7 +642,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     key: string,
     operation: (generation: number, action: number, signal: AbortSignal) => Promise<unknown>,
   ) {
-    if (!active || key !== "refresh" && historyLoading
+    if (!active || !contextCurrent || key !== "refresh" && historyLoading
       || actionRequest.current && !actionRequest.current.controller.signal.aborted) return;
     if (/^(refresh|search|approve|qualification|resume:|cancel:|delete:)/.test(key)) {
       savedReadRevision.current = crypto.randomUUID();
@@ -690,8 +691,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
     <section className="purview-audit" aria-label="Microsoft Purview Audit Search">
       <header className="purview-audit-heading">
         <div>
-          <h2>Purview Audit Search</h2>
-          <p>Search Copilot and Copilot Studio audit metadata for <strong>{userPrincipalName}</strong>.</p>
+          <h4>Search Purview logs</h4>
         </div>
         <button
           type="button"
@@ -710,12 +710,13 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
       </header>
 
       {error || capability.error ? <div className="error-banner" role="alert">{error ?? capability.error}</div> : null}
+      {!error && operationFailure ? <p role="status">Last search issue: {operationFailure.remediation.join(" ") || statusLabels[operationFailure.status]}</p> : null}
       {pollPaused ? <p role="status">Automatic history refresh paused. Refresh Audit Search history to retry saved reads.</p> : null}
       {busy?.startsWith("export:") ? <p role="status">Exporting saved Audit Search results...</p> : null}
 
       <form className="purview-search-form" onSubmit={handleSearch}>
         <div className="purview-search-primary">
-          <label>
+          {capability.views.some(view => view.definition.id === "purview.audit.search.application" && capabilityModeEnabled(view)) ? <label>
             <span>Authorization</span>
             <select
               value={tokenMode}
@@ -724,12 +725,12 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
                 invalidateQualification();
               }}
             >
-              <option value="delegated">Delegated</option>
-              <option value="application">Application</option>
+              <option value="delegated">My access</option>
+              <option value="application">Shared application</option>
             </select>
-          </label>
+          </label> : null}
           <label>
-            <span>Search preset</span>
+            <span>Log type</span>
             <select
               value={presetId}
               onChange={(event) => {
@@ -749,7 +750,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
                   id: "copilot_studio_admin" as const,
                   label: "Copilot Studio administration",
                 },
-              ]).map((preset) => (
+              ]).filter(preset => !presets || presets.includes(preset.id)).map((preset) => (
                 <option key={preset.id} value={preset.id}>
                   {preset.label}
                 </option>
@@ -784,63 +785,9 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
           </label>
         </div>
 
-        <div className="purview-guidance">
-          <section className="purview-coverage" aria-label="Available audit logs">
-            <h3>Available audit logs</h3>
-            <div className="purview-coverage-grid">
-              <p><strong>Copilot interactions:</strong> interaction events and actor, app and message IDs.</p>
-              <p><strong>Copilot Studio administration:</strong> bot publishing, sharing and changes to bots, components, plugin operations and environment variables. Not bot conversations.</p>
-            </div>
-            <p>Metadata only: prompt and response text are not included. These logs are separate from usage reports.</p>
-            {catalog ? <p>Up to {catalog.limits.maximumWindowHours} hours · {catalog.limits.maximumRows.toLocaleString()} rows · {catalog.limits.maximumPages} pages.</p> : null}
-          </section>
-
-          <section className="purview-access" aria-label="Purview access and setup">
-            <header>
-              <h3>Access and setup</h3>
-              <strong>{available ? `${applicationMode ? "Application" : "Delegated"} search ready`
-                : decision?.status === "available" ? "Search not ready" : statusLabels[decision?.status ?? "unknown"]}</strong>
-            </header>
-            {verification ? <p>{verification === "provider" ? "Search access verified." : "Token ready; run a search to verify access."}
-              {decision?.checkedAt ? <> Checked {formatDateTime(decision.checkedAt)}.</> : null}</p> : null}
-            <p><strong>{applicationMode ? "Application" : "Delegated"} AuditLogsQuery.Read.All</strong> with admin consent.</p>
-            <p>Requires Purview Audit entitlement and auditing enabled. {applicationMode
-              ? "An Admin must enable application mode, approve shared data scope and run qualification."
-              : "The user needs the Audit Logs or View-Only Audit Logs role."}</p>
-            {setupIssue ? <p>{setupIssue}</p> : null}
-            {operationFailure ? <p role="status">Last search issue: {operationFailure.remediation.join(" ") || statusLabels[operationFailure.status]}</p> : null}
-            <div className="purview-row-actions">
-              <button type="button" className="secondary"
-                disabled={Boolean(busy) || historyLoading || capability.loading || capability.pending || !hasRole(capability.user, "AgentControl.Viewer")}
-                onClick={() => void perform("permissions", async () => { await capability.reload(); })}>
-                <ShieldCheck aria-hidden="true" /> {capability.loading || capability.pending ? "Checking permissions…" : "Check permissions"}
-              </button>
-              {!available ? <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button> : null}
-            </div>
-            <small>Permission checks never create audit queries.</small>
-          </section>
-        </div>
-
-        <fieldset className="purview-operation-filters">
-          <legend>Operations</legend>
-          <div>
-            {(catalog?.presets.find((preset) => preset.id === presetId)?.operations ?? operations).map((operation) => (
-              <label key={operation}>
-                <input
-                  type="checkbox"
-                  checked={operations.includes(operation)}
-                  onChange={(event) => {
-                    setOperations((current) => event.target.checked
-                      ? [...current, operation].sort()
-                      : current.filter((value) => value !== operation));
-                    invalidateQualification();
-                  }}
-                />
-                <span>{operation}</span>
-              </label>
-            ))}
-          </div>
-        </fieldset>
+        <p className="agent-log-template-description">{presetId === "copilot_interactions"
+          ? "Copilot interactions, actors and application metadata. Conversation text is not included."
+          : "Copilot Studio publishing, sharing and configuration changes."}</p>
 
         {operationError ? (
           <div className="error-banner" role="alert">{operationError}</div>
@@ -851,45 +798,6 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
             {rangeError ?? qualificationRangeError}
           </div>
         ) : null}
-
-        <section className="purview-structured-filters" aria-label="Structured identity filters">
-          <h3>Structured identity filters</h3>
-          <div>
-            <StructuredFilter
-              label="User principal names"
-              value={userPrincipalName}
-              readOnly
-              placeholder="reader@contoso.com"
-            />
-            <StructuredFilter
-              label="IP addresses"
-              value={ipAddresses}
-              placeholder="192.0.2.10"
-              onChange={(value) => {
-                setIpAddresses(value);
-                invalidateQualification();
-              }}
-            />
-            <StructuredFilter
-              label="Object IDs"
-              value={objectIds}
-              placeholder="One ID per line"
-              onChange={(value) => {
-                setObjectIds(value);
-                invalidateQualification();
-              }}
-            />
-            <StructuredFilter
-              label="Administrative unit IDs"
-              value={administrativeUnitIds}
-              placeholder="One GUID per line"
-              onChange={(value) => {
-                setAdministrativeUnitIds(value);
-                invalidateQualification();
-              }}
-            />
-          </div>
-        </section>
 
         {!available && applicationMode ? (
           <section
@@ -950,8 +858,11 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
           <section className="purview-qualification" aria-label="Audit Search authorization pending">
             <div>
               <strong>Delegated authorization is not ready</strong>
-              <p>Check permissions above to retry. Missing consent or a Purview role must be set up by your administrator.</p>
+              <p>{setupIssue ?? "Microsoft sign-in, consent or a Purview role is required."}</p>
             </div>
+            <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
+            <button type="button" className="secondary" disabled={Boolean(busy) || capability.loading || capability.pending}
+              onClick={() => void perform("permissions", async () => { await capability.reload(); })}>Check permissions</button>
           </section>
         ) : null}
 
@@ -960,18 +871,13 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
           <button
             type="submit"
             disabled={
-              !available || !catalog || historyLoading || !filters || Boolean(rangeError) || Boolean(busy)
+              !contextCurrent || !available || !catalog || historyLoading || !filters || Boolean(rangeError) || Boolean(busy)
               || Boolean(operationError)
             }
           >
             <Search aria-hidden="true" /> Run Audit Search
           </button>
           </WorkbenchActionGate>
-          <span>
-            {available
-              ? applicationMode ? "Shared application qualification is current." : "Delegated authorization is ready for an explicit bounded search."
-              : applicationMode ? "Search remains disabled until shared application setup and qualification succeed." : "Search remains disabled until a permission check establishes delegated authorization."}
-          </span>
         </div>
       </form>
 
@@ -982,9 +888,6 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
         <header>
           <div>
             <h3 id="purview-history-title">Search history</h3>
-            <p>
-              Saved searches for this user. Delegated results are private; application results use the configured shared scope.
-            </p>
           </div>
           <span>{historyCount === undefined ? "Unknown" : historyCount.toLocaleString()} jobs</span>
         </header>
@@ -999,7 +902,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
           </div>
         ) : (
           <HistoryTable
-            busy={Boolean(busy) || historyLoading}
+            busy={Boolean(busy) || historyLoading || !contextCurrent}
             jobs={jobs}
             principalId={capability.user?.homeAccountId}
             selectedId={selected?.id}
@@ -1038,7 +941,7 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
           job={selected}
           records={records?.job.id === selected.id && readableStatuses.has(selected.status) ? records : undefined}
           recordOffset={recordOffset}
-          busy={Boolean(busy) || historyLoading}
+          busy={Boolean(busy) || historyLoading || !contextCurrent}
           loading={busy === `view:${selected.id}`}
           onPageChange={(offset) => void handleView(selected, offset)}
         />
@@ -1047,42 +950,16 @@ function PurviewAuditSession({ userPrincipalName, active, scopeKey }: { userPrin
   );
 }
 
-function StructuredFilter({
-  label,
-  onChange,
-  placeholder,
-  value,
-  readOnly = false,
-}: {
-  label: string;
-  onChange?: (value: string) => void;
-  placeholder: string;
-  value: string;
-  readOnly?: boolean;
-}) {
-  return (
-    <label>
-      <span>{label}</span>
-      <textarea
-        rows={2}
-        value={value}
-        readOnly={readOnly}
-        onChange={onChange ? (event) => onChange(event.target.value) : undefined}
-        placeholder={placeholder}
-      />
-    </label>
-  );
-}
-
-function assertUserJobs(jobs: PurviewAuditJob[], userPrincipalName: string) {
-  if (jobs.some(job => job.filters.userPrincipalNames.length !== 1
-    || job.filters.userPrincipalNames[0].toLowerCase() !== userPrincipalName.toLowerCase())) {
-    throw new Error("Audit Search history did not match the selected user. Close and reopen this user's audit search.");
+function assertUserJobs(jobs: PurviewAuditJob[], userPrincipalName?: string, agentRecordId?: string) {
+  if (jobs.some(job => userPrincipalName && (job.filters.userPrincipalNames.length !== 1
+    || job.filters.userPrincipalNames[0].toLowerCase() !== userPrincipalName.toLowerCase())
+    || agentRecordId && job.filters.agent?.recordId !== agentRecordId)) {
+    throw new Error("Audit Search history did not match the selected user or agent. Reopen the investigation.");
   }
 }
 
-function assertExactJob(job: PurviewAuditJob, id: string, userPrincipalName: string) {
-  assertUserJobs([job], userPrincipalName);
+function assertExactJob(job: PurviewAuditJob, id: string, userPrincipalName?: string, agentRecordId?: string) {
+  assertUserJobs([job], userPrincipalName, agentRecordId);
   if (job.id !== id) throw new Error("Audit Search returned a different job. Refresh the search history.");
 }
 
@@ -1117,12 +994,10 @@ function HistoryTable({
         <thead>
           <tr>
             <th scope="col">Requested range</th>
-            <th scope="col">Filters</th>
-            <th scope="col">Actor / scope</th>
-            <th scope="col">Provider status</th>
+            <th scope="col">Log type</th>
+            <th scope="col">Status</th>
             <th scope="col">Coverage</th>
             <th scope="col">Rows</th>
-            <th scope="col">Local expiry</th>
             <th scope="col">Actions</th>
           </tr>
         </thead>
@@ -1138,24 +1013,11 @@ function HistoryTable({
               </td>
               <td>
                 <strong>{presetLabel(job.filters.presetId)}</strong>
-                <small>
-                  {job.filters.operations.length.toLocaleString()} selected operation{job.filters.operations.length === 1 ? "" : "s"}
-                </small>
-                <small>{identityFilterCount(job.filters)}</small>
-              </td>
-              <td>
-                {job.authorizationPrincipalId}
-                <small>
-                  {job.tokenMode} / {job.resultScope.kind} / {shortId(job.resultScope.scopeId)}
-                </small>
               </td>
               <td>
                 <span className={`status ${statusClass(job.status)}`}>
                   {statusLabel(job.status)}
                 </span>
-                <small>
-                  {job.providerStatus ?? "Provider status not supplied"}
-                </small>
                 {job.message ? <small>{job.errorCode ? `${job.errorCode}: ` : ""}{job.message}</small> : null}
                 {job.canResume && job.authorizationPrincipalId !== principalId
                   ? <small>Resume requires the original authorizing account.</small> : null}
@@ -1172,9 +1034,7 @@ function HistoryTable({
               </td>
               <td>
                 {job.storedRowCount.toLocaleString()}
-                <small>{job.pageCount} / 20 pages</small>
               </td>
-              <td>{formatDateTime(job.expiresAt)}</td>
               <td>
                 <div className="purview-row-actions">
                   {readableStatuses.has(job.status) ? (
@@ -1292,10 +1152,6 @@ function SearchDetail({
       <header>
         <div>
           <h3 id="purview-results-title">Minimized results</h3>
-          <p>
-            Provider query <code>{job.providerQueryId ?? "not assigned"}</code>
-            {" / "}local job <code>{job.id}</code>
-          </p>
         </div>
         <span>
           {records
@@ -1305,26 +1161,6 @@ function SearchDetail({
       </header>
 
       <div className="purview-result-facts">
-        <ResultFact
-          label="Authorizing actor"
-          value={job.authorizationPrincipalId}
-        />
-        <ResultFact
-          label="Result scope"
-          value={`${job.resultScope.kind}: ${job.resultScope.scopeId}${job.resultScope.configurationRevision === null ? "" : ` (configuration ${job.resultScope.configurationRevision})`}`}
-        />
-        <ResultFact
-          label="Selected operations"
-          value={job.filters.operations.join(", ")}
-        />
-        <ResultFact
-          label="Structured filters"
-          value={identityFilterSummary(job.filters)}
-        />
-        <ResultFact
-          label="Provider status"
-          value={job.providerStatus ?? "Not supplied"}
-        />
         <ResultFact
           label="Observed range"
           value={
@@ -1336,17 +1172,6 @@ function SearchDetail({
         <ResultFact
           label="Page completeness"
           value={job.pageComplete ? "Complete" : "Incomplete"}
-        />
-        <ResultFact
-          label="Unknown fields omitted"
-          value={job.unknownFieldCount.toLocaleString()}
-        />
-        <ResultFact label="Provider / local request" value={`${job.providerRequestId ?? "Not supplied"} / ${job.localRequestId}`} />
-        <ResultFact label="Request / activation budget" value={`${job.providerRequestCount} / 64 requests; ${job.activationCount} / 12 activations`} />
-        <ResultFact label="Projection" value={`Version ${job.projectionVersion}`} />
-        <ResultFact
-          label="Saved / local expiry"
-          value={`${formatDateTime(job.updatedAt)} / ${formatDateTime(job.expiresAt)}`}
         />
       </div>
 
@@ -1504,25 +1329,6 @@ function ResultFact({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
-}
-
-function identityFilterCount(filters: PurviewAuditFilters) {
-  const count = filters.userPrincipalNames.length + filters.ipAddresses.length
-    + filters.objectIds.length + filters.administrativeUnitIds.length;
-  return `${count.toLocaleString()} structured identity filter${count === 1 ? "" : "s"}`;
-}
-
-function identityFilterSummary(filters: PurviewAuditFilters) {
-  const values = [
-    ["Users", filters.userPrincipalNames],
-    ["IPs", filters.ipAddresses],
-    ["Objects", filters.objectIds],
-    ["Administrative units", filters.administrativeUnitIds],
-  ] as const;
-  const selected = values
-    .filter(([, entries]) => entries.length)
-    .map(([label, entries]) => `${label}: ${entries.join(", ")}`);
-  return selected.length ? selected.join("; ") : "No structured identity filters";
 }
 
 function makeFilters(input: {

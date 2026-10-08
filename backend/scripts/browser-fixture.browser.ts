@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { type Server } from "node:http";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -29,6 +30,8 @@ import { inventoryRuntime } from "../src/services/inventoryRuntime.js";
 import { dataSync } from "../src/services/dataSync.js";
 import { packageInventory } from "../src/services/packageInventory.js";
 import { powerPlatformInventory } from "../src/services/powerPlatformInventory.js";
+import { savedReadBrowserFixture } from "./savedReadBrowserFixture.js";
+import { DataSyncRepository } from "../src/db/dataSync.js";
 
 await vi.hoisted(async () => {
   const { configureBrowserFixtureEnvironment } = await import("./fixtureSupport.js");
@@ -75,6 +78,7 @@ let fixture: Awaited<ReturnType<typeof testDatabase>>;
 const selectedBrowserFiles = browserFixtureTestFiles();
 let application: ReturnType<typeof createApp>;
 let server: Server;
+let savedLifecycle: Awaited<ReturnType<typeof savedReadBrowserFixture>> | undefined;
 const statuses: CapabilityStatus[] = ["available", "missing_permission", "missing_internal_role", "missing_role", "missing_license", "not_configured", "unsupported", "preview_disabled", "provider_error", "unknown"];
 const quarantineEnvironmentId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const qualifiedQuarantineBotId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -103,7 +107,7 @@ beforeAll(async () => {
   vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
     await invalidatePrincipal(user);
     const scenario = user.homeAccountId.replace(/^fixture-/, "");
-    if (![...statuses, "stale", "role-Viewer", "role-Admin"].includes(scenario)) return;
+    if (![...statuses, "stale", "role-Viewer", "role-Admin"].includes(scenario) && !scenario.startsWith("lifecycle-")) return;
     for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "provider_read")) {
       const configuration = await repository.configuration(config.tenants[0].tenantId!, definition.id);
       await repository.recordEvidence({ tenantId: config.tenants[0].tenantId!, principalId: definition.mode === "application" ? config.tenants[0].clientId! : user.homeAccountId,
@@ -160,7 +164,18 @@ beforeAll(async () => {
   });
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
   reportRuntime(fixture.runtime).start();
-  inventoryRuntime().start();
+  if (selectedBrowserFiles.includes("savedBackendLifecycle.spec.ts")) {
+    savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator, config.tenants[0].tenantId!);
+    process.env.AGENT_CONTROL_LIFECYCLE_CONTROL = savedLifecycle.origin;
+    const automaticRefresh = dataSync.automaticRefresh.bind(dataSync);
+    vi.spyOn(dataSync, "automaticRefresh").mockImplementation(async (user, signedInAt) => {
+      if (!user.homeAccountId.startsWith("fixture-lifecycle-")) return automaticRefresh(user, signedInAt);
+      return { run: null, detailJob: null, nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+        revisions: await new DataSyncRepository(fixture.runtime).automaticRevisions({
+          tenantId: user.tenantId!, principalId: user.homeAccountId,
+        }) };
+    });
+  } else inventoryRuntime().start();
   const origin = new URL(process.env.FRONTEND_ORIGIN!);
   await new Promise<void>((done, reject) => {
     server = application.app.listen(Number(origin.port || 80), origin.hostname, error => error ? reject(error) : done());
@@ -168,8 +183,16 @@ beforeAll(async () => {
   });
   console.log(JSON.stringify({ event: "isolated_browser_fixture", origin: origin.origin, database: fixture.name, liveProviders: false }));
   expect((await fetch(new URL("/api/ready", origin))).ok).toBe(true);
+  const html = await (await fetch(origin)).text();
+  const entry = html.match(/src="(\/assets\/index-[^"]+\.js)"/)?.[1];
+  expect(entry).toBeDefined();
+  const served = Buffer.from(await (await fetch(new URL(entry!, origin))).arrayBuffer());
+  expect(served).toEqual(await readFile(resolve("../frontend/dist", entry!.slice(1))));
+  console.log(JSON.stringify({ event: "fixture_compiled_frontend_verified", entry, bytes: served.length,
+    sha256: createHash("sha256").update(served).digest("hex") }));
 });
 afterAll(() => closeFixtureResources(
+  () => savedLifecycle?.close(),
   () => dataSync.drain(),
   () => packageInventory.drain(),
   () => powerPlatformInventory.drain(),

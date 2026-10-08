@@ -64,7 +64,7 @@ function New-Container([string]$Service) {
     }
     $ports = if ($Service -eq 'app') { @{'3001/tcp'=@(@{HostIp='127.0.0.1';HostPort='43127'})} } else { @{} }
     return (@{
-        Id=('a'*64);Name="/$($context.Project)-$Service-1"
+        Id=('a'*64);Image=('sha256:'+'b'*64);Name="/$($context.Project)-$Service-1"
         Config=@{Labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.service'=$Service
             'com.docker.compose.project.working_dir'=$root;'com.docker.compose.project.config_files'="$root/compose.yaml,$($context.FixtureCompose)"
             'io.agent-control.fixture'=$context.Project;'io.agent-control.source-sha256'=$context.SourceHash}}
@@ -93,6 +93,24 @@ foreach ($service in @('app','postgres')) {
         Assert-Refused { Assert-FreshInstallationContainer $context $bad }
     }
 }
+$verifiedPostgres = New-Container 'postgres'
+$context.VerifiedPostgres = $verifiedPostgres
+$context.AppliedComposeFiles = @("$root/artifacts/local-builds/current/source/compose.yaml")
+Assert-FreshInstallationContainer $context $verifiedPostgres
+$script:checks++
+foreach ($mutation in @(
+    {param($c) $c.Id=('c'*64)},
+    {param($c) $c.Image=('sha256:'+'d'*64)},
+    {param($c) $c.Config.Labels.'com.docker.compose.project.config_files'='foreign.yaml'}
+)) {
+    $bad = New-Container 'postgres'
+    & $mutation $bad
+    Assert-Refused { Assert-FreshInstallationContainer $context $bad }
+}
+Assert-Refused { Assert-FreshInstallationContainer $context (New-Container 'app') }
+$context.Remove('VerifiedPostgres')
+Assert-Refused { Assert-FreshInstallationContainer $context $verifiedPostgres }
+$context.Remove('AppliedComposeFiles')
 foreach ($binding in @(@{HostIp='0.0.0.0';HostPort='43127'},@{HostIp='127.0.0.1';HostPort='3002'})) {
     $bad = New-Container app; $bad.HostConfig.PortBindings.'3001/tcp'=@($binding)
     Assert-Refused { Assert-FreshInstallationContainer $context $bad }
@@ -104,7 +122,19 @@ Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'fresh-installation.ps1'))
 Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy')) 'Fresh runner no longer uses the real Deploy boundary.'
 Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks')) 'Fresh installation proof must explicitly execute full qualification.'
-Assert-True (-not $source.Contains('-DbReset') -and -not $source.Contains('-Action Start') -and -not $source.Contains('DROP DATABASE')) 'Fresh runner bypasses initialization safeguards.'
+Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset') -and
+    -not $source.Contains('-Action Start') -and -not $source.Contains('DROP DATABASE')) 'Reset qualification must use the real guarded deployment boundary.'
+Assert-True ($source.Contains("Invoke-FreshFirstSync `$context `$Directory 'collected'") -and
+    $source.Contains("Invoke-FreshFirstSync `$context `$Directory 'recollected'")) 'First collection must run before and after explicit reset.'
+$persistence = $source.IndexOf('Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter')
+$collection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'collected'")
+$reset = $source.IndexOf('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset')
+$recollection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'recollected'")
+Assert-True ($persistence -ge 0 -and $persistence -lt $collection -and $collection -lt $reset -and $reset -lt $recollection) 'Exact empty-schema fingerprints must precede collection; populated data must then be reset and recollected.'
+Assert-True ($source.Contains('$peak -gt $container.HostConfig.Memory') -and
+    $source.Contains('(max|oom|oom_kill) [1-9]')) 'Compiled runtime resource pressure must not be accepted as headroom.'
+Assert-True ($source.Contains('$limit -ne $container.HostConfig.Memory') -and
+    $source.Contains('$cpu -cne $expectedCpu') -and $source.Contains('memory.events cpu.max cpu.stat')) 'Actual cgroup memory and CPU caps must match supported configuration and be recorded.'
 Assert-True (-not $source.Contains("@('up'") -and $source.Contains('Wait-FreshInstallationHealth $context $Directory')) 'Fresh runner must poll health after restart, not directly create/start runtime services.'
 Assert-Refused { Get-IsolatedLocalHttp 'seha-app-1' '/api/ready' }
 Assert-Refused { Get-IsolatedLocalHttp "$($context.Project)-app-1" '/api/auth/callback' }
@@ -142,8 +172,25 @@ $qualificationStage = ($dockerfile -split 'FROM operator AS qualification')[1] -
 Assert-True ($qualificationStage.Contains('COPY --from=test /app /app') -and $qualificationStage.Contains('COPY --from=build /app/backend/dist') -and $qualificationStage.Contains('COPY --from=build /app/frontend/dist')) 'Qualification must reuse production compilation and retain all test inputs.'
 $buildStage = ($dockerfile -split 'FROM application-base AS build')[1] -split 'FROM dependencies AS test' | Select-Object -First 1
 Assert-True ($buildStage.Contains('COPY --from=application-source /app/backend/src') -and $buildStage.Contains('COPY --from=application-source /app/frontend/src') -and -not $buildStage.Contains('COPY scripts')) 'Production compilation must consume filtered sources rather than broad test inputs.'
+Assert-True ($buildStage.Contains('COPY frontend/tsconfig.build.json frontend/tsconfig.json')) 'Vite must resolve the production tsconfig rather than inherited references to excluded browser tests.'
 $operatorStage = ($dockerfile -split 'FROM postgres:17-bookworm AS operator')[1] -split 'FROM operator AS qualification' | Select-Object -First 1
 Assert-True ($operatorStage.Contains('COPY --from=application-source /app/backend/src') -and -not $operatorStage.Contains('COPY --from=test') -and -not $operatorStage.Contains('COPY backend/scripts backend/scripts')) 'Test-only changes must not change the database operator contract.'
+$runtimeFixture = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'large-tenant-lifecycle.ps1'))
+Assert-True ($runtimeFixture.Contains('$images.qualification.tag') -and
+    $runtimeFixture.Contains("@('qualification','runtime')")) 'Restart seed must use the qualification image; production operator excludes test scripts and runtime does not need Chromium.'
+$script:fingerprintMount = @{Type='bind';RW=$false;Destination='/app/backend/scripts/officialReportFingerprint.ts'
+    Source=(Join-Path $root 'backend/scripts/officialReportFingerprint.ts')}
+function Invoke-DockerCommand([string[]]$Arguments,[switch]$Capture) {
+    return ConvertTo-Json -InputObject @($script:fingerprintMount)
+}
+$mountProject = 'agent-control-ltdp-0123456789abcdef0123456789abcdef'
+$mountDirectory = Join-Path $root 'artifacts/large-tenant-data-platform/0123456789abcdef0123456789abcdef'
+Assert-True (@(Get-OwnedFixtureMounts $mountProject 'synthetic' 'test-db' $mountDirectory).Count -eq 1) 'Exact read-only fingerprint helper mount must be allowed.'
+$script:fingerprintMount.RW = $true
+Assert-Refused { Get-OwnedFixtureMounts $mountProject 'synthetic' 'test-db' $mountDirectory }
+$script:fingerprintMount.RW = $false
+$script:fingerprintMount.Source = Join-Path $root 'other.ts'
+Assert-Refused { Get-OwnedFixtureMounts $mountProject 'synthetic' 'test-db' $mountDirectory }
 $savedDependencyImage = [Environment]::GetEnvironmentVariable('AGENT_CONTROL_DEPENDENCY_IMAGE')
 try {
     $env:AGENT_CONTROL_DEPENDENCY_IMAGE = 'fixture-dependencies:local'

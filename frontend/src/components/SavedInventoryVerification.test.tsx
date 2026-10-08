@@ -150,6 +150,7 @@ describe("SavedAgentInventoryVerification read lifecycle", () => {
     { state: "failed", props: { error: "The saved selection expired." }, message: "The saved selection expired." },
     { state: "not collected", props: { unavailable: { state: "not_collected", message: "No saved inventory yet." } }, message: "No saved inventory yet." },
     { state: "preparing", props: { unavailable: { state: "preparing", message: "Preparing saved inventory." } }, message: "Preparing saved inventory." },
+    { state: "unavailable", props: { unavailable: { state: "unavailable", message: "Saved inventory was retired." } }, message: "Saved inventory was retired." },
     { state: "withdrawn", props: { inventory: undefined }, message: "Saved inventory verification is not available." },
   ] satisfies Array<{
     state: string;

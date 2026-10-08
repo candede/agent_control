@@ -1,6 +1,11 @@
 #requires -Version 7.0
-param([Parameter(Mandatory)][string]$Suite, [string]$BrowserFiles = 'reportSets.spec.ts')
+param([Parameter(Mandatory)][string]$Suite, [string]$BrowserFiles = 'reportSets.spec.ts',
+    [string]$BaselineImage = 'agent-control-scale-5096-operator:local',
+    [string]$BaselineImageId = 'sha256:78f3cb9fa91e7a64960699899d8fe2eb56bdd77c8ee56490f1f5255855b3c235')
 $ErrorActionPreference = 'Stop'
+if ($BaselineImage -cnotmatch '^[a-z0-9][a-z0-9./:_-]{0,200}$' -or $BaselineImageId -cnotmatch '^sha256:[a-f0-9]{64}$') {
+    throw 'Fixture baseline requires an explicit local image and exact SHA-256 identity.'
+}
 $profile = $Suite -eq 'cutover-report-profile'
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
 $root = Split-Path $PSScriptRoot -Parent
@@ -15,6 +20,8 @@ if ($Suite -in @('capacity','capacity-query','capacity-probe')) {
 }
 $implemented = @('inventory-registry','inventory-native-source','inventory-control-integration','inventory-refresh-services','inventory-exports','inventory-metadata','inventory-lifecycle','inventory-details','cutover-native-views','cutover-overview-contract','cutover-history-contract','cutover-native-authority','cutover-user-protocol','cutover-http-lifecycle','cutover-automatic-contract','cutover-agent-usage','cutover-runtime-contract','cutover-ui-contract','cutover-source-activation','cutover-types','cutover-app-contract','cutover-people-fences','cutover-browser-contract','cutover-browser-ui-contract','cutover-capability-admission','cutover-retention-contract','users-reports-cutover','data-page-contract','official-reports-foundation','user-sources-foundation','selected-reads','foundation','all','gate-failure','software-gate','export-readonly')
 $implemented += @('production-publication','production-gate-repairs','fresh-installation','production-counts','production-gate-cost','production-prerequisites','capacity-focused','capacity-core','capacity-retention','capacity-schema','capacity-cost','capacity-software','lifecycle-acceptance-related','lifecycle-acceptance','lifecycle-race','restore-inventory','restore','lifecycle','lifecycle-core','lifecycle-repair','browser','restart')
+$implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
+$implemented += @('production-frontend')
 if ($Suite -notin ($implemented + @('inventory-acceptance-repair','inventory-acceptance-recovery','inventory-controller-contract','report-source-scale','backend-shard-1','backend-shard-2','inventory-app-exports','inventory-http-contract','inventory-route-contract','inventory-integration','inventory-expiry','inventory-parity','inventory-verification','inventory-identity-proof','inventory-cleanup','inventory-identity','inventory-facets','inventory','inventory-cutover','inventory-usage-authority','inventory-native-evidence','inventory-staging','inventory-jobs','inventory-route','inventory-protocol','inventory-core','inventory-reconciliation','inventory-native-ui','inventory-groups','inventory-foundation')) -and -not $profile -and $Suite -ne 'cutover-compiled-restart') { throw "Suite '$Suite' is not yet implemented; no qualification claimed." }
 if ($Suite -in @('cutover-browser-contract','browser')) {
     if ($Suite -eq 'browser' -and -not $PSBoundParameters.ContainsKey('BrowserFiles')) { $BrowserFiles = 'largeTenantData.spec.ts' }
@@ -34,9 +41,9 @@ $project = "agent-control-ltdp-$id"
 $directory = Join-Path $root "artifacts/large-tenant-data-platform/$id"
 [IO.Directory]::CreateDirectory($directory) | Out-Null
 $image = "$project-operator:local"
-$baseline = 'agent-control-scale-5096-operator:local'
+$baseline = $BaselineImage
 $baselineId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$baseline) -Capture
-if ($baselineId -cne 'sha256:78f3cb9fa91e7a64960699899d8fe2eb56bdd77c8ee56490f1f5255855b3c235') { throw 'Campaign baseline image identity changed.' }
+if ($baselineId -cne $BaselineImageId) { throw 'Campaign baseline image identity changed.' }
 [IO.File]::WriteAllText((Join-Path $directory 'baseline.txt'),$baselineId)
 $hashes = (Invoke-DockerCommand @('run','--rm','--network','none','--entrypoint','node',$baseline,'-e',
     'const fs=require("node:fs"),crypto=require("node:crypto");console.log(JSON.stringify(Object.fromEntries(["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(f=>[f,crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")]))))') -Capture) | ConvertFrom-Json -AsHashtable
@@ -68,7 +75,7 @@ if ($Suite -eq 'cutover-browser-contract') {
     [IO.File]::WriteAllText((Join-Path $directory 'browser-baseline.txt'),$browserId)
     $base = "FROM $baseline AS installed`nFROM $browser`nRUN rm -rf /app /browser`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`n"
 }
-[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY plans /app/plans`nCOPY compose.yaml compose.large-tenant-test.yaml /app/`n")
+[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY compose.yaml compose.large-tenant-test.yaml /app/`n")
 if ($Suite -eq 'software-gate') { [IO.File]::AppendAllText($dockerfile,"RUN npm run build`n") }
 if ($Suite -eq 'gate-failure') {
     [IO.File]::AppendAllText($dockerfile, "RUN printf '%s\n' 'console.error(`"intentional owned gate failure`"); setTimeout(() => process.exit(17), 1200);' > /app/backend/scripts/test-all.ts`n")
@@ -128,7 +135,7 @@ if ($Suite -eq 'all') {
     $auxiliary = @()
     foreach ($childSuite in @('lifecycle','restore','restart','browser','capacity')) {
         $childLog = Join-Path $directory "$childSuite.log"
-        $childArguments = @('-NoProfile','-File',$PSCommandPath,'-Suite',$childSuite)
+        $childArguments = @('-NoProfile','-File',$PSCommandPath,'-Suite',$childSuite,'-BaselineImage',$BaselineImage,'-BaselineImageId',$BaselineImageId)
         if ($childSuite -eq 'browser') { $childArguments += @('-BrowserFiles','all') }
         $startedAt = [DateTime]::UtcNow
         try {

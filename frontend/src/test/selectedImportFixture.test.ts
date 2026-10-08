@@ -59,6 +59,20 @@ async function fixture(options: SelectedImportOptions = { active: true }, csvFil
 }
 
 describe("selected import route contracts", () => {
+  it.each([false, true])("mirrors save-only wizard acceptance with an existing selection=%s", async active => {
+    const { request, stage, state } = await fixture({ active });
+    const before = state.selectedSetId(), bundleId = "33333333-3333-4333-8333-333333333333";
+    const body = { ...await stage(bundleId, files.map(file => ({ ...file, content: file.content.replaceAll("Alpha", "New Alpha") }))),
+      preserveSelection: true };
+    const saved = await request(`${root}/bundles/${bundleId}/accept`, "POST", body);
+    expect(saved.status).toBe(200);
+    expect(state.selectedSetId()).toBe(before);
+    expect(saved.json.activeRevision).toBe(body.expectedActiveRevision);
+    expect((await request(`${root}/aggregate?setId=${saved.json.setId}`)).json.value[0].agentName).toBe("New Alpha");
+    expect(await request(`${root}/bundles/${bundleId}/accept`, "POST", body)).toEqual(saved);
+    expect(state.selectedSetId()).toBe(before);
+  });
+
   it("returns a registered user selection and retains filters, metadata and summaries across pages", async () => {
     const { request, state } = await fixture();
     const first = await request(`${root}/users?search=be&limit=1`);

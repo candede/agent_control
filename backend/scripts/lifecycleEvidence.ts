@@ -43,7 +43,8 @@ export async function lifecycleEvidence(database: pg.Pool) {
 
 /** Advance only the collector's SQL clock; immutable uploaded timestamps and all database guards stay intact. */
 export async function withCollectorClock<T>(database: pg.Pool, days: number, work: () => Promise<T>) {
-  return withQueries(database, text => text.replaceAll("clock_timestamp()", `(clock_timestamp()+interval '${days} days')`), work);
+  return withQueries(database, text => text.includes("pg_get_functiondef(") ? text
+    : text.replaceAll("clock_timestamp()", `(clock_timestamp()+interval '${days} days')`), work);
 }
 
 export async function withQueries<T>(database: pg.Pool, transform: (text: string, values: unknown[]) => string | Promise<string>, work: () => Promise<T>) {

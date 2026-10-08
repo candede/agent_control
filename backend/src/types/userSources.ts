@@ -39,7 +39,7 @@ export type UserSourceFacts = {
   appActivity: CopilotAppActivity | null;
   activityState: NonNullable<UserSourceFilter["activity"]>;
 };
-export type UserSourceSelection = { id: string; revision: string; expiresAt: string; evaluatedAt: string };
+export type UserSourceSelection = import("./dataSelection.js").SelectedRead;
 export type UserSourcePage<T> = {
   value: T[];
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };

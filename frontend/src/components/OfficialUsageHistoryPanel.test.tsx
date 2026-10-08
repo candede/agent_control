@@ -2,10 +2,11 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
-import type { ReportHistorySet, ReportObservation, ReportPage } from "../../../backend/src/types/officialReportData";
+import type { ReportHistorySet, ReportPage } from "../../../backend/src/types/officialReportData";
 import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { historySet, reportPage, selectionId } from "../test/reportDataFixture";
+import { selectedHistoryPage } from "../test/selectedUsageFixture";
 import { deferred } from "../test/deferred";
 
 type HistoryPage = ReportPage<ReportHistorySet>;
@@ -16,11 +17,13 @@ vi.mock("../api/reportData", async importOriginal => ({
 }));
 
 function history(start = 0, count = 2): HistoryPage {
-  return reportPage(Array.from({ length: Math.max(0, Math.min(50, count - start)) }, (_, index) =>
+  const page = reportPage(Array.from({ length: Math.max(0, Math.min(50, count - start)) }, (_, index) =>
     historySet(index + start + 1, { periodProvenance: "activity_range" })), {
     counts: { total: count, filtered: count }, page: { limit: 50,
       nextCursor: start + 50 < count ? `page-${start + 50}` : null, previousCursor: start ? `page-${Math.max(0, start - 50)}` : null },
   });
+  page.analytics.history = selectedHistoryPage(page.value).analytics.history;
+  return page;
 }
 
 beforeEach(() => {
@@ -59,10 +62,23 @@ describe("saved report history", () => {
     expect(screen.getByText("Current")).toBeVisible();
     expect(screen.getByText("Saved", { exact: true })).toBeVisible();
     expect(screen.getAllByRole("button", { name: "View report" })).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: /Refresh|View current|Make current/ })).not.toBeInTheDocument();
-    expect(screen.queryByText(/hash|Retention|Unique payloads|Aggregate snapshots/)).not.toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Report observations" })).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: /Refresh|View current|Make current|Load current report history|Report observations/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/hash|Retention|Unique payloads|Aggregate snapshots|pinned history|History coverage/)).not.toBeInTheDocument();
+    expect(screen.queryByText(historySet(1).id)).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
     expect(document.querySelector("details")).toBeNull();
+  });
+
+  it("shows only the compact empty state even when the server includes history analytics", async () => {
+    api.history.mockResolvedValue(history(0, 0));
+    render(<OfficialUsageHistoryPanel revision={0} />);
+    await screen.findByRole("heading", { name: "No reports yet" });
+    expect(screen.getByText("Add the three Microsoft 365 CSV exports to see agent usage.")).toBeVisible();
+    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 saved|matching report|pinned history|History coverage/)).not.toBeInTheDocument();
+    expect(document.querySelector("details")).toBeNull();
+    expect(api.history).toHaveBeenCalledOnce();
   });
 
   it("deduplicates concurrent reads with the shared saved-query client", async () => {
@@ -92,38 +108,25 @@ describe("saved report history", () => {
     expect(api.history).toHaveBeenCalledTimes(2);
   });
 
-  it.each([false, true])("withdraws idle peer history when observations invalidate an already-retired=%s capture", async retired => {
-    const observations = deferred<ReportPage<ReportObservation>>();
-    api.history.mockImplementation(async path => path.endsWith("/observations") ? observations.promise : history());
+  it("withdraws shared history when revalidation rejects its selection", async () => {
+    const revalidation = deferred<HistoryPage>();
     render(<SavedQueryProvider>
-      <section aria-label="Observing reader"><OfficialUsageHistoryPanel revision={0} /></section>
+      <section aria-label="Current reader"><OfficialUsageHistoryPanel revision={0} /></section>
       <section aria-label="Pinned reader"><OfficialUsageHistoryPanel revision={0} /></section>
-      <section aria-label="Restarting reader"><OfficialUsageHistoryPanel revision={0} /></section>
     </SavedQueryProvider>);
-    expect(await screen.findAllByRole("table")).toHaveLength(3);
-    const observing = within(screen.getByRole("region", { name: "Observing reader" }));
+    expect(await screen.findAllByRole("table")).toHaveLength(2);
+    const current = within(screen.getByRole("region", { name: "Current reader" }));
     const pinned = within(screen.getByRole("region", { name: "Pinned reader" }));
-    const restarting = within(screen.getByRole("region", { name: "Restarting reader" }));
-    fireEvent.click(observing.getAllByRole("button", { name: "Report observations" })[0]);
+    api.history.mockReturnValueOnce(revalidation.promise);
+    fireEvent.focus(window);
     await waitFor(() => expect(api.history).toHaveBeenCalledTimes(2));
-    if (retired) {
-      const replacement = history();
-      replacement.selection = { ...replacement.selection, id: "replacement-selection" };
-      api.history.mockResolvedValueOnce(replacement);
-      fireEvent.click(restarting.getByRole("button", { name: "Load current report history" }));
-      await restarting.findByRole("table");
-    }
-    await act(async () => observations.reject(new ApiError(409, "selection_invalidated", "History changed.")));
-    await observing.findByRole("alert");
+    await act(async () => revalidation.reject(new ApiError(409, "selection_invalidated", "History changed.")));
+    await current.findByRole("alert");
     await waitFor(() => expect(pinned.queryByRole("table")).not.toBeInTheDocument());
     expect(pinned.getByRole("button", { name: "Restart selection" })).toBeEnabled();
     expect(pinned.queryByRole("button", { name: "View report" })).not.toBeInTheDocument();
-    expect(observing.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
-    if (retired) {
-      expect(restarting.getByRole("table")).toBeVisible();
-      expect(restarting.queryByRole("alert")).not.toBeInTheDocument();
-    } else expect(restarting.queryByRole("table")).not.toBeInTheDocument();
-    expect(api.history).toHaveBeenCalledTimes(retired ? 3 : 2);
+    expect(current.queryByRole("table")).not.toBeInTheDocument();
+    expect(api.history).toHaveBeenCalledTimes(2);
   });
 
   it("cancels abandoned StrictMode reads without applying their late results", async () => {
@@ -179,7 +182,7 @@ describe("saved report history", () => {
     expect(screen.getAllByText("Observed activity")).toHaveLength(2);
     expect(screen.getByText("Reporting period")).toBeVisible();
     expect(screen.getByText("No activity dates")).toBeVisible();
-    expect(screen.getByText(/Activity dates do not imply continuous coverage/)).toBeVisible();
+    expect(screen.queryByText(/Activity dates do not imply continuous coverage/)).not.toBeInTheDocument();
     const dates = screen.getByRole("table").querySelectorAll("time");
     expect(dates).toHaveLength(4);
     expect(dates[0]).toHaveAttribute("datetime", data.value[0].reportingStart);
@@ -204,7 +207,7 @@ describe("saved report history", () => {
     const view = render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} admin={admin} />);
     await screen.findByRole("table");
     view.rerender(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} admin={{ ...admin, busy: true }} />);
-    for (const button of screen.getAllByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })) expect(button).toBeDisabled();
+    for (const button of screen.getAllByRole("button", { name: /View report|Delete report set/ })) expect(button).toBeDisabled();
     for (const button of within(screen.getByRole("navigation", { name: "report sets pages" })).getAllByRole("button")) {
       expect(button).toHaveAttribute("aria-disabled", "true");
       await userEvent.click(button);
@@ -214,11 +217,11 @@ describe("saved report history", () => {
     api.history.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     view.rerender(<OfficialUsageHistoryPanel revision={1} onSelect={vi.fn()} admin={admin} />);
     expect(screen.getByText("Loading saved data...")).toHaveAttribute("role", "status");
-    expect(screen.queryByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })).not.toBeInTheDocument();
-    for (const button of screen.getAllByRole("button")) expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("button", { name: /View report|Delete report set/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
     await act(async () => finish(history()));
     await waitFor(() => {
-      for (const button of screen.getAllByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })) expect(button).toBeEnabled();
+      for (const button of screen.getAllByRole("button", { name: /View report|Delete report set/ })) expect(button).toBeEnabled();
     });
   });
 

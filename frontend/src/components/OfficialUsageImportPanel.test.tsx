@@ -23,7 +23,7 @@ vi.mock("../api/reportData", async original => {
 mockNativeDialogs();
 const kinds = ["agents", "userAgents", "users"] as const;
 const bundleId = "60000000-0000-4000-8000-000000000001";
-const callbacks = { onChanged: vi.fn(), onDone: vi.fn(), onCancel: vi.fn(), onStaged: vi.fn() };
+const callbacks = { onChanged: vi.fn(), onDone: vi.fn(), onAddMore: vi.fn(), onCancel: vi.fn(), onStaged: vi.fn() };
 let stages: OfficialReportPreview[];
 let activeRevision: string;
 function file(name: string, body = "synthetic streamed CSV") { return new File([body], name, { type: "text/csv" }); }
@@ -70,7 +70,7 @@ beforeEach(() => {
     }
     let result = acceptedBundles.get(id);
     if (!result) {
-      if (current.some(stage => stage.status !== "accepted")) activeRevision = String(BigInt(activeRevision) + 1n);
+      if (!input.preserveSelection && current.some(stage => stage.status !== "accepted")) activeRevision = String(BigInt(activeRevision) + 1n);
       result = { setId: reportSetId, activeRevision, complete: true };
       acceptedBundles.set(id, result);
       stages = stages.map(stage => stage.bundleId === id ? { ...stage, status: "accepted" } : stage);
@@ -94,6 +94,26 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("streamed complete-set import confirmation", () => {
+  it("uses the server-selected first report without a separate selection request", async () => {
+    activeRevision = "1";
+    vi.mocked(api.acceptReportBundle).mockImplementationOnce(async (_id, input) => {
+      expect(input).toMatchObject({ expectedActiveRevision: "1", preserveSelection: true });
+      activeRevision = "2";
+      return { setId: reportSetId, activeRevision, complete: true };
+    });
+    render(<OfficialUsageImportPanel {...callbacks} />);
+    await choose();
+    await accept();
+    await imported();
+    expect(api.reportPages.agents).toHaveBeenCalledExactlyOnceWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
+    expect(callbacks.onChanged).toHaveBeenCalledOnce();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(callbacks.onDone).toHaveBeenCalledOnce();
+    expect(callbacks.onChanged).toHaveBeenCalledOnce();
+  });
+
   it("starts empty without enumerating unrelated drafts, including Strict Mode replay", () => {
     stages = kinds.map(kind => reportStage(kind, bundleId));
     render(<OfficialUsageImportPanel {...callbacks} />, { reactStrictMode: true });
@@ -120,7 +140,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.readReportDiagnostics).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).not.toHaveBeenCalled();
   });
-  it("streams three companions with immutable intent, waits for explicit acceptance, verifies exact bounded data and finishes only on OK", async () => {
+  it("streams three companions, saves without selecting, verifies exact data and finishes only on Close", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose();
     const confirm = await ready();
@@ -137,15 +157,17 @@ describe("streamed complete-set import confirmation", () => {
     fireEvent.click(confirm);
     await imported();
     expect(api.acceptReportBundle).toHaveBeenCalledExactlyOnceWith(id,
-      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }, expect.any(AbortSignal));
-    expect(activeRevision).toBe("5");
+      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection: true }, expect.any(AbortSignal));
+    expect(activeRevision).toBe("4");
     expect(api.reportPages.agents).toHaveBeenCalledWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(callbacks.onDone).not.toHaveBeenCalled();
-    expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["OK"]);
-    fireEvent.click(screen.getByRole("button", { name: "OK" }));
-    await waitFor(() => expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith(reportSetId));
-    expect(api.reportPages.agents).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["Add more reports", "Close"]);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith();
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
   });
   it.each([0, 1000000, null])("uses exact full-CSV lineage counts and responses %s instead of the one-row preview or overlapping license categories", async responses => {
     const data = reportPage([reportAgent()]);
@@ -159,26 +181,16 @@ describe("streamed complete-set import confirmation", () => {
       responses === 0 ? "0" : "100,000", responses === 0 ? "0" : "70,000", responses === null ? "Unknown" : responses.toLocaleString(),
     ]);
   });
-  it("focuses the accepted summary and revalidates exact saved evidence before Escape acknowledges success", async () => {
+  it("focuses the accepted summary and closes on Escape without another read or selection", async () => {
     const handle = createRef<OfficialUsageImportHandle>();
     render(<OfficialUsageImportPanel {...callbacks} ref={handle} />);
     await choose(); await accept(); await imported();
     expect(screen.getByRole("heading", { name: "Reports imported" })).toHaveFocus();
-    const evidence = reportPage([reportAgent()]);
-    const held = deferred<typeof evidence>();
-    vi.mocked(api.reportPages.agents).mockReturnValueOnce(held.promise);
-    act(() => { handle.current?.dismiss(); });
-    expect(callbacks.onDone).not.toHaveBeenCalled();
+    act(() => { handle.current?.dismiss(); handle.current?.dismiss(); });
+    expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith();
     expect(callbacks.onCancel).not.toHaveBeenCalled();
-    expect(api.reportPages.agents).toHaveBeenLastCalledWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
-    const calls = vi.mocked(api.reportPages.agents).mock.calls.length;
-    expect(screen.getByRole("button", { name: "Close saved import" })).toBeDisabled();
-    act(() => { handle.current?.dismiss(); });
-    expect(callbacks.onDone).not.toHaveBeenCalled();
-    expect(callbacks.onCancel).not.toHaveBeenCalled();
-    expect(api.reportPages.agents).toHaveBeenCalledTimes(calls);
-    await act(async () => { held.resolve(evidence); });
-    await waitFor(() => expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith(reportSetId));
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
   });
   it("keeps validated companions and shows only missing report kinds without automatic publication", async () => {
@@ -266,32 +278,15 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.stageReport).toHaveBeenCalledTimes(3);
     expect(api.acceptReportBundle).not.toHaveBeenCalled();
   });
-  it("does not consume an imported-selection confirmation twice before rerender", async () => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    const confirm = await screen.findByRole("button", { name: "Confirm use of imported reports" });
-    const pending = deferred<Awaited<ReturnType<typeof api.confirmReportOperation>>>();
-    vi.mocked(api.confirmReportOperation).mockReturnValue(pending.promise);
-    act(() => { fireEvent.click(confirm); fireEvent.click(confirm); });
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(vi.mocked(api.confirmReportOperation).mock.calls[0][1]?.aborted).toBe(false);
-    await act(async () => pending.resolve({ activeSetId: reportSetId, activeRevision: "5" }));
-    await imported();
-    expect(callbacks.onChanged).toHaveBeenCalledTimes(2);
-  });
-  it("shares same-batch acknowledgement verification instead of restarting readback", async () => {
+  it.each(["Close", "Add more reports"] as const)("honors the first completion action %s before rerender", async action => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept(); await imported();
-    const pending = deferred<Awaited<ReturnType<typeof api.reportPages.agents>>>();
-    vi.mocked(api.reportPages.agents).mockReturnValue(pending.promise);
-    const button = screen.getByRole("button", { name: "OK" });
-    act(() => { fireEvent.click(button); fireEvent.click(button); });
-    expect(api.reportPages.agents).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(api.reportPages.agents).mock.calls[1][1]?.aborted).toBe(false);
-    await act(async () => pending.resolve(reportPage([reportAgent()])));
-    await waitFor(() => expect(callbacks.onDone).toHaveBeenCalledOnce());
+    const button = screen.getByRole("button", { name: action });
+    const other = screen.getByRole("button", { name: action === "Close" ? "Add more reports" : "Close" });
+    act(() => { fireEvent.click(button); fireEvent.click(button); fireEvent.click(other); });
+    expect(callbacks.onDone).toHaveBeenCalledTimes(action === "Close" ? 1 : 0);
+    expect(callbacks.onAddMore).toHaveBeenCalledTimes(action === "Add more reports" ? 1 : 0);
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
   });
   it.each([
@@ -392,8 +387,8 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onChanged).not.toHaveBeenCalled();
   });
   it.each([
-    ["duplicate", "Keep current report"], ["duplicate", "Escape"],
-    ["correction", "Keep current report"], ["correction", "Escape"],
+    ["duplicate", "Close"], ["duplicate", "Escape"],
+    ["correction", "Close"], ["correction", "Escape"],
   ] as const)("dismisses a conclusively saved non-active %s via %s without selecting or discarding it", async (mode, action) => {
     const correctionOfSetId = mode === "correction" ? "60000000-0000-4000-8000-000000000002" : undefined;
     const saved = reportPage([reportAgent()], { reports: { ...reports, activeSetId: "another-active-set" } });
@@ -409,7 +404,7 @@ describe("streamed complete-set import confirmation", () => {
     }
     render(<Host />);
     await choose(); await accept();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Use imported reports" })).toBeEnabled());
+    await imported();
     const acceptedStages = stages.map(stage => ({ ...stage }));
     expect(acceptedStages).toHaveLength(3);
     expect(acceptedStages.every(stage => stage.status === "accepted" && stage.correctionOfSetId === (correctionOfSetId ?? null))).toBe(true);
@@ -417,7 +412,7 @@ describe("streamed complete-set import confirmation", () => {
     else fireEvent.click(screen.getByRole("button", { name: action }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(callbacks.onCancel).toHaveBeenCalledOnce();
-    expect(callbacks.onDone).not.toHaveBeenCalled();
+    expect(callbacks.onDone).toHaveBeenCalledOnce();
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
     expect(api.reportPages.agents).toHaveBeenCalledExactlyOnceWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
@@ -427,6 +422,30 @@ describe("streamed complete-set import confirmation", () => {
     expect(stages).toEqual(acceptedStages);
     expect(saved.reports.activeSetId).toBe("another-active-set");
     expect(saved.reports.activeRevision).toBe(reports.activeRevision);
+  });
+  it("adds another report set in a fresh wizard without discarding saved reports or selecting either import", async () => {
+    function Host() {
+      const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={callbacks.onChanged} />;
+    }
+    render(<Host />);
+    await choose(); await accept(); await imported();
+    const first = stages.map(stage => ({ ...stage }));
+    fireEvent.click(screen.getByRole("button", { name: "Add more reports" }));
+    expect(screen.getByRole("button", { name: "Choose CSV files" })).toBeEnabled();
+    expect(screen.queryByRole("heading", { name: "Reports imported" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Selected CSV files" })).not.toBeInTheDocument();
+    await choose(); await accept(); await imported();
+    expect(stages.slice(0, 3)).toEqual(first);
+    expect(stages[3].bundleId).not.toBe(first[0].bundleId);
+    expect(stages.every(stage => stage.status === "accepted")).toBe(true);
+    expect(callbacks.onChanged).toHaveBeenCalledTimes(2);
+    expect(api.discardReportStage).not.toHaveBeenCalled();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(activeRevision).toBe("4");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
   it("uploads only the file without asking for or inventing source metadata", async () => {
       const actual = await vi.importActual<typeof api>("../api/reportData");
@@ -810,7 +829,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onCancel).not.toHaveBeenCalled();
     expect(callbacks.onDone).not.toHaveBeenCalled();
     expect(api.discardReportStage).not.toHaveBeenCalled();
-    expect(activeRevision).toBe("5");
+    expect(activeRevision).toBe("4");
     expect(stages.every(stage => stage.status === "accepted")).toBe(true);
     expect(callbacks.onChanged).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Verify acceptance" }));
@@ -819,7 +838,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(calls[1][1]).toBe(calls[0][1]);
     expect(api.previewReportBundle).toHaveBeenCalledOnce();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
-    expect(activeRevision).toBe("5");
+    expect(activeRevision).toBe("4");
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
   });
   it("requires explicit validation refresh and another acceptance after a definite revision conflict", async () => {
@@ -936,7 +955,7 @@ describe("streamed complete-set import confirmation", () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept();
     expect(await screen.findByRole("alert")).toHaveTextContent(/saved/i);
-    expect(screen.queryByRole("button", { name: "OK" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close saved import" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Cancel import" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Verify saved import" }));
@@ -944,22 +963,13 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
   });
-  it.each(["acceptance", "selection"] as const)("invalidates saved views after %s without waiting for readback or repeating invalidation on retries", async operation => {
+  it("invalidates saved views after acceptance without waiting for readback or repeating invalidation on retries", async () => {
     const readback = deferred<Awaited<ReturnType<typeof api.reportPages.agents>>>();
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose();
-    if (operation === "selection") {
-      vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-      await accept();
-      fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-      await screen.findByRole("button", { name: "Confirm use of imported reports" });
-      expect(callbacks.onChanged).toHaveBeenCalledOnce();
-    }
     vi.mocked(api.reportPages.agents).mockReturnValueOnce(readback.promise);
-    if (operation === "acceptance") await accept();
-    else fireEvent.click(screen.getByRole("button", { name: "Confirm use of imported reports" }));
-    const changes = operation === "acceptance" ? 1 : 2;
-    await waitFor(() => expect(callbacks.onChanged).toHaveBeenCalledTimes(changes));
+    await accept();
+    await waitFor(() => expect(callbacks.onChanged).toHaveBeenCalledOnce());
     expect(screen.queryByRole("heading", { name: "Reports imported" })).not.toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Verifying import...");
     expect(screen.queryByText("The imported report is saved, but another report is currently selected.")).not.toBeInTheDocument();
@@ -968,11 +978,11 @@ describe("streamed complete-set import confirmation", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("saved");
     fireEvent.click(screen.getByRole("button", { name: "Verify saved import" }));
     await imported();
-    fireEvent.click(screen.getByRole("button", { name: "OK" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(callbacks.onDone).toHaveBeenCalledOnce());
-    expect(callbacks.onChanged).toHaveBeenCalledTimes(changes);
+    expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).toHaveBeenCalledTimes(operation === "selection" ? 1 : 0);
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
   });
   it("does not substitute another report for exact accepted verification", async () => {
@@ -980,176 +990,55 @@ describe("streamed complete-set import confirmation", () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept();
     await screen.findByRole("alert");
-    expect(screen.queryByRole("button", { name: "OK" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
     expect(callbacks.onDone).not.toHaveBeenCalled();
   });
-  it("does not silently select an older accepted report; adoption has its own one-use confirmation", async () => {
-    const other = reportPage([reportAgent()], { reports: { ...reports, activeSetId: "other" } });
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(other);
+  it.each([null, "other", reportSetId])("shows the same summary with selected report %s and never offers selection", async activeSetId => {
+    vi.mocked(api.reportPages.agents).mockResolvedValue(reportPage([reportAgent()], { reports: { ...reports, activeSetId } }));
     render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
+    await choose(); await accept(); await imported();
+    expect(screen.getByRole("heading", { name: "Reports imported" })).toHaveFocus();
+    expect(screen.getByRole("status")).toHaveTextContent("Your report set has been saved.");
+    expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["Add more reports", "Close"]);
+    expect(screen.queryByText(/another report is currently selected|keep the current selection/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(callbacks.onDone).toHaveBeenCalledOnce();
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm use of imported reports" }));
-    await imported();
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(callbacks.onDone).not.toHaveBeenCalled();
+    expect(activeRevision).toBe("4");
   });
-  it("keeps one prepared selection until it is cancelled or confirmed", async () => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    const prepare = await screen.findByRole("button", { name: "Use imported reports" });
-    act(() => { fireEvent.click(prepare); fireEvent.click(prepare); });
-    await screen.findByRole("button", { name: "Confirm use of imported reports" });
-    expect(screen.queryByRole("button", { name: "Use imported reports" })).not.toBeInTheDocument();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel selection" }));
-    fireEvent.click(screen.getByRole("button", { name: "Use imported reports" }));
-    await screen.findByRole("button", { name: "Confirm use of imported reports" });
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(2);
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-  });
-  it("retires a cancelled selection before a same-batch confirmation can submit it", async () => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    const confirm = await screen.findByRole("button", { name: "Confirm use of imported reports" });
-    const cancel = screen.getByRole("button", { name: "Cancel selection" });
-    act(() => { fireEvent.click(cancel); fireEvent.click(confirm); });
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Use imported reports" })).toBeEnabled();
-    expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-  });
-  it("retires selection and file handlers synchronously when the import itself closes", async () => {
-    const ref = createRef<OfficialUsageImportHandle>();
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    const view = render(<OfficialUsageImportPanel {...callbacks} ref={ref} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    const confirm = await screen.findByRole("button", { name: "Confirm use of imported reports" });
-    act(() => { ref.current?.dismiss(); fireEvent.click(confirm); ref.current?.dismiss(); });
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(callbacks.onCancel).toHaveBeenCalledOnce();
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-    view.unmount();
-    render(<OfficialUsageImportPanel {...callbacks} ref={ref} />);
-    const drop = screen.getByText("Drop your three CSV exports here").parentElement!;
-    act(() => { ref.current?.dismiss(); fireEvent.drop(drop, { dataTransfer: { files: files() } }); });
-    expect(api.stageReport).toHaveBeenCalledTimes(3);
-    expect(callbacks.onCancel).toHaveBeenCalledTimes(2);
-  });
-  it.each(["changed", "unavailable", "network"] as const)("requires readback after %s selection preparation instead of reusing stale saved evidence", async failure => {
-    const saved = reportPage([], { reports: { ...reports, activeSetId: "other" } });
-    vi.mocked(api.reportPages.agents).mockResolvedValue(saved);
-    if (failure === "changed") {
-      vi.mocked(api.previewReportOperation).mockResolvedValueOnce({ id: "changed", setId: reportSetId, operation: "select",
-        activeRevision: "99", historyRevision: reports.historyRevision, historyEpoch: reports.historyEpoch, hash: "c".repeat(64) });
-    } else vi.mocked(api.previewReportOperation).mockRejectedValueOnce(failure === "unavailable"
-      ? new ApiError(409, "staging_unavailable", "Saved report is no longer selectable") : new Error("Preview response lost"));
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    await screen.findByRole("alert");
-    expect(screen.queryByRole("button", { name: "Use imported reports" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Confirm use of imported reports" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Cancel this import and add the three CSV files again.")).not.toBeInTheDocument();
-    const readback = deferred<typeof saved>();
-    vi.mocked(api.reportPages.agents).mockReturnValueOnce(readback.promise);
-    const retry = screen.getByRole("button", { name: "Verify saved import" });
-    act(() => { fireEvent.click(retry); fireEvent.click(retry); });
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("Verifying import...");
-    expect(api.reportPages.agents).toHaveBeenCalledTimes(2);
-    await act(async () => readback.resolve(saved));
-    expect(screen.getByRole("button", { name: "Use imported reports" })).toBeEnabled();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-  });
-  it("recovers a lost shared-selection confirmation by reading, never replaying its one-use token", async () => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(new Error("Selection response lost"));
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm use of imported reports" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("do not replay");
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: "Confirm use of imported reports" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Verify saved import" }));
-    await imported();
-    expect(callbacks.onChanged).toHaveBeenCalledTimes(2);
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-  });
-  it.each(["button", "Escape"] as const)("invalidates an uncertain shared selection once when dismissed by %s without readback", async action => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(new Error("Selection response lost"));
-    function Host() {
-      const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={next => { setRoute(next); if (!next) callbacks.onCancel(); }}
-        canManage revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
-    }
-    render(<Host />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm use of imported reports" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("do not replay");
-    if (action === "Escape") fireEvent(screen.getByRole("dialog"), new Event("cancel", { cancelable: true }));
-    else fireEvent.click(screen.getByRole("button", { name: "Close saved import" }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(callbacks.onChanged).toHaveBeenCalledTimes(2);
-    expect(callbacks.onCancel).toHaveBeenCalledOnce();
-    expect(callbacks.onDone).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(api.discardReportStage).not.toHaveBeenCalled();
-  });
-  it("cannot invalidate or close a replacement session through a retired uncertain-selection handle", async () => {
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(new Error("Selection response lost"));
+  it("cannot close a replacement session through a retired saved-import handle", async () => {
     const ref = createRef<OfficialUsageImportHandle>();
     const view = render(<OfficialUsageImportPanel {...callbacks} ref={ref} />);
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm use of imported reports" }));
-    await screen.findByRole("alert");
+    await choose(); await accept(); await imported();
     const retired = ref.current;
     view.unmount();
     render(<OfficialUsageImportPanel {...callbacks} />);
     act(() => retired?.dismiss());
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(callbacks.onCancel).not.toHaveBeenCalled();
+    expect(callbacks.onDone).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Choose CSV files" })).toBeEnabled();
     expect(api.reportPages.agents).toHaveBeenCalledOnce();
   });
-  it("requires a new explicit adoption if the shared selection changes between saved verification and OK", async () => {
+  it("closes without reading or changing a shared selection updated after the summary", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept(); await imported();
     vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "another-report" } }));
-    fireEvent.click(screen.getByRole("button", { name: "OK" }));
-    expect(await screen.findByRole("button", { name: "Use imported reports" })).toBeEnabled();
-    expect(callbacks.onDone).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(callbacks.onDone).toHaveBeenCalledOnce();
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
     expect(api.previewReportOperation).not.toHaveBeenCalled();
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
   });
-  it("rechecks the exact destination on OK and refuses to navigate to a deleted report", async () => {
+  it("closes without navigating to or rechecking a report deleted after the summary", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept(); await imported();
     vi.mocked(api.reportPages.agents).mockRejectedValueOnce(new ApiError(404, "report_set_unavailable", "Report deleted"));
-    fireEvent.click(screen.getByRole("button", { name: "OK" }));
-    await screen.findByRole("alert");
-    expect(callbacks.onDone).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(callbacks.onDone).toHaveBeenCalledOnce();
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
   });
   it.each([401, 403])("clears private staging evidence after status %i and stops all publication", async status => {
@@ -1235,45 +1124,18 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onChanged).not.toHaveBeenCalled();
     expect(screen.queryByText("agents.csv", { selector: "strong" })).not.toBeInTheDocument();
   });
-  it("cancels imported-report selection on an account change and ignores its late confirmation", async () => {
-    const confirmation = deferred<Awaited<ReturnType<typeof api.confirmReportOperation>>>();
-    vi.mocked(api.confirmReportOperation).mockReturnValueOnce(confirmation.promise);
-    vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-    const content = (homeAccountId: string) => <CapabilityContext value={{
-      user: { tenantId: "tenant", homeAccountId, username: `${homeAccountId}@example.invalid`, displayName: homeAccountId,
-        roles: ["AgentControl.Admin"] }, views: [], now: Date.now(), pending: false, loading: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
-    }}><OfficialUsageImportPanel {...callbacks} /></CapabilityContext>;
-    const view = render(content("first"));
-    await choose(); await accept();
-    fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm use of imported reports" }));
-    const signal = vi.mocked(api.confirmReportOperation).mock.calls[0][1]!;
-    view.rerender(content("replacement"));
-    expect(signal.aborted).toBe(true);
-    expect(screen.getByRole("button", { name: "Choose CSV files" })).toBeEnabled();
-    await act(async () => confirmation.resolve({ activeSetId: reportSetId, activeRevision: "5" }));
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-    expect(callbacks.onDone).not.toHaveBeenCalled();
-    expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("heading", { name: "Reports imported" })).not.toBeInTheDocument();
-  });
-  it.each(["resume", "bundle", "verification", "discard", "selection preview"] as const)(
+  it.each(["resume", "bundle", "verification", "discard"] as const)(
     "retires pending %s work and its callbacks on an account transition", async phase => {
       const stageRead = deferred<OfficialReportPreview>();
       const bundleRead = deferred<Awaited<ReturnType<typeof api.previewReportBundle>>>();
       const verification = deferred<Awaited<ReturnType<typeof api.reportPages.agents>>>();
       const discard = deferred<void>();
-      const selection = deferred<Awaited<ReturnType<typeof api.previewReportOperation>>>();
       if (phase === "resume") {
         stages = kinds.map(kind => reportStage(kind, bundleId));
         vi.mocked(api.readReportStage).mockReturnValueOnce(stageRead.promise);
       } else if (phase === "bundle") vi.mocked(api.previewReportBundle).mockReturnValueOnce(bundleRead.promise);
       else if (phase === "verification") vi.mocked(api.reportPages.agents).mockReturnValueOnce(verification.promise);
       else if (phase === "discard") vi.mocked(api.discardReportStage).mockReturnValueOnce(discard.promise);
-      else {
-        vi.mocked(api.reportPages.agents).mockResolvedValueOnce(reportPage([], { reports: { ...reports, activeSetId: "other" } }));
-        vi.mocked(api.previewReportOperation).mockReturnValueOnce(selection.promise);
-      }
       const content = (homeAccountId: string) => <CapabilityContext value={{
         user: { tenantId: "tenant", homeAccountId, username: `${homeAccountId}@example.invalid`, displayName: homeAccountId,
           roles: ["AgentControl.Admin"] }, views: [], now: Date.now(), pending: false, loading: false, error: undefined,
@@ -1281,8 +1143,7 @@ describe("streamed complete-set import confirmation", () => {
       }}><OfficialUsageImportPanel {...callbacks} initialStagingId={phase === "resume" && homeAccountId === "first" ? stages[0].id : undefined} /></CapabilityContext>;
       const view = render(content("first"));
       if (phase !== "resume") await choose();
-      if (phase === "verification" || phase === "selection preview") await accept();
-      if (phase === "selection preview") fireEvent.click(await screen.findByRole("button", { name: "Use imported reports" }));
+      if (phase === "verification") await accept();
       if (phase === "discard") {
         await ready();
         fireEvent.click(screen.getByRole("button", { name: "Cancel import" }));
@@ -1291,8 +1152,7 @@ describe("streamed complete-set import confirmation", () => {
       const signal = () => phase === "resume" ? vi.mocked(api.readReportStage).mock.lastCall?.[1]
         : phase === "bundle" ? vi.mocked(api.previewReportBundle).mock.lastCall?.[1]
           : phase === "verification" ? vi.mocked(api.reportPages.agents).mock.lastCall?.[1]
-            : phase === "discard" ? vi.mocked(api.discardReportStage).mock.lastCall?.[1]
-              : vi.mocked(api.previewReportOperation).mock.lastCall?.[2];
+            : vi.mocked(api.discardReportStage).mock.lastCall?.[1];
       await waitFor(() => expect(signal()).toBeInstanceOf(AbortSignal));
       const retired = signal()!, changed = callbacks.onChanged.mock.calls.length, staged = callbacks.onStaged.mock.calls.length;
       view.rerender(content("replacement"));
@@ -1303,8 +1163,6 @@ describe("streamed complete-set import confirmation", () => {
         bundleRead.resolve(reportBundle(stages, stages[0].bundleId));
         verification.resolve(reportPage([reportAgent()]));
         discard.resolve();
-        selection.resolve({ id: "retired", setId: reportSetId, operation: "select", hash: "c".repeat(64),
-          activeRevision: reports.activeRevision, historyRevision: reports.historyRevision, historyEpoch: reports.historyEpoch });
       });
       expect(callbacks.onChanged).toHaveBeenCalledTimes(changed);
       expect(callbacks.onStaged).toHaveBeenCalledTimes(staged);
@@ -1371,7 +1229,7 @@ describe("streamed complete-set import confirmation", () => {
     await act(async () => acceptance.resolve({ setId: reportSetId, activeRevision: "5", complete: true }));
     await imported();
     expect(api.acceptReportBundle).toHaveBeenCalledExactlyOnceWith(bundleId,
-      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }, expect.any(AbortSignal));
+      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection: true }, expect.any(AbortSignal));
     expect(api.stageReport).not.toHaveBeenCalled();
     expect(api.discardReportStage).not.toHaveBeenCalled();
   });

@@ -33,6 +33,7 @@ import {
   type DataSyncState,
 } from "../api/client";
 import { useSavedRead } from "../savedQueries";
+import { useBrowserAvailability } from "../useBrowserAvailability";
 import { useCapabilityContext } from "../capabilityContext";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { SyncDialog } from "./SyncDialog";
@@ -53,7 +54,7 @@ const pollIntervalMs = 1_000;
 export type WorkspaceSetupStatus = "checking" | "required" | "ready" | "error";
 
 export type DataSyncPanelHandle = {
-  refresh: () => Promise<void>;
+  refresh: (explicit?: boolean) => Promise<void>;
   start: (mode: DataSyncMode, sources?: DataSyncSourceId[]) => Promise<void>;
 };
 
@@ -69,6 +70,7 @@ type DataSyncPanelProps = {
   onOpenUsageImport: () => void;
   onRequestedRunChange: (runId: string | undefined) => void;
   onSourcesChanged: (sources: DataSyncSourceId[]) => void;
+  onCheckPublication?: (sources: DataSyncSourceId[]) => void;
   onCancelRequested?: () => void;
 };
 
@@ -88,9 +90,11 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   onOpenUsageImport,
   onRequestedRunChange,
   onSourcesChanged,
+  onCheckPublication,
   onCancelRequested,
 }, ref) {
   const { openPermissions } = useCapabilityContext();
+  const available = useBrowserAvailability();
   const [state, setState] = useState<DataSyncState>();
   const [requestedRunResult, setRequestedRunResult] = useState<{ principalKey: string; run: DataSyncRun }>();
   const requestedRun = requestedRunResult?.principalKey === principalKey && requestedRunResult.run.id === requestedRunId
@@ -125,6 +129,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   const requestedSourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const notifiedSources = useRef(new Map<DataSyncSourceId, string>());
   const onSourcesChangedRef = useRef(onSourcesChanged);
+  const onCheckPublicationRef = useRef(onCheckPublication);
   const onRunsChangedRef = useRef(onRunsChanged);
   const wasActive = useRef(active);
   const readSaved = useSavedRead();
@@ -137,6 +142,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   useEffect(() => {
     onSourcesChangedRef.current = onSourcesChanged;
   }, [onSourcesChanged]);
+  useEffect(() => { onCheckPublicationRef.current = onCheckPublication; }, [onCheckPublication]);
 
   useEffect(() => {
     onRunsChangedRef.current = onRunsChanged;
@@ -207,7 +213,6 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
           if (source.status === "succeeded") {
             return !previous || sourceObservationIdentity(previous) !== sourceObservationIdentity(source);
           }
-          // Failed attempts and sources omitted by limited runs can still have saved data.
           return source.count === null && source.lastSuccessAt === null
             && (!previous || previous.status === "succeeded" || previous.lastSuccessAt !== null);
         })
@@ -218,7 +223,9 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
           return true;
         })
         .map(source => source.source);
-      if (changed.length) onSourcesChangedRef.current(changed);
+      // Job status is only a hint to check persisted publications, not authority
+      // to invalidate saved content or infer that a failed attempt cleared it.
+      if (changed.length) onCheckPublicationRef.current?.(changed);
     }
   }, []);
 
@@ -253,7 +260,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
       setCheckedAt(new Date().toISOString());
       setStateReadFailed(false);
       if (!preserveActionError) setError("");
-      return isProgressing(next.run);
+      return isProgressing(next.run) && (wasActive.current || next.onboardingRequired);
     } catch (reason) {
       if (controller.signal.aborted || owner !== generation.current) return false;
       if (clearDeniedState(reason)) return false;
@@ -272,6 +279,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
     const pollingOwner = pollingGeneration.current;
     const poll = async () => {
       timer.current = undefined;
+      if (document.visibilityState !== "visible" || !navigator.onLine) return;
       const progressing = await load(owner, preserveActionError);
       if (owner !== generation.current || pollingOwner !== pollingGeneration.current || !progressing) return;
       timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
@@ -318,9 +326,9 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
       setRequestedRunResult(current => current?.principalKey === principalKey && current.run.id === requestedRunId
         ? current : undefined);
       setRequestedRunError("");
-      setRequestedRunLoading(Boolean(requestedRunId) && !accessDenied.current);
+      setRequestedRunLoading(Boolean(requestedRunId) && active && available && !accessDenied.current);
     });
-    if (!requestedRunId || accessDenied.current) return;
+    if (!requestedRunId || !active || !available || accessDenied.current) return;
 
     const poll = async () => {
       requestedRunTimer.current = undefined;
@@ -356,7 +364,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
       requestedRunGeneration.current += 1;
       stopRequestedRunPolling();
     };
-  }, [clearDeniedState, observeSources, principalKey, readOwner, readSaved, requestedRunId, requestedRunReload, stopRequestedRunPolling]);
+  }, [active, available, clearDeniedState, observeSources, principalKey, readOwner, readSaved, requestedRunId, requestedRunReload, stopRequestedRunPolling]);
 
   const perform = useCallback(async (
     key: "start" | "cancel",
@@ -479,11 +487,19 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   useEffect(() => {
     if (active && !wasActive.current) void refresh(false);
     if (!active && wasActive.current) {
+      if (stateRef.current?.onboardingRequired === false) stopPolling();
       cleanConsent.current = false;
       void Promise.resolve().then(closeCleanConfirmation);
     }
     wasActive.current = active;
-  }, [active, closeCleanConfirmation, refresh]);
+  }, [active, closeCleanConfirmation, refresh, stopPolling]);
+
+  const wasAvailable = useRef(available);
+  useEffect(() => {
+    if (!available) stopPolling();
+    else if (!wasAvailable.current && (active || !stateRef.current || stateRef.current.onboardingRequired)) void refresh(false);
+    wasAvailable.current = available;
+  }, [active, available, refresh, stopPolling]);
 
   function runActions(run: DataSyncRun) {
     if (!isProgressing(run)) return null;

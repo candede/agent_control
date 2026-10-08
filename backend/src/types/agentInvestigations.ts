@@ -1,4 +1,5 @@
 import type { PurviewAuditRecord } from "./purviewAudit.js";
+import type { PurviewAuditPresetId } from "./purviewAudit.js";
 import type { DefenderHuntingTemplateId } from "./defenderHunting.js";
 
 export type AgentInvestigationReasonCode = "unsupported_agent_type" | "unsupported_identity_crosswalk" | "ambiguous_identity" | "stale_source"
@@ -45,11 +46,17 @@ export type AgentInvestigationContext = {
       runtimeProvenance?: AgentIdentityRuntimeProvenance;
     };
   };
-  purview: { status: "available" | "unavailable"; reason?: string; reasonCode?: AgentInvestigationReasonCode; mode: "saved_only" };
+  purview: {
+    status: "available" | "unavailable";
+    reason?: string;
+    reasonCode?: AgentInvestigationReasonCode;
+    mode: "search";
+    presets: PurviewAuditPresetId[];
+  };
 };
 
 export type AgentInvestigationScope = { recordId: string; entraAgentIds: string[]; entraAgentApplicationIds?: string[] };
-export type AgentPurviewTarget = { environmentId: string; botId: string };
+export type AgentPurviewTarget = { environmentId: string; botId: string; applicationId?: string };
 export type AgentPurviewQuery = { limit: number; offset: number; search?: string; operation?: string };
 export type AgentPurviewRecordPage = {
   recordId: string;

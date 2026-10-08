@@ -42,7 +42,7 @@ export class AgentInvestigationsService {
     const uncertain = record.identity.invalidMetadata || ["ambiguous", "conflicting"].includes(record.identity.state);
     const current = Boolean(record.revision) && resource?.type === "microsoft.copilotstudio/agents"
       && resource.tenantId.toLowerCase() === scope.tenantId.toLowerCase()
-      && observation?.current === true && Date.parse(observation.expiresAt) > Date.now();
+      && observation?.current === true;
     const unsupported = !resource || resource.type !== "microsoft.copilotstudio/agents" || resource.agentKind === "agent_builder_agent";
     const commonReasonCode: AgentInvestigationReasonCode | undefined = unsupported ? "unsupported_identity_crosswalk"
       : uncertain ? "ambiguous_identity" : !current ? "stale_source" : undefined;
@@ -95,7 +95,7 @@ export class AgentInvestigationsService {
     return { record, resource, observation, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
       identitySource, savedCache, resolutionReason, resolutionCode };
     });
-    const { record, resource, observation, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
+    const { record, resource, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
       identitySource, savedCache, resolutionReason, resolutionCode } = loaded;
     if (current) {
       try { await this.inventory.assertCurrent(scope, record.id, record.revision); }
@@ -103,7 +103,6 @@ export class AgentInvestigationsService {
         if (error instanceof AppError && error.code === "inventory_changed") throw sourceChanged();
         throw error;
       }
-      if (!observation || Date.parse(observation.expiresAt) <= Date.now()) throw sourceChanged();
     }
     const cacheExpiresAt = savedCache.expiresAt ?? savedCache.value?.expiresAt;
     const cache: AgentIdentityCacheState = cacheExpiresAt && Date.parse(cacheExpiresAt) <= Date.now()
@@ -131,7 +130,7 @@ export class AgentInvestigationsService {
     const environment = resource?.environmentId;
     const purviewReason = commonReason ?? (bots.length !== 1 || !environment || record.environmentId?.toLowerCase() !== environment.toLowerCase()
       || !unambiguous("cds_bot_id", bots)
-      ? "Saved Purview association requires an exact bot ID and its current environment." : undefined);
+      ? "Purview search requires an unambiguous saved bot identity and environment." : undefined);
     return {
       inventoryRevision: record.revision,
       ...(identitySource ? { identitySource } : {}),
@@ -152,9 +151,11 @@ export class AgentInvestigationsService {
             ...(inventoryReason ? { reason: inventoryReason, reasonCode: savedReasonCode ?? "identity_resolution_required" } : {}) },
           agent_activity: runtimeAvailability, agent_tools: runtimeAvailability } },
         purview: { status: purviewReason ? "unavailable" : "available",
-          ...(purviewReason ? { reason: purviewReason, reasonCode: commonReasonCode ?? "purview_identity_unavailable" as const } : {}), mode: "saved_only" },
+          ...(purviewReason ? { reason: purviewReason, reasonCode: commonReasonCode ?? "purview_identity_unavailable" as const } : {}),
+          mode: "search", presets: purviewReason ? [] : legacyAvailable ? ["copilot_interactions", "copilot_studio_admin"] : ["copilot_studio_admin"] },
       },
-      ...(!purviewReason ? { purviewTarget: { environmentId: environment!.toLowerCase(), botId: bots[0] } } : {}),
+      ...(!purviewReason ? { purviewTarget: { environmentId: environment!.toLowerCase(), botId: bots[0],
+        ...(legacyAvailable ? { applicationId: applicationIds[0] } : {}) } } : {}),
     };
   }
 

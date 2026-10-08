@@ -90,7 +90,7 @@ type PackageObservation = {
 
 export type PackagePage = {
   value: CopilotPackage[];
-  selection: { id: string; revision: string; expiresAt: string; evaluatedAt: string };
+  selection: UnifiedAgentInventoryPage["selection"];
   counts: { total: number; scoped: number; filtered: number };
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   freshness: { state: string; capturedRevision: string; sources: unknown[] };
@@ -306,6 +306,7 @@ type AuditRequestContext = {
 };
 
 export class ApiError extends Error {
+  details?: { reason?: "expired" | "unavailable" | "changed" };
   retryAfterSeconds?: number;
   status: number;
   code: string;
@@ -317,7 +318,7 @@ export class ApiError extends Error {
     status: number,
     code: string,
     message: string,
-    options: { requestId?: string; type?: string; kind?: "problem" | "aborted" | "network"; retryAfterSeconds?: number } = {},
+    options: { requestId?: string; type?: string; kind?: "problem" | "aborted" | "network"; retryAfterSeconds?: number; details?: ApiError["details"] } = {},
   ) {
     super(message);
     this.status = status;
@@ -326,6 +327,7 @@ export class ApiError extends Error {
     this.type = options.type;
     this.kind = options.kind ?? "problem";
     this.retryAfterSeconds = options.retryAfterSeconds;
+    this.details = options.details;
   }
 
   get authenticationExpired() {
@@ -467,7 +469,7 @@ export async function getUnifiedAgents(
     });
     assertCurrentRequest(generation, options.signal);
     if ("state" in selected) {
-      if (!["not_collected", "preparing"].includes(selected.state) || typeof selected.message !== "string" || !selected.message) {
+      if (!["not_collected", "preparing", "unavailable"].includes(selected.state) || typeof selected.message !== "string" || !selected.message) {
         throw new ApiError(500, "invalid_inventory_availability", "The server returned invalid inventory availability.");
       }
       return selected;
@@ -713,9 +715,10 @@ export function getPurviewAuditCatalog(options: { signal?: AbortSignal } = {}) {
   return request<PurviewAuditCatalog>("/api/audit-search/catalog", { signal: options.signal });
 }
 
-export function getPurviewAuditJobs(limit = 20, offset = 0, options: { signal?: AbortSignal; userPrincipalName?: string } = {}) {
+export function getPurviewAuditJobs(limit = 20, offset = 0, options: { signal?: AbortSignal; userPrincipalName?: string; agentRecordId?: string } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (options.userPrincipalName) params.set("userPrincipalName", options.userPrincipalName);
+  if (options.agentRecordId) params.set("agentRecordId", options.agentRecordId);
   return request<PurviewAuditHistory>(`/api/audit-search/jobs?${params}`, { signal: options.signal });
 }
 
@@ -723,8 +726,8 @@ export function getPurviewAuditJob(id: string, options: { signal?: AbortSignal }
   return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
 
-export function submitPurviewAuditSearch(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal } = {}) {
-  return request<PurviewAuditJob>("/api/audit-search/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
+export function submitPurviewAuditSearch(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal; agentRecordId?: string } = {}) {
+  return request<PurviewAuditJob>("/api/audit-search/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters, agentRecordId: options.agentRecordId }), signal: options.signal });
 }
 
 export function getPurviewAuditRecords(id: string, limit = 100, offset = 0, options: { signal?: AbortSignal } = {}) {
@@ -746,8 +749,8 @@ export function deletePurviewAuditSearch(id: string, options: { signal?: AbortSi
   });
 }
 
-export function approvePurviewAuditQualification(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal } = {}) {
-  return request<PurviewAuditQualification>("/api/audit-search/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
+export function approvePurviewAuditQualification(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal; agentRecordId?: string } = {}) {
+  return request<PurviewAuditQualification>("/api/audit-search/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters, agentRecordId: options.agentRecordId }), signal: options.signal });
 }
 
 export function startPurviewAuditQualification(id: string, options: { signal?: AbortSignal } = {}) {
@@ -770,7 +773,7 @@ export type DefenderHuntingCatalog = {
   defenderPortalUrl: string;
 };
 
-type AgentHuntingOptions = { signal?: AbortSignal; agentRecordId?: string };
+type AgentHuntingOptions = { signal?: AbortSignal; agentRecordId?: string; userObjectId?: string };
 
 export function getAgentInvestigationContext(recordId: string, options: { signal?: AbortSignal } = {}) {
   return request<AgentInvestigationContext>(`/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`, { signal: options.signal });
@@ -790,13 +793,16 @@ export function getAgentPurviewRecords(recordId: string, query: { limit: number;
 }
 
 function agentHuntingUrl(path: string, options: AgentHuntingOptions) {
-  if (!options.agentRecordId) return path;
-  return `${path}${path.includes("?") ? "&" : "?"}${new URLSearchParams({ agentRecordId: options.agentRecordId })}`;
+  const params = new URLSearchParams();
+  if (options.agentRecordId) params.set("agentRecordId", options.agentRecordId);
+  if (options.userObjectId) params.set("userObjectId", options.userObjectId);
+  return params.size ? `${path}${path.includes("?") ? "&" : "?"}${params}` : path;
 }
 
 function huntingSubmissionFilters(filters: DefenderHuntingFilters, options: AgentHuntingOptions) {
   if (!options.agentRecordId) return filters;
-  return { templateId: filters.templateId, startDateTime: filters.startDateTime, endDateTime: filters.endDateTime, operations: filters.operations };
+  return { templateId: filters.templateId, startDateTime: filters.startDateTime, endDateTime: filters.endDateTime, operations: filters.operations,
+    ...(filters.userObjectId ? { userObjectId: filters.userObjectId } : {}) };
 }
 
 export function getDefenderHuntingCatalog(options: AgentHuntingOptions = {}) {
@@ -1180,11 +1186,14 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     if (signal?.aborted || !(error instanceof SyntaxError || error instanceof TypeError)) throw error;
   }
   const problem = typeof body === "object" && body !== null ? body : {};
+  const reason = "details" in problem && typeof problem.details === "object" && problem.details !== null
+    && "reason" in problem.details ? problem.details.reason : undefined;
   return new ApiError(
     response.status,
     "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
     "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
     {
+      details: reason === "expired" || reason === "unavailable" || reason === "changed" ? { reason } : undefined,
       requestId: "requestId" in problem && typeof problem.requestId === "string" ? problem.requestId : response.headers.get("X-Request-ID") ?? undefined,
       type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,
       retryAfterSeconds: /^\d+$/.test(response.headers.get("Retry-After") ?? "")

@@ -115,7 +115,7 @@ describe("live selected users and reports", () => {
     },
   );
 
-  it.each(["missing", "expired"])("does not invent license metrics when a refresh has %s saved directory evidence", async evidence => {
+  it.each(["missing", "expired"])("distinguishes retained rows from current license metrics with %s directory evidence", async evidence => {
     const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     if (evidence === "expired") {
       const expiresAt = new Date(Date.now() + 5_000);
@@ -135,7 +135,9 @@ describe("live selected users and reports", () => {
       const reader = new LargeTenantUsersReports(fixture.runtime, secret, 30);
       const selection = await reader.capture(identity, "delegated", "copilot_users");
       const saved = await reader.page(selection.id, identity);
-      expect(saved.sources.directory).toMatchObject({ state: "unavailable", attemptStatus: "running", generationId: null });
+      expect(saved.sources.directory).toMatchObject({ state: evidence === "missing" ? "unavailable" : "stale",
+        attemptStatus: "running", generationId: evidence === "missing" ? null : expect.any(String) });
+      if (evidence === "expired") expect(saved.value).toHaveLength(1);
       expect(saved.summary.licensedUsers).toBeNull();
     } finally { await generations.abort(lease); }
   }, 10_000);
@@ -856,6 +858,8 @@ describe("live selected users and reports", () => {
     expect((await another.page(selected.id, identity, { limit: 2, cursor: second.page.previousCursor! })).value).toEqual(first.value);
     await expect(another.page(selected.id, { ...identity, principalId: "other" })).rejects.toMatchObject({ code: "selection_invalidated" });
     await new DataGenerations(fixture.runtime).invalidate(await reports.sources.ensureScope(identity, "delegated"), identity.tenantId);
+    expect((await another.page(selected.id, identity, { limit: 2 })).value).toEqual(first.value);
+    await new DataGenerations(fixture.runtime).invalidate(first.sources.directory.scopeId!, identity.tenantId);
     await expect(another.page(selected.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
 

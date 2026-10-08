@@ -14,6 +14,30 @@ import { schemaFingerprint } from "../src/db/schema.js";
 import { testSchemaTemplateIdentity } from "./testDatabaseTemplate.js";
 
 describe("large tenant fixture and frozen semantic seeds", () => {
+  it("runs every frontend test under the configured software-gate deadline", () => {
+    const commands = fixtureCommands("production-frontend");
+    expect(commands).toEqual([["run", "test", "--workspace", "frontend"]]);
+    const execute = vi.fn(() => ({ pid: 42, status: 0, signal: null,
+      stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), output: [] }));
+    runFixtureCommand(commands[0], {}, execute);
+    expect(execute).toHaveBeenCalledWith("npm", commands[0], expect.objectContaining({ timeout: 300_000, detached: true }));
+    for (const suite of ["lifecycle", "inventory-acceptance-repair", "inventory-jobs", "inventory-details",
+      "inventory-metadata", "inventory-staging", "inventory-groups", "cutover-app-contract", "inventory-app-exports"]) {
+      const selected = fixtureCommands(suite).flat();
+      for (const file of ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"]) {
+        expect(selected.filter(value => value === file), `${suite}: ${file}`).toHaveLength(1);
+        expect(existsSync(new URL(`../../frontend/${file}`, import.meta.url)), file).toBe(true);
+      }
+    }
+  });
+  it.each(["lifecycle-publication-contract", "lifecycle-read-contract"])("qualifies explicit reset and current-schema initialization: %s", suite => {
+    const files = fixtureCommands(suite).filter(command => command[1] === "test" && command[3] === "backend")
+      .flatMap(command => command.filter(value => /\.test\.ts$/.test(value)));
+    expect(files).toContain("scripts/databasePreflight.test.ts");
+    expect(files).toContain("scripts/databaseReset.test.ts");
+    for (const file of files) expect(existsSync(new URL(`../${file}`, import.meta.url)), file).toBe(true);
+  });
+
   it.each(["inventory-metadata", "cutover-ui-contract"])("points cleanup qualification at current frontend tests: %s", suite => {
     const files = fixtureCommands(suite).filter(command => command[1] === "test" && command[3] === "frontend")
       .flatMap(command => command.filter(value => /\.test\.tsx?$/.test(value)));

@@ -8,6 +8,8 @@ import { useSavedQueryClient } from "../savedQueries";
 import { useReportPrincipalScope } from "../useReportPage";
 import { usageDate } from "../usageInsights";
 import { hasAppRole } from "../../../backend/src/types/capability";
+import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "../selectedRead";
+import { PublicationContext } from "../publicationContext";
 
 type Props = {
   objectId?: string;
@@ -18,6 +20,7 @@ type Props = {
 };
 
 async function readResponsibility(query: AgentResponsibilityQuery, signal: AbortSignal, selection?: AgentResponsibilityPage["selection"]) {
+  const startedAt = performance.now();
   const value = await getAgentResponsibility(query, { signal });
   signal.throwIfAborted();
   if (value.selected?.person.objectId.toLowerCase() !== query.objectId) {
@@ -29,10 +32,7 @@ async function readResponsibility(query: AgentResponsibilityQuery, signal: Abort
       || Date.parse(value.selection.expiresAt) !== Date.parse(selection.expiresAt)))) {
     throw new ApiError(409, "selection_invalidated", "Saved responsibility did not match the selected inventory.");
   }
-  if (!(Date.parse(value.selection.expiresAt) > Date.now())) {
-    throw new ApiError(409, "selection_invalidated", "The responsibility selection has expired. Retry saved responsibility.");
-  }
-  return value;
+  return acceptSelectedRead(value, startedAt);
 }
 
 function rejectsResponsibility(query: Query, scope: string, selectionId: string) {
@@ -43,6 +43,7 @@ function rejectsResponsibility(query: Query, scope: string, selectionId: string)
 
 export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, onPersonLoaded }: Props) {
   const context = useContext(CapabilityContext);
+  const publication = useContext(PublicationContext);
   const canRead = !context || hasAppRole(context.user?.roles ?? [], "AgentControl.Viewer");
   const scope = useReportPrincipalScope(), client = useSavedQueryClient();
   const [retry, setRetry] = useState(0);
@@ -54,46 +55,58 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   // Retained relationships must not turn a cancelled replacement query into a success.
   const [retained, setRetained] = useState<{ owner: string; cursor?: string; data: AgentResponsibilityPage }>();
   if (retained && retained.owner !== owner) setRetained(undefined);
-  const [evidence, setEvidence] = useState<{ boundary: string; selectionId?: string; expiresAt?: number }>({ boundary });
+  const [evidence, setEvidence] = useState<{ boundary: string; selectionId?: string; selection?: AgentResponsibilityPage["selection"] }>({ boundary });
   const current = evidence.boundary === boundary ? evidence : { boundary };
   if (evidence.boundary !== boundary) setEvidence(current);
   const local = navigation?.scope === boundary ? navigation : undefined;
   if (navigation && !local) setNavigation(undefined);
   const selectionId = local?.selection.id.toLowerCase(), cursor = local?.cursor, page = local?.page ?? 0;
-  const [observedNow, setObservedNow] = useState(Date.now);
-  const now = Math.max(observedNow, context?.now ?? 0);
-  const expired = current.expiresAt !== undefined && !(current.expiresAt > now);
   const queryKey = ["saved", "agent-responsibility", scope, personId, dataRevision, agentInventoryRevision, retry, selectionId, cursor];
   const observed = client.getQueryCache().find({ queryKey, exact: true })?.getObserversCount();
   const read = useQuery<AgentResponsibilityPage>({
-    queryKey, enabled: cached => valid && canRead && !expired
+    queryKey, enabled: cached => valid && canRead
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
-    staleTime: observed ? Infinity : 0, gcTime: 0,
-    queryFn: ({ signal }) => readResponsibility({ objectId: personId, selectionId, cursor, limit: 50 }, signal, local?.selection),
+    staleTime: observed ? Infinity : 0, gcTime: 0, structuralSharing: false,
+    queryFn: ({ signal }) => readResponsibility({ objectId: personId, selectionId: selectionId ?? current.selectionId, cursor, limit: 50 },
+      signal, local?.selection ?? current.selection),
   }, client);
   const incompleteRead = !read.isFetching && !read.isError
     && (read.isPending || read.isStale && client.getQueryState(queryKey)?.isInvalidated);
   if (read.data && !read.isError && !read.isFetching && !incompleteRead && (retained?.owner !== owner || retained.cursor !== cursor || retained.data !== read.data)) {
     setRetained({ owner, cursor, data: read.data });
-  } else if (retained && (read.isError || incompleteRead)) setRetained(undefined);
+  } else if (retained && (read.isError && !isExpiredSelection(read.error) || incompleteRead)) setRetained(undefined);
   if (read.data && !read.isError && !read.isFetching && !incompleteRead
-    && (current.selectionId !== read.data.selection.id.toLowerCase() || current.expiresAt !== Date.parse(read.data.selection.expiresAt))) {
-    setEvidence({ boundary, selectionId: read.data.selection.id.toLowerCase(), expiresAt: Date.parse(read.data.selection.expiresAt) });
+    && current.selectionId !== read.data.selection.id.toLowerCase()) {
+    setEvidence({ boundary, selectionId: read.data.selection.id.toLowerCase(), selection: read.data.selection });
   }
   const retainedPage = !read.data && read.isFetching && retained?.owner === owner && retained.cursor === cursor && !selectionId ? retained : undefined;
-  const value = read.data ?? retainedPage?.data;
-  const invalidated = expired || read.error instanceof ApiError && read.error.code === "selection_invalidated";
-  const error = !read.isFetching ? expired ? "The responsibility selection has expired. Retry saved responsibility."
-    : read.error?.message ?? (incompleteRead ? read.isPending ? "Saved responsibility was cancelled. Retry saved responsibility."
+  const value = read.data ?? (isExpiredSelection(read.error) ? retained?.data : retainedPage?.data);
+  const leaseActive = useSelectedReadLease(value?.selection ?? current.selection);
+  const expired = Boolean((value || current.selection) && !leaseActive) || isExpiredSelection(read.error);
+  const invalidated = read.error instanceof ApiError && read.error.code === "selection_invalidated" && !isExpiredSelection(read.error);
+  const error = !read.isFetching ? read.error?.message ?? (incompleteRead ? read.isPending ? "Saved responsibility was cancelled. Retry saved responsibility."
       : "Saved responsibility needs reloading. Retry saved responsibility." : undefined) : undefined;
-  const data = canRead && valid && !invalidated && !read.isError && !incompleteRead && value
-    && Date.parse(value.selection.expiresAt) > now ? value : undefined;
+  const data = canRead && valid && !invalidated && (!read.isError || isExpiredSelection(read.error)) && !incompleteRead ? value : undefined;
+  const admitPublication = publication?.admit;
+  useEffect(() => { if (data) admitPublication?.(data.selection.publicationRevisions); }, [admitPublication, data]);
+  const observedPublication = useRef<{ owner: string; revision: string } | undefined>(undefined);
+  const published = publication?.revisions;
+  const publicationRevision = published ? JSON.stringify([published.graph_packages, published.power_platform]) : undefined;
+  const refetchPublication = read.refetch;
+  useEffect(() => {
+    if (!data || !publicationRevision || read.isFetching || read.isError) return;
+    const previous = observedPublication.current?.owner === owner ? observedPublication.current.revision : undefined;
+    if (previous === publicationRevision) return;
+    observedPublication.current = { owner, revision: publicationRevision };
+    const captured = data.selection.publicationRevisions;
+    if (!previous && JSON.stringify([captured.graph_packages, captured.power_platform]) === publicationRevision) return;
+    if (selectedReadRemaining(data.selection)) void refetchPublication({ cancelRefetch: false });
+  }, [data, owner, publicationRevision, read.isError, read.isFetching, refetchPublication]);
   const selected = data?.selected;
   const paginationOwner = JSON.stringify([scope, personId]);
   const hasPages = Boolean(data?.page.nextCursor || data?.page.previousCursor);
   const [pagination, setPagination] = useState({ owner: paginationOwner, visible: false });
   if (pagination.owner !== paginationOwner || hasPages && !pagination.visible) setPagination({ owner: paginationOwner, visible: hasPages });
-  const expiresAt = current.expiresAt ?? (value ? Date.parse(value.selection.expiresAt) : undefined);
   useEffect(() => {
     if (!retainedPage) return;
     const retire = (query: Query) => {
@@ -105,13 +118,6 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
     cache.findAll({ queryKey: ["saved", "agent-responsibility", scope] }).forEach(retire);
     return cache.subscribe(event => { if (event.type === "updated") retire(event.query); });
   }, [client, retainedPage, scope]);
-  useEffect(() => {
-    if (expiresAt === undefined || !(expiresAt > now) || invalidated) return;
-    const checkExpiry = () => setObservedNow(Date.now());
-    window.addEventListener("focus", checkExpiry);
-    const timer = window.setTimeout(checkExpiry, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now())));
-    return () => { window.removeEventListener("focus", checkExpiry); window.clearTimeout(timer); };
-  }, [expiresAt, invalidated, now]);
   useEffect(() => {
     if (!invalidated || !current.selectionId) return;
     for (const cached of client.getQueryCache().findAll({ queryKey: ["saved", "agent-responsibility", scope],
@@ -138,24 +144,24 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
     actions.current = { owner: actionOwner, moved: false };
     return () => { actions.current = undefined; };
   }, [actionOwner]);
-  function availableAtAction(checkedAt: number) {
+  function availableAtAction() {
     if (actions.current?.owner !== actionOwner || actions.current.moved || !data) return false;
-    if (!(Date.parse(data.selection.expiresAt) > checkedAt)) { setObservedNow(checkedAt); return false; }
+    if (!selectedReadRemaining(data.selection)) return false;
     const cached = client.getQueryState(queryKey);
     return !cached?.error && !(cached?.isInvalidated && cached.fetchStatus !== "fetching")
       && (read.data ? cached?.data === data : cached?.fetchStatus === "fetching"
       && !client.getQueryCache().find({ queryKey: ["saved", "agent-responsibility", scope], exact: false,
         predicate: query => rejectsResponsibility(query, scope, data.selection.id.toLowerCase()) }));
   }
-  const changePage = (direction: "next" | "previous", checkedAt: number) => {
+  const changePage = (direction: "next" | "previous") => {
     const nextCursor = direction === "next" ? data?.page.nextCursor : data?.page.previousCursor;
-    if (!nextCursor || !data || !availableAtAction(checkedAt) || read.isFetching || client.getQueryState(queryKey)?.fetchStatus === "fetching") return;
+    if (!nextCursor || !data || !availableAtAction() || read.isFetching || client.getQueryState(queryKey)?.fetchStatus === "fetching") return;
     actions.current!.moved = true;
     setNavigation({ scope: boundary, page: page + (direction === "next" ? 1 : -1), selection: data.selection, cursor: nextCursor });
   };
   const retryRead = () => {
     const cached = client.getQueryState(queryKey);
-    if (actions.current?.owner !== actionOwner || actions.current.moved || !error || cached?.fetchStatus === "fetching"
+    if (actions.current?.owner !== actionOwner || actions.current.moved || !error && !expired || cached?.fetchStatus === "fetching"
       || !expired && !cached?.error && cached?.status !== "pending" && !cached?.isInvalidated) return;
     actions.current.moved = true;
     setRetry(value => value + 1);
@@ -171,6 +177,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
       : <>
         {!error && read.isFetching && !data ? <p role="status">Loading saved responsibility...</p> : null}
         {!error && read.isFetching && data ? <p className="sr-only" role="status">Refreshing saved responsibility. Showing the last loaded relationships.</p> : null}
+        {expired && data ? <p role="status">Showing previously loaded saved responsibility. <button type="button" onClick={retryRead}>Load new responsibility selection</button> before paging.</p> : null}
         {error ? <p role="alert" className="error-banner">{error} <button type="button" className="secondary"
           onClick={retryRead}>Retry saved responsibility</button></p> : null}
         {data ? <>
@@ -184,7 +191,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
             </div> : <ul className="responsibility-list" aria-label="Agents with saved responsibility">{selected.agents.map(agent => <li key={agent.id}>
               <div className="responsibility-agent">
                 {onOpenAgent ? <button type="button" className="agent-name-button" aria-label={`Open agent ${agent.displayName}`}
-                  onClick={() => { if (availableAtAction(Date.now())) onOpenAgent(agent.id); }}>{agent.displayName}</button> : <strong>{agent.displayName}</strong>}
+                  onClick={() => { if (availableAtAction()) onOpenAgent(agent.id); }}>{agent.displayName}</button> : <strong>{agent.displayName}</strong>}
                 <small>Source observed {usageDate(agent.observedAt)}</small>
               </div>
               <ul className="responsibility-roles" aria-label={`Relationships for ${agent.displayName}`}>
@@ -196,10 +203,10 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
           </> : null}
         </> : null}
         {pagination.owner === paginationOwner && pagination.visible ? <nav className="copilot-users-pagination" aria-label="Responsibility pages" aria-busy={read.isFetching}>
-          <button type="button" className="secondary" aria-disabled={!data?.page.previousCursor || read.isFetching} onClick={() => changePage("previous", Date.now())}>Previous</button>
+          <button type="button" className="secondary" aria-disabled={expired || !data?.page.previousCursor || read.isFetching} onClick={() => changePage("previous")}>Previous</button>
           <span>{read.isFetching ? "Loading responsibility page..." : !selected || selected.state === "unavailable" ? "Responsibility page unavailable"
-            : `Page ${page + 1} · ${selected.agents.length} of ${selected.count.toLocaleString()} agents`}</span>
-          <button type="button" className="secondary" aria-disabled={!data?.page.nextCursor || read.isFetching} onClick={() => changePage("next", Date.now())}>Next</button>
+            : `${isExpiredSelection(read.error) ? "Saved page" : `Page ${page + 1}`} · ${selected.agents.length} of ${selected.count.toLocaleString()} agents`}</span>
+          <button type="button" className="secondary" aria-disabled={expired || !data?.page.nextCursor || read.isFetching} onClick={() => changePage("next")}>Next</button>
         </nav> : null}
       </>}
   </section>;

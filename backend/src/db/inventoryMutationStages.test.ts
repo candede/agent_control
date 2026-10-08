@@ -30,6 +30,52 @@ describe("record-store mutation staging", () => {
     const identity = await usageIdentity(fixture.runtime, scope), selectionId = await stages.currentSelection(identity);
     return { scope, identity, selectionId, intent: { ...usageAudit(scope), action: "block" as const, scope: "bulk" as const } };
   }
+  it.each(["single", "bulk"] as const)("publishes %s block/unblock and skipped readbacks before the next selection and confirmation", async mutationScope => {
+    const scope = newUsageScope();
+    const ids = mutationScope === "single" ? ["A"] : ["A", "B"];
+    await saveUsageInventory(fixture.runtime, scope, [...ids, "Untouched"].map(id => ({
+      packages: [id], packageFields: { isBlocked: false, availableTo: "some", deployedTo: "some" },
+    })));
+    const identity = await usageIdentity(fixture.runtime, scope);
+    const original = inventoryPresentation(await stages.queries.page(await stages.currentSelection(identity), identity));
+    const jobs = new JobRepository(fixture.runtime);
+    const blocked = new Set<string>();
+    const fetcher = vi.fn<FetchLike>(async (url, request) => {
+      const path = new URL(url).pathname.split("/");
+      const id = decodeURIComponent(path.at(request?.method === "POST" ? -2 : -1)!);
+      if (request?.method === "POST") {
+        if (path.at(-1) === "block") blocked.add(id);
+        else blocked.delete(id);
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({ id, displayName: `Inventory ${id}`, isBlocked: blocked.has(id) });
+    });
+    vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined));
+    const provider = new GraphPackagesClient(fetcher, { minimumReadIntervalMs: 0, maxAttempts: 1 });
+    for (const [action, skipped] of [["block", false], ["block", true], ["unblock", false], ["unblock", true]] as const) {
+      const selectionId = await stages.currentSelection(identity);
+      const intent = { ...usageAudit(scope), action, scope: mutationScope };
+      const preview = await stages.preview(identity, selectionId, intent, ids);
+      const job = await stages.submit(identity, {
+        ...intent, ids, confirmationHash: preview.confirmationHash, idempotencyKey: randomUUID(),
+      });
+      await runBulkJob(job.id, scope, false, jobs, provider, async () => "synthetic");
+      expect(await jobs.get(job.id, scope)).toMatchObject({
+        status: "succeeded", succeeded: skipped ? 0 : ids.length, skipped: skipped ? ids.length : 0,
+      });
+      expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_control_pending
+        WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(0);
+      const page = inventoryPresentation(await stages.queries.page(await stages.currentSelection(identity), identity));
+      expect(page.value.map(record => record.id).sort()).toEqual(original.value.map(record => record.id).sort());
+      for (const item of page.value.flatMap(record => record.packages)) {
+        expect(item).toMatchObject({
+          isBlocked: ids.includes(item.id) && action === "block", availableTo: "some", deployedTo: "some",
+        });
+      }
+    }
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(ids.length * 2);
+  });
+
   it("acceptance: durable authority survives preview cleanup and preserves an unchanged qualified provider write", async () => {
     const { scope, identity, selectionId, intent } = await setup();
     const preview = await stages.preview(identity, selectionId, { ...intent, scope: "single" }, ["A"]);

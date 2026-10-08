@@ -473,10 +473,11 @@ describe("selected user fixture contracts", () => {
       expect(transport).toHaveBeenCalledTimes(5);
     });
 
-    it("cancels expired pinned child pages without renewing or admitting their late response", async () => {
+    it("admits an already-started frozen child response after lease end without renewing or replaying it", async () => {
       vi.useFakeTimers();
       const fixture = await paidFixture(), client = createSavedQueryClient();
       clients.push(client);
+      fixture.source.selection.validatedAt = new Date().toISOString();
       fixture.source.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
       const page: ReportPage<CombinedUser> = await (await fixture.request(root)).json();
       const pending = deferred<Response>();
@@ -493,13 +494,14 @@ describe("selected user fixture contracts", () => {
       act(() => result.current.next());
       const signal = transport.mock.lastCall![1]?.signal;
       await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-      expect(signal?.aborted).toBe(true);
-      expect(result.current).toMatchObject({ data: undefined, loading: false, invalidated: true });
+      expect(signal?.aborted).toBe(false);
+      expect(result.current).toMatchObject({ data: undefined, loading: true, invalidated: false, leaseEnded: true });
       act(() => { window.dispatchEvent(new Event("focus")); result.current.restart(); });
       expect(restart).toHaveBeenCalledOnce();
       expect(transport).toHaveBeenCalledTimes(2);
       await act(async () => { pending.resolve(response); await vi.advanceTimersByTimeAsync(1); });
-      expect(result.current.data).toBeUndefined();
+      expect(result.current.data?.value).toHaveLength(1);
+      expect(result.current.leaseEnded).toBe(true);
     });
 
     it("retries one failed child page without reloading or displaying its previous rows and error", async () => {

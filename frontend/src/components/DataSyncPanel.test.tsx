@@ -121,6 +121,8 @@ function renderPanel(options: {
     onOpenSync: options.onOpenSync,
     automaticRefresh: options.automaticRefresh,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
+    // Existing observation tests count hints, not content invalidations.
+    onCheckPublication: options.onSourcesChanged ?? vi.fn(),
   };
   const view = render(<DataSyncPanel {...props} />, { reactStrictMode: options.strictMode });
   return {
@@ -143,6 +145,55 @@ describe("DataSyncPanel", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("never invalidates source content from progress, provider failure or completed status", async () => {
+    vi.useFakeTimers();
+    const running = source("graph_packages", "running", { count: 12, lastSuccessAt: "2026-09-15T10:00:00Z" });
+    const failed = { ...running, status: "failed" as const, message: "Provider returned 504" };
+    const published = { ...running, status: "succeeded" as const, jobId: "new-job", lastSuccessAt: "2026-09-15T11:00:00Z" };
+    api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false, run: run("running", [running]), sources: [running] }))
+      .mockResolvedValueOnce(syncState({ onboardingRequired: false, run: run("running", [running]), sources: [{ ...running, count: 13 }] }))
+      .mockResolvedValueOnce(syncState({ onboardingRequired: false, run: run("partial", [failed]), sources: [failed] }))
+      .mockResolvedValue(syncState({ onboardingRequired: false, run: run("completed", [published]), sources: [published] }));
+    const content = vi.fn(), checkPublication = vi.fn(), ref = createRef<DataSyncPanelHandle>();
+    render(<DataSyncPanel ref={ref} principalKey="fixture" canUploadUsage onRequestedRunChange={vi.fn()}
+      onOpenUsageImport={vi.fn()} onSourcesChanged={content} onCheckPublication={checkPublication} />);
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    expect(api.getState).toHaveBeenCalledTimes(3);
+    expect(content).not.toHaveBeenCalled();
+    expect(checkPublication).not.toHaveBeenCalled();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(api.getState).toHaveBeenCalledTimes(3);
+    await act(async () => { await ref.current!.refresh(); });
+    expect(api.getState).toHaveBeenCalledTimes(4);
+    expect(checkPublication).toHaveBeenCalledExactlyOnceWith(["graph_packages"]);
+    expect(content).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("stops irrelevant ready-workspace polling and suspends visible status while offline", async () => {
+    vi.useFakeTimers();
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, run: run("running", [source("users", "running")]) }));
+    const view = renderPanel();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    view.rerenderPanel({ active: false });
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(api.getState).toHaveBeenCalledTimes(1);
+    view.rerenderPanel({ active: true });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    await act(async () => { window.dispatchEvent(new Event("offline")); });
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    online.mockReturnValue(true);
+    await act(async () => { window.dispatchEvent(new Event("online")); });
+    expect(api.getState).toHaveBeenCalledTimes(3);
+    view.unmount();
+    online.mockRestore();
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
   });
 
   it.each([true, false])("does not assume setup is required before saved status resolves to %s", async onboardingRequired => {
@@ -345,7 +396,8 @@ describe("DataSyncPanel", () => {
     expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
-    expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
+    expect(within(screen.getByRole("dialog")).queryByRole("button")).not.toBeInTheDocument();
+    expect(view.container.querySelector(".first-sync-actions")).not.toBeInTheDocument();
     view.rerenderPanel({ active: true });
     expect(await screen.findByRole("region", { name: "Data sync" })).toBeVisible();
     view.rerenderPanel({ active: false });
@@ -374,6 +426,7 @@ describe("DataSyncPanel", () => {
     api.getState.mockRejectedValueOnce(new ApiError(503, "unavailable", "Status endpoint unavailable.", { requestId: "sync-status-request" }));
     expect(await screen.findByRole("alert", {}, { timeout: 2_000 })).toHaveTextContent("Status endpoint unavailable.");
     expect(screen.getByRole("alert")).toHaveTextContent("Progress below is the last reported status.");
+    expect(screen.getByRole("button", { name: "View sync details" })).toBeEnabled();
     api.getState.mockResolvedValue(syncState());
     await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
     expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
@@ -470,6 +523,27 @@ describe("DataSyncPanel", () => {
     expect(screen.getByText("42 directory users checked saved")).toBeVisible();
     expect(screen.queryByText(/Resolve the waiting step/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Start initial sync|Retry incomplete sources/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /View sync details|Review permissions/ })).not.toBeInTheDocument();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("keeps permission recovery available when another source is still syncing", async () => {
+    api.getState.mockResolvedValue(syncState({
+      run: run("running", [
+        source("users", "permission_required", { message: "Administrator consent is required." }),
+        source("graph_packages", "running", { count: 650 }),
+        source("power_platform", "queued"),
+      ]),
+    }));
+    const onOpenSync = vi.fn();
+    renderPanel({ active: false, onOpenSync });
+
+    expect(await screen.findByRole("heading", { name: "First sync needs attention" })).toBeVisible();
+    expect(screen.getByText("650 processed in this stage")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
+    expect(api.openPermissions).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
+    expect(onOpenSync).toHaveBeenCalledOnce();
     expect(api.start).not.toHaveBeenCalled();
   });
 
@@ -704,7 +778,7 @@ describe("DataSyncPanel", () => {
   });
 
   it.each(["pending", "scheduled"] as const)(
-    "preserves a %s exact-run read when opening Sync with idle workspace status",
+    "starts a %s exact-run read only when opening Sync with idle workspace status",
     async phase => {
       vi.useFakeTimers();
       const active = run("running", [source("users", "running")], { id: "exact-run" });
@@ -716,21 +790,23 @@ describe("DataSyncPanel", () => {
       api.getRun.mockResolvedValue(completed);
       const view = renderPanel({ active: false, requestedRunId: active.id });
       await act(async () => { await vi.advanceTimersByTimeAsync(500); });
-      const signal = api.getRun.mock.calls[0][1].signal as AbortSignal;
+      expect(api.getRun).not.toHaveBeenCalled();
 
       view.rerenderPanel({ active: true });
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      const signal = api.getRun.mock.calls[0][1].signal as AbortSignal;
 
-      expect(api.getState).toHaveBeenCalledOnce();
+      expect(api.getState).toHaveBeenCalledTimes(2);
       expect(api.getRun).toHaveBeenCalledOnce();
       expect(signal.aborted).toBe(false);
       if (phase === "pending") await act(async () => resolveRun(completed));
-      else await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      else await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
       expect(within(screen.getByRole("dialog")).getByText("Sync complete", { exact: true })).toBeVisible();
       const runReads = api.getRun.mock.calls.length;
       view.rerenderPanel({ active: false });
       view.rerenderPanel({ active: true });
       await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-      expect(api.getState).toHaveBeenCalledTimes(2);
+      expect(api.getState).toHaveBeenCalledTimes(3);
       expect(api.getRun).toHaveBeenCalledTimes(runReads + 1);
       expect(api.start).not.toHaveBeenCalled();
       expect(api.cancel).not.toHaveBeenCalled();
@@ -2143,6 +2219,7 @@ describe("DataSyncPanel", () => {
           onOpenUsageImport={vi.fn()}
           onRequestedRunChange={vi.fn()}
           onSourcesChanged={onChanged}
+          onCheckPublication={onChanged}
         />,
       );
     });
@@ -2433,7 +2510,7 @@ describe("DataSyncPanel", () => {
     expect(onChanged).toHaveBeenCalledWith(["graph_packages"]);
   });
 
-  it("continues polling the exact requested run while inactive without showing or substituting another run", async () => {
+  it("defers an irrelevant exact run while inactive without substituting the latest run", async () => {
     vi.useFakeTimers();
     const runningSources = [source("users", "running")];
     const completedSources = [source("users", "succeeded", { count: 0 })];
@@ -2452,10 +2529,14 @@ describe("DataSyncPanel", () => {
     await act(async () => { await Promise.resolve(); });
     expect(view.container).toBeEmptyDOMElement();
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-    expect(api.getRun).toHaveBeenCalledTimes(2);
-    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+    expect(api.getRun).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
     expect(view.container).toBeEmptyDOMElement();
     await act(async () => { view.rerenderPanel({ active: true }); });
+    expect(api.getRun).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(api.getRun).toHaveBeenCalledTimes(2);
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
     expect(within(screen.getByRole("dialog", { name: "Sync run details" })).getByText("Sync complete")).toBeVisible();
     expect(screen.queryByText("latest-run", { selector: "code" })).not.toBeInTheDocument();
     expect(screen.getByText("exact-run", { selector: "code" })).toBeVisible();
@@ -2557,7 +2638,7 @@ describe("DataSyncPanel", () => {
     }
   });
 
-  it("aborts hidden state and exact-run requests on unmount and ignores their late responses", async () => {
+  it("aborts visible state and exact-run requests on unmount and ignores their late responses", async () => {
     vi.useFakeTimers();
     let resolveState!: (value: DataSyncState) => void;
     let resolveRun!: (value: DataSyncRun) => void;
@@ -2566,7 +2647,7 @@ describe("DataSyncPanel", () => {
     const onChanged = vi.fn();
     const onSetupStatusChange = vi.fn();
     const view = renderPanel({
-      active: false, requestedRunId: "exact-run", onSourcesChanged: onChanged, onSetupStatusChange,
+      active: true, requestedRunId: "exact-run", onSourcesChanged: onChanged, onSetupStatusChange,
     });
     await act(async () => { await Promise.resolve(); });
     const stateSignal = api.getState.mock.calls[0][0].signal as AbortSignal;

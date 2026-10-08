@@ -8,10 +8,12 @@ import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
 import { useSavedQueryClient } from "../savedQueries";
 import { useReportPage } from "../useReportPage";
+import { isExpiredSelection } from "../selectedRead";
 import { usageCount, usageDate } from "../usageInsights";
 import { ReportPageControls, ReportReadStatus } from "./ReportPageControls";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { AgentUsageTrend } from "./AgentUsageTrend";
+import { UserDetailModal } from "./UserDetailModal";
 import { usagePeriodLabel } from "../agentUsageTrends";
 import "./agentInsights.css";
 
@@ -275,8 +277,8 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
     setCursor(nextCursor);
   }
   const selectionInvalidated = [history.error, ...(usesSummary ? [summary.error, associations.error] : [])].some(cause =>
-    cause instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(cause.code));
-  const historySelectionInvalidated = history.error instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(history.error.code);
+    cause instanceof ApiError && !isExpiredSelection(cause) && ["selection_invalidated", "inventory_changed"].includes(cause.code));
+  const historySelectionInvalidated = history.error instanceof ApiError && !isExpiredSelection(history.error) && ["selection_invalidated", "inventory_changed"].includes(history.error.code);
   useEffect(() => {
     if (selectionInvalidated || usesSummary && changed) recoverInventory(historySelectionInvalidated ? "history" : "users");
   }, [selectionInvalidated, usesSummary, changed, historySelectionInvalidated, recoverInventory]);
@@ -358,7 +360,7 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
       {usersRequested && !usersInvalidated && !mismatched && summary.data?.status === "linked" && context
         && context.reportSetId === requestedSetId && usersContextKey === validatedUsersContext
         ? <AgentUsers key={usersContextKey}
-        recordId={record.id} context={context} revision={dataRevision} inventorySelectionId={inventorySelectionId}
+        recordId={record.id} agentName={record.displayName} context={context} revision={dataRevision} inventorySelectionId={inventorySelectionId}
         setId={reportOverride} revalidating={revalidating} active={view === "users" && Boolean(usage)}
         onReady={usageReady} onInvalidated={recoverInventory} onRestartSelection={restartUsage} /> : null}
       {view === "users" && canManageViewedReport && !usersInvalidated && !changed
@@ -418,11 +420,14 @@ function targetLabel(target: CandidateAgentUsageAssociations["value"][number]["t
 function UsageMetric({ label, value }: { label: string; value: string }) {
   return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong></dd></div>;
 }
-function AgentUsers({ recordId, context, revision, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active }: {
-  recordId: string; context: CandidateAgentUsageSummary["context"]; revision: number; onRestartSelection: () => void;
+function AgentUsers({ recordId, agentName, context, revision, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active }: {
+  recordId: string; agentName: string; context: CandidateAgentUsageSummary["context"]; revision: number; onRestartSelection: () => void;
   inventorySelectionId?: string; setId?: string; onInvalidated: () => void; onReady: () => void; revalidating: boolean; active: boolean;
 }) {
   const [search, setSearch] = useState("");
+  const [investigatedUser, setInvestigatedUser] = useState<string>();
+  const investigationTrigger = useRef<HTMLButtonElement | null>(null);
+  if (!active && investigatedUser) setInvestigatedUser(undefined);
   const [requested, setRequested] = useState(active);
   const [readRevision, setReadRevision] = useState(revision);
   if (active && !requested) setRequested(true);
@@ -447,10 +452,20 @@ function AgentUsers({ recordId, context, revision, onRestartSelection, inventory
     {data?.value.length ? <div className="table-shell"><table className="agent-insight-table">
       <caption className="sr-only">Users of this agent in this CSV report</caption>
       <thead><tr><th scope="col">User</th><th scope="col">Responses</th></tr></thead>
-      <tbody>{data.value.map(user => <tr key={user.username}><th scope="row">{user.displayName !== user.username
-        ? <><span>{user.displayName}</span><small>{user.username}</small></> : user.username}</th><td>{usageCount(user.responses)}</td></tr>)}</tbody>
+      <tbody>{data.value.map(user => <tr key={user.username}><th scope="row">
+        <button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" disabled={read.loading || revalidating || Boolean(changed)}
+          aria-label={`View logs for ${user.displayName} on ${agentName}`} onClick={event => {
+            investigationTrigger.current = event.currentTarget;
+            setInvestigatedUser(user.username);
+          }}>{user.displayName !== user.username
+            ? <><span>{user.displayName}</span><small>{user.username}</small></> : user.username}</button>
+        </th><td>{usageCount(user.responses)}</td></tr>)}</tbody>
     </table></div> : data ? <p>{data.counts.filtered > 0 ? "No users on this page. Use the page controls to continue."
       : normalizedSearch ? "No users match your search." : "No users listed in this report."}</p> : null}
     <ReportPageControls {...read} data={data} loading={read.loading || revalidating} disabled={Boolean(changed)} label="users" />
+    {investigatedUser && !changed ? <UserDetailModal key={investigatedUser} identity={investigatedUser} kind="report"
+      selectionId={context.selectionId} initialTab="purview" investigationAgent={{ recordId, name: agentName }}
+      returnFocusTo={investigationTrigger} closeLabel="Close user logs" onClose={() => setInvestigatedUser(undefined)}
+      onRestartSelection={onRestartSelection} onSelectionInvalidated={onInvalidated} /> : null}
   </section>;
 }

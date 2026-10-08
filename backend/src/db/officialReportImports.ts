@@ -13,7 +13,7 @@ import { OfficialReportHistory } from "./officialReportHistory.js";
 import { streamOfficialReport, officialReportLimits, type OfficialRow, type StreamedOfficialReport } from "../services/officialReportStream.js";
 import { reportBase } from "../services/officialReportFields.js";
 import type { OfficialUsageMetadata, OfficialUsageReportKind } from "../types/officialReportRecords.js";
-import type { OfficialReportBundleInspection } from "../types/officialReportApi.js";
+import type { OfficialReportBundleAcceptance, OfficialReportBundleInspection } from "../types/officialReportApi.js";
 import { CursorCodec, type SelectionIdentity } from "../services/dataSelections.js";
 import { measurePublication } from "../services/peakMemory.js";
 import { completeReportVersionSql } from "./reportCapacitySchema.js";
@@ -326,11 +326,14 @@ export class OfficialReportImports {
     });
   }
 
-  acceptBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
+  acceptBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     return settleAcceptance(() => this.acceptReviewedBundle(identity, bundleId, input, signal), signal);
   }
-  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
+  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     confirmationInput(input, "bundleHash"); revision(input.expectedActiveRevision);
+    if (input.preserveSelection !== undefined && typeof input.preserveSelection !== "boolean") {
+      throw new AppError(400, "invalid_import_intent", "Preserving the report selection must be a boolean.");
+    }
     const receipt = await this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
       return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at FROM official_usage_bundle_receipts r
@@ -348,7 +351,7 @@ export class OfficialReportImports {
       throw new AppError(409, "bundle_fence_mismatch", "Review the current complete bundle before accepting.");
     }
     return this.acceptStages(identity, preview.stages.map(stage => ({ ...stage, expectedActiveRevision: input.expectedActiveRevision })), signal,
-      { bundleId, hash: input.bundleHash });
+      { bundleId, hash: input.bundleHash, preserveSelection: input.preserveSelection });
   }
   accept(identity: SelectionIdentity, input: ReportAcceptance, signal?: AbortSignal) {
     confirmationInput(input, "contentHash"); revision(input.expectedActiveRevision);
@@ -383,7 +386,7 @@ export class OfficialReportImports {
       stages.at(-1)!.version, result.activeRevision, result.complete]);
   }
 
-  private async acceptStages(identity: SelectionIdentity, inputs: readonly ReportAcceptance[], parent?: AbortSignal, bundle?: { bundleId: string; hash: string }) {
+  private async acceptStages(identity: SelectionIdentity, inputs: readonly ReportAcceptance[], parent?: AbortSignal, bundle?: { bundleId: string; hash: string; preserveSelection?: boolean }) {
     if (!inputs.length || inputs.length > 3) throw unavailable();
     await this.history.ensure(identity.tenantId);
     const prepared = await this.connections.run(async client => {
@@ -589,13 +592,15 @@ export class OfficialReportImports {
             const ends = versions.map(row => row.reporting_end as string | null).filter((value): value is string => value !== null).sort();
             await client.query(`UPDATE official_usage_sets SET complete=true,accepted_at=clock_timestamp(),content_hash=$2,reporting_start=$3,reporting_end=$4
               WHERE id=$1`, [setId, contentHash, starts[0] ?? null, ends.at(-1) ?? null]);
-            await this.history.accepted(client, identity.tenantId, setId, prepared.correctionOf);
+            const historyRevision = await this.history.accepted(client, identity.tenantId, setId, prepared.correctionOf);
+            // History survives deletion, so later imports cannot reset the first-report exception.
+            const firstReport = historyRevision === "1" && !state.active_set_id;
             const activePeriod = state.active_set_id && !prepared.correctionOf ? (await client.query(
               "SELECT reporting_start::text,reporting_end::text FROM official_usage_sets WHERE tenant_id=$1 AND id=$2",
               [identity.tenantId, state.active_set_id])).rows[0] : undefined;
             const backfill = activePeriod?.reporting_end && (!ends.length
               || `${ends.at(-1)}/${starts[0] ?? ""}` < `${activePeriod.reporting_end}/${activePeriod.reporting_start ?? ""}`);
-            if (!state.active_set_id || prepared.correctionOf === state.active_set_id || !prepared.correctionOf && !backfill) {
+            if (firstReport || !bundle?.preserveSelection && (!state.active_set_id || prepared.correctionOf === state.active_set_id || !prepared.correctionOf && !backfill)) {
               revision = (await client.query(`UPDATE official_usage_state SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp()
                 WHERE tenant_id=$1 RETURNING revision::text`, [identity.tenantId, setId])).rows[0].revision;
             }

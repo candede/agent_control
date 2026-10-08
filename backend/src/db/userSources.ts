@@ -18,7 +18,7 @@ const activityMatchCounts = new WeakMap<pg.Pool, Map<string, number>>();
 export type UserSourceMetadataSet = { directory: UserSourceMetadata; app_activity: UserSourceMetadata };
 export type UserSourceReadContext = {
   metadata: UserSourceMetadataSet; evaluatedAt: Date; scope: UserSourceScope;
-  selection: { id: string; revision: string; expiresAt: string; evaluatedAt: string };
+  selection: import("../types/dataSelection.js").SelectedRead;
   query: UserSourceFilter; queryHash: string;
 };
 
@@ -139,7 +139,7 @@ export class UserSourcesRepository {
       const roots: DependencyRoot[] = [{ kind: "user_sources", scopeId: stateId, revision: state.epoch, expiresAt: expiry }];
       for (const source of Object.values(metadata)) {
         if (source.generationId) roots.push({ kind: "generation", scopeId: source.scopeId!, generationId: source.generationId,
-          revision: source.revision!, expiresAt: new Date(source.expiresAt!) });
+          revision: source.revision!, expiresAt: new Date(evaluatedAt.getTime() + 30 * 60_000) });
       }
       const refresh = metadata.app_activity.reportRefreshDate;
       const transition = refresh === null ? null : new Date(Date.parse(`${refresh}T23:59:59.999Z`) + 4 * 86_400_000);
@@ -162,7 +162,7 @@ export class UserSourcesRepository {
         AND s.source=requested.source AND s.selector='complete'
       LEFT JOIN data_generation_heads h ON h.scope_id=s.id
       LEFT JOIN data_generations g ON g.id=h.generation_id AND g.state='published'
-        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>$4
+        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
         AND EXISTS(SELECT 1 FROM user_source_attempts proof WHERE proof.generation_id=g.id AND proof.status='available')
       LEFT JOIN user_source_attempts success ON success.generation_id=g.id AND success.status='available'
       LEFT JOIN LATERAL (SELECT attempt.status,attempt.error_code,attempt.message,attempt.observed_count,attempt.report_period,attempt_generation.created_at FROM user_source_attempts attempt
@@ -170,11 +170,12 @@ export class UserSourcesRepository {
         WHERE attempt.scope_id=s.id AND attempt_generation.scope_id=s.id
           AND attempt_generation.scope_epoch=s.epoch AND attempt_generation.session_epoch=s.session_epoch
         ORDER BY attempt_generation.created_at DESC,attempt_generation.id DESC LIMIT 1) latest ON true`,
-    [scope.tenantId, scope.principalId, scope.tokenMode, evaluatedAt])).rows;
+    [scope.tenantId, scope.principalId, scope.tokenMode])).rows;
     const metadata = Object.fromEntries(rows.map(row => {
       const available = row.generation_id !== null;
       const state = !available ? "unavailable"
-        : row.source === "app_activity" && row.report_refresh_date !== null && !isCopilotAppActivityFresh(row.report_refresh_date, evaluatedAt) ? "stale"
+        : row.expires_at <= evaluatedAt
+          || row.source === "app_activity" && row.report_refresh_date !== null && !isCopilotAppActivityFresh(row.report_refresh_date, evaluatedAt) ? "stale"
           : row.source === "app_activity" && row.report_refresh_date === null ? "partial"
           : row.attempt_status === "available" || row.attempt_status === "running" ? "available" : "partial";
       const value: UserSourceMetadata = {
@@ -237,7 +238,8 @@ export class UserSourcesRepository {
     return { metadata, evaluatedAt: selected.selection.evaluated_at,
       scope: { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: row.token_mode },
       selection: { id: selected.selection.id, revision: selected.selection.revision,
-        expiresAt: selected.selection.expires_at.toISOString(), evaluatedAt: selected.selection.evaluated_at.toISOString() },
+        expiresAt: selected.selection.expires_at.toISOString(), evaluatedAt: selected.selection.evaluated_at.toISOString(),
+        validatedAt: selected.selection.validated_at.toISOString() },
       query, queryHash: selected.selection.query_hash };
   }
 
@@ -548,7 +550,7 @@ export function userSourceObjectIds(ids: readonly string[]) {
 export async function userSourcePeopleInRead(
   client: pg.PoolClient, scope: UserSourceScope,
   directory: { generationId: string; observedAt: Date } | null,
-  ids: readonly string[], evaluatedAt: Date,
+  ids: readonly string[], evaluatedAt: Date, includePeopleCache = true,
 ): Promise<UserSourcePeople[]> {
   const requested = userSourceObjectIds(ids);
   if (!requested.length) return [];
@@ -559,9 +561,9 @@ export async function userSourcePeopleInRead(
     LEFT JOIN directory_user_rows d ON d.generation_id=$3 AND d.tenant_id=$1 AND d.identity=requested.id
       AND EXISTS(SELECT 1 FROM data_scope_epochs s WHERE s.id=d.scope_id AND s.principal_id=$2 AND s.token_mode=$6)
     LEFT JOIN agent_people_cache c ON c.tenant_id=$1 AND c.principal_id=$2
-      AND c.object_id=requested.id::uuid AND c.expires_at>$5
+      AND c.object_id=requested.id::uuid AND c.expires_at>$5 AND $7::boolean
     WHERE d.identity IS NOT NULL OR c.object_id IS NOT NULL ORDER BY requested.id COLLATE "C"`,
-  [scope.tenantId, scope.principalId, directory?.generationId ?? null, requested, evaluatedAt, scope.tokenMode])).rows;
+  [scope.tenantId, scope.principalId, directory?.generationId ?? null, requested, evaluatedAt, scope.tokenMode, includePeopleCache])).rows;
   return rows.map(row => {
     const saved = row.directory_id !== null && directory !== null ? {
       objectId: row.id, displayName: row.display_name, userPrincipalName: row.upn,

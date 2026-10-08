@@ -125,7 +125,7 @@ describe("inventory dashboard exact report context", () => {
     const view = render(<AgentInventoryOverview revision={0} inventory={inventory} />);
     await screen.findByText(usageCoverageLabel(reports));
     const selector = <select aria-label="Report set"><option>Selected dates</option></select>;
-    for (const availability of ["stale", "not_selected", "deleted", "incomplete", "never_imported"] as const) {
+    for (const availability of ["stale", "not_selected", "deleted", "incomplete"] as const) {
       view.rerender(<AgentInventoryOverview revision={0} reportSelector={selector} inventory={{
         ...inventory, usageContext: { ...automaticUsageContext, reports: { ...reports, availability,
           ...(availability === "stale" ? {} : { setId: null, activeSetId: null }) } },
@@ -133,6 +133,19 @@ describe("inventory dashboard exact report context", () => {
       expect(screen.getByText(usageAvailabilityLabel(availability)).closest(".agent-report-context")).not.toBeNull();
       expect(screen.queryByText(usageCoverageLabel(reports))).not.toBeInTheDocument();
     }
+  });
+  it("lets the empty selector replace the duplicate never-imported status", () => {
+    const emptyInventory: UnifiedAgentInventoryPage = { ...inventory, usageContext: {
+      ...automaticUsageContext, reports: { ...reports, setId: null, activeSetId: null, availability: "never_imported" },
+    } };
+    const view = render(<AgentInventoryOverview revision={0} inventory={emptyInventory} />);
+    expect(screen.getByText("Reports not imported")).toBeVisible();
+    view.rerender(<AgentInventoryOverview revision={0} inventory={emptyInventory} reportSelector={
+      <select aria-label="Report set" disabled><option>No report sets available</option></select>
+    } />);
+    expect(screen.getByRole("combobox", { name: "Report set" })).toHaveDisplayValue("No report sets available");
+    expect(screen.queryByText("Reports not imported")).not.toBeInTheDocument();
+    expect(api.readReportPage).not.toHaveBeenCalled();
   });
   it("reads the exact inventory report set and never joins its latest summary onto a different pinned set", async () => {
     const selected = "10000000-0000-4000-8000-000000000099";
@@ -178,7 +191,7 @@ describe("inventory dashboard exact report context", () => {
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
 
-  it("rejects a different returned report set with one bounded recovery and an explicit restart", async () => {
+  it("rejects a different returned report set without automatic recovery and requires an explicit restart", async () => {
     vi.mocked(api.readReportPage).mockResolvedValue(overviewPage({
       reports: { ...reports, setId: "10000000-0000-4000-8000-000000000099" },
     }));
@@ -188,12 +201,12 @@ describe("inventory dashboard exact report context", () => {
     expect(button).toBeDisabled();
     expect(button).not.toHaveTextContent("50,000");
     expect(button).toHaveTextContent("Selected report evidence unavailable");
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
     vi.mocked(api.readReportPage).mockResolvedValueOnce(overviewPage());
     fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await waitFor(() => expect(button).toBeEnabled());
     expect(button).toHaveTextContent("50,000");
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
 
   it("withdraws failed background evidence and clears its stale error during retry", async () => {

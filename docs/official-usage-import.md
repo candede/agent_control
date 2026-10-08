@@ -37,6 +37,15 @@ after changing the setting.
 3. Add all three CSV files.
 4. Review the detected file types and row counts.
 5. Select **Import reports**.
+6. Review the saved-report summary, then select **Close** or **Add more reports**
+   to start another upload.
+
+The first complete report set imported for the tenant is selected automatically,
+so its usage is available on Agents and Users immediately. Later imports save
+reports without changing the selected report, including when no report is
+selected. Deleting earlier reports does not reset this first-import behavior.
+Closing the summary keeps you on Sync. To use a different saved report, select it
+from the report dropdown on Agents or Users.
 
 Invalid files show an actionable error and can be replaced without removing the
 valid files already selected.

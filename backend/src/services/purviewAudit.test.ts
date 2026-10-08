@@ -18,7 +18,8 @@ vi.mock("../db/pool.js", () => ({
   pool: {},
   transaction: vi.fn(() => { throw new Error("Database access is outside the worker unit-test boundary."); }),
 }));
-vi.mock("./agentInvestigations.js", () => ({
+vi.mock("./agentInvestigations.js", async original => ({
+  ...await original<typeof import("./agentInvestigations.js")>(),
   agentInvestigations: {
     resolve: vi.fn(() => { throw new Error("Saved inventory reads are outside the audit worker unit-test boundary."); }),
   },
@@ -82,6 +83,64 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Purview audit worker", () => {
+  it("binds agent identity on the server and combines it with the selected user", async () => {
+    const recordId = "agent:33333333-3333-4333-8333-333333333333";
+    const target = { botId: "44444444-4444-4444-8444-444444444444", environmentId: "environment-a",
+      applicationId: "55555555-5555-4555-8555-555555555555" };
+    const agentContext = vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "search" } }, purviewTarget: target }));
+    const fixture = setup({ agentContext });
+    await fixture.service.submit(user, { tokenMode: "delegated", idempotencyKey: "scoped-search",
+      agentRecordId: recordId, filters: { ...filters, userPrincipalNames: ["employee@example.invalid"] } });
+    expect(agentContext).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, recordId);
+    expect(fixture.repository.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      filters: expect.objectContaining({ userPrincipalNames: ["employee@example.invalid"], agent: { recordId, ...target } }),
+    }));
+    await expect(fixture.service.submit(user, { tokenMode: "delegated", idempotencyKey: "forged-target",
+      filters: { ...filters, agent: { recordId, ...target } } })).rejects.toMatchObject({ code: "invalid_audit_filters" });
+    expect(fixture.repository.submit).toHaveBeenCalledOnce();
+  });
+
+  it("scopes agent history without acquiring tokens or resolving current identities again", async () => {
+    const recordId = "agent:33333333-3333-4333-8333-333333333333";
+    const fixture = setup();
+    await fixture.service.list(user, 20, 0, "employee@example.invalid", recordId);
+    expect(fixture.repository.listJobs).toHaveBeenCalledWith(expect.anything(), 20, 0, "employee@example.invalid", recordId);
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
+  it("publishes partial coverage when the provider's successful query exceeded its record limit", async () => {
+    const fixture = setup();
+    fixture.dependencies.getQuery.mockResolvedValue({ ...query("succeeded"), isRecordCountLimitExceeded: true });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
+    expect(fixture.repository.publish.mock.calls[0][3]).toMatchObject({ complete: false, partialReason: "provider_result_limit" });
+    expect(fixture.current().status).toBe("partial");
+    await fixture.service.drain();
+  });
+
+  it("rechecks the exact agent target before publication rather than saving results for a changed identity", async () => {
+    const recordId = "agent:33333333-3333-4333-8333-333333333333";
+    const target = { recordId, botId: "44444444-4444-4444-8444-444444444444", environmentId: "environment-a",
+      applicationId: "55555555-5555-4555-8555-555555555555" };
+    const selected = { ...filters, agent: target };
+    let changed = false;
+    const agentContext = vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "search" } },
+      purviewTarget: { ...target, applicationId: changed ? "66666666-6666-4666-8666-666666666666" : target.applicationId } }));
+    const fixture = setup({ agentContext });
+    fixture.setCurrent(job({ filters: selected }));
+    fixture.dependencies.createQuery.mockResolvedValue({ ...query("running"), ...createProviderQueryBody(job().displayName, selected) });
+    fixture.dependencies.getQuery.mockResolvedValue({ ...query("succeeded"), ...createProviderQueryBody(job().displayName, selected) });
+    fixture.dependencies.listRecords.mockImplementation(async () => {
+      changed = true;
+      return { records: [], pageCount: 1, providerRowCount: 0, storedRowCount: 0, byteCount: 2,
+        unknownFieldCount: 0, complete: true, nextLink: null, partialReason: null };
+    });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
+    expect(fixture.current().errorCode).toBe("agent_identity_changed");
+    expect(fixture.repository.publish).not.toHaveBeenCalled();
+    await fixture.service.drain();
+  });
   it.each(["create", "reconcile", "records"] as const)(
     "rechecks admission around durable %s request accounting without dispatch or partial publication", async action => {
       let closed = false;
@@ -163,7 +222,7 @@ describe("Purview audit worker", () => {
     await fixture.service.list(user, 20, 40, "employee+test@example.invalid");
     expect(fixture.repository.listJobs).toHaveBeenCalledWith(expect.objectContaining({
       tenantId: user.tenantId, resultScopes: [{ kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }],
-    }), 20, 40, "employee+test@example.invalid");
+    }), 20, 40, "employee+test@example.invalid", undefined);
     expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
     expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
   });
@@ -249,7 +308,7 @@ describe("Purview audit worker", () => {
   it("reads saved agent Purview records using only server-resolved environment/bot and current authorized scopes", async () => {
     const recordId = "agent:11111111-1111-4111-8111-111111111111";
     const target = { environmentId: "environment-a", botId: "22222222-2222-4222-8222-222222222222" };
-    const agentContext = vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "saved_only" } }, purviewTarget: target }));
+    const agentContext = vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "search" } }, purviewTarget: target }));
     const fixture = setup({ agentContext });
     await expect(fixture.service.agentRecords(user, recordId, { limit: 25, offset: 50, search: "actor" }))
       .resolves.toEqual({ recordId, mode: "saved_only", value: [], count: 0, limit: 25, offset: 50 });
@@ -266,7 +325,7 @@ describe("Purview audit worker", () => {
 
   it("fails closed when saved Purview identity is missing or changes while reading", async () => {
     const recordId = "agent:11111111-1111-4111-8111-111111111111";
-    const unavailable = { context: { recordId, purview: { status: "unavailable", reason: "No exact bot identity", mode: "saved_only" } } };
+    const unavailable = { context: { recordId, purview: { status: "unavailable", reason: "No exact bot identity", mode: "search" } } };
     const agentContext = vi.fn(async () => unavailable);
     const fixture = setup({ agentContext });
     await expect(fixture.service.agentRecords(user, recordId, { limit: 25, offset: 0 })).rejects.toMatchObject({ code: "agent_investigation_unavailable" });
@@ -282,7 +341,7 @@ describe("Purview audit worker", () => {
     const fixture = setup({
       applicationIdentity: () => "application-client",
       requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision })),
-      agentContext: vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "saved_only" } },
+      agentContext: vi.fn(async () => ({ context: { recordId, purview: { status: "available", mode: "search" } },
         purviewTarget: { environmentId: "environment-a", botId: "22222222-2222-4222-8222-222222222222" } })),
     });
     fixture.repository.agentRecords.mockImplementation(async () => {

@@ -1,7 +1,7 @@
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
-import { GraphAuditSearchClient, createProviderQueryBody, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
+import { GraphAuditSearchClient, createProviderQueryBody, providerQueryMatches, scopePurviewAuditResult, validatePurviewAuditFilters } from "./graphAuditSearch.js";
 import type { PurviewAuditFilters, PurviewProviderQuery } from "../types/purviewAudit.js";
 
 const tenantId = "11111111-1111-1111-1111-111111111111";
@@ -190,14 +190,62 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it("rejects the documented conflicting GET envelope and plural service shape", async () => {
+  it("rejects a query collection in place of one query and accepts the documented plural service field", async () => {
     const wrapped = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: query() })) as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(wrapped.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_schema" });
     const plural = { ...query() } as Record<string, unknown>;
     delete plural.serviceFilter;
     plural.serviceFilters = ["Copilot"];
     const pluralClient = new GraphAuditSearchClient({ fetch: vi.fn(async () => response(plural)) as typeof fetch, wait: vi.fn(), random: () => 0 });
-    await expect(pluralClient.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(pluralClient.getQuery("token", "provider-1")).resolves.toMatchObject({ serviceFilter: "Copilot" });
+  });
+
+  it("binds agent searches to documented keywords without misusing object filters or AgentId suffixes", () => {
+    const agent = { recordId: "agent:22222222-2222-4222-8222-222222222222", botId: "22222222-2222-4222-8222-222222222222",
+      environmentId: "environment-a", applicationId: "55555555-5555-4555-8555-555555555555" };
+    const selected = validatePurviewAuditFilters({ ...filters, agent }, { now });
+    const body = createProviderQueryBody(marker, selected);
+    expect(body).toMatchObject({ keywordFilter: agent.applicationId, objectIdFilters: [] });
+    expect(providerQueryMatches({ ...query(), ...body }, marker, selected)).toBe(true);
+    expect(providerQueryMatches({ ...query(), ...body, keywordFilter: agent.botId }, marker, selected)).toBe(false);
+    expect(() => validatePurviewAuditFilters({ ...filters, agent: { ...agent, applicationId: undefined } }, { now }))
+      .toThrow(/verified application identity/);
+  });
+
+  it("retains only exact application matches from keyword results and reports unidentifiable events", async () => {
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [record()] })) as typeof fetch, wait: vi.fn(), random: () => 0 });
+    const result = await client.listRecords("token", "provider-1", tenantId);
+    const selected = { ...filters, agent: { recordId: "agent:22222222-2222-4222-8222-222222222222",
+      botId: "44444444-4444-4444-8444-444444444444", environmentId: "environment-a",
+      applicationId: "55555555-5555-4555-8555-555555555555" } };
+    expect(scopePurviewAuditResult(result, selected)).toMatchObject({ storedRowCount: 1, complete: true });
+    expect(scopePurviewAuditResult(result, { ...selected, agent: { ...selected.agent, applicationId: selected.agent.botId } }))
+      .toMatchObject({ records: [], storedRowCount: 0, complete: true });
+    expect(scopePurviewAuditResult({ ...result, records: result.records.map(row => ({ ...row, appIdentity: null })) }, selected))
+      .toMatchObject({ records: [], storedRowCount: 0, complete: false, partialReason: "audit_identity_unresolved" });
+  });
+
+  it("matches documented unique BotId even without an optional environment, but excludes a contradictory environment", async () => {
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [studioRecord()] })) as typeof fetch, wait: vi.fn(), random: () => 0 });
+    const result = await client.listRecords("token", "provider-1", tenantId);
+    const botId = "22222222-2222-4222-8222-222222222222";
+    const selected: PurviewAuditFilters = { ...filters, presetId: "copilot_studio_admin", operations: ["BotCreate"],
+      agent: { recordId: `agent:${botId}`, botId, environmentId: "environment-a" } };
+    expect(createProviderQueryBody(marker, selected)).toMatchObject({ keywordFilter: botId });
+    const matching = { ...result, records: result.records.map(row => ({ ...row, botId, environmentId: null })) };
+    expect(scopePurviewAuditResult(matching, selected)).toMatchObject({ storedRowCount: 1, complete: true });
+    expect(scopePurviewAuditResult({ ...matching, records: matching.records.map(row => ({ ...row, environmentId: "environment-b" })) }, selected))
+      .toMatchObject({ storedRowCount: 0, complete: true });
+  });
+
+  it("accepts documented count-limit metadata and rejects contradictory service binding", async () => {
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ ...query("succeeded"),
+      approximateReturnedRecordCount: 1000, recordCountLimit: 1000, isRecordCountLimitExceeded: true,
+      serviceFilters: ["Copilot"] })) as typeof fetch, wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", "provider-1")).resolves.toMatchObject({ isRecordCountLimitExceeded: true });
+    const invalid = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ ...query(), serviceFilters: ["PowerPlatform"] })) as typeof fetch,
+      wait: vi.fn(), random: () => 0 });
+    await expect(invalid.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it.each(["2", "Wed, 09 Sep 2026 12:00:02 GMT"])("uses Retry-After %s for idempotent reads and cancels retry bodies", async retryAfter => {

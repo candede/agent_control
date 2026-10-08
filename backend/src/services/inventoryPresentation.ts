@@ -31,6 +31,7 @@ function status(source: Source | undefined, kind: "graph_packages" | "power_plat
 }
 
 export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
+  const evaluatedAt = new Date(page.selection.evaluatedAt as string).getTime();
   const { graphPackages: graph, powerPlatform: native } = inventorySourceStatuses(page.freshness.sources);
   const counts = page.verificationCounts;
   const partial = page.partial || graph.state === "unavailable" || native.state !== "available";
@@ -65,9 +66,11 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
       observations: {
         graphPackages: graph.observation as UnifiedAgentPackageObservation | null,
         powerPlatform: resource && nativeObservation ? { ...nativeObservation,
-          observedAt: new Date(resource.observed_at).toISOString(), expiresAt: new Date(resource.expires_at).toISOString() } : null,
+          observedAt: new Date(resource.observed_at).toISOString(), expiresAt: new Date(resource.expires_at).toISOString(),
+          current: nativeObservation.current && new Date(resource.expires_at).getTime() > evaluatedAt } : null,
         packageSnapshots: Object.fromEntries(packages.map(member => {
-          const current = page.freshness.sources.find(source => source.scope_id === member.scope_id)?.current === true;
+          const current = page.freshness.sources.find(source => source.scope_id === member.scope_id)?.current === true
+            && new Date(member.expires_at).getTime() > evaluatedAt;
           const providerGeneration = member.catalog_generation ?? member.generation_id;
           const detail = member.residual.detailFreshness;
           return [member.native_id, {
@@ -78,7 +81,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
               && ["fresh", "stale"].includes(detail.state) ? {
                 id: member.detail_generation, snapshotId: member.detail_generation, observedAt: detail.observedAt,
                 expiresAt: detail.expiresAt, current: current && detail.state === "fresh"
-                  && Date.parse(detail.expiresAt) > Date.parse(String(page.selection.evaluatedAt)),
+                  && Date.parse(detail.expiresAt) > evaluatedAt,
               } : null,
           }];
         })),
@@ -89,7 +92,8 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     usageContext: { reports: page.reports, revision: page.selection.id,
       expiresAt: new Date(page.selection.expiresAt as string).toISOString() },
     counts: page.counts, page: page.page, selection: { id: page.selection.id, revision: String(page.selection.revision),
-      evaluatedAt: new Date(page.selection.evaluatedAt as string).toISOString(), expiresAt: new Date(page.selection.expiresAt as string).toISOString() },
+      evaluatedAt: new Date(page.selection.evaluatedAt as string).toISOString(), expiresAt: new Date(page.selection.expiresAt as string).toISOString(),
+      validatedAt: new Date(page.selection.validatedAt as string).toISOString(), publicationRevisions: page.selection.publicationRevisions },
     freshness: page.freshness,
     summary: page.summary as UnifiedAgentInventorySummary, scopeSummary: page.scopeSummary as UnifiedAgentInventorySummary,
     filteredSummary: page.filteredSummary as UnifiedAgentInventorySummary,

@@ -8,6 +8,34 @@ vi.mock("../api/reportData", () => ({ createReportExport: vi.fn(), reportExportS
   reportExportDownload: (id: string) => `/api/data-exports/${id}/download` }));
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+it("finishes an admitted frozen export after the read lease ends without admitting another export", async () => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "frozen-artifact" });
+  vi.mocked(reportExportStatus).mockResolvedValue({ id: "frozen-artifact", status: "ready", rows: 3, bytes: 100,
+    expiresAt: "2030-01-01T00:00:00Z", error: null, limit: null, observed: null });
+  let active = true;
+  const props = { selectionId: "frozen-selection", kind: "official_users" as const, label: "Export", admissionAllowed: () => active };
+  const view = render(<ReportExportButton {...props} />);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
+  const signal = vi.mocked(createReportExport).mock.calls[0][1]!;
+  active = false;
+  view.rerender(<ReportExportButton {...props} />);
+  expect(signal.aborted).toBe(false);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(screen.getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/data-exports/frozen-artifact/download");
+  expect(screen.getByRole("button", { name: "Export" })).toBeDisabled();
+  expect(createReportExport).toHaveBeenCalledOnce();
+  expect(reportExportStatus).toHaveBeenCalledExactlyOnceWith("frozen-artifact", signal);
+});
+
+it("checks export admission against the monotonic lease before the timer renders", () => {
+  let active = true;
+  render(<ReportExportButton selectionId="frozen" kind="official_users" label="Export" admissionAllowed={() => active} />);
+  active = false;
+  fireEvent.click(screen.getByRole("button", { name: "Export" }));
+  expect(createReportExport).not.toHaveBeenCalled();
+});
+
 it("aborts and clears a disabled owner's pending state, then permits a new explicit request", async () => {
   vi.useFakeTimers();
   vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });

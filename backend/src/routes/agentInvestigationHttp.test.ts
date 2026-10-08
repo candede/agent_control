@@ -74,7 +74,7 @@ beforeEach(() => {
 describe("agent investigation HTTP wiring", () => {
   it("protects explicit resolution with Viewer, CSRF, narrow capability and an exact record-only body", async () => {
     const result = { recordId, displayName: "Agent", defender: { status: "available" as const, entraAgentIds: [id] },
-      purview: { status: "unavailable" as const, mode: "saved_only" as const } };
+      purview: { status: "unavailable" as const, mode: "search" as const, presets: [] } };
     const resolve = vi.spyOn(agentIdentityResolution, "resolve").mockResolvedValue(result);
     const available = vi.spyOn(capabilities, "requireAvailable").mockResolvedValue({
       capabilityId: "graph.agentIdentity.read", authorized: true, fresh: true, status: "available",
@@ -115,33 +115,34 @@ describe("agent investigation HTTP wiring", () => {
     }
     for (const method of [defenderHunting.get, defenderHunting.list, defenderHunting.rows, defenderHunting.qualificationEvidence, defenderHunting.retainedScopes]) {
       expect(vi.mocked(method).mock.calls.length).toBeGreaterThan(0);
-      for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toBe(recordId);
+      for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toEqual({ agentRecordId: recordId });
     }
   });
 
   it.each(["body", "query"] as const)("forwards %s context through submission, qualification, resume, cancellation, delete and revoke", async location => {
+    const userObjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     for (const [path, method, expected] of [
       ["jobs", "POST", 202], ["qualifications", "POST", 201], [`qualifications/${id}/start`, "POST", 202],
       [`jobs/${id}/resume`, "POST", 202], [`jobs/${id}/cancel`, "POST", 200], [`jobs/${id}`, "DELETE", 204],
       [`retained-scopes/${id}/revoke`, "POST", 200],
     ] as const) {
-      const response = await fetch(`${origin}/api/hunting/${path}${location === "query" ? `?agentRecordId=${encodeURIComponent(recordId)}` : ""}`, { method,
+      const response = await fetch(`${origin}/api/hunting/${path}${location === "query" ? `?agentRecordId=${encodeURIComponent(recordId)}&userObjectId=${userObjectId}` : ""}`, { method,
         headers: { "content-type": "application/json", "x-csrf-token": "test-csrf" },
-        body: JSON.stringify({ ...(location === "body" ? { agentRecordId: recordId } : {}),
+        body: JSON.stringify({ ...(location === "body" ? { agentRecordId: recordId, userObjectId } : {}),
           ...(path.includes("revoke") || method === "DELETE" ? { confirmation: id } : { tokenMode: "delegated", filters: {} }) }) });
       expect(response.status, path).toBe(expected); await response.text();
     }
     for (const method of [defenderHunting.submit, defenderHunting.approveQualification]) {
-      expect(method).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentRecordId: recordId }));
+      expect(method).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentRecordId: recordId, userObjectId }));
     }
     for (const method of [defenderHunting.start, defenderHunting.startQualification, defenderHunting.cancel, defenderHunting.delete, defenderHunting.revokeRetainedScope]) {
-      for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toBe(recordId);
+      for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toEqual({ agentRecordId: recordId, userObjectId });
     }
   });
 
   it("keeps context/Purview saved reads Viewer-only and hunting mutations CSRF-protected", async () => {
     const context = vi.spyOn(agentInvestigations, "resolve").mockResolvedValue({ context: { recordId, displayName: "Agent",
-      defender: { status: "unavailable", entraAgentIds: [] }, purview: { status: "unavailable", mode: "saved_only" } } });
+      defender: { status: "unavailable", entraAgentIds: [] }, purview: { status: "unavailable", mode: "search", presets: [] } } });
     vi.mocked(purviewAudit.agentRecords).mockResolvedValue({ recordId, mode: "saved_only", count: 0, value: [], limit: 50, offset: 0 });
     try {
       for (const path of ["context", "purview"]) {

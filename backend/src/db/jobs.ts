@@ -376,12 +376,8 @@ export class JobRepository {
     });
   }
 
-  async settleInventoryControls(lease: Lease, itemId: string, signal: AbortSignal, authorize: () => Promise<void>) {
-    if ((await this.database.query(`SELECT 1 FROM job_items item JOIN jobs job ON job.id=item.job_id
-      WHERE item.id=$1 AND job.id=$2 AND job.tenant_id=$3 AND job.principal_id=$4 AND item.source_generation_id IS NOT NULL`,
-    [itemId, lease.jobId, lease.scope.tenantId, lease.scope.principalId])).rowCount) {
-      await new InventoryRuntime(this.database, authorize).settleControls(lease.scope, signal);
-    }
+  async settleInventoryControls(scope: DataScope, signal: AbortSignal, authorize: () => Promise<void>) {
+    await new InventoryRuntime(this.database, authorize).settleControls(scope, signal);
   }
 
   async markSent(lease: Lease, itemId: string, observedPrestateHash: string) {

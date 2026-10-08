@@ -107,6 +107,7 @@ export class OfficialReportHistory {
     }
     await client.query(`INSERT INTO official_usage_history_memberships(tenant_id,set_id,valid_from_revision,visibility)
       VALUES($1,$2,$3,'retained')`, [tenantId, setId, revision]);
+    return revision;
   }
 
   async invalidate(client: pg.PoolClient, tenantId: string, setId: string, remove: boolean) {

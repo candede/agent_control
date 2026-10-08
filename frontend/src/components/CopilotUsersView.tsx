@@ -4,6 +4,7 @@ import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
 import { normalizeReportSearch } from "../api/reportData";
 import { useReportPage, useReportPrincipalScope } from "../useReportPage";
+import { isExpiredSelection, withdrawsSelectedRead } from "../selectedRead";
 import type { UsersRouteState } from "../workbenchRouting";
 import { usageCount, isValidLowResponseThreshold, usageDate } from "../usageInsights";
 import { ReportReadStatus, ReportPageControls } from "./ReportPageControls";
@@ -73,7 +74,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   const [filters, setFilters] = useState<ReportQuery>({ cohort: "licensed", sort: "responses", order: "desc" });
   const [threshold, setThreshold] = useState("5");
   const [lastThreshold, setLastThreshold] = useState(5);
-  const [selected, setSelected] = useState<{ id: string; selectionId: string; queryKey: string }>();
+  const [selected, setSelected] = useState<{ id: string; selectionId: string; queryKey: string; replacing?: boolean }>();
   const [unresolvedSelectionId, setUnresolvedSelectionId] = useState<string>();
   const focus = useRef<HTMLInputElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -82,17 +83,24 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   const query = { ...filters, search: normalizeReportSearch(route.search) || undefined, setId: route.reportSetId?.toLowerCase(),
     lowResponseThreshold: valid ? Number(threshold) : lastThreshold };
   const read = useReportPage<CombinedUser>("copilot-usage/users", query, revision);
-  const queryKey = JSON.stringify([query, revision, read.recoveryRevision]);
+  const queryKey = JSON.stringify([query, revision, read.selectionRevision]);
   const data = read.data;
   const [initialReadComplete, setInitialReadComplete] = useState(false);
   if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
   const [hasShownPageControls, setHasShownPageControls] = useState(false);
   const showPageControls = Boolean(read.loading || read.error || read.invalidated || data && data.counts.filtered > 0);
   if (!hasShownPageControls && initialReadComplete && showPageControls) setHasShownPageControls(true);
-  if (selected && (selected.queryKey !== queryKey || read.error || read.invalidated || !data && !read.loading
-    || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
+  if (selected && withdrawsSelectedRead(read.error)) setSelected(undefined);
+  else if (selected?.replacing && data && !read.loading && data.selection.id !== selected.selectionId) {
+    setSelected({ id: selected.id, selectionId: data.selection.id, queryKey });
+  } else if (selected && !selected.replacing && (selected.queryKey !== queryKey || read.error && !isExpiredSelection(read.error)
+    || read.invalidated || !data && !read.loading || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
   if (unresolvedSelectionId && (!data || data.selection.id !== unresolvedSelectionId || !data.summary.unresolvedIdentities)) setUnresolvedSelectionId(undefined);
-  function restartSelection() { setSelected(undefined); setUnresolvedSelectionId(undefined); read.restart(); }
+  function restartSelection() {
+    setSelected(current => current ? { ...current, replacing: true } : undefined);
+    setUnresolvedSelectionId(undefined);
+    read.restart();
+  }
   if (!initialReadComplete && read.loading && !data && !read.error && !read.invalidated) {
     return <WorkspaceSkeleton view="users" contentOnly />;
   }
@@ -111,7 +119,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
     {data && !read.loading && ["stale", "unavailable"].includes(data.sources.app_activity.state) ? <p className="copilot-users-notice" role="status">
       Office app activity {data.sources.app_activity.state === "stale" ? "is out of date. Run Users sync in Sync." : "unavailable. Review the connection in Permissions."}</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
-      <UserActivityFilters path="copilot-usage/users" selectionId={read.selectionId} onRestartSelection={restartSelection}
+      <UserActivityFilters path="copilot-usage/users" selectionId={read.frozenData?.selection.id} onRestartSelection={restartSelection}
       onSelectionInvalidated={read.invalidateSelection}
       values={{ company: filters.company, department: filters.department, cohort: filters.cohort ?? "licensed", lowResponseThreshold: threshold }}
       cohorts={cohorts.map(([value, label]) => ({ value, label: value === "licensed" ? "All paid users" : label }))} defaultCohort="licensed" cohortLabel="Activity"
@@ -121,14 +129,16 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
       }} onSort={value => { const [sort, order] = value.split(":"); setFilters({ ...filters, sort: sort as ReportQuery["sort"], order: order as ReportQuery["order"] }); }}
       onClear={() => { setFilters({ cohort: "licensed", sort: filters.sort, order: filters.order }); setThreshold("5"); change({ ...route, search: "", page: 0 }); }}
-      exportButton={<ReportExportButton key={read.selectionId} kind="copilot_users" selectionId={read.selectionId} label="Export users CSV"
-        onSelectionInvalidated={read.invalidateSelection} disabled={!read.selectionId || !valid} />} />
+      exportButton={<ReportExportButton key={read.frozenData?.selection.id} kind="copilot_users" selectionId={read.frozenData?.selection.id} label="Export users CSV"
+        onOwnSelection={read.ownPublication}
+        admissionAllowed={() => read.isCurrentData(true)}
+        onSelectionInvalidated={read.invalidateSelection} disabled={!read.frozenData || !valid} />} />
       <div className="table-shell copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
         <table className="agent-table copilot-users-table reported-users-table"><thead><tr>{([["User", "name"], ["Agent responses", "responses"], ["Agents used", "agentsUsed"],
           ["Company", "company"], ["Department", "department"], ["Last activity", "lastActivity"]] as const).map(([label, sort]) =>
           <ReportSortHeading key={sort} label={label} sort={sort} query={filters} onChange={setFilters} />)}</tr></thead>
           <tbody>{data?.value.map(user => <tr key={user.directory.objectId}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
-            trigger.current = event.currentTarget; setSelected({ id: user.directory.objectId, selectionId: data.selection.id, queryKey });
+            read.ownPublication(); trigger.current = event.currentTarget; setSelected({ id: user.directory.objectId, selectionId: data.selection.id, queryKey });
           }}>
             {user.directory.displayName || user.directory.userPrincipalName}</button><small>{user.directory.userPrincipalName}</small>
             {user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</th>
@@ -159,7 +169,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
           onSelectionInvalidated={read.invalidateSelection} /> : null}
       </details>
     </> : null}
-    {selected ? <UserDetailModal key={selected.selectionId + selected.id} identity={selected.id} selectionId={selected.selectionId} kind="directory"
+    {selected ? <UserDetailModal key={selected.id} identity={selected.id} selectionId={selected.selectionId} kind="directory"
       returnFocusTo={trigger} closeLabel="Close user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
       dataRevision={revision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
       onSelectionInvalidated={read.invalidateSelection} /> : null}

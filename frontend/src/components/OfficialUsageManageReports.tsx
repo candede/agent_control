@@ -10,7 +10,7 @@ import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
 
 type Props = { revision: number; canManage?: boolean; onChanged?: () => void; onViewSnapshot: (id: string) => void; onCorrect?: (id: string) => void };
-type Target = { report: ReportHistorySet; evidence: ReportMetadata };
+type Target = { report: ReportHistorySet; evidence: ReportMetadata; canAct: () => boolean };
 type Recovery = "prepare" | "refresh";
 export function OfficialUsageManageReports(props: Props) {
   const capability = useContext(CapabilityContext), scope = useReportPrincipalScope();
@@ -67,7 +67,7 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     setDenied(false); setNotice(undefined); setReload(value => ({ sequence: value.sequence + 1, revision })); onChanged?.();
   }
   async function prepare(nextTarget: Target) {
-    if (interactionSequence.current !== interaction || !canManage || busy || operation.current && !operation.current.controller.signal.aborted) return;
+    if (interactionSequence.current !== interaction || !canManage || !nextTarget.canAct() || busy || operation.current && !operation.current.controller.signal.aborted) return;
     if (!target) {
       const focused = document.activeElement;
       returnFocus.current = focused instanceof HTMLElement && focused !== document.body && focused !== document.documentElement ? focused : null;
@@ -77,6 +77,7 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     try {
       const next = await previewReportOperation(nextTarget.report.id, "delete", abort.signal);
       if (abort.signal.aborted) return;
+      if (!nextTarget.canAct()) { dismiss(); return; }
       const evidence = nextTarget.evidence;
       if (next.operation !== "delete" || next.setId !== nextTarget.report.id || next.activeRevision !== evidence.activeRevision
         || next.historyRevision !== evidence.historyRevision || next.historyEpoch !== evidence.historyEpoch) {
@@ -93,7 +94,7 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     }
   }
   async function remove() {
-    if (interactionSequence.current !== interaction || !confirmation || !target || !canManage || busy || operation.current && !operation.current.controller.signal.aborted) return;
+    if (interactionSequence.current !== interaction || !confirmation || !target?.canAct() || !canManage || busy || operation.current && !operation.current.controller.signal.aborted) return;
     retireHandlers();
     const abort = new AbortController(); operation.current = { controller: abort, kind: "confirm" };
     setBusy("confirm"); setError(undefined);
@@ -121,9 +122,11 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
       : <OfficialUsageHistoryPanel key={reload.sequence} revision={revision}
         freshCaptureOnMount={reload.sequence > 0 && reload.revision === revision} onSelect={onViewSnapshot}
         onSelectionRetired={() => { if (target && recovery !== "refresh") dismiss(); }}
-        admin={canManage ? { busy: Boolean(busy), onDelete: (report, evidence) => void prepare({ report, evidence }) } : undefined} />}
+        admin={canManage ? { busy: Boolean(busy), onDelete: (report, evidence, canAct) => void prepare({ report, evidence, canAct }) } : undefined} />}
     {target && canManage ? <DeleteReportDialog report={target.report} active={target.report.id === target.evidence.activeSetId}
-      ready={Boolean(confirmation)} busy={busy} error={error} recovery={recovery} onCancel={dismiss}
+      ready={Boolean(confirmation) && target.canAct()} busy={busy}
+      error={error ?? (!busy && !target.canAct() ? "This saved selection is no longer eligible. Reload report history before deleting." : undefined)}
+      recovery={!busy && !target.canAct() ? "refresh" : recovery} onCancel={dismiss}
       onConfirm={() => void remove()} onRetry={() => void prepare(target)} onReload={reloadHistory}
       onCorrect={onCorrect ? () => { if (dismiss()) onCorrect(target.report.id); } : undefined} /> : null}
   </section>;

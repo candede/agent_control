@@ -1,5 +1,6 @@
 import type { CombinedUser, ReportAgent, ReportHistorySet, ReportMetadata, ReportOverviewAgent, ReportPage, ReportSummary, ReportUser } from "../../../backend/src/types/officialReportData";
-import type { UserSourceMetadata, UserSourceSelection } from "../../../backend/src/types/userSources";
+import type { UserSourceMetadata } from "../../../backend/src/types/userSources";
+import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
 export const reportSetId = "10000000-0000-4000-8000-000000000001";
 export const selectionId = "20000000-0000-4000-8000-000000000002";
 const capturedAt = Date.now();
@@ -17,12 +18,14 @@ function freeze<T>(value: T): T {
 }
 
 // One capture is reused, never renewed by a retry. Explicit captures model other owners.
-export function reportSelection(index = 2, evaluatedAt = capturedAt): UserSourceSelection {
+export function reportSelection(index = 2, evaluatedAt = capturedAt): PublishedSelectedRead {
   if (!Number.isSafeInteger(index) || index < 1 || index > 999999999999) throw new Error("Invalid report fixture selection index.");
   return {
     id: `20000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
     revision: `70000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
     evaluatedAt: new Date(evaluatedAt).toISOString(), expiresAt: new Date(evaluatedAt + 600_000).toISOString(),
+    validatedAt: new Date(evaluatedAt).toISOString(),
+    publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) },
   };
 }
 const selection = freeze(reportSelection());

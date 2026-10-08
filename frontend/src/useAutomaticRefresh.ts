@@ -1,5 +1,6 @@
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { ApiError, automaticDataSyncSourceIds, checkAutomaticRefresh, dataSyncFailureStatus, type AutomaticRefreshResult, type DataSyncSourceId } from "./api/client";
+import { isPublicationRevisions, type PublicationRevisions } from "../../backend/src/types/dataSelection";
 
 const checkIntervalMs = 60_000;
 const maximumBackoffMs = 5 * 60_000;
@@ -65,6 +66,7 @@ export function useAutomaticRefresh({
   }));
   const [observation, setObservation] = useState<Observation & { owner: string; authorization: string }>();
   const [checkingRequest, setCheckingRequest] = useState<{ owner: string; authorization: string }>();
+  const [publication, setPublication] = useState<{ owner: string; revisions: PublicationRevisions }>();
   const session = useRef<{
     owner: string;
     authorization: string;
@@ -74,14 +76,34 @@ export function useAutomaticRefresh({
     interaction: boolean;
     denied: boolean;
     sourceIssues: Map<string, SourceIssue>;
+    publicationCheckRequested: boolean;
     revisions?: AutomaticRefreshResult["revisions"];
+    admitted?: PublicationRevisions;
+    compared?: PublicationRevisions;
     jobs?: string;
   } | undefined>(undefined);
   // Retain the transport lock across effect restarts, even if an aborted transport settles late.
   const inFlight = useRef<AbortController | undefined>(undefined);
   const wake = useRef<(() => void) | undefined>(undefined);
-  const observeSources = useEffectEvent(onSourcesChanged);
+  const sourcesChanged = useRef(onSourcesChanged);
+  useLayoutEffect(() => { sourcesChanged.current = onSourcesChanged; }, [onSourcesChanged]);
   const observeJobs = useEffectEvent(onRunsChanged);
+  const comparePublication = useCallback(() => {
+    const current = session.current;
+    if (!current || current.owner !== principalKey || !current.revisions || !current.admitted) return;
+    const prior = current.compared ?? current.admitted;
+    const changed = automaticDataSyncSourceIds.filter(source => prior[source] !== current.revisions![source]);
+    // A frozen page keeps its captured vector. Neither its revalidation nor a
+    // pending page/ended lease can roll this observer acknowledgement backwards.
+    current.compared = current.revisions;
+    if (changed.length) sourcesChanged.current(changed);
+  }, [principalKey]);
+  const admitPublication = useCallback((revisions: PublicationRevisions) => {
+    const current = session.current;
+    if (current?.owner !== principalKey || !isPublicationRevisions(revisions)) return;
+    current.admitted = { ...revisions };
+    comparePublication();
+  }, [comparePublication, principalKey]);
 
   useEffect(() => {
     const changed = () => {
@@ -104,7 +126,7 @@ export function useAutomaticRefresh({
     if (session.current?.owner !== principalKey) {
       session.current = {
         owner: principalKey, authorization: authorizationKey, paused, dueAt: 0, failures: 0,
-        interaction: false, denied: false, sourceIssues: new Map(),
+        interaction: false, denied: false, sourceIssues: new Map(), publicationCheckRequested: false,
       };
     }
     const current = session.current;
@@ -155,12 +177,14 @@ export function useAutomaticRefresh({
       try {
         const result = await checkAutomaticRefresh({ signal: controller.signal });
         if (!active || controller.signal.aborted) return;
-        if (!result?.revisions || automaticDataSyncSourceIds.some(source => typeof result.revisions[source] !== "string")) {
+        if (!isPublicationRevisions(result?.revisions)) {
           throw new Error("The server returned invalid automatic refresh status.");
         }
-        const changed = automaticDataSyncSourceIds.filter(source => current.revisions?.[source] !== result.revisions[source]);
         current.revisions = { ...result.revisions };
-        if (changed.length) observeSources(changed);
+        setPublication(previous => previous?.owner === principalKey
+          && automaticDataSyncSourceIds.every(source => previous.revisions[source] === result.revisions[source])
+          ? previous : { owner: principalKey, revisions: current.revisions! });
+        comparePublication();
         const jobs = JSON.stringify([result.run, result.detailJob]);
         if (jobs !== current.jobs && (current.jobs !== undefined || result.run || result.detailJob)) observeJobs();
         current.jobs = jobs;
@@ -177,7 +201,6 @@ export function useAutomaticRefresh({
           publish({ phase: "sign_in_required", message: "Sign in again to continue automatic refresh. Saved data has not been cleared." });
         } else if (cause instanceof ApiError && cause.status === 403) {
           current.denied = true;
-          current.revisions = undefined;
           publish({ phase: "permission_required", message: "Automatic refresh access was denied. Review Sync and Permissions." });
         } else {
           backoff();
@@ -188,6 +211,10 @@ export function useAutomaticRefresh({
         window.clearTimeout(timeout);
         requestTimeout = undefined;
         if (inFlight.current === controller) inFlight.current = undefined;
+        if (current.publicationCheckRequested) {
+          current.publicationCheckRequested = false;
+          if (!current.failures) current.dueAt = 0;
+        }
         // A new account/permission scope may have been waiting for the old request to settle.
         if (!active) wake.current?.();
         else if (admitted()) timer = window.setTimeout(() => void check(), Math.max(0, current.dueAt - Date.now()));
@@ -207,11 +234,23 @@ export function useAutomaticRefresh({
       if (requestTimeout !== undefined) window.clearTimeout(requestTimeout);
       inFlight.current?.abort();
     };
-  }, [principalKey, authorizationKey, enabled, paused, availability.visible, availability.online]);
+  }, [principalKey, authorizationKey, enabled, paused, availability.visible, availability.online, comparePublication]);
 
   const status = observation?.owner === principalKey
     && (observation.authorization === authorizationKey || observation.phase === "sign_in_required") ? observation : undefined;
   return {
+    admitPublication,
+    publicationRevisions: publication?.owner === principalKey ? publication.revisions : undefined,
+    checkNow: () => {
+      const current = session.current;
+      if (current?.owner !== principalKey || current.failures) return;
+      current.dueAt = 0;
+      if (inFlight.current) {
+        current.publicationCheckRequested = true;
+        return;
+      }
+      wake.current?.();
+    },
     phase: status?.phase ?? (enabled ? "checking" as const : "ready" as const),
     checking: enabled && !paused && availability.visible && availability.online
       && checkingRequest?.owner === principalKey && checkingRequest.authorization === authorizationKey,
@@ -230,4 +269,4 @@ export function useAutomaticRefresh({
   };
 }
 
-export type AutomaticRefreshStatus = ReturnType<typeof useAutomaticRefresh>;
+export type AutomaticRefreshStatus = Omit<ReturnType<typeof useAutomaticRefresh>, "admitPublication" | "publicationRevisions" | "checkNow">;

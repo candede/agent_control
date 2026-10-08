@@ -14,7 +14,7 @@ const roles = `array_remove(ARRAY[
 
 export async function readInventoryResponsibility(client: pg.PoolClient, relation: { sql: string; values: unknown[] },
   data: ReportCurrentData, selection: Record<string, unknown>, id: string, identity: SelectionIdentity, cursors: CursorCodec,
-  options: AgentResponsibilityQuery) {
+  options: AgentResponsibilityQuery, includePeopleCache: boolean) {
   const limit = options.limit ?? 50;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
     || options.objectId !== undefined && !new RegExp(validObjectId, "i").test(options.objectId)
@@ -72,7 +72,7 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
   const evidenceIds = objectId ? [objectId] : pageRows.map(row => row.id as string);
   const evidence = new Map((await userSourcePeopleInRead(client, { ...identity, tokenMode: "delegated" },
     data.metadata.directory.generationId ? { generationId: data.metadata.directory.generationId,
-      observedAt: new Date(data.metadata.directory.observedAt!) } : null, evidenceIds, data.evaluatedAt))
+      observedAt: new Date(data.metadata.directory.observedAt!) } : null, evidenceIds, data.evaluatedAt, includePeopleCache))
     .map(person => [person.objectId, person]));
   const person = (row: Record<string, unknown>): ResponsibilityPerson => ({
     objectId: String(row.id ?? row.object_id), agentCount: exactCount(row.agent_count as string),
@@ -93,7 +93,8 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
   const more = rows.length > limit || Boolean(rows[0] && Number(rows[0].candidate_count) > pageRows.length);
   const result = {
     selection: { id, revision: String(selection.revision), evaluatedAt: new Date(selection.evaluated_at as Date).toISOString(),
-      expiresAt: new Date(selection.expires_at as Date).toISOString() },
+      expiresAt: new Date(selection.expires_at as Date).toISOString(), validatedAt: new Date(selection.validated_at as Date).toISOString(),
+      publicationRevisions: data.publicationRevisions },
     counts: { total: exactCount(counts.total), filtered: exactCount(counts.filtered) },
     page: { limit, nextCursor: encode(pageRows.at(-1), "next", reverse ? Boolean(cursor) : more),
       previousCursor: encode(pageRows[0], "previous", reverse ? more : Boolean(cursor)) },

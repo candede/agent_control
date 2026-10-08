@@ -35,7 +35,7 @@ export function ReportedUserAgents({ path, selectionId, filters, query, onQueryC
         aria-label={`${row.agentName || row.agentId}: active users without paid Copilot`} title={`Show active users without paid Copilot for report agent ${row.agentId}`}
         onClick={() => {
           if (!read.isCurrentData()) return;
-          if (!(Date.parse(data.selection.expiresAt) > Date.now())) { read.invalidateSelection(); return; }
+          if (!read.isCurrentData(true)) return;
           onFocusAgent(row.agentId, data.reports.setId!);
         }}>{row.agentName || row.agentId}</button> : row.agentName || row.agentId}<small>{row.agentId}</small></td>
         <td>{row.creatorType || "Unknown"}</td><td data-numeric>{usageCount(row.responses)}</td><td>{usageDate(row.lastActivityDateUtc)}</td></tr>)}</tbody></table></div>

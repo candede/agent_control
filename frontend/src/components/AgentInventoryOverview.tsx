@@ -85,6 +85,7 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
         <span className="agent-context-label">Report context</span>
         {reportSelector ?? <span>{usageContext ? usageCoverageLabel(usageContext.reports) : "Selected report set"}</span>}
         {usageContext && usageContext.reports.availability !== "active"
+          && !(reportSelector && usageContext.reports.availability === "never_imported")
           ? <span role="status">{usageAvailabilityLabel(usageContext.reports.availability)}</span> : null}
       </div>
     </div>

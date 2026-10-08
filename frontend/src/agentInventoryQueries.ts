@@ -1,18 +1,12 @@
 import { hashKey, isCancelledError, QueryClient, type QueryKey } from "@tanstack/react-query";
 import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage, type UnifiedAgentInventoryQuery, type UnifiedAgentInventoryUnavailable } from "./api/client";
+import { acceptSelectedRead, canReuseSelectedRead } from "./selectedRead";
 
 type InventoryRead = UnifiedAgentInventoryPage | UnifiedAgentInventoryUnavailable;
 type InventoryOutcome = { epoch: number; family?: InventoryFamily } & ({ data: InventoryRead } | { error: unknown });
 type InventoryRequest = { controller: AbortController; promise: Promise<InventoryOutcome>; readers: number };
 type InventoryFamily = { selectionId?: string; requests: Map<string, InventoryRequest> };
-const cacheMs = 30_000;
 const maximumFamilies = 4;
-
-export class AgentInventoryExpiredError extends ApiError {
-  constructor() {
-    super(409, "inventory_changed", "The saved agent inventory or usage report expired. Reload Agents.");
-  }
-}
 
 export class AgentInventoryQueries {
   private owner?: string;
@@ -21,7 +15,7 @@ export class AgentInventoryQueries {
   private readonly positions = new Map<string, number>();
   private readonly client = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, staleTime: cacheMs, gcTime: 60_000, networkMode: "always" },
+      queries: { retry: false, staleTime: Infinity, gcTime: 60_000, networkMode: "always", structuralSharing: false },
     },
   });
 
@@ -43,7 +37,7 @@ export class AgentInventoryQueries {
     const data = saved?.state.data as InventoryRead | undefined;
     if (saved?.state.status === "success" && !saved.state.isInvalidated && data && !("state" in data)
       && (!query.selectionId || data.selection.id === query.selectionId)
-      && Date.now() - saved.state.dataUpdatedAt < cacheMs && expiry(data) > Date.now()) return data;
+      && canReuseSelectedRead(data.selection)) return data;
   }
 
   private removeFamily(family: string) {
@@ -126,7 +120,7 @@ export class AgentInventoryQueries {
     const complete = (outcome: { data: InventoryRead } | { error: unknown }): InventoryOutcome =>
       ({ ...outcome, epoch: this.epoch, family: this.families.get(family) });
     const cached = this.client.getQueryData<InventoryRead>(queryKey);
-    if (recapturing || cached && ("state" in cached || expiry(cached) <= Date.now())) {
+    if (recapturing || cached && ("state" in cached || !canReuseSelectedRead(cached.selection))) {
       await this.client.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
     }
     if (signal.aborted || !ownsFamily()) throw abortedRead();
@@ -138,8 +132,12 @@ export class AgentInventoryQueries {
       const result = await this.client.fetchQuery({
         queryKey,
         queryFn: async ({ signal: requestSignal }) => {
+          const startedAt = performance.now();
           const page = await getUnifiedAgents(query, { signal: requestSignal });
-          if (!("state" in page)) assertUnexpired(page);
+          if (!("state" in page)) {
+            acceptSelectedRead(page, startedAt);
+            assertInventoryMetadata(page);
+          }
           return page;
         },
       });
@@ -148,7 +146,6 @@ export class AgentInventoryQueries {
         this.removeFamily(family);
         return complete({ data: result });
       }
-      assertUnexpired(result);
       let position = this.positions.get(key);
       const entries = this.client.getQueryCache().findAll({ queryKey: ["agent-inventory", principalKey, family] });
       if (position === undefined) {
@@ -216,34 +213,20 @@ function familyKey(query: UnifiedAgentInventoryQuery) {
   return hashKey([family]);
 }
 
-function expiry(page: UnifiedAgentInventoryPage) {
-  const timestamps = [
-    page.selection.expiresAt,
-    page.sources.graphPackages.observation?.expiresAt,
-    page.sources.powerPlatform.observation?.expiresAt,
-    page.usageContext?.reports.expiresAt,
-    page.usageContext?.expiresAt,
+function assertInventoryMetadata(page: UnifiedAgentInventoryPage) {
+  const dates = [
+    page.sources.graphPackages.observation?.expiresAt, page.sources.powerPlatform.observation?.expiresAt,
+    page.usageContext?.reports.expiresAt, page.usageContext?.expiresAt,
     ...page.value.flatMap(record => [
       record.environment?.observation.expiresAt,
-      record.observations.graphPackages?.expiresAt,
-      record.observations.powerPlatform?.expiresAt,
-      ...Object.values(record.observations.packageSnapshots).flatMap(observation => [
-        observation.expiresAt, observation.identityDetails?.current ? observation.identityDetails.expiresAt : null,
-      ]),
-      ...record.packages.map(value => value.detailFreshness?.state === "fresh" ? value.detailFreshness.expiresAt : null),
-      ...Object.values(record.people ?? {}).map(person => person?.expiresAt),
+      record.observations.graphPackages?.expiresAt, record.observations.powerPlatform?.expiresAt,
+      ...Object.values(record.observations.packageSnapshots).flatMap(value => [value.expiresAt, value.identityDetails?.expiresAt]),
+      ...record.packages.map(value => value.detailFreshness?.expiresAt),
+      ...Object.values(record.people ?? {}).map(value => value?.expiresAt),
     ]),
-  ].filter((value): value is string => typeof value === "string");
-  const dates = timestamps.map(value => Date.parse(value));
-  if (dates.some(value => !Number.isFinite(value))) {
-    throw new ApiError(500, "invalid_inventory_expiry", "The saved agent inventory contains an invalid expiration timestamp.");
-  }
-  return Math.min(...dates);
-}
-
-function assertUnexpired(page: UnifiedAgentInventoryPage) {
-  if (expiry(page) <= Date.now()) {
-    throw new AgentInventoryExpiredError();
+  ];
+  if (dates.some(value => value != null && (typeof value !== "string" || !Number.isFinite(Date.parse(value))))) {
+    throw new ApiError(502, "invalid_inventory_metadata", "The saved inventory contains malformed observation metadata.");
   }
 }
 

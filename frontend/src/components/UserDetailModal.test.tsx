@@ -22,11 +22,11 @@ vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getAgentResponsibility: vi.fn(),
 }));
 mockNativeDialogs();
-afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); });
+afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 function evidence<T>(value: T): OfficialReportDetail<T> {
   const { selection, sources, reports } = reportPage([]);
-  return { value, selection, sources, reports };
+  return { value, selection: { ...selection, validatedAt: new Date().toISOString() }, sources, reports };
 }
 function props(overrides: Partial<ComponentProps<typeof UserDetailModal>> = {}): ComponentProps<typeof UserDetailModal> {
   return { kind: "directory", identity: combinedUser().directory.objectId, returnFocusTo: createRef<HTMLButtonElement>(),
@@ -157,7 +157,7 @@ describe("user detail lifecycle", () => {
     expect(readReportDetail).toHaveBeenCalledTimes(2);
   });
 
-  it("cancels a pending pinned exact read at expiry instead of showing perpetual loading", async () => {
+  it("does not cancel or repin an admitted exact read at lease end and retains the historical result", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const client = createSavedQueryClient(), saved = evidence(combinedUser());
     saved.selection.expiresAt = new Date(Date.now() + 5000).toISOString();
@@ -171,13 +171,13 @@ describe("user detail lifecycle", () => {
     act(() => { void client.invalidateQueries({ queryKey: ["saved", "report-detail"] }); });
     await screen.findByText("Loading exact user details...");
     const signal = vi.mocked(readReportDetail).mock.calls.at(-1)![2];
-    vi.setSystemTime(Date.now() + 6000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 6000);
     fireEvent.focus(window);
     expect(await screen.findByRole("button", { name: "Restart selection" })).toBeVisible();
-    expect(signal?.aborted).toBe(true);
-    expect(screen.queryByText("Loading exact user details...")).not.toBeInTheDocument();
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByText("Loading exact user details...")).toBeVisible();
     await act(async () => pending.resolve(saved));
-    expect(screen.queryByText("Contoso")).not.toBeInTheDocument();
+    expect(await screen.findByText("Contoso")).toBeVisible();
     expect(readReportDetail).toHaveBeenCalledTimes(2);
   });
 
@@ -196,9 +196,9 @@ describe("user detail lifecycle", () => {
     vi.mocked(readReportDetail).mockRejectedValue(new Error("User details unavailable."));
     await act(async () => { await client.invalidateQueries({ queryKey: ["saved", target === "user" ? "report-detail" : "report-directory-detail"] }); });
     const retry = await screen.findByRole("button", { name: `Retry ${target} details` });
-    vi.setSystemTime(Date.now() + 6000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 6000);
     if (focus) fireEvent.focus(window);
-    else fireEvent.click(retry);
+    else { fireEvent.click(retry); fireEvent.focus(window); }
     expect(await screen.findByRole("button", { name: "Restart selection" })).toBeVisible();
     expect(readReportDetail).toHaveBeenCalledTimes(target === "user" ? 2 : 3);
     expect(screen.queryByText("Contoso")).not.toBeInTheDocument();

@@ -71,20 +71,22 @@ describe("selected persisted directory people", () => {
     expect(after.page.value[0].id).toBe(before.page.value[0].id);
     expect(after.page.value[0].people?.createdBy?.displayName).toBe("Unlicensed Creator");
     expect(await cache.directoryIds(scope, [personId])).toEqual([]);
-    await expect(exportRows(before)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect((await exportRows(before)).find(row => row.recordType === "agent")).toMatchObject({
+      createdBy: personId, createdByDisplayName: "", createdByResolutionStatus: "",
+    });
     await cache.save(scope, [{ objectId: personId, status: "lookup_failed", displayName: null,
       userPrincipalName: null, checkedAt: new Date().toISOString(), errorCode: "provider_timeout" }], { generation });
-    const failed = await selected(scope), rows = await exportRows(failed);
+    const failed = await selected(scope, { sortBy: "createdBy" }), rows = await exportRows(failed);
     expect(rows.find(row => row.recordType === "agent")).toMatchObject({
       createdBy: personId, createdByDisplayName: "Unlicensed Creator", createdByObservedAt: checkedAt,
       createdByResolutionStatus: "lookup_failed", createdByErrorCode: "provider_timeout",
     });
     await cache.save(scope, [{ objectId: personId, status: "not_found", displayName: null,
       userPrincipalName: null, checkedAt: new Date(Date.now() + 1).toISOString() }], { generation });
-    expect((await selected(scope)).page.value[0].people?.createdBy).toMatchObject({ status: "not_found", displayName: null });
+    expect((await selected(scope, { sortBy: "createdBy" })).page.value[0].people?.createdBy).toMatchObject({ status: "not_found", displayName: null });
   });
 
-  it("excludes other tenants, principals, app reports, unmatched IDs and genuinely expired directory generations", async () => {
+  it("excludes other scopes and unmatched IDs while retaining current directory evidence past freshness until revocation", async () => {
     const scope = { tenantId: "saved-people", principalId: "private-reader" };
     await inventory(scope);
     const before = await selected(scope);
@@ -112,9 +114,12 @@ describe("selected persisted directory people", () => {
     expect(saved.page.value[0].id).toBe(before.page.value[0].id);
     await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now()) + 20));
     const expired = await selected(scope);
-    expect(expired.page.value[0].people?.createdBy).toBeUndefined();
+    expect(expired.page.value[0].people?.createdBy).toEqual(saved.page.value[0].people?.createdBy);
     expect(expired.page.value[0].powerPlatformResource?.details.ownerId).toBe(personId.toUpperCase());
     expect(expired.page.value[0].id).toBe(saved.page.value[0].id);
+    expect((await saved.queries.page(saved.selection.id, saved.identity)).value).toEqual(saved.raw.value);
+    expect((await exportRows(saved)).find(row => row.recordType === "agent")).toMatchObject({ createdByDisplayName: "Saved Person" });
+    await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId);
     await expect(saved.queries.page(saved.selection.id, saved.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(exportRows(saved)).rejects.toMatchObject({ code: "selection_invalidated" });
   });

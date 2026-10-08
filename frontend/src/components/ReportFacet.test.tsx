@@ -22,7 +22,7 @@ const viewer: ReturnType<typeof useCapabilityContext> = {
 type FacetPage = Awaited<ReturnType<typeof api.readReportFacet>>;
 function facetPage(values: Array<string | null>, page: Partial<FacetPage["page"]> = {}): FacetPage {
   return {
-    value: values.map(value => ({ value, count: 10 })), selection: reportPage([]).selection,
+    value: values.map(value => ({ value, count: 10 })), selection: { ...reportPage([]).selection, validatedAt: new Date().toISOString() },
     counts: { total: 100, filtered: 100 },
     page: { limit: 50, nextCursor: null, previousCursor: null, ...page },
   };
@@ -276,10 +276,11 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
     vi.mocked(api.readReportFacet).mockResolvedValue(saved);
     render(<ReportFacet compact={compact} path="copilot-usage/users" selectionId={selectionId}
       field="company" onChange={vi.fn()} onRestartSelection={vi.fn()} onSelectionInvalidated={invalidated} />);
-    await waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
+    if (evidence === "mismatched") await waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
+    else expect(await screen.findByRole("alert")).toHaveTextContent("saved-read metadata");
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "true");
     expect(screen.queryByRole("option", { name: /^Wrong evidence/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry options" })).not.toBeInTheDocument();
+    if (evidence === "mismatched") expect(screen.queryByRole("button", { name: "Retry options" })).not.toBeInTheDocument();
   });
 
   it("ignores retired facet failures instead of invalidating a replacement selection", async () => {
@@ -314,7 +315,7 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
 
   it.each([
     ["timer", false], ["timer", true], ["focus", false], ["focus", true],
-  ] as const)("withdraws expired options on %s (pending page=%s) without reloading", async (boundary, paging) => {
+  ] as const)("keeps saved options on %s lease end (pending page=%s) without reloading or invalidating the parent", async (boundary, paging) => {
     const initial = facetPage(["Contoso"], { nextCursor: "next" }), pending = deferred<FacetPage>();
     const invalidated = vi.fn();
     vi.useFakeTimers();
@@ -328,16 +329,17 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
     const signal = vi.mocked(api.readReportFacet).mock.lastCall?.[3]?.signal;
     if (boundary === "timer") await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
     else {
-      vi.setSystemTime(Date.now() + 1000);
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1001);
       fireEvent.focus(window);
     }
-    expect(invalidated).toHaveBeenCalledOnce();
-    if (paging) expect(signal?.aborted).toBe(true);
+    expect(invalidated).not.toHaveBeenCalled();
+    if (paging) expect(signal?.aborted).toBe(false);
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.queryByRole("option", { name: /^Contoso/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
-    await act(async () => { pending.resolve(facetPage(["Late"])); await vi.advanceTimersByTimeAsync(1); });
-    expect(screen.queryByRole("option", { name: /^Late/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /^Contoso/ }) !== null).toBe(!paging);
+    expect(screen.getByRole("status")).toHaveTextContent("Showing saved options");
+    await act(async () => { pending.resolve({ ...initial, value: [{ value: "Late", count: 10 }] }); await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.queryByRole("option", { name: /^Late/ }) !== null).toBe(paging);
+    expect(invalidated).not.toHaveBeenCalled();
     expect(api.readReportFacet).toHaveBeenCalledTimes(paging ? 2 : 1);
   });
 
@@ -349,12 +351,13 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
     render(facet(changed));
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false");
-    vi.setSystemTime(Date.now() + 1000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1001);
     if (action === "choice") fireEvent.change(screen.getByRole("combobox"), { target: { value: "~string:Contoso" } });
     else if (action === "page") move("next");
     else fireEvent.change(screen.getByRole("searchbox"), { target: { value: "New search" } });
     expect(changed).not.toHaveBeenCalled();
     expect(api.readReportFacet).toHaveBeenCalledOnce();
+    fireEvent.focus(window);
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByRole("button", { name: "Restart selection" })).toBeInTheDocument();
   });

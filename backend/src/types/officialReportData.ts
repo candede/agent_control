@@ -77,7 +77,7 @@ export type ReportSummary = {
   distinctActiveReportUsers: number | null; licensedOccurrences: number | null; unlicensedOccurrences: number | null;
   responseReconciliation: "matching" | "mismatch" | "not_comparable"; activeUsersAreNonAdditive: true;
 };
-export type ReportListPage<T> = UserSourcePage<T> & { reports: ReportMetadata };
+export type ReportListPage<T> = UserSourcePage<T> & { reports: ReportMetadata; selection: import("./dataSelection.js").PublishedSelectedRead };
 export type ReportPage<T> = ReportListPage<T> & {
   sources: { directory: UserSourceMetadata; app_activity: UserSourceMetadata };
   summary: ReportSummary; analytics: ReportAnalytics; filters: ReportQuery;

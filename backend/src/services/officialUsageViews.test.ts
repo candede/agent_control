@@ -286,7 +286,9 @@ describe("native report row semantics and exact children", () => {
     expect(detail).toMatchObject({ value: { agentId: "usage-a", responses: 9, bridgeResponses: 9, activeUsers: 2 } });
     const children = await relationships(identity, page.selection.id, "usage-a", 1, { search: "casesensitiveuser", sort: "responses", order: "asc" });
     expect(children.counts.filtered).toBe(2); expect(children.value).toMatchObject([{ username: "casesensitiveuser", responses: 4 }]);
-    expect((await reports.exact(page.selection.id, identity, "usage-a"))).toEqual(detail);
+    const reread = await reports.exact(page.selection.id, identity, "usage-a");
+    expect(Date.parse(reread.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(detail.selection.validatedAt));
+    expect(reread).toEqual({ ...detail, selection: { ...detail.selection, validatedAt: reread.selection.validatedAt } });
     for (const id of ["USAGE-A", "Agent A", "inventory:usage-a"]) await expect(reports.exact(page.selection.id, identity, id)).rejects.toMatchObject({ status: 404 });
   });
 });
@@ -388,7 +390,9 @@ describe("native current licensing and organization evidence", () => {
     const stages = new UserSourceStages(fixture.runtime);
     await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
       async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
-    expect(await reports.page(prior.selection.id, identity)).toEqual(prior);
+    const reread = await reports.page(prior.selection.id, identity);
+    expect(Date.parse(reread.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(prior.selection.validatedAt));
+    expect(reread).toEqual({ ...prior, selection: { ...prior.selection, validatedAt: reread.selection.validatedAt } });
     const page = await users(identity, { licenseCohort: "active_without_paid" });
     expect(page.value).toEqual([]); expect(page.sources.directory).toMatchObject({ state: "partial", attemptStatus: "failed" });
     expect(page.summary.activeWithoutPaidUsers).toBeNull();

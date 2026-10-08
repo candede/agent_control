@@ -147,9 +147,11 @@ test("automatic first sync blocks dashboards across reloads and opens fresh User
   const notice = page.getByRole("dialog");
   await expect(notice.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
   await expect(notice.getByRole("progressbar")).toHaveAttribute("max", "3");
-  await expect(notice.getByRole("button", { name: "Start initial sync" })).toHaveCount(0);
+  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(notice.locator(".first-sync-actions")).toHaveCount(0);
   await page.reload();
   await expect(notice.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
+  await expect(notice.getByRole("button")).toHaveCount(0);
   await expect(page).toHaveURL(/\/users$/);
   await page.goto("/audit");
   await expect(notice.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
@@ -641,7 +643,8 @@ test("a running sync survives back, forward, and reload without starting another
   await expect(page).toHaveURL(/\/users$/);
   await expect(panel).toHaveCount(0);
   await expect(page.getByRole("dialog", { name: "Your first sync is in progress" })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "View sync details" }).click();
+  await expect(page.getByRole("dialog").getByRole("button")).toHaveCount(0);
+  await page.goto("/sync");
   await page.reload();
   await expect(page).toHaveURL(/\/sync$/);
   await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");

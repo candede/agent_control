@@ -4,6 +4,10 @@ This reference summarizes the Microsoft permissions and service requirements
 used by Agent Control. Provider availability and authorization are verified when
 an operation runs.
 
+The [capability registry](../backend/src/services/capabilityRegistry.ts) is the
+complete, current capability-ID and Microsoft source-reference inventory. The
+table below summarizes its required permissions, not a dated readiness result.
+
 | Feature | API and mode | Permission | Additional requirement |
 | --- | --- | --- | --- |
 | Package inventory | Microsoft Graph, delegated | `CopilotPackages.Read.All` | Microsoft Agent 365 license |

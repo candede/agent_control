@@ -25,7 +25,7 @@ const retainedInputs = (baseline = "$1", scope = "$2") => `SELECT input.revision
   CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) input("baselineId" uuid,revision bigint,epoch bigint,"expiresAt" timestamptz)
   JOIN data_scope_epochs source ON source.id=${scope}
   WHERE v.inputs @> jsonb_build_array(jsonb_build_object('baselineId',${baseline}::text)) AND input."baselineId"=${baseline}::uuid
-    AND input.epoch=source.epoch AND input."expiresAt">clock_timestamp()
+    AND input.epoch=source.epoch
     AND (canonical.current AND canonical.revision=v.revision OR EXISTS(SELECT 1 FROM data_generation_pins p
       WHERE p.generation_id=canonical.baseline_id AND p.revision=v.revision AND p.expires_at>clock_timestamp()))`;
 // Child identities retain the database collation; do not force their indexed joins to use the key's C collation.
@@ -92,7 +92,7 @@ export class InventoryGenerations {
         await this.fence(client, lease);
         const root = (await client.query(`SELECT r.* FROM inventory_roots r JOIN inventory_revisions v
           ON v.scope_id=r.scope_id AND v.revision=r.revision JOIN data_generations g ON g.id=v.generation_id
-          WHERE r.scope_id=$1 AND r.current AND g.session_epoch=$3 AND g.expires_at>clock_timestamp()
+          WHERE r.scope_id=$1 AND r.current AND g.session_epoch=$3 AND g.state IN ('published','retired') AND g.validated
             AND (g.scope_epoch=$2 OR $4='control')
           FOR UPDATE OF r`, [lease.scopeId, lease.epoch, lease.sessionEpoch, intent.channel])).rows[0];
         if (intent.mode === "delta" && !root && ["detail", "control"].includes(intent.channel)) throw new Error("inventory_baseline_required");
@@ -662,7 +662,7 @@ export class InventoryGenerations {
       // Control epochs fence readers immediately, but recovery still needs the captured membership.
       const retired = await client.query(`UPDATE inventory_roots r SET current=false FROM data_generations g,data_scope_epochs s,inventory_revisions v
         WHERE r.scope_id=$1 AND r.current AND v.scope_id=r.scope_id AND v.revision=r.revision AND g.id=v.generation_id AND s.id=r.scope_id
-          AND (g.expires_at<=clock_timestamp() OR g.session_epoch<>s.session_epoch
+          AND (g.state NOT IN ('published','retired') OR g.session_epoch<>s.session_epoch
             OR g.scope_epoch<>s.epoch AND NOT(s.token_mode='delegated' AND (
               s.source='inventory_packages' AND EXISTS(SELECT 1 FROM inventory_control_pending p
                 WHERE p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id)
@@ -670,8 +670,9 @@ export class InventoryGenerations {
             OR EXISTS(SELECT 1 FROM jsonb_to_recordset(v.inputs) input("scopeId" uuid,"baselineId" uuid,epoch bigint,"expiresAt" timestamptz)
               LEFT JOIN data_scope_epochs dependency ON dependency.id=input."scopeId"
               LEFT JOIN data_generations captured ON captured.id=input."baselineId"
-              WHERE input."expiresAt"<=clock_timestamp() OR dependency.epoch IS DISTINCT FROM input.epoch AND NOT coalesce(
-                captured.session_epoch=dependency.session_epoch AND captured.expires_at>clock_timestamp()
+              WHERE captured.id IS NULL OR captured.state NOT IN ('published','retired')
+                OR dependency.epoch IS DISTINCT FROM input.epoch AND NOT coalesce(
+                captured.session_epoch=dependency.session_epoch
                 AND (EXISTS(SELECT 1 FROM inventory_native_control_pending p WHERE p.scope_id=dependency.id)
                   OR dependency.source='inventory_packages' AND EXISTS(SELECT 1 FROM inventory_control_pending p
                     WHERE p.tenant_id=dependency.tenant_id AND p.principal_id=dependency.principal_id)
@@ -679,7 +680,7 @@ export class InventoryGenerations {
                     ON revision.scope_id=live.scope_id AND revision.revision=live.revision
                     JOIN data_generations published ON published.id=revision.generation_id
                     WHERE live.scope_id=dependency.id AND live.current AND published.scope_epoch=dependency.epoch
-                      AND published.session_epoch=dependency.session_epoch AND published.expires_at>clock_timestamp())),false)))`, [scopeId]);
+                      AND published.session_epoch=dependency.session_epoch AND published.state='published')),false)))`, [scopeId]);
       slice.rows += retired.rowCount ?? 0;
       slice.bytes += (retired.rowCount ?? 0) * 1024;
       await remove("workerPins", "inventory_worker_pins", `target.scope_id=$3 AND target.expires_at<=clock_timestamp()`);

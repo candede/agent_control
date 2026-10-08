@@ -7,10 +7,17 @@ export type PurviewAuditPresetId = (typeof purviewAuditPresetIds)[number];
 export type PurviewAuditTokenMode = "delegated" | "application";
 export type PurviewProviderQueryStatus = "notStarted" | "running" | "succeeded" | "failed" | "cancelled" | "unknownFutureValue";
 export type PurviewAuditJobStatus = "waiting_authorization" | "reconciling_create" | "running" | "succeeded" | "failed" | "cancelled" | "partial" | "inconclusive";
-export type PurviewAuditPartialReason = "provider_error" | "provider_throttled" | "provider_result_limit" | "audit_provider_request_limit" | "audit_job_expired" | "audit_activation_timeout" | "audit_page_limit" | "audit_row_limit" | "audit_byte_limit";
+export type PurviewAuditPartialReason = "provider_error" | "provider_throttled" | "provider_result_limit" | "audit_provider_request_limit" | "audit_job_expired" | "audit_activation_timeout" | "audit_page_limit" | "audit_row_limit" | "audit_byte_limit" | "audit_identity_unresolved";
 export type PurviewAuditResultScope =
   | { kind: "principal"; scopeId: string; configurationRevision: null }
   | { kind: "application"; scopeId: string; configurationRevision: number };
+
+export type PurviewAuditAgentTarget = {
+  recordId: string;
+  botId: string;
+  environmentId: string;
+  applicationId?: string;
+};
 
 export type PurviewAuditFilters = {
   presetId: PurviewAuditPresetId;
@@ -21,6 +28,7 @@ export type PurviewAuditFilters = {
   ipAddresses: string[];
   objectIds: string[];
   administrativeUnitIds: string[];
+  agent?: PurviewAuditAgentTarget;
 };
 
 export type PurviewProviderQuery = {
@@ -36,6 +44,8 @@ export type PurviewProviderQuery = {
   objectIdFilters: string[];
   administrativeUnitIdFilters: string[];
   status: PurviewProviderQueryStatus;
+  keywordFilter?: string;
+  isRecordCountLimitExceeded?: boolean;
 };
 
 export type PurviewMessageReference = {

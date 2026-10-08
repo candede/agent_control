@@ -37,7 +37,7 @@ describe("native official report import HTTP contracts", () => {
     return (await fixture.database.runtime.query("SELECT count(*)::int AS n FROM official_usage_ingestions WHERE tenant_id=$1 AND principal_id=$2",
       [fixture.identity.tenantId, fixture.identity.principalId])).rows[0].n as number;
   }
-  async function completeBundle(marker: string) {
+  async function completeBundle(marker: string, preserveSelection?: boolean) {
     const bundleId = randomUUID();
     for (const kind of ["agents", "userAgents", "users"] as const) {
       const row = kind === "agents" ? `${marker},Assistant,Your org,1,0,4,2026-07-06`
@@ -51,11 +51,31 @@ describe("native official report import HTTP contracts", () => {
     const preview = await previewResponse.json() as OfficialReportBundlePreview;
     expect(preview.complete).toBe(true); expect(preview.stages).toHaveLength(3);
     const response = await fixture.api(`/official-usage/bundles/${bundleId}/accept`, { method: "POST",
-      body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }) });
+      body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection }) });
     expect(response.status, await response.clone().text()).toBe(200);
     return await response.json() as OfficialReportAccepted;
   }
 
+  it("selects the first wizard report through HTTP and preserves it for later imports", async () => {
+    const selected = await completeBundle(randomUUID(), true);
+    for (const path of ["/official-usage/aggregate?limit=1", "/official-usage/users?limit=1"]) {
+      const response = await fixture.api(path);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ reports: { setId: selected.setId, activeSetId: selected.setId } });
+    }
+    const saved = await completeBundle(randomUUID(), true);
+    expect(saved.setId).not.toBe(selected.setId);
+    expect(saved.activeRevision).toBe(selected.activeRevision);
+    const response = await fixture.api(`/official-usage/aggregate?setId=${saved.setId}&limit=1`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ reports: { setId: saved.setId, activeSetId: selected.setId } });
+  });
+  it.each(["true", "false", 0, null])("rejects non-boolean preserveSelection %j before acceptance", async preserveSelection => {
+    const response = await fixture.api(`/official-usage/bundles/${randomUUID()}/accept`, { method: "POST",
+      body: JSON.stringify({ bundleHash: "a".repeat(64), expectedActiveRevision: "1", preserveSelection }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "invalid_import_intent" });
+  });
   it.each([undefined, "true", "false"])("parses duplicate guard %s exclusively from immutable upload intent", async guard => {
     const bundleId = randomUUID(), query = new URLSearchParams({ bundleId });
     if (guard !== undefined) query.set("rejectDuplicateKind", guard);

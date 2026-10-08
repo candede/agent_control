@@ -35,7 +35,8 @@ export class OfficialAgentUsage {
     return { ...context.data, identity, tokenMode: "delegated", endpoint: "official_agents", query,
       queryHash: canonicalQuery(query, reportQueryFields), inventorySelectionId: id,
       selection: { id, revision: selection.revision, evaluatedAt: new Date(selection.evaluated_at).toISOString(),
-        expiresAt: new Date(selection.expires_at).toISOString() } };
+        expiresAt: new Date(selection.expires_at).toISOString(), validatedAt: new Date(selection.validated_at).toISOString(),
+        publicationRevisions: context.data.publicationRevisions } };
   }
 
   private read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: UsageReadContext) => Promise<T>, setId?: string) {

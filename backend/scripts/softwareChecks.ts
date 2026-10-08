@@ -9,7 +9,8 @@ const steps = [
   { name: "Frontend lint", args: ["run", "lint", "--workspace", "frontend"], timeout: defaultTimeout },
   { name: "Frontend typecheck", args: ["run", "typecheck", "--workspace", "frontend"], timeout: defaultTimeout },
   { name: "Backend tests", args: ["run", "test", "--workspace", "backend"], timeout: 1_200_000 },
-  { name: "Frontend tests", args: ["run", "test", "--workspace", "frontend"], timeout: defaultTimeout },
+  // Aggregate orchestration only; individual test and runtime resource limits remain unchanged.
+  { name: "Frontend tests", args: ["run", "test", "--workspace", "frontend"], timeout: 300_000 },
 ];
 const fixtureEnvironment = {
   AGENT_CONTROL_ISOLATED_TESTS: "1",

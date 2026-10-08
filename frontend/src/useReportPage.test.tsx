@@ -9,6 +9,7 @@ import { createSavedQueryClient } from "./savedQueries";
 import { deferred } from "./test/deferred";
 import { reportPage, reportSelection } from "./test/reportDataFixture";
 import { useReportPage } from "./useReportPage";
+import { PublicationContext } from "./publicationContext";
 
 vi.mock("./api/reportData", async original => ({
   ...await original<typeof import("./api/reportData")>(), readReportPage: vi.fn(),
@@ -16,7 +17,7 @@ vi.mock("./api/reportData", async original => ({
 
 function page(id: string) {
   const result = reportPage([id]);
-  return { ...result, selection: { ...result.selection, id },
+  return { ...result, selection: { ...result.selection, id, validatedAt: new Date().toISOString() },
     page: { limit: 50, nextCursor: "next", previousCursor: null } };
 }
 const invalidated = new ApiError(409, "selection_invalidated", "Saved data changed.");
@@ -32,6 +33,73 @@ beforeEach(() => { vi.mocked(api.readReportPage).mockResolvedValue(page("initial
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
 describe("report page selection lifetimes", () => {
+  it.each(["page-first", "observer-first"] as const)("compares the admitted report vector %s without a startup reread", async order => {
+    const initial = page("initial"), published = initial.selection.publicationRevisions;
+    const pending = deferred<typeof initial>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    const admit = vi.fn(), Wrapper = sharedQueries();
+    const context = { admit, revisions: order === "observer-first" ? published : undefined };
+    const hook = renderHook(() => useReportPage("copilot-usage/users"), { wrapper: ({ children }) =>
+      <Wrapper><PublicationContext value={context}>{children}</PublicationContext></Wrapper> });
+    await act(async () => pending.resolve(initial));
+    await waitFor(() => expect(hook.result.current.data).toBeDefined());
+    context.revisions = published;
+    hook.rerender();
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith(published);
+  });
+
+  it.each(["fresh", "page", "detail", "export", "report", "lease-end"] as const)(
+    "scopes publication synchronization to %s ownership without replaying a frozen capture", async ownership => {
+      const initial = page("initial");
+      vi.mocked(api.readReportPage).mockImplementation(async (_path, request) =>
+        request?.selectionId ? { ...initial, selection: { ...initial.selection, validatedAt: new Date().toISOString() } } : initial);
+      const Wrapper = sharedQueries(), context = { admit: vi.fn(), revisions: initial.selection.publicationRevisions };
+      const hook = renderHook(() => useReportPage("copilot-usage/users",
+        ownership === "report" ? { setId: initial.reports.setId! } : {}), { wrapper: ({ children }) =>
+        <Wrapper><PublicationContext value={context}>{children}</PublicationContext></Wrapper> });
+      await waitFor(() => expect(hook.result.current.data).toBeDefined());
+      if (ownership === "page") {
+        act(() => hook.result.current.next());
+        await waitFor(() => expect(hook.result.current.loading).toBe(false));
+      }
+      if (ownership === "detail" || ownership === "export") act(() => hook.result.current.ownPublication());
+      if (ownership === "lease-end") {
+        vi.spyOn(performance, "now").mockReturnValue(performance.now() + 20 * 60_000);
+      }
+      const before = vi.mocked(api.readReportPage).mock.calls.length;
+      context.revisions = { ...context.revisions, users: "4".repeat(64) };
+      hook.rerender();
+      if (ownership === "lease-end") {
+        expect(api.readReportPage).toHaveBeenCalledTimes(before);
+        expect(hook.result.current.data?.selection.id).toBe("initial");
+      } else {
+        await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(before + 1));
+        await waitFor(() => expect(hook.result.current.loading).toBe(false));
+        expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe(ownership === "fresh" ? undefined : "initial");
+      }
+      hook.rerender();
+      expect(api.readReportPage).toHaveBeenCalledTimes(before + (ownership === "lease-end" ? 0 : 1));
+    });
+
+  it("shares concurrent base report synchronization while unrelated source publications do not reread Users", async () => {
+    const initial = page("initial"), pending = deferred<typeof initial>();
+    const Wrapper = sharedQueries(), context = { admit: vi.fn(), revisions: initial.selection.publicationRevisions };
+    const hook = renderHook(() => [useReportPage("copilot-usage/users"), useReportPage("copilot-usage/users")], {
+      wrapper: ({ children }) => <Wrapper><PublicationContext value={context}>{children}</PublicationContext></Wrapper>,
+    });
+    await waitFor(() => expect(hook.result.current.every(read => read.data)).toBe(true));
+    context.revisions = { ...context.revisions, graph_packages: "4".repeat(64) };
+    hook.rerender();
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    context.revisions = { ...context.revisions, users: "4".repeat(64) };
+    hook.rerender();
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await act(async () => pending.resolve(initial));
+    await waitFor(() => expect(hook.result.current.every(read => read.data)).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
   it.each(["account", "revision"] as const)("keeps isolated realistic captures behind the %s owner when cancelled transports finish late", async boundary => {
     const old = reportPage(["private-old"], { selection: reportSelection(20) });
     const current = reportPage(["current"], { selection: reportSelection(21),
@@ -134,17 +202,11 @@ describe("report page selection lifetimes", () => {
     await waitFor(() => expect(result.current.data).toBeDefined());
     act(() => result.current.next());
     await waitFor(() => expect(result.current.error?.message).toBe("Page unavailable."));
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(initial.selection.expiresAt) + 1);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 20_001);
     act(() => result.current.retry());
-    if (pinned) {
-      expect(api.readReportPage).toHaveBeenCalledTimes(2);
-      expect(result.current.invalidated).toBe(true);
-      expect(result.current.loading).toBe(false);
-    } else {
-      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
-      expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toEqual({ limit: 50 });
-      expect(result.current.loading).toBe(true);
-    }
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(result.current.invalidated).toBe(false);
+    expect(result.current.loading).toBe(false);
     expect(result.current.data).toBeUndefined();
   });
 
@@ -171,7 +233,8 @@ describe("report page selection lifetimes", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.error?.message).toBe("Access denied.");
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(result.current.invalidated).toBe(true);
+    expect(result.current.error).toMatchObject({ status });
+    expect(result.current.data).toBeUndefined();
     expect(result.current.loading).toBe(false);
     act(() => { result.current.retry(); window.dispatchEvent(new Event("focus")); });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
@@ -195,18 +258,19 @@ describe("report page selection lifetimes", () => {
       act(() => result.current.next());
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     }
-    if (beforeTimer) vi.setSystemTime(Date.now() + 1000);
+    if (beforeTimer) vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1000);
     else {
       await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-      expect(result.current.invalidated).toBe(true);
+      expect(result.current.leaseEnded).toBe(true);
     }
     const count = vi.mocked(api.readReportPage).mock.calls.length;
     await act(async () => { await client.invalidateQueries({ queryKey: ["saved", "record-page"] }); });
+    act(() => window.dispatchEvent(new Event("focus")));
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(api.readReportPage).toHaveBeenCalledTimes(count);
-    expect(result.current.invalidated).toBe(true);
+    expect(result.current.leaseEnded).toBe(true);
     expect(result.current.loading).toBe(false);
-    expect(result.current.data).toBeUndefined();
+    expect(result.current.data).toBe(failed ? undefined : initial);
   });
 
   it.each(["failure", "invalidation", "expiry", "revalidation"] as const)(
@@ -222,7 +286,7 @@ describe("report page selection lifetimes", () => {
       act(() => {
         if (boundary === "failure") cached.setState({ status: "error", error: new Error("Read failed.") });
         if (boundary === "invalidation") result.current.invalidateSelection();
-        if (boundary === "expiry") vi.spyOn(Date, "now").mockReturnValue(Date.parse(initial.selection.expiresAt) + 1);
+        if (boundary === "expiry") vi.spyOn(performance, "now").mockReturnValue(performance.now() + 600_001);
         if (boundary === "revalidation") window.dispatchEvent(new Event("focus"));
         result.current.next();
       });
@@ -411,7 +475,7 @@ describe("report page selection lifetimes", () => {
     const { result } = renderHook(() => useReportPage<string>("official-usage/aggregate",
       pinned ? { selectionId: "initial" } : {}, 0, true, restart), { wrapper });
     await waitFor(() => expect(result.current.invalidated).toBe(true));
-    const reads = pinned ? 1 : 2;
+    const reads = 1;
     expect(api.readReportPage).toHaveBeenCalledTimes(reads);
     act(() => { result.current.retry(); window.dispatchEvent(new Event("focus")); window.dispatchEvent(new Event("focus")); });
     await act(async () => {});
@@ -491,10 +555,10 @@ describe("report page selection lifetimes", () => {
     const { result } = renderHook(() => useReportPage<string>(
       "agent-inventory/agent/usage-users", { selectionId: "initial" }, 0, true, undefined, false), { wrapper: sharedQueries() });
     await waitFor(() => expect(result.current.data).toBeDefined());
-    vi.spyOn(Date, "now").mockReturnValue(now + 21_000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 21_000);
     act(() => window.dispatchEvent(new Event("focus")));
-    expect(result.current.data).toBeUndefined();
-    expect(result.current.invalidated).toBe(true);
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
 
@@ -519,11 +583,11 @@ describe("report page selection lifetimes", () => {
   it.each([true, false])("preserves the selection deadline while retrying a rejected cursor (pinned=%s)", async pinned => {
     vi.useFakeTimers();
     const initial = page("initial"), retry = deferred<ReturnType<typeof page>>();
-    const replacement = deferred<ReturnType<typeof page>>(), restartParent = vi.fn();
+    const restartParent = vi.fn();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(initial)
       .mockRejectedValueOnce(new ApiError(400, "invalid_cursor", "Cursor expired."))
-      .mockReturnValueOnce(retry.promise).mockReturnValueOnce(replacement.promise);
+      .mockReturnValueOnce(retry.promise);
     const { result } = renderHook(() => useReportPage<string>("copilot-usage/users",
       pinned ? { selectionId: "initial" } : {}, 0, true, restartParent), { wrapper: sharedQueries() });
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
@@ -538,30 +602,18 @@ describe("report page selection lifetimes", () => {
     expect(result.current.loading).toBe(true);
     const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(signal?.aborted).toBe(true);
+    expect(signal?.aborted).toBe(false);
     expect(result.current.data).toBeUndefined();
     expect(result.current.selectionId).toBeUndefined();
-    if (pinned) {
-      expect(result.current.invalidated).toBe(true);
-      expect(result.current.loading).toBe(false);
-      act(() => result.current.restart());
-      expect(restartParent).toHaveBeenCalledOnce();
-      expect(api.readReportPage).toHaveBeenCalledTimes(3);
-    } else {
-      expect(result.current.loading).toBe(true);
-      expect(result.current.error).toBeNull();
-      expect(api.readReportPage).toHaveBeenCalledTimes(4);
-      expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toEqual({ limit: 50 });
-    }
+    expect(result.current.leaseEnded).toBe(true);
+    expect(result.current.loading).toBe(true);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
     await act(async () => { retry.resolve(initial); await vi.advanceTimersByTimeAsync(1); });
-    expect(result.current.data).toBeUndefined();
-    if (!pinned) {
-      await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
-      expect(result.current.data?.selection.id).toBe("replacement");
-    }
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
   });
 
-  it("renews an expired displayed selection without waiting for a focus or navigation event", async () => {
+  it("retains an expired displayed selection until explicit replacement", async () => {
     vi.useFakeTimers();
     const initial = page("initial"), replacement = deferred<ReturnType<typeof page>>();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
@@ -570,14 +622,17 @@ describe("report page selection lifetimes", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("initial");
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(result.current.data).toBeUndefined();
-    expect(result.current.loading).toBe(true);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
+    expect(result.current.loading).toBe(false);
     expect(result.current.error).toBeNull();
+    act(() => result.current.restart());
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
     await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("replacement");
   });
-  it("retires an expired selection during pending pagination and cancels its late page before recapturing", async () => {
+  it("does not cancel or repin already-admitted pagination when its local lease ends", async () => {
     vi.useFakeTimers();
     const initial = page("initial"), next = deferred<ReturnType<typeof page>>(), replacement = deferred<ReturnType<typeof page>>();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
@@ -587,15 +642,17 @@ describe("report page selection lifetimes", () => {
     act(() => result.current.next());
     const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(signal?.aborted).toBe(true);
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
+    expect(signal?.aborted).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe("initial");
     await act(async () => { next.resolve(initial); await vi.advanceTimersByTimeAsync(1); });
-    expect(result.current.data).toBeUndefined();
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
+    act(() => result.current.restart());
     await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("replacement");
   });
-  it("stops loading an expired pinned page and requires the parent's restart without another request", async () => {
+  it("keeps an admitted pinned page through lease end and delegates explicit replacement to its parent", async () => {
     vi.useFakeTimers();
     const initial = page("initial"), next = deferred<ReturnType<typeof page>>(), restart = vi.fn();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
@@ -607,15 +664,16 @@ describe("report page selection lifetimes", () => {
     expect(result.current.selectionId).toBe("initial");
     const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(signal?.aborted).toBe(true);
+    expect(signal?.aborted).toBe(false);
     expect(result.current.selectionId).toBeUndefined();
-    expect(result.current.loading).toBe(false);
-    expect(result.current.invalidated).toBe(true);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.leaseEnded).toBe(true);
     act(() => { window.dispatchEvent(new Event("focus")); result.current.restart(); });
     expect(restart).toHaveBeenCalledOnce();
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     await act(async () => { next.resolve(initial); await vi.advanceTimersByTimeAsync(1); });
-    expect(result.current.data).toBeUndefined();
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
   });
   it.each(["copilot-usage/users", "official-usage/users", "official-usage/overview", "official-usage/history/options"])("reuses a recent first %s page on remount without another capture", async path => {
     const wrapper = sharedQueries();
@@ -657,7 +715,7 @@ describe("report page selection lifetimes", () => {
     first.unmount();
     const pending = deferred<ReturnType<typeof page>>();
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
-    vi.spyOn(Date, "now").mockReturnValue(now + (boundary === "ttl" ? 31_000 : boundary === "expiry" ? 21_000 : 0));
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + (boundary === "ttl" ? 31_000 : boundary === "expiry" ? 21_000 : 0));
     const returned = renderHook(() => useReportPage<string>("copilot-usage/users", {}, boundary === "revision" ? 1 : 0), { wrapper });
     expect(returned.result.current.loading).toBe(true);
     expect(returned.result.current.data).toBeUndefined();
@@ -766,13 +824,17 @@ describe("report page selection lifetimes", () => {
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toEqual({ limit: 50 });
   });
 
-  it.each(["manual", "automatic"] as const)("retires standalone cached evidence across filter visits after %s restart", async kind => {
+  it.each(["manual", "rejected"] as const)("retires standalone cached evidence across filter visits after %s explicit restart", async kind => {
     const { result, rerender } = renderHook(({ search }) =>
       useReportPage<string>("copilot-usage/users", { search }), { initialProps: { search: "" } });
     await waitFor(() => expect(result.current.data?.selection.id).toBe("initial"));
-    if (kind === "automatic") vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+    if (kind === "rejected") {
+      vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+      act(() => result.current.next());
+      await waitFor(() => expect(result.current.invalidated).toBe(true));
+    }
     vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
-    act(() => kind === "manual" ? result.current.restart() : result.current.next());
+    act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("restarted"));
     vi.mocked(api.readReportPage).mockResolvedValueOnce(page("filtered"));
     rerender({ search: "Ada" });
@@ -808,7 +870,7 @@ describe("report page selection lifetimes", () => {
     await waitFor(() => expect(result.current.invalidated).toBe(true));
     expect(result.current.data).toBeUndefined();
     expect(result.current.error).toMatchObject({ code: "selection_invalidated" });
-    expect(api.readReportPage).toHaveBeenCalledTimes(field === "selectionId" ? 1 : 2);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
   });
 
   it.each(["selectionId", "setId", "inventorySelectionId"] as const)(
@@ -1061,12 +1123,12 @@ describe("report page selection lifetimes", () => {
       expect(api.readReportPage).toHaveBeenCalledTimes(3);
     });
 
-  it.each(["manual", "automatic"] as const)("does not revive a cache entry when a pending read settles after %s restart", async kind => {
+  it.each(["manual", "rejected"] as const)("does not revive a cache entry when a pending read settles after %s explicit restart", async kind => {
     const wrapper = sharedQueries(), pending = deferred<ReturnType<typeof page>>();
     const first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
     const second = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
     await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
-    if (kind === "automatic") {
+    if (kind === "rejected") {
       const next = page("initial");
       vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...next, page: { ...next.page, nextCursor: "last" } });
       act(() => first.result.current.next());
@@ -1075,13 +1137,17 @@ describe("report page selection lifetimes", () => {
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
     act(() => second.result.current.retry());
     const pendingSignal = vi.mocked(api.readReportPage).mock.calls.at(-1)?.[2];
-    if (kind === "automatic") vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+    if (kind === "rejected") {
+      vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+      act(() => first.result.current.next());
+      await waitFor(() => expect(first.result.current.invalidated).toBe(true));
+    }
     vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
-    act(() => kind === "manual" ? first.result.current.restart() : first.result.current.next());
+    act(() => first.result.current.restart());
     await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
-    expect(pendingSignal?.aborted).toBe(kind === "automatic");
+    expect(pendingSignal?.aborted).toBe(kind === "rejected");
     await act(async () => pending.resolve(page("initial")));
-    if (kind === "automatic") {
+    if (kind === "rejected") {
       await waitFor(() => expect(second.result.current.invalidated).toBe(true));
       expect(second.result.current.data).toBeUndefined();
       expect(second.result.current.loading).toBe(false);
@@ -1114,14 +1180,17 @@ describe("report page selection lifetimes", () => {
     act(() => first.result.current.restart());
     await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
     const exposed: string[] = [];
+    const replacement = deferred<ReturnType<typeof page>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(replacement.promise);
     const returned = renderHook(() => {
       const read = useReportPage<string>("copilot-usage/users");
       if (read.data) exposed.push(read.data.selection.id);
       return read;
     }, { wrapper });
     expect(returned.result.current.data).toBeUndefined();
-    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("returned"));
     await act(async () => pending.resolve(page("initial")));
+    expect(returned.result.current.data).toBeUndefined();
+    await act(async () => replacement.resolve(page("returned")));
     await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
     expect(exposed).not.toContain("initial");
     expect(first.result.current.data?.selection.id).toBe("restarted");
@@ -1199,7 +1268,7 @@ describe("report page selection lifetimes", () => {
     expect(client.getQueryCache().getAll().every(query => query.getObserversCount() === 0)).toBe(true);
   });
 
-  it("does not expose a recoverable invalidation as an error while capturing its replacement", async () => {
+  it("exposes invalidation without replay and captures a replacement only on explicit restart", async () => {
     const pending = deferred<ReturnType<typeof page>>(), errors: unknown[] = [];
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockReturnValueOnce(pending.promise);
     const { result } = renderHook(() => {
@@ -1207,17 +1276,19 @@ describe("report page selection lifetimes", () => {
       if (read.error) errors.push(read.error);
       return read;
     });
-    expect(result.current.recoveryRevision).toBe(-1);
-    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
-    expect(errors).toEqual([]);
-    expect(result.current.loading).toBe(true);
-    const recoveryRevision = result.current.recoveryRevision;
-    expect(recoveryRevision).toBeGreaterThan(-1);
+    expect(result.current.selectionRevision).toBe(0);
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(errors).toContain(invalidated);
+    act(() => result.current.restart());
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    const selectionRevision = result.current.selectionRevision;
+    expect(selectionRevision).toBe(1);
     await act(async () => pending.resolve(page("replacement")));
     await waitFor(() => expect(result.current.data?.selection.id).toBe("replacement"));
-    expect(result.current.recoveryRevision).toBe(recoveryRevision);
+    expect(result.current.selectionRevision).toBe(selectionRevision);
   });
-  it.each(["manual", "automatic"] as const)("does not reuse another observer's cached selection on %s restart", async kind => {
+  it.each(["manual", "rejected"] as const)("does not reuse another observer's cached selection on %s explicit restart", async kind => {
     const replacement = deferred<ReturnType<typeof page>>();
     const { result } = renderHook(() => ({
       first: useReportPage<string>("official-usage/history"),
@@ -1232,9 +1303,13 @@ describe("report page selection lifetimes", () => {
     await waitFor(() => expect(result.current.first.data?.selection.id).toBe("first-restart"));
     expect(result.current.second.data?.selection.id).toBe("initial");
 
-    if (kind === "automatic") vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+    if (kind === "rejected") {
+      vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+      act(() => result.current.second.next());
+      await waitFor(() => expect(result.current.second.invalidated).toBe(true));
+    }
     vi.mocked(api.readReportPage).mockReturnValueOnce(replacement.promise);
-    act(() => kind === "manual" ? result.current.second.restart() : result.current.second.next());
+    act(() => result.current.second.restart());
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(kind === "manual" ? 3 : 4));
     expect(result.current.second.data).toBeUndefined();
     expect(result.current.second.loading).toBe(true);
@@ -1265,39 +1340,48 @@ describe("report page selection lifetimes", () => {
     expect(result.current.first.data?.selection.id).toBe("initial");
   });
 
-  it("gives a new filter visit its own bounded automatic recovery attempt", async () => {
+  it("requires explicit replacement on each rejected filter visit", async () => {
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockResolvedValueOnce(page("recovered"))
       .mockResolvedValueOnce(page("filtered")).mockRejectedValueOnce(invalidated).mockResolvedValueOnce(page("returned"));
     const { result, rerender } = renderHook(({ search }) =>
       useReportPage<string>("official-usage/history", { search }), { initialProps: { search: "" } });
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("recovered"));
     rerender({ search: "changed" });
     await waitFor(() => expect(result.current.data?.selection.id).toBe("filtered"));
     rerender({ search: "" });
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledTimes(4);
+    act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("returned"));
     expect(api.readReportPage).toHaveBeenCalledTimes(5);
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ search: "", limit: 50 });
   });
 
-  it("stops persistent invalidation after one automatic recovery and allows an explicit restart", async () => {
+  it("stops persistent invalidation at one read and allows an explicit restart", async () => {
     vi.mocked(api.readReportPage).mockRejectedValue(invalidated);
     const { result } = renderHook(() => useReportPage("official-usage/history"));
     await waitFor(() => {
       expect(result.current.invalidated).toBe(true);
       expect(result.current.loading).toBe(false);
     });
-    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(result.current.data).toBeUndefined();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(page("manual"));
     act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("manual"));
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ limit: 50 });
   });
 
-  it("does not renew automatic recovery by paging, but does renew it on explicit restart", async () => {
+  it("never replays rejected paging or replacement reads", async () => {
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockResolvedValueOnce(page("recovered"));
     const { result } = renderHook(() => useReportPage("official-usage/history"));
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("recovered"));
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
     act(() => result.current.next());
@@ -1309,6 +1393,9 @@ describe("report page selection lifetimes", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ limit: 50, selectionId: "recovered", cursor: "next" });
     vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockResolvedValueOnce(page("manual"));
+    act(() => result.current.restart());
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledTimes(4);
     act(() => result.current.restart());
     await waitFor(() => expect(result.current.data?.selection.id).toBe("manual"));
     expect(api.readReportPage).toHaveBeenCalledTimes(5);

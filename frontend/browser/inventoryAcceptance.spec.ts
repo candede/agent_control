@@ -5,50 +5,81 @@ import { createUnifiedVerification } from "../src/test/inventoryVerification";
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
-test("reloading keeps the loading skeleton through a background inventory publication without error flashes", async ({ page }, info) => {
+for (const order of ["observer-first", "page-first"] as const) for (const changed of [false, true]) {
+test(`reloading handshakes ${order}, publication changed=${changed}, without redundant reads or error flashes`, async ({ page }, info) => {
+  // mockLayoutApi explicitly owns online availability in this isolated runner.
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));
-  let inventoryReads = 0;
-  let automaticReady: Promise<void>, inventoryReady: Promise<void>;
-  let releaseAutomatic!: () => void, releaseInventory!: () => void;
+  let inventoryReads = 0, automaticReads = 0, captures = 0;
+  let automaticReady: Promise<void>, inventoryReady: Promise<void>, replacementReady: Promise<void>;
+  let releaseAutomatic!: () => void, releaseInventory!: () => void, releaseReplacement!: () => void;
   await page.route(url => url.pathname === "/api/data-sync/auto-refresh", async route => {
+    automaticReads++;
     await automaticReady;
-    await route.fallback();
+    await route.fulfill({ json: { run: null, detailJob: null, revisions: {
+      graph_packages: (changed ? "4" : "1").repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64),
+    }, nextCheckAt: "2030-01-01T00:00:00.000Z" } });
   });
   await page.route(url => url.pathname === "/api/agent-inventory", async route => {
     inventoryReads++;
-    await inventoryReady;
+    await (inventoryReads === 1 ? inventoryReady : replacementReady);
+    await route.fallback();
+  });
+  await page.route(url => url.pathname === "/api/agent-inventory/selections", async route => {
+    captures++;
     await route.fallback();
   });
   for (let visit = 0; visit < 3; visit++) {
-    inventoryReads = 0;
+    inventoryReads = 0; automaticReads = 0; captures = 0;
     automaticReady = new Promise(resolve => { releaseAutomatic = resolve; });
     inventoryReady = new Promise(resolve => { releaseInventory = resolve; });
+    replacementReady = new Promise(resolve => { releaseReplacement = resolve; });
     try {
       if (visit === 0) await page.goto("/agents?usage=used&sort=responses&direction=desc");
       else await page.reload();
       await expect.poll(() => inventoryReads).toBe(1);
       await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
-      releaseAutomatic();
-      await expect.poll(() => inventoryReads).toBe(2);
-      await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+      await expect.poll(() => automaticReads).toBe(1);
+      if (order === "observer-first") {
+        releaseAutomatic();
+        await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+        expect(inventoryReads).toBe(1);
+        releaseInventory();
+      } else {
+        releaseInventory();
+        await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
+        expect(inventoryReads).toBe(1);
+        releaseAutomatic();
+      }
+      if (changed) {
+        await expect.poll(() => inventoryReads).toBe(2);
+        if (order === "observer-first") await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+        else await expect(page.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+      }
       await expect(page.getByRole("alert")).toHaveCount(0);
       await expect(page.getByText(/No saved package catalog observation|The request was cancelled/)).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
+      // A completed unchanged fixture truthfully reports its missing optional
+      // Power Platform source; a pending replacement must not flash that state.
+      if (changed) await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
+      else await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toBeVisible();
       if (visit === 2) await page.screenshot({ path: info.outputPath("reload-pending.png") });
-      releaseInventory();
+      releaseReplacement();
       await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
       await expect(page.getByRole("region", { name: "Loading agents" })).toHaveCount(0);
       await expect(page.getByRole("alert")).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
-      expect(inventoryReads).toBe(2);
+      expect(inventoryReads).toBe(changed ? 2 : 1);
+      expect(captures).toBe(changed ? 2 : 1);
+      expect(automaticReads).toBe(1);
     } finally {
       releaseAutomatic();
       releaseInventory();
+      releaseReplacement();
     }
   }
   expect(unexpected).toEqual([]);
 });
+}
 
 test("inventory retry shows loading, then exposes a real failure or recovers", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);

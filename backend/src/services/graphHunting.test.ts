@@ -85,6 +85,40 @@ function row(templateId: DefenderHuntingTemplateId, overrides: Record<string, un
 }
 
 describe("Microsoft Graph v1.0 curated hunting contract", () => {
+  it("compiles a user-on-agent invocation query in the human caller namespace", () => {
+    const selected = validateDefenderHuntingFilters({ ...filters(), userObjectId: blueprintId, entraAgentApplicationIds: [agentId],
+      operations: ["InvokeAgent"] }, { now });
+    const { Query } = createHuntingRequest(selected);
+    expect(Query).toContain(`tostring(Event.UserKey) in~ (@'${blueprintId}')`);
+    expect(Query).toContain("ActionType in (@'InvokeAgent')");
+    expect(Query).not.toContain(`AccountObjectId in~ (@'${blueprintId}')`);
+    expect(compileKusto(Query, publishedHuntingTables).diagnostics.filter(item => item.severity === "Error")).toEqual([]);
+  });
+
+  it.each(["InferenceCall", "ExecuteToolBySDK"])("does not attribute %s agent-account telemetry to a human", operation => {
+    expect(() => validateDefenderHuntingFilters({ ...filters(operation === "InferenceCall" ? "agent_activity" : "agent_tools"),
+      operations: [operation], userObjectId: blueprintId }, { now })).toThrow(/human-attributed/);
+  });
+
+  it("rejects a different human caller even when the account or selected agent matches", async () => {
+    const selected = { ...filters(), operations: ["InvokeAgent"], userObjectId: blueprintId, entraAgentApplicationIds: [agentId] };
+    const fetcher = vi.fn(async () => response("agent_activity", [row("agent_activity", {
+      AccountObjectId: blueprintId, HumanUserKey: agentId, HumanUserKeyState: "value",
+    })]));
+    const client = new GraphHuntingClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", selected, { tenantId })).rejects.toMatchObject({ code: "provider_scope_mismatch" });
+  });
+
+  it("accepts a matching human invocation without requiring the account column to identify the same person", async () => {
+    const selected = { ...filters(), operations: ["InvokeAgent"], userObjectId: blueprintId, entraAgentApplicationIds: [agentId] };
+    const fetcher = vi.fn(async () => response("agent_activity", [row("agent_activity", {
+      AccountObjectId: agentId, HumanUserKey: blueprintId, HumanUserKeyState: "value",
+    })]));
+    const client = new GraphHuntingClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", selected, { tenantId })).resolves.toMatchObject({
+      storedRowCount: 1, complete: true, rows: [expect.objectContaining({ humanActorUserObjectId: blueprintId })],
+    });
+  });
   it("compiles typed Entra scopes without using platform/native aliases as identity predicates", () => {
     for (const template of ["agents_inventory", "agent_activity", "agent_tools"] as const) {
       const selected = { ...filters(template), ...(template === "agents_inventory" ? { entraAgentIds: [agentId] } : { entraAgentApplicationIds: [agentId] }) };

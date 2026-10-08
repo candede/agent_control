@@ -40,11 +40,15 @@ function Assert-FreshInstallationContainer {
     $labels = $Container.Config.Labels
     $service = $labels.'com.docker.compose.service'
     $composeFiles = if ($Context.AppliedComposeFiles) { $Context.AppliedComposeFiles } else { @((Join-Path $Context.Root 'compose.yaml'),$Context.FixtureCompose) }
+    # Reset can recreate only the app; the already-verified PostgreSQL container keeps its original compose paths.
+    $retainedPostgres = $service -ceq 'postgres' -and $Context.VerifiedPostgres -and
+        $Container.Id -ceq $Context.VerifiedPostgres.Id -and $Container.Image -ceq $Context.VerifiedPostgres.Image -and
+        $labels.'com.docker.compose.project.config_files' -ceq $Context.VerifiedPostgres.Config.Labels.'com.docker.compose.project.config_files'
     if ($labels.'com.docker.compose.project' -cne $Context.Project -or $service -notin @('app','postgres') -or
         $labels.'com.docker.compose.project.working_dir' -cne $Context.Root -or
         $Container.Name -cne "/$($Context.Project)-$service-1" -or
         $Container.Id -cnotmatch '^[a-f0-9]{64}$' -or
-        $labels.'com.docker.compose.project.config_files' -cne ($composeFiles -join ',')) {
+        ($labels.'com.docker.compose.project.config_files' -cne ($composeFiles -join ',') -and -not $retainedPostgres)) {
         throw 'Fresh installation container metadata differs; cleanup refused.'
     }
     $expected = if ($service -eq 'postgres') {
@@ -121,7 +125,7 @@ function Write-FreshInstallationEvidence {
         Write-LocalText (Join-Path $Directory "$Stage-$($container.Id).log") (Get-RedactedFixtureLog $container.Id '500')
         if ($container.State.Running) {
             $metrics = Invoke-DockerCommand @('exec',$container.Id,'sh','-c',
-                'for f in memory.current memory.peak memory.max memory.events; do printf "%s\n" "$f"; cat "/sys/fs/cgroup/$f"; done') -Capture
+                'for f in memory.current memory.peak memory.max memory.events cpu.max cpu.stat; do printf "%s\n" "$f"; cat "/sys/fs/cgroup/$f"; done') -Capture
             Write-LocalText (Join-Path $Directory "$Stage-$($container.Id)-cgroup.log") $metrics
         }
     }
@@ -140,6 +144,29 @@ function Wait-FreshInstallationHealth {
         Start-Sleep -Seconds 2
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Fresh installation did not regain health within the existing 90-second readiness bound.'
+}
+
+function Invoke-FreshFirstSync {
+    param($Context,[string]$Directory,[string]$Stage)
+    Assert-FreshInstallationContext $Context $Directory
+    $script = [IO.File]::ReadAllText((Join-Path $Context.Root 'backend/scripts/restart-runtime.mjs'))
+    $output = @($script | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$($Context.Project)" "$($Context.Project)-app-1" node --input-type=module - first-sync 2>&1)
+    Write-LocalText (Join-Path $Directory "$Stage-first-sync.log") ($output -join "`n")
+    if ($LASTEXITCODE -ne 0 -or -not ($output -match '"event":"fresh_runtime_first_sync".*"outcome":"passed"')) {
+        throw "Compiled first collection failed; inspect $Stage-first-sync.log."
+    }
+    $snapshot = Write-FreshInstallationEvidence $Context $Directory $Stage
+    foreach ($container in $snapshot.containers) {
+        $peak = [long](Invoke-DockerCommand @('exec',$container.Id,'cat','/sys/fs/cgroup/memory.peak') -Capture)
+        $limit = [long](Invoke-DockerCommand @('exec',$container.Id,'cat','/sys/fs/cgroup/memory.max') -Capture)
+        $cpu = Invoke-DockerCommand @('exec',$container.Id,'cat','/sys/fs/cgroup/cpu.max') -Capture
+        $expectedCpu = if ($container.HostConfig.NanoCpus -eq 1500000000) { '150000 100000' } else { '50000 100000' }
+        $events = Invoke-DockerCommand @('exec',$container.Id,'cat','/sys/fs/cgroup/memory.events') -Capture
+        if ($limit -ne $container.HostConfig.Memory -or $cpu -cne $expectedCpu -or
+            $peak -gt $container.HostConfig.Memory -or $events -match '(?m)^(max|oom|oom_kill) [1-9]') {
+            throw "Compiled fresh runtime exceeded its unchanged resource budget: $($container.Name)."
+        }
+    }
 }
 
 function Get-FreshLifecycleProgress {
@@ -237,6 +264,7 @@ networks:
         Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks
         $snapshot = Write-FreshInstallationEvidence $context $Directory 'ready'
         if ($snapshot.containers.Count -ne 2 -or @($snapshot.containers | Where-Object { $_.State.Health.Status -cne 'healthy' -or $_.State.OOMKilled }).Count) { throw 'Fresh installation is not healthy.' }
+        $context.VerifiedPostgres = $snapshot.containers | Where-Object { $_.Config.Labels.'com.docker.compose.service' -ceq 'postgres' }
         $schema = Invoke-LocalOperator $context @('backend/scripts/database.ts','preflight') -Capture | ConvertFrom-Json
         if ($schema.state -cne 'current' -or $schema.targetFingerprint -cnotmatch '^[a-f0-9]{64}$' -or
             $schema.currentFingerprint -cne $schema.targetFingerprint) { throw 'Fresh installation does not match the compiled schema fingerprint.' }
@@ -271,9 +299,27 @@ networks:
         Copy-Item -LiteralPath "$afterBackup.json" -Destination (Join-Path $Directory 'backup-restarted.json')
         Write-LocalText (Join-Path $Directory 'restart-progress.json') (@{before=$progressBefore;after=$progressAfter;interpretation='Only scheduled lifecycle metadata may advance within existing 1000-row/1-MiB slice bounds; all other table fingerprints and all row counts must match.'} | ConvertTo-Json -Depth 5)
         Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter
+        Invoke-FreshFirstSync $context $Directory 'collected'
         $restore = 'agentcontrol_restore_' + ($project -replace '^ac-ltdp-install-','')
         Invoke-LocalDeployment -Context $context -Action Restore -BackupFile $backup -RestoreDatabase $restore
-        Write-LocalText (Join-Path $Directory 'result.json') (@{suite='fresh-installation';project=$project;deploy='passed';reset=$false;schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;authenticatedWorkflow='separate isolated gate fixtures; no real sign-in';syntheticSoak='waived by user';at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
+        $retained = @{}
+        foreach ($path in @('settings.json','secrets/tenants.json','secrets/session','secrets/postgres-admin','secrets/postgres-app','backups/fresh.dump','backups/fresh.dump.json')) {
+            $retained[$path] = (Get-FileHash -LiteralPath (Join-Path $context.State $path) -Algorithm SHA256).Hash
+        }
+        Assert-FreshInstallationContext $context $Directory
+        @(Get-FreshInstallationResources $context $Directory) | Out-Null
+        Invoke-LocalDeployment -Context $context -Action Deploy -DbReset
+        foreach ($path in $retained.Keys) {
+            if ((Get-FileHash -LiteralPath (Join-Path $context.State $path) -Algorithm SHA256).Hash -cne $retained[$path]) {
+                throw "Explicit reset changed retained configuration or backup: $path."
+            }
+        }
+        $resetSchema = Invoke-LocalOperator $context @('backend/scripts/database.ts','preflight') -Capture | ConvertFrom-Json
+        if ($resetSchema.state -cne 'current' -or $resetSchema.currentFingerprint -cne $schema.targetFingerprint) {
+            throw 'Explicit reset did not initialize the current schema.'
+        }
+        Invoke-FreshFirstSync $context $Directory 'recollected'
+        Write-LocalText (Join-Path $Directory 'result.json') (@{suite='fresh-installation';project=$project;deploy='passed';reset='passed';firstSync='passed';firstSyncAfterReset='passed';retainedConfigurationAndBackups='unchanged';schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;authenticatedWorkflow='synthetic compiled loopback router; no real sign-in';at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
     } catch { $failures.Add($_.Exception) }
     finally {
         foreach ($tag in @($context.Operator,$context.Image,$context.Checks)) {

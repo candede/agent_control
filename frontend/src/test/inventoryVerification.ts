@@ -5,7 +5,8 @@ export function inventoryPageMetadata(counts: UnifiedAgentInventoryPage["counts"
   selection: Partial<Omit<UnifiedAgentInventoryPage["selection"], "expiresAt">> = {},
 ): Pick<UnifiedAgentInventoryPage, "selection" | "page" | "counts" | "freshness" | "usageContext" | "inventoryOverview"> {
   const captured = { id: "20000000-0000-4000-8000-000000000002", revision: "1",
-    evaluatedAt: "2026-09-20T12:00:00.000Z", ...selection, expiresAt };
+    evaluatedAt: "2026-09-20T12:00:00.000Z", validatedAt: selection.evaluatedAt ?? "2026-09-20T12:00:00.000Z",
+    publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) }, ...selection, expiresAt };
   return {
     selection: captured,
     page: { limit: 50, nextCursor: null, previousCursor: null }, counts: { ...counts },

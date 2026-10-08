@@ -13,9 +13,6 @@ import {
 } from "../types/dataSync.js";
 import { pool, transaction } from "./pool.js";
 import { readAutomaticInventoryRevisions } from "./inventoryAutomaticRevisions.js";
-import { dataConnections } from "./dataConnections.js";
-import { UserSourcesRepository } from "./userSources.js";
-import { config } from "../config.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
 export type UserSourcePublication = { runId: string; jobId: string };
@@ -109,12 +106,7 @@ export class DataSyncRepository {
 
   async automaticRevisions(scope: DataSyncScope) {
     validateScope(scope);
-    return dataConnections(this.database).selectedRead(async client => {
-      const now = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
-      const inventory = await readAutomaticInventoryRevisions(scope, client, now);
-      const users = await new UserSourcesRepository(this.database, config.sessionSecret).metadataInRead(client, { ...scope, tokenMode: "delegated" }, now);
-      return { ...inventory, users: hash(["automatic-users-v2", scope.tenantId, scope.principalId, users]) };
-    });
+    return readAutomaticInventoryRevisions(scope, this.database);
   }
 
   async finishAutomatic(scope: DataSyncScope, runId: string) {

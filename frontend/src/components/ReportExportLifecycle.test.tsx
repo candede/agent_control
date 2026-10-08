@@ -9,6 +9,7 @@ import { combinedUser, reportAgent, reportPage, reportUser } from "../test/repor
 import { CopilotUsersView } from "./CopilotUsersView";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportingView } from "./ReportingView";
+import { PublicationContext } from "../publicationContext";
 
 vi.mock("../api/reportData", async original => ({
   ...await original<typeof import("../api/reportData")>(),
@@ -63,17 +64,19 @@ describe.each(views)("$name export and page lifetimes", ({ element, page, row, e
     expect(api.createReportExport).toHaveBeenCalledOnce();
   });
 
-  it.each([
+  it.each(([
     { phase: "building", age: 0 }, { phase: "ready", age: 0 },
     { phase: "building", age: 31_000 }, { phase: "ready", age: 31_000 },
-  ] as const)("preserves a $phase export during pinned focus revalidation at cache age $age", async ({ phase, age }) => {
+  ] as const).flatMap(value => (["focus", "publication"] as const).map(trigger => ({ ...value, trigger }))))(
+    "preserves a $phase export during pinned $trigger revalidation at cache age $age", async ({ phase, age, trigger }) => {
     const selected = page();
     vi.mocked(api.readReportPage).mockResolvedValue(selected);
     vi.mocked(api.createReportExport).mockResolvedValue({ id: "artifact" });
     const ready = { id: "artifact", status: "ready" as const, rows: 1, bytes: 10,
       expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
     vi.mocked(api.reportExportStatus).mockResolvedValue({ ...ready, status: phase });
-    render(element);
+    const publication = { admit: vi.fn(), revisions: selected.selection.publicationRevisions };
+    const view = render(<PublicationContext value={publication}>{element}</PublicationContext>);
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: exportLabel })); });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
@@ -81,7 +84,14 @@ describe.each(views)("$name export and page lifetimes", ({ element, page, row, e
     const pending = deferred<ReturnType<typeof page>>();
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
     vi.setSystemTime(Date.now() + age);
-    await act(async () => { fireEvent.focus(window); fireEvent.focus(window); await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => {
+      if (trigger === "focus") { fireEvent.focus(window); fireEvent.focus(window); }
+      else {
+        publication.revisions = { ...publication.revisions, users: "4".repeat(64) };
+        view.rerender(<PublicationContext value={{ ...publication }}>{element}</PublicationContext>);
+      }
+      await vi.advanceTimersByTimeAsync(1);
+    });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe(selected.selection.id);
     expect(signal.aborted).toBe(false);

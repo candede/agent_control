@@ -62,7 +62,8 @@ export function projectAgentResponsibility(inventory: UnifiedAgentInventoryPage,
   }
   const count = selected?.count ?? sorted.length;
   return { selection: { id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", revision: inventory.selection.revision,
-    evaluatedAt: "2026-09-12T10:00:00.000Z", expiresAt: "2099-09-12T10:00:00.000Z" },
+    evaluatedAt: "2026-09-12T10:00:00.000Z", expiresAt: "2099-09-12T10:00:00.000Z",
+    validatedAt: "2026-09-12T10:00:00.000Z", publicationRevisions: inventory.selection.publicationRevisions },
     sources: inventory.sources, invalidReferenceCount,
     people: objectId ? [] : sorted.slice(offset, offset + limit), counts: { total: people.size, filtered: sorted.length },
     page: { limit, nextCursor: offset + limit < count ? `tiny-oracle:${offset + limit}` : null,

@@ -69,6 +69,24 @@ async function qualifyScope(key: string, scope = principalScope, selectedFilters
 }
 
 describe.sequential("Defender hunting repository", () => {
+  it("filters human scope before counts and denies other-human job access even on the same agent", async () => {
+    const owner: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "human-history-reader",
+      resultScope: { kind: "principal", scopeId: "human-history-reader", configurationRevision: null } };
+    const userObjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const applicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const selected: DefenderHuntingFilters = { ...filters, templateId: "agent_activity", operations: ["InvokeAgent"],
+      agentIds: [], entraAgentApplicationIds: [applicationId], userObjectId };
+    const matching = await repository.submit(owner, { idempotencyKey: "human-match", filters: selected });
+    const other = await repository.submit(owner, { idempotencyKey: "human-other", filters: { ...selected, userObjectId: applicationId } });
+    await repository.submit(owner, { idempotencyKey: "human-broad", filters: { ...selected, userObjectId: undefined } });
+    const read = { tenantId: owner.tenantId, authorizationPrincipalId: owner.authorizationPrincipalId,
+      resultScopes: [owner.resultScope], qualifications: [], userObjectId, entraAgentApplicationIds: [applicationId] };
+    const page = await repository.listJobs(read, 1, 0);
+    expect(page.count).toBe(1);
+    expect(page.value.map(job => job.id)).toEqual([matching.id]);
+    expect(await repository.getJob(read, other.id)).toBeUndefined();
+    await expect(repository.cancel(read, other.id)).rejects.toMatchObject({ code: "hunting_job_state" });
+  });
   it("isolates typed agent history before real database counts, pagination and lifecycle access", async () => {
     const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "agent-history-reader",
       resultScope: { kind: "principal", scopeId: "agent-history-reader", configurationRevision: null } };

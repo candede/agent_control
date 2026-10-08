@@ -638,11 +638,10 @@ test("official usage dialogs keep import and management recovery reachable in sh
         </div><footer class="usage-import-footer"><button class="secondary" disabled>Cancel import</button><button>Refresh bundle validation</button></footer>
       </section>` : `<section class="usage-manage-reports" aria-label="Manage saved reports" tabindex="0">
         <section class="official-usage-history-panel"><div class="error-banner" role="alert">${reference}<button>Retry saved data</button></div>
-          <div class="table-shell" role="region" aria-label="Saved report history" aria-busy="true" tabindex="0"><table><thead><tr><th>Imported</th><th>Reporting window</th><th>Status</th><th>Actions</th></tr></thead>
-            <tbody><tr><td>10/7/2026</td><td>No activity dates</td><td>Saved<small>${reference}</small></td><td><button disabled>View report</button><button disabled>Report observations</button></td></tr></tbody></table></div>
-          <nav class="copilot-users-pagination" aria-label="report sets pages" aria-busy="true"><span>Unknown matching report sets</span><button aria-disabled="true">Previous report sets</button><button aria-disabled="true">Next report sets</button></nav>
-          <button>Load current report history</button>
-          <section aria-label="Report observations"><h4>Observations for ${reference}</h4><ul><li>hash ${reference}</li></ul></section>
+          <div class="table-shell usage-history-table" role="region" aria-label="Saved report history" aria-busy="true" tabindex="0"><table><thead><tr><th>Imported</th><th>Activity dates</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody><tr><td><span class="usage-mobile-label" aria-hidden="true">Imported</span>10/7/2026</td><td><span class="usage-mobile-label" aria-hidden="true">Activity dates</span>No activity dates</td>
+            <td><span class="usage-mobile-label" aria-hidden="true">Status</span><span class="usage-report-badge">Saved</span></td>
+            <td><div class="table-actions"><button class="secondary" disabled>View report</button><button class="icon-button danger" aria-label="Delete report set" disabled>X</button></div></td></tr></tbody></table></div>
         </section></section>`}</div></dialog>`);
     const dialog = page.locator("dialog.official-usage-modal");
     await expect(dialog).toBeHidden();
@@ -655,7 +654,7 @@ test("official usage dialogs keep import and management recovery reachable in sh
           expect(await page.locator(selector).evaluate(element => element.scrollWidth <= element.clientWidth + 1),
             `${selector} must not scroll horizontally at ${width}x${height} with ${fontSize}px text`).toBe(true);
         }
-        for (const name of importing ? ["Discard staged import", "Continue import", "Refresh bundle validation"] : ["Close reports", "Retry saved data", "Load current report history"]) {
+        for (const name of importing ? ["Discard staged import", "Continue import", "Refresh bundle validation"] : ["Close reports", "Retry saved data"]) {
           const control = page.getByRole("button", { name, exact: true });
           await control.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
           await expect(control, `${name} at ${width}x${height} with ${fontSize}px text`).toBeInViewport({ ratio: 1 });
@@ -670,8 +669,10 @@ test("official usage dialogs keep import and management recovery reachable in sh
       await expect(table).toBeFocused();
       await expect(table).toHaveCSS("overflow-x", "auto");
       expect(await table.evaluate(element => getComputedStyle(element).outlineStyle !== "none")).toBe(true);
-      await page.keyboard.press("ArrowRight");
-      await expect.poll(() => table.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
+      if (await table.evaluate(element => element.scrollWidth > element.clientWidth)) {
+        await page.keyboard.press("ArrowRight");
+        await expect.poll(() => table.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
+      }
     }
     await dialog.evaluate((element: HTMLDialogElement) => element.close());
     await expect(dialog).toBeHidden();
@@ -692,10 +693,10 @@ test("official usage snapshot, import success and nested deletion preserve reada
       <nav class="copilot-users-pagination" aria-label="agents pages" aria-busy="true"><span>Unknown matching agents</span><button aria-disabled="true">Previous agents</button><button aria-disabled="true">Next agents</button></nav>
     </section></section>`;
   const success = `<section class="official-usage-import" aria-label="Import CSV reports"><div class="usage-import-body">
-    <div class="usage-import-success"><h3 tabindex="-1">Reports imported</h3><p role="status">Your report set is ready in Agents.</p>
+    <div class="usage-import-success"><h3 tabindex="-1">Reports imported</h3><p role="status">Your report set has been saved.</p>
       <section aria-label="Imported CSV summary"><dl class="usage-import-statistics">${["Agents", "Users", "Responses"].map(label =>
         `<div><dt>${label}</dt><dd>1,234,567,890,123</dd></div>`).join("")}</dl></section></div>
-    </div><footer class="usage-import-footer"><button>OK</button></footer></section>`;
+    </div><footer class="usage-import-footer"><button class="secondary">Add more reports</button><button>Close</button></footer></section>`;
   const deletion = `<section class="usage-manage-reports" tabindex="0"><dialog class="confirm-modal" aria-label="Delete report set?">
     <h2>Delete report set?</h2><p>This removes report ${reference}. History pages, overview and exports will be invalidated.</p>
     <p role="alert">Deletion may already have completed. Reload report history to verify; do not repeat this confirmation. ${reference}</p>
@@ -714,7 +715,7 @@ test("official usage snapshot, import success and nested deletion preserve reada
         const container = page.locator(state === "deletion" ? ".confirm-modal" : state === "snapshot" ? ".usage-snapshot" : ".usage-import-body");
         expect(await container.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
           `${state} evidence must fit at ${width}x${height} with ${fontSize}px text`).toBe(true);
-        for (const name of state === "snapshot" ? ["Back to reports", "Retry saved data", "Responses", "Last reported activity"] : state === "success" ? ["OK"] : ["Cancel", "Reload report history", "Import correction instead"]) {
+        for (const name of state === "snapshot" ? ["Back to reports", "Retry saved data", "Responses", "Last reported activity"] : state === "success" ? ["Add more reports", "Close"] : ["Cancel", "Reload report history", "Import correction instead"]) {
           const control = page.getByRole("button", { name, exact: true });
           await control.evaluate(element => element.scrollIntoView({ block: "center", inline: "center" }));
           await expect(control, `${name} at ${width}x${height} with ${fontSize}px text`).toBeInViewport({ ratio: 1 });

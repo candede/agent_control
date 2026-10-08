@@ -154,7 +154,7 @@ describe("persisted package control observations", () => {
     expect(await readPackageControls(fixture.runtime, scope, ["rain"])).toMatchObject([{ state: { kind: "block", isBlocked: true } }]);
   });
 
-  it("does not extend source membership or label expired identity current after a control readback", async () => {
+  it("retains historical membership without extending current authority after a control readback", async () => {
     const scope = newScope();
     await refresh(scope, [original()], ["rain"], "delegated", new Date(Date.now() + 2500));
     await control(scope, sparse(true));
@@ -164,7 +164,10 @@ describe("persisted package control observations", () => {
     await expect.poll(() => live.record(scope, id).then(() => "current", error => error.code),
       { interval: 100, timeout: 3500 }).toBe("agent_not_found");
     await expect(selected.queries.packageDetail(selected.selection.id, selected.identity, "rain"))
-      .rejects.toMatchObject({ code: "selection_invalidated" });
+      .resolves.toMatchObject({ id: "rain", isBlocked: true });
+    expect((await read(scope)).detail).toMatchObject({ id: "rain", isBlocked: true, observation: { current: false } });
+    const current = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
+    expect(current.value[0].observations.packageSnapshots.rain).toMatchObject({ current: false, identityDetails: { current: false } });
     expect(await readPackageControls(fixture.runtime, scope, ["rain"])).toMatchObject([{ state: { kind: "block", isBlocked: true } }]);
   });
 

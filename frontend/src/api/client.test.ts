@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
 import { createUnifiedVerification } from "../test/inventoryVerification";
@@ -92,6 +93,17 @@ import {
   type PurviewAuditFilters,
   type DefenderHuntingFilters,
 } from "./client";
+
+it.each(["expired", "unavailable", "changed", "unrecognized"])("preserves only classified selected-read failure reason %s", async reason => {
+  const fetchMock = vi.fn().mockResolvedValue(Response.json({
+    code: "selection_invalidated", detail: "Selection is not valid.", details: { reason, private: "must not be copied" },
+  }, { status: 409 }));
+  vi.stubGlobal("fetch", fetchMock);
+  await expect(getUnifiedAgents({ selectionId: "selected" })).rejects.toMatchObject({
+    code: "selection_invalidated", status: 409, details: reason === "unrecognized" ? undefined : { reason },
+  });
+  expect(fetchMock).toHaveBeenCalledOnce();
+});
 
 const accessUpdate: PackageAccessReplacement = {
   target: "availability",
@@ -854,7 +866,7 @@ describe("access API client", () => {
     );
   });
 
-  it.each(["not_collected", "preparing"])("returns explicit %s inventory availability without reading a nonexistent selection", async state => {
+  it.each(["not_collected", "preparing", "unavailable"])("returns explicit %s inventory availability without reading a nonexistent selection", async state => {
     const unavailable = { state, message: "Inventory is not ready yet." };
     const fetchMock = mockJsonResponse(unavailable);
     await expect(getUnifiedAgents()).resolves.toEqual(unavailable);
@@ -1255,7 +1267,7 @@ describe("investigation request cancellation", () => {
   const confirmationBody = JSON.stringify({ confirmation: id });
   const requests: Array<{
     name: string; path: string; method?: "POST" | "DELETE"; body?: string;
-    send: (options?: { signal?: AbortSignal; agentRecordId?: string }) => Promise<unknown>;
+    send: (options?: { signal?: AbortSignal; agentRecordId?: string; userObjectId?: string }) => Promise<unknown>;
   }> = [
     { name: "Agent identity resolution", path: "/api/agent-inventory/investigations/resolve", method: "POST", body: JSON.stringify({ recordId: "power_platform:env/one:agent%one" }), send: options => resolveAgentInvestigationIdentity("power_platform:env/one:agent%one", options) },
     { name: "Purview submit", path: "/api/audit-search/jobs", method: "POST", body: auditBody, send: options => submitPurviewAuditSearch("delegated", auditFilters, options) },
@@ -1318,8 +1330,9 @@ describe("investigation request cancellation", () => {
   it.each(requests.filter(item => item.name.startsWith("Defender")))("binds $name to the exact selected agent on every lifecycle request", async ({ path, send }) => {
     const fetchMock = mockJsonResponse({});
     const agentRecordId = "power_platform:env/id:opaque%agent";
-    await send({ agentRecordId });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(`${path}?${new URLSearchParams({ agentRecordId })}`,
+    const userObjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await send({ agentRecordId, userObjectId });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(`${path}?${new URLSearchParams({ agentRecordId, userObjectId })}`,
       expect.objectContaining({ credentials: "include" }));
   });
 
@@ -1339,8 +1352,8 @@ describe("investigation request cancellation", () => {
   it("binds saved context, history, details, rows and Purview paging to their agent", async () => {
     const fetchMock = mockJsonResponse({});
     const recordId = "power_platform:env/id:opaque%agent";
-    const options = { agentRecordId: recordId };
-    const agentQuery = new URLSearchParams({ agentRecordId: recordId }).toString();
+    const options = { agentRecordId: recordId, userObjectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    const agentQuery = new URLSearchParams(options).toString();
     await getDefenderHuntingCatalog(options);
     await getDefenderHuntingJobs(20, 40, options);
     await getDefenderHuntingJob("job/one", options);

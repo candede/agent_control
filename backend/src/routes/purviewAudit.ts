@@ -30,7 +30,7 @@ policyRoute(purviewAuditRouter, "get", "/audit-search/catalog", { access: "authe
 });
 
 policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  response.status(201).json(await purviewAudit.approveQualification(request.session.user!, { tokenMode: tokenMode(request.body?.tokenMode), filters: request.body?.filters }));
+  response.status(201).json(await purviewAudit.approveQualification(request.session.user!, { tokenMode: tokenMode(request.body?.tokenMode), filters: request.body?.filters, agentRecordId: request.body?.agentRecordId }));
 });
 
 policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications/:id/start", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
@@ -39,13 +39,13 @@ policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications/:id/start"
 
 policyRoute(purviewAuditRouter, "post", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const mode = tokenMode(request.body?.tokenMode);
-  const job = await purviewAudit.submit(request.session.user!, { tokenMode: mode, filters: request.body?.filters, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() });
+  const job = await purviewAudit.submit(request.session.user!, { tokenMode: mode, filters: request.body?.filters, agentRecordId: request.body?.agentRecordId, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() });
   response.status(202).json(await startOrWaiting(request, job.id, mode));
 });
 
 policyRoute(purviewAuditRouter, "get", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await purviewAudit.list(request.session.user!, positiveInteger(first(request.query.limit), 20, 50),
-    positiveInteger(first(request.query.offset), 0, 100_000, true), request.query.userPrincipalName));
+    positiveInteger(first(request.query.offset), 0, 100_000, true), request.query.userPrincipalName, request.query.agentRecordId));
 });
 
 policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {

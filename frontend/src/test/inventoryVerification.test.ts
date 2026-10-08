@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { PowerPlatformResourceType } from "../api/client";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "./inventoryVerification";

@@ -1,9 +1,27 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { CursorCodec, DataSelections, canonicalQuery } from "./dataSelections.js";
+import { CursorCodec, DataSelections, SelectionError, canonicalQuery } from "./dataSelections.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { dataConnections,isSelectedRead } from "../db/dataConnections.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { directoryRecord, generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
+import { isPublicationRevisions } from "../types/dataSelection.js";
+import { withQueries } from "../../scripts/lifecycleEvidence.js";
+
+it("exposes only explicit safe selection invalidation reasons", () => {
+  for (const reason of ["expired", "unavailable", "changed"] as const) {
+    expect(new SelectionError("selection_invalidated", reason)).toMatchObject({ status: 409, details: { reason } });
+  }
+  expect(new SelectionError("selection_invalidated").details).toBeUndefined();
+  expect(new SelectionError("invalid_cursor", "expired")).toMatchObject({ status: 400, details: undefined });
+});
+
+it("requires a bounded complete publication vector rather than accepting an old context", () => {
+  const vector = { graph_packages: "a".repeat(64), power_platform: "b".repeat(64), users: "c".repeat(64) };
+  expect(isPublicationRevisions(vector)).toBe(true);
+  for (const value of [null, undefined, [], {}, { ...vector, users: "" }, { ...vector, extra: "a".repeat(64) }]) {
+    expect(isPublicationRevisions(value)).toBe(false);
+  }
+});
 
 describe("selected-read transactions", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -290,6 +308,33 @@ describe("SQL pinned reads", () => {
       expect((await client.query("SHOW transaction_isolation")).rows[0].transaction_isolation).toBe("repeatable read");
     });
     expect(validate).toHaveBeenCalledTimes(4);
+  });
+  it("does not stamp a successful validation after the required deadline passed inside validation", async () => {
+    let delay = false;
+    const domain = new DataSelections(fixture.runtime, async client => {
+      if (delay) await client.query("SELECT pg_sleep(0.3)");
+    });
+    const cutoff = new Date(Date.now() + 200);
+    const selected = await domain.capture(selectionIdentity, "/users", { values: {}, allowed: [] }, [{
+      kind: "inventory_delta", scopeId, generationId, revision: "1", expiresAt: new Date(Date.now() + 600_000),
+    }], cutoff);
+    delay = true;
+    await expect(domain.read(selected.id, selectionIdentity, async () => "must not execute"))
+      .rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "expired" } });
+  });
+  it.each([-1, 0, 1])("enforces the exact SQL logical lease boundary at %+i ms without replay", async offset => {
+    const selected = await selections.capture(selectionIdentity, "/users", { values: {}, allowed: [] }, [{
+      kind: "generation", scopeId, generationId, revision: "1", expiresAt: new Date(Date.now() + 1200_000),
+    }]);
+    const instant = new Date(selected.expiresAt.getTime() + offset).toISOString();
+    let calls = 0;
+    // Only this client's explicit SQL clock is deterministic; database triggers retain their real clock.
+    await withQueries(fixture.runtime, text => text.replaceAll("clock_timestamp()", `'${instant}'::timestamptz`), async () => {
+      const result = selections.read(selected.id, selectionIdentity, async () => { calls++; return "authorized"; });
+      if (offset < 0) await expect(result).resolves.toBe("authorized");
+      else await expect(result).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "expired" } });
+    });
+    expect(calls).toBe(offset < 0 ? 1 : 0);
   });
   it("enforces scope and exact-ID/page/vector bounds and explicit invalidation", async () => {
     expect(() => selections.exactDirectory(id, selectionIdentity, generationId, Array(101).fill("a"))).toThrow("data_exact_ids_limit");

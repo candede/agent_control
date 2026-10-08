@@ -475,11 +475,11 @@ describe("exact reported-agent evidence lifetime", () => {
     await screen.findByText(/Exact report identity/);
     cleanup(); client.clear();
   });
-  it.each(["expired", "invalid"] as const)("rejects %s exact-agent expiry before reading relationships", async expiry => {
+  it.each(["expired", "invalid"] as const)("rejects inconsistent %s exact-agent metadata before reading relationships", async expiry => {
     vi.mocked(api.readReportDetail).mockResolvedValue({ ...evidence(), selection: { ...page().selection,
       expiresAt: expiry === "expired" ? "2000-01-01T00:00:00Z" : "not-a-date" } });
     render(<ReportAgentDetail {...props} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent(/expired/);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/incomplete or inconsistent saved-read metadata/);
     expect(screen.queryByText(/Exact report identity/)).not.toBeInTheDocument();
     expect(api.readReportPage).not.toHaveBeenCalled();
   });
@@ -495,10 +495,11 @@ describe("exact reported-agent evidence lifetime", () => {
     expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
-  it.each(["timer", "focus"] as const)("retires expired exact evidence on %s and cancels pending relationships without reloading", async boundary => {
+  it.each(["timer", "focus"] as const)("retains historical exact evidence on %s without cancelling an admitted relationship read", async boundary => {
     vi.useFakeTimers();
     const pending = deferred<ReturnType<typeof reportPage>>();
     vi.mocked(api.readReportDetail).mockResolvedValue({ ...evidence(), selection: { ...page().selection,
+      validatedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 2000).toISOString() } });
     vi.mocked(api.readReportPage).mockReturnValue(pending.promise);
     render(<ReportAgentDetail {...props} />);
@@ -507,11 +508,12 @@ describe("exact reported-agent evidence lifetime", () => {
     const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
     await act(async () => {
       if (boundary === "timer") await vi.advanceTimersByTimeAsync(2000);
-      else { vi.setSystemTime(Date.now() + 2000); fireEvent.focus(window); }
+      else { vi.spyOn(performance, "now").mockReturnValue(performance.now() + 2000); fireEvent.focus(window); }
     });
-    expect(screen.queryByText(/Exact report identity/)).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent(/expired/);
-    expect(signal?.aborted).toBe(true);
+    expect(screen.getByText(/Exact report identity/)).toBeVisible();
+    expect(screen.getByText(/Showing previously loaded saved agent details/)).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(signal?.aborted).toBe(false);
     expect(api.readReportDetail).toHaveBeenCalledOnce();
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });

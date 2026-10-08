@@ -8,7 +8,7 @@ import { ApiError, getAgentResponsibility } from "../api/client";
 import * as api from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { createSavedQueryClient } from "../savedQueries";
-import { combinedUser, reportPage, reportSetId, reportUser, selectionId } from "../test/reportDataFixture";
+import { combinedUser, reportPage, reportSelection, reportSetId, reportUser, selectionId } from "../test/reportDataFixture";
 import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 import { deferred } from "../test/deferred";
 import { mockNativeDialogs } from "../test/dialog";
@@ -78,6 +78,52 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("selected active users without paid Copilot", () => {
+  it("reads the retained stale directory cohort with truthful age while its successor fails", async () => {
+    const saved = page();
+    saved.sources.directory = { ...saved.sources.directory, state: "stale", attemptStatus: "failed",
+      expiresAt: "2000-01-01T00:00:00Z", message: "Successor sync failed; showing the last published directory." };
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    renderActivity();
+    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.getByText(/Saved directory data is out of date/)).toHaveTextContent("Successor sync failed");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+  });
+  it.each(["success", "denied"] as const)("preserves detail tab and draft during explicit frozen replacement (%s)", async outcome => {
+    const saved = page(), replacement = page({ selection: reportSelection(9) });
+    const pending = deferred<ReportPage<ReportUser>>();
+    vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/agents") ? reportPage([relationship]) : saved);
+    renderActivity({ ...initial, reportSetId, search: "Ada" });
+    const { modal, dialog } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    const search = await modal.findByRole("searchbox", { name: "Search this user's agents" });
+    fireEvent.change(search, { target: { value: "Researcher" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringMatching(/\/agents$/),
+      expect.objectContaining({ search: "researcher" }), expect.any(AbortSignal)));
+    const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(saved.selection.expiresAt) - Date.parse(saved.selection.validatedAt) + 1);
+    fireEvent.focus(window);
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockImplementation(async () => reportPage([relationship], { selection: replacement.selection }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Restart selection" })[0]);
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(search).toHaveValue("Researcher");
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/users",
+      expect.objectContaining({ search: "ada", setId: reportSetId }), expect.any(AbortSignal));
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
+    if (outcome === "denied") {
+      await act(async () => pending.reject(new ApiError(403, "forbidden", "User access withdrawn")));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("User access withdrawn");
+    } else {
+      details(ada, directory(), replacement);
+      await act(async () => pending.resolve(replacement));
+      await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledWith(`official-usage/users/${encodeURIComponent(ada.username)}`, replacement.selection.id, expect.any(AbortSignal)));
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(modal.getByRole("tab", { name: "Usage & agents" })).toHaveAttribute("aria-selected", "true");
+      expect(await modal.findByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("Researcher");
+    }
+    clock.mockRestore();
+  });
   it("keeps valid non-paid users and export available without a routine refresh banner", async () => {
     const saved = page();
     saved.sources.directory.attemptStatus = "running";
@@ -126,7 +172,7 @@ describe("selected active users without paid Copilot", () => {
     await screen.findByRole("button", { name: "Ada" });
     expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
   });
-  it.each(["unavailable", "partial", "stale"] as const)("does not describe %s license evidence as an empty matching cohort", async state => {
+  it.each(["unavailable", "partial"] as const)("does not describe %s license evidence as an empty matching cohort", async state => {
     const missing = page({ value: [], counts: { total: 100000, filtered: 0 } });
     missing.sources.directory = { ...missing.sources.directory, state };
     vi.mocked(api.readReportPage).mockResolvedValue(missing);
@@ -497,13 +543,17 @@ describe("selected active users without paid Copilot", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
   });
-  it("closes pinned details when an invalidated parent selection is automatically recaptured", async () => {
+  it("closes rejected private detail and requires explicit parent replacement", async () => {
     const pending = deferred<ReportPage<ReportUser>>();
     render(<ReportedUserActivity route={initial} onRouteChange={vi.fn()} />);
     await open();
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Saved data changed"))
       .mockReturnValueOnce(pending.promise);
     fireEvent.focus(window);
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -630,8 +680,8 @@ describe("selected active users without paid Copilot", () => {
   });
   it("rejects an envelope for a different explicitly requested report instead of adopting it silently", async () => {
     renderActivity({ ...initial, reportSetId: "a-different-set" });
-    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole("alert")).toHaveTextContent(/selection/i);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Restart selection" })).toBeVisible();
   });

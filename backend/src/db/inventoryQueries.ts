@@ -17,12 +17,14 @@ import { inventoryNativeRootChoicesSql } from "./inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "./inventoryIdentityExpiry.js";
 import { projectPackageDetailAge } from "../services/packageDetailProjection.js";
 import { peakCheckpoint } from "../services/peakMemory.js";
+import { isPublicationRevisions } from "../types/dataSelection.js";
 
 export type InventoryQuery = Omit<UnifiedAgentInventoryQuery, "limit" | "selectionId" | "cursor">;
 const queryFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
   "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher", "availableTo", "host", "platform",
   "createdWithinDays", "sortBy", "sortDirection"] as const;
 const numericSorts = new Set(["createdAt", "lastModifiedAt", "lastPublishedAt", "observedAt", "responses", "activeUsers", "lastActivity"]);
+const needsPeopleCache = (query: InventoryQuery) => Boolean(query.search?.trim()) || ["owner", "createdBy"].includes(query.sortBy ?? "");
 const unfilteredOrdering = (query: InventoryQuery, source: string) => Object.entries(query).every(([key,value]) =>
   ["sortBy","sortDirection"].includes(key)
   || ["inventoryScope","view","source"].includes(key) && value==="all"
@@ -107,25 +109,25 @@ export class InventoryQueries {
       JOIN data_generations anchor ON anchor.id=v.baseline_id
       WHERE v.scope_id=$1 AND v.revision=$2 AND v.baseline_id=$3 AND v.tenant_id=$4 AND r.collected_before<=$2
         AND s.principal_id=ANY($5::text[]) AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-        AND (s.token_mode<>'application' OR s.source='inventory_packages' AND s.principal_id=$7
+        AND (s.token_mode<>'application' OR s.source='inventory_packages' AND s.principal_id=$6
           AND EXISTS(SELECT 1 FROM capability_configuration c WHERE c.tenant_id=s.tenant_id
             AND c.capability_id='graph.package.read.application' AND c.enabled AND c.shared_data_scope))
-        AND g.state IN ('published','retired') AND g.validated AND g.expires_at>= $6 AND g.expires_at>clock_timestamp()
+        AND g.state IN ('published','retired') AND g.validated
         AND anchor.state IN ('published','retired')`,
-    [root.scopeId, root.revision, root.generationId, identity.tenantId, this.sourceOwners(identity), root.expiresAt,
+    [root.scopeId, root.revision, root.generationId, identity.tenantId, this.sourceOwners(identity),
       this.authorizedApplicationScope?.tenantId === identity.tenantId ? this.authorizedApplicationScope.principalId : ""])).rows[0];
     if (!revision) throw new SelectionError("selection_invalidated");
     const invalid = await client.query(`SELECT 1 FROM jsonb_to_recordset($1::jsonb) r("scopeId" uuid,"baselineId" uuid,epoch bigint,"expiresAt" timestamptz)
       LEFT JOIN data_scope_epochs s ON s.id=r."scopeId" LEFT JOIN data_generations g ON g.id=r."baselineId"
       WHERE s.epoch IS DISTINCT FROM r.epoch OR s.tenant_id<>$2 OR NOT(s.principal_id=ANY($3::text[]))
-        OR r."expiresAt"<=clock_timestamp() OR g.state NOT IN ('published','retired') LIMIT 1`, [JSON.stringify(revision.inputs), identity.tenantId, this.sourceOwners(identity)]);
+        OR g.id IS NULL OR g.state NOT IN ('published','retired') LIMIT 1`, [JSON.stringify(revision.inputs), identity.tenantId, this.sourceOwners(identity)]);
     if (invalid.rowCount) throw new SelectionError("selection_invalidated");
   }
 
   async capture(identity: SelectionIdentity, scopeId: string, query: InventoryQuery = {}, tokenMode: "delegated" | "application" = "delegated") {
     if (query.sortBy && !unifiedAgentSortKeys.includes(query.sortBy) || query.sortDirection && !["asc", "desc"].includes(query.sortDirection)
       || query.createdWithinDays !== undefined && (!Number.isInteger(query.createdWithinDays) || query.createdWithinDays < 0)) throw new SelectionError("invalid_cursor");
-    const sourceScope = await this.reports.sources.ensureScope(identity, "delegated");
+    const sourceScope = needsPeopleCache(query) ? await this.reports.sources.ensureScope(identity, "delegated") : null;
     await this.reports.history.ensure(identity.tenantId);
     const criteria = inventoryCriteria(query.availableTo === undefined ? query : { ...query, availableTo: encodeInventoryFacet(query.availableTo) });
     const metadata = { inventoryQuery: digest(JSON.stringify(criteria)),
@@ -138,22 +140,25 @@ export class InventoryQueries {
       [scopeId, identity.tenantId, this.sourceOwners(identity), tokenMode])).rows[0];
       if (!root) throw new SelectionError("selection_invalidated");
       const data = await this.reports.currentInventoryData(client, identity, at);
-      const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
+      const pinUntil = new Date(at.getTime() + 30 * 60_000);
       const association = (await client.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
-      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: root.expires_at },
-        await this.reports.history.root(client, identity.tenantId, at),
-        { kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) }];
+      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: pinUntil },
+        await this.reports.history.root(client, identity.tenantId, at)];
+      if (sourceScope) {
+        const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
+        roots.push({ kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) });
+      }
       const inputs = (await client.query("SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$2", [scopeId, root.revision])).rows[0]?.inputs ?? [];
       for (const input of inputs) roots.push({ kind: "inventory_delta", scopeId: input.scopeId, generationId: input.baselineId,
-        revision: input.revision, expiresAt: new Date(input.expiresAt) });
-      for (const metadata of Object.values(data.metadata)) if (metadata.generationId) roots.push({
+        revision: input.revision, expiresAt: pinUntil });
+      // Directory labels are exported, so their immutable generation remains pinned.
+      for (const metadata of [data.metadata.directory]) if (metadata.generationId) roots.push({
         kind: "generation", scopeId: metadata.scopeId!, generationId: metadata.generationId,
-        revision: metadata.revision!, expiresAt: new Date(metadata.expiresAt!),
+        revision: metadata.revision!, expiresAt: pinUntil,
       });
-      const transition = (await client.query(`SELECT least(min(r.expires_at),
-        (SELECT min(expires_at) FROM agent_people_cache WHERE tenant_id=$4 AND principal_id=$5 AND expires_at>$3)) AS expires_at FROM inventory_memberships m
-        JOIN inventory_records r ON r.generation_id=m.generation_id AND r.identity=m.identity
-        WHERE ${inventoryAsOf()} AND r.expires_at>$3`, [root.baseline_id, root.revision, at, identity.tenantId, identity.principalId])).rows[0]?.expires_at;
+      const transition = needsPeopleCache(query) ? (await client.query(`SELECT min(expires_at) AS expires_at
+        FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>$3`,
+      [identity.tenantId, identity.principalId, at])).rows[0]?.expires_at : null;
       return { roots, nextTransition: transition ?? undefined, persist: async (connection, selection) => {
         await connection.query(`INSERT INTO inventory_read_contexts(selection_id,tenant_id,report_context,association_revision,root_scope_id,query_values)
           VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb)`, [selection.id, identity.tenantId, JSON.stringify(data), association, scopeId, JSON.stringify(criteria)]);
@@ -185,12 +190,14 @@ export class InventoryQueries {
     const saved = (await client.query(`SELECT c.*,s.source,s.token_mode FROM inventory_read_contexts c
       JOIN data_scope_epochs s ON s.id=c.root_scope_id WHERE c.selection_id=$1 AND c.tenant_id=$2`, [id, identity.tenantId])).rows[0];
     const association = (await client.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
-    if (!saved || saved.association_revision !== association) throw new SelectionError("selection_invalidated");
+    if (!saved) throw new SelectionError("selection_invalidated", "unavailable");
+    if (saved.association_revision !== association) throw new SelectionError("selection_invalidated", "changed");
     const pin = selected.pins.find(pin => pin.scope_id === saved.root_scope_id);
     if (!pin) throw new SelectionError("selection_invalidated");
     if (!["inventory_canonical", "inventory_packages", "inventory_power_platform"].includes(saved.source)
       || this.requiredSource && (saved.source !== this.requiredSource.source || saved.token_mode !== this.requiredSource.tokenMode)) throw new SelectionError("invalid_cursor");
     const data = saved.report_context as ReportCurrentData;
+    if (!isPublicationRevisions(data.publicationRevisions)) throw new SelectionError("selection_invalidated", "unavailable");
     data.evaluatedAt = selected.selection.evaluated_at;
     const criteria = inventoryCriteria(saved.query_values);
     if (selected.selection.query_json.inventoryQuery !== digest(JSON.stringify(criteria))
@@ -217,10 +224,10 @@ export class InventoryQueries {
       $6::bigint AS low_activity_threshold), inventory AS ${identities ? "" : "NOT "}MATERIALIZED (
       SELECT r.* FROM inventory_memberships m ${identities ? `CROSS JOIN LATERAL (
         SELECT record.* FROM inventory_records record WHERE record.generation_id=m.generation_id AND record.identity=m.identity
-          AND record.scope_id=$12 AND record.domain='${domain}' AND record.expires_at>$9 OFFSET 0
+          AND record.scope_id=$12 AND record.domain='${domain}' OFFSET 0
       ) r` : "JOIN inventory_records r ON r.generation_id=m.generation_id AND r.identity=m.identity"}
       JOIN data_scope_epochs scope ON scope.id=r.scope_id
-      WHERE ${inventoryAsOf("m", "$7", "$8")} AND scope.principal_id=ANY($11::text[]) AND r.expires_at>$9
+      WHERE ${inventoryAsOf("m", "$7", "$8")} AND scope.principal_id=ANY($11::text[])
         AND r.scope_id=$12 AND r.domain='${domain}'
         ${identities ? "AND m.identity=ANY($13::text[]) AND r.identity=ANY($13::text[])" : ""}
     ), input_roots AS (
@@ -247,7 +254,7 @@ export class InventoryQueries {
       LEFT JOIN LATERAL (SELECT d.identity,d.display_name,d.upn FROM directory_user_rows d
         WHERE d.generation_id=$1 AND d.identity=x.value OFFSET 0) d ON true
       LEFT JOIN data_generations g ON g.id=$1
-      LEFT JOIN agent_people_cache c ON c.tenant_id=$4 AND c.principal_id=$10 AND c.object_id::text=x.value AND c.expires_at>$9
+      LEFT JOIN agent_people_cache c ON ${needsPeopleCache(context.query)} AND c.tenant_id=$4 AND c.principal_id=$10 AND c.object_id::text=x.value AND c.expires_at>$9
     ), people AS NOT MATERIALIZED (
       SELECT *,CASE WHEN status='not_found' THEN object_id||' (not found)'
         ELSE coalesce(CASE WHEN name IS NOT NULL AND upn IS NOT NULL THEN name||' ('||upn||')' ELSE coalesce(name,upn) END,object_id)
@@ -423,10 +430,10 @@ export class InventoryQueries {
     const table = context.source==="inventory_packages" ? "package_record_rows"
       : context.source==="inventory_power_platform" ? "power_platform_record_rows" : "unified_agent_rows";
     const collation = context.source==="inventory_canonical" ? '"inventory_text_order"' : '"C"';
-    const values: unknown[] = [context.scopeId,context.baselineId,context.revision,context.data.evaluatedAt,
+    const values: unknown[] = [context.scopeId,context.baselineId,context.revision,
       this.sourceOwners(context.data.identity),context.data.identity.tenantId];
     const exportDomain = exportKind==="graph_packages" ? "packages" : exportKind==="power_platform_agents" ? "power_platform" : undefined;
-    const where = `r.scope_id=$1 AND r.expires_at>$4 AND scope.principal_id=ANY($5::text[]) AND scope.tenant_id=$6
+    const where = `r.scope_id=$1 AND scope.principal_id=ANY($4::text[]) AND scope.tenant_id=$5
       ${context.source==="inventory_power_platform" && exportKind==="power_platform_agents" ? "AND r.resource_type='microsoft.copilotstudio/agents'" : ""}
       ${context.source==="inventory_canonical" && exportDomain ? `AND EXISTS(
         SELECT 1 FROM unified_agent_memberships member CROSS JOIN LATERAL (
@@ -441,12 +448,12 @@ export class InventoryQueries {
         AND (m.valid_to_revision IS NULL OR m.valid_to_revision>$3) LIMIT 1 OFFSET 0)`;
     if (anchorId!==undefined) {
       const rows = (await client.query(`SELECT r.identity,r.sort_key FROM ${table} r
-        JOIN data_scope_epochs scope ON scope.id=r.scope_id WHERE ${where} AND r.identity=$7 LIMIT 2`,[...values,anchorId])).rows;
+        JOIN data_scope_epochs scope ON scope.id=r.scope_id WHERE ${where} AND r.identity=$6 LIMIT 2`,[...values,anchorId])).rows;
       if (rows.length!==1) throw new SelectionError("invalid_cursor");
       values.push(rows[0].sort_key,rows[0].identity);
     }
     const boundary = (key: string) => anchorId===undefined ? "" : `AND (${key} COLLATE ${collation},r.identity COLLATE "C")
-      ${order==="ASC" ? ">" : "<"} ($7::text COLLATE ${collation},$8::text COLLATE "C")`;
+      ${order==="ASC" ? ">" : "<"} ($6::text COLLATE ${collation},$7::text COLLATE "C")`;
     // Disjoint short/long partitions preserve the full collation order. Only
     // short keys equal their indexed prefix; long keys are never truncated.
     return (await client.query(`SELECT identity FROM (
@@ -620,7 +627,8 @@ export class InventoryQueries {
       return { value, inventoryScope: context.query.inventoryScope ?? "all",
         page: { limit, nextCursor: (!reverse && more || reverse && Boolean(cursor)) ? cursorFor(retainedPage.at(-1), "next") : null,
           previousCursor: (reverse && more || !reverse && Boolean(cursor)) ? cursorFor(retainedPage[0], "previous") : null },
-        selection: { id, revision: selection.revision, expiresAt: selection.expires_at, evaluatedAt: selection.evaluated_at }, ...summary };
+        selection: { id, revision: selection.revision, expiresAt: selection.expires_at, evaluatedAt: selection.evaluated_at,
+          validatedAt: selection.validated_at, publicationRevisions: context.data.publicationRevisions }, ...summary };
   }
 
   private async pageEnrichment(client: pg.PoolClient, context: Context, ids: readonly string[]) {
@@ -640,7 +648,7 @@ export class InventoryQueries {
     for (let offset = 0; offset < objectIds.length; offset += 100) {
       const batch = await userSourcePeopleInRead(client, { ...context.data.identity, tokenMode: "delegated" },
         context.data.metadata.directory.generationId ? { generationId: context.data.metadata.directory.generationId,
-          observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, objectIds.slice(offset, offset + 100), context.data.evaluatedAt);
+          observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, objectIds.slice(offset, offset + 100), context.data.evaluatedAt, needsPeopleCache(context.query));
       encodeBatch(batch);
       for (const person of batch) evidence.set(person.objectId, person);
     }
@@ -674,8 +682,8 @@ export class InventoryQueries {
       JOIN inventory_revisions revision ON revision.scope_id=input.scope_id AND revision.revision=input.revision
       JOIN data_generations g ON g.id=revision.generation_id
       WHERE input.kind='microsoft.powerplatform/environments' AND r.resource_type=input.kind AND lower(r.native_id)=lower(selected.environment_id)
-        AND r.expires_at>$5 ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
-    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId, context.data.evaluatedAt])).rows;
+        ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
+    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId])).rows;
     encodeBatch(rows);
     for (const row of rows) environments.set(row.identity, row.value);
     return { people, environments };
@@ -751,7 +759,7 @@ export class InventoryQueries {
             AND r.resource_type='microsoft.copilotstudio/agents') ELSE 0 END AS agent_count,
         a.expected_count,CASE WHEN saved.catalog_complete THEN saved.catalog_page_count ELSE g.page_count END AS page_count,
         saved.catalog_omitted_fields AS unknown_field_count,g.wire_count,a.complete,
-        (saved.catalog_complete AND saved.catalog_expires_at>$4) AS catalog_complete,
+        saved.catalog_complete,
         saved.catalog_observed_at,saved.catalog_expires_at,
         root.revision AS captured_revision,coalesce(current.baseline_id=root.baseline_id AND current.revision=root.revision,false) AS current
       FROM roots root JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision
@@ -761,7 +769,7 @@ export class InventoryQueries {
       WHERE a.domain<>'canonical' ORDER BY s.source,
         CASE WHEN EXISTS(SELECT 1 FROM native_roots selected WHERE selected.scope_id=root.scope_id
           AND selected.kind='microsoft.copilotstudio/agents') THEN 0 ELSE 1 END,s.selector LIMIT 16`,
-    [context.scopeId, context.revision, context.baselineId, context.data.evaluatedAt])).rows;
+    [context.scopeId, context.revision, context.baselineId])).rows;
     const expiredIdentity = (await client.query(`SELECT EXISTS(${pendingInventoryIdentityExpirySql}) AS expired`, [context.scopeId])).rows[0].expired;
     const state = !current || current.baseline_id !== context.baselineId || current.revision !== context.revision ? "stale"
       : current.status === "running" ? "reconciling" : expiredIdentity || sources.some(source => !source.current) ? "catching_up" : current.status ?? "idle";
@@ -901,7 +909,7 @@ export class InventoryQueries {
           JOIN data_generations generation ON generation.id=revision.generation_id
           WHERE root.current AND root.scope_id=selected.source_scope_id AND live.generation_id=selected.generation_id
             AND live.identity=selected.identity AND generation.scope_epoch=scope.epoch
-            AND generation.session_epoch=scope.session_epoch AND generation.expires_at>$5) AS current
+            AND generation.session_epoch=scope.session_epoch AND generation.expires_at>$5 AND selected.expires_at>$5) AS current
         FROM selected LIMIT 2`,
       [context.baselineId, context.revision, nativeId, context.scopeId, context.data.evaluatedAt])).rows;
       encodeBatch(rows);
@@ -1055,12 +1063,15 @@ export class InventoryQueries {
   people(id: string, identity: SelectionIdentity, objectIds: readonly string[]) {
     return this.read(id, identity, (client, context) => userSourcePeopleInRead(client, { ...identity, tokenMode: "delegated" },
       context.data.metadata.directory.generationId ? { generationId: context.data.metadata.directory.generationId,
-        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, objectIds, context.data.evaluatedAt));
+        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, objectIds, context.data.evaluatedAt, needsPeopleCache(context.query)));
   }
 
   responsibility(id: string, identity: SelectionIdentity, options: AgentResponsibilityQuery = {}) {
     return this.read(id, identity, async (client, context, selection) => {
-      const result = await readInventoryResponsibility(client, this.relation(context), context.data, selection, id, identity, this.cursors, options);
+      // Like inventory paging, this broad facts/people join must not repeatedly
+      // materialize the selected relation inside an N-row nested loop.
+      await client.query("SELECT set_config('enable_nestloop','off',true)");
+      const result = await readInventoryResponsibility(client, this.relation(context), context.data, selection, id, identity, this.cursors, options, needsPeopleCache(context.query));
       return { ...result, sourceRows: (await this.summaries(client, context)).freshness.sources };
     });
   }

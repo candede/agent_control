@@ -59,7 +59,8 @@ export function AgentSyncTools({
   const needsAttention = attentionReasons.length > 0;
   const detailsPending = inventoryDetailsPending(currentInventory);
   const health = verifyingInventory ? "Checking"
-    : needsAttention ? "Needs attention" : inventoryUnavailable ? inventoryUnavailable.state === "preparing" ? "Preparing" : "Not collected"
+    : needsAttention ? "Needs attention" : inventoryUnavailable ? inventoryUnavailable.state === "preparing" ? "Preparing"
+      : inventoryUnavailable.state === "unavailable" ? "Unavailable" : "Not collected"
       : currentInventory ? detailsPending ? "Sources checked" : "Verified" : "Not checked";
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">

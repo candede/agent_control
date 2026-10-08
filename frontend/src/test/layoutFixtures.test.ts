@@ -11,7 +11,9 @@ type Fulfillment = NonNullable<Parameters<Route["fulfill"]>[0]>;
 async function fixture() {
   const route = vi.fn<Page["route"]>(), contextRoute = vi.fn<Page["route"]>();
   const context: Pick<ReturnType<Page["context"]>, "route"> = { route: contextRoute };
-  const page: Pick<Page, "route" | "context"> = { route, context: () => context as ReturnType<Page["context"]> };
+  const page: Pick<Page, "route" | "context" | "addInitScript"> = {
+    route, context: () => context as ReturnType<Page["context"]>, addInitScript: vi.fn<Page["addInitScript"]>(),
+  };
   const unexpected = await mockLayoutApi(page as Page);
   async function request(path: string, method = "GET", body?: unknown) {
     const url = new URL(path, "http://localhost");

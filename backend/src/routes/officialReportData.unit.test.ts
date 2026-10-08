@@ -44,7 +44,8 @@ function context(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportReadC
   const query = reportQuery(endpoint, input);
   return { identity, tokenMode: "delegated", endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
     evaluatedAt: new Date("2026-10-01T00:00:00Z"),
-    selection: { id: selectionId, revision: "1", evaluatedAt: "2026-10-01T00:00:00Z", expiresAt: "2026-10-01T00:10:00Z" },
+    selection: { id: selectionId, revision: "1", evaluatedAt: "2026-10-01T00:00:00Z", expiresAt: "2026-10-01T00:10:00Z",
+      validatedAt: "2026-10-01T00:00:00Z", publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
     metadata: { directory: source("directory"), app_activity: source("app_activity") },
     report: { setId, activeSetId: setId, activeRevision: "1", historyRevision: "1", historyEpoch: "0",
       availability: "active", staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: 0,

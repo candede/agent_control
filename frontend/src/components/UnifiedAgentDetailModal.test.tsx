@@ -2123,11 +2123,11 @@ describe("UnifiedAgentDetailModal", () => {
     const context = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValue({
       recordId: record.id, displayName: record.displayName,
       defender: { status: "unavailable", entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" },
-      purview: { status: "unavailable", mode: "saved_only", reasonCode: "unsupported_identity_crosswalk" },
+      purview: { status: "unavailable", mode: "search", presets: [], reasonCode: "unsupported_identity_crosswalk" },
     });
     renderDetail({ record: observedRecord(), activeTab });
     if (activeTab === "audit-security") {
-      expect(await screen.findByRole("heading", { name: "Defender linking not supported for this agent" })).toBeVisible();
+      expect(await screen.findByRole("heading", { name: "Purview linking not supported for this agent" })).toBeVisible();
       expect(context).toHaveBeenCalledOnce();
       expect(screen.getByRole("region", { name: /Investigations for/ }).querySelector("details")).toBeNull();
     } else expect(context).not.toHaveBeenCalled();
@@ -2138,22 +2138,22 @@ describe("UnifiedAgentDetailModal", () => {
     const context = {
       recordId: record.id, displayName: record.displayName,
       defender: { status: "unavailable" as const, entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" as const },
-      purview: { status: "unavailable" as const, mode: "saved_only" as const, reason: "No exact bot mapping." },
+      purview: { status: "unavailable" as const, mode: "search" as const, presets: [], reason: "No exact bot mapping." },
     };
     const lookup = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValueOnce(context).mockResolvedValueOnce({
       ...context, purview: { ...context.purview, reason: "Updated saved mapping is unavailable." },
     });
     const { update } = renderDetail({ activeTab: "audit-security", inventoryRevision: "first" });
-    await screen.findByRole("heading", { name: "Defender linking not supported for this agent" });
-    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByRole("heading", { name: "Purview identity not mapped" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Source" }), { target: { value: "purview" } });
     expect(screen.getByText("No exact bot mapping.")).toBeVisible();
     update({ dataRevision: 1, inventoryRevision: "second" });
-    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
     expect(screen.getByText("No exact bot mapping.")).toBeVisible();
     await screen.findByText("Updated saved mapping is unavailable.");
     expect(screen.queryByText("No exact bot mapping.")).not.toBeInTheDocument();
     expect(lookup).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
   });
 
   it("offers common Manage controls for every package and quarantine with exact target callbacks", async () => {

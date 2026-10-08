@@ -9,7 +9,7 @@ import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, type FetchLike } from "./graphPackages.js";
 import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
 import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
-import { inventorySelectionFixture, reconcileInventoryFixture, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { inventorySelectionFixture, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord } from "./inventoryRecordProjection.js";
 import { inventoryPresentation } from "./inventoryPresentation.js";
 import { readPackageControls } from "../db/packageControls.js";
@@ -123,7 +123,6 @@ describe("Durable bulk execution", () => {
       status: "succeeded", succeeded: operation === "skipped" ? 0 : 1, skipped: operation === "skipped" ? 1 : 0,
     });
     await expect(before.queries.page(before.selection.id, before.identity)).rejects.toThrow("selection_invalidated");
-    await reconcileInventoryFixture(fixture.runtime, owner);
     const after = await canonicalPage(owner);
     expect(after.raw.freshness.capturedRevision).not.toBe(before.raw.freshness.capturedRevision);
     const changed = after.page.value.flatMap(row => row.packages).find(item => item.id === providerState.id)!;
@@ -186,7 +185,6 @@ describe("Durable bulk execution", () => {
       }));
       await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
       expect(await jobs.get(job.id, owner)).toMatchObject({ status: "succeeded", succeeded: 1 });
-      await reconcileInventoryFixture(fixture.runtime, owner);
       const selected = await canonicalPage(owner, { search: "Reviewed" }), page = selected.page;
       const membership = await fixture.runtime.query(`SELECT s.evidence FROM inventory_memberships m
         JOIN inventory_roots root ON root.baseline_id=m.baseline_id AND root.current
@@ -363,6 +361,35 @@ describe("Durable bulk execution", () => {
       expect(await controlReceiptCount(scope)).not.toBe(previousRevision);
       expect(await readPackageControls(fixture.runtime, scope, ["package-1"])).toMatchObject([{ detail: { isBlocked: applied } }]);
     }
+  });
+
+  it("publishes reconciled control state before returning a fresh readable inventory", async () => {
+    const owner = { tenantId: "reconciled-inventory-tenant", principalId: randomUUID() };
+    await savedReadbackInventory(owner);
+    const before = await canonicalPage(owner);
+    let blocked = false;
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") {
+        blocked = true;
+        return Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 });
+      }
+      return Response.json({ id: "readback-package", displayName: "Reviewed package", isBlocked: blocked });
+    });
+    const provider = new GraphPackagesClient(fetcher, { maxAttempts: 1, minimumReadIntervalMs: 0 });
+    const job = await jobs.submit(owner, confirmedInput({
+      action: "block", scope: "single", requestPath: "/api/agents/readback-package/block",
+      actor: { tenantId: owner.tenantId, homeAccountId: owner.principalId, username: "fixture@example.invalid", displayName: "Fixture" },
+      targets: [{ id: "readback-package", displayName: "Reviewed package", prestate: { kind: "block", isBlocked: false } }],
+    }));
+    await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
+    expect(await jobs.get(job.id, owner)).toMatchObject({ status: "partial", inconclusive: 1 });
+    expect(await reconcileBulkJob(job.id, owner, jobs, provider, async () => "synthetic-token"))
+      .toMatchObject({ status: "succeeded", reconciliation: { attempted: 1, failed: 0 } });
+    const after = await canonicalPage(owner);
+    expect(after.page.value.map(record => record.id).sort()).toEqual(before.page.value.map(record => record.id).sort());
+    expect(after.page.value.flatMap(record => record.packages).find(item => item.id === "readback-package"))
+      .toMatchObject({ isBlocked: true, availableTo: "some", deployedTo: "some" });
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
   it("does not publish reconciliation after read authority is revoked or the job is cancelled", async () => {

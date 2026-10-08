@@ -101,7 +101,7 @@ export class InventoryRuntime {
       JOIN data_scope_epochs s ON s.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
       JOIN data_generations g ON g.id=v.generation_id WHERE r.current AND r.tenant_id=$1 AND s.principal_id=$2
         AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
-        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()
+        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated
       ORDER BY r.scope_id LIMIT 17`, [scope.tenantId, scope.principalId])).rows;
     if (roots.length > 16) throw new AppError(413, "inventory_source_limit", "At most 16 source roots may form a canonical inventory.");
     if (roots.length) await this.reconciliation.request(await this.input(scope), roots);
@@ -117,7 +117,7 @@ export class InventoryRuntime {
             JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision JOIN data_generations g ON g.id=v.generation_id
             WHERE root.current AND s.tenant_id=p.tenant_id AND s.principal_id=p.principal_id
               AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='delegated'
-              AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp())
+              AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.target_id COLLATE "C" LIMIT 250)`, [scope.tenantId, scope.principalId]);
     });
     const pending = (await this.database.query(`SELECT p.target_id,p.observation_id,p.updated_at
@@ -127,7 +127,7 @@ export class InventoryRuntime {
           JOIN data_generations g ON g.id=revision.generation_id
           WHERE root.current AND s.tenant_id=p.tenant_id AND s.principal_id=p.principal_id
             AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='delegated'
-            AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp())
+            AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
       ORDER BY p.updated_at,p.target_id COLLATE "C" LIMIT 20`, [scope.tenantId, scope.principalId])).rows;
     for (const target of pending) {
       signal.throwIfAborted();
@@ -164,7 +164,8 @@ export class InventoryRuntime {
         SELECT p.scope_id,p.identity FROM inventory_native_control_pending p WHERE tenant_id=$1 AND principal_id=$2
           AND NOT EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
             JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision JOIN data_generations g ON g.id=v.generation_id
-            WHERE root.scope_id=p.scope_id AND root.current AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp())
+            WHERE root.scope_id=p.scope_id AND root.current AND g.session_epoch=s.session_epoch
+              AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.scope_id,p.identity LIMIT 250)`, [scope.tenantId, scope.principalId]);
     });
     const pending = (await this.database.query(`SELECT p.scope_id,p.identity,p.observation_id,p.updated_at,s.selector,observation.observed_at AS receipt_observed_at,
@@ -180,7 +181,7 @@ export class InventoryRuntime {
         AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
       LEFT JOIN power_platform_record_rows record ON record.generation_id=member.generation_id AND record.identity=member.identity
       WHERE p.tenant_id=$1 AND p.principal_id=$2 AND generation.session_epoch=s.session_epoch
-        AND generation.expires_at>clock_timestamp() ORDER BY p.updated_at,p.scope_id,p.identity LIMIT 20`,
+        AND generation.state IN ('published','retired') AND generation.validated ORDER BY p.updated_at,p.scope_id,p.identity LIMIT 20`,
     [scope.tenantId, scope.principalId])).rows;
     for (const target of pending) {
       signal.throwIfAborted();

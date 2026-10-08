@@ -82,11 +82,14 @@ import { clearPackageSelection, restorePackageSelection, storePackageSelection }
 import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
+import { PublicationContext } from "./publicationContext";
+import { useBrowserAvailability } from "./useBrowserAvailability";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
 import { BackgroundRefreshIndicator } from "./components/BackgroundRefreshIndicator";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentInventoryUnavailable, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 import { inventoryScopeAgentCount } from "./agentColumns";
-import { AgentInventoryExpiredError, AgentInventoryQueries } from "./agentInventoryQueries";
+import { AgentInventoryQueries } from "./agentInventoryQueries";
+import { isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "./selectedRead";
 import { inventoryAttentionReasons } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
 import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
@@ -261,6 +264,7 @@ function App() {
 }
 
 function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSavedQueryClient> }) {
+  const statusObservationAvailable = useBrowserAvailability();
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
   const [initialAgentRoute] = useState(readInitialAgentRoute);
   const [syncReportRoute, setSyncReportRoute] = useState(() => parseDataSyncRoute(readViewSearch("sync")).reports);
@@ -301,6 +305,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [inventoryUnavailable, setInventoryUnavailable] = useState<UnifiedAgentInventoryUnavailable>();
   const inventoryNavigation = useRef<{ key: string; selectionId?: string; cursor?: string }>({ key: "" });
   const [unifiedAgentReadError, setUnifiedAgentReadError] = useState<string>();
+  const [expiredAgentSelection, setExpiredAgentSelection] = useState<string>();
   const [selectedUnifiedAgent, setSelectedUnifiedAgent] = useState<UnifiedAgentRecord>();
   const [agentPackageSelection, setAgentPackageSelection] = useState<{ owner: string; recordId: string; packageId: string }>();
   const [packageAccessRevisions, setPackageAccessRevisions] = useState(new Map<string, number>());
@@ -369,6 +374,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
   const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialAgentRoute.syncRunId);
   const [syncSetup, setSyncSetup] = useState<{ owner: string; status: WorkspaceSetupStatus }>();
+  const [pendingDataSyncPublication, setPendingDataSyncPublication] = useState<{
+    owner: string;
+    sources: DataSyncSourceId[];
+  }>();
   const [syncHistoryRevision, setSyncHistoryRevision] = useState(0);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
@@ -507,7 +516,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setPowerPlatformAgentRefreshJob(next);
       const prior = previous ?? latest;
       if (next.id !== prior.id || next.status !== prior.status) {
-        if (next.status === "succeeded" && claimPowerPlatformPublication(next)) handleDataSyncSourcesChanged(["power_platform"]);
+        if (next.status === "succeeded" && claimPowerPlatformPublication(next)) automaticRefresh.checkNow();
         else handleSyncRunsChanged();
       }
     }).catch(requestError => {
@@ -521,7 +530,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     });
   });
   const reloadPublishedPackages = useEffectEvent(() => {
-    handleDataSyncSourcesChanged(["graph_packages"]);
+    automaticRefresh.checkNow();
   });
   const claimPackageRefreshPublication = useCallback((job: PackageRefreshJob) => {
     const publication = JSON.stringify([principalKey, job.tokenMode, job.id]);
@@ -531,8 +540,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [principalKey]);
   const reloadPublishedPowerPlatformAgents = useEffectEvent((job: InventoryRefreshJob) => {
     if (!claimPowerPlatformPublication(job)) return;
-    resetPowerPlatformSelection();
-    requestCurrentAgentReload();
+    automaticRefresh.checkNow();
   });
   const revalidateCurrentSession = useEffectEvent((restoringPage = false) => {
     if (sessionRevalidationInFlight.current || (!restoringPage && !user && loadingSession)) return;
@@ -947,6 +955,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         && record.packages.some(item => item.id === current.detail.id) ? current : undefined);
     }).catch(requestError => {
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
+        if (isExpiredSelection(requestError)) {
+          setExpiredAgentSelection(selectionId);
+          setAgentDetailError(errorMessage(requestError));
+          return;
+        }
         if (requestError instanceof ApiError && requestError.code === "selection_invalidated") {
           invalidateBookmarkedInventory(selectionId);
           return;
@@ -979,7 +992,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     ? linkedPackageRefreshJob : undefined;
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && activeView !== "sync") || !requestedPackageRefreshJobId) {
+    if (!statusObservationAvailable || !user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && activeView !== "sync") || !requestedPackageRefreshJobId) {
       linkedPackageRefreshPending.current = false;
       void Promise.resolve().then(() => {
         setLinkedPackageRefreshJob(undefined);
@@ -996,7 +1009,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       linkedPackageRefreshPending.current = true;
       setLinkedPackageRefreshLoading(true);
       try {
-        const job = await getPackageRefreshJob(requestedPackageRefreshJobId, requestedPackageRefreshMode, { signal: controller.signal });
+        const job = await readSavedQuery(savedQueries, ["package-refresh-job", requestedPackageRefreshJobId, requestedPackageRefreshMode],
+          signal => getPackageRefreshJob(requestedPackageRefreshJobId, requestedPackageRefreshMode, { signal }), controller.signal);
         if (controller.signal.aborted || owner !== linkedPackageRefreshRequestId.current) return;
         setLinkedPackageRefreshJob(job);
         if (job.status === "running") {
@@ -1031,7 +1045,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         linkedPackageRefreshPending.current = false;
       }
     };
-  }, [activeView, claimPackageRefreshPublication, linkedPackageRefreshRevision, principalKey, requestedPackageRefreshJobId, requestedPackageRefreshMode, user, waitingForLinkedPackageStatus]);
+  }, [activeView, claimPackageRefreshPublication, linkedPackageRefreshRevision, principalKey, requestedPackageRefreshJobId, requestedPackageRefreshMode, savedQueries, statusObservationAvailable, user, waitingForLinkedPackageStatus]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Admin") || activeView !== "agents" || !requestedPackageControlJobId) return;
@@ -1093,6 +1107,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   useEffect(() => {
     if (
       activeView !== "sync"
+      || !statusObservationAvailable
       || refreshingPowerPlatformAgents
       || powerPlatformAgentRefreshJob?.status !== "running"
       || requestedPowerPlatformJobId === powerPlatformAgentRefreshJob.id
@@ -1108,7 +1123,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     const poll = async () => {
       try {
-        const job = await getInventoryRefreshJob(jobId, { signal: controller.signal });
+        const job = await readSavedQuery(savedQueries, ["inventory-refresh-job", jobId],
+          signal => getInventoryRefreshJob(jobId, { signal }), controller.signal);
         if (
           controller.signal.aborted
           || requestId !== inventoryRefreshRequestId.current
@@ -1143,7 +1159,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeView, powerPlatformAgentRefreshJob?.id, powerPlatformAgentRefreshJob?.status, principalKey, refreshingPowerPlatformAgents, requestedPowerPlatformJobId, setPowerPlatformAgentRefreshJob]);
+  }, [activeView, powerPlatformAgentRefreshJob?.id, powerPlatformAgentRefreshJob?.status, principalKey, refreshingPowerPlatformAgents, requestedPowerPlatformJobId, savedQueries, setPowerPlatformAgentRefreshJob, statusObservationAvailable]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer")
@@ -1346,12 +1362,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       && automaticAction && (automaticAction.roles.length === 0 || automaticAction.roles.some(role => hasRole(user, role)))
       && (!automaticAction.capabilityId || providerActionAllowed(capabilityState.views.find(view => view.definition.id === automaticAction.capabilityId)))),
     onSourcesChanged: sources => {
-      if (ownsAgentScope(principalKey)) handleDataSyncSourcesChanged(sources);
+      if (ownsAgentScope(principalKey)) handleDataSyncSourcesChanged(sources, true);
     },
     onRunsChanged: () => {
       if (!ownsAgentScope(principalKey)) return;
       handleSyncRunsChanged();
-      void dataSyncPanelRef.current?.refresh();
+      void dataSyncPanelRef.current?.refresh(false);
     },
   });
 
@@ -1361,6 +1377,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [activeView, replaceRoute, user, visibleActiveView]);
 
   function navigateToView(view: WorkbenchViewId) {
+    if (view === "agents" && agentPageIndex === 0 && !selectedAgentIds.size && !selectedPowerPlatformTargets.size
+      && !serverPackageSelection && !groupPackageSelection && !inventoryExport && !requestedAgentDetailId
+      && unifiedAgentPage && !selectedReadRemaining(unifiedAgentPage.selection)) inventoryNavigation.current = { key: "" };
     cancelAgentDetailRequest();
     savedViewSearches.current.set(activeView, window.location.search);
     setAgentDetail(undefined);
@@ -1446,24 +1465,23 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     handleSyncReportRouteChange({ view, activityWindowDays: 30 });
   }
 
-  function finishUsageImport() {
-    resetUserReportFilters();
-    navigateToView("agents");
-    requestAnimationFrame(() => document.getElementById("agents-heading")?.focus({ preventScroll: true }));
-  }
-
-  function handleDataSyncSourcesChanged(sources: DataSyncSourceId[]) {
+  function handleDataSyncSourcesChanged(sources: DataSyncSourceId[], publicationOnly = false) {
     setSyncHistoryRevision(revision => revision + 1);
     const changed = new Set(sources);
+    setPendingDataSyncPublication(current => {
+      if (!current || current.owner !== principalKey) return current;
+      const remaining = current.sources.filter(source => !changed.has(source));
+      return remaining.length ? { ...current, sources: remaining } : undefined;
+    });
+    if (!publicationOnly && changed.has("users")) setCopilotUsersDataRevision(revision => revision + 1);
     if (changed.has("graph_packages") || changed.has("power_platform")) {
       if (inventoryNavigation.current.selectionId && (agentPageIndex > 0 || selectedAgentIds.size > 0
         || groupPackageSelection?.owner === principalKey || serverPackageSelection?.owner === principalKey
-        || selectedUnifiedAgent || requestedAgentDetailId)) {
-        scheduleAgentReload();
+        || selectedPowerPlatformTargets.size > 0 || pendingPowerPlatformIds.size > 0
+        || inventoryExport || exportChoiceOpen || bulkConfirmation || singleAccessAgentDetail || bulkAccessAgentIds
+        || selectedUnifiedAgent || requestedAgentDetailId || requestedInventorySnapshotId)) {
+        if (selectedReadRemaining(unifiedAgentPage?.selection)) scheduleAgentReload();
       } else requestCurrentAgentReload();
-    }
-    if (changed.has("users")) {
-      setCopilotUsersDataRevision(revision => revision + 1);
     }
     if (changed.has("usage_reports")) {
       handleOfficialUsageChanged();
@@ -1506,6 +1524,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   const visibleUnifiedAgentPage = unifiedAgentPage?.inventoryScope === agentInventoryScope
     ? unifiedAgentPage : undefined;
+  const agentReadLeaseActive = useSelectedReadLease(visibleUnifiedAgentPage?.selection);
+  const agentLeaseEnded = Boolean(visibleUnifiedAgentPage && (!agentReadLeaseActive
+    || expiredAgentSelection === visibleUnifiedAgentPage.selection.id));
   const matchingPackageSelection = serverPackageSelection?.owner === principalKey
     && serverPackageSelection.id === visibleUnifiedAgentPage?.selection?.id ? serverPackageSelection : undefined;
   const matchingPackageCount = matchingPackageSelection ? visibleUnifiedAgentPage?.counts?.packageTargets ?? 0 : 0;
@@ -1558,14 +1579,19 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     };
   }, [groupCountRetryRevision, groupTargetKey]);
   const displayedUnifiedAgents = visibleUnifiedAgentPage?.value ?? [];
-  const agentInventoryPending = loadingAgents || agentSearchPending;
+  const publishingAgentInventory = pendingDataSyncPublication?.owner === principalKey
+    && pendingDataSyncPublication.sources.some(source => source === "graph_packages" || source === "power_platform");
+  const agentInventoryPending = loadingAgents || agentSearchPending || publishingAgentInventory;
   const inventoryScopeCount = visibleUnifiedAgentPage
     ? inventoryScopeAgentCount(visibleUnifiedAgentPage.summary, agentInventoryScope) : undefined;
   const nativeObservation = visibleUnifiedAgentPage?.sources.powerPlatform.observation;
-  const inventoryCollectionText = !visibleUnifiedAgentPage && agentInventoryPending ? "Loading saved agent inventory..."
+  const inventoryCollectionText = publishingAgentInventory
+    ? "Publishing newly synced agents to the inventory. Results will appear automatically."
+    : !visibleUnifiedAgentPage && agentInventoryPending ? "Loading saved agent inventory..."
     : !visibleUnifiedAgentPage && unifiedAgentReadError ? "Saved agent inventory unavailable." : [
     ...(agentInventoryScope !== "power_platform_only" ? [lastAgentListRefreshAt
-      ? `Catalog collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
+      ? `Catalog collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && visibleUnifiedAgentPage
+        && packageSnapshotExpiresAt.getTime() <= Date.parse(visibleUnifiedAgentPage.selection.validatedAt) ? " / stale saved data" : ""}`
       : "No saved package catalog observation. Open Sync to collect it."] : []),
     ...(agentInventoryScope !== "catalog" ? [nativeObservation
       ? `Power Platform collected ${formatRefreshTime(new Date(nativeObservation.observedAt))}`
@@ -1590,9 +1616,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const exportableAgentCount = visibleUnifiedAgentPage?.counts.filtered ?? 0;
   const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size + selectedGroups.size;
   const exportSelectionRestoring = pendingPowerPlatformIds.size > 0 || pendingStoredAgentSelectionCount !== undefined;
-  const agentExportRevision = visibleUnifiedAgentPage?.selection?.id;
+  const agentExportRevision = agentLeaseEnded ? undefined : visibleUnifiedAgentPage?.selection?.id;
   const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (visibleUnifiedAgentPage && !agentExportRevision));
-  const showAgentExportError = Boolean(agentExportError && !agentExportError.reloadRequired || !agentInventoryPending && agentExportNeedsReload);
+  const showAgentExportError = !agentLeaseEnded && Boolean(agentExportError && !agentExportError.reloadRequired || !agentInventoryPending && agentExportNeedsReload);
   const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
     record => record.observations.powerPlatform,
   )?.observations.powerPlatform ?? null;
@@ -1712,12 +1738,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLinkedJobError(undefined);
   }
 
-  function invalidateAgentSelection(reloading = false) {
+  function invalidateAgentSelection() {
     setInventoryUnavailable(undefined);
-    if (!reloading) {
-      agentListRequestId.current += 1;
-      agentListAbortController.current?.abort();
-    }
+    agentListRequestId.current += 1;
+    agentListAbortController.current?.abort();
     cancelAgentDetailRequest();
     agentInventoryQueries.clear();
     inventoryNavigation.current = { key: "" };
@@ -1740,9 +1764,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setBulkConfirmation(undefined);
     setBulkAccessSelection(undefined);
     setBulkAccessAgentIds(undefined);
-    setLoadingAgents(reloading);
+    setLoadingAgents(false);
     clearPackageSelection(user);
-    setUnifiedAgentReadError(reloading ? undefined : "The saved inventory selection is no longer available. Reload saved inventory.");
+    setUnifiedAgentReadError("The saved inventory selection is no longer available. Reload saved inventory.");
   }
 
   async function loadSession() {
@@ -1838,33 +1862,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
 
     try {
-      const selectionId = inventoryNavigation.current.selectionId;
-      let unifiedResponse;
-      try {
-        unifiedResponse = await agentInventoryQueries.read(principalKey, {
-          ...query,
-          limit: agentDisplayPageSize,
-          selectionId,
-          cursor: inventoryNavigation.current.cursor,
-        }, controller.signal);
-      } catch (requestError) {
-        if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
-        const expiredSelection = selectionId && unifiedAgentPage?.selection.id === selectionId
-          && Date.parse(unifiedAgentPage.selection.expiresAt) <= Date.now();
-        if (!(requestError instanceof AgentInventoryExpiredError)
-          && !(expiredSelection && requestError instanceof ApiError && requestError.code === "selection_invalidated")) throw requestError;
-        // Renew only the read, once; no expired target selection or prepared action survives it.
-        invalidateAgentSelection(true);
-        inventoryNavigation.current = { key: inventoryKey };
-        pendingAgentListKey.current = JSON.stringify([inventoryKey, agentReloadRevision, undefined, undefined]);
-        setAgentPageIndex(0);
-        unifiedResponse = await agentInventoryQueries.read(principalKey, {
-          ...query, limit: agentDisplayPageSize,
-        }, controller.signal);
-      }
+      const unifiedResponse = await agentInventoryQueries.read(principalKey, {
+        ...query,
+        limit: agentDisplayPageSize,
+        selectionId: inventoryNavigation.current.selectionId,
+        cursor: inventoryNavigation.current.cursor,
+      }, controller.signal);
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
-      setInitialAgentReadOwner(principalKey);
       if ("state" in unifiedResponse) {
+        setInitialAgentReadOwner(principalKey);
         invalidateAgentSelection();
         setInventoryUnavailable(unifiedResponse);
         setUnifiedAgentReadError(undefined);
@@ -1873,10 +1879,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setPackageSnapshotExpiresAt(undefined);
         return;
       }
+      automaticRefresh.admitPublication(unifiedResponse.selection.publicationRevisions);
+      if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
+      setInitialAgentReadOwner(principalKey);
       setInventoryUnavailable(undefined);
       inventoryNavigation.current.selectionId = unifiedResponse.selection.id;
       setAgents(unifiedResponse.value.flatMap(record => record.packages));
       setUnifiedAgentPage(unifiedResponse);
+      setExpiredAgentSelection(undefined);
       setInventoryReportRevision(officialUsageDashboardRevision);
       setUnifiedAgentReadError(undefined);
       setAgentExportError(current => current === agentExportError ? undefined : current);
@@ -1888,7 +1898,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setInitialAgentReadOwner(principalKey);
         setInventoryUnavailable(undefined);
         if (isAccessDenied(requestError)) clearAgentState();
-        else if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
+        else if (isExpiredSelection(requestError) && unifiedAgentPage) {
+          setExpiredAgentSelection(unifiedAgentPage.selection.id);
+          setUnifiedAgentReadError(undefined);
+          return;
+        } else if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
           invalidateAgentSelection();
         }
         setError(errorMessage(requestError));
@@ -1942,7 +1956,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           ? "Package refresh requires current delegated read authorization. Open Permissions to request consent or retry the probe."
           : "Package refresh failed without replacing the last complete saved observation."));
       }
-      if (claimPackageRefreshPublication(job)) requestCurrentAgentReload();
+      if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
     } catch (requestError) {
       if (ownsPackageRefreshRequest(requestId, owner)) setError(errorMessage(requestError));
     } finally {
@@ -1985,7 +1999,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           ? "Matching-detail refresh requires current delegated package-read authorization."
           : "Matching-detail refresh failed without replacing the last complete saved observations."));
       }
-      if (claimPackageRefreshPublication(job)) requestCurrentAgentReload();
+      if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
     } catch (requestError) {
       if (ownsPackageRefreshRequest(requestId, owner)) {
         if (requestError instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(requestError.code)) {
@@ -2020,7 +2034,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
       if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current delegated package-read authorization.");
       setRequestedAgentDetailId(id);
-      if (claimPackageRefreshPublication(job)) requestCurrentAgentReload();
+      if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
     } catch (requestError) {
       if (ownsPackageRefreshRequest(requestId, owner)) setAgentDetailError(errorMessage(requestError));
     } finally {
@@ -2104,9 +2118,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     } catch (requestError) {
       if (ownsAgentDetailRequest(requestId, owner, controller.signal) && currentDetailSelection.current === selectionId) {
-        setAgentDetail(undefined);
+        if (!isExpiredSelection(requestError)) setAgentDetail(undefined);
         setAgentDetailError(errorMessage(requestError));
-        if (requestError instanceof ApiError && requestError.code === "selection_invalidated"
+        if (isExpiredSelection(requestError)) setExpiredAgentSelection(selectionId);
+        else if (requestError instanceof ApiError && requestError.code === "selection_invalidated"
           && selectionId === inventoryNavigation.current.selectionId) invalidateAgentSelection();
       }
     } finally {
@@ -2156,6 +2171,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   async function handleManageAgentAccess(agent: CopilotPackage, target: PackageAccessTarget = "availability") {
+    if (!selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
     if (!isCurrentAgentScope() || bulkJobStatusUnrecognized) return;
     const key = JSON.stringify([principalKey, agent.id, target]);
     if (pendingAccessPreparation.current?.key === key
@@ -2196,7 +2212,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     agent: CopilotPackage,
     targetBlockedState: boolean,
   ) {
-    if (!isCurrentAgentScope() || bulkJobStatusUnrecognized || pendingBlockPreview.current === agentDetailRequestId.current) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)
+      || bulkJobStatusUnrecognized || pendingBlockPreview.current === agentDetailRequestId.current) return;
     const returnFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     const requestId = cancelAgentDetailRequest();
     pendingBlockPreview.current = requestId;
@@ -2228,7 +2245,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   async function handleInlineAccessUpdate(agent: CopilotPackage, update: PackageAccessUpdate) {
-    if (!isCurrentAgentScope()) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
     if (bulkJobStatusUnrecognized) throw new Error(jobStatusMessage(undefined));
     if (!selectedUnifiedAgent?.packages.some(item => item.id === agent.id)) {
       throw new Error("This published version is no longer selected. Reopen the agent before changing access.");
@@ -2255,7 +2272,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     update: PackageAccessUpdate,
     mutationScope: "single" | "bulk",
   ) {
-    if (!isCurrentAgentScope()) return false;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return false;
     if (bulkJobStatusUnrecognized) throw new Error(jobStatusMessage(undefined));
     if (mutationScope === "single" && update.mode !== "replace") {
       throw new Error("Single-agent access updates must replace assignments.");
@@ -2269,13 +2286,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
     const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update }, { signal: controller.signal });
-    if (!ownsAgentFlowRequest(requestId, owner)) return false;
+    if (!ownsAgentFlowRequest(requestId, owner) || forceCurrentAgentReload.current
+      || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return false;
     setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
     return true;
   }
 
   function requestExportCsv() {
-    if (!isCurrentAgentScope() || exportingCsv || loadingAgents || forceCurrentAgentReload.current) return;
+    if (!isCurrentAgentScope() || exportingCsv || loadingAgents || forceCurrentAgentReload.current
+      || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
     if (!agentExportRevision || agentExportNeedsReload) {
       setAgentExportError({ message: "Reload the saved agent inventory before exporting; a valid saved revision is required.", reloadRequired: true });
       return;
@@ -2284,7 +2303,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleExportCsv(scope: UnifiedAgentExportScope) {
-    if (exportingCsv) return;
+    if (exportingCsv || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
     const owner = principalKey;
     if (!ownsAgentScope(owner) || !hasRole(user, "AgentControl.Viewer")) return;
     if (!agentExportRevision || agentExportNeedsReload) {
@@ -2347,8 +2366,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       handleSyncRunsChanged();
       if (job.status === "succeeded") {
         if (claimPowerPlatformPublication(job)) {
-          resetPowerPlatformSelection();
-          requestCurrentAgentReload();
+          automaticRefresh.checkNow();
         }
       } else if (job.status !== "waiting_authorization" && job.status !== "running") {
         setError(job.message ?? "Power Platform agent refresh did not complete.");
@@ -2383,8 +2401,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       handleSyncRunsChanged();
       if (job.status === "succeeded") {
         if (claimPowerPlatformPublication(job)) {
-          resetPowerPlatformSelection();
-          requestCurrentAgentReload();
+          automaticRefresh.checkNow();
         }
       }
       else if (job.status !== "running" && job.status !== "waiting_authorization") {
@@ -2414,12 +2431,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (latest?.id === job.id || previous && previous.id !== job.id
       && job.requestedTypes.includes("microsoft.copilotstudio/agents")) setPowerPlatformAgentRefreshJob(job);
     if (job.status === "succeeded" && claimPowerPlatformPublication(job)) {
-      handleDataSyncSourcesChanged(["power_platform"]);
+      automaticRefresh.checkNow();
     } else if (prior && (prior.id !== job.id || prior.status !== job.status)) handleSyncRunsChanged();
   }
 
   async function requestBulkAction(targetBlockedState: boolean) {
-    if (!isCurrentAgentScope() || bulkJobStatusUnrecognized || groupCountPending || matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)
+      || bulkJobStatusUnrecognized || groupCountPending || matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) return;
     const label = targetBlockedState ? "block" : "unblock";
     const scope = [...selectedAgentIds];
 
@@ -2443,7 +2461,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
     try {
       const preview = await previewPackageMutation({ action: label, ...targets, mutationScope: "bulk" }, { signal: controller.signal });
-      if (!ownsAgentFlowRequest(requestId, owner)) return;
+      if (!ownsAgentFlowRequest(requestId, owner) || forceCurrentAgentReload.current
+        || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
       if (selectedGroups.size && !preview.selectionId) throw new Error("The server did not return the reviewed group selection.");
       setBulkConfirmation({ action: label, ...targets, ids: scope, selectionId: selectedGroups.size ? preview.selectionId : targets.selectionId, mutationScope: "bulk", preview });
     } catch (requestError) {
@@ -2455,7 +2474,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
-    if (!isCurrentAgentScope() || bulkJobStatusUnrecognized || pendingBulkSubmission.current) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)
+      || bulkJobStatusUnrecognized || pendingBulkSubmission.current) return;
     pendingBulkSubmission.current = confirmation;
     const { action: label, ids, recordIds, selectionId, mutationScope, preview, accessUpdate } = confirmation;
     const requestId = ++bulkJobPollRequestId.current;
@@ -2518,7 +2538,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       await followBulkJob(job.id, job, true, mutationScope === "single" ? ids[0] : undefined);
     } catch (requestError) {
       if (ownsBulkJobRequest(requestId, owner)) {
-        const message = errorMessage(requestError);
+        const staleConfirmation = requestError instanceof ApiError
+          && ["selection_invalidated", "inventory_changed", "confirmation_mismatch"].includes(requestError.code);
+        const message = staleConfirmation
+          ? "The saved inventory changed before the action could start. Reloading saved inventory. Review and confirm the action again."
+          : errorMessage(requestError);
+        if (staleConfirmation) {
+          invalidateAgentSelection();
+          requestCurrentAgentReload();
+        }
         setBulkJobError(message);
         if (mutationScope === "single" && ids.length === 1) setPackageControlError({ packageId: ids[0], message });
         setBusyBulkAction(undefined);
@@ -2532,7 +2560,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function requestBulkAccessUpdate() {
-    if (!isCurrentAgentScope() || bulkJobStatusUnrecognized || groupCountPending || matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)
+      || bulkJobStatusUnrecognized || groupCountPending || matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) return;
     cancelAgentDetailRequest();
     setBulkConfirmation(undefined);
     if (matchingPackageSelection || selectedGroups.size) {
@@ -2556,7 +2585,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   async function runBulkAccessUpdate(update: PackageAccessUpdate) {
-    if (!isCurrentAgentScope()) return;
+    if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
     if (bulkJobStatusUnrecognized) throw new Error(jobStatusMessage(undefined));
     const ids = bulkAccessAgentIds ?? [];
 
@@ -2576,7 +2605,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const action = update.target === "availability" ? "update-availability" : "update-installation";
         const { recordIds, ids: exactIds } = bulkAccessSelection;
         const preview = await previewPackageMutation({ action, selectionId: bulkAccessSelection.id, recordIds, ids: exactIds, mutationScope: "bulk", accessUpdate: update }, { signal: controller.signal });
-        if (agentDetailRequestId.current !== requestId) return;
+        if (agentDetailRequestId.current !== requestId || forceCurrentAgentReload.current
+          || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return;
         setBulkConfirmation({ action, ids: exactIds ?? [], recordIds, selectionId: bulkAccessSelection.id, mutationScope: "bulk", accessUpdate: update, preview });
       } else await requestAccessConfirmation(ids, update, "bulk");
       if (agentDetailRequestId.current !== requestId) return;
@@ -3086,11 +3116,33 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function requestCurrentAgentReload() {
     if (!isCurrentAgentScope()) return;
+    forceCurrentAgentReload.current = true;
+    scheduleAgentReload();
+  }
+
+  function replaceCurrentAgentSelection() {
+    if (!isCurrentAgentScope()) return;
+    // Replacement may change membership. Retire targets and unsent previews first,
+    // but keep the route, query and detail identity for the replacement read.
+    if (pendingBulkPreview.current || bulkConfirmation || bulkAccessAgentIds || singleAccessAgentDetail) {
+      cancelAgentDetailRequest();
+      setPreparingBulkAction(undefined);
+      setBusyAgentId(undefined);
+    }
+    setSelectedAgentIds(new Set());
+    setSelectedPowerPlatformTargets(new Map());
+    setSelectedPowerPlatformSnapshot(null);
+    setBulkConfirmation(undefined);
+    setBulkAccessSelection(undefined);
+    setBulkAccessAgentIds(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setInventoryExport(undefined);
+    setExportChoiceOpen(false);
+    clearPackageSelection(user);
     setServerPackageSelection(undefined);
     setGroupPackageSelection(undefined);
     setGroupTargetCount(undefined);
-    forceCurrentAgentReload.current = true;
-    scheduleAgentReload();
+    requestCurrentAgentReload();
   }
 
   function handleQuarantineJobChange(job: QuarantineJob) {
@@ -3101,7 +3153,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (job.succeeded || job.skipped || job.inconclusive) requestCurrentAgentReload();
   }
 
-  function handleInventoryExportInvalidation() {
+  function handleInventoryExportInvalidation(error?: ApiError) {
     if (!inventoryExport || !ownsAgentScope(inventoryExport.owner)) return;
     agentInventoryQueries.invalidateSelection(inventoryExport.selectionId);
     if (inventoryExport.selectionId !== inventoryNavigation.current.selectionId) {
@@ -3109,13 +3161,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setAgentExportError({ message: "The previous export selection changed or expired. Start a new export from the current inventory.", reloadRequired: false });
       return;
     }
-    clearAgentState();
+    if (isExpiredSelection(error)) {
+      setInventoryExport(undefined);
+      setExpiredAgentSelection(inventoryExport.selectionId);
+    } else clearAgentState();
     setAgentExportError({ message: "The saved inventory selection changed or expired. Reload inventory before exporting again.", reloadRequired: true });
   }
 
   function verifySavedAgentInventory() {
     setLoadingAgents(true);
-    requestCurrentAgentReload();
+    replaceCurrentAgentSelection();
   }
 
   if (loadingSession) {
@@ -3186,6 +3241,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   return (
     <CapabilityContext key={principalKey} value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
+    <PublicationContext value={{ admit: automaticRefresh.admitPublication, revisions: automaticRefresh.publicationRevisions }}>
     <WorkbenchActionProvider value={workbenchMetadata?.actions}>
     <main className="app-shell">
       <BackgroundRefreshIndicator active={automaticRefresh.checking || loadingAgents} />
@@ -3305,6 +3361,19 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onOpenUsageImport={() => openUsageImport()}
           onRequestedRunChange={handleRequestedSyncRunChange}
           onSourcesChanged={handleDataSyncSourcesChanged}
+          onCheckPublication={sources => {
+            const inventorySources = sources.filter(source => source === "graph_packages" || source === "power_platform");
+            if (inventorySources.length) {
+              setPendingDataSyncPublication(current => ({
+                owner: principalKey,
+                sources: [...new Set([
+                  ...(current?.owner === principalKey ? current.sources : []),
+                  ...inventorySources,
+                ])],
+              }));
+            }
+            automaticRefresh.checkNow();
+          }}
           onCancelRequested={() => automaticRefresh.setPaused(true)}
         />
       ) : null}
@@ -3331,7 +3400,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           canManage={canImportReports}
           revision={officialUsageDashboardRevision}
           onChanged={handleOfficialUsageChanged}
-          onImported={finishUsageImport}
         />
       ) : null}
 
@@ -3376,7 +3444,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             </div>
             {canReadSensitiveUsage ? <AgentInventoryScopes
               inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}
-              loading={loadingAgents}
+              loading={agentInventoryPending}
               value={agentInventoryScope} onChange={handleInventoryScopeChange} /> : null}
             <div className="agent-catalog-actions">
               <span className="last-refresh" aria-live="polite">
@@ -3389,7 +3457,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </button> : null}
               <div className="agent-catalog-export">
                 <span className="agent-refresh-indicator">
-                  {loadingAgents || agentSearchPending ? <span role="status" aria-label="Updating agent results"
+                  {agentInventoryPending ? <span role="status" aria-label="Updating agent results"
                     title="Updating agent results. Previous results remain visible until the current filters and sorting finish loading.">
                     <RefreshCw className="agent-refresh-spinner" size={18} aria-hidden="true" />
                     <span className="sr-only">Updating agent results...</span>
@@ -3412,7 +3480,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
             inventory={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage} revision={inventoryReportRevision}
             reportPending={inventoryReportRevision !== officialUsageDashboardRevision}
-            loadingInventory={loadingAgents}
+            loadingInventory={agentInventoryPending}
             inventoryScope={agentInventoryScope}
             reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
               principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
@@ -3425,7 +3493,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             <span>{agentExportError?.message ?? (unifiedAgentReadError
               ? "The current saved agent inventory could not be loaded. Reload the saved inventory before exporting."
               : "A saved agent inventory revision is unavailable. Reload the saved inventory before exporting.")}</span>
-            {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={requestCurrentAgentReload}>Reload saved agent inventory</button> : null}
+            {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={replaceCurrentAgentSelection}>Reload saved agent inventory</button> : null}
+          </div> : null}
+          {agentLeaseEnded ? <div className="copilot-users-notice" role="status">
+            Showing previously loaded saved inventory, evaluated {formatRefreshTime(new Date(visibleUnifiedAgentPage!.selection.evaluatedAt))}.
+            {" "}Load a new selection before paging, exporting or acting. Sync progress does not remove this saved data.
+            {" "}<button type="button" className="secondary" disabled={loadingAgents} onClick={replaceCurrentAgentSelection}>Reload saved agent inventory</button>
           </div> : null}
           {matchingPackageSelection ? <p className="selection-summary">Server selection · no target list downloaded · maximum 5,000 targets per job</p> : null}
           {groupTargetKey && groupCount?.error ? <div role="alert">
@@ -3441,7 +3514,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           {canOperate && !groupCountPending && (matchingPackageCount > 0 || selectedPackageCount > 0 || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobCommand || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
               owner={principalKey}
             disabled={
-              Boolean(matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) || Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
+              agentLeaseEnded || Boolean(matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) || Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
             }
             busyAction={busyBulkAction}
             preparingAction={preparingBulkAction}
@@ -3482,12 +3555,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             }}
           /> : null}
 
-            <div className="agent-table-stack" aria-busy={loadingAgents || agentSearchPending}>
+            <div className="agent-table-stack" aria-busy={agentInventoryPending}>
               <UnifiedAgentTable
                 records={displayedUnifiedAgents}
-                loading={(loadingAgents || agentSearchPending) && displayedUnifiedAgents.length === 0}
+                loading={agentInventoryPending && displayedUnifiedAgents.length === 0}
+                loadingMessage={publishingAgentInventory
+                  ? "Publishing synced agents to the inventory..."
+                  : "Loading Copilot agents..."}
                 emptyState={inventoryUnavailable ? <div role="status">
-                  <h2>{inventoryUnavailable.state === "preparing" ? "Preparing agent inventory" : "No saved agent inventory yet"}</h2>
+                  <h2>{inventoryUnavailable.state === "preparing" ? "Preparing agent inventory"
+                    : inventoryUnavailable.state === "unavailable" ? "Saved agent inventory unavailable" : "No saved agent inventory yet"}</h2>
                   <p>{inventoryUnavailable.message}</p>
                   <button type="button" className="secondary" onClick={() => navigateToView("sync")}>Open Sync</button>
                 </div> : unifiedAgentReadError ? <>
@@ -3509,7 +3586,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                     publishers: publisherOptions, environments: [],
                     types: [] }}
                   matchingCount={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage?.counts.filtered}
-                  loading={loadingAgents || agentSearchPending}
+                  loading={agentInventoryPending}
                   onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={(message, readSelectionId) => {
                     if (readSelectionId === undefined || readSelectionId === inventoryNavigation.current.selectionId) setError(message);
                   }} />}
@@ -3541,11 +3618,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 selectedRecordIds={new Set(selectedGroups.keys())}
                 selectedPowerPlatformKeys={new Set(selectedPowerPlatformTargets.keys())}
                 packageSelectionAllowed
-                packageOperationsAllowed={canOperate}
-                quarantineSelectionAllowed={canOperate}
+                packageOperationsAllowed={canOperate && !agentLeaseEnded}
+                quarantineSelectionAllowed={canOperate && !agentLeaseEnded}
                 quarantineSelectionRestoring={pendingPowerPlatformIds.size > 0}
-                selectionDisabled={loadingAgents || agentSearchPending || Boolean(busyBulkAction) || refreshingAgents}
-                packageActionsDisabled={Boolean(busyBulkAction) || refreshingAgents || bulkJobStatusUnrecognized}
+                selectionDisabled={agentLeaseEnded || loadingAgents || agentSearchPending || Boolean(busyBulkAction) || refreshingAgents}
+                packageActionsDisabled={agentLeaseEnded || Boolean(busyBulkAction) || refreshingAgents || bulkJobStatusUnrecognized}
                 environmentNames={agentEnvironmentNames}
                 onToggleSelection={toggleUnifiedAgentSelection}
                 onViewDetails={record => {
@@ -3564,11 +3641,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               {visibleUnifiedAgentPage && !unifiedAgentReadError ? <nav aria-label="Agent inventory pages" className="agent-inventory-pagination" aria-busy={loadingAgents || agentSearchPending}>
                 <span role="status">{visibleUnifiedAgentPage.value.length.toLocaleString()} shown · {visibleUnifiedAgentPage.counts.filtered.toLocaleString()} matching agents</span>
                 <div className="agent-inventory-page-actions">
-                  <button type="button" className="secondary" disabled={loadingAgents || agentSearchPending || !visibleUnifiedAgentPage.page.previousCursor}
-                    onClick={() => { inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.previousCursor ?? undefined;
+                  <button type="button" className="secondary" disabled={agentLeaseEnded || loadingAgents || agentSearchPending || !visibleUnifiedAgentPage.page.previousCursor}
+                    onClick={() => { if (!selectedReadRemaining(visibleUnifiedAgentPage.selection)) return;
+                      inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.previousCursor ?? undefined;
                       setAgentPageIndex(index => Math.max(0, index - 1)); }}>Previous</button>
-                  <button type="button" className="secondary" disabled={loadingAgents || agentSearchPending || !visibleUnifiedAgentPage.page.nextCursor}
-                    onClick={() => { inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.nextCursor ?? undefined;
+                  <button type="button" className="secondary" disabled={agentLeaseEnded || loadingAgents || agentSearchPending || !visibleUnifiedAgentPage.page.nextCursor}
+                    onClick={() => { if (!selectedReadRemaining(visibleUnifiedAgentPage.selection)) return;
+                      inventoryNavigation.current.cursor = visibleUnifiedAgentPage.page.nextCursor ?? undefined;
                       setAgentPageIndex(index => index + 1); }}>Next</button>
                 </div>
               </nav> : null}
@@ -3579,7 +3658,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <CopilotUsersView
           key={`users:${principalKey}`}
           dataRevision={copilotUsersDataRevision}
-          agentInventoryRevision={agentReloadRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
           reportSelector={canImportReports ? <OfficialUsageReportSelector key={`user-reports:${principalKey}`}
@@ -3624,7 +3702,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onInventoryInvalidated={selectionId => {
             if (ownsAgentScope(principalKey) && selectionId === inventoryNavigation.current.selectionId) invalidateAgentSelection();
           }}
-          onRetryInventory={requestCurrentAgentReload}
+          onRetryInventory={replaceCurrentAgentSelection}
           onUsageChanged={() => {
             if (ownsAgentScope(principalKey)) requestCurrentAgentReload();
           }}
@@ -3660,7 +3738,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           packageDetailLoading={Boolean(loadingAgentDetailId)}
           packageDetailError={agentDetailError}
           packageActionsBusy={Boolean(busyAgentId || busyBulkAction || refreshingAgents)}
-          packageActionsBlockedReason={bulkJobStatusUnrecognized ? jobStatusMessage(undefined) : undefined}
+          packageActionsBlockedReason={agentLeaseEnded ? "Load a new saved selection before acting." : bulkJobStatusUnrecognized ? jobStatusMessage(undefined) : undefined}
           onUpdatePackageAccess={handleInlineAccessUpdate}
           packageAccessRevisions={packageAccessRevisions}
           packageControlError={packageControlError}
@@ -3668,6 +3746,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onCancelPackageConfirmation={() => setBulkConfirmation(undefined)}
           packageConfirmation={inlinePackageConfirmation && bulkConfirmation ? <BulkConfirmModal
             confirmation={bulkConfirmation} inline
+            disabled={agentLeaseEnded}
             onCancel={() => setBulkConfirmation(undefined)}
             onConfirm={() => void runConfirmedBulkAction(bulkConfirmation)}
           /> : undefined}
@@ -3712,6 +3791,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       {bulkConfirmation && !inlinePackageConfirmation ? (
         <BulkConfirmModal
           confirmation={bulkConfirmation}
+          disabled={agentLeaseEnded}
           onCancel={() => setBulkConfirmation(undefined)}
           onConfirm={() => void runConfirmedBulkAction(bulkConfirmation)}
         />
@@ -3742,6 +3822,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       <AppFooter />
     </main>
     </WorkbenchActionProvider>
+    </PublicationContext>
     </CapabilityContext>
   );
 }
@@ -3939,11 +4020,13 @@ export function BulkConfirmModal({
   onCancel,
   onConfirm,
   inline = false,
+  disabled = false,
 }: {
   confirmation: BulkConfirmation;
   onCancel: () => void;
   onConfirm: () => void;
   inline?: boolean;
+  disabled?: boolean;
 }) {
   const { summary } = confirmation.preview;
   const isBlockAction = summary.operation === "block" || summary.operation === "unblock";
@@ -3966,7 +4049,7 @@ export function BulkConfirmModal({
   }
 
   function confirm() {
-    if (activeConfirmation.current !== confirmation) return;
+    if (disabled || activeConfirmation.current !== confirmation) return;
     activeConfirmation.current = undefined;
     onConfirm();
   }
@@ -4106,6 +4189,7 @@ export function BulkConfirmModal({
           </p>
         ) : null}
         </>}
+        {disabled ? <p role="status">This saved selection lease ended. Reload saved inventory before confirming an action.</p> : null}
         <div className="confirm-actions">
           <button type="button" className="secondary" onClick={cancel}>
             Cancel
@@ -4115,6 +4199,7 @@ export function BulkConfirmModal({
             type="button"
             className={summary.operation === "block" || confirmation.accessUpdate?.scope === "none" ? "danger" : undefined}
             onClick={confirm}
+            disabled={disabled}
           >
             {isBlockAction ? `${actionLabel} ${targetLabel}` : `Confirm ${actionLabel.toLowerCase()}`}
           </button>

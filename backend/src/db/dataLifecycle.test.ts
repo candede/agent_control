@@ -102,17 +102,18 @@ describe("cross-domain bounded lifecycle", () => {
     expect(await bytes()).toBe(0);
   });
 
-  it("advances beyond 20 pinned historical roots and 17 expired selectors, including after collector restart", async () => {
+  it("collects beyond 20 historical roots while retaining 18 aged current selectors until explicit retirement, including after restart", async () => {
     const stages = new InventoryGenerations(fixture.runtime), principal = randomUUID();
     const roots = [await inventoryBaseline(stages, principal, 1)];
     const queries = new InventoryQueries(fixture.runtime, "synthetic-lifecycle-inventory-cursor-key");
     const identity = { ...selectionIdentity, tenantId: "synthetic-tenant", principalId: principal };
     const selection = await queries.capture(identity, roots[0].scopeId);
     for (let index = 1; index < 24; index++) roots.push(await inventoryBaseline(stages, principal, 1));
-    const expired: string[] = [];
+    const aged: Array<{ baselineId: string; scopeId: string; principalId: string }> = [];
     for (let index = 0; index < 18; index++) {
-      const root = await inventoryBaseline(stages, randomUUID(), 1, new Date(), new Date(Date.now() + 2000));
-      expired.push(root.baselineId);
+      const principalId = randomUUID();
+      const root = await inventoryBaseline(stages, principalId, 1, new Date(), new Date(Date.now() + 2000));
+      aged.push({ ...root, principalId });
     }
     await new Promise(resolve => setTimeout(resolve, 2050));
     const before = (await fixture.runtime.query("SELECT count(*)::int AS n FROM data_generations")).rows[0].n;
@@ -127,11 +128,20 @@ describe("cross-domain bounded lifecycle", () => {
       "SELECT count(*)::int AS n FROM inventory_memberships WHERE baseline_id=$1", [id])).rows[0].n;
     expect(await membershipCount(roots[0].baselineId)).toBe(1);
     expect(await membershipCount(roots[21].baselineId)).toBe(0);
-    for (const id of expired) expect(await membershipCount(id)).toBe(0);
+    for (const root of aged) {
+      expect(await membershipCount(root.baselineId)).toBe(1);
+      const owner = { ...identity, principalId: root.principalId };
+      const fresh = await queries.capture(owner, root.scopeId);
+      expect((await queries.page(fresh.id, owner)).value).toHaveLength(1);
+      await stages.clear(root.scopeId, owner.tenantId);
+      await expect(queries.capture(owner, root.scopeId)).rejects.toMatchObject({ code: "selection_invalidated" });
+    }
     await fixture.operator.query("UPDATE data_read_selections SET invalidated_at=clock_timestamp() WHERE id=$1", [selection.id]);
     for (let index = 0; index < 4; index++) await stages.generations.connections.run(client => retainRecordData(client));
     for (let index = 0; index < 100; index++) await runtime.collect();
     expect(await membershipCount(roots[0].baselineId)).toBe(0);
+    expect(await membershipCount(roots.at(-1)!.baselineId)).toBe(1);
+    for (const root of aged) expect(await membershipCount(root.baselineId)).toBe(0);
     expect((await fixture.runtime.query("SELECT slices::int AS n FROM data_lifecycle_progress WHERE worker='inventory'")).rows[0].n).toBeGreaterThan(400);
   }, 30_000);
 

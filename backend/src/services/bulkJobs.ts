@@ -130,7 +130,7 @@ export async function runBulkJob(
       };
       let sent = false;
       try {
-        await repository.settleInventoryControls(lease, item.id, signal, async () => { await authorizeJob(scope, job.capability); });
+        await repository.settleInventoryControls(scope, signal, async () => { await authorizeJob(scope, job.capability); });
         await capabilities.observeOperation(job.capability, principal, () => repository.withTargetLock(lease, item, async () => {
           const readOptions = { correlationId: item.correlation_id!, signal };
           const before = await getPackageDetails(accessToken, item.target_id, readOptions);
@@ -210,7 +210,10 @@ export async function runBulkJob(
             ...failureEvidence(error),
           });
         if (isAdmissionFailure(error) || externalSignal?.aborted) return;
+        continue;
       }
+      // The verified outcome is durable; a publication failure must not overwrite it as inconclusive.
+      await repository.settleInventoryControls(scope, signal, async () => { await authorizeJob(scope, job.capability); });
     }
   } finally { await releaseIfOwned(repository, lease); }
 }
@@ -279,6 +282,14 @@ export async function reconcileBulkJob(
     if (!context) throw new AppError(404, "not_found", "Job was not found.");
   }
   requireProviderAdmissions();
+  if (attempted > failed) {
+    await repository.settleInventoryControls(scope, AbortSignal.timeout(reconciliationDeadlineMs), async () => {
+      requireProviderAdmissions();
+      assertAccountSessionValidation(validation);
+      await authorize(scope, "graph.package.read.delegated");
+      assertAccountSessionValidation(validation);
+    });
+  }
   await authorize(scope, "graph.package.read.delegated");
   assertAccountSessionValidation(validation);
   const current = await repository.get(id, scope);

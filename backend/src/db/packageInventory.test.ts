@@ -206,17 +206,24 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
       .toEqual(["Even publisher", "Odd publisher"]);
   });
 
-  it("expires a selected source, retains finite job metadata, and denies direct control or published-row deletion", async () => {
+  it("retains saved source and success beyond freshness while expiring read leases and finite jobs", async () => {
     const owner = { tenantId: "tenant-package-retention", principalId: "reader-package-retention" };
     const job = await running("expiring-source", undefined, owner);
     await refreshThroughProvider(owner, job, [packageValue("expiring")], { expiresAt: new Date(Date.now() + 2500) });
     const read = await selected({}, owner);
     await expect(fixture.runtime.query("DELETE FROM package_inventory_snapshots WHERE tenant_id=$1", [owner.tenantId])).rejects.toThrow();
     await expect(fixture.runtime.query("DELETE FROM package_record_rows WHERE tenant_id=$1", [owner.tenantId])).rejects.toThrow();
-    await expect.poll(() => read.queries.page(read.selection.id, read.identity).then(() => "live", error => error.code),
-      { timeout: 3500, interval: 100 }).toBe("selection_invalidated");
+    const success = (await jobs.listJobs(owner, owner.principalId)).lastSuccessAt;
+    expect(success).not.toBeNull();
+    await new Promise(resolve => setTimeout(resolve, 2550));
+    expect((await read.queries.page(read.selection.id, read.identity)).counts.total).toBe(1);
+    expect((await selected({}, owner)).raw.counts.total).toBe(1);
+    expect((await jobs.listJobs(owner, owner.principalId)).lastSuccessAt).toBe(success);
+    await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [read.selection.id]);
+    await expect(read.queries.page(read.selection.id, read.identity)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "expired" } });
     await fixture.operator.query("UPDATE package_refresh_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [job]);
     await retain(fixture.operator);
     expect(await jobs.getJob(owner, job)).toBeUndefined();
+    expect((await jobs.listJobs(owner, owner.principalId)).lastSuccessAt).toBe(success);
   });
 });

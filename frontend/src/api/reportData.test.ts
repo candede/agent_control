@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterEach, expect, it, vi } from "vitest";
 import { ApiError, request } from "./client";
 import { cancelReportExport, createReportExport, normalizeReportSearch, previewReportBundle, reportExportStatus } from "./reportData";

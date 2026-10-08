@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
+import { matchesPurviewAgent } from "../services/graphAuditSearch.js";
 import type {
   PurviewAuditFilters,
   PurviewAuditHistory,
@@ -204,11 +205,15 @@ export class PurviewAuditRepository {
     return rows[0] ? projectJob(rows[0]) : undefined;
   }
 
-  async listJobs(scope: PurviewAuditReadScope, limit = 20, offset = 0, userPrincipalName?: string): Promise<PurviewAuditHistory> {
+  async listJobs(scope: PurviewAuditReadScope, limit = 20, offset = 0, userPrincipalName?: string, agentRecordId?: string): Promise<PurviewAuditHistory> {
     const read = scopedWhere(scope);
     if (userPrincipalName !== undefined) {
       read.values.push(userPrincipalName.toLowerCase());
       read.sql += ` AND jsonb_array_length(filters->'userPrincipalNames')=1 AND lower(filters->'userPrincipalNames'->>0)=$${read.values.length}`;
+    }
+    if (agentRecordId !== undefined) {
+      read.values.push(agentRecordId);
+      read.sql += ` AND filters->'agent'->>'recordId'=$${read.values.length}`;
     }
     const bounded = Math.min(Math.max(limit, 1), 50);
     const boundedOffset = Math.min(Math.max(offset, 0), 100_000);
@@ -319,6 +324,9 @@ export class PurviewAuditRepository {
     }
     await transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution, ["running"]);
+      if (result.records.some(record => matchesPurviewAgent(record, job.filters) !== true)) {
+        throw new AppError(409, "invalid_audit_publication", "Audit Search results do not match the selected agent.");
+      }
       if (job.deadline_at <= new Date()) throw new AppError(409, "audit_job_expired", "Audit Search results arrived after its deadline.");
       if (result.records.length) {
         const rows = result.records.map(record => ({
@@ -658,6 +666,7 @@ function partialPublication(complete: boolean, reason: PurviewAuditPartialReason
     audit_page_limit: "The local result page limit was reached; preserved records are partial and part of the requested range is unobserved.",
     audit_row_limit: "The local result row limit was reached; preserved records are partial and part of the requested range is unobserved.",
     audit_byte_limit: "The local result byte limit was reached; preserved records are partial and part of the requested range is unobserved.",
+    audit_identity_unresolved: "Some returned events did not contain the identity needed to match this agent. Only exactly matched records were saved.",
   };
   if (!complete && reason && messages[reason]) return { code: reason, message: messages[reason] };
   throw new AppError(409, "invalid_audit_publication", "Audit Search completion and partial reason are inconsistent.");

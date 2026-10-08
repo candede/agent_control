@@ -67,7 +67,7 @@ describe("data sync persistence integration", () => {
     }
   });
 
-  it("collects expired native records and runs without resetting successful zero-row markers", async () => {
+  it("retains current records beyond freshness and collects expired runs without resetting successful zero-row markers", async () => {
     const fixture = await testDatabase();
     try {
       const repository = new DataSyncRepository(fixture.runtime);
@@ -81,10 +81,10 @@ describe("data sync persistence integration", () => {
         VALUES(gen_random_uuid(),$1,$2,'incremental','["users"]',repeat('a',64),'completed',clock_timestamp()-interval '1 second')`,
       [scope.tenantId, scope.principalId]);
       const result = await retain(fixture.operator);
-      expect(result.affected).toMatchObject({ recordExpiredGenerations: 1, recordCollectedGenerations: 1, dataSyncRuns: 1 });
-      expect((await sourcePage(fixture.runtime)).sources.directory).toMatchObject({ generationId: null, state: "unavailable", rowCount: null });
+      expect(result.affected).toMatchObject({ recordExpiredGenerations: 0, recordCollectedGenerations: 0, dataSyncRuns: 1 });
+      expect((await sourcePage(fixture.runtime)).sources.directory).toMatchObject({ generationId: published.generationId, state: "stale", rowCount: 0 });
       expect((await fixture.runtime.query("SELECT collected_at FROM data_generations WHERE id=$1", [published.generationId])).rows[0].collected_at)
-        .toBeInstanceOf(Date);
+        .toBeNull();
       expect((await repository.listMarkers(scope)).find(source => source.source === "users")).toMatchObject({ status: "succeeded", count: 0 });
       expect(await repository.getRun(scope, run.id)).toBeDefined();
     } finally {

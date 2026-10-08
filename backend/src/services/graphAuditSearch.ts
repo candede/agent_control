@@ -5,6 +5,7 @@ import {
   purviewAuditPresetIds,
   purviewAuditPresets,
   type PurviewAuditFilters,
+  type PurviewAuditAgentTarget,
   type PurviewAuditPresetId,
   type PurviewAuditRecord,
   type PurviewAuditResult,
@@ -17,7 +18,7 @@ import {
 const graphOrigin = "https://graph.microsoft.com";
 const queryPath = "/v1.0/security/auditLog/queries";
 const queryStatuses = new Set<PurviewProviderQueryStatus>(["notStarted", "running", "succeeded", "failed", "cancelled", "unknownFutureValue"]);
-const queryKeys = new Set(["@odata.type", "id", "displayName", "filterStartDateTime", "filterEndDateTime", "serviceFilter", "recordTypeFilters", "operationFilters", "userPrincipalNameFilters", "ipAddressFilters", "objectIdFilters", "administrativeUnitIdFilters", "status"]);
+const queryKeys = new Set(["@odata.type", "@odata.context", "id", "displayName", "filterStartDateTime", "filterEndDateTime", "serviceFilter", "serviceFilters", "recordTypeFilters", "operationFilters", "userPrincipalNameFilters", "ipAddressFilters", "objectIdFilters", "administrativeUnitIdFilters", "keywordFilter", "status", "approximateReturnedRecordCount", "recordCountLimit", "isRecordCountLimitExceeded"]);
 const recordKeys = new Set(["@odata.type", "id", "createdDateTime", "auditLogRecordType", "operation", "organizationId", "userType", "userId", "service", "objectId", "userPrincipalName", "clientIp", "administrativeUnits", "auditData"]);
 const auditDataKeys = new Set(["@odata.type", "dynamicProperties"]);
 const dynamicPropertyKeys = new Set(["@odata.type", "ID", "CreationTime", "Operation", "OrganizationId", "RecordType", "ResultStatus", "UserId", "UserKey", "UserType", "Version", "Workload", "ClientIP", "ObjectId", "CorrelationId", "CopilotEventData", "BotId", "EnvironmentId", "BotComponentId", "AIPluginOperationId"]);
@@ -267,7 +268,7 @@ export class GraphAuditSearchClient {
 
 export function validatePurviewAuditFilters(value: unknown, options: { now?: Date; qualification?: boolean } = {}): PurviewAuditFilters {
   if (!isObject(value)) throw new AppError(400, "invalid_audit_filters", "Audit Search filters must be a structured object.");
-  const allowed = new Set(["presetId", "operations", "startDateTime", "endDateTime", "userPrincipalNames", "ipAddresses", "objectIds", "administrativeUnitIds"]);
+  const allowed = new Set(["presetId", "operations", "startDateTime", "endDateTime", "userPrincipalNames", "ipAddresses", "objectIds", "administrativeUnitIds", "agent"]);
   if (Object.keys(value).some(key => !allowed.has(key))) throw new AppError(400, "invalid_audit_filters", "Audit Search filters contain an unsupported field.");
   const presetId = value.presetId;
   if (typeof presetId !== "string" || !purviewAuditPresetIds.includes(presetId as PurviewAuditPresetId)) throw new AppError(400, "invalid_audit_filters", "Select a supported code-owned Audit Search preset.");
@@ -283,6 +284,10 @@ export function validatePurviewAuditFilters(value: unknown, options: { now?: Dat
   const preset = purviewAuditPresets[presetId as PurviewAuditPresetId];
   const operations = stringList(value.operations, "operations", item => preset.operationFilters.includes(item), 256, 100);
   if (!operations.length) throw new AppError(400, "invalid_audit_filters", "Select at least one supported Audit Search operation.");
+  const agent = value.agent === undefined ? undefined : validateAuditAgentTarget(value.agent);
+  if (agent && presetId === "copilot_interactions" && !agent.applicationId) {
+    throw new AppError(409, "agent_investigation_unavailable", "Copilot interaction search requires this agent's verified application identity.");
+  }
   return {
     presetId: presetId as PurviewAuditPresetId,
     operations,
@@ -292,7 +297,44 @@ export function validatePurviewAuditFilters(value: unknown, options: { now?: Dat
     ipAddresses: stringList(value.ipAddresses, "ipAddresses", item => isIP(item) !== 0),
     objectIds: stringList(value.objectIds, "objectIds", () => true, 512),
     administrativeUnitIds: stringList(value.administrativeUnitIds, "administrativeUnitIds", item => uuid(item)),
+    ...(agent ? { agent } : {}),
   };
+}
+
+function validateAuditAgentTarget(value: unknown): PurviewAuditAgentTarget {
+  if (!isObject(value) || Object.keys(value).some(key => !["recordId", "botId", "environmentId", "applicationId"].includes(key))
+    || typeof value.recordId !== "string" || !value.recordId || value.recordId.length > 2048
+    || typeof value.botId !== "string" || !uuid(value.botId)
+    || typeof value.environmentId !== "string" || !value.environmentId || value.environmentId.length > 256 || /[\s\0]/.test(value.environmentId)
+    || value.applicationId !== undefined && (typeof value.applicationId !== "string" || !uuid(value.applicationId))) {
+    throw new AppError(400, "invalid_audit_filters", "Agent audit search requires exact saved agent, bot and environment identities.");
+  }
+  return { recordId: value.recordId, botId: value.botId.toLowerCase(), environmentId: value.environmentId.toLowerCase(),
+    ...(typeof value.applicationId === "string" ? { applicationId: value.applicationId.toLowerCase() } : {}) };
+}
+
+export function matchesPurviewAgent(record: PurviewAuditRecord, filters: PurviewAuditFilters): boolean | undefined {
+  const agent = filters.agent;
+  if (!agent) return true;
+  if (filters.presetId === "copilot_studio_admin") {
+    if (!record.botId) return undefined;
+    return record.botId.toLowerCase() === agent.botId
+      && (!record.environmentId || record.environmentId.toLowerCase() === agent.environmentId);
+  }
+  if (!record.appIdentity) return undefined;
+  return Boolean(agent.applicationId && record.appIdentity.toLowerCase() === `copilot.studio.${agent.applicationId}`);
+}
+
+export function scopePurviewAuditResult(result: PurviewAuditResult, filters: PurviewAuditFilters): PurviewAuditResult {
+  if (!filters.agent) return result;
+  let unresolved = false;
+  const records = result.records.filter(record => {
+    const matches = matchesPurviewAgent(record, filters);
+    if (matches === undefined) unresolved = true;
+    return matches === true;
+  });
+  return { ...result, records, storedRowCount: records.length, complete: result.complete && !unresolved,
+    partialReason: result.partialReason ?? (unresolved ? "audit_identity_unresolved" : null) };
 }
 
 export function createProviderQueryBody(displayName: string, filters: PurviewAuditFilters) {
@@ -309,6 +351,7 @@ export function createProviderQueryBody(displayName: string, filters: PurviewAud
     ipAddressFilters: [...filters.ipAddresses],
     objectIdFilters: [...filters.objectIds],
     administrativeUnitIdFilters: [...filters.administrativeUnitIds],
+    ...(filters.agent ? { keywordFilter: filters.presetId === "copilot_studio_admin" ? filters.agent.botId : filters.agent.applicationId! } : {}),
   };
 }
 
@@ -318,6 +361,7 @@ export function providerQueryMatches(query: PurviewProviderQuery, displayName: s
     && query.filterStartDateTime === expected.filterStartDateTime
     && query.filterEndDateTime === expected.filterEndDateTime
     && query.serviceFilter === expected.serviceFilter
+    && (query.keywordFilter ?? "") === (expected.keywordFilter ?? "")
     && unorderedArraysEqual(query.recordTypeFilters, expected.recordTypeFilters)
     && unorderedArraysEqual(query.operationFilters, expected.operationFilters)
     && unorderedArraysEqual(query.userPrincipalNameFilters, expected.userPrincipalNameFilters)
@@ -331,12 +375,21 @@ function parseDirectQuery(value: unknown, operation: "create" | "get" | "list"):
   if (Object.keys(value).some(key => !queryKeys.has(key))) throw new AppError(502, "provider_schema", "Microsoft Graph returned unknown Audit Search query fields.");
   const status = boundedString(value.status, "status", 64) as PurviewProviderQueryStatus;
   if (!queryStatuses.has(status)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search query status.");
+  if (value.isRecordCountLimitExceeded !== undefined && typeof value.isRecordCountLimitExceeded !== "boolean") {
+    throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search completeness flag.");
+  }
+  const services = value.serviceFilters === undefined ? undefined : responseStringList(value.serviceFilters, "serviceFilters");
+  const service = value.serviceFilter === undefined && services?.length === 1 ? services[0] : boundedString(value.serviceFilter, "serviceFilter", 128);
+  if (services && (services.length !== 1 || services[0] !== service)) {
+    throw new AppError(502, "provider_schema", "Microsoft Graph returned inconsistent Audit Search service filters.");
+  }
+  const keywordFilter = optionalString(value.keywordFilter, 512);
   return {
     id: boundedString(value.id, "id", 512),
     displayName: boundedString(value.displayName, "displayName", 256),
     filterStartDateTime: providerUtcInstant(value.filterStartDateTime, "filterStartDateTime"),
     filterEndDateTime: providerUtcInstant(value.filterEndDateTime, "filterEndDateTime"),
-    serviceFilter: boundedString(value.serviceFilter, "serviceFilter", 128),
+    serviceFilter: service,
     recordTypeFilters: responseStringList(value.recordTypeFilters, "recordTypeFilters"),
     operationFilters: responseStringList(value.operationFilters, "operationFilters", 100),
     userPrincipalNameFilters: responseStringList(value.userPrincipalNameFilters, "userPrincipalNameFilters"),
@@ -344,6 +397,8 @@ function parseDirectQuery(value: unknown, operation: "create" | "get" | "list"):
     objectIdFilters: responseStringList(value.objectIdFilters, "objectIdFilters"),
     administrativeUnitIdFilters: responseStringList(value.administrativeUnitIdFilters, "administrativeUnitIdFilters"),
     status,
+    ...(keywordFilter !== null ? { keywordFilter } : {}),
+    ...(typeof value.isRecordCountLimitExceeded === "boolean" ? { isRecordCountLimitExceeded: value.isRecordCountLimitExceeded } : {}),
   };
 }
 

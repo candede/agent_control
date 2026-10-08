@@ -1,7 +1,8 @@
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import { cancelInventoryRefresh, getInventoryRefreshJob, refreshInventory, resumeInventoryRefresh, type InventoryRefreshJob } from "../api/client";
 import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { useBrowserAvailability } from "../useBrowserAvailability";
 
 export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved, onCancelRequested, paused = false }: {
   jobId: string;
@@ -12,6 +13,7 @@ export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved
   paused?: boolean;
 }) {
   const [initial] = useState(() => initialJob?.id === jobId ? initialJob : undefined);
+  const available = useBrowserAvailability();
   const [job, setJob] = useState(initial);
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -22,6 +24,9 @@ export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved
   const readRequest = useRef<AbortController | undefined>(undefined);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const previousJob = useRef(initial);
+  const lastReadRevision = useRef<number | undefined>(undefined);
+  const commandRevision = useRef(0);
+  const readOwner = useId();
   const observed = useEffectEvent(onObserved);
   const readSaved = useSavedRead();
   const selected = job?.id === jobId ? job : undefined;
@@ -34,23 +39,27 @@ export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved
   }, []);
 
   useEffect(() => {
-    if (paused || error || actionRequest.current) return;
+    if (paused || !available || error || actionRequest.current) return;
+    if (lastReadRevision.current === revision && previousJob.current?.id === jobId && previousJob.current.status !== "running") return;
     // A retry hands off an already-observed response, not a stale saved read.
-    if (revision === 0 && initial) {
+    if (revision === 0 && initial?.id === jobId) {
       if (initial.status === "running") pollTimer.current = setTimeout(() => setRevision(value => value + 1), 2500);
       return () => clearTimeout(pollTimer.current);
     }
     const request = ++generation.current;
     const controller = new AbortController();
     readRequest.current = controller;
-    void readSaved(["power-platform-source-job", jobId, revision], signal =>
+    // A command's readback cannot join a peer's older, still-pending status.
+    const boundary = commandRevision.current ? [readOwner, commandRevision.current] : [];
+    void readSaved(["inventory-refresh-job", jobId, ...boundary], signal =>
       getInventoryRefreshJob(jobId, { signal }), controller.signal).then(result => {
-      if (controller.signal.aborted || generation.current !== request) return;
+      if (controller.signal.aborted || generation.current !== request || document.visibilityState !== "visible" || !navigator.onLine) return;
       if (result.id !== jobId) throw new Error("The source returned a different job. Reload the exact job.");
       setJob(result);
       setError(undefined);
-      observed(result, previousJob.current);
+      observed(result, previousJob.current?.id === jobId ? previousJob.current : undefined);
       previousJob.current = result;
+      lastReadRevision.current = revision;
       if (result.status === "running") pollTimer.current = setTimeout(() => setRevision(value => value + 1), 2500);
     }).catch(caught => {
       if (controller.signal.aborted || generation.current !== request) return;
@@ -58,12 +67,13 @@ export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved
       setError(caught instanceof Error ? caught.message : "Unable to read this source job.");
     });
     return () => { controller.abort(); clearTimeout(pollTimer.current); generation.current += 1; };
-  }, [jobId, revision, paused, error, readSaved, initial]);
+  }, [jobId, revision, paused, available, error, readSaved, initial, readOwner]);
 
   async function act(action: "resume" | "cancel" | "retry") {
     if (!selected || paused || busy || error || actionRequest.current) return;
     if (action === "cancel") onCancelRequested?.();
     generation.current += 1;
+    commandRevision.current += 1;
     readRequest.current?.abort();
     clearTimeout(pollTimer.current);
     const owner = lifetime.current;

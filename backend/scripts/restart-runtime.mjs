@@ -1,6 +1,133 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+
+// This mode is piped only into the exact owned, read-only fresh-installation container.
+if (process.argv[2] === "first-sync") {
+  assert.match(process.env.AGENT_CONTROL_FRESH_FIXTURE ?? "", /^ac-ltdp-install-[a-f0-9]{12}$/);
+  assert.equal(process.env.PGDATABASE, "agentcontrol");
+  assert.equal(process.env.PGUSER, "agentcontrol_app");
+  const { pool } = await import("/app/backend/dist/db/pool.js");
+  const { config } = await import("/app/backend/dist/config.js");
+  const { default: express } = await import("/app/node_modules/express/index.js");
+  const { createInventoryDataRouter } = await import("/app/backend/dist/routes/inventoryData.js");
+  const { PackageRefreshJobs } = await import("/app/backend/dist/db/packageRefreshJobs.js");
+  const { PackageInventoryService } = await import("/app/backend/dist/services/packageInventory.js");
+  const { StreamedInventory } = await import("/app/backend/dist/services/streamedInventory.js");
+  const { GraphPackagesClient } = await import("/app/backend/dist/services/graphPackages.js");
+  const { InventoryRuntime } = await import("/app/backend/dist/services/inventoryRuntime.js");
+  const { DataGenerations } = await import("/app/backend/dist/db/dataGenerations.js");
+  const tenant = config.tenants[0];
+  assert.equal(config.tenants.length, 1);
+  assert.deepEqual(tenant.domains, ["example.invalid"]);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM inventory_roots")).rows[0].count, 0);
+  const user = { tenantId: tenant.tenantId, homeAccountId: "fresh-installation-reader",
+    displayName: "Synthetic first collection", username: "fixture@example.invalid", roles: ["AgentControl.Viewer"] };
+  const scope = { tenantId: user.tenantId, principalId: user.homeAccountId };
+  const runtime = new InventoryRuntime(pool, async () => {});
+  let providerCalls = 0;
+  const records = Array.from({ length: 1001 }, (_, index) => ({
+    id: `fresh-${index}`, displayName: `Fresh ${String(index).padStart(4, "0")}`, isBlocked: false,
+  }));
+  const provider = new GraphPackagesClient(async input => {
+    const url = new URL(String(input));
+    assert.equal(url.origin, "https://graph.microsoft.com");
+    assert.ok(url.pathname.endsWith("/packages"));
+    providerCalls++;
+    return Response.json({ value: records, "@odata.count": records.length });
+  }, { minimumReadIntervalMs: 0, maxAttempts: 1 });
+  const jobs = new PackageRefreshJobs(pool);
+  const service = new PackageInventoryService(jobs, {
+    observeOperation: async (_capability, _user, operation) => operation(() => {}),
+    delegatedToken: async () => "synthetic-first-collection", revalidateUser: async () => user,
+    requireAvailable: async () => {}, applicationPrincipalId: () => undefined,
+    applicationToken: async () => { throw new Error("Unexpected application authentication"); },
+    requireApplicationDataScope: async () => { throw new Error("Unexpected application scope"); },
+    streams: database => new StreamedInventory(database, provider), wait: async () => {},
+  });
+  const app = express();
+  app.use(express.json());
+  app.use((request, _response, next) => {
+    request.session = { user, tenantId: user.tenantId, accountId: user.homeAccountId, clientId: tenant.clientId,
+      rolesValidatedAt: Date.now(), csrfToken: "synthetic-first-sync-csrf", destroy: callback => callback() };
+    next();
+  });
+  app.use("/api", createInventoryDataRouter(pool));
+  app.use((error, _request, response, _next) => response.status(error.status ?? 500).json({ code: error.code }));
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise(resolve => server.once("listening", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const capture = async expected => {
+    const response = await fetch(`${origin}/api/agent-inventory/selections`, { method: "POST",
+      headers: { "content-type": "application/json", "x-csrf-token": "synthetic-first-sync-csrf" },
+      body: JSON.stringify({ query: {} }), signal: AbortSignal.timeout(15_000) });
+    assert.equal(response.status, expected === "complete" ? 201 : 200);
+    const result = await response.json();
+    if (expected !== "complete") assert.equal(result.state, expected);
+    return result;
+  };
+  try {
+    const started = performance.now();
+    assert.equal((await fetch("http://127.0.0.1:3001/api/ready")).status, 200);
+    const html = await (await fetch("http://127.0.0.1:3001/")).text();
+    const entry = html.match(/src="(\/assets\/index-[^"]+\.js)"/)?.[1];
+    assert.ok(entry);
+    const served = Buffer.from(await (await fetch(`http://127.0.0.1:3001${entry}`)).arrayBuffer());
+    assert.deepEqual(served, readFileSync(`/app/frontend/dist${entry}`));
+    await capture("not_collected");
+    const job = await service.submit(user, { tokenMode: "delegated", idempotencyKey: randomUUID() });
+    await service.start(user, job.id, "delegated");
+    const deadline = Date.now() + 90_000;
+    let status;
+    do {
+      status = await jobs.getJob(scope, job.id);
+      if (["succeeded", "failed", "cancelled"].includes(status.status)) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+    assert.equal(status.status, "succeeded", JSON.stringify(status));
+    assert.equal(status.totalRecords, records.length);
+    assert.equal(providerCalls, 1);
+    await runtime.enqueue(scope, false);
+    await capture("preparing");
+    const canonical = await runtime.reconciliation.runNext({
+      scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_canonical", selector: "complete" },
+      schemaVersion: 1, sessionEpoch: await new DataGenerations(pool).sessionEpoch(scope.tenantId, scope.principalId),
+      jobId: randomUUID(), jobKind: "derived", observedAt: new Date(), expiresAt: new Date(Date.now() + 86_400_000),
+      deadlineAt: new Date(Date.now() + 1_799_000), reserveBytes: 1024 ** 3,
+    }, async () => {});
+    assert.ok(canonical);
+    const selections = [];
+    let maximumPageBytes = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const selection = await capture("complete");
+      selections.push(selection.id);
+      const response = await fetch(`${origin}/api/agent-inventory?selectionId=${selection.id}&limit=50`,
+        { signal: AbortSignal.timeout(15_000) });
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      maximumPageBytes = Math.max(maximumPageBytes, Buffer.byteLength(text));
+      assert.ok(maximumPageBytes <= 1_048_576);
+      const page = JSON.parse(text);
+      assert.equal(page.counts.total, records.length);
+      assert.equal(page.value.length, 50);
+    }
+    assert.equal(new Set(selections).size, 3);
+    assert.equal((await pool.query("SELECT count(*)::int AS count FROM data_read_selections WHERE id=ANY($1::uuid[])",
+      [selections])).rows[0].count, 3);
+    assert.equal((await fetch("http://127.0.0.1:3001/api/ready")).status, 200);
+    console.log(JSON.stringify({ event: "fresh_runtime_first_sync", outcome: "passed",
+      states: ["not_collected", "preparing", "complete"], rows: records.length, providerCalls,
+      freshCaptures: 3, maximumPageBytes, durationMs: performance.now() - started,
+      bundle: { entry, bytes: served.length, sha256: createHash("sha256").update(served).digest("hex") },
+      authentication: "synthetic standalone loopback router; real compiled policy and selected-read handlers",
+      runtimeRole: "agentcontrol_app", maxRssKiB: process.resourceUsage().maxRSS }));
+  } finally {
+    await service.drain();
+    await new Promise(resolve => server.close(resolve));
+    await pool.end();
+  }
+  process.exit(0);
+}
 
 const receipt=JSON.parse(readFileSync(process.argv[3] ?? "/evidence/restart-fixture.json","utf8"));
 assert.ok(["crash","crash-quarantine","crash-canary","crash-bulk","recover"].includes(process.argv[2]));
@@ -13,7 +140,7 @@ const { PowerPlatformRefreshJobs }=await import("/app/backend/dist/db/powerPlatf
 const { PackageRefreshJobs }=await import("/app/backend/dist/db/packageRefreshJobs.js");
 const { StreamedInventory }=await import("/app/backend/dist/services/streamedInventory.js");
 const { LargeTenantUsersReports }=await import("/app/backend/dist/services/largeTenantUsersReports.js");
-const { officialReportFingerprint }=await import("/app/backend/dist/services/officialReportFingerprint.js");
+const { officialReportFingerprint }=await import("/app/backend/scripts/officialReportFingerprint.ts");
 const { reportIdentity }=await import("/app/backend/dist/services/reportIdentity.js");
 const { reportRuntime }=await import("/app/backend/dist/services/reportExportDispatcher.js");
 const { OfficialReportExports }=await import("/app/backend/dist/services/officialReportExports.js");

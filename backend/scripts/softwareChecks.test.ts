@@ -90,7 +90,7 @@ describe("isolated aggregate software qualification", () => {
     const deadline = /Invoke-OwnedFixtureWorkload[^\n]+backend\/scripts\/test-all\.ts[^\n]+-TimeoutSeconds (\d+)/.exec(script);
     expect(deadline).not.toBeNull();
     const combinedBudget = mocks.spawnSync.mock.calls.reduce((total, call) => total + call[2].timeout, 0);
-    expect(combinedBudget).toBe(1_740_000);
+    expect(combinedBudget).toBe(1_860_000);
     expect(Number(deadline?.[1]) * 1_000).toBeGreaterThanOrEqual(combinedBudget + 120_000);
   });
 
@@ -109,7 +109,7 @@ describe("isolated aggregate software qualification", () => {
     }));
     for (const [index, call] of mocks.spawnSync.mock.calls.entries()) {
       expect(call[2]).toMatchObject({
-        stdio: "inherit", timeout: index === 2 ? 1_200_000 : 180_000, env: { ...fixtureEnvironment, PGDATABASE: name,
+        stdio: "inherit", timeout: index === 2 ? 1_200_000 : index === 3 ? 300_000 : 180_000, env: { ...fixtureEnvironment, PGDATABASE: name,
           NODE_OPTIONS: "--max-old-space-size=768", DEBUG_PRINT_LIMIT: "1200",
           NPM_CONFIG_REGISTRY: "https://packagefeedproxy.microsoft.io/npm/" },
       });
@@ -168,7 +168,7 @@ describe("isolated aggregate software qualification", () => {
     { index: 0, seconds: 180 },
     { index: 1, seconds: 180 },
     { index: 2, seconds: 1_200 },
-    { index: 3, seconds: 180 },
+    { index: 3, seconds: 300 },
   ])("fails closed at step $index with its exact $seconds-second budget", async ({ index, seconds }) => {
     const error = Object.assign(new Error("spawn npm ETIMEDOUT"), { code: "ETIMEDOUT" });
     for (let prior = 0; prior < index; prior += 1) mocks.spawnSync.mockReturnValueOnce(result());

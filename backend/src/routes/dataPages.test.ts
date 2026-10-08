@@ -211,7 +211,8 @@ describe("users/report route-to-client boundary", () => {
     const next = await api(`/official-usage/users${reportQueryString({ limit: 1, cursor: page.page.nextCursor! })}`);
     const continued = await next.json() as ReportPage<ReportUser>;
     expect(next.status).toBe(200);
-    expect(continued.selection).toEqual(page.selection);
+    expect(Date.parse(continued.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(page.selection.validatedAt));
+    expect(continued.selection).toEqual({ ...page.selection, validatedAt: continued.selection.validatedAt });
     expect(continued.value.map(row => row.reportedResponses)).toEqual([4]);
     expect(continued.page.nextCursor).toBeNull();
     expect(JSON.stringify(continued).length).toBeLessThan(1048576);
@@ -304,7 +305,9 @@ describe("users/report route-to-client boundary", () => {
     expect(options.status).toBe(200);
     const lightweight = await options.json();
     expect(Object.keys(lightweight).sort()).toEqual(["counts", "page", "reports", "selection", "value"]);
-    expect(lightweight).toEqual({ value: first.value, page: first.page, counts: first.counts, selection: first.selection, reports: first.reports });
+    expect(Date.parse(lightweight.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(first.selection.validatedAt));
+    expect(lightweight).toEqual({ value: first.value, page: first.page, counts: first.counts,
+      selection: { ...first.selection, validatedAt: lightweight.selection.validatedAt }, reports: first.reports });
     expect(first.counts.total).toBe(33);
     const pins = (await fixture.runtime.query("SELECT root_kind FROM data_generation_pins WHERE selection_id=$1", [first.selection.id])).rows;
     expect(pins.filter(pin => pin.root_kind === "tenant_history")).toHaveLength(1); expect(pins.length).toBeLessThanOrEqual(16);
@@ -314,7 +317,8 @@ describe("users/report route-to-client boundary", () => {
       const next = await api(`/official-usage/history/options${reportQueryString({ limit: 5, cursor })}`);
       expect(next.status, await next.clone().text()).toBe(200);
       const page = await next.json() as ReportPage<ReportHistorySet>;
-      expect(page.selection).toEqual(first.selection); expect(page.counts.total).toBe(33);
+      expect(Date.parse(page.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(first.selection.validatedAt));
+      expect(page.selection).toEqual({ ...first.selection, validatedAt: page.selection.validatedAt }); expect(page.counts.total).toBe(33);
       for (const row of page.value) { expect(ids.has(row.id)).toBe(false); ids.add(row.id); }
       expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1048576); cursor = page.page.nextCursor;
     }

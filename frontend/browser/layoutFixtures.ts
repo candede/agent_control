@@ -56,7 +56,8 @@ const packages: PackagePage = {
     createdDateTime: "2026-08-01T00:00:00.000Z", lastModifiedDateTime: observedAt,
   })),
   counts: { total: 3, scoped: 3, filtered: 3 },
-  selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1", evaluatedAt: observedAt, expiresAt },
+  selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1", evaluatedAt: observedAt, expiresAt,
+    validatedAt: observedAt, publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
   page: { limit: 50, nextCursor: null, previousCursor: null },
   freshness: { state: "current", capturedRevision: "1", sources: [] },
   mode: "delegated",
@@ -72,7 +73,7 @@ const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, 
 export const unifiedAgents: UnifiedAgentInventoryPage = {
   ...inventoryPageMetadata({ total: 3, scoped: 3, filtered: 3, packageTargets: 3 }, expiresAt),
   inventoryScope: "catalog", scopeSummary: agentSummary,
-  selection: { id: "33333333-3333-4333-8333-333333333333", revision: "1", evaluatedAt: observedAt, expiresAt },
+  selection: { ...packages.selection, id: "33333333-3333-4333-8333-333333333333" },
   page: { limit: 50, nextCursor: null, previousCursor: null },
   counts: { total: 3, scoped: 3, filtered: 3, packageTargets: 3 },
   verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 0, logicalAgentCount: 3 }, { sourceScopes: false }, layoutTime),
@@ -187,7 +188,7 @@ const auditEvents: AuditEvent[] = packageNames.slice(0, 2).map((agentDisplayName
   message: index ? "Provider temporarily unavailable; saved evidence remains readable." : "Package block state verified.",
 }));
 
-const purviewJob: PurviewAuditJob = {
+export const purviewJob: PurviewAuditJob = {
   id: "77777777-7777-4777-8777-777777777777", authorizationPrincipalId: actor.homeAccountId,
   resultScope: { kind: "principal", scopeId: actor.homeAccountId, configurationRevision: null },
   tokenMode: "delegated", status: "succeeded",
@@ -285,6 +286,8 @@ const jobs: WorkbenchJobsResponse = {
 };
 
 export async function mockLayoutApi(page: Page) {
+  // The network-isolated runner serves reachable synthetic API routes.
+  await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { get: () => true }));
   const unexpectedRequests: string[] = [];
   await page.context().route(url => !isLocalFixtureUrl(url), route => {
     unexpectedRequests.push(`External request: ${route.request().url()}`);
@@ -307,7 +310,7 @@ export async function mockLayoutApi(page: Page) {
     "/api/agent-inventory/investigations/context": {
       recordId: unifiedAgents.value[0].id, displayName: unifiedAgents.value[0].displayName,
       defender: { status: "available", entraAgentIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
-      purview: { status: "unavailable", mode: "saved_only", reason: "No exact saved audit bot identity." },
+      purview: { status: "unavailable", mode: "search", presets: [], reason: "No exact saved audit bot identity." },
     },
     "/api/data-sync/state": {
       onboardingRequired: false, usageImportRequired: false, run: null,
@@ -316,6 +319,8 @@ export async function mockLayoutApi(page: Page) {
         jobId: null, message: "", canRetry: false,
       })),
     },
+    "/api/data-sync/auto-refresh": { run: null, detailJob: null,
+      revisions: unifiedAgents.selection.publicationRevisions, nextCheckAt: "2030-01-01T00:00:00.000Z" },
     "/api/agents/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/inventory/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/quarantine/jobs": { value: [] },
@@ -460,7 +465,7 @@ export async function mockLayoutApi(page: Page) {
         : { ...directory, value: [...directory.value, ...unpaidPeople] });
       if (read) return route.fulfill({ json: read });
     }
-    if ((method === "GET" || (method === "POST" && path === "/api/capabilities/check")) && path in responses) {
+    if ((method === "GET" || (method === "POST" && ["/api/capabilities/check", "/api/data-sync/auto-refresh"].includes(path))) && path in responses) {
       return route.fulfill({ json: responses[path] });
     }
     return unexpectedRequest(route);

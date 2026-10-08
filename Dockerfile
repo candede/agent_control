@@ -25,6 +25,7 @@ COPY --from=application-source /app/frontend/src frontend/src
 COPY backend/tsconfig.json backend/tsconfig.json
 COPY frontend/public frontend/public
 COPY frontend/index.html frontend/vite.config.ts frontend/tsconfig.app.json frontend/tsconfig.node.json frontend/tsconfig.build.json frontend/
+COPY frontend/tsconfig.build.json frontend/tsconfig.json
 RUN npm run build
 
 FROM dependencies AS test

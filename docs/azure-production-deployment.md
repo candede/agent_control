@@ -29,12 +29,18 @@ https://<app-host>/api/auth/callback
 
 ## Prepare Key Vault
 
-The prepared vault must contain versioned secrets for:
+The prepared vault must contain these exact versioned secret names:
 
-- the tenant registry;
-- the application session secret;
-- the operator database password;
-- the runtime database password.
+| Secret name | Consumer |
+| --- | --- |
+| `agent-control-tenants-json` | Application tenant registry |
+| `agent-control-session-secret` | Application sessions |
+| `agent-control-postgres-admin-password` | Database operator only |
+| `agent-control-postgres-app-password` | Application database role |
+
+Only the three rows other than `agent-control-postgres-admin-password` are
+provided to the application runtime. The operator password must never appear
+in its environment or runtime secret references.
 
 The tenant registry contains the tenant ID, client ID, client secret, accepted
 domains, and optional display name for every tenant. Keep secret values out of

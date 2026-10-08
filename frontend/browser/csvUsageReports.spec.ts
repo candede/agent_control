@@ -2,10 +2,12 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 import { fixtureLoginUrl, isExternalFixtureRequest } from "./permissionFixtures";
 import { mockAutomaticRefresh } from "./automaticRefreshFixtures";
+import { completedState } from "./dataSyncFixtures";
 import { csvFilePayloads } from "./usageCsvFixture";
 import type { OfficialReportAccepted } from "../../backend/src/types/officialReportApi";
+import type { DataSyncState } from "../src/api/client";
 
-async function uploadBundle(page: Page, dates: [string, string, string], identity: string, selectImported = false) {
+async function uploadBundle(page: Page, dates: [string, string, string], identity: string) {
   const section = page.getByRole("region", { name: "CSV usage reports", exact: true });
   await section.getByRole("button", { name: "Add CSV reports" }).click();
   const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
@@ -31,20 +33,13 @@ async function uploadBundle(page: Page, dates: [string, string, string], identit
   const result: OfficialReportAccepted = await response.json();
   expect(Object.keys(result).sort()).toEqual(["activeRevision", "complete", "setId"]);
   expect(result.complete).toBe(true);
-  if (selectImported) {
-    await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
-    await modal.getByRole("button", { name: "Use imported reports", exact: true }).click();
-    await modal.getByRole("button", { name: "Confirm use of imported reports", exact: true }).click();
-  }
   await expect(modal.getByRole("heading", { name: "Reports imported", exact: true })).toBeVisible();
-  await expect(modal.getByRole("status")).toContainText("Your report set is ready in Agents.");
+  await expect(modal.getByRole("status")).toContainText("Your report set has been saved.");
   await expect(modal.getByLabel("Imported CSV summary").locator("dd")).toHaveText(["1", "1", "7"]);
-  await expect(modal.getByRole("button")).toHaveText(["OK"]);
-  await modal.getByRole("button", { name: "OK", exact: true }).click();
-  await expect(page).toHaveURL(/\/agents$/);
+  await expect(modal.getByRole("button")).toHaveText(["Add more reports", "Close"]);
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page).toHaveURL(/\/sync$/);
   await expect(modal).toBeHidden();
-  await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(result.setId);
-  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   return result.setId;
 }
 
@@ -67,6 +62,16 @@ test("CSV section reflects retained observed activity dates across history after
   test.setTimeout(45_000);
   await context.route(isExternalFixtureRequest, route => route.abort());
   await mockAutomaticRefresh(page);
+  // Keep unrelated first-sync onboarding out of this real report API workflow.
+  await page.route("**/api/data-sync/state", async route => {
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    const state: DataSyncState = await response.json();
+    const completed = completedState();
+    await route.fulfill({ response, json: { ...state, onboardingRequired: completed.onboardingRequired,
+      sources: completed.sources.map(source => source.source === "usage_reports"
+        ? state.sources.find(saved => saved.source === source.source)! : source) } });
+  });
   // Official history is tenant-owned, so each viewport needs its own synthetic tenant, not merely a different actor.
   await page.goto(fixtureLoginUrl("available", `fixture@csv-${info.project.name}.example.invalid`));
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
@@ -92,16 +97,20 @@ test("CSV section reflects retained observed activity dates across history after
   await page.reload();
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();
-  const repeated = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name, true);
+  const navigation = page.getByRole("navigation", { name: "Primary views" });
+  await navigation.getByRole("button", { name: "Agents", exact: true }).click();
+  const selector = page.getByRole("region", { name: "Report set selection" });
+  await expect(selector.getByRole("combobox")).toHaveValue("");
+  await selector.getByRole("combobox").selectOption(second);
+  await expect(selector.getByRole("combobox")).toBeEnabled();
+  await expect(selector.getByRole("combobox")).toHaveValue(second);
+  await navigation.getByRole("button", { name: /^Sync/ }).click();
+  const repeated = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name);
   expect(repeated).toBe(first);
   await expect(reports.getByRole("heading", { name: "2 saved report sets", exact: true })).toBeVisible();
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();
-  const navigation = page.getByRole("navigation", { name: "Primary views" });
   await navigation.getByRole("button", { name: "Agents", exact: true }).click();
-  const selector = page.getByRole("region", { name: "Report set selection" });
-  await expect(selector.getByRole("combobox")).toHaveValue(first);
-  await selector.getByRole("combobox").selectOption(second);
   await expect(selector.getByRole("combobox")).toHaveValue(second);
   await selector.getByRole("combobox").selectOption(first);
   await expect(selector.getByRole("combobox")).toBeEnabled();

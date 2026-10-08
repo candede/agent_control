@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from "vitest";
 import type { BulkJobStatus } from "./api/client";
 import { isJobPolling, isKnownJobStatus, jobStatusMessage } from "./jobStatus";

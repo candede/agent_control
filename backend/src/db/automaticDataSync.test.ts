@@ -45,6 +45,7 @@ async function complete(scope: DataSyncScope, run: DataSyncRun) {
 describe("session-driven automatic sync admission", () => {
   it("atomically deduplicates across independent callers and does not request manual reports", async () => {
     const scope = owner();
+    const publication = await repository.automaticRevisions(scope);
     const [left, right] = await Promise.all([
       repository.submitDue(scope), new DataSyncRepository(fixture.runtime).submitDue(scope),
     ]);
@@ -52,9 +53,17 @@ describe("session-driven automatic sync admission", () => {
     expect([left.created, right.created].sort()).toEqual([false, true]);
     expect(left.run).toMatchObject({ automatic: true, mode: "incremental" });
     expect(left.run?.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_sync_runs
+      WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(1);
+    await repository.updateSource(scope, left.run!.id, "graph_packages",
+      { status: "running", count: 123, message: "Synthetic progressing source.", canRetry: false });
+    expect(await repository.automaticRevisions(scope)).toEqual(publication);
     expect(await repository.getRun(owner(), left.run!.id)).toBeUndefined();
     await complete(scope, left.run!);
+    expect(await repository.automaticRevisions(scope)).toEqual(publication);
     expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: left.run!.id } });
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_sync_runs
+      WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(1);
   });
 
   function directoryUser(objectId: string, displayName = "Directory person"): CopilotDirectoryUser {
@@ -75,7 +84,7 @@ describe("session-driven automatic sync admission", () => {
   }
 
   describe("persisted automatic revision boundaries", () => {
-    it("separates package, detail, native ownership and people publications/expiry from the Users license/activity response", async () => {
+    it("separates persisted inventory and people publications from freshness and the Users response", async () => {
       const scope = owner();
       const personId = randomUUID();
       const observedAt = new Date(Date.now() - 60_000).toISOString();
@@ -134,18 +143,18 @@ describe("session-driven automatic sync admission", () => {
         objectId: personId, status: "resolved", displayName: "Exact owner name",
         userPrincipalName: "owner@example.invalid", checkedAt: observedAt,
       }], { generation: await people.generation(scope) });
-      await onlyChanged("power_platform");
+      await onlyChanged("power_platform", true);
       const savedPeople = new SavedAgentPeopleService(fixture.runtime);
       expect((await savedPeople.read(scope, [personId])).get(personId)?.displayName).toBe("Exact owner name");
 
-      for (const [expiry, source] of [[packageExpiry, "graph_packages"], [nativeExpiry, "power_platform"]] as const) {
+      for (const expiry of [packageExpiry, nativeExpiry]) {
         await new Promise(resolve => setTimeout(resolve, Math.max(0, expiry.getTime() - Date.now()) + 20));
-        await onlyChanged(source);
         expect(await repository.automaticRevisions(scope)).toEqual(previous);
+        expect(await readUsers()).toEqual(users);
       }
       await fixture.operator.query(`UPDATE agent_people_cache SET expires_at=clock_timestamp()-interval '1 second'
         WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId]);
-      await onlyChanged("power_platform");
+      await onlyChanged("power_platform", true);
       expect((await savedPeople.read(scope, [personId])).get(personId)?.displayName).toBe("Directory person");
     });
 
@@ -164,7 +173,7 @@ describe("session-driven automatic sync admission", () => {
       expect(await new DataSyncRepository(fixture.runtime).automaticRevisions(scope)).toEqual(ready);
     });
 
-    it.each(["directory", "app_activity"] as const)("tracks %s publication, retained failure, recovery and expiry", async source => {
+    it.each(["directory", "app_activity"] as const)("tracks %s publication but not retained failure or freshness expiry", async source => {
       const scope = owner();
       const observedAt = new Date().toISOString();
       const person = directoryUser(randomUUID());
@@ -176,12 +185,13 @@ describe("session-driven automatic sync admission", () => {
       await publish();
       const before = await repository.automaticRevisions(scope);
       expect(before.users).not.toBe(empty.users);
-      expect(before.graph_packages).toBe(empty.graph_packages);
-      if (source === "directory") expect(before.power_platform).not.toBe(empty.power_platform);
-      else expect(before.power_platform).toBe(empty.power_platform);
+      for (const key of ["graph_packages", "power_platform"] as const) {
+        if (source === "directory") expect(before[key]).not.toBe(empty[key]);
+        else expect(before[key]).toBe(empty[key]);
+      }
       await failure(scope, source);
       const failed = await repository.automaticRevisions(scope);
-      expect(failed.users).not.toBe(before.users);
+      expect(failed.users).toBe(before.users);
       expect(failed.graph_packages).toBe(before.graph_packages);
       expect(failed.power_platform).toBe(before.power_platform);
       const readUsers = savedUsers(scope);
@@ -194,21 +204,19 @@ describe("session-driven automatic sync admission", () => {
       await publish();
       const recovered = await repository.automaticRevisions(scope);
       expect(recovered.users).not.toBe(failed.users);
-      expect(recovered.graph_packages).toBe(failed.graph_packages);
-      if (source === "directory") expect(recovered.power_platform).not.toBe(failed.power_platform);
-      else expect(recovered.power_platform).toBe(failed.power_platform);
+      for (const key of ["graph_packages", "power_platform"] as const) {
+        if (source === "directory") expect(recovered[key]).not.toBe(failed[key]);
+        else expect(recovered[key]).toBe(failed[key]);
+      }
       if (source === "directory") expect((await readUsers()).value[0].directory.displayName).toBe("Renamed directory person");
       await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt!.getTime() - Date.now() + 20)));
       const expired = await repository.automaticRevisions(scope);
-      expect(expired.users).not.toBe(recovered.users);
-      expect(expired.graph_packages).toBe(recovered.graph_packages);
-      if (source === "directory") expect(expired.power_platform).not.toBe(recovered.power_platform);
-      else expect(expired.power_platform).toBe(recovered.power_platform);
-      expect((await readUsers()).sources[source]).toMatchObject({ state: "unavailable" });
+      expect(expired).toEqual(recovered);
+      expect((await readUsers()).sources[source]).toMatchObject({ state: "stale" });
       expect(await repository.automaticRevisions(scope)).toEqual(expired);
     });
 
-    it("ignores other scopes and unlinked snapshots, but detects source status without any retained data", async () => {
+    it("ignores other scopes, failed attempts and unlinked snapshots but detects actual retirement", async () => {
       const scope = owner();
       const before = await repository.automaticRevisions(scope);
       const other = await publishFixtureDirectory(fixture.runtime, identity({ ...scope, principalId: "another-reader" }), []);
@@ -217,7 +225,7 @@ describe("session-driven automatic sync admission", () => {
 
       await failure(scope, "directory", true);
       const failed = await repository.automaticRevisions(scope);
-      expect(failed.users).not.toBe(before.users);
+      expect(failed.users).toBe(before.users);
       expect(failed.graph_packages).toBe(before.graph_packages);
       expect(failed.power_platform).toBe(before.power_platform);
       await expect(fixture.operator.query(`UPDATE data_generation_heads head SET generation_id=$3

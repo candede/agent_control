@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { AppRole, SessionUser } from "./api/client";
 import { allowedViews, hasRole } from "./authorization";

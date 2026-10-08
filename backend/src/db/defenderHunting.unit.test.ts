@@ -49,6 +49,20 @@ function projectedClient(selected: DefenderHuntingFilters, overrides: Record<str
 }
 
 describe("Defender publication transaction without a database", () => {
+  it("requires the invocation's human caller even when the account-object column matches", async () => {
+    const human = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const selected: DefenderHuntingFilters = { ...filters, templateId: "agent_activity", operations: ["InvokeAgent"], userObjectId: human };
+    const f = fixture();
+    f.row.filters = selected;
+    const unrelated = await projectedClient(selected, { AccountObjectId: human, HumanUserKey: id, HumanUserKeyState: "value" })
+      .runQuery("fixture-token", { ...selected, userObjectId: undefined });
+    await expect(f.repository.publish(scope, id, execution, unrelated)).rejects.toMatchObject({ code: "invalid_hunting_publication" });
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+    const matching = await projectedClient(selected, { AccountObjectId: id, HumanUserKey: human, HumanUserKeyState: "value" })
+      .runQuery("fixture-token", selected);
+    await f.repository.publish(scope, id, execution, matching);
+    expect(f.query).toHaveBeenCalledWith("COMMIT");
+  });
   it.each([
     ["agents_inventory", "blueprintIds", "EntraBlueprintId"],
     ["agent_activity", "blueprintIds", "TargetAgentBlueprintId"],

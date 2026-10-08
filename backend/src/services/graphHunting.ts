@@ -152,7 +152,7 @@ export class GraphHuntingClient {
 
 export function validateDefenderHuntingFilters(value: unknown, options: { now?: Date; qualification?: boolean } = {}): DefenderHuntingFilters {
   if (!isObject(value)) throw new AppError(400, "invalid_hunting_filters", "Hunting filters must be a structured object.");
-  const allowedKeys = new Set(["templateId", "startDateTime", "endDateTime", "agentIds", "entraAgentIds", "entraAgentApplicationIds", "blueprintIds", "actorObjectIds", "operations"]);
+  const allowedKeys = new Set(["templateId", "startDateTime", "endDateTime", "agentIds", "entraAgentIds", "entraAgentApplicationIds", "blueprintIds", "actorObjectIds", "userObjectId", "operations"]);
   if (Object.keys(value).some(key => !allowedKeys.has(key))) throw new AppError(400, "invalid_hunting_filters", "Hunting filters contain an unsupported field.");
   if (typeof value.templateId !== "string" || !defenderHuntingTemplateIds.includes(value.templateId as DefenderHuntingTemplateId)) {
     throw new AppError(400, "invalid_hunting_filters", "Select a supported code-owned hunting template.");
@@ -174,6 +174,10 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
   }
   const actorObjectIds = stringList(value.actorObjectIds, "actorObjectIds", uuid, 128);
   if (templateId === "agents_inventory" && actorObjectIds.length) throw new AppError(400, "invalid_hunting_filters", "Actor filters are not available for the inventory template.");
+  if (value.userObjectId !== undefined && (typeof value.userObjectId !== "string" || !uuid(value.userObjectId)
+    || templateId !== "agent_activity" || operations.length !== 1 || operations[0] !== "InvokeAgent")) {
+    throw new AppError(400, "invalid_hunting_filters", "User investigations require an exact directory user and the human-attributed agent invocation operation.");
+  }
   const filters: DefenderHuntingFilters = {
     templateId,
     startDateTime,
@@ -183,6 +187,7 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
     ...(value.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...new Set(stringList(value.entraAgentApplicationIds, "entraAgentApplicationIds", uuid, 128).map(id => id.toLowerCase()))].sort() } : {}),
     blueprintIds: stringList(value.blueprintIds, "blueprintIds", () => true),
     actorObjectIds,
+    ...(typeof value.userObjectId === "string" ? { userObjectId: value.userObjectId.toLowerCase() } : {}),
     operations,
   };
   validateEntraNamespace(filters);
@@ -259,6 +264,7 @@ function activityQuery(filters: DefenderHuntingFilters) {
     anyInPredicate(["tolower(tostring(Event.TargetAgentId))", "tolower(tostring(Event.AgentId))"], filters.entraAgentApplicationIds ?? []),
     anyInPredicate(["tostring(Event.TargetAgentBlueprintID)", "tostring(Event.AgentBlueprintId)"], filters.blueprintIds, true),
     inPredicate("AccountObjectId", filters.actorObjectIds, true),
+    inPredicate("tostring(Event.UserKey)", filters.userObjectId ? [filters.userObjectId] : [], true),
   ].filter(Boolean);
   return [
     "CloudAppEvents",
@@ -455,7 +461,8 @@ function validateReturnedRow(row: DefenderHuntingRow, filters: DefenderHuntingFi
     || filters.agentIds.length && !agentIds.some(value => filters.agentIds.includes(value))
     || filters.entraAgentApplicationIds?.length && ![row.targetAgentId, row.agentId].some(value => value && filters.entraAgentApplicationIds!.includes(value.toLowerCase()))
     || selectedBlueprintIds.length && !blueprintIds.some(value => selectedBlueprintIds.includes(value))
-    || filters.actorObjectIds.length && !filters.actorObjectIds.some(value => value.toLowerCase() === row.actorAccountObjectId)) throw scopeMismatch();
+    || filters.actorObjectIds.length && !filters.actorObjectIds.some(value => value.toLowerCase() === row.actorAccountObjectId)
+    || filters.userObjectId && (row.actionType !== "InvokeAgent" || row.humanActorUserObjectId !== filters.userObjectId)) throw scopeMismatch();
 }
 
 function scopeMismatch() {

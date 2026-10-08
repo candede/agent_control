@@ -221,9 +221,15 @@ describe("paid-feature evidence details", () => {
     else vi.mocked(readReportPage).mockResolvedValue({ ...first, selection: { ...first.selection,
       ...(failure === "mismatched selection" ? { id: "20000000-0000-4000-8000-000000000003" } : { expiresAt: new Date(Date.now() - 1000).toISOString() }) } });
     render(<CopilotServiceDetails path={path} selectionId={selectionId} copilotServiceState="disabled" current onRestartSelection={onRestartSelection} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("This selection changed or expired.");
+    expect(await screen.findByRole("alert")).toHaveTextContent(failure === "expired selection"
+      ? "incomplete or inconsistent saved-read metadata" : "This selection changed or expired.");
     expect(screen.queryByRole("list", { name: "Paid feature states" })).not.toBeInTheDocument();
     expect(screen.queryByText("No paid Copilot services are assigned.")).not.toBeInTheDocument();
+    if (failure === "expired selection") {
+      expect(readReportPage).toHaveBeenCalledOnce();
+      expect(onRestartSelection).not.toHaveBeenCalled();
+      return;
+    }
     expect(screen.queryByRole("button", { name: "Retry saved data" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     expect(onRestartSelection).toHaveBeenCalledOnce();

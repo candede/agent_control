@@ -10,12 +10,12 @@ vi.mock("./api/client", async importOriginal => ({
 }));
 
 const check = vi.mocked(checkAutomaticRefresh);
-const sources = ["users", "graph_packages", "power_platform"];
+const revisions = { users: "3".repeat(64), graph_packages: "1".repeat(64), power_platform: "2".repeat(64) };
 function response(overrides: Partial<AutomaticRefreshResult> = {}): AutomaticRefreshResult {
   return {
     run: null,
     detailJob: null,
-    revisions: { users: "users-1", graph_packages: "packages-1", power_platform: "pp-1" },
+    revisions,
     nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
     ...overrides,
   };
@@ -73,6 +73,109 @@ afterEach(() => {
 });
 
 describe("automatic saved-data refresh", () => {
+  it.each(["active", "idle"] as const)("bounds a 45-minute %s session without manufacturing a publication", async mode => {
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    act(() => hook.result.current.admitPublication(revisions));
+    if (mode === "idle") await visible(false);
+    for (let minute = 0; minute < 45; minute++) {
+      await advance(60_000);
+      expect(props.onSourcesChanged).not.toHaveBeenCalled();
+      expect(check).toHaveBeenCalledTimes(mode === "idle" ? 1 : minute + 2);
+    }
+    if (mode === "idle") {
+      await visible(true);
+      expect(check).toHaveBeenCalledTimes(2);
+      await advance(59_999);
+      expect(check).toHaveBeenCalledTimes(2);
+      await advance(1);
+      expect(check).toHaveBeenCalledTimes(3);
+    }
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+  });
+
+  it.each(["page-first", "observer-first"] as const)("handshakes %s without a no-change startup reread", async order => {
+    const pending = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(pending.promise);
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    if (order === "page-first") act(() => hook.result.current.admitPublication(revisions));
+    await act(async () => pending.resolve(response()));
+    if (order === "observer-first") act(() => hook.result.current.admitPublication(revisions));
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    await advance(60_000);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+  });
+
+  it.each(["page-first", "observer-first"] as const)("synchronizes one racing publication %s and retains acknowledgement across frozen rereads", async order => {
+    const pending = deferred<AutomaticRefreshResult>();
+    const published = { ...revisions, graph_packages: "4".repeat(64) };
+    check.mockReturnValueOnce(pending.promise).mockImplementation(async () => response({ revisions: published }));
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    if (order === "page-first") act(() => hook.result.current.admitPublication(revisions));
+    await act(async () => pending.resolve(response({ revisions: published })));
+    if (order === "observer-first") act(() => hook.result.current.admitPublication(revisions));
+    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(["graph_packages"]);
+    act(() => hook.result.current.admitPublication(revisions));
+    hook.rerender({ ...props });
+    await advance(12 * 60_000);
+    expect(check).toHaveBeenCalledTimes(13);
+    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces publication hints, never treats progress or a provider 504 as content, and preserves retry admission", async () => {
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    act(() => hook.result.current.admitPublication(revisions));
+    const pending = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(pending.promise);
+    act(() => { for (let i = 0; i < 5; i++) hook.result.current.checkNow(); });
+    expect(check).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(response({ run: sourceRun("graph_packages", "running") })));
+    await advance(0);
+    expect(check).toHaveBeenCalledTimes(3);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    check.mockRejectedValueOnce(new ApiError(504, "provider_unavailable", "Provider deadline exceeded."));
+    act(() => hook.result.current.checkNow());
+    await settle();
+    expect(check).toHaveBeenCalledTimes(4);
+    expect(hook.result.current.phase).toBe("backoff");
+    act(() => { for (let i = 0; i < 5; i++) hook.result.current.checkNow(); });
+    await advance(59_999);
+    expect(check).toHaveBeenCalledTimes(4);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    check.mockResolvedValueOnce(response({ revisions: { ...revisions, graph_packages: "4".repeat(64) } }));
+    await advance(1);
+    expect(check).toHaveBeenCalledTimes(5);
+    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(["graph_packages"]);
+    act(() => { hook.result.current.setPaused(true); hook.result.current.checkNow(); });
+    await advance(60_000);
+    expect(check).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([
+    { ...revisions, users: "A".repeat(64) },
+    { ...revisions, other_source: "4".repeat(64) },
+  ])("rejects an invalid observer vector without acknowledging or invalidating selected content: %j", async invalid => {
+    check.mockResolvedValueOnce(response({ revisions: invalid }));
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    act(() => hook.result.current.admitPublication(revisions));
+    expect(hook.result.current.phase).toBe("backoff");
+    expect(hook.result.current.publicationRevisions).toBeUndefined();
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    expect(props.onRunsChanged).not.toHaveBeenCalled();
+    expect(check).toHaveBeenCalledOnce();
+  });
+
   it("separates active browser checks from ongoing server refreshes and clears activity after failures", async () => {
     const initial = deferred<AutomaticRefreshResult>();
     const later = deferred<AutomaticRefreshResult>();
@@ -95,23 +198,24 @@ describe("automatic saved-data refresh", () => {
     expect(hook.result.current.checking).toBe(false);
   });
 
-  it("checks after valid sign-in, invalidates the first publication, then only changed source revisions", async () => {
+  it("checks after valid sign-in and invalidates only changed admitted source revisions", async () => {
     const props = options({ enabled: false });
-    const { rerender } = renderHook(useAutomaticRefresh, { initialProps: props });
+    const { rerender, result } = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
     expect(check).not.toHaveBeenCalled();
     rerender({ ...props, enabled: true });
     await settle();
+    act(() => result.current.admitPublication(revisions));
     expect(check).toHaveBeenCalledTimes(1);
-    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     await advance(60_000);
     expect(check).toHaveBeenCalledTimes(2);
-    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).not.toHaveBeenCalled();
-    check.mockImplementation(async () => response({ revisions: { users: "users-2", graph_packages: "packages-1", power_platform: "pp-1" } }));
+    check.mockImplementation(async () => response({ revisions: { ...revisions, users: "4".repeat(64) } }));
     await advance(60_000);
     expect(props.onSourcesChanged).toHaveBeenLastCalledWith(["users"]);
-    expect(props.onSourcesChanged).toHaveBeenCalledTimes(2);
+    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
   });
 
   it("admits only one check during StrictMode setup and never overlaps slow requests", async () => {
@@ -179,7 +283,7 @@ describe("automatic saved-data refresh", () => {
     else hook.rerender(props);
     await settle();
     expect(check).toHaveBeenCalledTimes(2);
-    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
   });
 
   it.each(["principalKey", "authorizationKey"] as const)("fences stale responses and private errors across a changed %s", async field => {
@@ -201,7 +305,7 @@ describe("automatic saved-data refresh", () => {
     })));
     expect(first.onSourcesChanged).not.toHaveBeenCalled();
     expect(first.onRunsChanged).not.toHaveBeenCalled();
-    expect(next.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(next.onSourcesChanged).not.toHaveBeenCalled();
     expect(check).toHaveBeenCalledTimes(2);
     expect(hook.result.current.message).toBeUndefined();
     expect(hook.result.current.phase).toBe("ready");
@@ -241,7 +345,7 @@ describe("automatic saved-data refresh", () => {
     else await online(true);
     await settle();
     expect(check).toHaveBeenCalledTimes(2);
-    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(hook.result.current.phase).toBe("ready");
   });
 
@@ -297,7 +401,7 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(2);
     expect(hook.result.current.checking).toBe(true);
     await act(async () => current.resolve(response()));
-    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).not.toHaveBeenCalled();
     expect(hook.result.current.phase).toBe("ready");
     expect(hook.result.current.checking).toBe(false);
@@ -370,7 +474,7 @@ describe("automatic saved-data refresh", () => {
     });
     expect(check).toHaveBeenCalledTimes(2);
     await act(async () => pending.resolve(response()));
-    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).not.toHaveBeenCalled();
     await advance(59_999);
     act(() => window.dispatchEvent(new Event("focus")));
@@ -437,7 +541,7 @@ describe("automatic saved-data refresh", () => {
     });
     await advance(0);
     expect(check).toHaveBeenCalledTimes(2);
-    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).not.toHaveBeenCalled();
     expect(hook.result.current.phase).toBe("ready");
   });
@@ -460,6 +564,7 @@ describe("automatic saved-data refresh", () => {
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
     expect(hook.result.current.phase).toBe("sign_in_required");
+    act(() => hook.result.current.admitPublication(revisions));
     expect(hook.result.current.checking).toBe(false);
     const calls = check.mock.calls.length;
     await advance(3_600_000);
@@ -482,10 +587,11 @@ describe("automatic saved-data refresh", () => {
     const props = options();
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
+    act(() => hook.result.current.admitPublication(revisions));
     expect(hook.result.current.phase).toBe("sign_in_required");
     check.mockResolvedValueOnce(response({
       run: sourceRun("users", "succeeded"),
-      revisions: { users: "users-2", graph_packages: "packages-1", power_platform: "pp-1" },
+      revisions: { ...revisions, users: "4".repeat(64) },
     }));
     await advance(60_000);
     expect(check).toHaveBeenCalledTimes(2);
@@ -559,12 +665,12 @@ describe("automatic saved-data refresh", () => {
     const props = options();
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
-    expect(props.onSourcesChanged).toHaveBeenCalledOnce();
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).toHaveBeenCalledOnce();
     hook.rerender({ ...props, authorizationKey: "permission-rechecked" });
     await settle();
     expect(check).toHaveBeenCalledTimes(2);
-    expect(props.onSourcesChanged).toHaveBeenCalledOnce();
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).toHaveBeenCalledOnce();
   });
 
@@ -617,7 +723,7 @@ describe("automatic saved-data refresh", () => {
       detailJob: { id: "detail-job", status: "running", updatedAt: new Date().toISOString() },
     }));
     await advance(60_000);
-    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).toHaveBeenCalledTimes(1);
   });
 

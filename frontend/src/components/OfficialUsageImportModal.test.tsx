@@ -17,8 +17,8 @@ const importMount = vi.hoisted(() => vi.fn());
 const importStage = vi.hoisted(() => vi.fn<(onStaged?: (id?: string) => void) => void>());
 const importCorrection = vi.hoisted(() => vi.fn());
 vi.mock("./OfficialUsageImportPanel", () => ({
-  OfficialUsageImportPanel: function TestImportPanel({ ref, initialStagingId, correctionOfSetId, onCancel, onDone, onStaged }: {
-    ref: Ref<OfficialUsageImportHandle>; initialStagingId?: string; onCancel: () => void; onDone: (id: string) => void;
+  OfficialUsageImportPanel: function TestImportPanel({ ref, initialStagingId, correctionOfSetId, onCancel, onDone, onAddMore, onStaged }: {
+    ref: Ref<OfficialUsageImportHandle>; initialStagingId?: string; onCancel: () => void; onDone: () => void; onAddMore: () => void;
     onStaged?: (id?: string) => void; correctionOfSetId?: string;
   }) {
     importMount(initialStagingId);
@@ -29,7 +29,8 @@ vi.mock("./OfficialUsageImportPanel", () => ({
     return <div>
       <input aria-label="Selected import draft" value={draft} onChange={event => setDraft(event.target.value)} />
       <button onClick={onCancel}>Cancel</button>
-      <button onClick={() => onDone("imported-set")}>OK</button>
+      <button onClick={onAddMore}>Add more reports</button>
+      <button onClick={onDone}>Close</button>
     </div>;
   },
 }));
@@ -141,7 +142,7 @@ describe("focused report dialogs", () => {
     render(<Host />);
     await userEvent.click(screen.getByRole("button", { name: "Open reports" }));
     const dialog = screen.getByRole("dialog", { name: "Add CSV reports" });
-    expect(within(dialog).queryByRole("button", { name: /Close|Manage reports|Add CSV reports/ })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /Close reports|Manage reports|Add CSV reports/ })).not.toBeInTheDocument();
     expect(within(dialog).queryByRole("group", { name: "Report workflow" })).not.toBeInTheDocument();
     expect(dialog).not.toHaveTextContent("Closing keeps your draft");
   });
@@ -152,20 +153,39 @@ describe("focused report dialogs", () => {
     const input = screen.getByLabelText("Selected import draft");
     input.focus();
     await userEvent.tab({ shift: true });
-    expect(screen.getByRole("button", { name: "OK" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
     await userEvent.tab();
     expect(input).toHaveFocus();
   });
 
-  it("closes the import and notifies the application only when OK is clicked", async () => {
+  it("closes the import and notifies completion only when Close is clicked", async () => {
     const onRouteChange = vi.fn();
     const onImported = vi.fn();
     render(<OfficialUsageImportModal route={{ view: "import", activityWindowDays: 30 }}
       onRouteChange={onRouteChange} canManage revision={0} onChanged={vi.fn()} onImported={onImported} />);
     expect(onImported).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: "OK" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(onRouteChange).toHaveBeenCalledExactlyOnceWith(undefined);
     expect(onImported).toHaveBeenCalledOnce();
+  });
+
+  it("starts a fresh import without retaining the completed draft or correction target", async () => {
+    function RoutedHost() {
+      const [route, setRoute] = useState<SyncReportRouteState | undefined>({
+        view: "import", stagingId: "saved-stage", reportSetId, activityWindowDays: 30,
+      });
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={vi.fn()} />;
+    }
+    render(<RoutedHost />);
+    const retiredStage = importStage.mock.lastCall?.[0];
+    await userEvent.type(screen.getByLabelText("Selected import draft"), "completed draft");
+    await userEvent.click(screen.getByRole("button", { name: "Add more reports" }));
+    expect(screen.getByRole("dialog", { name: "Add CSV reports" })).toBeVisible();
+    expect(screen.getByLabelText("Selected import draft")).toHaveValue("");
+    expect(importMount).toHaveBeenLastCalledWith(undefined);
+    expect(importCorrection).toHaveBeenLastCalledWith(undefined);
+    act(() => retiredStage?.("late-stage"));
+    expect(importMount).toHaveBeenLastCalledWith(undefined);
   });
 
   it("offers Add CSV reports from management, starting a new import rather than reusing a staging link", async () => {
@@ -329,8 +349,8 @@ describe("focused report dialogs", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     const abandoned = historySet(2);
     await act(async () => pending.resolve(reportPage([abandoned])));
-    expect(screen.queryByText(abandoned.id)).not.toBeInTheDocument();
-    expect(screen.getByText(reportSetId)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "View report" }));
+    expect(props.onRouteChange).toHaveBeenLastCalledWith({ view: "snapshot", reportSetId, activityWindowDays: 365 });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(props.onChanged).not.toHaveBeenCalled();
   });

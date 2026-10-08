@@ -14,7 +14,7 @@ type OfficialUsageImportModalProps = {
   canManage: boolean;
   revision: number;
   onChanged: () => void;
-  onImported: () => void;
+  onImported?: () => void;
 };
 type ImportSession = { sequence: number; owner: object; initialStagingId?: string; correctionOfSetId?: string;
   routeStage?: string; pending?: { from?: string; to?: string } };
@@ -141,7 +141,14 @@ export function OfficialUsageImportModal({
             onRouteChange({ ...route, stagingId });
           }}
           onChanged={onChanged} onCancel={() => onRouteChange(undefined)}
-          onDone={() => { onRouteChange(undefined); onImported(); }} /> : null}
+          onAddMore={() => {
+            if (importOwner.current !== activeDraft.owner) return;
+            importOwner.current = undefined;
+            setImportSession({ sequence: activeDraft.sequence + 1, owner: {} });
+            onRouteChange({ view: "import", activityWindowDays: 30 });
+            requestAnimationFrame(() => dialog.current?.querySelector<HTMLButtonElement>(".usage-upload-zone button")?.focus());
+          }}
+          onDone={() => { onRouteChange(undefined); onImported?.(); }} /> : null}
         {open && view === "manage" ? <OfficialUsageManageReports revision={revision} canManage={canManage}
           onChanged={onChanged}
           onViewSnapshot={setId => navigate("snapshot", setId)}

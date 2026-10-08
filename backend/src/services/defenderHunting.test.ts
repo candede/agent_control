@@ -82,8 +82,8 @@ describe("Defender hunting worker", () => {
     const agentScope = vi.fn(async () => { await pending.promise; return { recordId: agentRecordId, entraAgentIds }; });
     const fixture = setup({ agentScope });
     fixture.setCurrent(job({ filters: { ...filters, entraAgentIds }, qualification: qualificationOnly ? qualification : null }));
-    const starting = qualificationOnly ? fixture.service.startQualification(user, job().id, agentRecordId)
-      : fixture.service.start(user, job().id, "delegated", agentRecordId);
+    const starting = qualificationOnly ? fixture.service.startQualification(user, job().id, { agentRecordId: agentRecordId })
+      : fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
     const outcome = starting.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
     await vi.waitFor(() => expect(agentScope).toHaveBeenCalled());
     await fixture.service.drain();
@@ -264,8 +264,8 @@ describe("Defender hunting worker", () => {
     }));
     const fixture = setup({ agentScope, revalidateUser: vi.fn(() => new Promise<AuthenticatedUser>(() => undefined)) });
     fixture.setCurrent(job({ filters: { ...filters, entraAgentIds: [selected] } }));
-    await fixture.service.start(user, job().id, "delegated", "agent:selected");
-    await expect(fixture.service.start(user, job().id, "delegated", "agent:other")).rejects.toMatchObject({ code: "not_found" });
+    await fixture.service.start(user, job().id, "delegated", { agentRecordId: "agent:selected" });
+    await expect(fixture.service.start(user, job().id, "delegated", { agentRecordId: "agent:other" })).rejects.toMatchObject({ code: "not_found" });
     expect(fixture.repository.begin).toHaveBeenCalledOnce();
     await fixture.service.drain();
   });
@@ -312,7 +312,7 @@ describe("Defender hunting worker", () => {
       }),
     });
     fixture.setCurrent(job({ filters: { ...filters, entraAgentIds: [selected] } }));
-    await fixture.service.start(user, job().id, "delegated", agentRecordId);
+    await fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
     await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledOnce());
     expect(dispatched).not.toHaveBeenCalled();
     expect(fixture.repository.authorizeProviderRequest).not.toHaveBeenCalled();
@@ -348,12 +348,12 @@ describe("Defender hunting worker", () => {
       filters: { ...runtimeFilters, entraAgentApplicationIds: [applicationId] },
     }));
     fixture.setCurrent(job({ filters: { ...runtimeFilters, entraAgentIds: [applicationId] } }));
-    await expect(fixture.service.get(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
-    await expect(fixture.service.start(user, job().id, "delegated", agentRecordId)).rejects.toMatchObject({ status: 404 });
+    await expect(fixture.service.get(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
+    await expect(fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
     expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
     fixture.setCurrent(job({ filters: { ...runtimeFilters, entraAgentApplicationIds: [applicationId] } }));
-    await expect(fixture.service.get(user, job().id, agentRecordId)).resolves.toMatchObject({ filters: { entraAgentApplicationIds: [applicationId] } });
-    await fixture.service.list(user, 10, 0, agentRecordId);
+    await expect(fixture.service.get(user, job().id, { agentRecordId: agentRecordId })).resolves.toMatchObject({ filters: { entraAgentApplicationIds: [applicationId] } });
+    await fixture.service.list(user, 10, 0, { agentRecordId: agentRecordId });
     expect(fixture.repository.listJobs).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds: [], entraAgentApplicationIds: [applicationId] }), 10, 0);
   });
 
@@ -382,11 +382,11 @@ describe("Defender hunting worker", () => {
     for (const entraAgentIds of [undefined, [], ["33333333-3333-4333-8333-333333333333"], [selected, "33333333-3333-4333-8333-333333333333"]]) {
       const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds: [selected] })) });
       fixture.setCurrent(job({ filters: { ...filters, ...(entraAgentIds ? { entraAgentIds } : {}) } }));
-      await expect(fixture.service.get(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
-      await expect(fixture.service.start(user, job().id, "delegated", agentRecordId)).rejects.toMatchObject({ status: 404 });
-      await expect(fixture.service.startQualification(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
-      await expect(fixture.service.cancel(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
-      await expect(fixture.service.delete(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.get(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.startQualification(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.cancel(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.delete(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
       expect(fixture.repository.begin).not.toHaveBeenCalled();
       expect(fixture.repository.cancel).not.toHaveBeenCalled();
       expect(fixture.repository.delete).not.toHaveBeenCalled();
@@ -398,10 +398,10 @@ describe("Defender hunting worker", () => {
     const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
     const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
     const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds })) });
-    await fixture.service.list(user, 10, 30, agentRecordId);
-    await fixture.service.rows(user, job().id, 10, 30, agentRecordId);
-    await fixture.service.qualificationEvidence(user, agentRecordId);
-    await fixture.service.retainedScopes(user, agentRecordId);
+    await fixture.service.list(user, 10, 30, { agentRecordId: agentRecordId });
+    await fixture.service.rows(user, job().id, 10, 30, { agentRecordId: agentRecordId });
+    await fixture.service.qualificationEvidence(user, { agentRecordId: agentRecordId });
+    await fixture.service.retainedScopes(user, { agentRecordId: agentRecordId });
     for (const method of [fixture.repository.listJobs, fixture.repository.listRows, fixture.repository.listQualificationEvidence, fixture.repository.listRetainedScopes]) {
       expect(method).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds, tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId }), ...(
         method === fixture.repository.listJobs ? [10, 30] : method === fixture.repository.listRows ? [job().id, 10, 30] : []));
@@ -422,7 +422,7 @@ describe("Defender hunting worker", () => {
     });
     const fixture = setup({ agentScope, runQuery: vi.fn(async () => { changed = true; return emptyResult; }) });
     fixture.setCurrent(job({ filters: { ...filters, entraAgentIds } }));
-    await fixture.service.start(user, job().id, "delegated", agentRecordId);
+    await fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
     await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalled());
     expect(fixture.repository.publish).not.toHaveBeenCalled();
     expect(agentScope.mock.calls.length).toBeGreaterThan(2);

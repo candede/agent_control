@@ -5,6 +5,8 @@ import { encodeReportFacetValue, normalizeReportSearch, readReportFacet } from "
 import { ApiError } from "../api/client";
 import { useSavedQueryClient } from "../savedQueries";
 import { useReportPrincipalScope } from "../useReportPage";
+import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "../selectedRead";
+import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
 
 export function ReportFacet({ path, selectionId: requestedSelectionId, field, value, onChange, onRestartSelection, onSelectionInvalidated, compact = false }: {
   path: string; selectionId?: string; field: "company" | "department" | "creatorType"; value?: string | null;
@@ -25,12 +27,12 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
   const selectionId = requestedSelectionId?.toLowerCase(), searchQuery = normalizeReportSearch(search);
   const owner = JSON.stringify([principal, path, selectionId]);
   // Selection validity survives option search and page changes.
-  const [evidence, setEvidence] = useState<{ owner: string; expiresAt?: number; rejected?: boolean }>({ owner });
+  const [evidence, setEvidence] = useState<{ owner: string; selection?: PublishedSelectedRead; rejected?: boolean }>({ owner });
   const current = evidence.owner === owner ? evidence : { owner };
   if (evidence.owner !== owner) setEvidence(current);
-  const [now, setNow] = useState(Date.now);
-  const expiresAt = current.expiresAt;
-  const rejected = current.rejected || expiresAt !== undefined && expiresAt <= now;
+  const leaseActive = useSelectedReadLease(current.selection);
+  const leaseEnded = Boolean(current.selection && !leaseActive);
+  const rejected = current.rejected;
   const key = JSON.stringify([principal, path, selectionId, field, searchQuery]), cursor = page.key === key ? page.cursor : undefined;
   if (page.key !== key) setPage({ key });
   const client = useSavedQueryClient();
@@ -38,23 +40,24 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
   // Reuse only actively owned options, not retired pages awaiting zero-time collection.
   const observed = client.getQueryCache().find({ queryKey, exact: true })?.getObserversCount();
   const read = useQuery<OfficialReportFacetPage>({
-    queryKey, enabled: cached => Boolean(selectionId) && !rejected
+    queryKey, enabled: cached => Boolean(selectionId) && !rejected && !leaseEnded
       && !(cached.state.error instanceof ApiError && cached.state.error.code === "selection_invalidated"),
-    staleTime: observed ? Infinity : 0, gcTime: 0,
+    staleTime: observed ? Infinity : 0, gcTime: 0, structuralSharing: false,
     queryFn: async ({ signal }) => {
+      const startedAt = performance.now();
       const result = await readReportFacet(path, selectionId!, field, { search: searchQuery, cursor, signal });
       signal.throwIfAborted();
-      if (result.selection.id.toLowerCase() !== selectionId?.toLowerCase() || !(Date.parse(result.selection.expiresAt) > Date.now())) {
+      if (result.selection.id.toLowerCase() !== selectionId?.toLowerCase()) {
         throw new ApiError(409, "selection_invalidated", "Facet evidence does not match a current selection.");
       }
-      return result;
+      return acceptSelectedRead(result, startedAt);
     },
   }, client);
   const label = field === "creatorType" ? "Creator type" : field === "company" ? "Company" : "Department";
-  const invalidated = rejected || read.error instanceof ApiError && read.error.code === "selection_invalidated";
+  const invalidated = rejected || read.error instanceof ApiError && read.error.code === "selection_invalidated" && !isExpiredSelection(read.error);
   if (invalidated && !current.rejected) setEvidence({ ...current, rejected: true });
-  else if (!invalidated && read.data && !read.isError && expiresAt !== Date.parse(read.data.selection.expiresAt)) {
-    setEvidence({ ...current, expiresAt: Date.parse(read.data.selection.expiresAt) });
+  else if (!invalidated && read.data && !read.isError && current.selection !== read.data.selection) {
+    setEvidence({ ...current, selection: read.data.selection });
   }
   const data = read.isError || invalidated ? undefined : read.data;
   useLayoutEffect(() => {
@@ -71,22 +74,15 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
     retryFocus.current = undefined;
   }, [key, cursor, data, read.error, read.isFetching]);
   useEffect(() => {
-    if (expiresAt === undefined || invalidated) return;
-    const checkExpiry = () => setNow(Date.now());
-    window.addEventListener("focus", checkExpiry);
-    const timer = window.setTimeout(checkExpiry, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now())));
-    return () => { window.removeEventListener("focus", checkExpiry); window.clearTimeout(timer); };
-  }, [expiresAt, invalidated, now]);
-  useEffect(() => {
     if (invalidated) void client.cancelQueries({ queryKey: ["saved", "report-facet", path, field, key, cursor], exact: true });
   }, [client, invalidated, path, field, key, cursor]);
   useEffect(() => {
     if (invalidated) onSelectionInvalidated?.();
   }, [invalidated, onSelectionInvalidated]);
   function invalidatedAtAction() {
+    if (current.selection && !selectedReadRemaining(current.selection) || isExpiredSelection(read.error)) return true;
     const failure = client.getQueryState(queryKey)?.error;
-    if (!invalidated && !(failure instanceof ApiError && failure.code === "selection_invalidated")
-      && (expiresAt === undefined || expiresAt > Date.now())) return false;
+    if (!invalidated && !(failure instanceof ApiError && failure.code === "selection_invalidated")) return false;
     if (!current.rejected) setEvidence({ ...current, rejected: true });
     return true;
   }
@@ -112,14 +108,15 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
     if (retryCursor !== cursor) setPage({ key });
     else void read.refetch({ cancelRefetch: false });
   }
-  const status = selectionId && !invalidated && read.isFetching ? <p role="status">Loading {label.toLowerCase()} options...</p>
+  const status = leaseEnded || isExpiredSelection(read.error) ? <p role="status">Showing saved options. <button type="button" onClick={onRestartSelection}>Restart selection</button> before loading more.</p>
+    : selectionId && !invalidated && read.isFetching ? <p role="status">Loading {label.toLowerCase()} options...</p>
     : (read.error || invalidated) && !(invalidated && onSelectionInvalidated) ? <p role="alert">{invalidated ? "This selection changed or expired." : read.error?.message}{" "}
       <button ref={retryRef} type="button" onClick={invalidated ? onRestartSelection : retry}>
         {invalidated ? "Restart selection" : "Retry options"}</button></p>
       : data && !data.value.length ? <p role="status">{data.counts.filtered > 0
         ? `No ${label.toLowerCase()} options on this page.` : searchQuery
           ? `No ${label.toLowerCase()} options match this search.` : `No ${label.toLowerCase()} options available.`}</p> : null;
-  const control = <select ref={controlRef} aria-label={label} aria-disabled={!selectionId || !data || read.isFetching} value={value === undefined ? "" : encodeReportFacetValue(value)}
+  const control = <select ref={controlRef} aria-label={label} aria-disabled={leaseEnded || !selectionId || !data || read.isFetching} value={value === undefined ? "" : encodeReportFacetValue(value)}
     className={value !== undefined ? "active-filter-select" : undefined}
     onChange={event => {
       if (!data || !currentOptions()) return;
@@ -147,9 +144,9 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
       onChange={event => changeSearch(event.target.value)} /></label>
     {control}
     <div className="report-facet-pages"><span>{data?.counts.filtered.toLocaleString() ?? "Unknown"} options</span>
-      <button type="button" aria-label={`Previous ${label.toLowerCase()} options`} aria-disabled={!data?.page.previousCursor || read.isFetching}
+      <button type="button" aria-label={`Previous ${label.toLowerCase()} options`} aria-disabled={leaseEnded || !data?.page.previousCursor || read.isFetching}
         onClick={() => move(data?.page.previousCursor)}>Previous</button>
-      <button type="button" aria-label={`Next ${label.toLowerCase()} options`} aria-disabled={!data?.page.nextCursor || read.isFetching}
+      <button type="button" aria-label={`Next ${label.toLowerCase()} options`} aria-disabled={leaseEnded || !data?.page.nextCursor || read.isFetching}
         onClick={() => move(data?.page.nextCursor)}>Next</button>
     </div>
     {status}

@@ -20,7 +20,7 @@ export type ResponsibilityAgent = Pick<UnifiedAgentRecord, "id" | "displayName" 
 
 export type AgentResponsibilityQuery = { objectId?: string; search?: string; selectionId?: string; cursor?: string; limit?: number };
 export type AgentResponsibilityPage = {
-  selection: { id: string; revision: string; evaluatedAt: string; expiresAt: string };
+  selection: import("./dataSelection.js").PublishedSelectedRead;
   counts: { total: number; filtered: number };
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   sources: UnifiedAgentInventoryPage["sources"];

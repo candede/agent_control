@@ -143,6 +143,9 @@ describe("selected overview query freshness", () => {
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Original selection deleted"))
       .mockResolvedValueOnce(overviewPage({ selection: reportSelection(4) }));
     act(() => result.current.original.retry());
+    await waitFor(() => expect(result.current.original.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    act(() => result.current.original.restart());
     await waitFor(() => expect(result.current.original.data?.selection.id).toBe(reportSelection(4).id));
     expect(result.current.current.data).toEqual(replacement);
     expect(result.current.current.invalidated).toBe(false);
@@ -175,13 +178,16 @@ describe("selected overview query freshness", () => {
     expect(result.current.loading).toBe(false);
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/overview", expect.objectContaining({ selectionId }), expect.any(AbortSignal));
   });
-  it("recaptures history on a known revision and automatically recovers one concurrent invalidation", async () => {
+  it("recaptures history on a known revision but requires explicit replacement after invalidation", async () => {
     const { result, rerender } = renderHook(({ revision }) => useOfficialUsageOverview({ scope: "history" }, revision), { initialProps: { revision: 0 } });
     await waitFor(() => expect(result.current.data).toBeDefined());
     const replacement = deferred<ReportPage<ReportOverviewAgent>>();
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed"));
     vi.mocked(api.readReportPage).mockReturnValueOnce(replacement.promise);
     rerender({ revision: 1 });
+    await waitFor(() => expect(result.current.invalidated).toBe(true));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    act(() => result.current.restart());
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
     expect(result.current.data).toBeUndefined();
     expect(result.current.loading).toBe(true);

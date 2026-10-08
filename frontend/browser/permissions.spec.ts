@@ -140,7 +140,7 @@ test("log setup is concise and agent blockers link to manual setup without runni
   await page.route("**/api/agent-inventory/investigations/context?**", route => route.fulfill({ json: {
     recordId: "graph_packages:layout-package-1", displayName: "Service desk assistant",
     defender: { status: "unavailable", entraAgentIds: [], reason: "Synthetic agent has no verified calling identity." },
-    purview: { status: "unavailable", mode: "saved_only", reason: "Synthetic agent has no bot identity." },
+    purview: { status: "unavailable", mode: "search", presets: [], reason: "Synthetic agent has no bot identity." },
   } }));
   await page.goto("/permissions");
   const setup = page.getByRole("region", { name: "Log setup" });
@@ -174,12 +174,11 @@ test("log setup is concise and agent blockers link to manual setup without runni
   await agent.getByRole("tab", { name: "Activity", exact: true }).click();
   await expect(agent.getByRole("heading", { name: "Defender identity not mapped" })).toBeVisible();
   await expect(agent.getByText("Synthetic agent has no verified calling identity.")).toBeVisible();
-  await agent.getByRole("button", { name: "Purview audit", exact: true }).click();
+  await agent.getByRole("combobox", { name: "Source" }).selectOption("purview");
   await expect(agent.getByRole("heading", { name: "Purview identity not mapped" })).toBeVisible();
-  await expect(agent.getByRole("region", { name: "Purview log coverage and setup" })).toContainText("Saved records only");
-  await agent.getByRole("button", { name: "Setup & permissions", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(agent.getByRole("region", { name: "Purview log coverage and setup" })).toHaveCount(0);
+  await expect(agent.getByText("Synthetic agent has no bot identity.")).toBeVisible();
+  await expect(agent.locator("details")).toHaveCount(0);
   expect(commands.filter(path => /\/(?:hunting|audit)\/(?:jobs|qualifications)/.test(path))).toEqual([]);
   expect(unexpectedRequests).toEqual([]);
 });
@@ -218,7 +217,7 @@ test("selected agent identity resolution is explicit and does not start a hunt",
           agent_tools: { status: resolved ? "available" : "unavailable" },
         },
       },
-      purview: { status: "unavailable", mode: "saved_only", reasonCode: "purview_identity_unavailable" },
+      purview: { status: "unavailable", mode: "search", presets: [], reasonCode: "purview_identity_unavailable" },
     };
   }
   page.on("request", request => {
@@ -236,11 +235,11 @@ test("selected agent identity resolution is explicit and does not start a hunt",
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const agent = page.getByRole("dialog");
   await agent.getByRole("tab", { name: "Activity", exact: true }).click();
+  await agent.getByRole("combobox", { name: "Source" }).selectOption("defender");
   await expect(agent.getByRole("button", { name: "Resolve log identity", exact: true })).toBeVisible();
   expect(commands.filter(command => command.path.includes("/investigations/"))).toEqual([]);
   await agent.getByRole("button", { name: "Resolve log identity", exact: true }).click();
-  await expect(agent.getByRole("button", { name: "Refresh log identity", exact: true })).toBeVisible();
-  await expect(agent.getByText("Directory identity verified.", { exact: true })).toBeVisible();
+  await expect(agent.getByRole("button", { name: "Resolve log identity", exact: true })).toHaveCount(0);
   await expect(agent.getByRole("button", { name: "Run hunt", exact: true })).toBeEnabled();
   await agent.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
   await expect(agent.getByRole("button", { name: "Run hunt", exact: true })).toBeEnabled();
@@ -251,8 +250,7 @@ test("selected agent identity resolution is explicit and does not start a hunt",
     { path: "/api/agent-inventory/investigations/resolve", body: { recordId } },
   ]);
   expect((await new AxeBuilder({ page }).include(".agent-investigations").analyze()).violations).toEqual([]);
-  await agent.getByRole("button", { name: "Setup & permissions", exact: true }).click();
-  await expect(page.getByRole("region", { name: "App prerequisites" })).toBeVisible();
+  await expect(agent.getByRole("button", { name: "Setup & permissions", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /Authorize identity lookup|Request consent/ })).toHaveCount(0);
   expect(unexpectedRequests).toEqual([]);
 });
@@ -1127,11 +1125,11 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   await expect(page.getByRole("tab", { name: "Purview Audit Search" })).toHaveCount(0);
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await page.getByRole("button", { name: "Ada", exact: true }).click();
-  await page.getByRole("tab", { name: "Purview audit", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Purview Audit Search" })).toBeVisible();
-  await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveAttribute("readonly", "");
-  await expect(page.getByRole("region", { name: "Available audit logs", exact: true })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Purview access and setup", exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Logs", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Search Purview logs" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
+  await expect(page.getByRole("region", { name: "Purview access and setup", exact: true })).toHaveCount(0);
   await expect(page.getByRole("dialog").locator("details")).toHaveCount(0);
   expect(providerCommands).toEqual([]);
 
@@ -1142,7 +1140,7 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   await expect(page.getByText("Partial coverage", { exact: true })).toBeVisible();
   await expect(page.getByText("native-event-browser", { exact: true })).toBeVisible();
   await expect(page.getByText(/Prompt ID: message-browser/)).toBeVisible();
-  await expect(page.getByText(/Metadata only: prompt and response text are not included/)).toBeVisible();
+  await expect(page.getByText("Conversation text is not included.")).toBeVisible();
   await expect(page.getByRole("dialog").locator("details")).toHaveCount(0);
   await expect(page.getByTitle("Stop local polling; remote work may continue")).toHaveCount(0);
   await expect(page.getByTitle("Delete local cache only")).toBeVisible();
@@ -1252,7 +1250,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
       agents_inventory: { status: "unavailable", reason: "No verified enterprise-application object ID." },
       agent_activity: { status: "available" }, agent_tools: { status: "available" },
     } },
-    purview: { status: "unavailable", mode: "saved_only", reason: "No saved bot identity in this fixture." },
+    purview: { status: "unavailable", mode: "search", presets: [], reason: "No saved bot identity in this fixture." },
   } }));
   await page.route(url => /^\/api\/capabilities(?:\/check)?$/.test(url.pathname), route =>
     route.fulfill({ json: {
@@ -1353,7 +1351,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
 
   await page.goto(`/agents?detail=${encodeURIComponent(unifiedAgents.value[0].id)}&detailTab=audit-security`);
   await expect(page.getByRole("heading", { name: "Search Defender logs" })).toBeVisible();
-  await expect(page.getByText(/These views contain metadata, not conversation transcripts/)).toBeVisible();
+  await expect(page.getByText(/Agent invocations and model inference/)).toBeVisible();
   await expect(page.getByRole("dialog").locator("details:visible")).toHaveCount(0);
   await expect(page.getByText(/Opening this view does not run a provider query/)).toHaveCount(0);
   expect(providerCommands).toEqual([]);
@@ -1371,7 +1369,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   await page.getByRole("button", { name: /View hunt 88888888/ }).click();
   await expect(page.getByText(/200-row local cap was reached/)).toBeVisible();
   await expect(page.getByText("CloudAppEvents", { exact: true }).last()).toBeVisible();
-  await expect(page.getByText(/metadata, not conversation transcripts/)).toBeVisible();
+  await expect(page.getByText(/Agent invocations and model inference/)).toBeVisible();
   await expect(page.getByText("Child of unobserved-root-span", { exact: true })).toBeVisible();
   await expect(page.getByText("Blueprint parent only", { exact: true })).toBeVisible();
   await expect(page.getByRole("textbox", { name: /KQL/i })).toHaveCount(0);

@@ -20,18 +20,35 @@ async function expectContained(container: Locator) {
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("empty report management stays compact without diagnostics or inactive controls", async ({ page }, info) => {
+  const state = await mockSelectedImport(page, []);
+  await page.goto("/sync?reports=manage");
+  const dialog = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(dialog.getByRole("heading", { name: "No reports yet" })).toBeVisible();
+  await expect(dialog.locator("details")).toHaveCount(0);
+  await expect(dialog.getByRole("navigation")).toHaveCount(0);
+  await expect(dialog.getByRole("button")).toHaveCount(2);
+  await expect(dialog).not.toContainText(/pinned history|History coverage|matching report|0 saved/);
+  await expect(dialog.getByRole("button", { name: "Add CSV reports", exact: true })).toBeVisible();
+  await expectContained(dialog);
+  await dialog.screenshot({ path: info.outputPath("report-management-empty.png") });
+  await dialog.getByRole("button", { name: "Add CSV reports", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Add CSV reports", exact: true }).locator(".usage-upload-zone")).toBeVisible();
+  expect(state.unexpected).toEqual([]);
+});
+
 test("user details restore all five task-focused tabs without exposing storage diagnostics", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.goto("/users");
   const trigger = page.getByRole("button", { name: "Ada", exact: true });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "Ada", exact: true });
-  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit"]);
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Logs"]);
   await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toBeVisible();
   await expect(dialog.getByRole("region", { name: "User reported activity" })).toBeVisible();
   await expect(dialog.getByText("Agent report dates", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("region", { name: "Report provenance" })).toHaveCount(0);
-  for (const tab of ["Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit"]) {
+  for (const tab of ["Overview", "Usage & agents", "Licenses", "Responsibility", "Logs"]) {
     await dialog.getByRole("tab", { name: tab, exact: true }).click();
     const panel = dialog.getByRole("tabpanel", { name: tab, exact: true });
     await expect(panel).toBeVisible();
@@ -45,7 +62,7 @@ test("user details restore all five task-focused tabs without exposing storage d
     }
     if (tab === "Licenses") await expect(panel.getByRole("list", { name: "Paid feature states" })).toBeVisible();
     if (tab === "Responsibility") await expect(panel.getByRole("heading", { name: "Agent responsibility" })).toBeVisible();
-    if (tab === "Purview audit") await expect(panel.getByText(/Purview/).first()).toBeVisible();
+    if (tab === "Logs") await expect(panel.getByText(/Purview/).first()).toBeVisible();
     expect((await new AxeBuilder({ page }).include(".user-detail-modal").analyze()).violations).toEqual([]);
     await dialog.screenshot({ path: info.outputPath(`user-${tab.replaceAll(" ", "-")}.png`) });
   }
@@ -142,6 +159,13 @@ for (const scenario of [
       await expect(dialog.getByRole("tabpanel")).not.toContainText("Reload saved inventory");
       await expect(dialog.getByRole("region", { name: "Inventory source members" })).toHaveCount(0);
       await expect(dialog.getByRole("region", { name: "About", exact: true })).toBeVisible();
+    }
+    if (scenario.name === "report management") {
+      await expect(dialog.locator("details")).toHaveCount(0);
+      await expect(dialog.getByRole("navigation")).toHaveCount(0);
+      await expect(dialog.getByRole("button", { name: /Report observations|Load current report history/ })).toHaveCount(0);
+      await expect(dialog.getByRole("button", { name: "View report", exact: true })).toBeVisible();
+      await expect(dialog.getByRole("button", { name: "Delete report set", exact: true })).toBeVisible();
     }
     await dialog.screenshot({ path: info.outputPath(`${scenario.name.replaceAll(" ", "-")}.png`) });
     expect(unexpected).toEqual([]);

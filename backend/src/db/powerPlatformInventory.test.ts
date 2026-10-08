@@ -296,14 +296,19 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     await expect(fixture.runtime.query("DELETE FROM power_platform_record_rows WHERE generation_id=$1", [root.baselineId])).rejects.toThrow();
   });
 
-  it("rejects expired selected source pins instead of returning an unverified empty inventory", async () => {
+  it("retains published source reads and success past freshness but rejects an expired read lease", async () => {
     const scope = owner(), job = await running(scope, "expiry", [agentType]);
     const root = await collect(scope, job, provider([resource(scope, "expiring")]), { expiresAt: new Date(Date.now() + 2_000) });
     const pin = await selected(scope, root);
     expect(pin.raw.counts.total).toBe(1);
+    const success = (await jobs.listJobs(scope)).lastSuccessAt;
+    expect(success).not.toBeNull();
     await new Promise(resolve => setTimeout(resolve, 2_050));
-    await expect(pin.queries.page(pin.selection.id, pin.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
-    expect((await jobs.listJobs(scope)).lastSuccessAt).toBeNull();
+    expect((await pin.queries.page(pin.selection.id, pin.identity)).value).toEqual(pin.raw.value);
+    expect((await selected(scope, root)).raw.value).toEqual(pin.raw.value);
+    expect((await jobs.listJobs(scope)).lastSuccessAt).toBe(success);
+    await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [pin.selection.id]);
+    await expect(pin.queries.page(pin.selection.id, pin.identity)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "expired" } });
   });
 
   it.each([

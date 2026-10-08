@@ -269,6 +269,9 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         }
       }
       const body: OfficialReportBundleAcceptance = request.postDataJSON(); acceptRequests.push({ bundleId: bundle[1], ...body });
+      if (body.preserveSelection !== undefined && typeof body.preserveSelection !== "boolean") {
+        return respond({ code: "invalid_import_intent", detail: "Preserving the report selection must be a boolean." }, 400);
+      }
       const receiptKey = JSON.stringify([bundle[1], body.bundleHash, body.expectedActiveRevision]);
       const receipt = receipts.get(receiptKey);
       if (receipt) {
@@ -307,7 +310,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         const active = selectedSetId ? sets.get(selectedSetId)?.row : undefined;
         const backfill = active?.reportingEnd && (!period.endDate
           || `${period.endDate}/${period.startDate ?? ""}` < `${active.reportingEnd}/${active.reportingStart ?? ""}`);
-        if (!selectedSetId || correctionOfSetId === selectedSetId || !correctionOfSetId && !backfill) {
+        if (!body.preserveSelection && (!selectedSetId || correctionOfSetId === selectedSetId || !correctionOfSetId && !backfill)) {
           selectedSetId = setId; activeRevision++;
         }
         usedImportedSetId = true; historyRevision++;
@@ -426,7 +429,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     if (selected.metadata.historyEpoch !== String(historyEpoch)) return respond({ code: "selection_invalidated", detail: "Report history changed. Restart selection." }, 409);
     const query = selected.query;
     const { data, rows } = agentRows(selected, query);
-    data.directory.selection = { ...data.directory.selection, id: selectionId, evaluatedAt: importInstant, expiresAt: "2026-09-12T15:15:00.000Z" };
+    data.directory.selection = { ...data.directory.selection, id: selectionId,
+      evaluatedAt: importInstant, validatedAt: importInstant, expiresAt: "2026-09-12T14:55:00.000Z" };
     const base = <T>(value: T[], total = value.length): ReportPage<T> => reportPage(value, {
       reports: selected.metadata, sources: data.directory.sources, summary: data.summary, filters: query,
       selection: data.directory.selection, counts: { total, filtered: value.length },

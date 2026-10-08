@@ -293,15 +293,15 @@ describe("UnifiedAgentTable", () => {
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
     expect(set).toHaveBeenCalledTimes(1);
-    update({ records: [], loading: true });
-    expect(screen.getByRole("status")).toHaveTextContent("Loading Copilot agents...");
+    update({ records: [], loading: true, loadingMessage: "Publishing synced agents to the inventory..." });
+    expect(screen.getByRole("status")).toHaveTextContent("Publishing synced agents to the inventory...");
     expect(screen.getByRole("checkbox", { name: "Hosts" })).toBeChecked();
     fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
     expect(set).toHaveBeenCalledTimes(2);
     update({ records: [{ ...record, displayName: "Replacement agent" }], loading: false });
     expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "Environment" })).toBeVisible();
-    expect(screen.queryByText("Loading Copilot agents...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Publishing synced agents to the inventory...")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Reset defaults" }));
     expect(set).toHaveBeenCalledTimes(3);
     expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();

@@ -38,6 +38,26 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); });
 
 describe("record-backed report management", () => {
+  it.each(["admission", "confirmation"] as const)("fences deletion %s at monotonic lease end without clearing saved history", async phase => {
+    const saved = reportPage([report], { counts: { total: 1, filtered: 1 } });
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<OfficialUsageManageReports {...props} />);
+    let trigger = await screen.findByRole("button", { name: "Delete report set" });
+    if (phase === "confirmation") {
+      const { modal } = await open();
+      trigger = modal.getByRole("button", { name: "Delete report set" });
+      await waitFor(() => expect(trigger).toBeEnabled());
+    }
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(saved.selection.expiresAt) - Date.parse(saved.selection.validatedAt) + 1);
+    fireEvent.click(trigger);
+    expect(api.previewReportOperation).toHaveBeenCalledTimes(phase === "confirmation" ? 1 : 0);
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    fireEvent.focus(window);
+    expect(screen.getByRole("table")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Delete report set" })).toBeDisabled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+  });
   it("shows one bounded history list and exact inspection without querying any whole-report administration endpoint", async () => {
     const storage = vi.spyOn(Storage.prototype, "getItem");
     render(<OfficialUsageManageReports {...props} />);
@@ -187,7 +207,7 @@ describe("record-backed report management", () => {
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(props.onChanged).not.toHaveBeenCalled();
   });
-  it("retires prepared deletion when invalidated history starts a fresh capture, without another mutation preview", async () => {
+  it("retires prepared deletion on history invalidation and explicitly replaces it without replaying the preview", async () => {
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
@@ -195,6 +215,10 @@ describe("record-backed report management", () => {
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed."))
       .mockReturnValueOnce(current.promise);
     fireEvent.focus(window);
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await screen.findByText("Loading saved data...");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
@@ -259,19 +283,20 @@ describe("record-backed report management", () => {
     expect(props.onChanged).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
-  it("retires prepared deletion when an idle shared history selection is rejected by peer observations", async () => {
-    const observations = deferred<ReportPage<never>>();
+  it("retires prepared deletion when shared history revalidation rejects its selection", async () => {
+    const revalidation = deferred<ReportPage<ReportHistorySet>>();
     render(<SavedQueryProvider>
       <OfficialUsageManageReports {...props} />
       <section aria-label="Pinned peer"><OfficialUsageHistoryPanel revision={0} /></section>
     </SavedQueryProvider>);
     const peer = within(screen.getByRole("region", { name: "Pinned peer" }));
     await peer.findByRole("table");
-    vi.mocked(api.readReportPage).mockReturnValueOnce(observations.promise);
-    fireEvent.click(peer.getByRole("button", { name: "Report observations" }));
     const { modal } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
-    await act(async () => observations.reject(new ApiError(409, "selection_invalidated", "History changed.")));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(revalidation.promise);
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await act(async () => revalidation.reject(new ApiError(409, "selection_invalidated", "History changed.")));
     const management = within(screen.getByRole("region", { name: "Manage saved reports" }));
     await management.findByRole("alert");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();

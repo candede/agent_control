@@ -22,7 +22,8 @@ function savedPage(pendingPackages: number, invalidPackages: number): Parameters
     inventoryOverview: { availableToUsers: 0, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 0 },
     counts: { total: packages, scoped: packages, filtered: packages, packageTargets: packages },
     page: { limit: 50, nextCursor: null, previousCursor: null },
-    selection: { id: "selection", revision: "1", evaluatedAt: observedAt, expiresAt },
+    selection: { id: "selection", revision: "1", evaluatedAt: observedAt, expiresAt, validatedAt: observedAt,
+      publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
     reports: {
       setId: null, activeSetId: null, activeRevision: "0", historyRevision: "0", historyEpoch: "0",
       availability: "never_imported", staleAfterDays: 30, periodAgeDays: null, acceptedAgeDays: null,
@@ -64,7 +65,7 @@ describe("saved inventory person evidence", () => {
           reportRefreshDate: null, period: null, reportVersion: null,
         });
         const context: Parameters<InventoryQueries["pageInRead"]>[1] = {
-          data: { identity, evaluatedAt: new Date(observedAt), query: {}, report: raw.reports,
+          data: { identity, evaluatedAt: new Date(observedAt), query: {}, report: raw.reports, publicationRevisions: raw.selection.publicationRevisions,
             metadata: { directory: source("directory"), app_activity: source("app_activity") } },
           selectionId: "selection", expiresAt: Date.parse(expiresAt), scopeId: "scope", baselineId: "baseline",
           revision: "1", source: "inventory_canonical", tokenMode: "delegated", query: { sortBy: "owner" },
@@ -96,7 +97,7 @@ describe("saved inventory person evidence", () => {
             return result([{ identity: "agent", observed_at: new Date(observedAt), people: references }]);
           }
           if (text.startsWith("SELECT requested.id")) {
-            expect(values).toEqual(["tenant", "reader", "directory-generation", [ownerId, creatorId], new Date(observedAt), "delegated"]);
+            expect(values).toEqual(["tenant", "reader", "directory-generation", [ownerId, creatorId], new Date(observedAt), "delegated", true]);
             return result([{
               id: creatorId, directory_id: status === "legacy" ? creatorId : null,
               display_name: "Known creator", upn: "creator@example.invalid",
@@ -108,7 +109,7 @@ describe("saved inventory person evidence", () => {
           if (text.startsWith("WITH inputs AS")) return result([]);
           throw new Error("Unexpected inventory person query.");
         });
-        const page = await queries.pageInRead(client, context, { revision: "1", expires_at: expiresAt, evaluated_at: observedAt },
+        const page = await queries.pageInRead(client, context, { revision: "1", expires_at: expiresAt, evaluated_at: observedAt, validated_at: observedAt },
           "selection", identity, { exportKind: "unified_agents" }, {
             counts: raw.counts, summary: raw.summary, scopeSummary: raw.scopeSummary, filteredSummary: raw.filteredSummary,
             inventoryOverview: raw.inventoryOverview, verificationCounts: raw.verificationCounts,

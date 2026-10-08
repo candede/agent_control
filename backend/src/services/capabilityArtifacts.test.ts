@@ -20,20 +20,17 @@ describe("capability documentation artifacts", () => {
     expect(manifest).not.toHaveProperty("requiredResourceAccess");
   });
 
-  it("lists every registry capability exactly once with its source", () => {
+  it("documents every required permission and links the current capability/source registry", () => {
     const inventory = readRepositoryFile("docs/provider-contract-inventory-2026-09-08.md");
 
-    expect(inventory).toContain("Inventory date: 2026-09-08");
-    for (const definition of capabilityDefinitions) {
-      expect(inventory.split(`\`${definition.id}\``)).toHaveLength(2);
-      const row = inventory.split("\n").find(line => line.startsWith(`| \`${definition.id}\` |`));
-      expect(row, definition.id).toBeDefined();
-      for (const source of definition.sources) expect(row, definition.id).toContain(`](${source})`);
+    expect(inventory).toContain("](../backend/src/services/capabilityRegistry.ts)");
+    for (const permission of new Set(capabilityDefinitions.flatMap(definition => definition.permissions))) {
+      expect(inventory).toContain(`\`${permission}\``);
     }
   });
 
   it("documents the exact prepared-vault contract and excludes the admin password from runtime", () => {
-    const setup = readRepositoryFile("docs/deployment-setup.md");
+    const setup = readRepositoryFile("docs/azure-production-deployment.md");
     const documentedNames = [...setup.matchAll(/^\| `((?:agent-control-)[^`]+)` \|/gm)].map(match => match[1]);
 
     expect(documentedNames).toEqual([

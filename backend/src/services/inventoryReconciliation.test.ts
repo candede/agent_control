@@ -722,7 +722,7 @@ describe("durable bounded reconciliation", () => {
       userPrincipalName: "owner@example.invalid", checkedAt: new Date().toISOString() }], async () => {});
     const withPeople = await readAutomaticInventoryRevisions(observerScope, fixture.runtime);
     expect(withPeople.power_platform).not.toBe(withCanonical.power_platform);
-    expect(withPeople.graph_packages).toBe(withCanonical.graph_packages);
+    expect(withPeople.graph_packages).not.toBe(withCanonical.graph_packages);
     expect(await readAutomaticInventoryRevisions(observerScope, fixture.runtime)).toEqual(withPeople);
     await expect(fixture.runtime.query("UPDATE inventory_people_revisions SET revision=revision+1 WHERE tenant_id=$1 AND principal_id=$2",
       [observerScope.tenantId, principal])).rejects.toMatchObject({ code: "42501" });

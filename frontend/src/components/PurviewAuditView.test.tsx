@@ -165,6 +165,8 @@ function capabilityView(
 
   return {
     definition,
+    enabled: true,
+    configuration: { enabled: true, sharedDataScope: true, revision: 1 },
     decision: {
       capabilityId: definition.id,
       status: authorized ? "available" : "unknown",
@@ -187,7 +189,7 @@ function context(
   now = Date.parse("2026-09-08T13:05:00.000Z"),
 ) {
   return {
-    views: [capabilityView(authorized)],
+    views: [capabilityView(authorized), capabilityView(false, "purview.audit.search.application")],
     user,
     loading: false,
     pending: false,
@@ -253,20 +255,45 @@ describe("PurviewAuditView", () => {
     vi.unstubAllGlobals();
   });
 
-  it("shows log coverage and setup inline and runs a real permission refresh without a query", async () => {
+  it.each([undefined, viewer.username])("scopes agent collection and history to the selected agent and user %s", async userPrincipalName => {
+    const agentRecordId = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    vi.mocked(submitPurviewAuditSearch).mockRejectedValue(new ApiError(403, "provider_denied", "Purview access denied by the provider."));
+    render(<CapabilityContext value={context(viewer, true)}><UserPurviewAuditView
+      agentRecordId={agentRecordId} userPrincipalName={userPrincipalName} presets={["copilot_studio_admin"]} /></CapabilityContext>);
+    await screen.findByText("No Audit Search history");
+    expect(getPurviewAuditJobs).toHaveBeenCalledWith(20, 0, expect.objectContaining({ agentRecordId, userPrincipalName }));
+    expect(within(screen.getByLabelText("Log type")).getAllByRole("option")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+    await waitFor(() => expect(submitPurviewAuditSearch).toHaveBeenCalledWith("delegated", expect.objectContaining({
+      presetId: "copilot_studio_admin", userPrincipalNames: userPrincipalName ? [userPrincipalName] : [],
+    }), expect.objectContaining({ agentRecordId })));
+    expect(vi.mocked(submitPurviewAuditSearch).mock.calls[0][1].agent).toBeUndefined();
+    expect(await screen.findByText("Purview access denied by the provider.")).toBeVisible();
+  });
+
+  it("rejects a history response from another agent before presenting its records", async () => {
+    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [{ ...partialJob, filters: {
+      ...filters, agent: { recordId: "agent:other", botId: "bot-other", environmentId: "environment-other" },
+    } }], count: 1, limit: 20, offset: 0 });
+    render(<CapabilityContext value={context(viewer, true)}><UserPurviewAuditView
+      agentRecordId="agent:selected" userPrincipalName={viewer.username} /></CapabilityContext>);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/agent/i);
+    expect(getPurviewAuditRecords).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Export CSV" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the scoped form compact and refreshes missing permissions without creating a query", async () => {
     const value = context(viewer);
+    value.views = value.views.filter(view => view.definition.mode === "delegated");
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     expect(view.container.querySelector("details, summary")).toBeNull();
-    expect(screen.getByRole("region", { name: "Available audit logs" })).toHaveTextContent("Not bot conversations");
-    expect(screen.getByRole("region", { name: "Available audit logs" }).querySelector("code")).toBeNull();
+    expect(screen.getByText(/Conversation text is not included/)).toBeVisible();
     expect(screen.queryByText("Microsoft Graph v1.0")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Authorization").compareDocumentPosition(
-      screen.getByRole("region", { name: "Available audit logs" }),
-    ) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Purview access and setup" })).toHaveTextContent("AuditLogsQuery.Read.All");
-    expect(screen.getByRole("region", { name: "Purview access and setup" })).toHaveTextContent("Purview Audit entitlement and auditing enabled");
-    expect(screen.getByRole("region", { name: "Structured identity filters" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Purview access and setup" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Structured identity filters" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("IP addresses")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Authorization")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Check permissions" }));
     expect(value.reload).toHaveBeenCalledOnce();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
@@ -286,19 +313,19 @@ describe("PurviewAuditView", () => {
     const denied = { ...value, views: [{ ...value.views[0], decision: { ...value.views[0].decision, status: "missing_role" as const } }] };
     view.rerender(<CapabilityContext value={denied}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
-    expect(screen.getByRole("region", { name: "Purview access and setup" })).toHaveTextContent("Requires Audit Logs or View-Only Audit Logs.");
+    expect(screen.getByRole("region", { name: "Audit Search authorization pending" })).toHaveTextContent("Requires Audit Logs or View-Only Audit Logs.");
   });
 
   it.each(["unchecked", "expired"] as const)("uses application-specific recovery for %s evidence", async state => {
     const value = context(administrator);
     const application = capabilityView(state === "expired", "purview.audit.search.application");
     if (state === "expired") application.decision.expiresAt = new Date(value.now).toISOString();
-    value.views.push(application);
+    value.views.splice(1, 1, application);
     render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    const access = screen.getByRole("region", { name: "Purview access and setup" });
-    expect(access).toHaveTextContent(/Admin must explicitly approve/);
+    const access = screen.getByRole("region", { name: "Audit Search qualification required" });
+    expect(access).toHaveTextContent(/Application qualification required/);
     expect(access).not.toHaveTextContent(/Check incomplete|Permissions have not been checked/);
     expect(within(access).queryByText("Available")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
@@ -325,7 +352,7 @@ describe("PurviewAuditView", () => {
     const value = context(administrator);
     const application = capabilityView(true, "purview.audit.search.application");
     application.decision.expiresAt = new Date(value.now + 1_000).toISOString();
-    value.views.push(application);
+    value.views.splice(1, 1, application);
     render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
@@ -343,12 +370,9 @@ describe("PurviewAuditView", () => {
     vi.mocked(getPurviewAuditRecords).mockResolvedValue(recordPage());
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByRole("button", { name: /View results/ });
-    await userEvent.selectOptions(screen.getByLabelText("Search preset"), "copilot_studio_admin");
+    await userEvent.selectOptions(screen.getByLabelText("Log type"), "copilot_studio_admin");
     fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:00" } });
     fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-08T11:00" } });
-    await userEvent.type(screen.getByLabelText("IP addresses"), "192.0.2.20");
-    await userEvent.type(screen.getByLabelText("Object IDs"), "object-123");
-    await userEvent.type(screen.getByLabelText("Administrative unit IDs"), "unit-123");
     await userEvent.click(screen.getByRole("button", { name: /View results/ }));
     await screen.findByText("Selected record actor");
     const renewed = context(viewer, true, Date.parse("2026-09-08T13:10:00.000Z"));
@@ -357,13 +381,10 @@ describe("PurviewAuditView", () => {
     renewed.views[0].decision.lastSuccessAt = renewed.views[0].decision.checkedAt;
     renewed.views[0].decision.fresh = false;
     view.rerender(<CapabilityContext value={renewed}><PurviewAuditView /></CapabilityContext>);
-    expect(screen.getByLabelText("Search preset")).toHaveValue("copilot_studio_admin");
+    expect(screen.getByLabelText("Log type")).toHaveValue("copilot_studio_admin");
     expect(screen.getByLabelText("Start")).toHaveValue("2026-09-08T10:00");
     expect(screen.getByLabelText("End")).toHaveValue("2026-09-08T11:00");
-    expect(screen.getByLabelText("IP addresses")).toHaveValue("192.0.2.20");
-    expect(screen.getByLabelText("Object IDs")).toHaveValue("object-123");
-    expect(screen.getByLabelText("Administrative unit IDs")).toHaveValue("unit-123");
-    expect(screen.getByRole("checkbox", { name: "BotCreate" })).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: "BotCreate" })).not.toBeInTheDocument();
     expect(screen.getByText("Selected record actor")).toBeVisible();
     expect(getPurviewAuditJobs).toHaveBeenCalledOnce();
     expect(getPurviewAuditRecords).toHaveBeenCalledOnce();
@@ -415,14 +436,14 @@ describe("PurviewAuditView", () => {
     vi.mocked(getPurviewAuditJob).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByRole("button", { name: /View results/ });
-    await userEvent.type(screen.getByLabelText("IP addresses"), "192.0.2.25");
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     await userEvent.click(screen.getByRole("button", { name: /View results/ }));
     await screen.findByText("Selected record actor");
     view.rerender(<CapabilityContext value={value}><PurviewAuditView active={false} /></CapabilityContext>);
     expect(view.container).toBeEmptyDOMElement();
     view.rerender(<CapabilityContext value={value}><PurviewAuditView active /></CapabilityContext>);
     expect(screen.queryByText("Selected record actor")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("IP addresses")).toHaveValue("192.0.2.25");
+    expect(screen.getByLabelText("Start")).toHaveValue("2026-09-08T10:30");
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
     await waitFor(() => expect(getPurviewAuditJob).toHaveBeenCalledOnce());
     expect(getPurviewAuditRecords).toHaveBeenCalledOnce();
@@ -486,7 +507,7 @@ describe("PurviewAuditView", () => {
     await waitFor(() => expect(stage === "job" ? getPurviewAuditJob : getPurviewAuditRecords).toHaveBeenCalledTimes(stage === "job" ? 1 : 2));
     expect(screen.getByText("Loading Audit Search history...")).toBeVisible();
 
-    fireEvent.change(screen.getByLabelText("IP addresses"), { target: { value: "192.0.2.25" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     await waitFor(() => expect(signal.aborted).toBe(true));
     expect(screen.queryByText("Loading Audit Search history...")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
@@ -558,13 +579,13 @@ describe("PurviewAuditView", () => {
 
   it.each(["role", "selected user", "application scope", "application revision"] as const)("isolates private state after a %s change", async change => {
     const value = context(viewer, true);
-    value.views.push({ ...capabilityView(true, "purview.audit.search.application"), configuration: { enabled: true, sharedDataScope: true, revision: 1 } });
+    value.views.splice(1, 1, { ...capabilityView(true, "purview.audit.search.application"), configuration: { enabled: true, sharedDataScope: true, revision: 1 } });
     vi.mocked(getPurviewAuditJobs).mockResolvedValueOnce({ value: [partialJob], count: 1, limit: 20, offset: 0 })
       .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
     vi.mocked(getPurviewAuditRecords).mockResolvedValue(recordPage());
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByRole("button", { name: /View results/ });
-    await userEvent.type(screen.getByLabelText("Object IDs"), "private-filter");
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     await userEvent.click(screen.getByRole("button", { name: /View results/ }));
     await screen.findByText("Selected record actor");
     const next = { ...value, user: change === "role" ? administrator : viewer,
@@ -573,7 +594,7 @@ describe("PurviewAuditView", () => {
     view.rerender(<CapabilityContext value={next}><PurviewAuditView userPrincipalName={change === "selected user" ? "other@example.invalid" : viewer.username} /></CapabilityContext>);
     expect(screen.queryByText("Selected record actor")).not.toBeInTheDocument();
     await screen.findByText("No Audit Search history");
-    expect(screen.getByLabelText("Object IDs")).toHaveValue("");
+    expect(screen.getByLabelText("Start")).not.toHaveValue("2026-09-08T10:30");
     expect(screen.queryByRole("button", { name: /Export results/ })).not.toBeInTheDocument();
   });
 
@@ -742,7 +763,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText(/a permission check establishes delegated authorization/)).toBeVisible();
+    expect(await screen.findByText("Delegated authorization is not ready")).toBeVisible();
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
     expect(getPurviewAuditCatalog).toHaveBeenCalledOnce();
@@ -759,7 +780,7 @@ describe("PurviewAuditView", () => {
   it.each([true, false])("uses application authorization independently of delegated readiness (available: %s)", async (available) => {
     const user = userEvent.setup();
     const selectedContext = context(administrator, !available);
-    selectedContext.views.push(capabilityView(available, "purview.audit.search.application"));
+    selectedContext.views.splice(1, 1, capabilityView(available, "purview.audit.search.application"));
     vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
     render(
       <CapabilityContext value={selectedContext}>
@@ -793,16 +814,12 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView userPrincipalName="employee@example.invalid" />
       </CapabilityContext>,
     );
-    const identity = await screen.findByRole("textbox", { name: "User principal names" });
-    expect(identity).toBeVisible();
-    expect(identity).toHaveValue("employee@example.invalid");
-    expect(identity).toHaveAttribute("readonly");
+    await screen.findByText("No Audit Search history");
+    expect(screen.queryByRole("textbox", { name: "User principal names" })).not.toBeInTheDocument();
     expect(getPurviewAuditJobs).toHaveBeenCalledWith(20, 0, expect.objectContaining({ userPrincipalName: "employee@example.invalid" }));
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-    await userEvent.type(identity, "other@example.invalid");
-    expect(identity).toHaveValue("employee@example.invalid");
     await userEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
     expect(submitPurviewAuditSearch).toHaveBeenCalledWith("delegated",
       expect.objectContaining({ userPrincipalNames: ["employee@example.invalid"] }), expect.anything());
@@ -851,7 +868,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    await screen.findByText(/a permission check establishes delegated authorization/);
+    await screen.findByText("Delegated authorization is not ready");
     await user.selectOptions(screen.getByLabelText("Authorization"), "application");
     await screen.findByText("Application qualification required");
     const approve = screen.getByRole("button", {
@@ -900,7 +917,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    await screen.findByText(/a permission check establishes delegated authorization/);
+    await screen.findByText("Delegated authorization is not ready");
     await user.selectOptions(screen.getByLabelText("Authorization"), "application");
     expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox", {
@@ -971,10 +988,10 @@ describe("PurviewAuditView", () => {
       await screen.findByRole("button", { name: /View results 11111111/ }),
     );
     expect(await screen.findByText("Partial coverage")).toBeVisible();
-    expect(screen.getByText("Authorizing actor").parentElement).toHaveTextContent("reader-a");
-    expect(screen.getByText("Result scope").parentElement).toHaveTextContent("principal: reader-a");
-    expect(screen.getByText("Selected operations").parentElement).toHaveTextContent("CopilotInteraction");
-    expect(screen.getByText("Structured filters").parentElement).toHaveTextContent(`Users: ${viewer.username}`);
+    expect(screen.queryByText("Authorizing actor")).not.toBeInTheDocument();
+    expect(screen.queryByText("Result scope")).not.toBeInTheDocument();
+    expect(screen.queryByText("Request / activation budget")).not.toBeInTheDocument();
+    expect(screen.getByText("Page completeness").parentElement).toHaveTextContent("Incomplete");
     expect(screen.getByText("native-event-a")).toBeVisible();
     expect(screen.getByText(/Prompt ID: message-a/)).toBeVisible();
     expect(
@@ -982,8 +999,8 @@ describe("PurviewAuditView", () => {
         "Exact microsoft.copilotstudio/agents: inventory-agent-a",
       ),
     ).toBeVisible();
-    expect(screen.getByText(/Metadata only: prompt and response text are not included/)).toBeVisible();
-    expect(screen.getByText("3")).toBeVisible();
+    expect(screen.getByText(/Conversation text is not included/)).toBeVisible();
+    expect(screen.queryByText("Unknown fields omitted")).not.toBeInTheDocument();
     expect(resumePurviewAuditSearch).not.toHaveBeenCalled();
     expect(cancelPurviewAuditSearch).not.toHaveBeenCalled();
     expect(deletePurviewAuditSearch).not.toHaveBeenCalled();
@@ -999,9 +1016,9 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    await screen.findByRole("heading", { name: "Purview Audit Search" });
-    await user.selectOptions(screen.getByLabelText("Search preset"), "copilot_studio_admin");
-    expect(screen.getByRole("checkbox", { name: "BotCreate" })).toBeChecked();
+    await screen.findByRole("heading", { name: "Search Purview logs" });
+    await user.selectOptions(screen.getByLabelText("Log type"), "copilot_studio_admin");
+    expect(screen.queryByRole("checkbox", { name: "BotCreate" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Run Audit Search" }));
     expect(submitPurviewAuditSearch).toHaveBeenCalledWith("delegated", expect.objectContaining({
       presetId: "copilot_studio_admin",
@@ -1272,8 +1289,7 @@ describe("PurviewAuditView", () => {
     await user.click(screen.getByRole("button", { name: "Approve qualification" }));
     expect(await screen.findByRole("button", { name: "Run approved qualification" })).toBeVisible();
 
-    await user.click(screen.getByText("Structured identity filters"));
-    await user.type(screen.getByLabelText("IP addresses"), "192.0.2.10");
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
 
     expect(approval).not.toBeChecked();
     expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
@@ -1396,7 +1412,7 @@ describe("PurviewAuditView", () => {
     expect(await screen.findByText("Selected record actor")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: /View results 22222222/ }));
     expect(screen.queryByText("Selected record actor")).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("IP addresses"), { target: { value: "192.0.2.10" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     expect(signal.aborted).toBe(true);
     await act(async () => finish(recordPage(second, "Obsolete filtered actor")));
     expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
@@ -1449,7 +1465,7 @@ describe("PurviewAuditView", () => {
     await screen.findByRole("button", { name: /View results/ });
     await userEvent.click(screen.getByRole("button", { name: "Refresh Audit Search history" }));
     await waitFor(() => expect(getPurviewAuditJob).toHaveBeenCalledOnce());
-    fireEvent.change(screen.getByLabelText("Object IDs"), { target: { value: "new-draft" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     expect(jobSignal.aborted).toBe(true);
     expect(historySignal.aborted).toBe(false);
     expect(screen.getByText("Loading Audit Search history...")).toBeVisible();
@@ -1484,7 +1500,7 @@ describe("PurviewAuditView", () => {
     await act(async () => {});
     await act(() => vi.advanceTimersByTimeAsync(2_000));
     expect(getPurviewAuditJob).toHaveBeenCalledOnce();
-    fireEvent.change(screen.getByLabelText("Object IDs"), { target: { value: "new-draft" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     expect(signal.aborted).toBe(true);
     await act(async () => rejectJob(new ApiError(404, "not_found", "Retired saved selection")));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -1514,7 +1530,7 @@ describe("PurviewAuditView", () => {
     await screen.findByRole("heading", { name: "Minimized results" });
     await userEvent.click(screen.getByRole("button", { name: "Refresh Audit Search history" }));
     await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledTimes(5));
-    fireEvent.change(screen.getByLabelText("IP addresses"), { target: { value: "192.0.2.40" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
     await act(async () => finish({ value: [partialJob], count: 1, limit: 20, offset: 0 }));
     expect(screen.queryByText("Loading Audit Search history...")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
@@ -1559,7 +1575,7 @@ describe("PurviewAuditView", () => {
       const name = action === "resume" ? /Resume search/ : action === "cancel" ? /Cancel local polling/
         : action === "delete" ? /Delete local cache/ : /Export results/;
       await userEvent.click(await screen.findByRole("button", { name }));
-      fireEvent.change(screen.getByLabelText("Object IDs"), { target: { value: "new-draft" } });
+      fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
       expect(signal.aborted).toBe(false);
       expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
       if (action === "export") expect(screen.getByRole("status")).toHaveTextContent("Exporting saved Audit Search results");
@@ -1587,10 +1603,11 @@ describe("PurviewAuditView", () => {
     const secondButton = screen.getByRole("button", { name: /View results 22222222/ });
     act(() => { firstButton.click(); secondButton.click(); });
     const detail = screen.getByRole("heading", { name: "Minimized results" }).closest("section")!;
-    expect(detail).toHaveTextContent(partialJob.id);
-    expect(detail).not.toHaveTextContent(second.id);
+    expect(firstButton.closest("tr")).toHaveClass("selected-row");
+    expect(secondButton.closest("tr")).not.toHaveClass("selected-row");
     expect(within(detail).getByRole("status")).toHaveTextContent("Loading minimized results");
     expect(getPurviewAuditRecords).toHaveBeenCalledOnce();
+    expect(getPurviewAuditRecords).toHaveBeenCalledWith(partialJob.id, 100, 0, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     await act(async () => finish(recordPage()));
     expect(await screen.findByText("Selected record actor")).toBeVisible();
   });
@@ -1802,13 +1819,15 @@ describe("PurviewAuditView", () => {
   });
 
   it("enforces current authorization and operations in the form handler, not only the button", async () => {
+    vi.mocked(getPurviewAuditCatalog).mockResolvedValue({ ...catalog,
+      presets: catalog.presets.map(preset => preset.id === "copilot_studio_admin" ? { ...preset, operations: [] } : preset) });
     const view = render(<CapabilityContext value={context(viewer)}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.submit(screen.getByRole("button", { name: "Run Audit Search" }).closest("form")!);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     view.rerender(<CapabilityContext value={context(viewer, true)}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
-    await userEvent.click(screen.getByRole("checkbox", { name: "CopilotInteraction" }));
+    await userEvent.selectOptions(screen.getByLabelText("Log type"), "copilot_studio_admin");
     fireEvent.submit(screen.getByRole("button", { name: "Run Audit Search" }).closest("form")!);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
   });
@@ -2216,7 +2235,7 @@ describe("PurviewAuditView", () => {
     );
     const access = (changed = false) => {
       const value = context(changed && change === "account" ? currentUser : viewer, true);
-      value.views.push({ ...capabilityView(true, "purview.audit.search.application"),
+      value.views.splice(1, 1, { ...capabilityView(true, "purview.audit.search.application"),
         configuration: { enabled: true, sharedDataScope: true, revision: changed && change === "application revision" ? 2 : 1 } });
       return value;
     };
@@ -2251,7 +2270,7 @@ describe("PurviewAuditView", () => {
       </main>,
     );
 
-    await screen.findByRole("heading", { name: "Purview Audit Search" });
+    await screen.findByRole("heading", { name: "Search Purview logs" });
     await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledOnce());
     const result = await axe.run(container, {
       rules: { "color-contrast": { enabled: false } },

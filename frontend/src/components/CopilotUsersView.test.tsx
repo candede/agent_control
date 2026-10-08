@@ -183,20 +183,20 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       : state === "lookup_failed" ? /Directory lookup failed/ : /Saved directory identity is out of date/)).toBeVisible();
     expect(modal.queryByText("Identity from saved agent inventory.")).not.toBeInTheDocument();
   });
-  it("withdraws a responsibility-only user's fallback name when its inventory selection expires", async () => {
+  it("retains a responsibility-only user's historical name and rows when the lease ends", async () => {
     vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Record is not in the selected cohort."));
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selection.expiresAt = new Date(Date.now() + 60_000).toISOString();
     vi.mocked(getAgentResponsibility).mockResolvedValue(data);
     render(<CopilotUsersView route={{ view: "licenses", detailId: responsibilityOwnerId, detailTab: "responsibility", search: "", page: 0 }} />);
     const modal = within(await screen.findByRole("dialog", { name: "Responsible only" }));
-    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse(data.selection.expiresAt) + 1);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(data.selection.expiresAt) - Date.parse(data.selection.validatedAt) + 1);
     try {
       fireEvent(window, new Event("focus"));
-      expect(await modal.findByRole("alert")).toHaveTextContent(/responsibility selection.*expired/i);
-      expect(screen.getByRole("dialog")).toHaveAccessibleName(responsibilityOwnerId);
-      expect(modal.queryByText("Responsible only")).not.toBeInTheDocument();
-      expect(modal.queryByText("Responsible agent")).not.toBeInTheDocument();
+      expect(await modal.findByText(/Showing previously loaded saved responsibility/)).toBeVisible();
+      expect(screen.getByRole("dialog")).toHaveAccessibleName("Responsible only");
+      expect(modal.getByText("Responsible only")).toBeVisible();
+      expect(modal.getByText("Responsible agent")).toBeVisible();
       expect(getAgentResponsibility).toHaveBeenCalledOnce();
     } finally {
       clock.mockRestore();

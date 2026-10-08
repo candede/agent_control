@@ -59,11 +59,13 @@ function provider() {
 }
 
 describe("typed package observation identity and provenance", () => {
-  it("keeps invalid metadata actionable across filtered selections until replacement details repair it", async () => {
+  it("keeps invalid metadata actionable across filtered selections until authoritative replacement details repair it", async () => {
     const source = provider();
+    const invalidPackage = { ...packageValue("invalid"), version: "1", lastModifiedDateTime: "2026-09-22T00:00:00Z" };
+    const pendingPackage = { ...packageValue("pending"), version: "1", lastModifiedDateTime: "2026-09-22T00:00:00Z" };
     await nativeInventoryFixture(database.runtime, source.scope, [], { resourceTypes: ["microsoft.copilotstudio/agents"] });
-    await source.catalogPage([packageValue("invalid"), packageValue("pending")]);
-    source.exact.set("invalid", { ...packageValue("invalid"), elementDetails: [
+    await source.catalogPage([invalidPackage, pendingPackage]);
+    source.exact.set("invalid", { ...invalidPackage, elementDetails: [
       { elementType: "AgentMetadatas", elements: [
         { id: "metadata", definition: JSON.stringify({ SourceIds: { CdsBotId: "not-a-guid" } }) },
       ] },
@@ -81,14 +83,14 @@ describe("typed package observation identity and provenance", () => {
     expect(filtered.page.identityCollection?.invalidPackages).toBe(1);
     expect(filtered.page.verification.status).toBe("needs_attention");
 
-    source.exact.set("invalid", { ...packageValue("invalid"), elementDetails: [] });
-    await source.exactPage(["invalid"], true);
+    source.exact.set("invalid", { ...invalidPackage, elementDetails: [] });
+    await source.exactPage(["invalid"]);
     const repaired = await source.read();
     expect(repaired.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 1, invalidPackages: 0 });
     expect(repaired.page.verification.status).toBe("details_pending");
     expect(repaired.page.value.every(row => !row.identity.invalidMetadata)).toBe(true);
 
-    source.exact.set("pending", { ...packageValue("pending"), elementDetails: [] });
+    source.exact.set("pending", { ...pendingPackage, elementDetails: [] });
     await source.exactPage(["pending"], true);
     expect((await source.read()).page.verification).toMatchObject({ status: "verified", checks: { packageMetadata: true } });
   });

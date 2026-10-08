@@ -142,7 +142,7 @@ describe("selected users and reports client boundary", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("automatically recaptures a top-level selection invalidated by a concurrent saved-data update", async () => {
+  it("requires explicit replacement after a concurrent dependency invalidation", async () => {
     render(<CopilotUsersView />);
     fireEvent.click(await screen.findByRole("button", { name: "User 1" }));
     await within(screen.getByRole("dialog")).findByRole("heading", { name: "User 1" });
@@ -150,6 +150,10 @@ describe("selected users and reports client boundary", () => {
       new ApiError(409, "selection_invalidated", "Saved data changed during the read"),
     );
     fireEvent.focus(window);
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
     expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users",
       expect.not.objectContaining({ selectionId: expect.anything() }), expect.any(AbortSignal));
@@ -326,13 +330,16 @@ describe("selected users and reports client boundary", () => {
     pending.unmount();
     expect(replacementSignal?.aborted).toBe(true);
   });
-  it("automatically recaptures after a paged root selection is invalidated", async () => {
+  it("explicitly replaces an invalidated frozen page without replaying its cursor", async () => {
     vi.mocked(api.readReportPage).mockResolvedValueOnce(reportPage([combinedUser()], { page: { limit: 50, nextCursor: "next", previousCursor: null } }))
       .mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Selection invalidated"))
       .mockResolvedValueOnce(reportPage([combinedUser(2)]));
     render(<CopilotUsersView />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
     await screen.findByRole("button", { name: "User 2" });
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -373,82 +380,71 @@ describe("selected users and reports client boundary", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(4);
     expect(search).toHaveValue(" Reported ");
   });
-  it("keeps one history selection across more than 32 sets and pages observations separately", async () => {
-    vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("observations") ? reportPage([])
-      : reportPage([{ id: reports.setId!, bundleId: reports.setId!, contentHash: "a".repeat(64), reportingStart: null, reportingEnd: null,
+  it("keeps one history selection across more than 32 sets without additional diagnostic reads", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => reportPage([{ id: reports.setId!, bundleId: reports.setId!, contentHash: "a".repeat(64), reportingStart: null, reportingEnd: null,
         periodProvenance: "activity_range", supersedesSetId: null, acceptedAt: reports.acceptedAt!, visibility: "retained", active: false }],
       { counts: { total: 35, filtered: 35 }, page: { limit: 50, nextCursor: query?.cursor ? null : "history-next", previousCursor: query?.cursor ? "history-prev" : null } }));
     render(<OfficialUsageHistoryPanel revision={0} />);
     await screen.findByText("35 saved report sets");
     fireEvent.click(screen.getByRole("button", { name: "Next report sets" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/history", expect.objectContaining({ selectionId, cursor: "history-next" }), expect.any(AbortSignal)));
-    fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
-    await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith(`official-usage/history/${reports.setId}/observations`, expect.objectContaining({ selectionId }), expect.any(AbortSignal)));
+    expect(screen.queryByRole("button", { name: "Report observations" })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
-  it.each(["revision", "restart", "denial", "account"] as const)(
-    "cancels history observations across a %s boundary without silently reopening them", async boundary => {
+  it.each(["revision", "account"] as const)(
+    "cancels pending history pages across a %s boundary without restoring their late rows", async boundary => {
       const pending = deferred<ReturnType<typeof reportPage>>();
-      const first = reportPage([historySet()]);
-      vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/observations") ? pending.promise : first);
+      const first = reportPage([historySet()], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
+      const onSelect = vi.fn();
+      vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => query?.cursor ? pending.promise : first);
       const capability: ReturnType<typeof useCapabilityContext> = {
         user: { tenantId: "tenant", homeAccountId: "first", username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"] },
         now: Date.now(), views: [], loading: false, pending: false, error: undefined, reload: vi.fn(async () => {}), openPermissions: vi.fn(),
       };
       const panel = (revision: number, account = "first") => <CapabilityContext value={{ ...capability, user: { ...capability.user!, homeAccountId: account } }}>
-        <OfficialUsageHistoryPanel revision={revision} />
+        <OfficialUsageHistoryPanel revision={revision} onSelect={onSelect} />
       </CapabilityContext>;
       const view = render(panel(0));
-      fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Next report sets" }));
       await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
       const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
       if (boundary === "revision") view.rerender(panel(1));
-      else if (boundary === "account") view.rerender(panel(0, "second"));
-      else if (boundary === "restart") fireEvent.click(screen.getByRole("button", { name: "Load current report history" }));
-      else {
-        vi.mocked(api.readReportPage).mockImplementation(async path => {
-          if (path.endsWith("/observations")) return pending.promise;
-          throw new ApiError(403, "access_denied", "History access denied");
-        });
-        fireEvent.focus(window);
-        await screen.findByText("History access denied");
-      }
+      else view.rerender(panel(0, "second"));
       await waitFor(() => expect(signal?.aborted).toBe(true));
-      if (boundary === "denial") {
-        vi.mocked(api.readReportPage).mockResolvedValue(first);
-        fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
-      }
       await waitFor(() => expect(screen.getByRole("button", { name: "View report" })).toBeEnabled());
-      expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
-      await act(async () => pending.reject(new ApiError(409, "selection_invalidated", "Obsolete observation")));
+      await act(async () => pending.resolve(reportPage([historySet(2)])));
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-      expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
-      expect(vi.mocked(api.readReportPage).mock.calls.filter(([path]) => path.endsWith("/observations"))).toHaveLength(1);
+      fireEvent.click(screen.getByRole("button", { name: "View report" }));
+      expect(onSelect).toHaveBeenCalledExactlyOnceWith(historySet().id);
+      expect(api.readReportPage).toHaveBeenCalledTimes(3);
     },
   );
-  it("preserves independently pending history observations while paging the same parent selection", async () => {
+  it("keeps history paging controls stable while the selected next page is pending", async () => {
     const pending = deferred<ReturnType<typeof reportPage>>();
-    vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("/observations") ? pending.promise
-      : reportPage([historySet(query?.cursor ? 2 : 1)], { page: { limit: 50, nextCursor: query?.cursor ? null : "next", previousCursor: null } }));
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => query?.cursor ? pending.promise
+      : reportPage([historySet()], { page: { limit: 50, nextCursor: "next", previousCursor: null } }));
     render(<OfficialUsageHistoryPanel revision={0} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+    const next = await screen.findByRole("button", { name: "Next report sets" });
+    next.focus();
+    fireEvent.click(next);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
-    const observations = screen.getByRole("region", { name: "Report observations" });
-    fireEvent.click(screen.getByRole("button", { name: "Next report sets" }));
-    await waitFor(() => expect(screen.getByRole("table")).toHaveTextContent(historySet(2).id));
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(signal?.aborted).toBe(false);
-    expect(screen.getByRole("region", { name: "Report observations" })).toBe(observations);
-    expect(api.readReportPage).toHaveBeenCalledTimes(3);
-    await act(async () => pending.resolve(reportPage([])));
-    await waitFor(() => expect(within(observations).queryByText("Loading saved data...")).not.toBeInTheDocument());
+    await act(async () => pending.resolve(reportPage([historySet(2)], { page: { limit: 50, nextCursor: null, previousCursor: "previous" } })));
+    expect(await screen.findByRole("table")).toBeVisible();
+    expect(next).toHaveFocus();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
-  it("withdraws history actions when independently paged observations invalidate their selection", async () => {
-    vi.mocked(api.readReportPage).mockImplementation(async path => {
-      if (path.endsWith("/observations")) throw new ApiError(409, "selection_invalidated", "History changed");
-      return reportPage([historySet()]);
+  it("withdraws history actions when the next page invalidates their selection", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      if (query?.cursor) throw new ApiError(409, "selection_invalidated", "History changed");
+      return reportPage([historySet()], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
     });
     render(<OfficialUsageHistoryPanel revision={0} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Next report sets" }));
     await screen.findByRole("alert");
     expect(screen.queryByRole("button", { name: "View report" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();

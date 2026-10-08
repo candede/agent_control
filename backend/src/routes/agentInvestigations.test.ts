@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { huntingAgentRecordId } from "./defenderHunting.js";
+import { huntingAgentRecordId, huntingTarget } from "./defenderHunting.js";
 import { agentPurviewQuery } from "./unifiedAgents.js";
 
 const recordId = "agent:11111111-1111-4111-8111-111111111111";
 
 describe("agent investigation request contracts", () => {
+  it("binds human and agent independently and rejects ambiguous human targets", () => {
+    const userObjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    expect(huntingTarget({ query: {}, body: {} })).toBeUndefined();
+    expect(huntingTarget({ query: { userObjectId }, body: {} })).toEqual({ userObjectId });
+    expect(huntingTarget({ query: { agentRecordId: recordId }, body: { userObjectId } })).toEqual({ agentRecordId: recordId, userObjectId });
+    for (const input of [
+      { query: { userObjectId: [userObjectId] }, body: {} },
+      { query: { userObjectId }, body: { userObjectId: recordId.slice(6) } },
+      { query: {}, body: { userObjectId: null } },
+      { query: { userObjectId: "reader@example.invalid" }, body: {} },
+    ]) expect(() => huntingTarget(input)).toThrow();
+  });
   it("supports query/body context across the lifecycle, rejecting ambiguous references", () => {
     expect(huntingAgentRecordId({ query: {}, body: {} })).toBeUndefined();
     expect(huntingAgentRecordId({ query: { agentRecordId: recordId }, body: undefined })).toBe(recordId);

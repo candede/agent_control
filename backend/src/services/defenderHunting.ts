@@ -4,7 +4,7 @@ import { findTenantConfiguration } from "../config.js";
 import { DefenderHuntingRepository, type DefenderHuntingExecution, type DefenderHuntingReadScope, type DefenderHuntingScope } from "../db/defenderHunting.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import type { DefenderHuntingJob, DefenderHuntingQualificationBinding, DefenderHuntingTokenMode } from "../types/defenderHunting.js";
+import type { DefenderHuntingJob, DefenderHuntingQualificationBinding, DefenderHuntingTokenMode, DefenderHuntingTarget } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
@@ -14,6 +14,7 @@ import { GraphHuntingClient, validateDefenderHuntingFilters } from "./graphHunti
 import { operationalLog } from "./telemetry.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { agentInvestigations, assertAgentHuntingScope, bindAgentHuntingFilters } from "./agentInvestigations.js";
+import { isDirectoryObjectId } from "../types/copilotPackage.js";
 
 type CapabilityId = "defender.hunting.delegated" | "defender.hunting.application";
 type Dependencies = {
@@ -59,10 +60,11 @@ export class DefenderHuntingService {
 
   constructor(private readonly repository = new DefenderHuntingRepository(), private readonly dependencies: Dependencies = defaultDependencies) {}
 
-  async submit(user: AuthenticatedUser, input: { tokenMode: DefenderHuntingTokenMode; filters: unknown; idempotencyKey: string; agentRecordId?: string }) {
+  async submit(user: AuthenticatedUser, input: { tokenMode: DefenderHuntingTokenMode; filters: unknown; idempotencyKey: string } & DefenderHuntingTarget) {
     requireViewer(user);
     const agent = input.agentRecordId === undefined ? undefined : await this.dependencies.agentScope(actorScope(user), input.agentRecordId);
-    const filters = validateDefenderHuntingFilters(agent ? bindAgentHuntingFilters(input.filters, agent) : input.filters);
+    const selected = bindUserFilters(input.filters, input.userObjectId);
+    const filters = validateDefenderHuntingFilters(agent ? bindAgentHuntingFilters(selected, agent) : selected);
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
@@ -76,10 +78,11 @@ export class DefenderHuntingService {
     return this.repository.submit(scope, { idempotencyKey: input.idempotencyKey, filters, retainedScope });
   }
 
-  async approveQualification(user: AuthenticatedUser, input: { tokenMode: DefenderHuntingTokenMode; filters: unknown; agentRecordId?: string }) {
+  async approveQualification(user: AuthenticatedUser, input: { tokenMode: DefenderHuntingTokenMode; filters: unknown } & DefenderHuntingTarget) {
     requireQualificationRole(user, input.tokenMode);
     const agent = input.agentRecordId === undefined ? undefined : await this.dependencies.agentScope(actorScope(user), input.agentRecordId);
-    const filters = validateDefenderHuntingFilters(agent ? bindAgentHuntingFilters(input.filters, agent) : input.filters, { qualification: true });
+    const selected = bindUserFilters(input.filters, input.userObjectId);
+    const filters = validateDefenderHuntingFilters(agent ? bindAgentHuntingFilters(selected, agent) : selected, { qualification: true });
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
@@ -91,18 +94,18 @@ export class DefenderHuntingService {
     });
   }
 
-  async startQualification(user: AuthenticatedUser, id: string, agentRecordId?: string) {
+  async startQualification(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    return this.startAuthorized(user, id, undefined, agentRecordId, true);
+    return this.startAuthorized(user, id, undefined, target, true);
   }
 
-  start(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, agentRecordId?: string): Promise<DefenderHuntingJob> {
+  start(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, target?: DefenderHuntingTarget): Promise<DefenderHuntingJob> {
     requireViewer(user);
-    return this.startAuthorized(user, id, tokenMode, agentRecordId);
+    return this.startAuthorized(user, id, tokenMode, target);
   }
 
   private startAuthorized(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
-    agentRecordId?: string, qualificationOnly = false): Promise<DefenderHuntingJob> {
+    target?: DefenderHuntingTarget, qualificationOnly = false): Promise<DefenderHuntingJob> {
     id = id.toLowerCase();
     if (this.draining) throw new AppError(503, "hunting_shutdown", "Hunting is stopping for application shutdown.");
     requireProviderAdmissions();
@@ -112,13 +115,13 @@ export class DefenderHuntingService {
     const existing = this.active.get(id);
     if (existing) {
       return existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId
-        && existing.tokenMode === tokenMode && existing.qualificationOnly === qualificationOnly && agentRecordId === undefined
-        ? existing.started : this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly);
+        && existing.tokenMode === tokenMode && existing.qualificationOnly === qualificationOnly && target === undefined
+        ? existing.started : this.currentJobForStart(user, id, tokenMode, target, qualificationOnly);
     }
-    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly);
+    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, target, qualificationOnly);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(activationDeadlineMs)]);
-    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, validation, agentRecordId, qualificationOnly);
+    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, validation, target, qualificationOnly);
     const started = prepared.then(value => value.job);
     let operation: Promise<void>;
     operation = prepared.then(value => value.run?.(), error => {
@@ -133,35 +136,35 @@ export class DefenderHuntingService {
     return started;
   }
 
-  async get(user: AuthenticatedUser, id: string, agentRecordId?: string) {
+  async get(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    const scope = await this.readScope(user, agentRecordId);
+    const scope = await this.readScope(user, target);
     const job = await this.repository.getJob(scope, id);
     if (!job) throw new AppError(404, "not_found", "Hunting job was not found.");
-    if (scope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: agentRecordId!, entraAgentIds: scope.entraAgentIds, entraAgentApplicationIds: scope.entraAgentApplicationIds });
+    if (scope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: target!.agentRecordId!, entraAgentIds: scope.entraAgentIds, entraAgentApplicationIds: scope.entraAgentApplicationIds });
     return job;
   }
 
-  async list(user: AuthenticatedUser, limit = 20, offset = 0, agentRecordId?: string) {
+  async list(user: AuthenticatedUser, limit = 20, offset = 0, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    return this.repository.listJobs(await this.readScope(user, agentRecordId), limit, offset);
+    return this.repository.listJobs(await this.readScope(user, target), limit, offset);
   }
 
-  async qualificationEvidence(user: AuthenticatedUser, agentRecordId?: string) {
+  async qualificationEvidence(user: AuthenticatedUser, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    return this.repository.listQualificationEvidence(await this.readScope(user, agentRecordId));
+    return this.repository.listQualificationEvidence(await this.readScope(user, target));
   }
 
-  async retainedScopes(user: AuthenticatedUser, agentRecordId?: string) {
+  async retainedScopes(user: AuthenticatedUser, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    return this.repository.listRetainedScopes(await this.readScope(user, agentRecordId));
+    return this.repository.listRetainedScopes(await this.readScope(user, target));
   }
 
-  async revokeRetainedScope(user: AuthenticatedUser, id: string, agentRecordId?: string) {
+  async revokeRetainedScope(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    const readScope = await this.readScope(user, agentRecordId);
+    const readScope = await this.readScope(user, target);
     const retained = (await this.repository.listRetainedScopes(readScope)).find(scope => scope.id === id);
-    if (retained && readScope.entraAgentIds) assertAgentHuntingScope(retained.approvedScope, { recordId: agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
+    if (retained && readScope.entraAgentIds) assertAgentHuntingScope(retained.approvedScope, { recordId: target!.agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
     if (!retained || (retained.tokenMode === "delegated" &&
       (retained.resultScope.kind !== "principal" || retained.resultScope.scopeId !== user.homeAccountId))) {
       throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
@@ -170,27 +173,27 @@ export class DefenderHuntingService {
     return this.repository.revokeRetainedScope(readScope, id, retained.tokenMode, user.homeAccountId);
   }
 
-  async rows(user: AuthenticatedUser, id: string, limit = 100, offset = 0, agentRecordId?: string) {
+  async rows(user: AuthenticatedUser, id: string, limit = 100, offset = 0, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    return this.repository.listRows(await this.readScope(user, agentRecordId), id, limit, offset);
+    return this.repository.listRows(await this.readScope(user, target), id, limit, offset);
   }
 
-  async cancel(user: AuthenticatedUser, id: string, agentRecordId?: string) {
+  async cancel(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    const readScope = await this.readScope(user, agentRecordId);
+    const readScope = await this.readScope(user, target);
     const job = await this.repository.getJob(readScope, id);
     if (!job) throw new AppError(404, "not_found", "Hunting job was not found.");
-    if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
+    if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: target!.agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
     this.active.get(job.id.toLowerCase())?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting was cancelled locally."));
     return this.repository.cancel(readScope, id);
   }
 
-  async delete(user: AuthenticatedUser, id: string, agentRecordId?: string) {
+  async delete(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
     requireViewer(user);
-    const readScope = await this.readScope(user, agentRecordId);
+    const readScope = await this.readScope(user, target);
     const job = await this.repository.getJob(readScope, id);
     if (!job) throw new AppError(404, "not_found", "Hunting job was not found.");
-    if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
+    if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: target!.agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
     this.active.get(job.id.toLowerCase())?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting local cache was deleted."));
     await this.repository.delete(readScope, id);
   }
@@ -216,8 +219,8 @@ export class DefenderHuntingService {
 
   private async prepareStart(user: AuthenticatedUser, actor: { tenantId: string; principalId: string }, id: string,
     tokenMode: DefenderHuntingTokenMode | undefined, signal: AbortSignal, cancellationSignal: AbortSignal,
-    validation: SessionValidation, agentRecordId?: string, qualificationOnly = false) {
-    const current = await abortable(this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly, signal), signal);
+    validation: SessionValidation, target?: DefenderHuntingTarget, qualificationOnly = false) {
+    const current = await abortable(this.currentJobForStart(user, id, tokenMode, target, qualificationOnly, signal), signal);
     assertCurrent(validation, signal);
     if (current.status !== "waiting_authorization") return { job: current };
     const scope = scopeFromResult(user, current.tokenMode, current.resultScope);
@@ -233,17 +236,17 @@ export class DefenderHuntingService {
       }
       throw error;
     }
-    return { job: execution.job, run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal, validation, agentRecordId) };
+    return { job: execution.job, run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal, validation, target) };
   }
 
   private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
-    agentRecordId?: string, qualificationOnly = false, signal?: AbortSignal) {
-    const readScope = await abortable(this.readScope(user, agentRecordId), signal);
+    target?: DefenderHuntingTarget, qualificationOnly = false, signal?: AbortSignal) {
+    const readScope = await abortable(this.readScope(user, target), signal);
     signal?.throwIfAborted();
     const current = await abortable(this.repository.getJob(readScope, id), signal);
     if (!current || current.authorizationPrincipalId !== user.homeAccountId || tokenMode !== undefined && current.tokenMode !== tokenMode
       || qualificationOnly && !current.qualification) throw new AppError(404, "not_found", "Hunting job was not found.");
-    if (readScope.entraAgentIds) assertAgentHuntingScope(current.filters, { recordId: agentRecordId!,
+    if (readScope.entraAgentIds) assertAgentHuntingScope(current.filters, { recordId: target!.agentRecordId!,
       entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
     if (current.qualification) {
       requireQualificationRole(user, current.tokenMode);
@@ -253,14 +256,14 @@ export class DefenderHuntingService {
   }
 
   private async run(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope, current: DefenderHuntingJob,
-    execution: DefenderHuntingExecution, signal: AbortSignal, cancellationSignal: AbortSignal, validation: SessionValidation, agentRecordId?: string) {
+    execution: DefenderHuntingExecution, signal: AbortSignal, cancellationSignal: AbortSignal, validation: SessionValidation, target?: DefenderHuntingTarget) {
     let auditEvent: Awaited<ReturnType<ReturnType<typeof getAuditLog>["startEvent"]>> | undefined;
     let providerRequestAuthorized = false;
     let providerCompleted = false;
     let phaseSignal = signal;
     const pendingAdmissions: Promise<void>[] = [];
     try {
-      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal, validation, agentRecordId);
+      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal, validation, target);
       const token = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => {
         assertCurrent(validation, signal);
         return abortable(scope.tokenMode === "delegated" ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
@@ -281,7 +284,7 @@ export class DefenderHuntingService {
       const result = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => this.dependencies.runQuery(token, current.filters, {
         signal, correlationId: current.localRequestId, tenantId: actor.tenantId,
         beforeRequest: async (requestSignal = signal) => {
-          await this.validateCurrentAuthority(actor, scope, current, requestSignal, validation, agentRecordId);
+          await this.validateCurrentAuthority(actor, scope, current, requestSignal, validation, target);
           const admission = commitAccountSessionValidation(validation, async () => {
             assertCurrent(validation, requestSignal);
             await this.repository.authorizeProviderRequest(scope, current.id, execution);
@@ -298,7 +301,7 @@ export class DefenderHuntingService {
       signal.throwIfAborted();
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
       phaseSignal = publicationSignal;
-      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, current, publicationSignal, validation, agentRecordId);
+      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, current, publicationSignal, validation, target);
       // Keep durable writes joined until their commit fence and transaction cleanup settle.
       const job = await commitAccountSessionValidation(validation, async () => {
         assertCurrent(validation, publicationSignal);
@@ -367,7 +370,7 @@ export class DefenderHuntingService {
   }
 
   private async validateCurrentAuthority(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope,
-    current: DefenderHuntingJob, signal: AbortSignal, validation: SessionValidation, agentRecordId?: string) {
+    current: DefenderHuntingJob, signal: AbortSignal, validation: SessionValidation, target?: DefenderHuntingTarget) {
     assertCurrent(validation, signal);
     const freshUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal);
     assertCurrent(validation, signal);
@@ -385,8 +388,8 @@ export class DefenderHuntingService {
       throw new AppError(403, "hunting_scope_unqualified", "Application hunting requires an exact current retained-scope qualification.");
     }
     assertCurrent(validation, signal);
-    if (agentRecordId !== undefined) {
-      const agent = await abortable(this.dependencies.agentScope(actorScope(freshUser), agentRecordId), signal);
+    if (target?.agentRecordId !== undefined) {
+      const agent = await abortable(this.dependencies.agentScope(actorScope(freshUser), target.agentRecordId), signal);
       assertAgentHuntingScope(current.filters, agent);
     }
     assertCurrent(validation, signal);
@@ -411,9 +414,10 @@ export class DefenderHuntingService {
     return scopeFor(user, tokenMode, configuration?.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
   }
 
-  private async readScope(user: AuthenticatedUser, agentRecordId?: string): Promise<DefenderHuntingReadScope> {
+  private async readScope(user: AuthenticatedUser, target?: DefenderHuntingTarget): Promise<DefenderHuntingReadScope> {
     if (!user.tenantId) throw AppError.unauthorized("Hunting requires a tenant scope.");
-    const agent = agentRecordId === undefined ? undefined : await this.dependencies.agentScope(actorScope(user), agentRecordId);
+    const userObjectId = huntingUserId(target?.userObjectId);
+    const agent = target?.agentRecordId === undefined ? undefined : await this.dependencies.agentScope(actorScope(user), target.agentRecordId);
     const delegatedScope = scopeFor(user, "delegated").resultScope;
     const delegatedAuthority = await this.dependencies.qualificationContext("defender.hunting.delegated", user);
     const resultScopes = [delegatedScope];
@@ -425,6 +429,7 @@ export class DefenderHuntingService {
     }
     catch (error) { if (!(error instanceof AppError && error.code === "not_configured")) throw error; }
     return { tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId, resultScopes, qualifications,
+      ...(userObjectId ? { userObjectId } : {}),
       ...(agent ? { entraAgentIds: agent.entraAgentIds, entraAgentApplicationIds: agent.entraAgentApplicationIds } : {}),
       ...(hasAppRole(user.roles, "AgentControl.Viewer") ? { inventoryIdentityScope: {
         principalId: user.homeAccountId, resourceTypes: [...powerPlatformResourceTypes],
@@ -433,6 +438,24 @@ export class DefenderHuntingService {
 }
 
 export const defenderHunting = new DefenderHuntingService();
+
+function huntingUserId(value: unknown) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !isDirectoryObjectId(value)) {
+    throw new AppError(400, "invalid_hunting_target", "Select an exact directory user.");
+  }
+  return value.toLowerCase();
+}
+
+function bindUserFilters(value: unknown, userObjectId?: string) {
+  const user = huntingUserId(userObjectId);
+  if (!user) return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || "userObjectId" in value && (typeof value.userObjectId !== "string" || value.userObjectId.toLowerCase() !== user)) {
+    throw new AppError(400, "invalid_hunting_target", "The hunting filters do not match the selected user.");
+  }
+  return { ...value, userObjectId: user };
+}
 
 function capabilityForMode(mode: DefenderHuntingTokenMode): CapabilityId {
   return mode === "delegated" ? "defender.hunting.delegated" : "defender.hunting.application";

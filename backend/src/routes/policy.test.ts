@@ -43,6 +43,7 @@ describe("route policy declarations", () => {
       "POST /official-usage/bundles/:id/preview", "POST /official-usage/bundles/:id/accept",
       "POST /official-usage/sets/:id/preview", "POST /official-usage/confirmations/:id",
       "GET /agent-inventory/:recordId/usage-candidates", "GET /agent-inventory/:recordId/usage", "GET /agent-inventory/:recordId/usage-associations", "GET /agent-inventory/:recordId/usage-users",
+      "GET /agent-inventory/:recordId/usage-history",
       "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
       "POST /data-exports", "GET /data-exports/:id", "DELETE /data-exports/:id", "GET /data-exports/:id/download",
       "GET /audit-search/catalog", "POST /audit-search/qualifications", "POST /audit-search/qualifications/:id/start",

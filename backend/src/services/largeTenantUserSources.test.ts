@@ -767,7 +767,7 @@ describe("dormant user-source foundation", () => {
     } }])).toThrow("another tenant");
   });
 
-  it("preserves empty, stale and expired source distinctions with captured evaluation time", async () => {
+  it("preserves empty and aged published sources with captured evaluation time", async () => {
     const identity = { ...selectionIdentity, principalId: "freshness" };
     const stages = new UserSourceStages(fixture.runtime);
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
@@ -783,7 +783,7 @@ describe("dormant user-source foundation", () => {
     expect((await repository.page(selected.id, identity)).sources.app_activity.state).toBe("stale");
     await repository.connections.selectedRead(async client => {
       const source = await repository.metadataInRead(client, { ...identity, tokenMode: "delegated" }, new Date(Date.now() + 2 * 86_400_000));
-      expect(source.app_activity).toMatchObject({ state: "unavailable", rowCount: null, generationId: null });
+      expect(source.app_activity).toMatchObject({ state: "stale", rowCount: expect.any(Number), generationId: expect.any(String) });
     });
   });
 
@@ -811,7 +811,7 @@ describe("dormant user-source foundation", () => {
         expect(current.app_activity).toMatchObject({ state, attemptStatus: "running" });
         expect(current.app_activity.generationId).not.toBeNull();
         const expired = await repository.metadataInRead(client, scope, new Date(Date.now() + 2 * 86_400_000));
-        expect(expired.app_activity).toMatchObject({ state: "unavailable", attemptStatus: "running", generationId: null });
+        expect(expired.app_activity).toMatchObject({ state: "stale", attemptStatus: "running", generationId: current.app_activity.generationId });
       });
     } finally { await generations.abort(lease); }
   });

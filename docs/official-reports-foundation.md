@@ -27,7 +27,8 @@ Import validates:
 - tenant and Admin authorization;
 - complete storage before acceptance.
 
-An exact duplicate selects the accepted report set without storing another copy.
+An exact duplicate reuses the accepted report set without storing another copy
+or changing the selection.
 Failed imports do not replace accepted data.
 
 ## Selection
@@ -37,6 +38,13 @@ the tenant and authorized user.
 
 Changing the selected set changes the displayed report data but does not delete
 another set or trigger provider collection.
+
+The import wizard automatically selects only the tenant's first complete report
+set. Later wizard imports preserve the selection, even if it is empty. The first
+acceptance is identified by the durable tenant history revision under the same
+transactional locks as publication, not by the number of retained sets or an
+empty active selection. Deletion, retention, and receipt retries cannot reset
+this exception.
 
 ## Associations
 

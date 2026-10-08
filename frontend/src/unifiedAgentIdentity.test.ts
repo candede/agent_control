@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
 import type { UnifiedAgentRecord } from "./api/client";

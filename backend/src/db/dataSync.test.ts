@@ -185,7 +185,7 @@ describe.sequential("Data sync repository", () => {
     expect(saved.sources.app_activity).toMatchObject({ attemptStatus: "available", rowCount: 0, reportRefreshDate: null });
   });
 
-  it("withholds expired source rows and counts at the captured read time even when the last attempt succeeded", async () => {
+  it("retains authorized current source rows and counts beyond freshness at the captured read time", async () => {
     const owner = { ...scope, principalId: "expired-user-sources" };
     await publishFixtureDirectory(fixture.runtime, identity(owner), []);
     await publishFixtureEmptyActivity(fixture.runtime, identity(owner));
@@ -193,7 +193,7 @@ describe.sequential("Data sync repository", () => {
     await reader.connections.selectedRead(async client => {
       const saved = await reader.metadataInRead(client, { ...owner, tokenMode: "delegated" }, new Date(Date.now() + 2 * 86400000));
       for (const source of [saved.directory, saved.app_activity]) expect(source).toMatchObject({
-        state: "unavailable", generationId: null, rowCount: null, observedAt: null,
+        state: "stale", generationId: expect.any(String), rowCount: 0, observedAt: expect.any(String),
       });
     });
   });

@@ -4287,7 +4287,7 @@ BEGIN
     WHERE g.id=NEW.generation_id AND g.scope_id=NEW.scope_id AND g.tenant_id=NEW.tenant_id
       AND g.expected_revision=OLD.revision AND g.state='validating' AND g.validated
       AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.cancellation=0
-      AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp() AND g.expires_at>clock_timestamp())
+      AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp())
   THEN RAISE EXCEPTION 'data_head_fenced'; END IF;
   RETURN NEW;
 END$$;
@@ -4633,7 +4633,7 @@ BEGIN
         CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) input("baselineId" uuid,revision bigint,epoch bigint,"expiresAt" timestamptz)
         JOIN data_scope_epochs source ON source.id=OLD.scope_id
         WHERE v.inputs @> jsonb_build_array(jsonb_build_object('baselineId',OLD.baseline_id::text))
-          AND input."baselineId"=OLD.baseline_id AND input.epoch=source.epoch AND input."expiresAt">clock_timestamp()
+          AND input."baselineId"=OLD.baseline_id AND input.epoch=source.epoch
           AND input.revision>=OLD.valid_from_revision AND (OLD.valid_to_revision IS NULL OR input.revision<OLD.valid_to_revision)
           AND (canonical.current AND canonical.revision=v.revision OR EXISTS(SELECT 1 FROM data_generation_pins p
             WHERE p.generation_id=canonical.baseline_id AND p.revision=v.revision AND p.expires_at>clock_timestamp())))
@@ -4655,7 +4655,7 @@ BEGIN
       CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) input("baselineId" uuid,revision bigint,epoch bigint,"expiresAt" timestamptz)
       JOIN data_scope_epochs source ON source.id=OLD.scope_id
       WHERE v.inputs @> jsonb_build_array(jsonb_build_object('baselineId',OLD.baseline_id::text))
-        AND input."baselineId"=OLD.baseline_id AND input.revision=OLD.revision AND input.epoch=source.epoch AND input."expiresAt">clock_timestamp()
+        AND input."baselineId"=OLD.baseline_id AND input.revision=OLD.revision AND input.epoch=source.epoch
         AND (canonical.current AND canonical.revision=v.revision OR EXISTS(SELECT 1 FROM data_generation_pins p
           WHERE p.generation_id=canonical.baseline_id AND p.revision=v.revision AND p.expires_at>clock_timestamp())))
     THEN RAISE EXCEPTION 'inventory_revision_pinned'; END IF;

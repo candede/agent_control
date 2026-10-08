@@ -1,3 +1,10 @@
+.agent-log-source-picker {
+  display: grid;
+  gap: 6px;
+  width: min(100%, 240px);
+  margin-bottom: 16px;
+}
+
 .agent-usage-trend {
   display: grid;
   gap: 12px;

@@ -26,6 +26,7 @@ export type DefenderHuntingReadScope = {
   inventoryIdentityScope?: InventoryIdentityReadScope;
   entraAgentIds?: string[];
   entraAgentApplicationIds?: string[];
+  userObjectId?: string;
 };
 
 export type DefenderHuntingExecution = { owner: string; version: number };
@@ -540,7 +541,15 @@ function retainedScopeWhere(scope: DefenderHuntingReadScope, alias: string) {
 }
 
 function agentScopePredicate(scope: DefenderHuntingReadScope, filters: string, values: unknown[]) {
-  if (scope.entraAgentIds === undefined && scope.entraAgentApplicationIds === undefined) return "";
+  let user = "";
+  if (scope.userObjectId !== undefined) {
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(scope.userObjectId)) {
+      throw new AppError(403, "scope_mismatch", "An exact directory user identity is required.");
+    }
+    values.push(scope.userObjectId);
+    user = ` AND ${filters}->>'userObjectId'=$${values.length}`;
+  }
+  if (scope.entraAgentIds === undefined && scope.entraAgentApplicationIds === undefined) return user;
   const objects = scope.entraAgentIds ?? [];
   const applications = scope.entraAgentApplicationIds ?? [];
   if (!objects.length && !applications.length || [objects, applications].some(ids => ids.length > 1
@@ -558,7 +567,7 @@ function agentScopePredicate(scope: DefenderHuntingReadScope, filters: string, v
     clauses.push(`(${filters}->>'templateId' IN ('agent_activity','agent_tools') AND ${filters}->'entraAgentApplicationIds'=$${values.length}::jsonb
       AND COALESCE(${filters}->'entraAgentIds','[]'::jsonb)='[]'::jsonb)`);
   }
-  return ` AND (${clauses.join(" OR ")}) AND ${filters}->'agentIds'='[]'::jsonb AND ${filters}->'blueprintIds'='[]'::jsonb`;
+  return `${user} AND (${clauses.join(" OR ")}) AND ${filters}->'agentIds'='[]'::jsonb AND ${filters}->'blueprintIds'='[]'::jsonb`;
 }
 
 function qualificationEvidencePredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
@@ -654,6 +663,7 @@ function priorSuccessfulJobSelect(alias: string) {
 export function huntingTargetScope(filters: DefenderHuntingFilters) {
   return { templateId: filters.templateId, agentIds: [...filters.agentIds].sort(ordinal), blueprintIds: [...filters.blueprintIds].sort(ordinal),
     actorObjectIds: [...filters.actorObjectIds].sort(ordinal), operations: [...filters.operations].sort(ordinal),
+    ...(filters.userObjectId !== undefined ? { userObjectId: filters.userObjectId } : {}),
     ...(filters.entraAgentIds !== undefined ? { entraAgentIds: [...filters.entraAgentIds].sort(ordinal) } : {}),
     ...(filters.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...filters.entraAgentApplicationIds].sort(ordinal) } : {}) };
 }
@@ -716,6 +726,7 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
       || filters.entraAgentApplicationIds?.length && ![row.targetAgentId, row.agentId].some(value => value && filters.entraAgentApplicationIds!.includes(value.toLowerCase()))
       || selectedBlueprintIds.length && !blueprints.some(value => value && selectedBlueprintIds.includes(value.toLowerCase()))
       || selectedActorIds.length && (!row.actorAccountObjectId || !selectedActorIds.includes(row.actorAccountObjectId.toLowerCase()))
+      || filters.userObjectId && (row.actionType !== "InvokeAgent" || row.humanActorUserObjectId !== filters.userObjectId)
       || row.rootSpanObserved !== rootSpanObserved || row.spanRole !== (rootSpanObserved ? "root_invoke_agent" : row.parentSpanId ? "child" : "unresolved")
       || row.contentAvailable !== false || !isExactStateRecord(row.fieldStates, activityFieldStateKeys, activityFieldStates)) throw invalidPublication();
   }

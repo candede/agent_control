@@ -39,7 +39,8 @@ export async function captureInventorySelection(route: Route, metadata: UnifiedA
   if (!selections) { selections = new Map(); captures.set(page, selections); }
   const selection = { ...metadata, id: randomUUID() };
   selections.set(selection.id, { selection, query: Object.freeze({ ...body.query }) as Readonly<Record<string, string>>, records: new Map() });
-  return route.fulfill({ status: 201, json: selection });
+  return route.fulfill({ status: 201, json: { id: selection.id, revision: selection.revision,
+    evaluatedAt: selection.evaluatedAt, validatedAt: selection.validatedAt, expiresAt: selection.expiresAt } });
 }
 
 export function inventoryFixtureQuery(route: Route) {

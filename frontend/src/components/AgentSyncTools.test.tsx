@@ -209,7 +209,7 @@ describe("AgentSyncTools", () => {
     expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
   });
 
-  it.each(["not_collected", "preparing"] as const)("withdraws a previous receipt when inventory becomes %s", async state => {
+  it.each(["not_collected", "preparing", "unavailable"] as const)("withdraws a previous receipt when inventory becomes %s", async state => {
     const actions = props({ inventory: inventory(), selectedPackageCount: 1 });
     const view = render(<AgentSyncTools {...actions} />);
     await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));

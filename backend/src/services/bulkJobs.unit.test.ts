@@ -109,6 +109,10 @@ describe("bulk job execution boundaries", () => {
   });
 
   describe("read-only package reconciliation boundaries", () => {
+    beforeEach(() => {
+      vi.spyOn(bulkJobs, "settleInventoryControls").mockResolvedValue(undefined);
+    });
+
     it.each(["verified_applied", "verified_not_applied", "conflict"] as const)(
       "preserves read-only %s evidence without requiring write authority", async outcome => {
         vi.spyOn(bulkJobs, "get").mockResolvedValue(jobSummary);
@@ -133,6 +137,7 @@ describe("bulk job execution boundaries", () => {
           .toMatchObject({ id: "job", reconciliation: { attempted: 1, failed: 0, errors: [] } });
         expect(records).toHaveBeenCalledWith(scope, "item", outcome, expect.anything(), expect.any(String),
           expect.objectContaining({ inventoryGeneration: "generation", details: expect.objectContaining({ id: "package" }) }));
+        expect(bulkJobs.settleInventoryControls).toHaveBeenCalledWith(scope, expect.any(AbortSignal), expect.any(Function));
         expect(authorize).toHaveBeenCalledTimes(3);
         expect(authorize.mock.calls.every(([, capability]) => capability === "graph.package.read.delegated")).toBe(true);
         expect(fetcher).toHaveBeenCalledOnce();
@@ -191,6 +196,42 @@ describe("bulk job execution boundaries", () => {
         expect(fetcher.mock.calls.every(([, request]) => !request?.method || request.method === "GET")).toBe(true);
       },
     );
+  });
+
+  it("waits for verified control publication before releasing the completed job", async () => {
+    const repository = fakeRepository();
+    let publish!: () => void;
+    repository.settleInventoryControls.mockResolvedValueOnce(undefined).mockImplementationOnce(
+      () => new Promise<void>(resolve => { publish = resolve; }),
+    );
+    let blocked = false;
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
+      return Response.json({ id: "package", displayName: "Package", isBlocked: blocked });
+    });
+    const execution = runBulkJob("job", scope, false, repository, provider(fetcher), async () => "token");
+    await vi.waitFor(() => expect(repository.settleInventoryControls).toHaveBeenCalledTimes(2));
+    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), "item", "succeeded", expect.anything());
+    expect(repository.release).not.toHaveBeenCalled();
+    publish();
+    await execution;
+    expect(repository.release).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
+  });
+
+  it("surfaces publication failure without overwriting verified evidence or replaying the write", async () => {
+    const repository = fakeRepository();
+    const failure = new Error("Saved inventory publication failed.");
+    repository.settleInventoryControls.mockResolvedValueOnce(undefined).mockRejectedValueOnce(failure);
+    let blocked = false;
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
+      return Response.json({ id: "package", displayName: "Package", isBlocked: blocked });
+    });
+    await expect(runBulkJob("job", scope, false, repository, provider(fetcher), async () => "token")).rejects.toBe(failure);
+    expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), "item", "succeeded", expect.anything());
+    expect(repository.release).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
   it.each((["block", "update-availability", "update-installation"] as const).flatMap(action =>

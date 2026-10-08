@@ -148,7 +148,7 @@ describe("compact shared report-set selection", () => {
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
   });
-  it("retires a preview when history automatically replaces its invalidated selection", async () => {
+  it("retires an invalidated preview without replacement until explicit retry", async () => {
     const pending = deferred<OfficialReportConfirmation>(), replacement = deferred<OfficialReportConfirmation>(), onChanged = vi.fn();
     vi.mocked(api.previewReportOperation).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
@@ -156,6 +156,10 @@ describe("compact shared report-set selection", () => {
     const signal = vi.mocked(api.previewReportOperation).mock.calls[0][2];
     vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed"));
     fireEvent.focus(window);
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(signal?.aborted).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
     expect(signal?.aborted).toBe(true);
     await ready();
@@ -260,10 +264,12 @@ describe("compact shared report-set selection", () => {
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
     const select = await ready();
     if (phase === "confirmation") await choose();
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2030-01-01T00:00:01.000Z"));
+    const selected = page().selection;
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(selected.expiresAt) - Date.parse(selected.validatedAt) + 1);
     if (phase === "admission") fireEvent.change(select, { target: { value: second.id } });
     else await act(async () => pending.resolve(confirmation()));
-    expect(await screen.findByRole("alert")).toHaveTextContent(/expired/i);
+    fireEvent.focus(window);
+    expect(await screen.findByText(/Showing saved report sets/)).toBeVisible();
     expect(api.previewReportOperation).toHaveBeenCalledTimes(phase === "admission" ? 0 : 1);
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
@@ -538,13 +544,16 @@ describe("compact shared report-set selection", () => {
     await act(async () => pending.resolve(confirmation()));
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
   });
-  it.each([false, true])("recovers history invalidation once and offers explicit retry when persistent=%s", async persistent => {
+  it.each([false, true])("requires explicit history replacement after each invalidation when persistent=%s", async persistent => {
     vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...page(), page: { limit: 50, nextCursor: "next", previousCursor: null } })
       .mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "A retained report was deleted"));
     if (persistent) vi.mocked(api.readReportPage).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "History changed again"));
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
     await ready();
     await userEvent.selectOptions(await ready(), "older-reports");
+    await screen.findByRole("alert");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     if (persistent) {
       await screen.findByRole("alert");
       expect(api.readReportPage).toHaveBeenCalledTimes(3);

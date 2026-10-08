@@ -14,6 +14,11 @@ import { createSavedQueryClient } from "../savedQueries";
 import { usageDate } from "../usageInsights";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { AgentUsagePanel } from "./AgentUsagePanel";
+import { UserDetailModal } from "./UserDetailModal";
+
+vi.mock("./UserDetailModal", () => ({
+  UserDetailModal: vi.fn(({ identity }: { identity: string }) => <div aria-label="Scoped user logs">{identity}</div>),
+}));
 
 const paging = vi.hoisted(() => ({ links: undefined as ComponentProps<typeof import("./ReportPageControls").ReportPageControls> | undefined }));
 vi.mock("./ReportPageControls", async original => {
@@ -76,6 +81,17 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("restored agent usage and users", () => {
+  it("opens user Logs against the saved inventory agent, not a CSV agent ID, and closes when hidden", async () => {
+    const view = renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "View logs for person0@example.invalid on Excel" }));
+    expect(UserDetailModal).toHaveBeenLastCalledWith(expect.objectContaining({
+      identity: "person0@example.invalid", kind: "report", initialTab: "purview",
+      investigationAgent: { recordId: record.id, name: "Excel" }, selectionId: context.selectionId,
+    }), undefined);
+    expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
+    view.rerender(view.content({ view: "usage" }));
+    expect(screen.queryByLabelText("Scoped user logs")).not.toBeInTheDocument();
+  });
   it.each(["page", "revision", "disabled", "account", "unmount"] as const)(
     "retires report-link callbacks across %s changes", async boundary => {
       const view = renderPanel();

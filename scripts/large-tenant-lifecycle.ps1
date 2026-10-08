@@ -7,7 +7,8 @@ function Invoke-LargeTenantRuntimeFixture {
     $architectures = @($Baseline,$browser | ForEach-Object { Invoke-DockerCommand @('image','inspect','--format','{{.Architecture}}',$_) -Capture })
     if (@($architectures | Select-Object -Unique).Count -ne 1) { throw 'Installed dependency and browser architectures differ.' }
     $images = @{}
-    foreach ($target in @('operator','runtime','permission-browser-test')) {
+    $targets = if ($Suite -eq 'restart') { @('qualification','runtime') } else { @('qualification','runtime','permission-browser-test') }
+    foreach ($target in $targets) {
         $tag = "${Project}-${target}:local"
         Invoke-DockerCommand @('build','--network','none','--build-arg',"DEPENDENCY_BASE=$Baseline",
             '--build-arg',"BROWSER_BASE=$browser",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1','--target',$target,'-t',$tag,$Root)
@@ -42,7 +43,7 @@ services:
       timeout: 3s
       retries: 90
   test-db:
-    image: $($images.operator.tag)
+    image: $($images.qualification.tag)
     mem_limit: 1536m
     cpus: 1.5
     networks: [fixture]
@@ -102,6 +103,7 @@ networks:
             [IO.File]::WriteAllText($runtimeCompose,"services:`n  test-db:`n    image: $($images.runtime.tag)`n    read_only: true`n    working_dir: /app`n")
             $runtime = @('--user',"${uid}:${gid}",'-v',"${receipt}:/evidence/restart-fixture.json:ro",
                 '-v',"$Root/backend/scripts/restart-runtime.mjs:/fixture.mjs:ro",
+                '-v',"$Root/backend/scripts/officialReportFingerprint.ts:/app/backend/scripts/officialReportFingerprint.ts:ro",
                 '-e','PGUSER=agentcontrol_app','-e','PGPASSWORD=isolated-fixture-password-never-production-01',
                 '-e','SESSION_SECRET=synthetic-restart-session-secret-0000001',
                 '-e','TENANTS_JSON=[{"tenantId":"11111111-1111-4111-8111-111111111111","clientId":"22222222-2222-4222-8222-222222222222","clientSecret":"synthetic-restart-client-secret","domains":["example.invalid"]}]',

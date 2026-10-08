@@ -21,6 +21,7 @@ type Props = {
   controls?: ReactNode;
   selectionAction?: ReactNode;
   loading?: boolean;
+  loadingMessage?: string;
   emptyState?: ReactNode;
   busyPackageId?: string;
   selectedPackageIds: Set<string>;
@@ -90,6 +91,7 @@ export function UnifiedAgentTable({
   controls,
   selectionAction,
   loading = false,
+  loadingMessage = "Loading Copilot agents...",
   emptyState,
   busyPackageId,
   selectedPackageIds,
@@ -192,7 +194,7 @@ export function UnifiedAgentTable({
         {packageSelectionAllowed && (selectedRecordIds?.size ?? 0) > 0 ? <span>{selectedRecordIds!.size} complete published-version groups selected</span> : null}
         {quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <span>{selectedPowerPlatformKeys.size} exact quarantine target{selectedPowerPlatformKeys.size === 1 ? "" : "s"} selected</span> : null}
       </div> : null}
-      {loading ? <div className="screen-state" role="status">Loading Copilot agents...</div>
+      {loading ? <div className="screen-state" role="status">{loadingMessage}</div>
         : records.length === 0 ? <div className="empty-state">{emptyState ?? <><h2>No matching agents</h2><p>Try clearing the search or filters.</p></>}</div> : <div className="table-shell">
         <table className="agent-table unified-agent-table" style={{ minWidth: Math.max(520, table.getVisibleLeafColumns().length * 145) }}>
           <thead>{table.getHeaderGroups().map(group => <tr key={group.id}>{group.headers.map(header => {

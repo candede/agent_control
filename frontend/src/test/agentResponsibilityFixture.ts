@@ -18,6 +18,8 @@ export function responsibilityFixture(objectId?: string, options: FixtureOptions
   const selection = options.selection ? { ...options.selection } : {
     id: crypto.randomUUID(), revision: crypto.randomUUID(),
     evaluatedAt: new Date(now).toISOString(), expiresAt: new Date(now + 600_000).toISOString(),
+    validatedAt: new Date(now).toISOString(),
+    publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) },
   };
   const state = options.state ?? (options.agentCount === 0 ? "no_reported_relationships" : "reported");
   const agentCount = state === "reported" ? options.agentCount ?? 1 : 0;

@@ -31,13 +31,24 @@ export function createInventoryDataRouter(database: pg.Pool) {
   const facetFields = ["type", "publisher", "availableTo", "host", "platform"];
   async function capture(identity: SelectionIdentity, query: InventoryQuery) {
     const root = (await database.query(`SELECT s.id,EXISTS(SELECT 1 FROM inventory_roots r
-      WHERE r.scope_id=s.id AND r.current) AS published FROM data_scope_epochs s
+      JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
+      JOIN data_generations g ON g.id=v.generation_id
+      WHERE r.scope_id=s.id AND r.current AND g.state='published' AND g.validated
+        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch) AS published,
+      EXISTS(SELECT 1 FROM inventory_roots r WHERE r.scope_id=s.id) OR
+        s.epoch>0 AS previously_published,
+      EXISTS(SELECT 1 FROM inventory_reconciliation work WHERE work.scope_id=s.id
+        AND (work.status='running' AND work.active_until>clock_timestamp()
+          OR work.status IN ('idle','catching_up') AND work.pending_inputs IS NOT NULL AND work.pending_deadline>clock_timestamp())) AS preparing
+      FROM data_scope_epochs s
       WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_canonical'
         AND s.token_mode='delegated' AND s.selector='complete'`, [identity.tenantId, identity.principalId])).rows[0];
     if (!root || !root.published) {
-      const unavailable: UnifiedAgentInventoryUnavailable = root
-        ? { state: "preparing", message: "The first saved agent inventory is being prepared. Results will appear when it is ready. Open Sync to review collection progress." }
-        : { state: "not_collected", message: "No saved agent inventory is available yet. Automatic collection will populate it when authorized, or open Sync to collect it." };
+      const unavailable: UnifiedAgentInventoryUnavailable = root?.previously_published
+        ? { state: "unavailable", message: "The saved agent inventory is no longer available. Reload saved data or open Sync to collect a new inventory." }
+        : root?.preparing
+          ? { state: "preparing", message: "The first saved agent inventory is being prepared. Results will appear when it is ready. Open Sync to review collection progress." }
+          : { state: "not_collected", message: "No saved agent inventory is available yet. Automatic collection will populate it when authorized, or open Sync to collect it." };
       return unavailable;
     }
     return inventory.capture(identity, root.id, Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined)));
@@ -112,7 +123,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported inventory query field: ${key}.`);
       scalar(value, key, facetFields.includes(key) ? 4104 : 4096);
     }
-    const query = unifiedAgentInventoryQuery(unfiltered ? {} : request.query);
+    // Responsibility pages always order/search people; their capture owns that dependency.
+    const query = unifiedAgentInventoryQuery(unfiltered ? { sortBy: "owner" } : request.query);
     if (request.query.offset !== undefined) throw new AppError(400, "invalid_inventory_query", "Use selectionId and cursor, not offset.");
     const limit = request.query.limit === undefined ? 50 : Number(scalar(request.query.limit, "limit", 3));
     if (request.query.limit !== undefined && !/^[1-9]\d{0,2}$/.test(String(request.query.limit))

@@ -1,12 +1,15 @@
 # Defender and Agent 365 hunting
 
 Agent Control runs explicit, curated Microsoft Graph advanced-hunting queries for
-the selected agent. It does not expose arbitrary KQL or collect telemetry.
+the selected agent, user, or user on an agent. It does not expose arbitrary KQL
+or collect telemetry.
 
 ## Where to use it
 
-Open **Agents > agent details > Activity**. The page keeps Defender runtime,
-tool, and inventory evidence separate from saved Purview administration records.
+Open **Agents > agent details > Activity**, **Users > user details > Logs**, or
+select a user name in an agent's **Users** tab. Select Defender from the source
+selector. Purview searches remain separate from Defender runtime, tool, and
+inventory evidence.
 
 Opening Activity does not run a hunt.
 
@@ -30,7 +33,7 @@ See [Microsoft roles](user-roles-and-permissions.md).
 | --- | --- |
 | `AgentsInfo` | Agent inventory metadata, platform, model, publication state, and source identifiers |
 | `CloudAppEvents` | Agent invocation, inference, tool-call, actor, error, and completion metadata when available |
-| Purview Audit Search | Saved Copilot Studio administration records associated with the exact bot and environment |
+| Purview Audit Search | Separate searches for exact agent and/or user audit evidence |
 
 Agent Control does not treat missing errors as proof of success and does not
 reconstruct prompts, responses, or conversations.
@@ -51,13 +54,30 @@ substitutes.
 ## Run a hunt
 
 1. Select a supported log type.
-2. Choose the bounded date range and available filters.
-3. Review the exact selected agent and source identity.
-4. Run the hunt.
-5. Monitor the saved job and review paged results.
+2. Choose the bounded date range.
+3. Run the hunt.
+4. Monitor the saved job and review paged results.
 
 Queries use fixed templates and bounded result storage. Provider throttling,
 partial pages, and source coverage are shown with the job.
+
+### Exact subject binding
+
+The server calls `/v1.0/security/runHuntingQuery` with a code-owned KQL template
+and explicit `Timespan`. Runtime `TargetAgentId`/`AgentId` predicates use verified
+application IDs; `AgentsInfo.EntraAgentId` uses verified enterprise object IDs.
+These namespaces are not interchangeable.
+
+User searches expose **Agent invocations** (`InvokeAgent`) only: documented
+`RawEventData.UserKey` identifies the human caller. Inference and tool events
+identify the agent account instead, so they are not attributed to a human using
+`AccountObjectId` or conversation ID guesses. User-on-agent searches intersect
+the human caller with the resolved runtime agent. Returned rows are checked
+again before publication. History, exports, cancellation and deletion carry
+the same scope.
+
+No workspace override or automatic provider preflight is used. Explicit search
+reports real provider permission, licensing, connection and telemetry failures.
 
 ## Authorization
 
@@ -90,4 +110,12 @@ Microsoft references:
 
 - [Advanced hunting overview](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-overview)
 - [AgentsInfo table](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-agentsinfo-table)
+- [Run a hunting query](https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery?view=graph-rest-1.0)
+- [CloudAppEvents table](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-cloudappevents-table)
+- [AI agent detection and event identities](https://learn.microsoft.com/en-us/defender-xdr/security-for-ai/ai-agent-detection-protection)
 - [Agent 365 observability attributes](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-attribute-reference)
+
+Local tests validate query construction, documented fixture schemas, scope
+isolation and job behavior. Live collection still requires qualification with a
+licensed, connected tenant containing agent telemetry; permission/token checks
+do not prove those prerequisites.

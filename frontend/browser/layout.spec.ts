@@ -53,7 +53,7 @@ for (const scenario of cases) {
 
     if (scenario.name === "user-purview") {
       await page.getByRole("button", { name: "Ada", exact: true }).click();
-      await page.getByRole("tab", { name: "Purview audit", exact: true }).click();
+      await page.getByRole("tab", { name: "Logs", exact: true }).click();
       await expect(page.locator(".purview-history-table tbody tr")).toBeVisible();
       await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toBeVisible();
       await page.locator(".purview-history-table").getByRole("button", { name: /View/ }).click();

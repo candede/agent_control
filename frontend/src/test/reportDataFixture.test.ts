@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { combinedUser, historySet, overviewAgent, overviewPage, reportAgent, reportPage, reports, reportSelection, reportSetId, reportUser, selectionId, source } from "./reportDataFixture";
 

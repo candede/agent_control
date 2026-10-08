@@ -154,7 +154,7 @@ describe("reported user's selected agent pages", () => {
         else if (boundary === "invalidation") cached.setState({
           status: "error", error: new ApiError(409, "selection_invalidated", "Selection changed."),
         });
-        else if (boundary === "expiry") vi.spyOn(Date, "now").mockReturnValue(Date.parse(initial.selection.expiresAt) + 1);
+        else if (boundary === "expiry") vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(initial.selection.expiresAt) - Date.parse(initial.selection.validatedAt) + 1);
         else if (boundary === "replacement") client.setQueryData(cached.queryKey, reportPage([relationship(2)]));
         else void client.invalidateQueries({ queryKey: cached.queryKey, exact: true });
         // The cache and clock change before React receives their observer notifications.
@@ -173,9 +173,12 @@ describe("reported user's selected agent pages", () => {
         expect(onFocusAgent).toHaveBeenCalledExactlyOnceWith("agent-2", reports.setId);
       } else {
         expect(readReportPage).toHaveBeenCalledOnce();
-        if (boundary === "expiry" || boundary === "invalidation") {
+        if (boundary === "invalidation") {
           await waitFor(() => expect(onSelectionInvalidated).toHaveBeenCalled());
           expect(screen.queryByRole("button", { name: "Agent 1: active users without paid Copilot" })).not.toBeInTheDocument();
+        } else if (boundary === "expiry") {
+          expect(onSelectionInvalidated).not.toHaveBeenCalled();
+          expect(screen.getByRole("button", { name: "Agent 1: active users without paid Copilot" })).toBeVisible();
         } else if (boundary === "failure") {
           expect(await screen.findByRole("alert")).toHaveTextContent("Relationships unavailable.");
           expect(screen.queryByText("Agent 1")).not.toBeInTheDocument();
@@ -300,7 +303,7 @@ describe("reported user's selected agent pages", () => {
     expect(onSelectionInvalidated).not.toHaveBeenCalled();
   });
 
-  it("cancels an expired relationship page and offers only the parent's restart", async () => {
+  it("admits an in-flight frozen relationship page through lease end without replay or automatic replacement", async () => {
     const initial = reportPage([relationship(1)], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
     initial.selection.expiresAt = new Date(Date.now() + 20_000).toISOString();
     const pending = deferred<ReportPage<ReportRelationship>>(), onRestartSelection = vi.fn();
@@ -309,18 +312,19 @@ describe("reported user's selected agent pages", () => {
     await screen.findByText("Agent 1");
     await userEvent.click(screen.getByRole("button", { name: "Next agents" }));
     const signal = vi.mocked(readReportPage).mock.lastCall![2];
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(initial.selection.expiresAt) + 1);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(initial.selection.expiresAt) - Date.parse(initial.selection.validatedAt) + 1);
     fireEvent.focus(window);
-    expect(signal?.aborted).toBe(true);
-    expect(screen.getByRole("alert")).toHaveTextContent("This selection changed or expired.");
-    expect(screen.queryByText("Loading saved data...")).not.toBeInTheDocument();
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByText("Loading saved data...")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry saved data" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve(reportPage([relationship(99)], { selection: initial.selection })));
+    expect(await screen.findByText("Agent 99")).toBeVisible();
     const restart = screen.getByRole("button", { name: "Restart selection" });
     act(() => { fireEvent.click(restart); fireEvent.click(restart); });
     expect(onRestartSelection).toHaveBeenCalledOnce();
     expect(readReportPage).toHaveBeenCalledTimes(2);
-    await act(async () => pending.resolve(reportPage([relationship(99)])));
-    expect(screen.queryByText("Agent 99")).not.toBeInTheDocument();
+    expect(screen.getByText("Agent 99")).toBeVisible();
     expect(screen.getByRole("button", { name: "Next agents" })).toHaveAttribute("aria-disabled", "true");
     expect(readReportPage).toHaveBeenCalledTimes(2);
   });

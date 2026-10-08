@@ -146,7 +146,7 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["not_collected", "preparing"] as const)("shares a %s outcome with every concurrent reader without caching it", async state => {
+  it.each(["not_collected", "preparing", "unavailable"] as const)("shares a %s outcome with every concurrent reader without caching it", async state => {
     const unavailable = { state, message: "Waiting for inventory." };
     read.mockResolvedValueOnce(unavailable);
     await expect(Promise.all([
@@ -216,21 +216,22 @@ describe("AgentInventoryQueries", () => {
 
   it("does not join an old pinned selection to an unfinished recapture", async () => {
     const original = page();
+    const revalidated = { ...original, selection: { ...original.selection, validatedAt: new Date(Date.now() + 30_001).toISOString() } };
     const recaptured = page(undefined, { id: "recaptured-selection", revision: "2" });
     const response = deferredPage();
-    read.mockResolvedValueOnce(original).mockReturnValueOnce(response.promise).mockResolvedValueOnce(original);
+    read.mockResolvedValueOnce(original).mockReturnValueOnce(response.promise).mockResolvedValueOnce(revalidated);
     const pinned = { selectionId: original.selection.id };
     await queries.read("owner", pinned, signal());
     vi.advanceTimersByTime(30_001);
 
     const superseded = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "request_aborted" });
     await Promise.resolve();
-    const current = expect(queries.read("owner", pinned, signal())).resolves.toEqual(original);
+    const current = expect(queries.read("owner", pinned, signal())).resolves.toEqual(revalidated);
     response.resolve(recaptured);
     await Promise.all([superseded, current]);
     expect(read).toHaveBeenCalledTimes(3);
     expect(read.mock.calls[1][1]?.signal?.aborted).toBe(true);
-    expect(queries.getCached("owner", pinned)).toEqual(original);
+    expect(queries.getCached("owner", pinned)).toEqual(revalidated);
     expect(queries.getCached("owner", { selectionId: recaptured.selection.id })).toBeUndefined();
   });
 
@@ -469,7 +470,7 @@ describe("AgentInventoryQueries", () => {
     expect(queries.getCached("owner", { inventoryScope: "power_platform_only" })).toBeUndefined();
   });
 
-  it.each(["not_collected", "preparing"] as const)("does not pin or retain a %s result as an empty inventory", async state => {
+  it.each(["not_collected", "preparing", "unavailable"] as const)("does not pin or retain a %s result as an empty inventory", async state => {
     const unavailable = { state, message: "Waiting for inventory." };
     read.mockResolvedValueOnce(unavailable);
     await expect(queries.read("owner", {}, signal())).resolves.toEqual(unavailable);
@@ -488,7 +489,7 @@ describe("AgentInventoryQueries", () => {
     await queries.read("tenant-a:user-a:viewer:1", {}, signal());
     expect(read).toHaveBeenCalledTimes(6);
   });
-  it.each([false, true])("acceptance: optional identity current=%s controls active expiry, not retained stale evidence", async current => {
+  it.each([false, true])("retains admitted inventory when optional identity current=%s ages", async current => {
     const result = pageWithPeople(undefined);
     const expiresAt = current ? "2026-09-20T12:00:05.000Z" : "2026-09-20T11:59:00.000Z";
     result.value[0].observations.packageSnapshots.aging = {
@@ -498,12 +499,11 @@ describe("AgentInventoryQueries", () => {
     };
     read.mockResolvedValue(result);
     await expect(queries.read("owner", {}, signal())).resolves.toEqual(result);
-    if (current) {
-      vi.advanceTimersByTime(5_001);
-      await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
-    }
+    vi.advanceTimersByTime(5_001);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+    expect(read).toHaveBeenCalledOnce();
   });
-  it.each(["fresh", "stale"] as const)("acceptance: optional package/access detail %s evidence has the same active expiry rules", async state => {
+  it.each(["fresh", "stale"] as const)("retains admitted inventory when optional package detail %s ages", async state => {
     const result = pageWithPeople(undefined);
     result.value[0].packages = [{ id: "access", displayName: "Access details", isBlocked: false,
       sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
@@ -513,10 +513,9 @@ describe("AgentInventoryQueries", () => {
       availableTo: "none", deployedTo: "none" }];
     read.mockResolvedValue(result);
     await expect(queries.read("owner", {}, signal())).resolves.toEqual(result);
-    if (state === "fresh") {
-      vi.advanceTimersByTime(5_001);
-      await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
-    }
+    vi.advanceTimersByTime(5_001);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+    expect(read).toHaveBeenCalledOnce();
   });
 
   it("retains only the current and directly adjacent pinned pages, including reverse-cursor aliases", async () => {
@@ -557,7 +556,7 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(6);
   });
 
-  it("never extends a saved source or selected report expiration", async () => {
+  it("bounds reuse by the server selection lease, not nested report freshness", async () => {
     read.mockResolvedValueOnce(page("2026-09-20T12:00:05.000Z"));
     await queries.read("owner", {}, signal());
     vi.advanceTimersByTime(5_001);
@@ -573,7 +572,7 @@ describe("AgentInventoryQueries", () => {
     await queries.read("owner", {}, signal());
     vi.advanceTimersByTime(5_000);
     await queries.read("owner", {}, signal());
-    expect(read).toHaveBeenCalledTimes(4);
+    expect(read).toHaveBeenCalledTimes(3);
     queries.clear();
     read.mockResolvedValueOnce({
       ...usagePage, usageContext: { ...usagePage.usageContext, reports: { ...reports, expiresAt: null }, expiresAt: "2026-09-20T12:00:15.000Z" },
@@ -581,33 +580,32 @@ describe("AgentInventoryQueries", () => {
     await queries.read("owner", {}, signal());
     vi.advanceTimersByTime(5_000);
     await queries.read("owner", {}, signal());
-    expect(read).toHaveBeenCalledTimes(6);
+    expect(read).toHaveBeenCalledTimes(4);
   });
 
-  it.each(["source", "usage"] as const)("rejects a response whose %s evidence expires in flight instead of caching it", async source => {
+  it.each(["source", "usage"] as const)("keeps a validated %s response delivered after its recorded deadline without inventing authority", async source => {
     const expiresAt = "2026-09-20T12:00:05.000Z";
     const expiring: UnifiedAgentInventoryPage = source === "source" ? page(expiresAt) : {
       ...page(),
       usageContext: { revision: "usage", reports: { ...reports, expiresAt: null }, expiresAt },
     };
     read.mockImplementationOnce(async () => {
-      vi.setSystemTime(new Date(expiresAt));
+      vi.advanceTimersByTime(5_000);
       return expiring;
     });
 
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(expiring);
+    expect(queries.getCached("owner", {})).toBe(source === "source" ? undefined : expiring);
     await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ selection: { revision: "1" } });
-    expect(read).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(source === "source" ? 2 : 1);
   });
 
-  it("rejects a cache hit that expires before the async read completes", async () => {
+  it("keeps a cache hit delivered at lease end as historical data, without extending reuse", async () => {
     read.mockResolvedValueOnce(page("2026-09-20T12:00:05.000Z"));
     await queries.read("owner", {}, signal());
     vi.advanceTimersByTime(4_999);
 
-    const expired = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({
-      status: 409, code: "inventory_changed",
-    });
+    const expired = expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ selection: { id: page().selection.id } });
     vi.advanceTimersByTime(1);
     await expired;
     expect(read).toHaveBeenCalledOnce();
@@ -616,7 +614,7 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
-  it("expires cached environment context independently of the agent source snapshots", async () => {
+  it("retains pinned environment labels after their recorded freshness date", async () => {
     const environmentPage = pageWithEnvironment("2026-09-20T12:00:05.000Z");
     read.mockResolvedValueOnce(environmentPage);
     await expect(queries.read("owner", {}, signal())).resolves.toBe(environmentPage);
@@ -624,8 +622,8 @@ describe("AgentInventoryQueries", () => {
     await expect(queries.read("owner", {}, signal())).resolves.toBe(environmentPage);
     expect(read).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1);
-    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
-    expect(read).toHaveBeenCalledTimes(2);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(environmentPage);
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it("expires an empty filtered page when its off-page context deadline is reached", async () => {
@@ -640,8 +638,8 @@ describe("AgentInventoryQueries", () => {
   });
 
   it.each([
-    ["2026-09-20T12:00:00.000Z", "inventory_changed"],
-    ["invalid", "invalid_inventory_expiry"],
+    ["2026-09-20T12:00:00.000Z", "invalid_selected_read"],
+    ["invalid", "invalid_selected_read"],
   ])("rejects a page-level deadline of %s", async (expiresAt, code) => {
     read.mockResolvedValueOnce({ ...page(), selection: { ...page().selection, expiresAt } });
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code });
@@ -649,20 +647,20 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects environment context that expires in flight instead of caching it", async () => {
+  it("retains selected environment context that ages in flight", async () => {
     const expiresAt = "2026-09-20T12:00:05.000Z";
     read.mockImplementationOnce(async () => {
-      vi.setSystemTime(new Date(expiresAt));
+      vi.advanceTimersByTime(5_000);
       return pageWithEnvironment(expiresAt);
     });
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
-    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
-    expect(read).toHaveBeenCalledTimes(2);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(pageWithEnvironment(expiresAt));
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(pageWithEnvironment(expiresAt));
+    expect(read).toHaveBeenCalledOnce();
   });
 
   it("rejects malformed environment expiry instead of extending saved context", async () => {
     read.mockResolvedValueOnce(pageWithEnvironment("invalid"));
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_metadata" });
     expect(read).toHaveBeenCalledTimes(1);
   });
 
@@ -670,7 +668,7 @@ describe("AgentInventoryQueries", () => {
     ["owner", "resolved"],
     ["createdBy", "not_found"],
     ["lastModifiedBy", "lookup_failed"],
-  ] as const)("expires the cached page at the %s %s person boundary", async (field, status) => {
+  ] as const)("retains the admitted page at the optional %s %s person boundary", async (field, status) => {
     const peoplePage = pageWithPeople({
       [field]: {
         objectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -685,8 +683,8 @@ describe("AgentInventoryQueries", () => {
     await expect(queries.read("owner", {}, signal())).resolves.toBe(peoplePage);
     expect(read).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1);
-    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
-    expect(read).toHaveBeenCalledTimes(2);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(peoplePage);
+    expect(read).toHaveBeenCalledOnce();
   });
 
   it("retains the ordinary cache window for legacy people without expiry", async () => {
@@ -708,7 +706,7 @@ describe("AgentInventoryQueries", () => {
       displayName: "Saved person", userPrincipalName: null,
       observedAt: "2026-09-20T11:00:00.000Z", expiresAt: "invalid",
     } }));
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_metadata" });
     expect(read).toHaveBeenCalledTimes(1);
   });
 
@@ -741,7 +739,7 @@ describe("AgentInventoryQueries", () => {
 
   it("rejects malformed expiration evidence instead of caching it indefinitely", async () => {
     read.mockResolvedValueOnce(page("invalid"));
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_selected_read" });
     expect(read).toHaveBeenCalledTimes(1);
   });
 });

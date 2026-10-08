@@ -76,7 +76,7 @@ export function FirstSyncNotice({
     {progressing && !collecting ? <p>Resolve the waiting step, or cancel the run in Sync before trying again.</p> : null}
     <p>Sync only reads Microsoft data; it does not change settings.
       CSV usage reports are a separate step in Sync and do not block this collection.</p>
-    <div className="first-sync-actions">
+    {!collecting || needsAttention || stale || error ? <div className="first-sync-actions">
       {!progressing ? <WorkbenchActionGate actionId="data-sync.start">
         <button type="button" disabled={cannotStart || loading || stale || automaticRefresh?.checking || automaticRefresh?.online === false}
           onClick={() => onStart(sources.filter(source => !source.saved).map(source => source.id))}>
@@ -93,7 +93,7 @@ export function FirstSyncNotice({
         ? <a href="/api/auth/login">Sign in again</a> : null}
       {!sources.some(({ observation }) => observation?.status === "permission_required")
         ? <button type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button> : null}
-    </div>
+    </div> : null}
     </div>
   </WorkbenchDialog>;
 }

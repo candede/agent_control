@@ -61,7 +61,7 @@ describe("corroborated current agent control identity", () => {
         catch (error) { return (error as { code?: string }).code; }
       }, { timeout: 3000 }).toBe("quarantine_target_unavailable");
       await reconcileInventoryFixture(fixture.runtime, scope);
-      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
+      await expect(resolve()).rejects.toMatchObject({ code: "quarantine_target_unavailable" });
 
       await publish(scope.principalId, "delta");
       expect(await resolve()).toMatchObject([{ resourceNativeId: botId, environmentId, botId }]);

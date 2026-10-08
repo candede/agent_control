@@ -28,8 +28,11 @@ export type DefenderHuntingFilters = {
   entraAgentApplicationIds?: string[];
   blueprintIds: string[];
   actorObjectIds: string[];
+  userObjectId?: string;
   operations: string[];
 };
+
+export type DefenderHuntingTarget = { agentRecordId?: string; userObjectId?: string };
 
 export const defenderHuntingTemplates: Record<DefenderHuntingTemplateId, {
   label: string;

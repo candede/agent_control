@@ -56,7 +56,7 @@ export class InventoryReconciliation {
         const current = (await client.query(`SELECT r.domain,r.baseline_id,r.revision,g.expires_at FROM inventory_roots r
           JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision JOIN data_generations g ON g.id=v.generation_id
           WHERE r.scope_id=$1 AND r.current AND g.scope_epoch=$2 AND g.session_epoch=$3
-            AND g.expires_at>clock_timestamp()`, [root.scopeId, root.epoch, input.sessionEpoch])).rows[0];
+            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, root.epoch, input.sessionEpoch])).rows[0];
         if (!current || !["packages", "power_platform"].includes(current.domain)) throw new Error("inventory_input_fenced");
         captured.push({ ...root, tenantId: input.scope.tenantId, baselineId: current.baseline_id, revision: current.revision,
           domain: current.domain, expiresAt: current.expires_at.toISOString() });
@@ -109,7 +109,7 @@ export class InventoryReconciliation {
           JOIN data_scope_epochs epoch ON epoch.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
           JOIN data_generations g ON g.id=v.generation_id WHERE r.scope_id=$1 AND r.current AND epoch.tenant_id=$2
             AND epoch.principal_id=$3 AND epoch.token_mode='delegated' AND g.scope_epoch=epoch.epoch AND g.session_epoch=$4
-            AND g.expires_at>clock_timestamp()`, [root.scopeId, s.tenantId, s.principalId, input.sessionEpoch])).rows[0];
+            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, s.tenantId, s.principalId, input.sessionEpoch])).rows[0];
         if (!current) throw new Error("inventory_input_fenced");
         Object.assign(root, { baselineId: current.baseline_id, revision: current.revision, epoch: current.epoch, expiresAt: current.expires_at.toISOString() });
       }
@@ -129,7 +129,7 @@ export class InventoryReconciliation {
         active_epoch=$3,active_deadline=$4,active_until=clock_timestamp()+interval '60 seconds',status='running',pending_inputs=NULL WHERE scope_id=$1`, [scope.id, job, scope.epoch, input.deadlineAt]);
       for (const root of roots) await client.query(`INSERT INTO inventory_worker_pins(worker_id,scope_id,tenant_id,baseline_id,revision,epoch,expires_at)
         VALUES($1,$2,$3,$4,$5,$6,$7)`, [job, root.scopeId, root.tenantId, root.baselineId, root.revision, root.epoch,
-        new Date(Math.min(input.deadlineAt.getTime(), Date.parse(root.expiresAt)))]);
+        input.deadlineAt]);
       const saved = (await client.query("SELECT * FROM inventory_roots WHERE scope_id=$1 AND current", [scope.id])).rows[0];
       const old: PreviousRoot | undefined = saved ? { ...saved,
         nativeScopes: (prior ?? []).filter(root => root.domain === "power_platform").map(root => root.scopeId) } : undefined;

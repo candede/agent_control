@@ -613,6 +613,9 @@ async function verifyDataGenerationSchema(database: Pick<pg.Pool, "query">) {
     AND (SELECT count(*)=14 FROM pg_constraint WHERE contype='f' AND conrelid IN
       (SELECT oid FROM pg_class WHERE relnamespace='public'::regnamespace AND relname=ANY($1)))
     AND EXISTS(SELECT 1 FROM pg_index WHERE indrelid='data_scope_epochs'::regclass AND indnullsnotdistinct)
+    AND strpos(pg_get_functiondef('data_protect_head()'::regprocedure),'g.expires_at>clock_timestamp()')=0
+    AND strpos(pg_get_functiondef('inventory_interval_guard()'::regprocedure),'input."expiresAt">clock_timestamp()')=0
+    AND strpos(pg_get_functiondef('inventory_revision_guard()'::regprocedure),'input."expiresAt">clock_timestamp()')=0
     AND (SELECT count(*)=12 FROM pg_indexes WHERE schemaname='public' AND indexname IN
       ('data_one_writer','data_generation_admission','data_generation_expiry','directory_user_order','directory_user_upn',
        'directory_user_company','directory_user_department','directory_plan_user','app_activity_identity',

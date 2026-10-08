@@ -40,6 +40,7 @@ export async function seedDisjointReportUnion(database: pg.Pool, tenant: string,
   if (!Number.isInteger(count) || count < 1 || count > 100000) throw new Error("fixture_row_count");
   const set = await seedReportSet(database, tenant, 1, "importing-admin", { agents: count, userAgents: count, users: count });
   for (const kind of ["agents", "userAgents", "users"] as const) {
+    const started = performance.now();
     for (let first = 0; first < count; first += 250) {
       await database.query(`WITH batch AS MATERIALIZED (
         SELECT n,CASE $2::text
@@ -61,7 +62,11 @@ export async function seedDisjointReportUnion(database: pg.Pool, tenant: string,
       ) INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
         SELECT $5,$1,$2,n,inserted.payload_hash FROM batch JOIN inserted ON inserted.payload_hash=official_usage_payload_hash(batch.row_data)`,
       [tenant, kind, first, Math.min(first + 249, count - 1), set.versions[kind]]);
+      // Refresh cold synthetic-table statistics before PostgreSQL caches a growing foreign-key scan.
+      if (first === 0) await database.query("ANALYZE official_usage_row_facts; ANALYZE official_usage_version_rows");
     }
+    process.stdout.write(JSON.stringify({ event: "disjoint_report_fixture", kind, rows: count, batchRows: 250,
+      elapsedMs: performance.now() - started }) + "\n");
   }
   return set;
 }

@@ -226,12 +226,12 @@ export type UnifiedAgentInventoryVerification = {
 };
 
 export type UnifiedAgentInventoryUnavailable = {
-  state: "not_collected" | "preparing";
+  state: "not_collected" | "preparing" | "unavailable";
   message: string;
 };
 
 export type UnifiedAgentInventoryPage = {
-  selection: { id: string; revision: string; evaluatedAt: string; expiresAt: string };
+  selection: import("./dataSelection.js").PublishedSelectedRead;
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   counts: { total: number; scoped: number; filtered: number; packageTargets: number };
   freshness: { state: string; capturedRevision: string; sources: unknown[] };

@@ -180,7 +180,7 @@ export class DataGenerations {
       WHERE g.scope_id=$2 AND g.tenant_id=$3 AND g.owner=$4 AND g.lease_version=$5
       AND g.scope_epoch=$6 AND g.session_epoch=$7 AND s.epoch=g.scope_epoch AND s.session_epoch=g.session_epoch
       AND g.cancellation=0 AND g.state IN ('staging','validating')
-      AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp() AND g.expires_at>clock_timestamp()`,
+      AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp()`,
     [lease.id, lease.scopeId, lease.tenantId, lease.owner, lease.version, lease.epoch, lease.sessionEpoch])).rows[0];
     if (!row) throw new Error("data_writer_fenced");
     if (row.run_id) {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import { ApiError, getInventoryFacets, type InventoryFacetField } from "../api/client";
 import { decodeInventoryFacet, encodeInventoryFacet, inventoryFacetLabel, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import { formatPackageFacetLabel, formatPackageType } from "../../../backend/src/types/copilotPackage";
+import { isExpiredSelection } from "../selectedRead";
 
 export function InventoryFacetSelect({ selectionId, scopeKey = selectionId, field, value, label, allLabel, loading, onChange, onInvalidated, onError, selectRef, compact, onOptionLabel }: {
   selectionId: string; field: InventoryFacetField; value?: InventoryFacetValue; label: string; allLabel: string;
@@ -32,7 +33,7 @@ export function InventoryFacetSelect({ selectionId, scopeKey = selectionId, fiel
       .then(page => { if (!controller.signal.aborted) setState({ owner, page }); })
       .catch(error => { if (!controller.signal.aborted) {
         setState({ owner, error: error instanceof Error ? error.message : "Facet options unavailable." });
-        if (error instanceof ApiError && ["selection_invalidated", "inventory_changed", "unauthorized", "forbidden"].includes(error.code)) {
+        if (error instanceof ApiError && !isExpiredSelection(error) && ["selection_invalidated", "inventory_changed", "unauthorized", "forbidden"].includes(error.code)) {
           invalidation.current?.();
         }
       } });

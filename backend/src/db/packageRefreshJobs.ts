@@ -249,7 +249,10 @@ export class PackageRefreshJobs {
       (SELECT max(g.observed_at) FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
         WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_packages'
           AND g.state='published' AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-          AND g.expires_at>clock_timestamp()) AS last_success_at`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
+          AND g.validated AND EXISTS(SELECT 1 FROM inventory_roots r JOIN inventory_revisions v
+            ON v.scope_id=r.scope_id AND v.revision=r.revision
+            WHERE r.current AND r.scope_id=s.id AND v.generation_id=g.id)) AS last_success_at`,
+    [scope.tenantId, scope.principalId, authorizationPrincipalId]);
     return { value: rows.map(projectJob), lastAttemptAt: summary.rows[0].last_attempt_at?.toISOString() ?? null,
       lastSuccessAt: summary.rows[0].last_success_at?.toISOString() ?? null };
   }

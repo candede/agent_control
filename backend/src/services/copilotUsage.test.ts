@@ -315,21 +315,20 @@ describe("live Users orchestration and publication boundary", () => {
     expect((await h.service.refreshUsers(h.user, undefined, { automatic: true, signedInAt: Date.now() + 1_000, publication: h.publication })).status).toBe("succeeded");
     expect(h.requireAvailable.mock.calls.map(([current]) => current)).toEqual([capability, capability]);
   });
-  it.each(["directory", "app_activity", "both"] as const)("recollects expired %s evidence on incomplete-only retry and preserves the fresh companion", async expired => {
+  it.each(["directory", "app_activity", "both"] as const)("reuses complete authorized %s evidence past freshness on incomplete-only retry", async expired => {
     const h = await harness(), expiry = new Date(Date.now() + 1500);
     for (const source of ["directory", "app_activity"] as const) await h.seed(source, new Date(), expired === source || expired === "both" ? expiry : undefined);
     const prior = (await h.status()).sources;
     await new Promise(resolve => setTimeout(resolve, Math.max(0, expiry.getTime() - Date.now()) + 20));
     h.fetcher.mockClear();
     expect(await h.service.refreshUsers(h.user, undefined, { incompleteOnly: true, publication: h.publication }))
-      .toMatchObject({ status: "succeeded", count: expired === "app_activity" ? null : 1 });
+      .toMatchObject({ status: "succeeded", count: 1 });
     const current = (await h.status()).sources;
     for (const source of ["directory", "app_activity"] as const) {
       expect(current[source].attemptStatus).toBe("available");
-      if (expired === source || expired === "both") expect(current[source].generationId).not.toBe(prior[source].generationId);
-      else expect(current[source].generationId).toBe(prior[source].generationId);
+      expect(current[source].generationId).toBe(prior[source].generationId);
     }
-    expect(h.fetcher).toHaveBeenCalledTimes(expired === "both" ? 3 : expired === "directory" ? 2 : 1);
+    expect(h.fetcher).not.toHaveBeenCalled();
   });
   it("publishes a verified zero only after a successful complete empty directory discovery", async () => {
     const h = await harness();

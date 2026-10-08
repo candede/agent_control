@@ -124,14 +124,15 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
     AND s.epoch=target.scope_epoch AND s.session_epoch=target.session_epoch)`;
   await update("recordAbandonedGenerations", "data_generations", `target.state IN ('staging','validating')
     AND (target.lease_until<=clock_timestamp() OR target.deadline_at<=clock_timestamp()
-      OR target.expires_at<=clock_timestamp() OR ${staleScope})`,
+      OR ${staleScope})`,
   "state='failed',cancellation=target.cancellation+1,reserved_bytes=target.byte_count", "reservation");
   await update("recordAbandonedAttempts", "user_source_attempts", `target.status='running'
     AND EXISTS(SELECT 1 FROM data_generations g WHERE g.id=target.generation_id AND g.state IN ('failed','cancelled'))`,
   `status=CASE WHEN (SELECT g.state FROM data_generations g WHERE g.id=target.generation_id)='cancelled' THEN 'cancelled' ELSE 'failed' END,
     error_code='data_writer_fenced',message='Collection is no longer current. Retry with current authorization.'`);
   await update("recordExpiredGenerations", "data_generations",
-    `target.state='published' AND (target.expires_at<=clock_timestamp() OR ${staleScope})`, "state='retired'");
+    `target.state='published' AND (${staleScope} OR target.expires_at<=clock_timestamp()
+      AND NOT EXISTS(SELECT 1 FROM data_generation_heads head WHERE head.generation_id=target.id))`, "state='retired'");
   await update("recordDeletingGenerations", "data_generations", `target.state IN ('retired','failed','cancelled')
     AND NOT EXISTS(SELECT 1 FROM inventory_attempts a WHERE a.generation_id=target.id)
     AND NOT EXISTS(SELECT 1 FROM inventory_mutation_targets t WHERE t.source_generation_id=target.id)
