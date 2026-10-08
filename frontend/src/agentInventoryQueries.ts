@@ -8,6 +8,12 @@ type InventoryFamily = { selectionId?: string; requests: Map<string, InventoryRe
 const cacheMs = 30_000;
 const maximumFamilies = 4;
 
+export class AgentInventoryExpiredError extends ApiError {
+  constructor() {
+    super(409, "inventory_changed", "The saved agent inventory or usage report expired. Reload Agents.");
+  }
+}
+
 export class AgentInventoryQueries {
   private owner?: string;
   private readonly families = new Map<string, InventoryFamily>();
@@ -237,7 +243,7 @@ function expiry(page: UnifiedAgentInventoryPage) {
 
 function assertUnexpired(page: UnifiedAgentInventoryPage) {
   if (expiry(page) <= Date.now()) {
-    throw new ApiError(409, "inventory_changed", "The saved agent inventory or usage report expired. Reload Agents.");
+    throw new AgentInventoryExpiredError();
   }
 }
 

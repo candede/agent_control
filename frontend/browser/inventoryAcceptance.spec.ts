@@ -5,6 +5,96 @@ import { createUnifiedVerification } from "../src/test/inventoryVerification";
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("reloading keeps the loading skeleton through a background inventory publication without error flashes", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.setFixedTime(new Date(layoutTime));
+  let inventoryReads = 0;
+  let automaticReady: Promise<void>, inventoryReady: Promise<void>;
+  let releaseAutomatic!: () => void, releaseInventory!: () => void;
+  await page.route(url => url.pathname === "/api/data-sync/auto-refresh", async route => {
+    await automaticReady;
+    await route.fallback();
+  });
+  await page.route(url => url.pathname === "/api/agent-inventory", async route => {
+    inventoryReads++;
+    await inventoryReady;
+    await route.fallback();
+  });
+  for (let visit = 0; visit < 3; visit++) {
+    inventoryReads = 0;
+    automaticReady = new Promise(resolve => { releaseAutomatic = resolve; });
+    inventoryReady = new Promise(resolve => { releaseInventory = resolve; });
+    try {
+      if (visit === 0) await page.goto("/agents?usage=used&sort=responses&direction=desc");
+      else await page.reload();
+      await expect.poll(() => inventoryReads).toBe(1);
+      await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+      releaseAutomatic();
+      await expect.poll(() => inventoryReads).toBe(2);
+      await expect(page.getByRole("region", { name: "Loading agents" })).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(page.getByText(/No saved package catalog observation|The request was cancelled/)).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
+      if (visit === 2) await page.screenshot({ path: info.outputPath("reload-pending.png") });
+      releaseInventory();
+      await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Loading agents" })).toHaveCount(0);
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      expect(inventoryReads).toBe(2);
+    } finally {
+      releaseAutomatic();
+      releaseInventory();
+    }
+  }
+  expect(unexpected).toEqual([]);
+});
+
+test("inventory retry shows loading, then exposes a real failure or recovers", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.setFixedTime(new Date(layoutTime));
+  let pending: Promise<void> | undefined, release!: () => void;
+  let failing = true, inventoryReads = 0;
+  await page.route(url => url.pathname === "/api/agent-inventory", async route => {
+    inventoryReads++;
+    await pending;
+    if (failing) await route.fulfill({ status: 503, json: { code: "service_unavailable", detail: "Saved inventory temporarily unavailable." } });
+    else await route.fallback();
+  });
+  await page.goto("/agents");
+  const reload = page.getByRole("button", { name: "Reload saved agent inventory" });
+  await expect(reload).toBeEnabled();
+  for (const failRetry of [true, false]) {
+    failing = failRetry;
+    const before = inventoryReads;
+    pending = new Promise(resolve => { release = resolve; });
+    try {
+      await reload.click();
+      await expect.poll(() => inventoryReads).toBe(before + 1);
+      await expect(page.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+      await expect(page.getByText("Loading saved agent inventory...")).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(page.getByText(/No saved package catalog observation/)).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+      if (!failRetry) await page.screenshot({ path: info.outputPath("retry-pending.png") });
+      release();
+      if (failRetry) {
+        await expect(reload).toBeEnabled();
+        await expect(page.getByRole("alert")).toContainText("The current saved agent inventory could not be loaded.");
+        await expect(page.getByText(/^Saved inventory temporarily unavailable\./)).toBeVisible();
+        await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+      } else {
+        await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
+        await expect(page.getByRole("alert")).toHaveCount(0);
+        await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      }
+      expect(inventoryReads).toBe(before + 1);
+    } finally { release(); }
+  }
+  expect(unexpected).toEqual([]);
+});
+
 test("Viewer exports selected multi-version and single groups without expanding members or gaining mutation controls", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));

@@ -86,7 +86,7 @@ import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
 import { BackgroundRefreshIndicator } from "./components/BackgroundRefreshIndicator";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentInventoryUnavailable, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 import { inventoryScopeAgentCount } from "./agentColumns";
-import { AgentInventoryQueries } from "./agentInventoryQueries";
+import { AgentInventoryExpiredError, AgentInventoryQueries } from "./agentInventoryQueries";
 import { inventoryAttentionReasons } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
 import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
@@ -1459,8 +1459,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       if (inventoryNavigation.current.selectionId && (agentPageIndex > 0 || selectedAgentIds.size > 0
         || groupPackageSelection?.owner === principalKey || serverPackageSelection?.owner === principalKey
         || selectedUnifiedAgent || requestedAgentDetailId)) {
-        agentInventoryQueries.clear();
-        setAgentReloadRevision(revision => revision + 1);
+        scheduleAgentReload();
       } else requestCurrentAgentReload();
     }
     if (changed.has("users")) {
@@ -1559,10 +1558,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     };
   }, [groupCountRetryRevision, groupTargetKey]);
   const displayedUnifiedAgents = visibleUnifiedAgentPage?.value ?? [];
+  const agentInventoryPending = loadingAgents || agentSearchPending;
   const inventoryScopeCount = visibleUnifiedAgentPage
     ? inventoryScopeAgentCount(visibleUnifiedAgentPage.summary, agentInventoryScope) : undefined;
   const nativeObservation = visibleUnifiedAgentPage?.sources.powerPlatform.observation;
-  const inventoryCollectionText = [
+  const inventoryCollectionText = !visibleUnifiedAgentPage && agentInventoryPending ? "Loading saved agent inventory..."
+    : !visibleUnifiedAgentPage && unifiedAgentReadError ? "Saved agent inventory unavailable." : [
     ...(agentInventoryScope !== "power_platform_only" ? [lastAgentListRefreshAt
       ? `Catalog collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
       : "No saved package catalog observation. Open Sync to collect it."] : []),
@@ -1570,7 +1571,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ? `Power Platform collected ${formatRefreshTime(new Date(nativeObservation.observedAt))}`
       : "No saved Power Platform observation. Open Sync to collect it."] : []),
   ].join(" · ");
-  const agentInventoryIssueSummary = inventoryUnavailable ? "" : inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
+  const agentInventoryIssueSummary = inventoryUnavailable || agentInventoryPending
+    ? "" : inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const hasActiveAgentFilters =
     packageType !== undefined ||
     endUserAccess !== "all" ||
@@ -1589,7 +1591,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size + selectedGroups.size;
   const exportSelectionRestoring = pendingPowerPlatformIds.size > 0 || pendingStoredAgentSelectionCount !== undefined;
   const agentExportRevision = visibleUnifiedAgentPage?.selection?.id;
-  const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (unifiedAgentPage && !agentExportRevision));
+  const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (visibleUnifiedAgentPage && !agentExportRevision));
+  const showAgentExportError = Boolean(agentExportError && !agentExportError.reloadRequired || !agentInventoryPending && agentExportNeedsReload);
   const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
     record => record.observations.powerPlatform,
   )?.observations.powerPlatform ?? null;
@@ -1709,10 +1712,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLinkedJobError(undefined);
   }
 
-  function invalidateAgentSelection() {
+  function invalidateAgentSelection(reloading = false) {
     setInventoryUnavailable(undefined);
-    agentListRequestId.current += 1;
-    agentListAbortController.current?.abort();
+    if (!reloading) {
+      agentListRequestId.current += 1;
+      agentListAbortController.current?.abort();
+    }
     cancelAgentDetailRequest();
     agentInventoryQueries.clear();
     inventoryNavigation.current = { key: "" };
@@ -1735,9 +1740,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setBulkConfirmation(undefined);
     setBulkAccessSelection(undefined);
     setBulkAccessAgentIds(undefined);
-    setLoadingAgents(false);
+    setLoadingAgents(reloading);
     clearPackageSelection(user);
-    setUnifiedAgentReadError("The saved inventory selection is no longer available. Reload saved inventory.");
+    setUnifiedAgentReadError(reloading ? undefined : "The saved inventory selection is no longer available. Reload saved inventory.");
   }
 
   async function loadSession() {
@@ -1833,12 +1838,30 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
 
     try {
-      const unifiedResponse = await agentInventoryQueries.read(principalKey, {
-        ...query,
-        limit: agentDisplayPageSize,
-        selectionId: inventoryNavigation.current.selectionId,
-        cursor: inventoryNavigation.current.cursor,
-      }, controller.signal);
+      const selectionId = inventoryNavigation.current.selectionId;
+      let unifiedResponse;
+      try {
+        unifiedResponse = await agentInventoryQueries.read(principalKey, {
+          ...query,
+          limit: agentDisplayPageSize,
+          selectionId,
+          cursor: inventoryNavigation.current.cursor,
+        }, controller.signal);
+      } catch (requestError) {
+        if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
+        const expiredSelection = selectionId && unifiedAgentPage?.selection.id === selectionId
+          && Date.parse(unifiedAgentPage.selection.expiresAt) <= Date.now();
+        if (!(requestError instanceof AgentInventoryExpiredError)
+          && !(expiredSelection && requestError instanceof ApiError && requestError.code === "selection_invalidated")) throw requestError;
+        // Renew only the read, once; no expired target selection or prepared action survives it.
+        invalidateAgentSelection(true);
+        inventoryNavigation.current = { key: inventoryKey };
+        pendingAgentListKey.current = JSON.stringify([inventoryKey, agentReloadRevision, undefined, undefined]);
+        setAgentPageIndex(0);
+        unifiedResponse = await agentInventoryQueries.read(principalKey, {
+          ...query, limit: agentDisplayPageSize,
+        }, controller.signal);
+      }
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
       setInitialAgentReadOwner(principalKey);
       if ("state" in unifiedResponse) {
@@ -3053,14 +3076,21 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       && ownsAgentScope(owner);
   }
 
+  function scheduleAgentReload() {
+    // Retire the consumer before clearing the cache can reject its pending read.
+    agentListRequestId.current += 1;
+    agentListAbortController.current?.abort();
+    agentInventoryQueries.clear();
+    setAgentReloadRevision(revision => revision + 1);
+  }
+
   function requestCurrentAgentReload() {
     if (!isCurrentAgentScope()) return;
     setServerPackageSelection(undefined);
     setGroupPackageSelection(undefined);
     setGroupTargetCount(undefined);
-    agentInventoryQueries.clear();
     forceCurrentAgentReload.current = true;
-    setAgentReloadRevision(revision => revision + 1);
+    scheduleAgentReload();
   }
 
   function handleQuarantineJobChange(job: QuarantineJob) {
@@ -3369,7 +3399,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   type="button"
                   className="secondary agent-export-button"
                   aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
-                  title={inventoryUnavailable ? "Collect agent inventory before exporting" : !agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
+                  title={agentInventoryPending ? "Wait for saved agent inventory to finish loading" : inventoryUnavailable ? "Collect agent inventory before exporting" : !agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
                   disabled={!canReadSensitiveUsage || loadingAgents || agentSearchPending || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
                   onClick={requestExportCsv}
                 >
@@ -3391,7 +3421,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             onAccessChange={endUserAccess => handleAgentFilterChange({ endUserAccess })}
             onUsageChange={reportedUsage => handleAgentFilterChange({ reportedUsage })} /> : null}
 
-          {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
+          {showAgentExportError ? <div className="error-banner" role="alert">
             <span>{agentExportError?.message ?? (unifiedAgentReadError
               ? "The current saved agent inventory could not be loaded. Reload the saved inventory before exporting."
               : "A saved agent inventory revision is unavailable. Reload the saved inventory before exporting.")}</span>

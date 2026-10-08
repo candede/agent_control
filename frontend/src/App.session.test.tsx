@@ -891,6 +891,12 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(reads()).toHaveLength(2));
     expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("The request was cancelled.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No saved package catalog observation/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Inventory needs attention · Open Sync" })).not.toBeInTheDocument();
+    expect(screen.getByText("Loading saved agent inventory...")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
     await act(async () => retry.resolve(new Response()));
     expect(await screen.findByText(agent.displayName)).toBeVisible();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -1213,6 +1219,101 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toEqual([]);
     expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")
       .every(([input]) => ["/api/data-sync/auto-refresh", "/api/capabilities/check", "/api/agent-inventory/selections"].includes(input))).toBe(true);
+  });
+
+  it.each(["capture", "page"] as const)(
+    "keeps the initial skeleton when an automatic publication supersedes an inventory %s", async phase => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const automatic = deferredResponse(), previous = deferredResponse(), replacement = deferredResponse();
+    const path = phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory";
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return automatic.promise;
+      if (new URL(input, "http://localhost").pathname === path) {
+        await (++reads === 1 ? previous.promise : replacement.promise);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<StrictMode><App /></StrictMode>);
+    await waitFor(() => expect(reads).toBe(1));
+    const previousSignal = transport.fetchMock.mock.calls.find(([input]) =>
+      new URL(input, "http://localhost").pathname === path)?.[1]?.signal;
+    expect(screen.getByRole("region", { name: "Loading agents" })).toBeVisible();
+
+    await act(async () => automatic.resolve(Response.json(automaticRefreshResponse())));
+    await waitFor(() => expect(reads).toBe(2));
+    expect(previousSignal?.aborted).toBe(true);
+    expect(screen.getByRole("region", { name: "Loading agents" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("The request was cancelled.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No saved package catalog observation/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Inventory needs attention · Open Sync" })).not.toBeInTheDocument();
+
+    await act(async () => previous.resolve(new Response()));
+    expect(screen.getByRole("region", { name: "Loading agents" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => replacement.resolve(new Response()));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(reads).toBe(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("retires a pending pinned page before a publication reload without flashing errors or losing rows", async () => {
+    vi.useFakeTimers();
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const previous = deferredResponse(), replacement = deferredResponse();
+    let version = 1, pendingReads = 0, holding = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory") {
+        if (holding) await (++pendingReads === 1 ? previous.promise : replacement.promise);
+        const nextPage = url.searchParams.has("cursor");
+        return Response.json(selectedInventoryPage(input, { ...unifiedPage,
+          page: { limit: 50, nextCursor: nextPage ? null : "next-agents", previousCursor: nextPage ? "first-agents" : null } }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    const selection = currentInventorySelection(transport.fetchMock);
+    holding = true;
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(pendingReads).toBe(1);
+    const previousSignal = agentListRequests(transport.fetchMock).at(-1)?.[1]?.signal;
+    version++;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(pendingReads).toBe(2);
+    expect(previousSignal?.aborted).toBe(true);
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("The request was cancelled.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    const latest = new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost");
+    expect(latest.searchParams.get("selectionId")).toBe(selection);
+    expect(latest.searchParams.get("cursor")).toBe("next-agents");
+
+    await act(async () => previous.resolve(new Response()));
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => replacement.resolve(new Response()));
+    expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(pendingReads).toBe(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("defers unused inventory reads across repeated checks and loads the latest revision when Agents opens", async () => {
@@ -6031,6 +6132,172 @@ describe("App session revalidation", () => {
       inventoryScope: "power_platform_only", sortBy: "displayName", sortDirection: "asc",
     });
     expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/agents/export.csv" || input.startsWith("/api/inventory/export.csv"))).toBe(false);
+  });
+
+  it.each(["selection", "identity", "usage"] as const)(
+    "recaptures saved inventory once when initial %s evidence expires, without flashing a failure", async expired => {
+    window.history.replaceState({}, "", "/agents?usage=used&sort=responses&direction=desc");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!, replacement = deferredResponse();
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/workbench/metadata") return Response.json({
+        views: workbenchViews, actions: workbenchActions.filter(action => action.id !== "data-sync.auto-refresh"),
+      });
+      const response = await base(input, init);
+      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return response;
+      if (++reads > 1) { await replacement.promise; return response; }
+      const page = await response.json() as UnifiedAgentInventoryPage;
+      const expiresAt = new Date(Date.now() - 1).toISOString();
+      if (expired === "selection") page.selection.expiresAt = expiresAt;
+      else if (expired === "usage") page.usageContext.expiresAt = expiresAt;
+      else page.value[0].packages[0].detailFreshness = {
+        state: "fresh", observedAt: new Date(Date.now() - 60_000).toISOString(), expiresAt,
+      };
+      return Response.json(page);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(reads).toBe(2));
+    expect(screen.getByRole("region", { name: "Loading agents" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(/saved agent inventory or usage report expired/)).not.toBeInTheDocument();
+    const captures = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections");
+    expect(captures).toHaveLength(2);
+    expect(captures.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+      { query: { inventoryScope: "catalog", reportedUsage: "used", sortBy: "responses", sortDirection: "desc" } },
+      { query: { inventoryScope: "catalog", reportedUsage: "used", sortBy: "responses", sortDirection: "desc" } },
+    ]);
+    const selectionIds = agentListRequests(transport.fetchMock).map(([input]) => new URL(input, "http://localhost").searchParams.get("selectionId"));
+    expect(new Set(selectionIds).size).toBe(2);
+    await act(async () => replacement.resolve(new Response()));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(reads).toBe(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it.each(["expired", "failed"] as const)("stops expiration recovery after one %s replacement and keeps explicit retry available", async outcome => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/workbench/metadata") return Response.json({
+        views: workbenchViews, actions: workbenchActions.filter(action => action.id !== "data-sync.auto-refresh"),
+      });
+      const response = await base(input, init);
+      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return response;
+      if (++reads === 2 && outcome === "failed") return Response.json({
+        code: "service_unavailable", detail: "Replacement saved inventory unavailable.",
+      }, { status: 503 });
+      const page = await response.json() as UnifiedAgentInventoryPage;
+      page.selection.expiresAt = new Date(Date.now() - 1).toISOString();
+      return Response.json(page);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Reload saved agent inventory" })).toBeEnabled();
+    expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("The current saved agent inventory could not be loaded.");
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(reads).toBe(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it.each(["identity", "selection"] as const)(
+    "renews expired %s evidence on a pinned detail view without reusing targets or the old page cursor", async expired => {
+    vi.useFakeTimers();
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!, replacement = deferredResponse();
+    const expiresAt = new Date(Date.now() + 45_000).toISOString();
+    let version = 1, firstSelection: string | undefined, replacementReads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      const url = new URL(input, "http://localhost");
+      if (url.pathname !== "/api/agent-inventory") return base(input, init);
+      const selected = url.searchParams.get("selectionId")!;
+      firstSelection ??= selected;
+      const initial = selected === firstSelection;
+      if (!initial) { replacementReads++; await replacement.promise; }
+      if (initial && expired === "selection" && Date.now() >= Date.parse(expiresAt)) {
+        return Response.json({ code: "selection_invalidated", detail: "The saved selection expired." }, { status: 409 });
+      }
+      const page = selectedInventoryPage(input, structuredClone(unifiedPage));
+      page.page = { limit: 50, nextCursor: url.searchParams.has("cursor") ? null : "next-agents",
+        previousCursor: url.searchParams.has("cursor") ? "first-agents" : null };
+      if (initial && expired === "selection") page.selection = { ...page.selection, expiresAt };
+      if (expired === "identity") page.value[0].packages[0].detailFreshness = {
+        state: initial ? "fresh" : "stale", observedAt: new Date(Date.now() - 120_000).toISOString(), expiresAt,
+      };
+      return Response.json(page);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(within(screen.getByRole("dialog", { name: agent.displayName })).getByRole("tab", { name: "Usage" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const detailId = new URLSearchParams(window.location.search).get("detail");
+    version++;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(agentListRequests(transport.fetchMock).map(([input, init]) => ({
+      query: new URL(input, "http://localhost").search, aborted: init?.signal?.aborted,
+    }))).toHaveLength(4);
+    expect(replacementReads).toBe(1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(/saved agent inventory or usage report expired/)).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    const requested = new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost");
+    expect(requested.searchParams.get("selectionId")).not.toBe(firstSelection);
+    expect(requested.searchParams.has("cursor")).toBe(false);
+    expect(new URLSearchParams(window.location.search).get("detail")).toBe(detailId);
+    expect(new URLSearchParams(window.location.search).get("detailTab")).toBe("reports");
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("selected")).toBe(false);
+    await act(async () => replacement.resolve(new Response()));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: agent.displayName });
+    expect(within(dialog).getByRole("tab", { name: "Usage" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(replacementReads).toBe(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")
+      .every(([input]) => ["/api/data-sync/auto-refresh", "/api/capabilities/check", "/api/agent-inventory/selections"].includes(input))).toBe(true);
+  });
+
+  it.each(["denial", "conflict", "malformed"] as const)("does not automatically renew inventory for a %s without confirmed expiration", async failure => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/workbench/metadata") return Response.json({
+        views: workbenchViews, actions: workbenchActions.filter(action => action.id !== "data-sync.auto-refresh"),
+      });
+      const response = await base(input, init);
+      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return response;
+      reads++;
+      if (failure !== "malformed") return Response.json({
+        code: failure === "denial" ? "forbidden" : "selection_invalidated", detail: "The saved inventory was rejected.",
+      }, { status: failure === "denial" ? 403 : 409 });
+      const page = await response.json() as UnifiedAgentInventoryPage;
+      page.selection.expiresAt = "invalid";
+      return Response.json(page);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Reload saved agent inventory" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(reads).toBe(1);
   });
 
   it.each(["", "expired"] as const)("does not export an unavailable selected inventory (%s)", async state => {

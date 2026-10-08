@@ -73,6 +73,28 @@ status.
 See [deployment setup](deployment-setup.md) and
 [Microsoft roles](user-roles-and-permissions.md).
 
+## Reload saved agent inventory
+
+Reloading reads saved data; it does not start a new collection from Microsoft.
+The Agents page keeps its loading skeleton during the first read, including when
+a background publication replaces that read. Subsequent reads show an updating
+indicator and retain previous results when available. Export stays disabled
+until the current read succeeds.
+
+A retry shows loading status instead of the previous inventory error. If the
+current read fails, the error and **Reload saved agent inventory** action remain
+available. Confirmed missing inventory or source-coverage issues are shown after
+loading finishes; a cancelled, superseded read is not an application failure.
+
+If saved inventory or report evidence expires during a read, Agents makes one
+automatic attempt to capture and load a fresh saved-data selection. Filters,
+sorting, and the requested agent detail link are preserved; paging restarts at
+the first page and target selections and prepared actions are cleared. This does
+not collect provider data, retry an export, or replay a management action.
+If the replacement also fails or is already expired, the page offers explicit
+retry rather than repeatedly reloading. Permission failures, malformed responses,
+and selection conflicts without confirmed expiration still surface as errors.
+
 ## Diagnose synchronization problems
 
 Use **Sync** to review each source independently.
