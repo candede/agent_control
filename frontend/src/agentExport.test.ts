@@ -39,6 +39,35 @@ describe("unified agent export references", () => {
     expect(() => selectedAgentExportReferences([], [], ["unqualified-native"])).toThrow(/exact canonical or Power Platform reference/);
   });
 
+  it("deduplicates normalized canonical and native aliases without merging opaque package IDs", () => {
+    const canonical = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const recordId = "agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    expect(selectedAgentExportReferences([{ ...record, id: recordId }],
+      ["opaque/package%one", "opaque/package%one", "OPAQUE/package%one"],
+      [canonical, recordId, nativeKey, "power_platform:env%2fa:native%2fone"])).toEqual([
+      canonical, "graph_packages:OPAQUE%2Fpackage%25one",
+    ]);
+  });
+
+  it("never restores an ambiguous source mapping when either canonical row is observed again", () => {
+    const other = { ...record, id: "agent:22222222-2222-4222-8222-222222222222" };
+    for (const records of [[record, other, record], [other, record, other]]) {
+      expect(selectedAgentExportReferences(records, ["opaque/package%one"], [nativeKey])).toEqual([
+        "graph_packages:opaque%2Fpackage%25one", nativeKey,
+      ]);
+    }
+  });
+
+  it("uses the same native GUID normalization as quarantine selections without folding opaque IDs", () => {
+    const nativeId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const observed = { ...record, powerPlatformResource: { environmentId: "ENVIRONMENT-A", nativeId } };
+    expect(selectedAgentExportReferences([observed], [],
+      [`power_platform:environment-a:${nativeId.toLowerCase()}`])).toEqual([canonical]);
+    expect(selectedAgentExportReferences([{ ...observed, powerPlatformResource: {
+      environmentId: "ENVIRONMENT-A", nativeId: "Opaque/Native",
+    } }], [], ["power_platform:environment-a:opaque%2Fnative"])).toEqual(["power_platform:environment-a:opaque%2Fnative"]);
+  });
+
   it("does not truncate a maximum-size selected package set", () => {
     const ids = Array.from({ length: maximumExplicitAgentReferences }, (_, index) => `package-${index}`);
     const refs = selectedAgentExportReferences([], ids, []);

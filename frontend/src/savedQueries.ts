@@ -25,6 +25,12 @@ export function createSavedQueryClient() {
   });
   client.getQueryCache().subscribe(event => {
     if (event.type !== "observerRemoved" || !event.query.meta?.retainReportPage) return;
+    if (event.query.getObserversCount() === 0 && event.query.state.error instanceof ApiError
+      && event.query.state.error.code === "selection_invalidated") {
+      // A rejected capture cannot be reused; let the next visit retain a fresh one.
+      client.removeQueries({ queryKey: event.query.queryKey, exact: true });
+      return;
+    }
     // QueryObserver switches its current query before detaching from the old one.
     const currentQuery = event.observer.getCurrentQuery();
     const incomingQuery = currentQuery !== event.query ? currentQuery : undefined;
@@ -54,12 +60,14 @@ export function useSavedQuery<T>(options: UseQueryOptions<T, Error, T, QueryKey>
 /**
  * An observer lets existing fenced workflows share saved reads without letting
  * one caller's cancellation abort another caller's request.
+ * Retention is opt-in for keys that include the server's immutable revision.
  */
 export function readSavedQuery<T>(
   client: QueryClient,
   queryKey: QueryKey,
   read: (signal: AbortSignal) => Promise<T>,
   signal: AbortSignal,
+  retention?: { staleTime: number; gcTime: number },
 ): Promise<T> {
   if (signal.aborted) return Promise.reject(abortedRead());
   return new Promise<T>((resolve, reject) => {
@@ -77,7 +85,8 @@ export function readSavedQuery<T>(
       },
       enabled: () => !settled,
       staleTime: 0,
-      refetchOnMount: "always",
+      ...retention,
+      refetchOnMount: retention ? true : "always",
     });
     let unsubscribe = () => observer.destroy();
     const finish = (complete: () => void) => {
@@ -105,27 +114,45 @@ export function readSavedQuery<T>(
       unsubscribe();
       return;
     }
+    const cached = observer.getCurrentResult();
+    if (retention && cached.isSuccess && !cached.isFetching && !cached.isStale) {
+      finish(() => resolve(cached.data));
+      return;
+    }
     // Cancellation can revert observer state to old data or idle/pending.
-    // Only the admitted fetch promise proves that this read completed.
+    // Without a fresh retained result, only the admitted fetch proves completion.
     const pending = observer.getCurrentQuery().promise;
     if (!pending) {
       finish(() => reject(new Error("The saved-data request did not start.")));
       return;
     }
-    void pending.then(
-      data => {
-        const result = observer.getCurrentResult();
-        finish(() => result.isError ? reject(result.error) : resolve(data));
-      },
-      cause => finish(() => reject(isCancelledError(cause) ? abortedRead() : cause)),
-    );
+    observeFetch(pending);
+
+    function observeFetch(admitted: Promise<T>) {
+      const settle = (complete: () => void) => {
+        if (settled) return;
+        const replacement = observer.getCurrentQuery().promise;
+        // Invalidation can replace a fetch before its completion reaches this caller.
+        if (replacement && replacement !== admitted) observeFetch(replacement);
+        else finish(complete);
+      };
+      void admitted.then(
+        data => settle(() => {
+          const result = observer.getCurrentResult();
+          if (result.isError) reject(result.error);
+          else resolve(data);
+        }),
+        cause => settle(() => reject(isCancelledError(cause) ? abortedRead() : cause)),
+      );
+    }
   });
 }
 
 export function useSavedRead() {
   const client = useSavedQueryClient();
-  return useCallback(<T,>(key: QueryKey, read: (signal: AbortSignal) => Promise<T>, signal: AbortSignal) =>
-    readSavedQuery(client, key, read, signal), [client]);
+  return useCallback(<T,>(key: QueryKey, read: (signal: AbortSignal) => Promise<T>, signal: AbortSignal,
+    retention?: { staleTime: number; gcTime: number }) =>
+    readSavedQuery(client, key, read, signal, retention), [client]);
 }
 
 function abortedRead() {

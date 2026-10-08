@@ -31,17 +31,49 @@ function isRadioInput(element: HTMLElement): element is HTMLInputElement {
   return element.matches('input[type="radio"]');
 }
 
+function isUnavailableForFocus(element: HTMLElement) {
+  const inert = element.closest("[inert]");
+  const modal = inert && element.closest("dialog:modal");
+  // Native modals escape inherited inertness, but not inertness applied inside the modal.
+  return !element.isConnected || element.matches(':disabled, input[type="hidden"]')
+    || element.closest("[hidden]") || inert && (!modal || modal.contains(inert))
+    || isHiddenByClosedDetails(element) || isHiddenByStyles(element);
+}
+
+export function observeDialogFocus(dialog: HTMLDialogElement) {
+  const document = dialog.ownerDocument;
+  const observer = new MutationObserver(() => {
+    // Removing or disabling focused content sends keydown to the body, bypassing the dialog's trap.
+    const active = document.activeElement;
+    if (dialog.isConnected && dialog.open && (active === document.body
+      || active instanceof HTMLElement && dialog.contains(active) && isUnavailableForFocus(active))) {
+      dialog.focus({ preventScroll: true });
+    }
+  });
+  observer.observe(dialog, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["disabled", "hidden", "inert", "open", "style", "class"],
+  });
+  return () => observer.disconnect();
+}
+
 export function trapDialogFocus(
-  event: Pick<KeyboardEvent, "key" | "shiftKey" | "preventDefault">,
+  event: Pick<KeyboardEvent, "key" | "shiftKey" | "preventDefault"> & { defaultPrevented?: boolean },
   dialog: HTMLElement | null,
 ) {
-  if (event.key !== "Tab" || !dialog) return;
+  if (event.key !== "Tab" || event.defaultPrevented || !dialog
+    || dialog.matches("dialog:not([open])") || isUnavailableForFocus(dialog)) return;
+  const document = dialog.ownerDocument;
+  const active = document.activeElement;
+  const activeModal = active?.closest("dialog:modal");
+  // Native modal inertness is not reflected in background elements' attributes.
+  if (activeModal && !activeModal.contains(dialog)
+    || !dialog.closest("dialog:modal") && document.querySelector("dialog:modal")) return;
   const candidates = [...dialog.querySelectorAll<HTMLElement>(focusableSelector)]
-    .filter(element => element.tabIndex >= 0 && !element.matches(':disabled, input[type="hidden"]')
-      && !element.closest("[hidden], [inert]") && !isHiddenByClosedDetails(element)
-      && !isHiddenByStyles(element))
+    .filter(element => element.tabIndex >= 0 && !isUnavailableForFocus(element))
     .sort((a, b) => (a.tabIndex || Number.MAX_SAFE_INTEGER) - (b.tabIndex || Number.MAX_SAFE_INTEGER));
-  const active = dialog.ownerDocument.activeElement;
   const radios = candidates.filter(isRadioInput);
   const focusable = candidates.filter(element => {
     if (!isRadioInput(element) || !element.name) return true;

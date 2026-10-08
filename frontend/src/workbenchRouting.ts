@@ -123,11 +123,11 @@ export function workbenchUrl(
 }
 
 export function parseDataSyncRoute(search: string): DataSyncRouteState {
-  const params = new URLSearchParams(search);
+  const params = routeParams(search);
   return {
-    powerPlatformJobId: bounded(params.get("powerPlatformJob"), 512),
-    syncRunId: bounded(params.get("syncRun"), 512),
-    refreshJobId: bounded(params.get("refreshJob"), 512),
+    powerPlatformJobId: bounded(params.get("powerPlatformJob"), 512)?.toLowerCase(),
+    syncRunId: durableRouteId(params.get("syncRun")),
+    refreshJobId: durableRouteId(params.get("refreshJob")),
     refreshMode: params.get("mode") === "application" ? "application" : "delegated",
     reports: parseSyncReportRoute(search),
   };
@@ -135,38 +135,39 @@ export function parseDataSyncRoute(search: string): DataSyncRouteState {
 
 export function dataSyncRouteSearch(state: DataSyncRouteState): URLSearchParams {
   const params = new URLSearchParams();
-  if (state.powerPlatformJobId && validSelectedId(state.powerPlatformJobId)) params.set("powerPlatformJob", state.powerPlatformJobId);
-  if (state.syncRunId && validSelectedId(state.syncRunId)) params.set("syncRun", state.syncRunId);
-  if (state.refreshJobId && validSelectedId(state.refreshJobId)) {
-    params.set("refreshJob", state.refreshJobId);
+  if (state.powerPlatformJobId && validSelectedId(state.powerPlatformJobId)) params.set("powerPlatformJob", state.powerPlatformJobId.toLowerCase());
+  setDurableRouteId(params, "syncRun", state.syncRunId);
+  if (setDurableRouteId(params, "refreshJob", state.refreshJobId)) {
     if (state.refreshMode === "application") params.set("mode", state.refreshMode);
   }
   if (state.reports) {
     params.set("reports", state.reports.view);
-    if (state.reports.view === "import" && state.reports.stagingId && validSelectedId(state.reports.stagingId)) {
-      params.set("staging", state.reports.stagingId);
+    if (state.reports.view === "import") {
+      setDurableRouteId(params, "staging", state.reports.stagingId);
+      setDurableRouteId(params, "correction", state.reports.reportSetId);
     }
     if (state.reports.view === "snapshot") {
-      if (state.reports.reportSetId && validSelectedId(state.reports.reportSetId)) params.set("snapshot", state.reports.reportSetId);
-      const defaultDays = state.reports.reportSetId ? 365 : 30;
-      if (state.reports.activityWindowDays !== defaultDays) {
-        params.set("window", String(Math.min(365, Math.max(1, state.reports.activityWindowDays))));
-      }
+      const reportSetId = setDurableRouteId(params, "snapshot", state.reports.reportSetId);
+      const defaultDays = reportSetId ? 365 : 30;
+      const days = Number.isSafeInteger(state.reports.activityWindowDays)
+        ? Math.min(365, Math.max(1, state.reports.activityWindowDays)) : defaultDays;
+      if (days !== defaultDays) params.set("window", String(days));
     }
   }
   return params;
 }
 
 export function parseAgentRoute(search: string): AgentRouteState {
-  const params = new URLSearchParams(search);
-  const query = (params.get("q") ?? "").slice(0, 256);
+  const params = routeParams(search);
+  const query = bounded((params.get("q") ?? "").slice(0, 256), 256) ?? "";
   const status = params.get("status");
   const legacyView = params.get("show");
   const sortBy = params.get("sort");
   const selectedIds = [...new Set(params.getAll("selected").filter(validSelectedId))].slice(0, maximumPackageSelection);
   const selectionCount = boundedSelectionCount(params.get("selectionCount"));
   const selectionStored = params.get("selectionState") === "session" && selectionCount !== undefined;
-  const environmentId = routeFacet(params, "environment", 512);
+  const environment = routeFacet(params, "environment", 512);
+  const environmentId = typeof environment === "string" ? environment.toLowerCase() : environment;
   const rawDetailId = agentRecordId(params.get("detail"));
   const detailId = rawDetailId && !parseUnifiedAgentRecordId(rawDetailId) && params.get("source") === "power_platform" && environmentId
     ? unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: rawDetailId })
@@ -175,12 +176,13 @@ export function parseAgentRoute(search: string): AgentRouteState {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
     packageType: params.has("type") ? routeFacet(params, "type", 4096) : legacyView === "first_party" ? "firstParty" : legacyView === "third_party" ? "thirdParty" : undefined,
     endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access"))
-      ?? (legacyView === "available" || legacyView === "unavailable" ? legacyView : legacyView === "availability_unknown" ? "unknown" : "all"),
-    reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (legacyView === "used" ? "used" : "all"),
+      ?? (!params.has("access") && (legacyView === "available" || legacyView === "unavailable") ? legacyView
+        : !params.has("access") && legacyView === "availability_unknown" ? "unknown" : "all"),
+    reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (!params.has("usage") && legacyView === "used" ? "used" : "all"),
     management: unifiedAgentManagementFilters.find(value => value === params.get("management"))
-      ?? (legacyView === "user_managed" || legacyView === "organization_managed" ? legacyView : "all"),
+      ?? (!params.has("management") && (legacyView === "user_managed" || legacyView === "organization_managed") ? legacyView : "all"),
     relevance: unifiedAgentRelevanceFilters.find(value => value === params.get("relevance"))
-      ?? (legacyView === "organization" || legacyView === "unknown" ? legacyView : "all"),
+      ?? (!params.has("relevance") && (legacyView === "organization" || legacyView === "unknown") ? legacyView : "all"),
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
     publisher: routeFacet(params, "publisher", 4096),
@@ -195,16 +197,16 @@ export function parseAgentRoute(search: string): AgentRouteState {
     detailTab: bounded(params.get("detailTab"), 64),
     selectedIds,
     ...(selectionStored ? { selectionStorage: "session" as const, selectionCount } : {}),
-    refreshJobId: bounded(params.get("refreshJob"), 512),
+    refreshJobId: durableRouteId(params.get("refreshJob")),
     refreshMode: params.get("mode") === "application" ? "application" : "delegated",
-    controlJobId: bounded(params.get("controlJob"), 512),
-    syncRunId: bounded(params.get("syncRun"), 512),
+    controlJobId: durableRouteId(params.get("controlJob")),
+    syncRunId: durableRouteId(params.get("syncRun")),
     source: "all",
     linkState: "all",
     environmentId,
-    inventorySnapshotId: bounded(params.get("inventorySnapshot"), 64),
-    selectedPowerPlatformIds: [...new Set(params.getAll("selectedResource").filter(value => agentRecordId(value) !== undefined))].slice(0, 25),
-    quarantineJobId: bounded(params.get("quarantineJob"), 512),
+    inventorySnapshotId: durableRouteId(params.get("inventorySnapshot"), 64),
+    selectedPowerPlatformIds: [...new Set(params.getAll("selectedResource").map(agentRecordId).filter(value => value !== undefined))].slice(0, 25),
+    quarantineJobId: durableRouteId(params.get("quarantineJob")),
   };
 }
 
@@ -227,28 +229,31 @@ export function agentRouteSearch(state: AgentRouteState) {
   if (state.reportedUsage !== "all") params.set("usage", state.reportedUsage);
   if (state.management !== "all") params.set("management", state.management);
   if (state.relevance !== "all") params.set("relevance", state.relevance);
-  if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
+  const search = bounded(state.search.trim().slice(0, 256), 256);
+  if (search) params.set("q", search);
   if (state.status !== "all") params.set("status", state.status);
   if (state.publisher !== undefined) params.set("publisher", encodeInventoryFacet(state.publisher));
   if (state.availability !== undefined) params.set("availability", encodeInventoryFacet(state.availability));
   if (state.host !== undefined) params.set("host", encodeInventoryFacet(state.host));
   if (state.platform !== undefined) params.set("platform", encodeInventoryFacet(state.platform));
-  if (state.createdWithinDays) params.set("createdWithinDays", state.createdWithinDays);
+  const createdWithinDays = boundedIntegerText(state.createdWithinDays, 3650);
+  if (createdWithinDays) params.set("createdWithinDays", createdWithinDays);
   if (state.sortBy !== "displayName") params.set("sort", state.sortBy);
   if (state.sortDirection !== "asc") params.set("direction", state.sortDirection);
-  if (state.page > 0) params.set("page", String(state.page + 1));
-  if (state.detailId && agentRecordId(state.detailId)) params.set("detail", state.detailId);
-  if (state.detailId && state.detailTab && state.detailTab !== "identities") params.set("detailTab", state.detailTab.slice(0, 64));
-  if (state.refreshJobId && validSelectedId(state.refreshJobId)) {
-    params.set("refreshJob", state.refreshJobId);
+  if (Number.isSafeInteger(state.page) && state.page > 0 && state.page <= 2_000) params.set("page", String(state.page + 1));
+  const detailId = agentRecordId(state.detailId ?? null);
+  if (detailId) params.set("detail", detailId);
+  const detailTab = bounded(state.detailTab?.slice(0, 64) ?? null, 64);
+  if (detailId && detailTab && detailTab !== "identities") params.set("detailTab", detailTab);
+  if (setDurableRouteId(params, "refreshJob", state.refreshJobId)) {
     if (state.refreshMode === "application") params.set("mode", "application");
   }
-  if (state.controlJobId && validSelectedId(state.controlJobId)) params.set("controlJob", state.controlJobId);
-  if (state.syncRunId && validSelectedId(state.syncRunId)) params.set("syncRun", state.syncRunId);
-  if (state.environmentId !== undefined) params.set("environment", encodeInventoryFacet(state.environmentId));
-  if (state.inventorySnapshotId) params.set("inventorySnapshot", state.inventorySnapshotId);
-  for (const id of [...new Set(state.selectedPowerPlatformIds.filter(value => agentRecordId(value) !== undefined))].slice(0, 25)) params.append("selectedResource", id);
-  if (state.quarantineJobId && validSelectedId(state.quarantineJobId)) params.set("quarantineJob", state.quarantineJobId);
+  setDurableRouteId(params, "controlJob", state.controlJobId);
+  setDurableRouteId(params, "syncRun", state.syncRunId);
+  if (state.environmentId !== undefined) params.set("environment", encodeInventoryFacet(state.environmentId?.toLowerCase() ?? null));
+  setDurableRouteId(params, "inventorySnapshot", state.inventorySnapshotId, 64);
+  for (const id of [...new Set(state.selectedPowerPlatformIds.map(agentRecordId).filter(value => value !== undefined))].slice(0, 25)) params.append("selectedResource", id);
+  setDurableRouteId(params, "quarantineJob", state.quarantineJobId);
   if (state.selectionStorage === "session" && boundedSelectionCount(String(state.selectionCount)) !== undefined) {
     params.set("selectionState", "session");
     params.set("selectionCount", String(state.selectionCount));
@@ -280,7 +285,7 @@ const localAuditStatuses = new Set([
 ]);
 
 export function parseAuditRoute(search: string): AuditRouteState {
-  const params = new URLSearchParams(search);
+  const params = routeParams(search);
   const action = bounded(params.get("action"), 64);
   const status = bounded(params.get("status"), 64);
   return {
@@ -293,23 +298,24 @@ export function parseAuditRoute(search: string): AuditRouteState {
 
 export function auditRouteSearch(state: AuditRouteState) {
   const params = new URLSearchParams();
-  if (state.search.trim()) params.set("q", state.search.trim().slice(0, auditMaximumSearchLength));
+  const search = bounded(state.search.trim().slice(0, auditMaximumSearchLength), auditMaximumSearchLength);
+  if (search) params.set("q", search);
   if (state.action !== "all" && localAuditActions.has(state.action)) params.set("action", state.action);
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
-  if (state.page > 0) params.set("page", String(Math.min(state.page, maximumAuditPageIndex) + 1));
+  if (Number.isSafeInteger(state.page) && state.page > 0) params.set("page", String(Math.min(state.page, maximumAuditPageIndex) + 1));
   return params;
 }
 
 export function parseSyncReportRoute(search: string): SyncReportRouteState | undefined {
-  const params = new URLSearchParams(search);
+  const params = routeParams(search);
   const view = params.get("reports");
   if (view !== "import" && view !== "manage" && view !== "snapshot") return undefined;
-  const reportSetId = bounded(params.get("snapshot"), 512);
+  const reportSetId = durableRouteId(params.get("snapshot"));
   const activityWindowDays = Number(params.get("window"));
   return {
     view,
-    stagingId: view === "import" ? bounded(params.get("staging"), 512) : undefined,
-    reportSetId: view === "snapshot" ? reportSetId : undefined,
+    stagingId: view === "import" ? durableRouteId(params.get("staging")) : undefined,
+    reportSetId: view === "snapshot" ? reportSetId : view === "import" ? durableRouteId(params.get("correction")) : undefined,
     activityWindowDays: view !== "snapshot" ? 30 : Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365
       ? activityWindowDays
       : reportSetId ? 365 : 30,
@@ -318,9 +324,9 @@ export function parseSyncReportRoute(search: string): SyncReportRouteState | und
 
 export function migrateOfficialUsageRoute(pathname: string, search: string): URLSearchParams | undefined {
   if (normalizePath(pathname) !== "/official-usage") return undefined;
-  const params = new URLSearchParams(search);
-  const stagingId = bounded(params.get("staging"), 512);
-  const reportSetId = bounded(params.get("snapshot"), 512);
+  const params = routeParams(search);
+  const stagingId = durableRouteId(params.get("staging"));
+  const reportSetId = durableRouteId(params.get("snapshot"));
   const window = Number(params.get("window"));
   const validWindow = Number.isSafeInteger(window) && window >= 1 && window <= 365;
   const view = stagingId ? "import"
@@ -328,12 +334,13 @@ export function migrateOfficialUsageRoute(pathname: string, search: string): URL
     : params.get("view") === "snapshot" || reportSetId || validWindow ? "snapshot" : "manage";
   return dataSyncRouteSearch({
     refreshMode: "delegated",
-    reports: { view, stagingId, reportSetId, activityWindowDays: validWindow ? window : reportSetId ? 365 : 30 },
+    reports: { view, stagingId, reportSetId: view === "snapshot" ? reportSetId : undefined,
+      activityWindowDays: validWindow ? window : reportSetId ? 365 : 30 },
   });
 }
 
 export function parseUsersRoute(search: string): UsersRouteState {
-  const params = new URLSearchParams(search);
+  const params = routeParams(search);
   const legacyResponsibility = params.get("view") === "responsibility";
   const detailId = params.get("detail") ?? (legacyResponsibility ? params.get("person") : null);
   return {
@@ -344,8 +351,9 @@ export function parseUsersRoute(search: string): UsersRouteState {
     } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
-    reportSetId: bounded(params.get("snapshot"), 512),
-    page: boundedPage(params.get("page")),
+    reportSetId: durableRouteId(params.get("snapshot")),
+    // Users pages require an owned selection cursor, not a legacy offset.
+    page: 0,
   };
 }
 
@@ -356,17 +364,29 @@ export function usersRouteSearch(state: UsersRouteState) {
     params.set("detail", isDirectoryObjectId(state.detailId) ? state.detailId.toLowerCase() : "invalid");
     if (state.detailTab && state.detailTab !== "overview") params.set("tab", state.detailTab);
   }
-  if (state.view === "licenses") return params;
-  if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
-  if (state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
-  if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);
-  if (state.page > 0) params.set("page", String(Math.min(2_001, state.page + 1)));
+  const search = bounded(state.search.trim().slice(0, 256), 256);
+  if (search) params.set("q", search);
+  if (state.view === "activity" && state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
+  setDurableRouteId(params, "snapshot", state.reportSetId);
   return params;
 }
 
 function normalizePath(pathname: string) {
   if (pathname === "/") return "/";
   return pathname.replace(/\/+$/, "") || "/";
+}
+
+function routeParams(search: string) {
+  const params = new URLSearchParams(search);
+  const counts = new Map<string, number>();
+  for (const key of params.keys()) counts.set(key, (counts.get(key) ?? 0) + 1);
+  for (const [key, count] of counts) {
+    if (key !== "selected" && key !== "selectedResource" && count > 1) {
+      // Retain presence so an ambiguous explicit filter cannot fall back to a legacy alias.
+      params.set(key, "");
+    }
+  }
+  return params;
 }
 
 function validSelectedId(value: string) {
@@ -376,7 +396,8 @@ function validSelectedId(value: string) {
 function agentRecordId(value: string | null): string | undefined {
   if (!value || value.length > 10000) return undefined;
   try {
-    return parseUnifiedAgentRecordId(value) || validSelectedId(value) ? value : undefined;
+    const target = parseUnifiedAgentRecordId(value);
+    return target ? unifiedAgentRecordId(target) : validSelectedId(value) ? value : undefined;
   } catch (error) {
     if (error instanceof URIError || error instanceof RangeError) return undefined;
     throw error;
@@ -393,6 +414,17 @@ function bounded(value: string | null, maximum: number) {
   return value && value.length <= maximum && !/[\0\r\n]/.test(value) ? value : undefined;
 }
 
+function durableRouteId(value: string | null | undefined, maximum = 512) {
+  const id = bounded(value ?? null, maximum);
+  return id?.replace(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i, uuid => uuid.toLowerCase());
+}
+
+function setDurableRouteId(params: URLSearchParams, key: string, value: string | undefined, maximum = 512) {
+  const id = durableRouteId(value, maximum);
+  if (id) params.set(key, id);
+  return id;
+}
+
 function boundedPage(value: string | null) {
   if (!value || !/^\d+$/.test(value)) return 0;
   const oneBased = Number(value);
@@ -402,5 +434,5 @@ function boundedPage(value: string | null) {
 function boundedIntegerText(value: string | null, maximum: number) {
   if (!value || !/^\d+$/.test(value)) return "";
   const number = Number(value);
-  return Number.isSafeInteger(number) && number >= 1 && number <= maximum ? value : "";
+  return Number.isSafeInteger(number) && number >= 1 && number <= maximum ? String(number) : "";
 }

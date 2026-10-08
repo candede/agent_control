@@ -30,7 +30,7 @@ export function AgentInventoryScopes({ inventory, value, onChange, loading = fal
 }
 
 export function AgentInventoryOverview({ inventory, revision, allSelected, onClearFilters,
-  endUserAccess = "all", reportedUsage = "all", onAccessChange, onUsageChange, inventoryScope = "catalog", reportSelector, loadingInventory = false }: {
+  endUserAccess = "all", reportedUsage = "all", onAccessChange, onUsageChange, inventoryScope = "catalog", reportSelector, loadingInventory = false, reportPending = false }: {
   inventory?: UnifiedAgentInventoryPage;
   revision: number;
   allSelected?: boolean;
@@ -42,18 +42,25 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   inventoryScope?: UnifiedAgentInventoryScope;
   reportSelector?: ReactNode;
   loadingInventory?: boolean;
+  reportPending?: boolean;
 }) {
   const usageContext = inventory?.usageContext;
   const { data, loading, error, retry, invalidated, restart } = useOfficialUsageOverview({
     scope: "selected", setId: usageContext?.reports.setId ?? undefined, limit: 1,
-  }, revision, Boolean(inventory));
+  }, revision, Boolean(usageContext?.reports.setId) && !reportPending);
   const hasCatalog = inventory?.sources.graphPackages.state !== undefined && inventory.sources.graphPackages.state !== "unavailable";
   const hasPowerPlatform = inventory?.sources.powerPlatform.state !== undefined && inventory.sources.powerPlatform.state !== "unavailable";
   const hasInventory = inventoryScope === "catalog" ? hasCatalog : inventoryScope === "power_platform_only" ? hasPowerPlatform : hasCatalog || hasPowerPlatform;
   const selectedScope = agentInventoryScopeOptions.find(option => option.value === inventoryScope)!;
   const scopedInventory = inventory?.inventoryScope === inventoryScope ? inventory : undefined;
   const reports = data?.reports.setId && data.analytics.overview && data.analytics.overview.retainedSets > 0
-    && (!usageContext || data.reports.setId === usageContext.reports.setId) ? data.analytics.overview : null;
+    && data.reports.setId.toLowerCase() === usageContext?.reports.setId?.toLowerCase() ? data.analytics.overview : null;
+  const waitingForInventory = Boolean(inventory) && reportPending || loadingInventory && !inventory;
+  const loadingReports = loading && !data || waitingForInventory;
+  const unavailableReportHint = waitingForInventory ? "Waiting for saved inventory"
+    : loadingReports ? "Loading selected report evidence"
+      : error || usageContext?.reports.setId ? "Selected report evidence unavailable"
+        : inventory ? "No selected report data" : "Report context unavailable";
   return <section className="agent-inventory-overview" aria-label="Agent inventory overview">
     {inventoryScope !== "catalog" && inventory && !hasCatalog ? <p className="agent-inventory-scope-warning" aria-live="polite">
       The package catalog is unavailable. Catalog matching is incomplete until that source is collected.
@@ -68,12 +75,12 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
         hint={inventory?.partial ? "In this view · Partial data" : "All or selected users"}
         selected={endUserAccess === "available"} onClick={onAccessChange ? () => onAccessChange(endUserAccess === "available" ? "all" : "available") : undefined} />
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
-        loading={loading && !data || loadingInventory && !inventory}
-        hint={reports ? "In selected report set" : "No selected report data"}
+        loading={loadingReports}
+        hint={reports ? "In selected report set" : unavailableReportHint}
         selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
       <Metric label="Reported active · 30 days" value={reports?.active30Days ?? null}
-        loading={loading && !data || loadingInventory && !inventory}
-        hint={reports ? `${usageDate(reports.activeSinceDateUtc)} - ${usageDate(reports.asOf)} (UTC)` : "No selected report data"} />
+        loading={loadingReports}
+        hint={reports ? `${usageDate(reports.activeSinceDateUtc)} - ${usageDate(reports.asOf)} (UTC)` : unavailableReportHint} />
       <div className="agent-report-context" title="Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero.">
         <span className="agent-context-label">Report context</span>
         {reportSelector ?? <span>{usageContext ? usageCoverageLabel(usageContext.reports) : "Selected report set"}</span>}
@@ -81,8 +88,9 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
           ? <span role="status">{usageAvailabilityLabel(usageContext.reports.availability)}</span> : null}
       </div>
     </div>
-    {loading ? <p className="sr-only" role="status">Loading selected report evidence...</p> : null}
-    {error ? <p className="error-banner" role="alert">{error.message} <button className="secondary" type="button" onClick={invalidated ? restart : retry}>{invalidated ? "Restart selection" : "Retry activity evidence"}</button></p> : null}
+    {waitingForInventory || loading ? <p className="sr-only" role="status">{waitingForInventory
+      ? "Waiting for saved inventory before reading report evidence..." : "Loading selected report evidence..."}</p> : null}
+    {error && !loading && !waitingForInventory ? <p className="error-banner" role="alert">{error.message} <button className="secondary" type="button" onClick={invalidated ? restart : retry}>{invalidated ? "Restart selection" : "Retry activity evidence"}</button></p> : null}
   </section>;
 }
 

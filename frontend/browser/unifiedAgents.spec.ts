@@ -109,10 +109,7 @@ test("expired package details stay in diagnostics without an admin attention war
   await mockScopedCatalog(page, {
     ...catalog,
     identityCollection: { checkedPackages: 668, pendingPackages: 429, pendingDetails: { missing: 0, stale: 417, invalidated: 12 } },
-    verification: {
-      ...createUnifiedVerification({ graphPackageCount: 1097, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, { packageMetadata: false }, layoutTime),
-      status: "details_pending",
-    },
+    verification: createUnifiedVerification({ graphPackageCount: 1097, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, { packageMetadata: false }, layoutTime),
   });
   await page.goto("/agents");
   await expect(page.getByRole("region", { name: "Unified agents" })).toBeVisible();

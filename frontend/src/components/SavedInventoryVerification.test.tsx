@@ -1,5 +1,7 @@
+import type { ComponentProps } from "react";
 import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 import type { UnifiedAgentInventoryPage } from "../api/client";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "../test/inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
@@ -59,13 +61,14 @@ describe("SavedAgentInventoryVerification source availability", () => {
     expect(details.getByText(/not a fresh Microsoft read or proof of universal tenant visibility/)).toBeVisible();
   });
 
-  it("does not describe stale package details as missing metadata or certify their freshness", () => {
+  it.each([true, false])("does not describe pending details as failed metadata or certify freshness (counts supplied: %s)", countsSupplied => {
     const inventory = emptyInventory();
-    inventory.identityCollection = { checkedPackages: 0, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } };
-    inventory.verification = {
-      ...createUnifiedVerification({ graphPackageCount: 549, powerPlatformAgentCount: 0, logicalAgentCount: 549 }, { packageMetadata: false }),
-      status: "details_pending",
-    };
+    inventory.identityCollection = countsSupplied
+      ? { checkedPackages: 0, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } }
+      : undefined;
+    inventory.verification = createUnifiedVerification(
+      { graphPackageCount: 549, powerPlatformAgentCount: 0, logicalAgentCount: 549 }, { packageMetadata: false },
+    );
     render(<SavedAgentInventoryVerification inventory={inventory} />);
     expect(screen.getByText("Saved source accounting verified")).toBeVisible();
     expect(screen.queryByText("Saved inventory needs attention")).not.toBeInTheDocument();
@@ -138,5 +141,77 @@ describe("SavedAgentInventoryVerification source availability", () => {
     expect(screen.getByText("Authorized Power Platform query verified")).toBeVisible();
     expect(screen.queryByText("Saved data checked at")).not.toBeInTheDocument();
     expect(screen.getByText("Saved data verified at").nextElementSibling?.querySelector("time")).toHaveAttribute("datetime", inventory.verification.checkedAt);
+  });
+});
+
+describe("SavedAgentInventoryVerification read lifecycle", () => {
+  it.each([
+    { state: "loading", props: { loading: true, error: "Previous read failed." }, message: "Checking saved inventory." },
+    { state: "failed", props: { error: "The saved selection expired." }, message: "The saved selection expired." },
+    { state: "not collected", props: { unavailable: { state: "not_collected", message: "No saved inventory yet." } }, message: "No saved inventory yet." },
+    { state: "preparing", props: { unavailable: { state: "preparing", message: "Preparing saved inventory." } }, message: "Preparing saved inventory." },
+    { state: "withdrawn", props: { inventory: undefined }, message: "Saved inventory verification is not available." },
+  ] satisfies Array<{
+    state: string;
+    props: Partial<ComponentProps<typeof SavedAgentInventoryVerification>>;
+    message: string;
+  }>)("withdraws the previous receipt while $state and shows only the replacement receipt on recovery", ({ state, props, message }) => {
+    const inventory = emptyInventory();
+    const onVerify = vi.fn();
+    const view = render(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} />);
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(screen.getByText("Authorized Power Platform query verified")).toBeVisible();
+
+    view.rerender(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} {...props} />);
+    const region = screen.getByRole("region", { name: "Saved agent inventory verification" });
+    expect(region).toHaveAttribute("aria-busy", String(state === "loading"));
+    expect(within(region).getByRole(state === "failed" ? "alert" : "status")).toHaveTextContent(message);
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Full saved agent accounting")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Saved Power Platform query verification" })).not.toBeInTheDocument();
+    expect(region.querySelector("time")).toBeNull();
+    if (state === "loading") {
+      expect(screen.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    }
+
+    const replacement = emptyInventory();
+    replacement.verification = createUnifiedVerification(
+      { graphPackageCount: 7, powerPlatformAgentCount: 0, logicalAgentCount: 7 }, {}, "2026-09-18T06:00:00.000Z",
+    );
+    view.rerender(<SavedAgentInventoryVerification inventory={replacement} onVerify={onVerify} />);
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(screen.getByText("Graph package targets").nextElementSibling).toHaveTextContent(/^7$/);
+    expect(screen.getByText("Saved data verified at").nextElementSibling?.querySelector("time"))
+      .toHaveAttribute("datetime", replacement.verification.checkedAt);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(onVerify).not.toHaveBeenCalled();
+  });
+
+  it("only requests explicit saved reads and prevents repeated verification while pending", async () => {
+    const inventory = emptyInventory();
+    const onVerify = vi.fn();
+    const view = render(<SavedAgentInventoryVerification inventory={inventory} />);
+    expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeDisabled();
+
+    view.rerender(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} />);
+    view.rerender(<SavedAgentInventoryVerification inventory={{ ...inventory }} onVerify={onVerify} />);
+    expect(onVerify).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+    expect(onVerify).toHaveBeenCalledOnce();
+
+    view.rerender(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} loading />);
+    await userEvent.click(screen.getByRole("button", { name: "Verifying saved inventory..." }));
+    expect(onVerify).toHaveBeenCalledOnce();
+
+    view.rerender(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} error="Saved read failed." />);
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+    expect(onVerify).toHaveBeenCalledTimes(2);
+    view.rerender(<SavedAgentInventoryVerification onVerify={onVerify} loading />);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    view.rerender(<SavedAgentInventoryVerification inventory={inventory} onVerify={onVerify} />);
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(onVerify).toHaveBeenCalledTimes(2);
   });
 });

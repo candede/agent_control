@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
-import type { CapabilityStatus, CapabilityView } from "./api/client";
+import type { CapabilityId, CapabilityStatus, CapabilityView } from "./api/client";
 import { providerActionAllowed } from "./capabilityState";
 import { isTransientPermissionCheck, permissionIssue, permissionIssues } from "./permissionIssues";
 
 const now = Date.parse("2026-09-24T00:00:00Z");
-function fixture(status: CapabilityStatus = "missing_permission"): CapabilityView {
+function fixture(status: CapabilityStatus = "missing_permission", id: CapabilityId = "graph.package.read.delegated"): CapabilityView {
   return {
-    definition: capabilityDefinitions[0],
+    definition: capabilityDefinitions.find(definition => definition.id === id)!,
     decision: {
-      capabilityId: capabilityDefinitions[0].id, status, authorized: false, fresh: true,
+      capabilityId: id, status, authorized: status === "available", fresh: true,
       checkedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60000).toISOString(),
       previewQualification: "not_required", remediation: [],
     },
@@ -56,7 +56,7 @@ describe("actual permission issues", () => {
     view.definition = capabilityDefinitions.find(definition => definition.id === "defender.hunting.application")!;
     view.decision.capabilityId = view.definition.id;
     expect(permissionIssue({ ...view, enabled: false }, now)).toBeUndefined();
-    expect(permissionIssue({ ...view, configuration: { enabled: false, sharedDataScope: false } }, now)).toBeUndefined();
+    expect(permissionIssue({ ...view, configuration: { enabled: false, sharedDataScope: false, revision: 1 } }, now)).toBeUndefined();
     expect(permissionIssue({ ...view, enabled: true }, now)?.name).toBe("App-only Defender logs");
   });
   it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)("keeps an unused or successfully admitted %s read silent and actionable", id => {
@@ -142,9 +142,34 @@ describe("actual permission issues", () => {
   it("suppresses only transient cached checks during initial confirmation", () => {
     const timeout = fixture("provider_error");
     timeout.decision.evidence = { category: "provider_timeout" };
-    expect(isTransientPermissionCheck(timeout)).toBe(true);
-    expect(permissionIssues([timeout, fixture("missing_permission")], now, true)).toHaveLength(1);
-    expect(permissionIssues([timeout, fixture("missing_permission")], now, false)).toHaveLength(2);
+    const denied = fixture("missing_permission", "graph.directory.read");
+    expect(isTransientPermissionCheck(timeout, now)).toBe(true);
+    expect(permissionIssues([timeout, denied], now, true).map(issue => issue.view.definition.id)).toEqual([denied.definition.id]);
+    expect(permissionIssues([timeout, denied], now, false).map(issue => issue.view.definition.id))
+      .toEqual([timeout.definition.id, denied.definition.id]);
+  });
+  it.each([
+    { fresh: false },
+    { checkedAt: undefined },
+    { checkedAt: "invalid" },
+    { checkedAt: new Date(now + 1).toISOString() },
+    { expiresAt: undefined },
+    { expiresAt: "invalid" },
+    { expiresAt: new Date(now).toISOString() },
+  ] satisfies Partial<CapabilityView["decision"]>[])("does not request failed-check retries from stale or invalid evidence: %j", override => {
+    const timeout = fixture("provider_error");
+    timeout.decision = { ...timeout.decision, evidence: { category: "provider_timeout" }, ...override };
+    expect(isTransientPermissionCheck(timeout, now)).toBe(false);
+    expect(permissionIssues([timeout], now)).toEqual([]);
+  });
+  it("reports one issue per capability when both a check and an operation failed", () => {
+    const view = fixture("missing_permission");
+    view.operationFailure = { status: "missing_role", checkedAt: new Date(now - 500).toISOString(),
+      expiresAt: new Date(now + 1000).toISOString(), remediation: [] };
+    const before = structuredClone(view);
+    expect(permissionIssues([view], now).map(issue => issue.decision.status)).toEqual(["missing_role"]);
+    expect(permissionIssues([view], now + 1000).map(issue => issue.decision.status)).toEqual(["missing_permission"]);
+    expect(view).toEqual(before);
   });
   it.each(["provider_timeout", "provider_network_error", "provider_throttled"])("does not label %s as a missing permission", category => {
     const view = fixture("provider_error");

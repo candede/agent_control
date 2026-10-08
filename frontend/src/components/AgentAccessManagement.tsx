@@ -6,6 +6,7 @@ import { AccessAssignmentEditor } from "./AccessAssignmentModal";
 type Props = {
   agent: CopilotPackage;
   detail?: CopilotPackageDetail;
+  detailUnavailable?: boolean;
   canManage: boolean;
   canEditAccess: boolean;
   active: boolean;
@@ -17,15 +18,19 @@ type Props = {
   onSetBlocked: (agent: CopilotPackage, blocked: boolean) => void;
 };
 
-export function AgentAccessManagement({ agent, detail, canManage, canEditAccess, active, busy, loading, revision, showName, onUpdate, onSetBlocked }: Props) {
+export function AgentAccessManagement({ agent, detail, detailUnavailable = false, canManage, canEditAccess, active, busy, loading, revision, showName, onUpdate, onSetBlocked }: Props) {
   const [initialDetail, setInitialDetail] = useState(detail);
+  const accessReadError = (detail ?? initialDetail)?.accessReadError;
+  const readOnly = !canEditAccess || Boolean(accessReadError);
   const [previousRevision, setPreviousRevision] = useState(revision);
   if (previousRevision !== revision) {
     setPreviousRevision(revision);
     setInitialDetail(detail);
-  } else if (detail && (!initialDetail || !canEditAccess && initialDetail !== detail)) setInitialDetail(detail);
-  const initial = canEditAccess ? initialDetail ?? detail : detail ?? initialDetail;
-  const readOnlyKey = !canEditAccess ? JSON.stringify([initial?.availableTo, initial?.deployedTo, initial?.allowedUsersAndGroups, initial?.acquireUsersAndGroups]) : "";
+  } else if (detailUnavailable) {
+    if (initialDetail) setInitialDetail(undefined);
+  } else if (detail && (!initialDetail || (readOnly || initialDetail.accessReadError) && initialDetail !== detail)) setInitialDetail(detail);
+  const initial = readOnly ? detail ?? initialDetail : initialDetail ?? detail;
+  const readOnlyKey = readOnly ? JSON.stringify([initial?.availableTo, initial?.deployedTo, initial?.allowedUsersAndGroups, initial?.acquireUsersAndGroups]) : "";
   const [target, setTarget] = useState<PackageAccessTarget>("availability");
   const [reset, setReset] = useState({ availability: 0, installation: 0 });
   const isBlocked = detail?.isBlocked ?? agent.isBlocked;
@@ -46,18 +51,21 @@ export function AgentAccessManagement({ agent, detail, canManage, canEditAccess,
         </WorkbenchActionGate> : null}
       </div>
     </div>
-    {detail?.accessReadError ? <p role="status">{detail.accessReadError} Access assignment editing is unavailable.</p> : null}
+    {accessReadError ? <p role="status">{accessReadError} Access assignment editing is unavailable.</p> : null}
     {(["availability", "installation"] as const).map(setting => <div key={setting} hidden={target !== setting}>
       <AccessAssignmentEditor
         key={`${revision}:${initial ? "detail" : "summary"}:${readOnlyKey}:${reset[setting]}`}
         initialTarget={setting}
         initialStatus={setting === "availability" ? initial?.availableTo ?? agent.availableTo : initial?.deployedTo ?? agent.deployedTo}
         initialPrincipals={setting === "availability" ? initial?.allowedUsersAndGroups : initial?.acquireUsersAndGroups}
-        active={active && target === setting}
-        readOnly={!canEditAccess || loading || Boolean(detail?.accessReadError)}
+        active={active && !loading && target === setting}
+        readOnly={readOnly}
         busy={busy}
         onTargetChange={setTarget}
-        onCancel={() => setReset(current => ({ ...current, [setting]: current[setting] + 1 }))}
+        onCancel={() => {
+          if (detail) setInitialDetail(detail);
+          setReset(current => ({ ...current, [setting]: current[setting] + 1 }));
+        }}
         onSubmit={update => onUpdate(agent, update)}
       />
     </div>)}

@@ -99,6 +99,10 @@ button.agent-sort-heading,
   flex: 0 0 auto;
 }
 
+.unified-agent-table :is(th, td) {
+  overflow-wrap: anywhere;
+}
+
 .agent-summary-status {
   display: grid;
   gap: 0.2rem;
@@ -141,13 +145,20 @@ button.agent-sort-heading,
   max-width: none;
   height: min(760px, calc(100svh - 48px));
   max-height: none;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
   display: flex;
   flex-direction: column;
 }
 
 .unified-agent-detail-modal > header {
   flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+.unified-agent-detail-modal > header > div {
+  min-width: 0;
 }
 
 .unified-agent-detail-modal > .detail-tabs {
@@ -175,7 +186,9 @@ button.agent-sort-heading,
 
 .unified-agent-detail-modal > .inventory-detail-section {
   flex: 1 1 auto;
-  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: min(10rem, 50svh);
+  min-width: 0;
   overflow-y: auto;
   align-content: start;
   padding: 24px;
@@ -183,12 +196,15 @@ button.agent-sort-heading,
 
 .agent-management-sections {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   margin-top: 6px;
 }
 
 .agent-management-card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
   gap: 12px;
   padding: 20px;
   border: 1px solid var(--border);
@@ -266,6 +282,13 @@ button.agent-sort-heading,
   overflow-wrap: anywhere;
 }
 .inventory-source-members button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.inventory-source-members .table-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.inventory-source-members button[aria-disabled="true"],
+.inventory-source-details select:disabled,
+.agent-version-selector select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
 .inventory-source-details label { display: grid; gap: 6px; min-width: 0; }
 .inventory-source-details pre {
   width: 100%;
@@ -436,6 +459,7 @@ button.agent-sort-heading,
 
 .agent-access-heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: start;
   justify-content: space-between;
   gap: 16px;
@@ -445,6 +469,7 @@ button.agent-sort-heading,
 
 .agent-access-heading > div:first-child {
   display: grid;
+  flex: 1 1 220px;
   gap: 4px;
   min-width: 0;
 }
@@ -467,6 +492,8 @@ button.agent-sort-heading,
   gap: 8px;
   justify-items: end;
   flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
   font-size: 0.85rem;
 }
 
@@ -559,19 +586,15 @@ button.agent-sort-heading,
   }
 
   .unified-agent-detail-modal .detail-tabs {
-    display: grid;
-    grid-template-columns: repeat(5, auto);
     gap: 0;
     padding: 0 8px;
   }
 
   .unified-agent-detail-modal .detail-tabs [role="tab"] {
     box-sizing: border-box;
-    height: 44px;
     min-height: 44px;
     padding: 4px;
     font-size: 0.82rem;
-    white-space: nowrap;
   }
 
   .unified-agent-detail-modal .agent-overview-facts {

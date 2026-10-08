@@ -369,7 +369,9 @@ export class InventoryQueries {
       else if (target.source === "graph_packages") clauses.push(`EXISTS(SELECT 1 FROM sources s
         WHERE s.canonical_id=f.identity AND s.source='graph_packages' AND s.native_id=${add(target.packageId)})`);
       else clauses.push(`EXISTS(SELECT 1 FROM sources s WHERE s.canonical_id=f.identity AND s.source='power_platform'
-        AND s.native_id=${add(target.nativeId)} AND coalesce(lower(s.environment_id),'')=lower(${add(target.environmentId ?? "")}))`);
+        AND CASE WHEN s.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
+          THEN lower(s.native_id)=lower(${add(target.nativeId)}) ELSE s.native_id=${add(target.nativeId)} END
+        AND coalesce(lower(s.environment_id),'')=lower(${add(target.environmentId ?? "")}))`);
     }
     if (query.operationIdPrefix) clauses.push(`EXISTS(SELECT 1 FROM sources s JOIN audit_events a ON a.tenant_id=$4
       AND a.principal_id=$10 AND a.agent_id=s.native_id AND a.scope='bulk'
@@ -539,7 +541,8 @@ export class InventoryQueries {
           ORDER BY (sort_key IS NULL)::int ${reverse ? "DESC" : "ASC"},sort_key ${sortCollation} ${order},identity COLLATE "C" ${order} LIMIT ${limit + 1}
         ), candidates AS MATERIALIZED (
         SELECT f.identity,f.native_id,f.domain,f.resource_type,f.display_name,f.environment_id,f.presence,f.link_state,f.availability,f.management,
-          jsonb_build_object('state',f.link_state,'reason',f.residual->'identity'->'reason') AS identity_info,
+          jsonb_build_object('state',f.link_state,'reason',f.residual->'identity'->'reason',
+            'invalidMetadata',f.residual->'identity'->'invalidMetadata') AS identity_info,
           CASE WHEN f.domain<>'canonical' THEN f.residual END AS source_residual,
           coalesce((SELECT jsonb_agg(to_jsonb(member_row) ORDER BY member_row.domain)
             FROM (${primaryMembersSql}) member_row),'[]'::jsonb) AS members,
@@ -642,9 +645,10 @@ export class InventoryQueries {
       for (const person of batch) evidence.set(person.objectId, person);
     }
     for (const reference of references) people.set(reference.identity, Object.fromEntries(
-      Object.entries(reference.people).map(([role, objectId]) => [role, evidence.get(String(objectId)) ?? {
-        objectId: String(objectId), displayName: null, userPrincipalName: null, observedAt: reference.observed_at.toISOString(),
-      }])));
+      Object.entries(reference.people).flatMap(([role, objectId]) => {
+        const person = evidence.get(String(objectId));
+        return person ? [[role, person]] : [];
+      })));
     const rows = (await client.query(`WITH inputs AS (
       SELECT r."scopeId" AS scope_id,r."baselineId" AS baseline_id,r.revision FROM inventory_revisions v
         CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) r("scopeId" uuid,"baselineId" uuid,revision bigint)
@@ -775,8 +779,10 @@ export class InventoryQueries {
         OR r.residual->'detailFreshness'->>'state'='fresh' AND NOT coalesce(
           (r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3
           AND (r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3,false)))::int AS stale_packages,
-      count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state'='invalidated')::int AS invalidated_packages
-      FROM inventory_memberships m JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
+      count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state'='invalidated')::int AS invalidated_packages,
+      count(*) FILTER(WHERE r.domain='packages' AND c.residual->'identity'->>'invalidMetadata'='true')::int AS invalid_packages
+      FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
+      JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
       JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
       WHERE ${inventoryAsOf()}`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
     if (cacheable && !cached) {

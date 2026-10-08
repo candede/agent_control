@@ -48,12 +48,18 @@ export function syncModeLabel(mode: DataSyncMode) {
   return mode === "full" ? "Full resync" : mode === "initial" ? "Initial sync" : "Data refresh";
 }
 
-export function formatSyncInstant(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+export function formatSyncInstant(value?: string | null) {
+  const instant = Date.parse(value ?? "");
+  return Number.isFinite(instant)
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(instant)
+    : "Not recorded";
 }
 
-export function syncDuration(start: string, end: string) {
-  const seconds = Math.max(0, Math.floor((Date.parse(end) - Date.parse(start)) / 1000));
+export function syncDuration(start?: string | null, end?: string | null) {
+  const started = Date.parse(start ?? "");
+  const completed = Date.parse(end ?? "");
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started) return "Not recorded";
+  const seconds = Math.floor((completed - started) / 1000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ${seconds % 60}s`;

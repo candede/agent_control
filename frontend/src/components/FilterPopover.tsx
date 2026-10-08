@@ -60,7 +60,7 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
     if (!open) return;
     let observer: MutationObserver | undefined;
     const focusFirst = () => {
-      const first = popover.current?.querySelector<HTMLElement>("select:not(:disabled), input:not(:disabled)");
+      const first = popover.current?.querySelector<HTMLElement>("select:not(:disabled):not([aria-disabled=true]), input:not(:disabled):not([aria-disabled=true])");
       if (!first) return false;
       if (document.activeElement === triggerRef.current || document.activeElement === document.body) first.focus();
       observer?.disconnect();
@@ -68,7 +68,7 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
     };
     if (!focusFirst() && popover.current) {
       observer = new MutationObserver(focusFirst);
-      observer.observe(popover.current, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
+      observer.observe(popover.current, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "aria-disabled"] });
     }
     const dismissOutside = (event: PointerEvent) => {
       if (event.target instanceof Node && !root.current?.contains(event.target)) setOpen(false);

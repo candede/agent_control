@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentUsageHistoryPoint, CandidateAgentUsageAssociations, CandidateAgentUsageSummary, CandidateAgentUsageUsers } from "../../../backend/src/types/officialReportApi";
+import type { AgentUsageHistoryPoint, CandidateAgentUsageAssociations, CandidateAgentUsageHistory, CandidateAgentUsageSummary, CandidateAgentUsageUsers } from "../../../backend/src/types/officialReportApi";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { ApiError, type SessionUser, type UnifiedAgentRecord } from "../api/client";
 import * as api from "../api/reportData";
@@ -9,9 +10,19 @@ import { CapabilityContext } from "../capabilityContext";
 import { agentUsageHistoryFixture, automaticUsageContext as inventoryContext, automaticUsagePackageId } from "../test/automaticAgentUsageFixture";
 import { reportPage, reports, selectionId } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
+import { createSavedQueryClient } from "../savedQueries";
+import { usageDate } from "../usageInsights";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { AgentUsagePanel } from "./AgentUsagePanel";
 
+const paging = vi.hoisted(() => ({ links: undefined as ComponentProps<typeof import("./ReportPageControls").ReportPageControls> | undefined }));
+vi.mock("./ReportPageControls", async original => {
+  const actual = await original<typeof import("./ReportPageControls")>();
+  return { ...actual, ReportPageControls: (props: ComponentProps<typeof actual.ReportPageControls>) => {
+    if (props.label === "report links") paging.links = props;
+    return <actual.ReportPageControls {...props} />;
+  } };
+});
 vi.mock("../api/reportData", async original => ({
   ...await original<typeof import("../api/reportData")>(), readAgentReportSummary: vi.fn(), readAgentReportHistory: vi.fn(), readAgentReportAssociations: vi.fn(),
   readAgentReportCandidates: vi.fn(), mutateAgentReportAssociation: vi.fn(), readReportDetail: vi.fn(), readReportPage: vi.fn(),
@@ -42,11 +53,12 @@ function users(cursor?: string, search?: string): CandidateAgentUsageUsers {
 }
 function renderPanel(overrides: Partial<ComponentProps<typeof AgentUsagePanel>> = {}) {
   const props = { record, view: "users" as const, context: inventoryContext, inventoryRevision: "a".repeat(64), canRemoveReviewedAssociations: true, onChanged: vi.fn(), ...overrides };
+  const queryClient = createSavedQueryClient();
   const principal: SessionUser = { tenantId: "tenant", homeAccountId: "admin", username: "admin@example.invalid", displayName: "Admin", roles: ["AgentControl.Admin"] };
-  const content = (next: Partial<typeof props> = {}, user = principal) => <CapabilityContext value={{
+  const content = (next: Partial<typeof props> = {}, user = principal, panelKey = "panel") => <QueryClientProvider client={queryClient}><CapabilityContext value={{
     user, views: [], now: Date.now(), pending: false, loading: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
-  }}><WorkbenchActionProvider value={workbenchActions}><AgentUsagePanel {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
-  return { ...render(content()), props, principal, content };
+  }}><WorkbenchActionProvider value={workbenchActions}><AgentUsagePanel key={panelKey} {...props} {...next} /></WorkbenchActionProvider></CapabilityContext></QueryClientProvider>;
+  return { ...render(content()), props, principal, content, queryClient };
 }
 async function removal() {
   await screen.findByText("person0@example.invalid");
@@ -64,6 +76,569 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("restored agent usage and users", () => {
+  it.each(["page", "revision", "disabled", "account", "unmount"] as const)(
+    "retires report-link callbacks across %s changes", async boundary => {
+      const view = renderPanel();
+      await removal();
+      const stale = paging.links!;
+      if (boundary === "unmount") view.unmount();
+      else if (boundary === "page") {
+        fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+        await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2));
+        await waitFor(() => expect(screen.getByRole("button", { name: "Next report links" })).toHaveAttribute("aria-disabled", "false"));
+      } else {
+        view.rerender(view.content(boundary === "revision" ? { dataRevision: 1 } : boundary === "disabled" ? { disabled: true } : {},
+          boundary === "account" ? { ...view.principal, homeAccountId: "replacement" } : view.principal));
+        if (boundary !== "disabled") await screen.findByText("person0@example.invalid");
+      }
+      const count = vi.mocked(api.readAgentReportAssociations).mock.calls.length;
+      act(() => { stale.next(); stale.previous(); });
+      expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(count);
+    });
+
+  it.each(["exact-inventory-report", "exact-inventory-history", "exact-inventory-associations"])(
+    "does not page report links after %s fails before its notification renders", async kind => {
+      const view = renderPanel();
+      await removal();
+      const cached = view.queryClient.getQueryCache().find({ queryKey: ["saved", kind], exact: false })!;
+      act(() => {
+        cached.setState({ status: "error", error: new Error("Read failed.") });
+        fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+      });
+      expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+    });
+
+  it.each(["exact-inventory-report", "exact-inventory-history", "exact-inventory-associations"])(
+    "does not page report links while %s revalidates before its notification renders", async kind => {
+      const view = renderPanel();
+      await removal();
+      const summaryRead = deferred<CandidateAgentUsageSummary>(), historyRead = deferred<CandidateAgentUsageHistory>();
+      const linksRead = deferred<CandidateAgentUsageAssociations>();
+      vi.mocked(api.readAgentReportSummary).mockReturnValue(summaryRead.promise);
+      vi.mocked(api.readAgentReportHistory).mockReturnValue(historyRead.promise);
+      vi.mocked(api.readAgentReportAssociations).mockReturnValue(linksRead.promise);
+      act(() => {
+        void view.queryClient.invalidateQueries({ queryKey: ["saved", kind] });
+        fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+      });
+      expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(kind === "exact-inventory-associations" ? 2 : 1);
+      expect(vi.mocked(api.readAgentReportAssociations).mock.lastCall?.[1].cursor).toBeUndefined();
+      expect(vi.mocked(api.readAgentReportAssociations).mock.lastCall?.[2]?.aborted).toBe(false);
+    });
+
+  it("admits only the first report-link direction before the page transition commits", async () => {
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValueOnce(links({
+      page: { limit: 50, nextCursor: "links-next", previousCursor: "links-previous" },
+    }));
+    renderPanel();
+    await removal();
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+      fireEvent.click(screen.getByRole("button", { name: "Previous report links" }));
+    });
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.readAgentReportAssociations).mock.lastCall?.[1].cursor).toBe("links-next");
+  });
+
+  it.each([false, true])("does not describe an empty users page as no matching users (filtered=%s)", async filtered => {
+    renderPanel();
+    await screen.findByText("person0@example.invalid");
+    if (filtered) {
+      fireEvent.change(screen.getByRole("searchbox"), { target: { value: "person" } });
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false"));
+    }
+    vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...users("users-next"), value: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Next users" }));
+    expect(await screen.findByText("No users on this page. Use the page controls to continue.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Previous users" })).toHaveAttribute("aria-disabled", "false");
+    expect(screen.queryByText("No users match your search.")).not.toBeInTheDocument();
+    expect(screen.queryByText("No users listed in this report.")).not.toBeInTheDocument();
+  });
+
+  it("retains the users pager through pending, failed and retried reads", async () => {
+    renderPanel({ inventorySelectionId: selectionId });
+    await screen.findByText("person0@example.invalid");
+    const pending = deferred<CandidateAgentUsageUsers>(), retry = deferred<CandidateAgentUsageUsers>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockReturnValueOnce(retry.promise);
+    const next = screen.getByRole("button", { name: "Next users" });
+    next.focus();
+    fireEvent.click(next);
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    await act(async () => pending.reject(new Error("Page unavailable.")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Page unavailable.");
+    expect(next).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    expect(next).toHaveFocus();
+    await act(async () => retry.resolve(users("users-next")));
+    await screen.findByText("person25@example.invalid");
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps report-link paging focused and withdraws stale rows and counts during failure and retry", async () => {
+    renderPanel({ inventorySelectionId: selectionId });
+    await removal();
+    const pending = deferred<CandidateAgentUsageAssociations>(), retry = deferred<CandidateAgentUsageAssociations>();
+    vi.mocked(api.readAgentReportAssociations).mockReturnValueOnce(pending.promise).mockReturnValueOnce(retry.promise);
+    const next = screen.getByRole("button", { name: "Next report links" });
+    next.focus();
+    fireEvent.click(next);
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("Reviewed report identity")).not.toBeInTheDocument();
+    expect(screen.queryByText("2,000 matching report links; 2 on this page")).not.toBeInTheDocument();
+    await act(async () => pending.reject(new ApiError(400, "invalid_cursor", "Link cursor expired.")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Link cursor expired.");
+    expect(next).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Retry report links" }));
+    expect(next).toHaveFocus();
+    await act(async () => retry.resolve(links()));
+    await screen.findByText("Reviewed report identity");
+    expect(next).toHaveFocus();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(3);
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+  });
+
+  it("loads only history for a pinned Usage view and reuses Users reads across tab switches", async () => {
+    const view = renderPanel({ inventorySelectionId: selectionId, view: "usage" });
+    await screen.findByRole("region", { name: "Reported usage trend" });
+    expect(api.readAgentReportSummary).not.toHaveBeenCalled();
+    expect(api.readAgentReportAssociations).not.toHaveBeenCalled();
+    expect(api.readReportPage).not.toHaveBeenCalled();
+    view.rerender(view.content({ view: "users" }));
+    await screen.findByText("person0@example.invalid");
+    view.rerender(view.content({ view: "usage" }));
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2));
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+    view.rerender(view.content({ view: "users" }));
+    await screen.findByText("person0@example.invalid");
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the users search and page across hidden visits without refetching unchanged evidence", async () => {
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    await screen.findByText("person0@example.invalid");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "person" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
+    await screen.findByText("person25@example.invalid");
+    view.rerender(view.content({ view: "usage" }));
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2));
+    view.rerender(view.content({ view: "users" }));
+    expect(await screen.findByRole("searchbox")).toHaveValue("person");
+    expect(screen.getByText("person25@example.invalid")).toBeVisible();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(api.readAgentReportHistory).toHaveBeenCalledTimes(3));
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a pending users read owned while hidden and defers its recovery until Users is visible", async () => {
+    const pending = deferred<CandidateAgentUsageUsers>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledOnce());
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    view.rerender(view.content({ view: "usage" }));
+    expect(signal?.aborted).toBe(false);
+    await act(async () => pending.reject(new ApiError(409, "selection_invalidated", "Users selection expired")));
+    expect(screen.getByRole("region", { name: "Reported usage trend" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    view.rerender(view.content({ view: "users" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This selection changed or expired");
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledOnce());
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+  });
+
+  it("defers hidden users revision reads and catches up once without resetting their search or page", async () => {
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    await screen.findByText("person0@example.invalid");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "person" } });
+    const next = screen.getByRole("button", { name: "Next users" });
+    await waitFor(() => expect(next).toHaveAttribute("aria-disabled", "false"));
+    fireEvent.click(next);
+    await screen.findByText("person25@example.invalid");
+    view.rerender(view.content({ view: "usage", dataRevision: 1 }));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2));
+    view.rerender(view.content({ view: "usage", dataRevision: 2 }));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(3));
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    view.rerender(view.content({ view: "users", dataRevision: 2 }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(4));
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/usage-users"),
+      expect.objectContaining({ selectionId, search: "person", cursor: "users-next" }), expect.any(AbortSignal));
+    expect(screen.getByRole("searchbox")).toHaveValue("person");
+    await screen.findByText("person25@example.invalid");
+  });
+
+  it("resets hidden users state and rejects late results across an account A-B-A change", async () => {
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    await screen.findByText("person0@example.invalid");
+    const pending = deferred<CandidateAgentUsageUsers>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "private search" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    view.rerender(view.content({ view: "usage" }));
+    view.rerender(view.content({ view: "usage" }, { ...view.principal, homeAccountId: "different" }));
+    expect(signal?.aborted).toBe(true);
+    view.rerender(view.content({ view: "users" }));
+    expect(await screen.findByRole("searchbox")).toHaveValue("");
+    const stale = users(); stale.value[0].username = "obsolete@example.invalid";
+    await act(async () => pending.resolve(stale));
+    expect(screen.queryByText("obsolete@example.invalid")).not.toBeInTheDocument();
+    await screen.findByText("person0@example.invalid");
+  });
+
+  it.each(["history", "summary", "associations"] as const)("cancels pending private users when %s loses authority", async endpoint => {
+    const pending = deferred<CandidateAgentUsageUsers>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledOnce());
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    const failure = new ApiError(403, "forbidden", "Usage access revoked");
+    if (endpoint === "history") vi.mocked(api.readAgentReportHistory).mockRejectedValue(failure);
+    else if (endpoint === "summary") vi.mocked(api.readAgentReportSummary).mockRejectedValue(failure);
+    else vi.mocked(api.readAgentReportAssociations).mockRejectedValue(failure);
+    await act(async () => view.queryClient.refetchQueries({
+      queryKey: ["saved", endpoint === "summary" ? "exact-inventory-report" : `exact-inventory-${endpoint}`],
+    }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Usage access revoked");
+    expect(signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(users()));
+    expect(screen.queryByText("person0@example.invalid")).not.toBeInTheDocument();
+  });
+
+  it.each(["summary", "associations"] as const)("does not let a hidden Users %s failure hide or reload the trend", async endpoint => {
+    const failure = new ApiError(409, "selection_invalidated", "Users evidence changed");
+    const pending = deferred<never>();
+    if (endpoint === "summary") vi.mocked(api.readAgentReportSummary).mockReturnValueOnce(pending.promise);
+    else vi.mocked(api.readAgentReportAssociations).mockReturnValueOnce(pending.promise);
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await waitFor(() => expect(endpoint === "summary" ? api.readAgentReportSummary : api.readAgentReportAssociations).toHaveBeenCalledOnce());
+    view.rerender(view.content({ view: "usage" }));
+    await act(async () => pending.reject(failure));
+    await waitFor(() => expect(view.queryClient.getQueryCache().find({
+      queryKey: ["saved", endpoint === "summary" ? "exact-inventory-report" : "exact-inventory-associations"], exact: false,
+    })?.state.status).toBe("error"));
+    await waitFor(() => expect(screen.queryByText("Loading saved agent usage...")).not.toBeInTheDocument());
+    expect(screen.getByRole("region", { name: "Reported usage trend" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    view.rerender(view.content({ view: "users" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Users evidence changed");
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledOnce());
+  });
+
+  it("retries an invalid history cursor from the first page without reloading inventory", async () => {
+    const first = { ...agentUsageHistoryFixture(context, record.id),
+      page: { limit: 50, nextCursor: "retired-cursor", previousCursor: null } };
+    vi.mocked(api.readAgentReportHistory).mockImplementation(async (_id, query) => {
+      if (query.cursor) throw new ApiError(400, "invalid_cursor", "Report history changed");
+      return first;
+    });
+    const onReloadInventory = vi.fn();
+    renderPanel({ inventorySelectionId: selectionId, onReloadInventory, view: "usage" });
+    fireEvent.click(await screen.findByRole("button", { name: "Older reports" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Report history changed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry usage history" }));
+    await screen.findByRole("region", { name: "Reported usage trend" });
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(3);
+    expect(api.readAgentReportHistory).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: undefined, limit: 50 }, expect.any(AbortSignal));
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+
+  it("retains a busy trend while paging and deduplicates navigation and focus without loading Users", async () => {
+    const defaultPoint = agentUsageHistoryFixture(context, record.id).value[0];
+    const points = [
+      ...Array.from({ length: 50 }, (_, index) => ({ ...defaultPoint, setId: `report-${String(index).padStart(2, "0")}` })),
+      { ...defaultPoint, setId: "older-report", reportingStart: "2025-12-01", reportingEnd: "2025-12-31",
+        responses: 0, status: "linked" as const, associationCount: 1 },
+    ];
+    const first = agentUsageHistoryFixture(context, record.id, points);
+    const older = agentUsageHistoryFixture(context, record.id, points, { cursor: first.page.nextCursor! });
+    const pending = deferred<CandidateAgentUsageHistory>(), returning = deferred<CandidateAgentUsageHistory>();
+    vi.mocked(api.readAgentReportHistory).mockResolvedValueOnce(first).mockReturnValueOnce(pending.promise)
+      .mockReturnValueOnce(returning.promise);
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory, view: "usage" });
+    const trend = await screen.findByRole("region", { name: "Reported usage trend" });
+    const table = within(trend).getByRole("table"), next = screen.getByRole("button", { name: "Older reports" });
+    expect(within(table).getAllByRole("row")).toHaveLength(51);
+    expect(screen.getByText("50 of 51 reports")).toBeVisible();
+    expect(screen.queryByText("No usage reported in saved reports.")).not.toBeInTheDocument();
+    fireEvent.click(next);
+    fireEvent.click(next);
+    fireEvent(window, new Event("focus"));
+    fireEvent(window, new Event("focus"));
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    expect(api.readAgentReportHistory).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: first.page.nextCursor, limit: 50 }, expect.any(AbortSignal));
+    expect(screen.getByRole("region", { name: "Reported usage trend" })).toBe(trend);
+    expect(trend).toHaveAttribute("aria-busy", "true");
+    expect(within(trend).getByRole("table")).toBe(table);
+    expect(next).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Newer reports" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Checking saved report history...");
+    await act(async () => pending.resolve(older));
+    await waitFor(() => expect(trend).toHaveAttribute("aria-busy", "false"));
+    expect(screen.getByText("Dec 1, 2025 to Dec 31, 2025")).toBeVisible();
+    view.rerender(view.content({ disabled: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Newer reports" }));
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    view.rerender(view.content());
+    fireEvent.click(screen.getByRole("button", { name: "Newer reports" }));
+    expect(api.readAgentReportHistory).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: older.page.previousCursor, limit: 50 }, expect.any(AbortSignal));
+    expect(trend).toHaveAttribute("aria-busy", "true");
+    await act(async () => returning.resolve(first));
+    await waitFor(() => expect(trend).toHaveAttribute("aria-busy", "false"));
+    expect(screen.queryByText("Dec 1, 2025 to Dec 31, 2025")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(3);
+    expect(api.readAgentReportSummary).not.toHaveBeenCalled();
+    expect(api.readAgentReportAssociations).not.toHaveBeenCalled();
+    expect(api.readReportPage).not.toHaveBeenCalled();
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["invalid_cursor", false], ["service_unavailable", false],
+    ["invalid_cursor", true], ["service_unavailable", true],
+  ] as const)("preserves Users ownership after history %s with a different shared report: %s", async (code, differentSharedReport) => {
+    const sharedContext = differentSharedReport ? { ...context, reportSetId: "77777777-7777-4777-8777-777777777777",
+      reports: { ...reports, setId: "77777777-7777-4777-8777-777777777777" } } : context;
+    const first = { ...agentUsageHistoryFixture(context, record.id),
+      context: sharedContext,
+      page: { limit: 50, nextCursor: "older", previousCursor: null } };
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(first);
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory,
+      context: { ...inventoryContext, reports: sharedContext.reports } });
+    await screen.findByText("person0@example.invalid");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "person" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
+    await screen.findByText("person25@example.invalid");
+    view.rerender(view.content({ view: "usage" }));
+    const failed = deferred<CandidateAgentUsageHistory>();
+    vi.mocked(api.readAgentReportHistory).mockReturnValueOnce(failed.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Older reports" }));
+    const signal = vi.mocked(api.readAgentReportHistory).mock.lastCall?.[2];
+    fireEvent(window, new Event("focus"));
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    expect(signal?.aborted).toBe(false);
+    await act(async () => failed.reject(new ApiError(code === "invalid_cursor" ? 400 : 503, code, "History page failed")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("History page failed");
+    view.rerender(view.content({ view: "users" }));
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
+    const retry = deferred<CandidateAgentUsageHistory>();
+    vi.mocked(api.readAgentReportHistory).mockReturnValueOnce(retry.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Retry usage history" }));
+    expect(api.readAgentReportHistory).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: code === "invalid_cursor" ? undefined : "older", limit: 50 }, expect.any(AbortSignal));
+    await act(async () => retry.resolve(first));
+    expect(await screen.findByRole("searchbox")).toHaveValue("person");
+    expect(screen.getByText("person25@example.invalid")).toBeVisible();
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(3);
+    expect(api.readAgentReportSummary).toHaveBeenCalledExactlyOnceWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, ...(differentSharedReport ? { setId: reports.setId } : {}) }, expect.any(AbortSignal));
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("waits for all current reads before treating a revalidation revision mismatch as invalidation", async () => {
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await screen.findByText("person0@example.invalid");
+    const updatedContext = { ...context, usageRevision: "d".repeat(64) };
+    const pendingSummary = deferred<CandidateAgentUsageSummary>(), pendingLinks = deferred<CandidateAgentUsageAssociations>();
+    vi.mocked(api.readAgentReportSummary).mockReturnValueOnce(pendingSummary.promise);
+    vi.mocked(api.readAgentReportAssociations).mockReturnValueOnce(pendingLinks.promise);
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(agentUsageHistoryFixture(updatedContext, record.id));
+    const updatedUsers: CandidateAgentUsageUsers = { ...users(), context: updatedContext };
+    vi.mocked(api.readReportPage).mockResolvedValue(updatedUsers);
+    view.rerender(view.content({ dataRevision: 1 }));
+    await act(async () => pendingSummary.resolve(summary({ context: updatedContext })));
+    await waitFor(() => expect(view.queryClient.getQueryCache().findAll({
+      queryKey: ["saved", "exact-inventory-report"],
+    }).some(query => query.state.data && (query.state.data as CandidateAgentUsageSummary).context.usageRevision === updatedContext.usageRevision)).toBe(true));
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Usage unavailable" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "No CSV reports available" })).not.toBeInTheDocument();
+    await act(async () => pendingLinks.resolve(links({ context: updatedContext })));
+    await screen.findByText("person0@example.invalid");
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2);
+    expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("invalidates dependent Users reads and retired link cursors only when history revisions change", async () => {
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await removal();
+    fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2));
+    const updatedContext = { ...context, usageRevision: "d".repeat(64) };
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(agentUsageHistoryFixture(updatedContext, record.id));
+    vi.mocked(api.readAgentReportSummary).mockResolvedValue(summary({ responses: 999, context: updatedContext }));
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ context: updatedContext }));
+    const updatedUsers: CandidateAgentUsageUsers = { ...users(), context: updatedContext };
+    vi.mocked(api.readReportPage).mockResolvedValue(updatedUsers);
+    view.rerender(view.content({ view: "usage" }));
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(3));
+    expect(api.readAgentReportAssociations).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: undefined, limit: 50 }, expect.any(AbortSignal));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    view.rerender(view.content({ view: "users" }));
+    expect(await screen.findByLabelText("Selected agent report metrics")).toHaveTextContent("999");
+    await screen.findByText("person0@example.invalid");
+    expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2);
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(onReloadInventory).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("deduplicates pending history revalidation and aborts superseded revisions without accepting late data", async () => {
+    const view = renderPanel({ inventorySelectionId: selectionId, view: "usage" });
+    await screen.findByRole("region", { name: "Reported usage trend" });
+    const stale = deferred<CandidateAgentUsageHistory>(), current = deferred<CandidateAgentUsageHistory>();
+    vi.mocked(api.readAgentReportHistory).mockReturnValueOnce(stale.promise).mockReturnValueOnce(current.promise);
+    fireEvent(window, new Event("focus"));
+    fireEvent(window, new Event("focus"));
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    const signal = vi.mocked(api.readAgentReportHistory).mock.lastCall?.[2];
+    view.rerender(view.content({ dataRevision: 1 }));
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(3);
+    expect(signal?.aborted).toBe(true);
+    const freshHistory = agentUsageHistoryFixture(context, record.id);
+    freshHistory.value[0] = { ...freshHistory.value[0], responses: 222, status: "linked" };
+    await act(async () => current.resolve(freshHistory));
+    expect(await screen.findByRole("cell", { name: "222" })).toBeVisible();
+    const staleHistory = agentUsageHistoryFixture(context, record.id);
+    staleHistory.value[0] = { ...staleHistory.value[0], responses: 111, status: "linked" };
+    await act(async () => stale.resolve(staleHistory));
+    expect(screen.queryByRole("cell", { name: "111" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.readAgentReportSummary).not.toHaveBeenCalled();
+  });
+
+  it.each(["tenant", "principal", "roles"] as const)("withdraws history and cancels pending requests across a %s A-B-A boundary", async boundary => {
+    const view = renderPanel({ inventorySelectionId: selectionId, view: "usage" });
+    await screen.findByRole("region", { name: "Reported usage trend" });
+    const stale = deferred<CandidateAgentUsageHistory>();
+    vi.mocked(api.readAgentReportHistory).mockReturnValueOnce(stale.promise);
+    fireEvent(window, new Event("focus"));
+    const signal = vi.mocked(api.readAgentReportHistory).mock.lastCall?.[2];
+    const principal = { ...view.principal, ...(boundary === "tenant" ? { tenantId: "different" }
+      : boundary === "principal" ? { homeAccountId: "different" } : { roles: ["AgentControl.Viewer"] as SessionUser["roles"] }) };
+    vi.mocked(api.readAgentReportHistory).mockReturnValue(new Promise(() => {}));
+    view.rerender(view.content({}, principal));
+    expect(signal?.aborted).toBe(true);
+    expect(screen.queryByRole("region", { name: "Reported usage trend" })).not.toBeInTheDocument();
+    view.rerender(view.content());
+    const staleHistory = agentUsageHistoryFixture(context, record.id);
+    staleHistory.value[0] = { ...staleHistory.value[0], responses: 111, status: "linked" };
+    await act(async () => stale.resolve(staleHistory));
+    expect(screen.queryByRole("region", { name: "Reported usage trend" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(4);
+  });
+
+  it("allows another history recovery only after a replacement selection has loaded successfully", async () => {
+    vi.mocked(api.readAgentReportHistory).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Expired history"));
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory, view: "usage" });
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledOnce());
+    const next = "66666666-6666-4666-8666-666666666666";
+    view.rerender(view.content({ inventorySelectionId: next }));
+    await screen.findByRole("region", { name: "Reported usage trend" });
+    vi.mocked(api.readAgentReportHistory).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "Expired again"));
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Expired again");
+  });
+
+  it.each(["summary", "associations", "users"] as const)("does not renew failed %s recovery by visiting a healthy Usage tab", async endpoint => {
+    const failure = new ApiError(409, "selection_invalidated", "Users selection expired");
+    if (endpoint === "summary") vi.mocked(api.readAgentReportSummary).mockRejectedValue(failure);
+    if (endpoint === "associations") vi.mocked(api.readAgentReportAssociations).mockRejectedValue(failure);
+    if (endpoint === "users") vi.mocked(api.readReportPage).mockRejectedValue(failure);
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledOnce());
+    for (let visit = 0; visit < 2; visit++) {
+      view.rerender(view.content({ view: "usage" }));
+      await screen.findByRole("region", { name: "Reported usage trend" });
+      view.rerender(view.content({ view: "users" }));
+      await screen.findByRole("alert");
+      expect(onReloadInventory).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each(["summary", "associations"] as const)("does not let retained unlinked data renew failed %s recovery while hidden", async endpoint => {
+    vi.mocked(api.readAgentReportSummary).mockResolvedValue(summary({ status: "unlinked", responses: null }));
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await screen.findByRole("heading", { name: "Usage not reported" });
+    await waitFor(() => expect(view.queryClient.isFetching()).toBe(0));
+    const failure = new ApiError(409, "selection_invalidated", "Unlinked evidence expired");
+    if (endpoint === "summary") vi.mocked(api.readAgentReportSummary).mockRejectedValue(failure);
+    else vi.mocked(api.readAgentReportAssociations).mockRejectedValue(failure);
+    await act(async () => view.queryClient.refetchQueries({
+      queryKey: ["saved", endpoint === "summary" ? "exact-inventory-report" : "exact-inventory-associations"],
+    }));
+    await waitFor(() => expect(onReloadInventory).toHaveBeenCalledOnce());
+    for (let visit = 0; visit < 2; visit++) {
+      view.rerender(view.content({ view: "usage" }));
+      await screen.findByRole("region", { name: "Reported usage trend" });
+      view.rerender(view.content({ view: "users" }));
+      await screen.findByRole("alert");
+      expect(onReloadInventory).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("normalizes report and selection UUIDs without restarting equivalent evidence", async () => {
+    const selected = "abcdefab-abcd-4abc-8abc-abcdefabcdef", setId = "fedcbafe-fedc-4fed-8fed-fedcbafedcba";
+    const normalized = { ...context, selectionId: selected, reportSetId: setId, reports: { ...reports, setId } };
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(agentUsageHistoryFixture(normalized, record.id));
+    vi.mocked(api.readAgentReportSummary).mockResolvedValue(summary({ context: normalized }));
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ context: normalized }));
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      const page = users(query?.cursor, query?.search);
+      return { ...page, context: normalized, reports: normalized.reports, selection: { ...page.selection, id: selected } };
+    });
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selected.toUpperCase(), onReloadInventory,
+      context: { ...inventoryContext, reports: { ...normalized.reports, setId: setId.toUpperCase() } } });
+    await waitFor(() => expect(screen.queryByText("Checking saved report history...")).not.toBeInTheDocument());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await screen.findByText("person0@example.invalid");
+    const search = screen.getByRole("searchbox");
+    fireEvent.change(search, { target: { value: "person" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    view.rerender(view.content({ inventorySelectionId: selected, context: { ...inventoryContext, reports: normalized.reports } }));
+    expect(screen.getByRole("searchbox")).toBe(search);
+    expect(search).toHaveValue("person");
+    expect(api.readAgentReportHistory).toHaveBeenCalledExactlyOnceWith(record.id,
+      { selectionId: selected, inventorySelectionId: selected, cursor: undefined, limit: 50 }, expect.any(AbortSignal));
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+
   it.each(["older", "none"])("uses the newest report for all Users data when the shared selection is %s", async shared => {
     const sharedReports = { ...reports, setId: shared === "older" ? reports.setId : null };
     const sharedContext = { ...context, reportSetId: sharedReports.setId, reports: sharedReports };
@@ -158,7 +733,7 @@ describe("restored agent usage and users", () => {
     expect(screen.queryByRole("button", { name: "View this period" })).not.toBeInTheDocument();
     expect(api.readReportPage).not.toHaveBeenCalled();
     view.rerender(view.content({ view: "users" }));
-    expect(screen.getByRole("heading", { name: "Usage not reported" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Usage not reported" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "View this period" }));
     expect(await screen.findByText("person0@example.invalid")).toBeVisible();
     expect(screen.getByLabelText("CSV report dates")).toHaveTextContent("Sep 1, 2026");
@@ -276,7 +851,7 @@ describe("restored agent usage and users", () => {
     const metrics = screen.getByLabelText("Selected agent report metrics");
     expect(metrics).toHaveTextContent("181"); expect(metrics).toHaveTextContent("7"); expect(metrics).toHaveTextContent("Sep 12, 2026");
     expect(metrics.querySelectorAll(".agent-usage-metric")).toHaveLength(3);
-    expect(screen.getByLabelText("CSV report dates")).toHaveTextContent("Jan 1, 2026");
+    expect(screen.getByLabelText("CSV report dates")).toHaveTextContent(usageDate(reports.reportingPeriod!.startDate));
     expect(screen.getAllByRole("columnheader").map(cell => cell.textContent)).toEqual(["User", "Responses"]);
     expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
     expect(screen.queryByText(/snapshot exact-snapshot|Reported agent identities|exact_package_id/)).not.toBeInTheDocument();
@@ -361,6 +936,327 @@ describe("restored agent usage and users", () => {
     await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenLastCalledWith(record.id,
       { selectionId, cursor: "links-next", limit: 50 }, expect.any(AbortSignal)));
   });
+  it("preserves users search, pagination and focus while loading another report-links page", async () => {
+    renderPanel({ inventorySelectionId: selectionId });
+    await removal();
+    const search = screen.getByRole("searchbox");
+    fireEvent.change(search, { target: { value: "person" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
+    await screen.findByText("person25@example.invalid");
+    const table = screen.getByRole("table"), region = screen.getByRole("region", { name: "Agent users" });
+    region.scrollTop = 128;
+    const pending = deferred<CandidateAgentUsageAssociations>();
+    vi.mocked(api.readAgentReportAssociations).mockReturnValueOnce(pending.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+    expect(screen.getByRole("searchbox")).toBe(search);
+    search.focus();
+    await act(async () => pending.resolve(links({ value: [association],
+      page: { limit: 50, nextCursor: null, previousCursor: "links-previous" } })));
+    expect(screen.getByRole("table")).toBe(table);
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("person");
+    expect(region.scrollTop).toBe(128);
+    expect(screen.getByText("person25@example.invalid")).toBeVisible();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
+  it("retries a retired users cursor at the first page of the same selection", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      if (query?.cursor) throw new ApiError(400, "invalid_cursor", "Saved user cursor changed");
+      return users(undefined, query?.search);
+    });
+    const onReloadInventory = vi.fn();
+    renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await screen.findByText("person0@example.invalid");
+    fireEvent.click(screen.getByRole("button", { name: "Next users" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved user cursor changed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/usage-users"),
+      { selectionId, inventorySelectionId: selectionId, search: undefined, limit: 25 }, expect.any(AbortSignal));
+    await screen.findByText("person0@example.invalid");
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+  it("retries a retired association cursor without recapturing inventory or other usage reads", async () => {
+    vi.mocked(api.readAgentReportAssociations).mockImplementation(async (_id, query) => {
+      if (query.cursor) throw new ApiError(400, "invalid_cursor", "Saved links cursor changed");
+      return links();
+    });
+    const onReloadInventory = vi.fn();
+    renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    await removal();
+    fireEvent.click(screen.getByRole("button", { name: "Next report links" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved links cursor changed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry report links" }));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(3));
+    expect(api.readAgentReportAssociations).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, cursor: undefined, limit: 50 }, expect.any(AbortSignal));
+    await screen.findByText("person0@example.invalid");
+    expect(api.readAgentReportHistory).toHaveBeenCalledOnce();
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+  it("retires confirmed removal when management permission changes without changing account roles", async () => {
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    view.rerender(view.content({ canRemoveReviewedAssociations: false }));
+    expect(screen.queryByRole("button", { name: "Confirm removal" })).not.toBeInTheDocument();
+    view.rerender(view.content());
+    expect(screen.queryByRole("button", { name: "Confirm removal" })).not.toBeInTheDocument();
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
+  });
+  it("reconciles a submitted removal when management permission is withdrawn", async () => {
+    const pending = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    const signal = vi.mocked(api.mutateAgentReportAssociation).mock.lastCall?.[3];
+    view.rerender(view.content({ canRemoveReviewedAssociations: false }));
+    expect(signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(context));
+    expect(view.props.onChanged).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  it.each(["view", "remount", "session"] as const)("does not send an admitted removal retired before submission by %s", async boundary => {
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    if (boundary === "session") view.queryClient.clear();
+    view.rerender(view.content(boundary === "view" ? { view: "usage" } : {}, view.principal,
+      boundary === "view" ? "panel" : "replacement"));
+    await act(async () => {});
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
+    expect(view.props.onChanged).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  it.each(["view", "revision", "context", "disabled", "remount"] as const)(
+    "reconciles committed removal across a %s boundary without replaying it", async boundary => {
+      const pending = deferred<typeof context>(), onReloadInventory = vi.fn();
+      vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+      const view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+      fireEvent.click(await removal());
+      fireEvent.click(screen.getByRole("checkbox"));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+      await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+      const signal = vi.mocked(api.mutateAgentReportAssociation).mock.lastCall?.[3];
+      const overrides = boundary === "view" ? { view: "usage" as const } : boundary === "revision" ? { dataRevision: 1 }
+        : boundary === "context" ? { context: { ...inventoryContext, revision: "replacement" } }
+          : boundary === "disabled" ? { disabled: true } : {};
+      const panelKey = boundary === "remount" ? "replacement" : "panel";
+      view.rerender(view.content(overrides, view.principal, panelKey));
+      expect(signal?.aborted).toBe(false);
+      view.rerender(view.content({}, view.principal, panelKey));
+      expect(await removal()).toBeDisabled();
+      const historyReads = vi.mocked(api.readAgentReportHistory).mock.calls.length;
+      const summaryReads = vi.mocked(api.readAgentReportSummary).mock.calls.length;
+      const linkReads = vi.mocked(api.readAgentReportAssociations).mock.calls.length;
+      const userReads = vi.mocked(api.readReportPage).mock.calls.length;
+      vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ value: [automatic] }));
+      await act(async () => pending.resolve(context));
+      await waitFor(() => expect(view.props.onChanged).toHaveBeenCalledOnce());
+      await screen.findByText("person0@example.invalid");
+      expect(screen.queryByText("Reviewed report identity")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Removing association..." })).not.toBeInTheDocument();
+      expect(api.readAgentReportHistory).toHaveBeenCalledTimes(historyReads + 1);
+      expect(api.readAgentReportSummary).toHaveBeenCalledTimes(summaryReads + 1);
+      expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(linkReads + 1);
+      expect(api.readReportPage).toHaveBeenCalledTimes(userReads + 1);
+      expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce();
+      expect(view.queryClient.getMutationCache().getAll()).toHaveLength(0);
+      expect(onReloadInventory).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
+  it("refreshes committed usage while hidden without fetching users until the tab reopens", async () => {
+    const pending = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    view.rerender(view.content({ view: "usage" }));
+    expect(screen.getByText("Removing association...")).toHaveAttribute("role", "status");
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ value: [automatic] }));
+    await act(async () => pending.resolve(context));
+    await waitFor(() => expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2));
+    expect(api.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(view.props.onChanged).toHaveBeenCalledOnce();
+    expect(screen.queryByText("Removing association...")).not.toBeInTheDocument();
+    view.rerender(view.content());
+    await screen.findByText("person0@example.invalid");
+    expect(screen.queryByText("Reviewed report identity")).not.toBeInTheDocument();
+    expect(api.readAgentReportHistory).toHaveBeenCalledTimes(2);
+    expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2);
+    expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it("invalidates the session after a removal commits with no usage panel mounted", async () => {
+    const pending = deferred<typeof context>(), onReloadInventory = vi.fn();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel({ inventorySelectionId: selectionId, onChanged: undefined, onReloadInventory });
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    view.unmount();
+    await act(async () => pending.resolve(context));
+    expect(onReloadInventory).toHaveBeenCalledOnce();
+    expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledOnce();
+  });
+  it("uses current owner callbacks and cancels reads begun before removal committed", async () => {
+    const pending = deferred<typeof context>(), staleLinks = deferred<CandidateAgentUsageAssociations>();
+    const currentOnChanged = vi.fn();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    vi.mocked(api.readAgentReportAssociations).mockReturnValueOnce(staleLinks.promise);
+    view.rerender(view.content({ onChanged: currentOnChanged }, view.principal, "replacement"));
+    await waitFor(() => expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(2));
+    const staleSignal = vi.mocked(api.readAgentReportAssociations).mock.lastCall?.[2];
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ value: [automatic] }));
+    await act(async () => pending.resolve(context));
+    await screen.findByText("person0@example.invalid");
+    expect(staleSignal?.aborted).toBe(true);
+    await act(async () => staleLinks.resolve(links()));
+    expect(screen.queryByText("Reviewed report identity")).not.toBeInTheDocument();
+    expect(currentOnChanged).toHaveBeenCalledOnce();
+    expect(view.props.onChanged).not.toHaveBeenCalled();
+    expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce();
+  });
+  it("admits a confirmed removal only once within the same event batch", async () => {
+    const pending = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    const confirm = screen.getByRole("button", { name: "Confirm removal" });
+    act(() => { confirm.click(); confirm.click(); });
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    await act(async () => pending.resolve(context));
+    await waitFor(() => expect(view.props.onChanged).toHaveBeenCalledOnce());
+  });
+  it("does not dismiss an admitted removal before its busy state renders", async () => {
+    const pending = deferred<typeof context>(), view = renderPanel();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    const confirm = screen.getByRole("button", { name: "Confirm removal" });
+    const cancel = screen.getByRole("button", { name: "Cancel association change" });
+    act(() => { confirm.click(); cancel.click(); });
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    expect(screen.getByRole("region", { name: "Confirm reviewed association removal" })).toBeVisible();
+    await act(async () => pending.resolve(context));
+    expect(view.props.onChanged).toHaveBeenCalledOnce();
+  });
+  it("retires failed removal errors with their cancelled confirmation", async () => {
+    vi.mocked(api.mutateAgentReportAssociation).mockRejectedValueOnce(new ApiError(400, "invalid_agent_usage", "Removal failed"));
+    renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Removal failed");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel association change" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(await removal());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirm removal" })).toBeDisabled();
+  });
+  it.each([
+    new ApiError(0, "network_error", "Response was lost.", { kind: "network" }),
+    new ApiError(200, "invalid_response", "Response was malformed."),
+    new ApiError(503, "service_unavailable", "Response was unavailable."),
+  ])("reconciles a possibly committed removal after $code without replaying it", async cause => {
+    const pending = deferred<typeof context>(), view = renderPanel({ inventorySelectionId: selectionId });
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    view.rerender(view.content({}, view.principal, "replacement"));
+    await removal();
+    const reads = vi.mocked(api.readAgentReportAssociations).mock.calls.length;
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ value: [automatic] }));
+    await act(async () => pending.reject(cause));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The removal result could not be verified");
+    await screen.findByText("person0@example.invalid");
+    expect(screen.queryByText("Reviewed report identity")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm removal" })).not.toBeInTheDocument();
+    expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce();
+    expect(api.readAgentReportAssociations).toHaveBeenCalledTimes(reads + 1);
+    expect(view.props.onChanged).toHaveBeenCalledOnce();
+  });
+  it.each(["view", "revision", "remount"] as const)("retires late removal errors, but not submission ownership, across a %s boundary", async boundary => {
+    const pending = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    view.rerender(view.content(boundary === "view" ? { view: "usage" } : { dataRevision: 1 }, view.principal,
+      boundary === "remount" ? "replacement" : "panel"));
+    view.rerender(view.content({}, view.principal, boundary === "remount" ? "replacement" : "panel"));
+    expect(await removal()).toBeDisabled();
+    await act(async () => pending.reject(new ApiError(400, "invalid_agent_usage", "Obsolete removal failure")));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Remove association for/ })).toBeEnabled());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(view.props.onChanged).not.toHaveBeenCalled();
+    expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce();
+  });
+  it.each([
+    ["account", "success"], ["account", "failure"], ["session", "success"], ["session", "failure"],
+  ] as const)("fences submitted removal completion across a replacement %s (%s)", async (boundary, outcome) => {
+    const stale = deferred<typeof context>(), current = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(stale.promise).mockReturnValueOnce(current.promise);
+    const view = renderPanel();
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    const replacement = boundary === "account" ? { ...view.principal, homeAccountId: "different" } : view.principal;
+    if (boundary === "session") view.queryClient.clear();
+    view.rerender(view.content({}, replacement, boundary === "session" ? "replacement" : "panel"));
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledTimes(2));
+    const reads = vi.mocked(api.readAgentReportSummary).mock.calls.length;
+    await act(async () => { if (outcome === "success") stale.resolve(context); else stale.reject(new Error("Obsolete failure")); });
+    expect(screen.getByRole("button", { name: "Removing association..." })).toBeDisabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(view.props.onChanged).not.toHaveBeenCalled();
+    expect(api.readAgentReportSummary).toHaveBeenCalledTimes(reads);
+    await act(async () => current.resolve(context));
+    await waitFor(() => expect(view.props.onChanged).toHaveBeenCalledOnce());
+  });
+  it("does not publish an old removal into an account A-B-A replacement", async () => {
+    const pending = deferred<typeof context>(), view = renderPanel();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    view.rerender(view.content({}, { ...view.principal, homeAccountId: "different" }));
+    view.rerender(view.content());
+    await screen.findByText("person0@example.invalid");
+    const reads = vi.mocked(api.readAgentReportSummary).mock.calls.length;
+    await act(async () => pending.resolve(context));
+    expect(api.readAgentReportSummary).toHaveBeenCalledTimes(reads);
+    expect(view.props.onChanged).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
   it("removes reviewed identities only after confirmation with exact compare-and-swap fences", async () => {
     const view = renderPanel(); fireEvent.click(await removal());
     expect(screen.getByRole("heading", { name: "Remove reviewed association" })).toHaveFocus();
@@ -383,6 +1279,28 @@ describe("restored agent usage and users", () => {
       selectionId, reportSetId: context.reportSetId, usageRevision: context.usageRevision, inventoryRevision: context.inventoryRevision,
       reportAgentId: association.reportAgentId, confirmed: true,
     }, "remove", expect.any(AbortSignal), selectionId);
+    expect(onReloadInventory).not.toHaveBeenCalled();
+  });
+  it("keeps an admitted removal owned when history observes its new revision before the response arrives", async () => {
+    const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
+    const pending = deferred<typeof context>();
+    vi.mocked(api.mutateAgentReportAssociation).mockReturnValueOnce(pending.promise);
+    fireEvent.click(await removal());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(api.mutateAgentReportAssociation).toHaveBeenCalledOnce());
+    const signal = vi.mocked(api.mutateAgentReportAssociation).mock.lastCall?.[3];
+    const updatedContext = { ...context, usageRevision: "d".repeat(64) };
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(agentUsageHistoryFixture(updatedContext, record.id));
+    vi.mocked(api.readAgentReportSummary).mockResolvedValue(summary({ context: updatedContext }));
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ context: updatedContext }));
+    const updatedUsers: CandidateAgentUsageUsers = { ...users(), context: updatedContext };
+    vi.mocked(api.readReportPage).mockResolvedValue(updatedUsers);
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2));
+    expect(signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(updatedContext));
+    await waitFor(() => expect(view.props.onChanged).toHaveBeenCalledOnce());
     expect(onReloadInventory).not.toHaveBeenCalled();
   });
   it("restores focus on cancellation without writing", async () => {
@@ -412,6 +1330,11 @@ describe("restored agent usage and users", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Exact source changed");
     expect(view.props.onChanged).not.toHaveBeenCalled();
+    view.rerender(view.content({ view: "usage" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    view.rerender(view.content({ view: "users" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Exact source changed");
+    expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Reload usage" }));
     await waitFor(() => expect(api.readAgentReportSummary).toHaveBeenCalledTimes(2));
   });
@@ -432,9 +1355,11 @@ describe("restored agent usage and users", () => {
     view.rerender(view.content({ dataRevision: 2 }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(5));
     expect(signal?.aborted).toBe(true);
+    expect(region).toHaveAttribute("aria-busy", "true");
     const newest = users("users-next", "person"); newest.value[0].responses = 909;
     await act(async () => latest.resolve(newest));
     expect(await screen.findByRole("cell", { name: "909" })).toBeVisible();
+    await waitFor(() => expect(region).toHaveAttribute("aria-busy", "false"));
     expect(screen.getByRole("table")).toBe(table); expect(search).toHaveFocus(); expect(region.scrollTop).toBe(128);
     const obsolete = users(); obsolete.value[0].username = "obsolete@example.invalid";
     await act(async () => stale.resolve(obsolete));
@@ -444,6 +1369,19 @@ describe("restored agent usage and users", () => {
     renderPanel(); await screen.findByText("person0@example.invalid");
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agent users" }), { target: { value: "concealed" } });
     expect(await screen.findByText("7f7de4f6-censored")).toBeVisible();
+  });
+  it("reuses equivalent normalized user searches without resetting the current page", async () => {
+    renderPanel();
+    await screen.findByText("person0@example.invalid");
+    const search = screen.getByRole("searchbox");
+    fireEvent.change(search, { target: { value: "person" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
+    await screen.findByText("person25@example.invalid");
+    fireEvent.change(search, { target: { value: " Person " } });
+    expect(screen.getByText("person25@example.invalid")).toBeVisible();
+    expect(search).toHaveValue(" Person ");
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
   });
   it.each([new Error("Saved users failed"), new ApiError(403, "forbidden", "User access revoked")])("clears retained users on $message and retries", async failure => {
     const view = renderPanel(); await screen.findByText("person0@example.invalid");

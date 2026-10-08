@@ -9,17 +9,17 @@ import type { OfficialReportAccepted, OfficialReportBundleAcceptance, OfficialRe
   OfficialReportExportRequest, OfficialReportExportStatus, OfficialReportPreview } from "../../backend/src/types/officialReportApi";
 import { reportExportColumns, type ReportAgent, type ReportAnalytics, type ReportHistorySet, type ReportMetadata, type ReportOverviewAgent, type ReportPage, type ReportQuery } from "../../backend/src/types/officialReportData";
 import { historySet, reportPage } from "../src/test/reportDataFixture";
+import { reportBundle } from "../src/test/reportImportFixture";
 import { selectedFixtureQuery, selectedFixtureWindow } from "../src/test/selectedUsageFixture";
 import { mockLayoutApi } from "./layoutFixtures";
 import { selectedCohortRead } from "./selectedCohortFixture";
-import { parseSelectedCsv, selectedImportData, selectedImportMetadata, selectedImportPeriod, type SelectedCsvFixture } from "./selectedImportData";
+import { parseSelectedCsv, selectedImportData, selectedImportMetadata, selectedImportPeriod, selectedImportRowHash, type SelectedCsvFixture } from "./selectedImportData";
 import { usageCsvFixture } from "./usageCsvFixture";
 
 export const importInstant = "2026-09-12T14:45:00.000Z";
 export const importedSetId = "11111111-1111-4111-8111-111111111111";
 export const retainedSetId = "99999999-9999-4999-8999-999999999999";
 const initialBundle = "22222222-2222-4222-8222-222222222222";
-const kinds = ["agents", "userAgents", "users"] as const;
 type SavedSet = { row: ReportHistorySet; files: SelectedCsvFixture[] };
 type Captured = { path: string; metadata: ReportMetadata; query: ReportQuery; files: SelectedCsvFixture[]; historyIds: string[] };
 export type SelectedImportOptions = {
@@ -47,7 +47,7 @@ function matchesActivity(date: string | null, query: ReportQuery, anchor: string
 }
 function setHash(files: SelectedCsvFixture[]) {
   return createHash("sha256").update(JSON.stringify([...files].sort((a, b) => compare(a.kind, b.kind))
-    .map(file => [file.kind, file.fileHash, file.reportingPeriod, file.sourceAsOf ?? null, file.sourceAsOfProvenance]))).digest("hex");
+    .map(file => [file.kind, file.contentHash]))).digest("hex");
 }
 
 export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: string; content: string }>, options: SelectedImportOptions = {}) {
@@ -55,27 +55,47 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   const unexpected = await mockLayoutApi(page);
   const seeded = await Promise.all(csvFiles.map(file => parseSelectedCsv(Buffer.from(file.content))));
   const sets = new Map<string, SavedSet>(), selections = new Map<string, Captured>();
+  const versions = new Map<string, SelectedCsvFixture>();
   const stages: OfficialReportPreview[] = [], stagedFiles = new Map<string, SelectedCsvFixture>(), discardedStages: string[] = [];
   const uploadBodies: string[] = [], uploadIntents: URLSearchParams[] = [], stageReads: string[] = [];
   const bundlePreviews: OfficialReportBundlePreview[] = [], acceptRequests: Array<OfficialReportBundleAcceptance & { bundleId: string }> = [];
-  const receipts = new Map<string, { input: OfficialReportBundleAcceptance; result: OfficialReportAccepted }>();
+  const receipts = new Map<string, OfficialReportAccepted>(), acceptedBundles = new Map<string, OfficialReportAccepted>();
   const setPreviews: OfficialReportConfirmation[] = [], confirmations: OfficialReportConfirmation[] = [];
+  const confirmationReceipts = new Map<string, OfficialReportConfirmation>();
   const agentRequests: URLSearchParams[] = [], userRequests: URLSearchParams[] = [], historyRequests: URLSearchParams[] = [];
   const metadataReads: ReportMetadata[] = [], apiRequests: string[] = [], commands: string[] = [], exportRequests: URLSearchParams[] = [];
   const exports = new Map<string, { selected: Captured; rows: ReportAgent[]; bytes: Buffer; status: OfficialReportExportStatus }>();
+  const exportIntents = new Map<string, { id: string; selectionId: string }>();
   const exportSubmissions: OfficialReportExportRequest[] = [], exportStatusBytes: number[] = [], exportDownloads: boolean[] = [];
   let activeRevision = options.active ? 2 : 1, historyRevision = 1, historyEpoch = 1;
   let selectedSetId = options.selectedSetId ?? (options.active ? importedSetId : null);
   let hasHistory = Boolean(options.active || options.historical);
   let usedImportedSetId = Boolean(options.active);
-  function save(id: string, bundleId: string, files: SelectedCsvFixture[], acceptedAt = importInstant) {
+  function save(id: string, bundleId: string, files: SelectedCsvFixture[], acceptedAt = importInstant, supersedesSetId: string | null = null) {
     const period = selectedImportPeriod(files);
     if (!period) throw new Error("A synthetic report set requires at least one CSV.");
+    const previous = supersedesSetId ? sets.get(supersedesSetId) : undefined;
+    files = files.map(file => {
+      let version = versions.get(file.contentHash);
+      if (!version) {
+        version = structuredClone({ ...file, observation: { acceptedAt,
+          supersedesVersionId: previous?.files.find(row => row.kind === file.kind)?.versionId ?? null } });
+        versions.set(file.contentHash, version);
+      }
+      return version;
+    });
     sets.set(id, { row: historySet(1, { id, bundleId, acceptedAt, reportingStart: period.startDate, reportingEnd: period.endDate,
-      periodProvenance: period.provenance, contentHash: setHash(files),
+      periodProvenance: period.provenance, contentHash: setHash(files), supersedesSetId,
       active: id === selectedSetId }), files });
   }
-  if (options.active) save(importedSetId, initialBundle, seeded);
+  function deleteSet(id: string) {
+    const removed = sets.get(id);
+    sets.delete(id); historyRevision++; historyEpoch++;
+    for (const file of removed?.files ?? []) {
+      if (![...sets.values()].some(set => set.files.some(row => row.versionId === file.versionId))) versions.delete(file.contentHash);
+    }
+    if (selectedSetId === id) { selectedSetId = null; activeRevision++; }
+  }
   if (options.historical) {
     const rows = [
       "historical-report-only,Historical report-only assistant,User-created agent,1,0,17,2026-06-01\r\n",
@@ -92,19 +112,20 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   for (let index = 0; index < (options.additionalSavedSets ?? 0); index++) {
     save(`aaaaaaaa-aaaa-4aaa-8aaa-${String(index + 1).padStart(12, "0")}`, randomUUID(), seeded, "2026-06-02T10:00:00.000Z");
   }
+  if (options.active) save(importedSetId, initialBundle, seeded);
   function metadata(id: string | null = selectedSetId): ReportMetadata {
     const saved = id ? sets.get(id) : undefined;
     const result = selectedImportMetadata(saved?.files ?? [], {
       setId: saved?.row.id ?? null, activeSetId: selectedSetId, activeRevision: String(activeRevision),
       historyRevision: String(historyRevision), historyEpoch: String(historyEpoch),
-      acceptedAt: saved?.row.acceptedAt ?? null, expiresAt: saved ? "2027-03-11T14:45:00.000Z" : null,
+      acceptedAt: saved?.row.acceptedAt ?? null, expiresAt: saved ? "2027-03-11T14:45:00.000Z" : null, evaluatedAt: importInstant,
     });
     if (!saved) result.availability = sets.size ? "not_selected" : hasHistory ? "deleted" : "never_imported";
     return result;
   }
   function createStage(file: SelectedCsvFixture, bundleId: string, correctionOfSetId: string | null = null) {
     const stage: OfficialReportPreview = {
-      id: randomUUID(), revision: 1, kind: file.kind, bundleId, contentHash: file.fileHash, fileHash: file.fileHash,
+      id: randomUUID(), revision: 1, kind: file.kind, bundleId, contentHash: file.contentHash, fileHash: file.fileHash,
       rowCount: file.rowCount, storedBytes: Buffer.byteLength(JSON.stringify(file.rows)), wireBytes: file.wireBytes, activeRevision: String(activeRevision),
       expiresAt: "2026-09-12T15:15:00.000Z", reportingPeriod: file.reportingPeriod, sourceAsOf: file.sourceAsOf ?? null,
       sourceAsOfProvenance: file.sourceAsOfProvenance, sourceFreshness: file.sourceFreshness, correctionOfSetId,
@@ -113,16 +134,14 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         responses: file.rows.reduce((sum, row) => sum + ("agentResponsesReceived" in row ? row.agentResponsesReceived : row.responsesSentToUsers), 0),
         agentsUsed: file.kind === "users" ? file.rows.reduce((sum, row) => sum + ("numberOfAgentsUsed" in row ? row.numberOfAgentsUsed : 0), 0) : null },
     };
-    stages.push(stage); stagedFiles.set(stage.id, file); return stage;
+    stages.push(structuredClone(stage)); stagedFiles.set(stage.id, file); return stage;
   }
   if (options.staged) createStage(seeded[0], initialBundle);
   function activeStages(bundleId: string) { return stages.filter(stage => stage.bundleId === bundleId && !discardedStages.includes(stage.id)); }
-  function bundlePreview(bundleId: string): OfficialReportBundlePreview {
+  function bundlePreview(bundleId: string, forDiscard = false): OfficialReportBundlePreview {
     const current = activeStages(bundleId);
-    return { bundleId, expectedActiveRevision: String(activeRevision), complete: kinds.every(kind => current.some(stage => stage.kind === kind)),
-      bundleHash: createHash("sha256").update(JSON.stringify([bundleId, activeRevision, current])).digest("hex"),
-      stages: current.map(stage => ({ stagingId: stage.id, kind: stage.kind, revision: stage.revision, contentHash: stage.contentHash,
-        rowCount: stage.rowCount, reconciliation: stage.reconciliation })) };
+    if (!forDiscard) selectedImportPeriod(current.map(stage => stagedFiles.get(stage.id)!));
+    return reportBundle(current, bundleId, String(activeRevision));
   }
   function captured(url: URL) {
     const root = /^\/api\/official-usage\/(?:aggregate|agents)(?:\/|$)/.test(url.pathname) ? "/api/official-usage/aggregate"
@@ -165,16 +184,19 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   }
   function historyRows(selected: Captured) {
     const query = selected.query;
-    return selected.historyIds.map(id => sets.get(id)!).filter(set => includes(`${set.row.id} ${set.row.acceptedAt}`, query.search))
-      .sort((a, b) => (query.order === "asc" ? 1 : -1) * (compare(a.row.acceptedAt, b.row.acceptedAt) || compare(a.row.id, b.row.id)));
+    return sortRows(selected.historyIds.map(id => sets.get(id)!).filter(set => includes(`${set.row.id} ${set.row.acceptedAt}`, query.search)), query,
+      ({ row }) => query.sort === "acceptedAt" ? row.acceptedAt
+        : row.reportingEnd === null ? null : `${row.reportingEnd}/${row.reportingStart ?? ""}/${row.acceptedAt}`,
+      set => set.row.id);
   }
   const handle = async (route: Route) => {
-    const request = route.request(), url = new URL(request.url()), path = url.pathname;
+    const request = route.request(), url = new URL(request.url()), path = url.pathname, method = request.method();
     apiRequests.push(path);
     const respond = (json: unknown, status = 200) => {
       expect(Buffer.byteLength(JSON.stringify(json))).toBeLessThanOrEqual(1024 * 1024);
-      return route.fulfill({ status, json });
+      return route.fulfill({ status, json: structuredClone(json) });
     };
+    const notFound = () => respond({ code: "not_found", detail: "No matching synthetic route." }, 404);
     if (path.startsWith("/api/official-usage/") && request.method() !== "GET") commands.push(`${request.method()} ${path}`);
     if (path === "/api/official-usage/admin" || path.endsWith(".csv")) return respond({ code: "not_found", detail: "Removed data endpoint" }, 404);
     if (options.role === "Viewer" && path.startsWith("/api/official-usage/")
@@ -190,9 +212,10 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         authorized: definition.mode === "local", fresh: true, verification: "local", previewQualification: "not_required", remediation: [] } })),
     });
     if (path === "/api/official-usage/staging") {
-      expect(request.method()).toBe("POST");
+      if (method !== "POST") return notFound();
       const body = request.postDataBuffer()!.toString("utf8"); uploadBodies.push(body); uploadIntents.push(url.searchParams);
       expect(url.searchParams.get("bundleId")).toMatch(/^[a-f0-9-]{36}$/); expect(body).not.toContain('name="bundleId"');
+      expect(url.searchParams.get("rejectDuplicateKind")).toBe("true");
       const boundary = request.headers()["content-type"].split("boundary=")[1], parts = body.split(`--${boundary}`);
       const part = parts.find(value => value.includes('name="file";')); if (!part) throw new Error("Missing CSV multipart part");
       const fields = Object.fromEntries(parts.filter(value => !value.includes('name="file";') && /name="([^"]+)"/.test(value))
@@ -209,15 +232,20 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         throw error;
       }
       const bundleId = url.searchParams.get("bundleId")!;
+      const correctionOfSetId = url.searchParams.get("correctionOfSetId");
+      if (correctionOfSetId && !sets.has(correctionOfSetId)) return respond({ code: "invalid_correction", detail: "Correction target is unavailable." }, 409);
       if (activeStages(bundleId).some(stage => stage.kind === file.kind)) return respond({ code: "duplicate_report_kind", detail: "Choose a missing companion kind." }, 409);
-      const stage = createStage(file, bundleId, url.searchParams.get("correctionOfSetId"));
+      const stage = createStage(file, bundleId, correctionOfSetId);
       await options.stageResponseGate; return respond(stage, 201);
     }
     const staging = /^\/api\/official-usage\/staging\/([^/]+)(?:\/(diagnostics))?$/.exec(path);
     if (staging) {
+      if (method !== "GET" && (method !== "DELETE" || staging[2])) return notFound();
       const stage = stages.find(value => value.id === staging[1] && !discardedStages.includes(value.id));
-      if (!stage) return respond({ code: "staging_unavailable", detail: "The exact staging receipt is unavailable." }, 404);
-      if (request.method() === "DELETE") { expect(stage.status).toBe("active"); discardedStages.push(stage.id); return route.fulfill({ status: 204 }); }
+      if (!stage || method === "DELETE" && stage.status !== "active") {
+        return respond({ code: "staging_unavailable", detail: "The exact staging receipt is unavailable for this operation." }, 409);
+      }
+      if (method === "DELETE") { discardedStages.push(stage.id); return route.fulfill({ status: 204 }); }
       stageReads.push(stage.id);
       if (staging[2]) return respond({ value: [], counts: { total: 0, filtered: 0 }, preview: { id: stage.id, revision: stage.revision, contentHash: stage.contentHash },
         page: { limit: 50, nextCursor: null, previousCursor: null } });
@@ -225,59 +253,123 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     }
     const bundle = /^\/api\/official-usage\/bundles\/([^/]+)\/(preview|accept)$/.exec(path);
     if (bundle) {
+      if (method !== "POST") return notFound();
       const current = activeStages(bundle[1]);
       if (bundle[2] === "preview") {
-        const preview = bundlePreview(bundle[1]);
-        bundlePreviews.push(preview); return respond(preview);
+        const forDiscard = request.postDataJSON()?.forDiscard;
+        if (forDiscard !== undefined && typeof forDiscard !== "boolean") {
+          return respond({ code: "invalid_import_intent", detail: "Bundle cleanup inspection must be a boolean." }, 400);
+        }
+        try {
+          const preview = bundlePreview(bundle[1], forDiscard === true);
+          bundlePreviews.push(preview); return respond(preview);
+        } catch (error) {
+          if (error instanceof AppError) return respond({ code: error.code, detail: error.message }, error.status);
+          throw error;
+        }
       }
       const body: OfficialReportBundleAcceptance = request.postDataJSON(); acceptRequests.push({ bundleId: bundle[1], ...body });
-      const receipt = receipts.get(bundle[1]), reviewed = bundlePreview(bundle[1]);
+      const receiptKey = JSON.stringify([bundle[1], body.bundleHash, body.expectedActiveRevision]);
+      const receipt = receipts.get(receiptKey);
       if (receipt) {
-        if (body.bundleHash !== receipt.input.bundleHash || body.expectedActiveRevision !== receipt.input.expectedActiveRevision) {
-          return respond({ code: "bundle_fence_mismatch", detail: "The acceptance receipt belongs to a different reviewed bundle." }, 409);
-        }
-        if (!sets.has(receipt.result.setId)) return respond({ code: "deleted_report_duplicate", detail: "This accepted report was deleted." }, 409);
-        return respond(receipt.result);
+        if (!sets.has(receipt.setId)) return respond({ code: "deleted_report_duplicate", detail: "This accepted report was deleted." }, 409);
+        return respond(receipt);
+      }
+      let reviewed: OfficialReportBundlePreview;
+      try { reviewed = bundlePreview(bundle[1]); }
+      catch (error) {
+        if (error instanceof AppError) return respond({ code: error.code, detail: error.message }, error.status);
+        throw error;
       }
       if (!reviewed.complete || body.bundleHash !== reviewed.bundleHash || body.expectedActiveRevision !== reviewed.expectedActiveRevision) {
         return respond({ code: "bundle_fence_mismatch", detail: "Review the current complete bundle before accepting." }, 409);
       }
+      const accepted = acceptedBundles.get(bundle[1]);
+      if (accepted) {
+        if (!sets.has(accepted.setId)) return respond({ code: "deleted_report_duplicate", detail: "This accepted report was deleted." }, 409);
+        receipts.set(receiptKey, accepted);
+        return respond(accepted);
+      }
       const files = current.map(stage => stagedFiles.get(stage.id)!);
-      const existing = [...sets.values()].find(set => set.row.contentHash === setHash(files));
+      const correctionOfSetId = current[0].correctionOfSetId, target = correctionOfSetId ? sets.get(correctionOfSetId) : undefined;
+      const period = selectedImportPeriod(files)!;
+      if (current.some(stage => stage.correctionOfSetId !== correctionOfSetId)) return respond({ code: "staging_unavailable", detail: "Companion correction targets differ." }, 409);
+      if (correctionOfSetId && (!target || target.row.periodProvenance !== period.provenance
+        || period.provenance !== "activity_range" && (target.row.reportingStart !== period.startDate || target.row.reportingEnd !== period.endDate))) {
+        return respond({ code: "invalid_correction", detail: "Correction reporting window differs or its target is unavailable." }, 409);
+      }
+      const existing = [...sets.values()].find(set => set.row.contentHash === setHash(files)
+        && (!correctionOfSetId || set.row.id === correctionOfSetId || set.row.supersedesSetId === correctionOfSetId));
       if (options.reusedExistingSet) expect(existing?.row.id).toBe(importedSetId);
       const setId = existing?.row.id ?? (usedImportedSetId ? randomUUID() : importedSetId);
-      for (const stage of current) stage.status = "accepted";
+      for (const stage of current) stages[stages.indexOf(stage)] = { ...stage, status: "accepted" };
       if (!existing) {
-        usedImportedSetId = true; selectedSetId = setId; activeRevision++; historyRevision++;
-        save(setId, bundle[1], files);
+        const active = selectedSetId ? sets.get(selectedSetId)?.row : undefined;
+        const backfill = active?.reportingEnd && (!period.endDate
+          || `${period.endDate}/${period.startDate ?? ""}` < `${active.reportingEnd}/${active.reportingStart ?? ""}`);
+        if (!selectedSetId || correctionOfSetId === selectedSetId || !correctionOfSetId && !backfill) {
+          selectedSetId = setId; activeRevision++;
+        }
+        usedImportedSetId = true; historyRevision++;
+        if (correctionOfSetId && target) {
+          historyEpoch++;
+          sets.set(correctionOfSetId, { ...target, row: { ...target.row, visibility: "superseded" } });
+        }
+        save(setId, bundle[1], files, importInstant, correctionOfSetId);
       }
       hasHistory = true;
       const result: OfficialReportAccepted = { setId, activeRevision: String(activeRevision), complete: true };
-      receipts.set(bundle[1], { input: body, result });
+      receipts.set(receiptKey, result); acceptedBundles.set(bundle[1], result);
       if (options.loseAcceptanceResponse) return route.abort("failed");
       return respond(result);
     }
     const preview = /^\/api\/official-usage\/sets\/([^/]+)\/preview$/.exec(path);
     if (preview) {
-      const operation: OfficialReportConfirmation["operation"] = request.postDataJSON().operation;
-      const result: OfficialReportConfirmation = { id: randomUUID(), setId: preview[1], operation, activeRevision: String(activeRevision),
-        historyRevision: String(historyRevision), historyEpoch: String(historyEpoch), hash: "c".repeat(64) };
-      setPreviews.push(result); return respond(result);
+      if (method !== "POST") return notFound();
+      const operation: OfficialReportConfirmation["operation"] = request.postDataJSON()?.operation;
+      if (operation !== "select" && operation !== "delete") return respond({ code: "invalid_operation", detail: "Unsupported operation." }, 400);
+      const target = sets.get(preview[1]);
+      if (!target || operation === "select" && target.row.visibility !== "retained") {
+        return respond({ code: "staging_unavailable", detail: "The exact report is unavailable for this operation." }, 409);
+      }
+      const intent = { id: randomUUID(), setId: preview[1], operation, activeRevision: String(activeRevision),
+        historyRevision: String(historyRevision), historyEpoch: String(historyEpoch) };
+      const result = { ...intent, hash: createHash("sha256").update(JSON.stringify(intent)).digest("hex") };
+      confirmationReceipts.set(result.id, result);
+      setPreviews.push(structuredClone(result)); return respond(result);
     }
-    if (path.startsWith("/api/official-usage/confirmations/")) {
+    const confirmationPath = /^\/api\/official-usage\/confirmations\/([^/]+)$/.exec(path);
+    if (confirmationPath) {
+      if (method !== "POST") return notFound();
       const confirmation: OfficialReportConfirmation = request.postDataJSON();
-      expect(confirmation).toEqual(setPreviews.find(value => value.id === path.split("/").at(-1)));
-      expect(confirmation).toMatchObject({ activeRevision: String(activeRevision), historyRevision: String(historyRevision), historyEpoch: String(historyEpoch) });
-      confirmations.push(confirmation);
+      if (confirmation?.id !== confirmationPath[1]) return respond({ code: "invalid_identifier", detail: "Confirmation ID mismatch." }, 400);
+      const reviewed = confirmationReceipts.get(confirmation.id);
+      if (!reviewed || Object.keys(reviewed).some(key => reviewed[key as keyof OfficialReportConfirmation] !== confirmation[key as keyof OfficialReportConfirmation])
+        || confirmation.activeRevision !== String(activeRevision) || confirmation.historyRevision !== String(historyRevision)
+        || confirmation.historyEpoch !== String(historyEpoch) || !sets.has(confirmation.setId)) {
+        return respond({ code: "confirmation_mismatch", detail: "Review a new immutable confirmation." }, 409);
+      }
+      confirmationReceipts.delete(confirmation.id);
+      confirmations.push(structuredClone(confirmation));
       if (confirmation.operation === "select") { selectedSetId = confirmation.setId; activeRevision++; }
-      else { sets.delete(confirmation.setId); historyRevision++; historyEpoch++; if (selectedSetId === confirmation.setId) { selectedSetId = null; activeRevision++; } }
+      else deleteSet(confirmation.setId);
       return respond({ activeSetId: selectedSetId, activeRevision: String(activeRevision) });
     }
     if (path === "/api/data-exports") {
+      if (method !== "POST") return notFound();
       const body: OfficialReportExportRequest = request.postDataJSON(); exportSubmissions.push(body);
       expect(Object.keys(body).sort()).toEqual(["idempotencyKey", "kind", "selectionId"]);
       expect(body.idempotencyKey).toMatch(/^[a-f0-9-]{36}$/); expect(body.kind).toBe("official_agents");
-      const selected = selections.get(body.selectionId)!; expect(selected).toBeDefined();
+      const selected = selections.get(body.selectionId);
+      if (!selected || selected.metadata.historyEpoch !== String(historyEpoch)) {
+        return respond({ code: "selection_invalidated", detail: "Report history changed. Restart selection." }, 409);
+      }
+      if (selected.path !== "/api/official-usage/aggregate") {
+        return respond({ code: "export_selection_kind", detail: "Export kind must match the pinned endpoint." }, 400);
+      }
+      const previous = exportIntents.get(body.idempotencyKey!);
+      if (previous) return previous.selectionId === body.selectionId ? respond({ id: previous.id }, 202)
+        : respond({ code: "export_idempotency_conflict", detail: "Export intent changed; create a new request." }, 409);
       const query = new URLSearchParams();
       for (const [key, value] of Object.entries({ ...selected.query, setId: selected.metadata.setId })) if (value !== undefined && value !== null) query.set(key, String(value));
       exportRequests.push(query);
@@ -291,7 +383,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         responsesSentToUsers: row.responses, responseComparisonStatus: row.responseComparison,
         responseDifference: row.reportResponses !== null && row.bridgeResponses !== null ? Math.abs(row.reportResponses - row.bridgeResponses) : "Unknown",
         responsesAgentsReport: unknown(row.reportResponses), responsesUsersAndAgentsReport: unknown(row.bridgeResponses),
-        lastActivityDateUtc: unknown(row.lastActivityDateUtc), sourceReports: row.reportResponses === null ? "userAgents" : row.bridgeResponses === null ? "agents" : "agents | userAgents",
+        lastActivityDateUtc: row.lastActivityDateUtc === null ? "Unknown" : new Date(row.lastActivityDateUtc).toISOString(),
+        sourceReports: row.reportResponses === null ? "userAgents" : row.bridgeResponses === null ? "agents" : "agents | userAgents",
         identityStatus: row.identityStatus, reportSetId: selected.metadata.setId, historyRevision: selected.metadata.historyRevision,
         reportingStart: selected.metadata.reportingPeriod?.startDate, reportingEnd: selected.metadata.reportingPeriod?.endDate,
         ...Object.fromEntries(selected.metadata.lineages.flatMap(lineage => [
@@ -300,14 +393,22 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       })));
       const id = randomUUID(), status: OfficialReportExportStatus = { id, status: "ready", rows: rows.length, bytes: bytes.length,
         expiresAt: "2026-09-12T15:15:00.000Z", error: null, limit: null, observed: null };
-      exports.set(id, { selected, rows, bytes, status }); return respond({ id }, 202);
+      exports.set(id, { selected, rows, bytes, status });
+      exportIntents.set(body.idempotencyKey!, { id, selectionId: body.selectionId });
+      return respond({ id }, 202);
     }
-    if (path.startsWith("/api/data-exports/")) {
-      const stored = exports.get(path.split("/")[3]); if (!stored) throw new Error("Unknown persisted export");
-      if (request.method() === "DELETE") { stored.status.status = "cancelled"; return route.fulfill({ status: 204 }); }
-      if (stored.selected.metadata.historyEpoch !== String(historyEpoch)) { stored.status.status = "failed"; stored.status.error = "selection_invalidated"; }
-      if (path.endsWith("/download")) {
-        expect(stored.status.status).toBe("ready"); exportDownloads.push(request.isNavigationRequest());
+    const exportPath = /^\/api\/data-exports\/([^/]+)(?:\/(download))?$/.exec(path);
+    if (exportPath) {
+      if (method !== "GET" && (method !== "DELETE" || exportPath[2])) return notFound();
+      const stored = exports.get(exportPath[1]);
+      if (!stored) return respond({ code: "export_not_found", detail: "Export is unavailable." }, 404);
+      if (stored.selected.metadata.historyEpoch !== String(historyEpoch)) {
+        return respond({ code: "selection_invalidated", detail: "Report history changed. Restart selection." }, 409);
+      }
+      if (method === "DELETE") { stored.status = { ...stored.status, status: "cancelled" }; return route.fulfill({ status: 204 }); }
+      if (exportPath[2]) {
+        if (stored.status.status !== "ready") return respond({ code: "export_not_ready", detail: "Export is not ready." }, 409);
+        exportDownloads.push(request.isNavigationRequest());
         return route.fulfill({ contentType: "text/csv", headers: { "Content-Disposition": 'attachment; filename="official-agents.csv"' }, body: stored.bytes });
       }
       exportStatusBytes.push(Buffer.byteLength(JSON.stringify(stored.status))); return respond(stored.status);
@@ -364,10 +465,10 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         const { value, page, counts, selection, reports } = window(result.value, result);
         return respond({ value, page, counts, selection, reports });
       }
-      const files = [...new Map(retained.flatMap(set => set.files.map(file => [file.fileHash, file] as const))).values()];
+      const files = [...new Map(retained.flatMap(set => set.files.map(file => [file.versionId, file] as const))).values()];
       const observations = files.flatMap(file => file.rows.map(row => ({ kind: file.kind, row })));
       const dates = observations.flatMap(({ row }) => row.lastActivityDateUtc ? [row.lastActivityDateUtc.slice(0, 10)] : []).sort();
-      const payloads = new Set(observations.map(({ kind, row }) => JSON.stringify([kind, row])));
+      const payloads = new Set(observations.map(({ kind, row }) => JSON.stringify([kind, selectedImportRowHash(row)])));
       const accepted = retained.map(set => set.row.acceptedAt).sort();
       const known = retained.filter(({ row }) => row.periodProvenance !== "activity_range" && row.reportingStart !== null && row.reportingEnd !== null);
       result.analytics.history = { imports: retained.length, uniqueObservations: files.length, observationRows: observations.length,
@@ -393,8 +494,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       const values = new Map<string, { row: ReportOverviewAgent; versions: Set<string>; creators: Set<string> }>();
       const seenVersions = new Set<string>(), agentIds = new Set<string>();
       for (const set of all) for (const file of set.files) {
-        if (file.kind === "users" || seenVersions.has(file.fileHash)) continue;
-        seenVersions.add(file.fileHash);
+        if (file.kind === "users" || seenVersions.has(file.versionId)) continue;
+        seenVersions.add(file.versionId);
         for (const row of file.rows) {
           if (!("agentId" in row)) continue;
           const date = row.lastActivityDateUtc?.slice(0, 10) ?? null;
@@ -407,7 +508,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
               active30Days: false, latestSetId: set.row.id, latestAcceptedAt: set.row.acceptedAt } };
             values.set(row.agentId, value);
           }
-          value.versions.add(file.fileHash); value.creators.add(row.creatorType);
+          value.versions.add(file.versionId); value.creators.add(row.creatorType);
           value.row.observationCount = value.versions.size; value.row.creatorTypeCount = value.creators.size;
           value.row.hasResponses ||= row.responsesSentToUsers > 0;
           if (date) {
@@ -465,6 +566,6 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     setPreviews, confirmations, metadataReads, agentRequests, userRequests, historyRequests, apiRequests, commands,
     exportRequests, exportSubmissions, exportStatusBytes, exportDownloads, selectedSetId: () => selectedSetId,
     selectReport(id: string) { expect(sets.has(id)).toBe(true); selectedSetId = id; activeRevision++; },
-    deleteImportedReport() { sets.delete(importedSetId); historyRevision++; historyEpoch++; if (selectedSetId === importedSetId) { selectedSetId = null; activeRevision++; } },
+    deleteImportedReport() { deleteSet(importedSetId); },
   };
 }

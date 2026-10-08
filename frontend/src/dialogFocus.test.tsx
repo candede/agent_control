@@ -1,7 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { trapDialogFocus } from "./dialogFocus";
+import { observeDialogFocus, trapDialogFocus } from "./dialogFocus";
 
 describe("dialog focus boundaries", () => {
   it("wraps both ends and excludes disabled, hidden, and inert controls", () => {
@@ -282,5 +282,116 @@ describe("dialog focus boundaries", () => {
     const preventDefault = vi.fn();
     trapDialogFocus({ key: "Tab", shiftKey: false, preventDefault }, null);
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("handles a bubbling Tab only once even when another listener invokes the trap", () => {
+    render(<section aria-label="Test dialog" tabIndex={-1}>
+      <button tabIndex={1}>First</button>
+      <button tabIndex={2}>Second</button>
+      <button tabIndex={3}>Third</button>
+    </section>);
+    const dialog = screen.getByRole("region", { name: "Test dialog" });
+    screen.getByRole("button", { name: "First" }).focus();
+    const event = new KeyboardEvent("keydown", { key: "Tab", cancelable: true });
+    trapDialogFocus(event, dialog);
+    expect(screen.getByRole("button", { name: "Second" })).toHaveFocus();
+    expect(event.defaultPrevented).toBe(true);
+    trapDialogFocus(event, dialog);
+    expect(screen.getByRole("button", { name: "Second" })).toHaveFocus();
+  });
+
+  it.each(["detached", "hidden", "inert", "closed"] as const)("ignores a %s dialog retained by an old listener", state => {
+    const { unmount } = render(<dialog open tabIndex={-1} style={{ display: "block" }}>
+      <button>Previous account action</button>
+    </dialog>);
+    const dialog = screen.getByRole("dialog");
+    render(<button>Current account action</button>);
+    const current = screen.getByRole("button", { name: "Current account action" });
+    if (state === "detached") unmount();
+    else if (state === "closed") dialog.removeAttribute("open");
+    else dialog.setAttribute(state, "");
+    current.focus();
+    const preventDefault = vi.fn();
+    trapDialogFocus({ key: "Tab", shiftKey: false, preventDefault }, dialog);
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(current).toHaveFocus();
+  });
+
+  it("recomputes focus targets after loading, error recovery, and owner replacement", () => {
+    const content = (state: "ready" | "loading" | "error" | "replacement") => <section aria-label="Test dialog" tabIndex={-1}>
+      {state === "ready" ? <button key="previous">Previous result</button>
+        : state === "loading" ? <p role="status">Loading current results...</p>
+          : state === "error" ? <button key="retry">Retry current results</button>
+            : <button key="replacement">Current account result</button>}
+    </section>;
+    const { rerender } = render(content("ready"));
+    const dialog = screen.getByRole("region", { name: "Test dialog" });
+    const previous = screen.getByRole("button", { name: "Previous result" });
+    previous.focus();
+    const focusPrevious = vi.spyOn(previous, "focus");
+    for (const state of ["loading", "error", "replacement"] as const) {
+      rerender(content(state));
+      const event = new KeyboardEvent("keydown", { key: "Tab", cancelable: true });
+      trapDialogFocus(event, dialog);
+      expect(state === "loading" ? dialog : screen.getByRole("button")).toHaveFocus();
+    }
+    expect(previous).not.toBeInTheDocument();
+    expect(focusPrevious).not.toHaveBeenCalled();
+  });
+});
+
+describe("native dialog focus recovery", () => {
+  it("recovers child-only focus loss but preserves retained and foreground focus", async () => {
+    const content = (loading: boolean, status: string) => <>
+      <dialog open tabIndex={-1}>
+        {!loading ? <button>Current result</button> : null}
+        <p role="status">{status}</p>
+      </dialog>
+      <button>Foreground action</button>
+    </>;
+    const { rerender } = render(content(false, "Ready"));
+    const dialog = screen.getByRole("dialog") as HTMLDialogElement;
+    const stopObserving = observeDialogFocus(dialog);
+    const focus = vi.spyOn(dialog, "focus");
+    try {
+      const result = screen.getByRole("button", { name: "Current result" });
+      result.focus();
+      await act(async () => { rerender(content(false, "Updated")); });
+      expect(result).toHaveFocus();
+      expect(focus).not.toHaveBeenCalled();
+      await act(async () => { rerender(content(true, "Loading")); });
+      expect(dialog).toHaveFocus();
+      expect(focus).toHaveBeenCalledOnce();
+      const foreground = screen.getByRole("button", { name: "Foreground action" });
+      foreground.focus();
+      await act(async () => { rerender(content(false, "Recovered")); });
+      expect(foreground).toHaveFocus();
+      expect(focus).toHaveBeenCalledOnce();
+    } finally {
+      stopObserving();
+      focus.mockRestore();
+    }
+  });
+
+  it.each(["closed", "detached", "disposed"] as const)("retires focus recovery when the owner is %s", async state => {
+    const { unmount } = render(<dialog open tabIndex={-1}><button>Previous result</button></dialog>);
+    const dialog = screen.getByRole("dialog") as HTMLDialogElement;
+    const stopObserving = observeDialogFocus(dialog);
+    const focus = vi.spyOn(dialog, "focus");
+    screen.getByRole("button").focus();
+    await act(async () => {
+      try {
+        if (state === "detached") unmount();
+        else if (state === "closed") dialog.removeAttribute("open");
+        else stopObserving();
+        dialog.replaceChildren();
+        await Promise.resolve();
+        expect(document.body).toHaveFocus();
+        expect(focus).not.toHaveBeenCalled();
+      } finally {
+        stopObserving();
+        focus.mockRestore();
+      }
+    });
   });
 });

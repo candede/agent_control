@@ -23,7 +23,8 @@ async function openUser(page: Page) {
   });
   await page.route("**/api/agent-responsibility?**", route => {
     reads.responsibility += 1;
-    return route.fulfill({ json: responsibilityFixture(new URL(route.request().url()).searchParams.get("objectId") ?? undefined) });
+    return route.fulfill({ json: responsibilityFixture(new URL(route.request().url()).searchParams.get("objectId") ?? undefined,
+      { now: Date.parse(layoutTime) }) });
   });
   await page.route("**/api/data-sync/auto-refresh", route => {
     expect(isAutomaticRefreshRequest(route.request())).toBe(true);

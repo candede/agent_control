@@ -1,4 +1,4 @@
-import { useContext, useMemo, useState, type ReactNode } from "react";
+import { useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CopilotPackage, CopilotPackageDetail, UnifiedAgentRecord } from "../api/client";
 import { agentAccessSummary, agentColumnValue } from "../../../backend/src/types/agentPresentation";
 import { formatPackageFacetLabel, formatPackageType } from "../../../backend/src/types/copilotPackage";
@@ -13,17 +13,18 @@ import { AgentConnectorOperations, SavedAgentChannels, SavedAgentConnectors } fr
 const connectorPageSize = 10;
 type Property = { label: string; value: ReactNode; wide?: boolean };
 
-export function AgentOverview({ record, selectionId, selectedPackage, packageDetail, peopleState, onOpenPerson }: {
+export function AgentOverview({ record, selectionId, selectedPackage, packageDetail, peopleState, onOpenPerson, onInvalidated }: {
   record: UnifiedAgentRecord;
   selectionId?: string;
   selectedPackage?: CopilotPackage;
   packageDetail?: CopilotPackageDetail;
   peopleState: ReturnType<typeof useAgentPeople>;
   onOpenPerson?: (id: string) => void;
+  onInvalidated?: () => void;
 }) {
-  const [connectorOffset, setConnectorOffset] = useState(0);
-  const [initialNow] = useState(Date.now);
-  const now = useContext(CapabilityContext)?.now ?? initialNow;
+  const capabilities = useContext(CapabilityContext);
+  const [localNow, setLocalNow] = useState(Date.now);
+  const now = Math.max(localNow, capabilities?.now ?? 0);
   const resource = record.powerPlatformResource;
   const { people, loading: loadingPeople, error: peopleError, unavailable: peopleUnavailable, canRetry, retry: retryPeople } = peopleState;
   const missingName = resource && !resource.displayName?.trim() && record.displayName === resource.nativeId;
@@ -40,9 +41,31 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
   const operationCount = resource?.details.distinctPowerPlatformConnectorsOperations;
   const savedConnectors = resource?.connectorCounts;
   const packageCount = record.packageCount ?? record.packages.length;
-  const partialConnectors = resource?.details.capabilityDetailsTruncated || resource?.details.connectorDetailsStatus === "partial";
-  const offset = Math.min(connectorOffset, Math.max(0, Math.ceil((connectors?.length ?? 0) / connectorPageSize) - 1) * connectorPageSize);
+  const partialConnectors = Boolean(resource?.details.capabilityDetailsTruncated || resource?.details.connectorDetailsStatus === "partial");
+  const connectorOwner = JSON.stringify([
+    capabilities?.user?.tenantId, capabilities?.user?.homeAccountId, [...(capabilities?.user?.roles ?? [])].sort(),
+    selectionId, record.id, record.observations.powerPlatform?.snapshotId, resource?.savedSource?.scopeId, resource?.savedSource?.identity,
+  ]);
+  const [navigation, setNavigation] = useState({ owner: connectorOwner, offset: 0 });
+  const offset = navigation.owner === connectorOwner
+    ? Math.min(navigation.offset, Math.max(0, Math.ceil((connectors?.length ?? 0) / connectorPageSize) - 1) * connectorPageSize) : 0;
+  if (navigation.owner !== connectorOwner || navigation.offset !== offset) setNavigation({ owner: connectorOwner, offset });
   const environment = record.environment?.id.toLowerCase() === record.environmentId?.toLowerCase() ? record.environment : undefined;
+  const nextExpiry = [environment?.observation.expiresAt, record.observations.powerPlatform?.expiresAt]
+    .map(value => Date.parse(value ?? "")).filter(expiry => Number.isFinite(expiry) && expiry > now)
+    .sort((left, right) => left - right)[0];
+  useEffect(() => {
+    if (nextExpiry === undefined) return;
+    const updateClock = () => setLocalNow(Date.now());
+    const timer = window.setTimeout(updateClock, Math.min(Math.max(nextExpiry - Date.now(), 0), 2_147_483_647));
+    window.addEventListener("focus", updateClock);
+    document.addEventListener("visibilitychange", updateClock);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", updateClock);
+      document.removeEventListener("visibilitychange", updateClock);
+    };
+  }, [nextExpiry, now]);
   const installationSummary = agentAccessSummary(observedRecord, "deployedTo");
   const information = properties([
     { label: "Publisher", value: metadata?.publisher },
@@ -70,7 +93,7 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
     { label: "Orchestration", value: resource?.details.orchestration },
     { label: "Web search for knowledge", value: resource?.details.isWebSearchEnabledForKnowledge },
     { label: "Channels", value: resource?.details.channels === undefined ? selectionId && resource?.savedSource
-      ? <SavedAgentChannels key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id} source={resource.savedSource} /> : undefined
+      ? <SavedAgentChannels key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id} source={resource.savedSource} onInvalidated={onInvalidated} /> : undefined
       : resource.details.channels.map(formatPackageFacetLabel).join(", ") || "None reported" },
     { label: "Managed solution", value: resource?.details.isManaged },
     { label: "Agent region", value: resource?.location?.toLowerCase() !== environment?.region?.toLowerCase() ? resource?.location : undefined },
@@ -150,11 +173,12 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
         </ul>
         {connectors.length > connectorPageSize ? <div className="agent-insight-pagination" aria-label="Connector detail pages">
           <span>{offset + 1}-{Math.min(offset + connectorPageSize, connectors.length)} of {connectors.length} saved connectors</span>
-          <button type="button" className="secondary" disabled={offset === 0} onClick={() => setConnectorOffset(offset - connectorPageSize)}>Previous connectors</button>
-          <button type="button" className="secondary" disabled={offset + connectorPageSize >= connectors.length} onClick={() => setConnectorOffset(offset + connectorPageSize)}>Next connectors</button>
+          <button type="button" className="secondary" disabled={offset === 0} onClick={() => setNavigation({ owner: connectorOwner, offset: offset - connectorPageSize })}>Previous connectors</button>
+          <button type="button" className="secondary" disabled={offset + connectorPageSize >= connectors.length} onClick={() => setNavigation({ owner: connectorOwner, offset: offset + connectorPageSize })}>Next connectors</button>
         </div> : null}
       </> : selectionId && resource.savedSource && savedConnectors
-        ? <SavedAgentConnectors key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id} source={resource.savedSource} />
+        ? <SavedAgentConnectors key={`${selectionId}:${record.id}`} selectionId={selectionId} recordId={record.id}
+          source={resource.savedSource} partial={partialConnectors} onInvalidated={onInvalidated} />
         : <p>{connectorCount === 0 && !partialConnectors || connectorCount === undefined && connectors !== undefined && !partialConnectors
           ? "No configured connectors were reported."
           : "Configured connector details are unavailable. Refresh inventory in Sync."}</p>}
@@ -183,7 +207,10 @@ function Person({ value, onOpen }: { value: AgentPerson; onOpen?: (id: string) =
   const name = value.displayName || value.address || value.id;
   return <div className="agent-person">
     {navigable && onOpen ? <button type="button" className="agent-person-link" aria-label={`View responsibility for ${name}`}
-      onClick={() => onOpen(value.id.toLowerCase())}>{name}</button> : <span>{name}</span>}
+      onClick={() => {
+        if (value.expiresAt !== undefined && !(Date.parse(value.expiresAt) > Date.now())) return;
+        onOpen(value.id.toLowerCase());
+      }}>{name}</button> : <span>{name}</span>}
     {value.displayName && value.address ? <small>{value.address}</small> : null}
     {value.status === "not_found" ? <small>User not found at the last directory lookup.</small> : null}
     {value.status === "lookup_failed" ? <small>Directory lookup failed.{value.displayName || value.address ? " Last known identity shown." : ""}</small> : null}

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReportAgent, ReportPage } from "../../../backend/src/types/officialReportData";
 import { ApiError } from "../api/client";
 import * as api from "../api/reportData";
+import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { reportAgent, reportPage, reports, reportSetId, selectionId } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
 import { OfficialUsageSnapshot } from "./OfficialUsageSnapshot";
@@ -24,7 +25,7 @@ beforeEach(() => {
   vi.mocked(api.readReportFacet).mockResolvedValue({ value: [], counts: { total: 0, filtered: 0 },
     page: { limit: 50, nextCursor: null, previousCursor: null }, selection: page().selection });
 });
-afterEach(() => { cleanup(); vi.resetAllMocks(); });
+afterEach(() => { cleanup(); vi.resetAllMocks(); vi.useRealTimers(); });
 
 describe("exact selected snapshot inspection", () => {
   it("loads the exact set and requested activity window, tenant totals and lazy detail without changing the active set", async () => {
@@ -48,7 +49,7 @@ describe("exact selected snapshot inspection", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate",
       expect.objectContaining({ cursor: "next", selectionId }), expect.any(AbortSignal)));
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "Helpdesk" } });
-    await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.search).toBe("Helpdesk"));
+    await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.search).toBe("helpdesk"));
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.cursor).toBeUndefined();
     await userEvent.selectOptions(screen.getByLabelText("Sort agents"), "name:asc");
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", expect.objectContaining({ sort: "name", order: "asc" }), expect.any(AbortSignal));
@@ -77,15 +78,16 @@ describe("exact selected snapshot inspection", () => {
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
   });
   it("honors changed controlled windows and report IDs while ignoring an obsolete transport", async () => {
+    const previousSetId = "a0000000-0000-4000-8000-000000000001", nextSetId = "b0000000-0000-4000-8000-000000000002";
     const pending = deferred<ReportPage<ReportAgent>>(); vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
-    const view = render(<OfficialUsageSnapshot {...props} setId="A" />);
+    const view = render(<OfficialUsageSnapshot {...props} setId={previousSetId} />);
     const signal = vi.mocked(api.readReportPage).mock.calls[0][2];
-    view.rerender(<OfficialUsageSnapshot {...props} setId="B" activityWindowDays={7} />);
+    view.rerender(<OfficialUsageSnapshot {...props} setId={nextSetId.toUpperCase()} activityWindowDays={7} />);
     await screen.findByRole("button", { name: "Researcher" });
     expect(signal?.aborted).toBe(true);
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate",
-      expect.objectContaining({ setId: "B", activityWindowDays: 7 }), expect.any(AbortSignal));
-    await act(async () => pending.resolve(page("A", "Obsolete")));
+      expect.objectContaining({ setId: nextSetId, activityWindowDays: 7 }), expect.any(AbortSignal));
+    await act(async () => pending.resolve(page(previousSetId, "Obsolete")));
     expect(screen.queryByRole("button", { name: "Obsolete" })).not.toBeInTheDocument();
   });
   it("deduplicates concurrent snapshot reads and aborts the abandoned request on unmount", async () => {
@@ -96,6 +98,145 @@ describe("exact selected snapshot inspection", () => {
     view.unmount();
     expect(signal?.aborted).toBe(true);
   });
+  it("preserves an admitted creator-options read while paging the same selected snapshot", async () => {
+    const options = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>(), next = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportFacet).mockReturnValueOnce(options.promise);
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await screen.findByRole("button", { name: "Researcher" });
+    const signal = vi.mocked(api.readReportFacet).mock.lastCall?.[3]?.signal;
+    vi.mocked(api.readReportPage).mockReturnValueOnce(next.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+    expect(signal?.aborted).toBe(false);
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    await act(async () => options.resolve({ value: [{ value: "Your org", count: 10 }], counts: { total: 1, filtered: 1 },
+      page: { limit: 50, nextCursor: null, previousCursor: null }, selection: page().selection }));
+    await screen.findByRole("option", { name: "Your org (10)" });
+    await act(async () => next.resolve(page()));
+    await screen.findByRole("button", { name: "Researcher" });
+    expect(api.readReportFacet).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it.each(["building", "ready"] as const)("preserves facet paging and a %s export across same-selection agent pagination", async status => {
+    vi.useFakeTimers();
+    vi.mocked(api.readReportFacet).mockImplementation(async (_path, _id, _field, options) => ({
+      value: [{ value: options?.cursor ? "Tail creator" : "First creator", count: 10 }], counts: { total: 100, filtered: 100 },
+      page: { limit: 50, nextCursor: options?.cursor ? null : "creator-next", previousCursor: options?.cursor ? "creator-previous" : null },
+      selection: page().selection,
+    }));
+    vi.mocked(api.createReportExport).mockResolvedValue({ id: "snapshot-export" });
+    vi.mocked(api.reportExportStatus).mockResolvedValue({ id: "snapshot-export", status, rows: 10, bytes: 100,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null });
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Next creator type options" }));
+      fireEvent.click(screen.getByRole("button", { name: "Export agent CSV" }));
+      await vi.advanceTimersByTimeAsync(2001);
+    });
+    const signal = vi.mocked(api.createReportExport).mock.lastCall?.[1], next = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(next.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByRole("option", { name: "Tail creator (10)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel export" })).toBeEnabled();
+    if (status === "ready") expect(screen.getByRole("link", { name: "Download CSV" })).toBeVisible();
+    await act(async () => { next.resolve(page()); await vi.advanceTimersByTimeAsync(1); });
+    expect(api.readReportFacet).toHaveBeenCalledTimes(2);
+    expect(api.createReportExport).toHaveBeenCalledOnce();
+    expect(screen.getByRole("option", { name: "Tail creator (10)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous creator type options" })).toBeEnabled();
+  });
+  it.each(["facet", "export"] as const)("retires a pending page when its preserved %s rejects the selection, without automatic replay", async child => {
+    const options = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>(), admission = deferred<{ id: string }>();
+    const next = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportFacet).mockReturnValueOnce(options.promise);
+    vi.mocked(api.createReportExport).mockReturnValueOnce(admission.promise);
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await screen.findByRole("button", { name: "Researcher" });
+    fireEvent.click(screen.getByRole("button", { name: "Export agent CSV" }));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(next.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    await act(async () => (child === "facet" ? options : admission).reject(
+      new ApiError(409, "selection_invalidated", "Snapshot selection retired")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This selection changed or expired");
+    expect(signal?.aborted).toBe(true);
+    expect(screen.getByRole("region", { name: "Reported agent activity" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
+    await act(async () => next.resolve(page()));
+    fireEvent.focus(window);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await screen.findByRole("button", { name: "Researcher" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toMatchObject({ setId: reportSetId });
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
+    expect(api.createReportExport).toHaveBeenCalledOnce();
+  });
+  it.each(["revision", "report", "account", "roles", "session", "search", "dates", "failure", "invalidation", "expiry"] as const)(
+    "retires preserved snapshot work on a %s boundary during pagination, ignoring late responses", async boundary => {
+      vi.useFakeTimers();
+      const initial = page(), next = deferred<ReportPage<ReportAgent>>(), replacement = deferred<ReportPage<ReportAgent>>();
+      if (boundary === "expiry") initial.selection = { ...initial.selection, expiresAt: new Date(Date.now() + 1000).toISOString() };
+      const options = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>(), exact = deferred<Awaited<ReturnType<typeof api.readReportDetail>>>();
+      const admission = deferred<{ id: string }>();
+      vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(next.promise).mockReturnValue(replacement.promise);
+      vi.mocked(api.readReportFacet).mockReturnValueOnce(options.promise);
+      vi.mocked(api.readReportDetail).mockReturnValueOnce(exact.promise);
+      vi.mocked(api.createReportExport).mockReturnValueOnce(admission.promise);
+      const capability: ReturnType<typeof useCapabilityContext> = {
+        user: { tenantId: "tenant", homeAccountId: "first", username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"] },
+        now: Date.now(), views: [], loading: false, pending: false, error: undefined, reload: vi.fn(async () => {}), openPermissions: vi.fn(),
+      };
+      const panel = (changed = false) => <SavedQueryProvider><CapabilityContext key={changed && boundary === "session" ? 1 : 0}
+        value={{ ...capability, user: { ...capability.user!, homeAccountId: changed && boundary === "account" ? "second" : "first",
+          roles: changed && boundary === "roles" ? ["AgentControl.Admin"] : capability.user!.roles } }}>
+        <OfficialUsageSnapshot {...props} revision={changed && boundary === "revision" ? 1 : 0}
+          setId={changed && boundary === "report" ? "a0000000-0000-4000-8000-000000000009" : reportSetId} />
+      </CapabilityContext></SavedQueryProvider>;
+      const view = render(panel());
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      fireEvent.click(screen.getByRole("button", { name: "Researcher" }));
+      fireEvent.click(screen.getByRole("button", { name: "Export agent CSV" }));
+      fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+      const pageSignal = vi.mocked(api.readReportPage).mock.lastCall?.[2], facetSignal = vi.mocked(api.readReportFacet).mock.lastCall?.[3]?.signal;
+      const detailSignal = vi.mocked(api.readReportDetail).mock.lastCall?.[2], exportSignal = vi.mocked(api.createReportExport).mock.lastCall?.[1];
+      expect(facetSignal?.aborted).toBe(false);
+      expect(detailSignal?.aborted).toBe(false);
+      expect(exportSignal?.aborted).toBe(false);
+      await act(async () => {
+        if (boundary === "search") fireEvent.change(screen.getByLabelText("Search agents"), { target: { value: "Changed filter" } });
+        else if (boundary === "dates") fireEvent.change(screen.getByLabelText("Activity start date"), { target: { value: "2026-01-01" } });
+        else if (boundary === "failure" || boundary === "invalidation") next.reject(new ApiError(boundary === "failure" ? 403 : 409,
+          boundary === "failure" ? "forbidden" : "selection_invalidated", "Snapshot no longer available"));
+        else if (boundary === "expiry") await vi.advanceTimersByTimeAsync(1000);
+        else view.rerender(panel(true));
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      if (boundary !== "failure" && boundary !== "invalidation") expect(pageSignal?.aborted).toBe(true);
+      expect(facetSignal?.aborted).toBe(true);
+      expect(detailSignal?.aborted).toBe(true);
+      expect(exportSignal?.aborted).toBe(true);
+      expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Cancel export" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
+      await act(async () => {
+        next.resolve(initial);
+        options.resolve({ value: [{ value: "Obsolete creator", count: 10 }], counts: { total: 1, filtered: 1 },
+          page: { limit: 50, nextCursor: null, previousCursor: null }, selection: initial.selection });
+        exact.resolve({ value: reportAgent(1), reports, sources: initial.sources, selection: initial.selection });
+        admission.resolve({ id: "obsolete-export" });
+        await vi.advanceTimersByTimeAsync(2001);
+      });
+      expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("option", { name: /Obsolete creator/ })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
+      expect(api.reportExportStatus).not.toHaveBeenCalled();
+      expect(api.createReportExport).toHaveBeenCalledOnce();
+    },
+  );
   it("never substitutes the current set after an exact retained-set read fails", async () => {
     vi.mocked(api.readReportPage).mockRejectedValue(new ApiError(404, "report_set_unavailable", "Retained set unavailable"));
     render(<OfficialUsageSnapshot {...props} setId="retained" />);
@@ -104,6 +245,24 @@ describe("exact selected snapshot inspection", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.readReportPage).mock.calls.every(call => call[1]?.setId === "retained")).toBe(true);
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+  });
+  it("does not let focus bypass explicit restart after its bounded snapshot recovery fails", async () => {
+    vi.mocked(api.readReportPage).mockRejectedValue(new ApiError(409, "selection_invalidated", "Retained snapshot expired"));
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await screen.findByRole("button", { name: "Restart selection" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    fireEvent.focus(window);
+    await act(async () => {});
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("region", { name: "Reported agent activity" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
+    expect(api.readReportFacet).not.toHaveBeenCalled();
+    vi.mocked(api.readReportPage).mockResolvedValue(page());
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await screen.findByRole("button", { name: "Researcher" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toMatchObject({ setId: reportSetId });
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
   });
   it("preserves explicitly retained immutable tenant totals on a filter transport failure but never stale rows or export", async () => {
     render(<OfficialUsageSnapshot {...props} setId="retained" />);
@@ -115,6 +274,58 @@ describe("exact selected snapshot inspection", () => {
     expect(screen.getByText(/previously read snapshot totals/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
+  });
+  it.each([
+    { phase: "pending", clock: "timer" }, { phase: "failed", clock: "timer" }, { phase: "pending", clock: "focus" },
+  ] as const)("expires retained totals on $clock while the replacement filter read is $phase without replaying it", async ({ phase, clock }) => {
+    vi.useFakeTimers();
+    const initial = page(), replacement = deferred<ReportPage<ReportAgent>>();
+    initial.selection = { ...initial.selection, expiresAt: new Date(Date.now() + 1000).toISOString() };
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
+    render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    fireEvent.change(screen.getByLabelText("Search agents"), { target: { value: "Changed filter" } });
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    if (phase === "failed") await act(async () => {
+      replacement.reject(new ApiError(0, "network_error", "Filter read unavailable"));
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
+    await act(async () => {
+      if (clock === "timer") await vi.advanceTimersByTimeAsync(1000);
+      else { vi.setSystemTime(Date.now() + 1000); fireEvent.focus(window); }
+    });
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/previously read snapshot totals/)).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    if (phase === "pending") {
+      expect(signal?.aborted).toBe(false);
+      expect(screen.getByText("Loading saved data...")).toBeVisible();
+      await act(async () => { replacement.resolve(page()); await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Researcher" })).toBeVisible();
+    } else expect(screen.getByRole("alert")).toHaveTextContent("Filter read unavailable");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it.each(["report", "window"] as const)("does not revive totals after an abandoned %s A-B-A transition", async boundary => {
+    const abandoned = deferred<ReportPage<ReportAgent>>(), replacement = deferred<ReportPage<ReportAgent>>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page()).mockReturnValueOnce(abandoned.promise).mockReturnValueOnce(replacement.promise);
+    const view = render(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    await screen.findByRole("button", { name: "Researcher" });
+    view.rerender(<OfficialUsageSnapshot {...props}
+      setId={boundary === "report" ? "10000000-0000-4000-8000-000000000009" : reportSetId}
+      activityWindowDays={boundary === "window" ? 7 : props.activityWindowDays} />);
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    const obsoleteSignal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    view.rerender(<OfficialUsageSnapshot {...props} setId={reportSetId} />);
+    expect(obsoleteSignal?.aborted).toBe(true);
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    await act(async () => abandoned.resolve(page()));
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    await act(async () => replacement.resolve(page()));
+    expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
   });
   it("does not use retained totals or replay a read after a fenced serialization conflict", async () => {
     const view = render(<OfficialUsageSnapshot {...props} setId="retained" />);

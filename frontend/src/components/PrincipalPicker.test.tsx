@@ -36,6 +36,10 @@ describe("explicit directory searches", () => {
     else unmount();
     expect(signal?.aborted).toBe(true);
     expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
+    if (mode === "disabled") {
+      expect(screen.getByRole("status")).toHaveTextContent("Directory search is paused until editing resumes.");
+      expect(screen.getByRole("group", { name: "Directory results" })).toHaveAttribute("aria-busy", "false");
+    }
   });
 
   it("surfaces provider failures without automatic retries", async () => {
@@ -43,7 +47,97 @@ describe("explicit directory searches", () => {
     render(<PrincipalPicker selected={[]} onChange={vi.fn()} />);
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Ada" } });
     expect(await screen.findByText("Directory access unavailable")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Directory access unavailable");
+    expect(screen.getByText("Change the search, or clear and re-enter it to try again.")).toBeVisible();
     expect(search).toHaveBeenCalledOnce();
+  });
+
+  it("validates the trimmed query limit locally, cancels old work, and recovers without a doomed request", async () => {
+    vi.useFakeTimers();
+    let completeOld!: (value: { value: api.DirectoryPrincipal[] }) => void;
+    const search = vi.spyOn(api, "searchDirectoryPrincipals")
+      .mockReturnValueOnce(new Promise(resolve => { completeOld = resolve; }))
+      .mockResolvedValue({ value: [] });
+    render(<PrincipalPicker selected={[]} onChange={vi.fn()} />);
+    const input = screen.getByRole("searchbox");
+    fireEvent.change(input, { target: { value: ` ${"a".repeat(120)} ` } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledExactlyOnceWith("a".repeat(120), 40, { signal: expect.any(AbortSignal) });
+
+    fireEvent.change(input, { target: { value: ` ${"a".repeat(121)} ` } });
+    expect(search.mock.calls[0][2]?.signal?.aborted).toBe(true);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent("Directory searches cannot exceed 120 characters.");
+    expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No matching unselected principals/)).not.toBeInTheDocument();
+    await act(async () => {
+      completeOld({ value: [{
+        resourceId: "old-user", resourceType: "user", principalKind: "user", displayName: "Old result",
+      }] });
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(search).toHaveBeenCalledOnce();
+    expect(screen.queryByText("Old result")).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "Ada" } });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(input).not.toHaveAttribute("aria-invalid", "true");
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
+  });
+
+  it.each(["success", "failure"] as const)("retains a completed %s through disabling and equivalent queries", async outcome => {
+    vi.useFakeTimers();
+    const principal: api.DirectoryPrincipal = {
+      resourceId: "current-user", resourceType: "user", principalKind: "user", displayName: "Current result",
+    };
+    const search = vi.spyOn(api, "searchDirectoryPrincipals");
+    if (outcome === "success") search.mockResolvedValue({ value: [principal] });
+    else search.mockRejectedValue(new Error("Directory access unavailable"));
+    const onChange = vi.fn();
+    const { rerender } = render(<PrincipalPicker selected={[]} onChange={onChange} />);
+    const input = screen.getByRole("searchbox");
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledOnce();
+
+    rerender(<PrincipalPicker selected={[]} onChange={onChange} disabled />);
+    rerender(<PrincipalPicker selected={[]} onChange={onChange} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledOnce();
+    fireEvent.change(input, { target: { value: " Ada " } });
+    expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledOnce();
+    expect(screen.getByText(outcome === "success" ? "Current result" : "Directory access unavailable")).toBeVisible();
+
+    fireEvent.change(input, { target: { value: "" } });
+    expect(screen.queryByText("Current result")).not.toBeInTheDocument();
+    expect(screen.queryByText("Directory access unavailable")).not.toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cancel or restart a pending search for equivalent trimmed input", async () => {
+    vi.useFakeTimers();
+    let complete!: (value: { value: api.DirectoryPrincipal[] }) => void;
+    const search = vi.spyOn(api, "searchDirectoryPrincipals")
+      .mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    render(<PrincipalPicker selected={[]} onChange={vi.fn()} />);
+    const input = screen.getByRole("searchbox");
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    const signal = search.mock.calls[0][2]?.signal;
+
+    fireEvent.change(input, { target: { value: "Ada " } });
+    expect(signal?.aborted).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledOnce();
+    await act(async () => complete({ value: [] }));
+    expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
+    expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
   });
 
   it("does not admit a disabled debounce and searches once after Strict Mode re-enablement", async () => {
@@ -58,7 +152,7 @@ describe("explicit directory searches", () => {
     rerender(<PrincipalPicker selected={[]} onChange={onChange} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(300); });
     expect(search).toHaveBeenCalledExactlyOnceWith("Ada", 40, { signal: expect.any(AbortSignal) });
-    expect(screen.getByText("No matching unselected principals.")).toBeVisible();
+    expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -108,5 +202,65 @@ describe("explicit directory searches", () => {
     fireEvent.click(screen.getByRole("button", { name: /Team result/ }));
     expect(onChange).toHaveBeenCalledExactlyOnceWith([selected, team]);
     expect(search).toHaveBeenCalledOnce();
+  });
+
+  it("explains bounded local filtering and preserves results through selection changes without another request", async () => {
+    vi.useFakeTimers();
+    const principals: api.DirectoryPrincipal[] = Array.from({ length: 40 }, (_, index) => ({
+      resourceId: `user-${index}`, resourceType: "user", principalKind: "user", displayName: `User ${index}`,
+    }));
+    const search = vi.spyOn(api, "searchDirectoryPrincipals").mockResolvedValue({ value: principals });
+    const onChange = vi.fn();
+    const { rerender } = render(<PrincipalPicker selected={[]} onChange={onChange} />);
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "User" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    const results = screen.getByRole("group", { name: "Directory results" });
+    expect(results).toHaveTextContent("Search returns up to 40 users and groups.");
+    expect(results).toHaveTextContent("Type filters apply only to these results; refine your search if a principal is missing.");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "security" } });
+    expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "users" } });
+    fireEvent.click(screen.getByRole("button", { name: /^User 0/ }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith([principals[0]]);
+    rerender(<PrincipalPicker selected={[principals[0]]} onChange={onChange} />);
+    expect(screen.queryByRole("button", { name: /^User 0/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove User 0" }));
+    expect(onChange).toHaveBeenLastCalledWith([]);
+    rerender(<PrincipalPicker selected={[]} onChange={onChange} />);
+    expect(screen.getByRole("button", { name: /^User 0/ })).toBeEnabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledOnce();
+  });
+
+  it.each(["success", "failure"] as const)("ignores a superseded %s after the replacement query settles", async outcome => {
+    vi.useFakeTimers();
+    let completeOld!: (value: { value: api.DirectoryPrincipal[] }) => void;
+    let rejectOld!: (failure: Error) => void;
+    const current: api.DirectoryPrincipal = {
+      resourceId: "current-user", resourceType: "user", principalKind: "user", displayName: "Current result",
+    };
+    const search = vi.spyOn(api, "searchDirectoryPrincipals")
+      .mockReturnValueOnce(new Promise((resolve, reject) => { completeOld = resolve; rejectOld = reject; }))
+      .mockResolvedValue({ value: [current] });
+    const onChange = vi.fn();
+    render(<PrincipalPicker selected={[]} onChange={onChange} />);
+    const input = screen.getByRole("searchbox");
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fireEvent.change(input, { target: { value: "Grace" } });
+    expect(search.mock.calls[0][2]?.signal?.aborted).toBe(true);
+    expect(screen.getByRole("group", { name: "Directory results" })).toHaveAttribute("aria-busy", "true");
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      if (outcome === "success") completeOld({ value: [{ ...current, displayName: "Obsolete result" }] });
+      else rejectOld(new Error("Obsolete failure"));
+    });
+    expect(screen.queryByText("Obsolete result")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Directory results" })).toHaveAttribute("aria-busy", "false");
+    fireEvent.click(screen.getByRole("button", { name: /Current result/ }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith([current]);
   });
 });

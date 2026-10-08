@@ -407,7 +407,7 @@ test("a deleted accepted report remains unavailable on read retry without anothe
   await expect(modal(page).getByRole("button", { name: "OK" })).toHaveCount(0);
   exactVerification(state); expect(state.uploadBodies).toHaveLength(3); expect(state.acceptRequests).toHaveLength(1);
   expect(state.confirmations).toEqual([]); expect(state.discardedStages).toEqual([]);
-  await modal(page).getByRole("button", { name: "Cancel import" }).click(); await expect(page).toHaveURL(/\/sync$/);
+  await modal(page).getByRole("button", { name: "Close saved import" }).click(); await expect(page).toHaveURL(/\/sync$/);
 });
 
 test("a lost acceptance response retries the identical reviewed operation without uploading or publishing twice", async ({ page }) => {

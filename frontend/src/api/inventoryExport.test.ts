@@ -96,9 +96,12 @@ describe("inventory saved-read authorization boundaries", () => {
   it.each([
     { status: 401, code: "unauthorized", revokeSession: true },
     { status: 403, code: "missing_internal_role", revokeSession: true },
+    { status: 403, code: "invalid_csrf", revokeSession: true },
     { status: 403, code: "forbidden", revokeSession: false },
     { status: 401, code: "interaction_required", revokeSession: false },
     { status: 401, code: "authorization_expired", revokeSession: false },
+    { status: 409, code: "selection_invalidated", revokeSession: false },
+    { status: 409, code: "export_selection_changed", revokeSession: false },
   ])("fences all admitted siblings only for session-wide $code denials", async ({ status, code, revokeSession }) => {
     const client = createSavedQueryClient();
     const retainedKey = ["saved", "previously-authorized"] as const;

@@ -120,6 +120,10 @@
   min-width: 0;
 }
 
+.agent-workspace .error-banner {
+  overflow-wrap: anywhere;
+}
+
 .agent-workspace .agent-catalog-heading,
 .copilot-users-header {
   min-height: 50px;
@@ -419,6 +423,7 @@
 
 .agent-grid-tools {
   display: flex;
+  flex-wrap: wrap;
   align-items: start;
   justify-content: flex-end;
   gap: 8px;
@@ -426,7 +431,7 @@
 }
 
 .agent-grid-tools > .catalog-controls {
-  flex: 1;
+  flex: 1 1 600px;
   min-width: 0;
 }
 
@@ -442,11 +447,15 @@
   gap: 8px;
 }
 
-.inventory-facet { display: grid; gap: 4px; min-width: 0; }
+.inventory-facet { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
 .inventory-facet label { margin: 0; min-width: 0; }
 .inventory-facet input, .inventory-facet select { width: 100%; min-width: 0; }
 .inventory-facet small { color: var(--muted); font-size: 11px; }
 .inventory-facet-compact { grid-template-columns: minmax(0, 1fr); }
+
+.agent-workspace select:disabled {
+  cursor: not-allowed;
+}
 
 .agent-query-bar input,
 .agent-query-bar select,

@@ -93,6 +93,7 @@
 .copilot-users-provenance p { margin-top: 8px; }
 .copilot-users-provenance,
 .copilot-users-notice,
+.copilot-users .error-banner,
 .copilot-user-dialog { overflow-wrap: anywhere; }
 
 .copilot-user-dialog {
@@ -164,7 +165,8 @@
   max-height: none;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 0;
 }
 .user-detail-modal > header { flex: 0 0 auto; flex-wrap: nowrap; margin: 0; }
@@ -175,7 +177,7 @@
 .user-detail-modal > header .copilot-user-badge { margin-top: 6px; }
 .user-detail-modal > .detail-tabs { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0 24px; background: #fff; }
 .user-detail-modal .detail-tabs [role="tab"] { min-height: 48px; padding: 10px 14px; }
-.user-detail-modal > .user-detail-panel { display: grid; grid-template-columns: minmax(0, 1fr); flex: 1 1 auto; min-height: 0; min-width: 0; overflow-y: auto; align-content: start; gap: 20px; margin: 0; padding: 24px; }
+.user-detail-modal > .user-detail-panel { display: grid; grid-template-columns: minmax(0, 1fr); flex: 1 1 auto; min-height: min(10rem, 50svh); min-width: 0; overflow-y: auto; align-content: start; gap: 20px; margin: 0; padding: 24px; }
 .user-detail-modal > .user-detail-panel[hidden] { display: none; }
 .user-detail-card { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; min-width: 0; align-content: start; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
 .user-detail-panel .reported-user-agents { min-width: 0; }
@@ -191,7 +193,7 @@
   .copilot-user-dialog.user-detail-modal { width: calc(100vw - 16px); height: calc(100svh - 16px); }
   .user-detail-modal > header, .user-detail-modal > .user-detail-panel { padding: 18px; }
   .user-detail-modal > .detail-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0 18px; }
-  .user-detail-modal .detail-tabs [role="tab"] { min-height: 44px; height: 44px; padding: 4px; font-size: .82rem; }
+  .user-detail-modal .detail-tabs [role="tab"] { min-height: 44px; padding: 4px; font-size: .82rem; }
   .user-detail-modal .detail-tabs [role="tab"]:last-child { grid-column: 1 / -1; }
   .user-detail-card { padding: 16px; }
   .user-profile-grid { grid-template-columns: minmax(0, 1fr); }

@@ -33,10 +33,10 @@ async function mockReportSelection(page: Page) {
     { ...unifiedAgents,
       usageContext: { revision: String(revision).repeat(64), reports: metadata(), expiresAt: selectedFixtureReports.expiresAt } }));
   await page.route("**/api/official-usage/history?*", route => route.fulfill({
-    json: { ...selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected), reports: metadata() },
+    json: { ...selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected, selectedFixtureQuery(route.request().url())), reports: metadata() },
   }));
   await page.route("**/api/official-usage/history/options?*", route => {
-    const { value, page, counts, selection } = selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected);
+    const { value, page, counts, selection } = selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected, selectedFixtureQuery(route.request().url()));
     return route.fulfill({ json: { value, page, counts, selection, reports: metadata() } });
   });
   await page.route("**/api/official-usage/overview?*", route => {

@@ -9,23 +9,25 @@ import { agentUsageHistoryFixture } from "../src/test/automaticAgentUsageFixture
 
 export async function mockSelectedInventoryUsage(page: Page, inventory: () => UnifiedAgentInventoryPage,
   relationships: () => ReportRelationship[], callbacks: { users?: (query: URLSearchParams) => void; candidates?: () => void } = {}) {
-  function context(id = selectionId): CandidateAgentUsageContext {
+  function context(id = selectionId, revision = inventory().selection.revision): CandidateAgentUsageContext {
     const data = inventory(), reports = data.usageContext!.reports;
-    if (!data.selection.revision) throw new Error("Selected inventory fixture requires its captured revision");
-    return { selectionId: id, reportSetId: reports.setId, reports, usageRevision: data.usageContext!.revision, inventoryRevision: data.selection.revision };
+    if (!revision) throw new Error("Selected inventory fixture requires its captured revision");
+    return { selectionId: id, reportSetId: reports.setId, reports, usageRevision: id, inventoryRevision: revision };
   }
   await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage(?:-associations|-candidates|-users|-history)?$/.test(url.pathname), route => {
     expect(route.request().method()).toBe("GET");
     const url = new URL(route.request().url()), recordId = decodeURIComponent(url.pathname.split("/")[3]);
     const record = inventory().value.find(value => value.id === recordId);
     expect(record, "Exact inventory evidence must exist").toBeDefined();
-    const selected = context(inventoryFixtureSelection(route).id), usage = selected.reportSetId ? record!.usage
+    const selection = inventoryFixtureSelection(route);
+    const selected = context(selection.id, selection.revision), usage = selected.reportSetId ? record!.usage
       : { reportSetId: null, status: "unavailable" as const, responses: null, activeUsers: null, lastActivityDateUtc: null, associationCount: 0 };
     expect(url.searchParams.get("inventorySelectionId")).toBe(selected.selectionId);
+    if (url.searchParams.has("selectionId")) expect(url.searchParams.get("selectionId")).toBe(selected.selectionId);
     if (usage?.reportSetId !== selected.reportSetId) {
       return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "The selected report changed. Restart usage selection." } });
     }
-    const pageInfo = { limit: 50, nextCursor: null, previousCursor: null };
+    const pageInfo = { limit: Number(url.searchParams.get("limit") ?? 50), nextCursor: null, previousCursor: null };
     if (url.pathname.endsWith("/usage-history")) {
       const period = selected.reports.reportingPeriod;
       return route.fulfill({ json: agentUsageHistoryFixture(selected, recordId, selected.reportSetId ? [{
@@ -33,7 +35,7 @@ export async function mockSelectedInventoryUsage(page: Page, inventory: () => Un
         periodProvenance: period?.provenance ?? "activity_range", acceptedAt: selected.reports.acceptedAt!,
         status: usage.status === "linked" ? "linked" : "unlinked", responses: usage.responses,
         lastActivityDateUtc: usage.lastActivityDateUtc, associationCount: usage.associationCount,
-      }] : []) });
+      }] : [], { limit: Number(url.searchParams.get("limit") ?? 50), cursor: url.searchParams.get("cursor") ?? undefined }) });
     }
     if (url.pathname.endsWith("/usage")) {
       const body: CandidateAgentUsageSummary = { recordId, status: usage.status, responses: usage.responses,
@@ -43,7 +45,7 @@ export async function mockSelectedInventoryUsage(page: Page, inventory: () => Un
     }
     if (url.pathname.endsWith("/usage-candidates")) {
       callbacks.candidates?.();
-      const body: CandidateAgentUsageCandidates = { value: [], context: selected, selection: reportPage([]).selection,
+      const body: CandidateAgentUsageCandidates = { value: [], context: selected, selection,
         page: pageInfo, counts: { total: 0, filtered: 0 } };
       return route.fulfill({ json: body });
     }
@@ -56,7 +58,7 @@ export async function mockSelectedInventoryUsage(page: Page, inventory: () => Un
         user.responses += row.responses; users.set(row.username, user);
       }
       const rows = [...users.values()], search = url.searchParams.get("search")?.toLowerCase();
-      const base = reportPage(rows, { reports: selected.reports, selection: { ...reportPage([]).selection, id: selected.selectionId },
+      const base = reportPage(rows, { reports: selected.reports, selection,
         counts: { total: rows.length, filtered: rows.length } });
       return route.fulfill({ json: { ...selectedFixtureWindow(url.href, rows.filter(row => !search || row.username.toLowerCase().includes(search)), base), context: selected } });
     }

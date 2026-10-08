@@ -5,9 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readReportDetail, readReportPage } from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { combinedUser, reportPage, reports, reportUser, selectionId } from "../test/reportDataFixture";
+import { mockNativeDialogs } from "../test/dialog";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { UserDetailModal } from "./UserDetailModal";
 import { UserPurviewAudit } from "./UserPurviewAudit";
+
+mockNativeDialogs();
 
 vi.mock("../api/reportData", async original => ({
   ...await original<typeof import("../api/reportData")>(), readReportPage: vi.fn(), readReportDetail: vi.fn(),
@@ -36,13 +39,11 @@ beforeEach(() => {
     state: "enabled", assignedDateTime: null, capabilityStatus: "Enabled",
   }]) : path.endsWith("/agents") ? reportPage([]) : reportPage([user]));
   vi.mocked(readReportDetail).mockResolvedValue({ value: user, reports, sources: reportPage([]).sources, selection: reportPage([]).selection });
-  HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
-  HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
 });
 afterEach(() => vi.resetAllMocks());
 
 describe("user audit entry point", () => {
-  it("uses consistent lazy tabs, keyboard navigation and retained user-agent filters", async () => {
+  it("retains lazy tabs and user-agent filters within a selection, but retires them on a data revision", async () => {
     const view = render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const element = await screen.findByRole("dialog", { name: "Ada" });
@@ -62,9 +63,6 @@ describe("user audit entry point", () => {
     expect(await dialog.findByRole("list", { name: "Paid feature states" })).toBeVisible();
     await userEvent.click(dialog.getByRole("tab", { name: "Usage & agents" }));
     expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
-    view.rerender(<CapabilityContext value={capability}><CopilotUsersView dataRevision={1} /></CapabilityContext>);
-    expect(dialog.getByRole("tab", { name: "Usage & agents" })).toHaveAttribute("aria-selected", "true");
-    expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
     dialog.getByRole("tab", { name: "Usage & agents" }).focus();
     await userEvent.keyboard("{End}");
     expect(dialog.getByRole("tab", { name: "Purview audit" })).toHaveFocus();
@@ -73,6 +71,19 @@ describe("user audit entry point", () => {
     await userEvent.keyboard("{Home}");
     expect(overview).toHaveFocus();
     expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+
+    const detailReads = vi.mocked(readReportDetail).mock.calls.length;
+    view.rerender(<CapabilityContext value={capability}><CopilotUsersView dataRevision={1} /></CapabilityContext>);
+    expect(element).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+    expect(readReportDetail).toHaveBeenCalledTimes(detailReads);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const replacement = within(await screen.findByRole("dialog", { name: "Ada" }));
+    expect(replacement.getByRole("tabpanel")).toHaveAccessibleName("Overview");
+    await userEvent.click(replacement.getByRole("tab", { name: "Usage & agents" }));
+    expect(await replacement.findByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("");
+    await userEvent.click(replacement.getByRole("tab", { name: "Purview audit" }));
+    expect(replacement.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
   });
 
   it("starts in the paid-user details modal and passes its verified directory identity", async () => {

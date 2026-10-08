@@ -12,6 +12,7 @@ import {
   getAgentDetails,
   powerPlatformResourceTypes,
   type BulkActionJob,
+  type AuditEvent,
   type AutomaticRefreshResult,
   type CopilotPackage,
   type InventoryRefreshJob,
@@ -23,11 +24,13 @@ import {
   type SessionUser,
   type UnifiedAgentInventoryPage,
   type UnifiedAgentRecord,
+  type WorkbenchJobSummary,
 } from "./api/client";
 import { restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 import * as savedQueries from "./savedQueries";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 import { mockNativeDialogs } from "./test/dialog";
+import { reportBundle, reportStage } from "./test/reportImportFixture";
 import { selectedAgentsPage, selectedFixtureRead, selectedHistoryPage, selectedReportUsersPage, selectedUsersPage } from "./test/selectedUsageFixture";
 import type { ReportHistorySet, ReportPage } from "../../backend/src/types/officialReportData";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "./test/inventoryVerification";
@@ -92,9 +95,9 @@ const inventoryFacets = {
   type: [{ value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" }],
 };
 const createUnifiedPage = (): UnifiedAgentInventoryPage => ({
-  ...inventoryPageMetadata({ total: 1, scoped: 1, filtered: 1, packageTargets: 1 }, new Date(Date.now() + 600_000).toISOString()),
+  ...inventoryPageMetadata({ total: 1, scoped: 1, filtered: 1, packageTargets: 1 }, new Date(Date.now() + 600_000).toISOString(),
+    { id: unifiedRevision, revision: unifiedRevision, evaluatedAt: new Date().toISOString() }),
   inventoryScope: "catalog",
-  selection: { id: unifiedRevision, revision: unifiedRevision, evaluatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString() },
   page: { limit: 50, nextCursor: null, previousCursor: null },
   verification: createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 }, { sourceScopes: false }),
   value: [{
@@ -331,7 +334,73 @@ describe("App session revalidation", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([false, true])("requires unambiguous workbench metadata before automatic refresh (duplicate: %s)", async duplicate => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const action = workbenchActions.find(candidate => candidate.id === "data-sync.auto-refresh")!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
+      ? Promise.resolve(Response.json({ views: workbenchViews, actions: duplicate
+        ? [...workbenchActions, { ...action, roles: ["AgentControl.Admin"] }]
+        : workbenchActions }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await act(async () => {});
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(duplicate ? 0 : 1);
+  });
+
+  it("does not claim workbench action metadata is still loading after a failed read", async () => {
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
+      ? Promise.resolve(Response.json({ code: "metadata_unavailable", detail: "Workbench metadata could not be loaded." }, { status: 503 }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(/Workbench metadata could not be loaded/)).toBeVisible();
+    const button = await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAccessibleDescription(/Action metadata is unavailable/);
+    expect(button).not.toHaveAccessibleDescription(/finishes loading/);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/workbench/metadata")).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(0);
+  });
+
+  it.each(["same", "replacement"] as const)("retires pending workbench metadata before accepting the %s account session", async account => {
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles,
+      revalidatedUser: account === "same" ? viewer : { ...viewer, homeAccountId: "replacement-account" } });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let metadataReads = 0;
+    let retiredSignal: AbortSignal | null | undefined;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input !== "/api/workbench/metadata") return base(input, init);
+      if (++metadataReads === 1) {
+        retiredSignal = init?.signal;
+        return pending.promise;
+      }
+      return Promise.resolve(Response.json({ views: workbenchViews, actions: [] }));
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` })).toBeDisabled();
+    await revalidateTransportSession(transport);
+    await waitFor(() => expect(metadataReads).toBe(2));
+    expect(retiredSignal?.aborted).toBe(true);
+    const button = await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` });
+    expect(button).toHaveAccessibleDescription(/not defined by the current signed-in workbench metadata/);
+    await act(async () => pending.resolve(Response.json({ views: workbenchViews, actions: workbenchActions })));
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(button).toBeDisabled();
+    expect(button).toHaveAccessibleDescription(/not defined by the current signed-in workbench metadata/);
+    expect(metadataReads).toBe(2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(0);
+  });
+
   it("reuses recent Users, Agents, report summaries and selector reads across navigation", async () => {
+    unifiedPage.usageContext.reports = selectedAgentsPage().reports;
     const roles: SessionUser["roles"] = ["AgentControl.Admin"];
     const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -361,6 +430,178 @@ describe("App session revalidation", () => {
     expect(reads()).toBe(before);
   });
 
+  it("preserves licensed-user search and report filters across navigation without recapturing evidence", async () => {
+    const reportId = selectedUsersPage().reports.setId!;
+    window.history.replaceState({}, "", `/users?snapshot=${reportId}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Ada" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search users or agents" }), { target: { value: "Ada" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled());
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/copilot-usage/users").length;
+    const before = reads();
+    const search = new URLSearchParams(window.location.search);
+    expect(search.get("q")).toBe("Ada");
+    expect(search.get("snapshot")).toBe(reportId);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    expect(await screen.findByRole("searchbox", { name: "Search users or agents" })).toHaveValue("Ada");
+    await screen.findByRole("button", { name: "Ada" });
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(reportId);
+    expect(reads()).toBe(before);
+  });
+
+  it.each(["licenses", "activity"] as const)("canonicalizes legacy %s numeric pages without restarting cursor-owned Users reads", async view => {
+    window.history.replaceState({}, "", `/users?view=${view}&q=Ada&page=3`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const label = view === "licenses" ? "Search users or agents" : "Search reported users or agents";
+    expect(await screen.findByRole("searchbox", { name: label })).toHaveValue("Ada");
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === (view === "licenses" ? "/api/copilot-usage/users" : "/api/official-usage/users")).length;
+    expect(reads()).toBe(1);
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    act(() => {
+      window.history.pushState({}, "", `/users?view=${view}&page=4&q=Ada`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(async () => {});
+    expect(screen.getByRole("searchbox", { name: label })).toHaveValue("Ada");
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(reads()).toBe(1);
+  });
+
+  it("invalidates saved views once for a verified CSV import, not again when acknowledging it", async () => {
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    const original = transport.fetchMock.getMockImplementation()!;
+    const stages: ReturnType<typeof reportStage>[] = [];
+    let reviewed: ReturnType<typeof reportBundle> | undefined;
+    const reports = selectedAgentsPage().reports;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/official-usage/staging" && init?.method === "POST") {
+        if (!(init.body instanceof FormData)) throw new Error("Expected a streamed upload");
+        const file = init.body.get("file");
+        if (!(file instanceof File)) throw new Error("Expected a CSV file");
+        const kind = file.name === "agents.csv" ? "agents" : file.name === "user-agents.csv" ? "userAgents" : "users";
+        const stage = reportStage(kind, url.searchParams.get("bundleId")!);
+        stages.push(stage);
+        return Response.json(stage);
+      }
+      if (/^\/api\/official-usage\/bundles\/[^/]+\/preview$/.test(url.pathname)) {
+        reviewed = reportBundle(stages, url.pathname.split("/")[4]);
+        return Response.json(reviewed);
+      }
+      if (/^\/api\/official-usage\/bundles\/[^/]+\/accept$/.test(url.pathname)) {
+        expect(reviewed?.complete).toBe(true);
+        expect(url.pathname.split("/")[4]).toBe(reviewed?.bundleId);
+        expect(JSON.parse(String(init?.body))).toEqual({
+          bundleHash: reviewed?.bundleHash, expectedActiveRevision: reviewed?.expectedActiveRevision,
+        });
+        expect(stages.every(stage => stage.status === "active")).toBe(true);
+        stages.forEach((stage, index) => { stages[index] = { ...stage, status: "accepted" }; });
+        return Response.json({ setId: reports.setId, activeRevision: reports.activeRevision, complete: true });
+      }
+      return original(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Add CSV reports" }));
+    await userEvent.upload(screen.getByLabelText("CSV report files"), ["agents.csv", "user-agents.csv", "users.csv"].map(
+      name => new File(["synthetic CSV"], name, { type: "text/csv" }),
+    ));
+    const stateReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/state").length;
+    const before = stateReads();
+    await userEvent.click(await screen.findByRole("button", { name: "Import reports" }));
+    await screen.findByRole("heading", { name: "Reports imported" });
+    await waitFor(() => expect(stateReads()).toBe(before + 1));
+    await userEvent.click(screen.getByRole("button", { name: "OK" }));
+    await screen.findByText(agent.displayName);
+    expect(window.location.pathname).toBe("/agents");
+    expect(stateReads()).toBe(before + 1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => /\/bundles\/[^/]+\/accept$/.test(input))).toHaveLength(1);
+  });
+
+  it.each(["different report", "same report", "no report", "failed inventory"] as const)(
+    "waits for replacement inventory before refreshing its selected report overview (%s)", async outcome => {
+    unifiedPage.usageContext.reports = selectedAgentsPage().reports;
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    const original = transport.fetchMock.getMockImplementation()!, pending = deferredResponse();
+    const nextSet = outcome === "different report" ? "10000000-0000-4000-8000-000000000099"
+      : outcome === "same report" ? unifiedPage.usageContext.reports.setId : null;
+    const history = selectedHistoryPage();
+    const alternate = { ...history.value[0], id: "10000000-0000-4000-8000-000000000099", active: false };
+    let optionsAvailable = false, reloading = false, nextInventory: UnifiedAgentInventoryPage | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/official-usage/history/options") {
+        return optionsAvailable ? Response.json(selectedHistoryPage([...history.value, alternate]))
+          : Response.json({ code: "service_unavailable", detail: "Report options unavailable" }, { status: 503 });
+      }
+      if (url.pathname === `/api/official-usage/sets/${alternate.id}/preview`) {
+        return Response.json({ code: "selection_invalidated", detail: "Report selection changed" }, { status: 409 });
+      }
+      const response = await original(input, init);
+      if (url.pathname === "/api/agent-inventory" && reloading) {
+        const data = await response.json() as UnifiedAgentInventoryPage;
+        nextInventory = { ...data, usageContext: { ...data.usageContext,
+          reports: { ...data.usageContext.reports, setId: nextSet, activeSetId: nextSet,
+            availability: nextSet ? "active" : "not_selected" } } };
+        return pending.promise;
+      }
+      return response;
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const summary = within(screen.getByRole("region", { name: "Agent inventory overview" }));
+    await waitFor(() => expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeEnabled());
+    const overviewReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/official-usage/overview");
+    expect(overviewReads()).toHaveLength(1);
+    const inventoryReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory").length;
+    const beforeRetry = inventoryReads();
+    const selector = within(screen.getByRole("region", { name: "Report set selection" }));
+    optionsAvailable = true;
+    fireEvent.click(selector.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(selector.getByRole("combobox")).toBeEnabled());
+    expect(inventoryReads()).toBe(beforeRetry);
+    expect(overviewReads()).toHaveLength(1);
+    await userEvent.selectOptions(selector.getByRole("combobox"), alternate.id);
+    await selector.findByRole("alert");
+    reloading = true;
+    fireEvent.click(selector.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(nextInventory).toBeDefined());
+    expect(overviewReads()).toHaveLength(1);
+    expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeDisabled();
+    expect(summary.getByRole("button", { name: "Show reported used agents" })).toHaveTextContent("Waiting for saved inventory");
+    expect(summary.queryByText("Loading selected report evidence...")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(outcome === "failed inventory"
+      ? Response.json({ code: "service_unavailable", detail: "Replacement inventory unavailable" }, { status: 503 })
+      : Response.json(nextInventory)));
+    await waitFor(() => expect(summary.queryByText("Waiting for saved inventory before reading report evidence...")).not.toBeInTheDocument());
+    if (nextSet) {
+      await waitFor(() => expect(overviewReads()).toHaveLength(2));
+      expect(new URL(overviewReads()[1][0], "http://localhost").searchParams.get("setId")).toBe(nextSet);
+      await waitFor(() => expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeEnabled());
+    } else {
+      expect(overviewReads()).toHaveLength(1);
+      expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeDisabled();
+      expect(summary.getByRole("button", { name: "Show reported used agents" })).toHaveTextContent(
+        outcome === "failed inventory" ? "Report context unavailable" : "No selected report data");
+      expect(summary.queryByRole("alert")).not.toBeInTheDocument();
+    }
+  });
+
   it("restores recent catalog and additional Power Platform rows synchronously without new captures", async () => {
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Additional native agent");
     const transport = appTransport({ revalidatedRoles: viewer.roles,
@@ -384,6 +625,190 @@ describe("App session revalidation", () => {
       await act(async () => {});
     }
     expect(reads()).toBe(before);
+  });
+
+  it("does not refetch Power Platform job history for inventory filter and sort changes", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    const historyReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/inventory/refresh-jobs").length;
+    const before = historyReads();
+    for (const query of ["Sensitive", "cached", ""]) {
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: query } });
+      await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    }
+    await userEvent.click(screen.getByRole("button", { name: "Sort by Agent" }));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    expect(historyReads()).toBe(before);
+  });
+
+  it.each([
+    { field: "type", code: "selection_invalidated", status: 409 },
+    { field: "environmentId", code: "selection_invalidated", status: 409 },
+    { field: "environmentId", code: "read_busy", status: 503 },
+  ])("does not let an old $field facet $code disrupt a replacement sort selection", async ({ field, code, status }) => {
+    if (field === "environmentId") {
+      window.history.replaceState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("env-a"))}`);
+      unifiedPage.value[0].environmentId = "env-a";
+    }
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const facet = deferredResponse(), replacement = deferredResponse();
+    let previousSelection: string | null = null;
+    let replacing = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory/facets" && url.searchParams.get("field") === field && !replacing) {
+        previousSelection = url.searchParams.get("selectionId");
+        return facet.promise;
+      }
+      if (url.pathname === "/api/agent-inventory" && replacing) return replacement.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(previousSelection).not.toBeNull());
+    replacing = true;
+    await userEvent.click(screen.getByRole("button", { name: "Sort by Agent" }));
+    const inventoryReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory");
+    await waitFor(() => expect(inventoryReads()).toHaveLength(2));
+    const [input, init] = inventoryReads()[1];
+    expect(new URL(input, "http://localhost").searchParams.get("selectionId")).not.toBe(previousSelection);
+    await act(async () => facet.resolve(Response.json({
+      code, detail: "The previous selection's facet read failed.",
+    }, { status })));
+    expect(init?.signal?.aborted).toBe(false);
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    if (field === "environmentId") {
+      expect(screen.queryByText("The previous selection's facet read failed.")).not.toBeInTheDocument();
+    }
+    await act(async () => replacement.resolve(await base(input, init)));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByText("The saved inventory selection is no longer available. Reload saved inventory.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The previous selection's facet read failed.")).not.toBeInTheDocument();
+    expect(inventoryReads()).toHaveLength(2);
+  });
+
+  it("withdraws the current inventory when its facet read is invalidated", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const facet = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory/facets" ? facet.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await act(async () => facet.resolve(Response.json({
+      code: "selection_invalidated", detail: "Selection expired.",
+    }, { status: 409 })));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("Unavailable");
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+  });
+
+  it.each(["detail:channels", "detail:connectors", "connectorOperation", "versions"])(
+    "withdraws the overview and sibling reads when %s invalidates its inventory selection", async kind => {
+      const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Selected native agent");
+      native.packages = [agent];
+      native.presence = "both";
+      native.packagesComplete = false;
+      native.packageCount = 2;
+      native.powerPlatformResource = { ...native.powerPlatformResource!,
+        savedSource: { scopeId: "11111111-1111-4111-8111-111111111111", identity: "native-source" },
+        connectorCounts: { connectors: 1, operations: 1 } };
+      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([native]) });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const rejected = deferredResponse(), operations = deferredResponse(), versions = deferredResponse();
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        const url = new URL(input, "http://localhost");
+        if (url.pathname.endsWith("/members")) return kind === "versions" ? rejected.promise : versions.promise;
+        if (url.pathname.endsWith("/children")) {
+          const section = url.searchParams.get("kind");
+          if (section === kind) return rejected.promise;
+          if (section === "connectorOperation") return operations.promise;
+          return Response.json({ value: [{ ordinal: 0, kind: section, value: section === "detail:channels" ? "Teams" : "0",
+            payload: section === "detail:connectors" ? { connectorId: "Saved connector", operations: [] } : {} }], total: 1, nextCursor: null });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: "View details for Selected native agent" }));
+      await screen.findByRole("dialog", { name: native.displayName });
+      const childCalls = () => transport.fetchMock.mock.calls.filter(([input]) => {
+        const url = new URL(input, "http://localhost");
+        return url.pathname.endsWith("/members") || url.pathname.endsWith("/children");
+      });
+      await waitFor(() => expect(childCalls().some(([input]) => {
+        const url = new URL(input, "http://localhost");
+        return kind === "versions" ? url.pathname.endsWith("/members") : url.searchParams.get("kind") === kind;
+      })).toBe(true));
+      await act(async () => rejected.resolve(Response.json({ code: "selection_invalidated", detail: "Selected inventory expired." }, { status: 409 })));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: native.displayName })).not.toBeInTheDocument());
+      expect(screen.queryByText(native.displayName)).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+      for (const [input, init] of childCalls()) {
+        const url = new URL(input, "http://localhost");
+        if (kind !== "versions" && url.pathname.endsWith("/members")
+          || kind !== "connectorOperation" && url.searchParams.get("kind") === "connectorOperation") expect(init?.signal?.aborted).toBe(true);
+      }
+      await act(async () => {
+        operations.resolve(Response.json({ value: [{ ordinal: 1, kind: "connectorOperation", value: "0",
+          payload: { operationId: "Obsolete operation" } }], total: 1, nextCursor: null }));
+        versions.resolve(Response.json({ value: [], total: 0, nextCursor: null }));
+      });
+      expect(screen.queryByText("Obsolete operation")).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
+    });
+
+  it("ignores late overview invalidation after a replacement inventory selection loads", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Selected native agent");
+    native.packages = [agent];
+    native.presence = "both";
+    native.powerPlatformResource = { ...native.powerPlatformResource!,
+      savedSource: { scopeId: "11111111-1111-4111-8111-111111111111", identity: "native-source" },
+      connectorCounts: { connectors: 0, operations: 0 } };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([native]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const previous = deferredResponse();
+    let channelReads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname.endsWith("/children")) {
+        if (url.searchParams.get("kind") === "detail:channels") {
+          if (++channelReads === 1) return previous.promise;
+          return Response.json({ value: [{ ordinal: 0, kind: "detail:channels", value: "Replacement channel", payload: {} }],
+            total: 1, nextCursor: null });
+        }
+        return Response.json({ value: [], total: 0, nextCursor: null });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "View details for Selected native agent" }));
+    await waitFor(() => expect(channelReads).toBe(1));
+    const previousSignal = transport.fetchMock.mock.calls.find(([input]) => {
+      const url = new URL(input, "http://localhost");
+      return url.pathname.endsWith("/children") && url.searchParams.get("kind") === "detail:channels";
+    })?.[1]?.signal;
+    const selection = currentInventorySelection(transport.fetchMock);
+    await userEvent.click(within(screen.getByRole("dialog", { name: native.displayName })).getByRole("button", { name: "Reload saved inventory" }));
+    expect(await screen.findByText("Replacement channel")).toBeVisible();
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(selection);
+    expect(previousSignal?.aborted).toBe(true);
+    await act(async () => previous.resolve(Response.json({ code: "selection_invalidated", detail: "Previous inventory expired." }, { status: 409 })));
+    expect(screen.getByRole("dialog", { name: native.displayName })).toBeVisible();
+    expect(screen.getByText("Replacement channel")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Agent inventory unavailable" })).not.toBeInTheDocument();
+    expect(channelReads).toBe(2);
   });
 
   it.each([
@@ -427,6 +852,199 @@ describe("App session revalidation", () => {
     else if (view === "users") expect(screen.getByRole("region", { name: "Users and adoption" })).toBeVisible();
     else expect(screen.getByRole("heading", { name: "No audit events" })).toBeVisible();
     expect(showModal).not.toHaveBeenCalled();
+  });
+
+  it.each(["capture", "page"] as const)("ends the initial agent skeleton after transport cancellation during %s and offers saved-only retry", async phase => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse(), retry = deferredResponse();
+    const path = phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory";
+    let retrying = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname !== path) return base(input, init);
+      if (retrying) {
+        await retry.promise;
+        return base(input, init);
+      }
+      await pending.promise;
+      throw new DOMException("The saved inventory transport was cancelled.", "AbortError");
+    });
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === path);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(reads()).toHaveLength(1));
+    expect(screen.getByRole("region", { name: "Loading agents" })).toHaveAttribute("aria-busy", "true");
+    expect(reads()[0][1]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(new Response()));
+
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    expect(screen.getByText("The request was cancelled.")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("The current saved agent inventory could not be loaded.");
+    expect(screen.queryByRole("heading", { name: /No agents in this inventory|No matching agents/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(reads()).toHaveLength(1);
+    expect(reads()[0][1]?.signal?.aborted).toBe(false);
+
+    retrying = true;
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await waitFor(() => expect(reads()).toHaveLength(2));
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    await act(async () => retry.resolve(new Response()));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(reads()).toHaveLength(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("reports a cancelled replacement agent read without presenting retained rows as current or restarting it automatically", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let cancelling = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (cancelling && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        await pending.promise;
+        throw new DOMException("The replacement transport was cancelled.", "AbortError");
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const before = agentListRequests(transport.fetchMock).length;
+    cancelling = true;
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: agent.displayName } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(before + 1));
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    await act(async () => pending.resolve(new Response()));
+
+    expect(await screen.findByText("The request was cancelled.")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("The current saved agent inventory could not be loaded.");
+    expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Agent inventory pages" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(before + 1);
+    cancelling = false;
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(before + 2);
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it.each(["success", "failure"] as const)("silences an abandoned initial agent %s while the returning view is still loading", async outcome => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const previous = deferredResponse(), replacement = deferredResponse();
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return base(input, init);
+      if (++reads === 1) {
+        await previous.promise;
+        if (outcome === "failure") throw new Error("Abandoned transport failure.");
+      } else await replacement.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(reads).toBe(1));
+    const previousSignal = agentListRequests(transport.fetchMock)[0][1]?.signal;
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(previousSignal?.aborted).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await waitFor(() => expect(reads).toBe(2));
+    await act(async () => previous.resolve(new Response()));
+    expect(screen.getByRole("region", { name: "Loading agents" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.queryByText("The request was cancelled.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Abandoned transport failure.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reads).toBe(2);
+    await act(async () => replacement.resolve(new Response()));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reads).toBe(2);
+  });
+
+  it.each([
+    { boundary: "same-account revalidation", user: viewer, roles: viewer.roles },
+    { boundary: "account replacement", user: { ...viewer, tenantId: "tenant-2", homeAccountId: "viewer-2" }, roles: viewer.roles },
+    { boundary: "role removal", user: viewer, roles: [] as SessionUser["roles"] },
+  ])("retires local audit reads, details and exports on $boundary", async ({ user, roles }) => {
+    window.history.replaceState({}, "", "/audit");
+    const transport = appTransport({ revalidatedRoles: roles, revalidatedUser: user });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pendingExport = deferredResponse(), pendingRead = deferredResponse();
+    const previousEvent: AuditEvent = {
+      id: "previous-audit-event", operationId: "previous-operation", action: "associate-agent-usage",
+      scope: "single", agentId: "previous-private-audit-agent", actor: { ...viewer, displayName: "Previous audit actor" },
+      startedAt: "2026-09-17T00:00:00.000Z", status: "succeeded", requestPath: "/fixture",
+      message: "Previous private audit details",
+    };
+    const currentEvent: AuditEvent = {
+      ...previousEvent, id: "current-audit-event", agentId: "current-audit-agent",
+      actor: { ...user, displayName: "Current audit actor" }, message: "Current audit details",
+    };
+    let replaced = false, auditReads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const path = new URL(input, "http://localhost").pathname;
+      if (path === "/api/audit/events") {
+        auditReads += 1;
+        if (!replaced && auditReads > 1) return pendingRead.promise;
+        return Response.json({ count: 1, value: [replaced ? currentEvent : previousEvent] });
+      }
+      if (path === "/api/audit/events/export.csv") return pendingExport.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    render(<App />);
+    await screen.findByText("Previous audit actor");
+    const exportButton = screen.getByRole("button", { name: "Export current audit page CSV" });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await userEvent.click(exportButton);
+    await userEvent.click(screen.getByRole("button", { name: /View event details: Previous/ }));
+    expect(screen.getByRole("dialog", { name: "Event details" })).toHaveTextContent("Previous private audit details");
+    const exportSignal = transport.fetchMock.mock.calls.find(([input]) => input === "/api/audit/events/export.csv")?.[1]?.signal;
+    expect(exportSignal?.aborted).toBe(false);
+
+    replaced = true;
+    await revalidateTransportSession(transport);
+    expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Previous audit actor")).not.toBeInTheDocument();
+    expect(exportSignal?.aborted).toBe(true);
+    if (roles.length) expect(await screen.findByText("Current audit actor")).toBeVisible();
+    else expect(screen.queryByRole("button", { name: "Export current audit page CSV" })).not.toBeInTheDocument();
+    const sessionReads = transport.meCalls();
+    await act(async () => pendingExport.resolve(new Response("obsolete,audit,csv")));
+    expect(download).not.toHaveBeenCalled();
+    expect(transport.meCalls()).toBe(sessionReads);
+    expect(auditReads).toBe(roles.length ? 2 : 1);
+
+    if (roles.length) {
+      // Exercise the same boundary with an unfinished saved read, not just an export.
+      replaced = false;
+      await userEvent.click(screen.getByRole("button", { name: "Refresh audit log" }));
+      await waitFor(() => expect(auditReads).toBe(3));
+      const readSignal = transport.fetchMock.mock.calls.filter(([input]) =>
+        new URL(input, "http://localhost").pathname === "/api/audit/events").at(-1)?.[1]?.signal;
+      replaced = true;
+      await revalidateTransportSession(transport);
+      expect(await screen.findByText("Current audit actor")).toBeVisible();
+      expect(readSignal?.aborted).toBe(true);
+      await act(async () => pendingRead.resolve(Response.json({ count: 1, value: [previousEvent] })));
+      expect(screen.queryByText("Previous audit actor")).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument();
+      expect(auditReads).toBe(4);
+    }
   });
 
   it("replaces unknown setup with an inline status error and retries without opening onboarding", async () => {
@@ -518,6 +1136,37 @@ describe("App session revalidation", () => {
     const stopped = captures();
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(captures()).toBe(stopped);
+  });
+
+  it.each(["not_collected", "preparing"] as const)("shows %s inventory in Sync health and diagnostics until publication", async state => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let ready = false;
+    const message = "Waiting for the first inventory publication.";
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/agent-inventory/selections" && !ready
+      ? Promise.resolve(Response.json({ state, message })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const health = screen.getByRole("region", { name: "Inventory health" });
+    expect(within(health).getByText(state === "preparing" ? "Preparing" : "Not collected")).toBeVisible();
+    expect(within(health).getByRole("status")).toHaveTextContent(message);
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    expect(receipt.getByRole("status")).toHaveTextContent(message);
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeDisabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    ready = true;
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(receipt.getByText("Saved inventory verified")).toBeVisible();
+    expect(within(health).getByText("Verified")).toBeVisible();
+    expect(screen.queryByText(message)).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input, init]) => init?.method === "POST"
+      && ["/api/agents/refresh-jobs", "/api/inventory/refresh-jobs"].includes(input))).toHaveLength(0);
   });
 
   it("refreshes Users, Agents and Sync history on automatic publications without opening a workflow", async () => {
@@ -636,6 +1285,28 @@ describe("App session revalidation", () => {
     }
   });
 
+  it("does not reload saved inventory when delayed permission evidence changes but publications do not", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const permissions = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/capabilities" ? permissions.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const checks = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh").length;
+    await waitFor(() => expect(checks()).toBe(1));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    const reads = agentListRequests(transport.fetchMock).length;
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    const selections = captures();
+    await act(async () => permissions.resolve(await base("/api/capabilities")));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions" })).toHaveAttribute("aria-busy", "false"));
+    await waitFor(() => expect(checks()).toBe(2));
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+    expect(captures()).toBe(selections);
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+  });
+
   it("keeps background detail pins and owns the open agent through repeated slow explicit inventory reloads", async () => {
     vi.useFakeTimers();
     const transport = initialCatalogTransport();
@@ -729,6 +1400,124 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id))).toHaveLength(3);
   });
 
+  it.each(["pending", "failed"] as const)(
+    "preserves a %s detail read when a saved inventory reload fails", async state => {
+      vi.useFakeTimers();
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const inventoryRecovery = deferredResponse();
+      let failInventory = false;
+      let recovering = false;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (recovering && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+          return inventoryRecovery.promise;
+        }
+        if (failInventory && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+          return Promise.resolve(Response.json({
+            code: "inventory_unavailable", detail: "Saved inventory could not be read.",
+          }, { status: 503 }));
+        }
+        if (isPackageDetailRequest(input, agent.id)) return recovering
+          ? Promise.resolve(Response.json({ ...agent, longDescription: "Recovered selection details" }))
+          : state === "pending" ? pending.promise
+          : Promise.resolve(Response.json({
+            code: "saved_details_unavailable", detail: "Saved details require an explicit retry.",
+          }, { status: 500 }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const reads = () => transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id));
+      expect(reads()).toHaveLength(1);
+      const signal = reads()[0][1]?.signal;
+      failInventory = true;
+      fireEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const dialog = screen.getByRole("dialog", { name: agent.displayName });
+      expect(within(dialog).getAllByRole("alert").map(alert => alert.textContent)).toContainEqual(
+        expect.stringContaining("Saved inventory could not be read."),
+      );
+      expect(reads()).toHaveLength(1);
+      expect(signal?.aborted).toBe(false);
+      if (state === "pending") {
+        await act(async () => pending.resolve(Response.json({ ...agent, longDescription: "Original selected detail" })));
+        expect(within(dialog).getByText("Original selected detail")).toBeVisible();
+        expect(within(dialog).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      } else {
+        expect(within(dialog).getByText("Saved details require an explicit retry.")).toBeVisible();
+        const retryDetails = within(dialog).getByRole("button", { name: "Retry saved details" });
+        expect(retryDetails).toBeDisabled();
+        expect(within(dialog).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+        fireEvent.click(retryDetails);
+        await act(() => vi.advanceTimersByTimeAsync(0));
+        expect(reads()).toHaveLength(1);
+      }
+      const inventoryReads = agentListRequests(transport.fetchMock).length;
+      recovering = true;
+      failInventory = false;
+      fireEvent.click(within(dialog).getByRole("button", { name: "Retry saved inventory" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(agentListRequests(transport.fetchMock)).toHaveLength(inventoryReads + 1);
+      expect(reads()).toHaveLength(1);
+      expect(within(dialog).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      if (state === "failed") expect(within(dialog).getByRole("button", { name: "Retry saved details" })).toBeDisabled();
+      await act(async () => inventoryRecovery.resolve(Response.json(selectedInventoryPage(
+        agentListRequests(transport.fetchMock).at(-1)![0], unifiedPage,
+      ))));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(reads()).toHaveLength(2);
+      expect(reads()[1][0]).not.toBe(reads()[0][0]);
+      expect(new URL(reads()[1][0], "http://localhost").searchParams.get("selectionId"))
+        .toBe(currentInventorySelection(transport.fetchMock));
+      expect(within(dialog).getByText("Recovered selection details")).toBeVisible();
+      expect(within(dialog).queryByText("Original selected detail")).not.toBeInTheDocument();
+      expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+      expect(within(dialog).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      expect(agentListRequests(transport.fetchMock)).toHaveLength(inventoryReads + 1);
+      expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    },
+  );
+
+  it.each(["success", "failure"] as const)(
+    "replaces a pending detail read after inventory reload and ignores its late %s", async outcome => {
+      vi.useFakeTimers();
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let reads = 0;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (isPackageDetailRequest(input, agent.id)) return ++reads === 1 ? pending.promise
+          : Promise.resolve(Response.json({ ...agent, longDescription: "New selection details" }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const original = transport.fetchMock.mock.calls.find(([input]) => isPackageDetailRequest(input, agent.id))!;
+      expect(reads).toBe(1);
+      fireEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(reads).toBe(2);
+      expect(original[1]?.signal?.aborted).toBe(true);
+      const latest = transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id))[1];
+      expect(latest[0]).not.toBe(original[0]);
+      expect(screen.getByText("New selection details")).toBeVisible();
+      await act(async () => pending.resolve(outcome === "success"
+        ? Response.json({ ...agent, longDescription: "Superseded selection details" })
+        : Response.json({ code: "unavailable", detail: "Superseded selection failure" }, { status: 503 })));
+      expect(screen.queryByText(/Superseded selection/)).not.toBeInTheDocument();
+      expect(screen.getByText("New selection details")).toBeVisible();
+      expect(reads).toBe(2);
+      expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    },
+  );
+
   it("shows a failed background inventory read inside the open dialog and retries saved data", async () => {
     vi.useFakeTimers();
     const transport = initialCatalogTransport();
@@ -811,7 +1600,7 @@ describe("App session revalidation", () => {
         revisions: { ...automaticRefreshResponse().revisions, graph_packages: refreshing ? "packages-2" : "packages-1" },
       }));
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
-        return Response.json({ ...page, revision: (refreshing ? "b" : "a").repeat(64) });
+        return Response.json(selectedInventoryPage(input, page));
       }
       if (isPackageDetailRequest(input, agent.id)) return refreshing
         ? pending.promise : Response.json({ ...agent, longDescription: "First agent saved details" });
@@ -826,7 +1615,13 @@ describe("App session revalidation", () => {
     refreshing = true;
     await act(() => vi.advanceTimersByTimeAsync(60_000));
     expect(screen.getByText("First agent saved details")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const delayed = transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id));
+    expect(delayed).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Close unified agent details" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(delayed[1][1]?.signal?.aborted).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: `View details for ${second.displayName}` }));
     await act(() => vi.advanceTimersByTimeAsync(0));
     const dialog = screen.getByRole("dialog", { name: second.displayName });
@@ -958,20 +1753,25 @@ describe("App session revalidation", () => {
     search.focus();
     expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
     const reads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/copilot-usage/users").length;
+    const detailReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === `/api/copilot-usage/users/${updated.value[1].directory.objectId}`).length;
     const before = reads();
     await act(() => vi.advanceTimersByTimeAsync(0));
     fireEvent.click(screen.getByRole("button", { name: "Ben" }));
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(screen.getByRole("dialog", { name: "Ben" })).toBeVisible();
+    expect(detailReads()).toBe(1);
 
     refreshing = true;
     await act(() => vi.advanceTimersByTimeAsync(60_000));
     expect(reads()).toBe(before + 1);
+    expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
+    expect(detailReads()).toBe(1);
     await act(() => vi.advanceTimersByTimeAsync(500));
     expect(screen.getByRole("status", { name: "Background refresh" })).toBeVisible();
     expect(screen.getByRole("status", { name: "Background refresh" }).textContent).toBe("");
     expect(screen.queryByRole("button", { name: "Ben" })).not.toBeInTheDocument();
-    expect(screen.getByRole("dialog", { name: "Ben" })).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
     expect(search).toHaveValue("Ben");
     expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Users and adoption" })).toHaveAttribute("aria-busy", "false");
@@ -979,7 +1779,7 @@ describe("App session revalidation", () => {
     const params = new URL(request, "http://localhost").searchParams;
     expect(params.has("selectionId")).toBe(false);
     expect(params.has("cursor")).toBe(false);
-    expect(params.get("search")).toBe("Ben");
+    expect(params.get("search")).toBe("ben");
     await act(async () => pending.resolve(Response.json(updated)));
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(screen.queryByRole("dialog", { name: "Ben" })).not.toBeInTheDocument();
@@ -991,6 +1791,7 @@ describe("App session revalidation", () => {
     expect(reads()).toBe(before + 1);
     expect(screen.getByRole("cell", { name: "4" })).toBeVisible();
     expect(reads()).toBe(before + 1);
+    expect(detailReads()).toBe(1);
   });
 
   it.each(["block", "unblock"] as const)("keeps selected package actions usable during a background inventory read and reports an actual %s denial", async action => {
@@ -1107,6 +1908,8 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    expect(screen.queryByRole("button", { name: `Manage access for ${agent.displayName}` })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: `Block ${agent.displayName}` })).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole("button", { name: "Block selected packages" }));
     const confirmation = await screen.findByRole("dialog", { name: "Block 40 packages?" });
     await userEvent.click(within(confirmation).getByRole("button", { name: "Block 40 packages" }));
@@ -1277,10 +2080,10 @@ describe("App session revalidation", () => {
   ]))(
     "reloads mounted Users responsibility for $surface on background $source $event", async ({ source, surface, event }) => {
       const directory = selectedUsersPage();
-      const reportUser = selectedReportUsersPage({ licenseCohort: "active_without_paid" }).value.find(user => user.username === "ben@example.invalid")!;
-      directory.value[1] = { ...directory.value[1], copilotServiceState: "disabled", entitlement: "no_paid", reportedResponses: reportUser.reportedResponses };
+      const reportUser = selectedReportUsersPage({ licenseCohort: "active_without_paid" }).value.find(user => user.username === "cleo@example.invalid")!;
+      directory.value[2] = { ...directory.value[2], copilotServiceState: "disabled", entitlement: "no_paid", reportedResponses: reportUser.reportedResponses };
       const personId = surface === "responsibility" ? responsibilityOwnerId
-        : directory.value[surface === "licenses" ? 0 : 1].directory.objectId;
+        : directory.value[surface === "licenses" ? 0 : 2].directory.objectId;
       const url = surface === "responsibility" ? `/users?detail=${personId}&tab=responsibility`
         : surface === "activity" ? "/users?view=activity" : "/users";
       window.history.replaceState({}, "", url);
@@ -1504,7 +2307,7 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.filter(([input, init]) => input.startsWith("/api/inventory/refresh") && init?.method === "POST")).toEqual([]);
   });
 
-  it("does not reopen a signed-out workbench from a superseded StrictMode bootstrap", async () => {
+  it.each(["success", "failure"] as const)("ignores a superseded StrictMode bootstrap %s after sign-out", async outcome => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const firstSetup = deferredResponse();
@@ -1513,7 +2316,9 @@ describe("App session revalidation", () => {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/auth/status" && ++setupReads === 1) {
         firstSignal = init?.signal;
-        return firstSetup.promise;
+        const response = await firstSetup.promise;
+        if (outcome === "failure") throw new TypeError("Superseded configuration failure");
+        return response;
       }
       if (input === "/api/auth/logout") return new Response(null, { status: 204 });
       return base(input, init);
@@ -1528,8 +2333,205 @@ describe("App session revalidation", () => {
     await act(async () => firstSetup.resolve(Response.json({ authConfigured: true })));
     expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeInTheDocument();
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.queryByText(/configuration could not be checked|Superseded configuration failure/)).not.toBeInTheDocument();
     expect(firstSignal?.aborted).toBe(true);
     expect(transport.meCalls()).toBe(1);
+  });
+
+  it.each(["network", "invalid JSON"] as const)("restores an existing session despite a configuration %s failure", async failure => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/auth/status") {
+        if (failure === "network") throw new TypeError("internal configuration network diagnostic");
+        return new Response("internal proxy response");
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(transport.meCalls()).toBe(1);
+    expect(screen.queryByRole("button", { name: "Sign in with Entra ID" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/internal configuration|internal proxy/)).not.toBeInTheDocument();
+  });
+
+  it.each(["bootstrap", "revalidation"] as const)("replaces a pre-departure pending %s session read on history restoration", async phase => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const abandoned = deferredResponse();
+    const replacement = deferredResponse();
+    const deferredRead = phase === "bootstrap" ? 1 : 2;
+    let sessionReads = 0;
+    let abandonedSignal: AbortSignal | null | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/me") {
+        sessionReads += 1;
+        if (sessionReads === deferredRead) {
+          abandonedSignal = init?.signal;
+          return abandoned.promise;
+        }
+        if (sessionReads === deferredRead + 1) return replacement.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    if (phase === "revalidation") {
+      await screen.findByText(agent.displayName);
+      await act(async () => {
+        transport.failProtectedReadsWith = 401;
+        await expect(getAgents()).rejects.toMatchObject({ status: 401 });
+        transport.failProtectedReadsWith = undefined;
+      });
+    }
+    await waitFor(() => expect(sessionReads).toBe(deferredRead));
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    expect(abandonedSignal?.aborted).toBe(true);
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await waitFor(() => expect(sessionReads).toBe(deferredRead + 1));
+    await act(async () => abandoned.resolve(Response.json({
+      user: { ...viewer, displayName: "Abandoned account" }, csrfToken: "abandoned-csrf", roleAssignmentRequired: false,
+    })));
+    expect(screen.queryByText("Abandoned account")).not.toBeInTheDocument();
+    expect(screen.getByText("Checking sign-in...")).toBeVisible();
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(sessionReads).toBe(deferredRead + 1);
+    await act(async () => replacement.resolve(Response.json({ user: viewer, csrfToken: "replacement-csrf", roleAssignmentRequired: false })));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.getByText(viewer.displayName)).toBeVisible();
+    expect(screen.queryByText("Abandoned account")).not.toBeInTheDocument();
+  });
+
+  it.each(["same", "replacement"] as const)("revalidates the %s account before reusing a browser-history-restored workbench", async account => {
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const replacementUser = account === "same" ? viewer : { ...viewer, homeAccountId: "replacement-account", displayName: "Replacement viewer" };
+    const replacementPage = createUnifiedPage();
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, revalidatedUser: replacementUser,
+      deferRevalidation: true, unifiedResponse: replacementPage,
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const previousCache = ["saved", "previous-session-evidence"];
+    client.setQueryDefaults(previousCache, { gcTime: Infinity });
+    client.setQueryData(previousCache, { value: "Previous session data" });
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: false })));
+    expect(transport.meCalls()).toBe(1);
+    expect(client.getQueryData(previousCache)).toBeDefined();
+
+    await act(async () => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    });
+    await waitFor(() => expect(transport.meCalls()).toBe(2));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(client.getQueryData(previousCache)).toBeUndefined();
+    expect(screen.getByText("Checking sign-in...")).toBeVisible();
+
+    replacementPage.value = [{ ...replacementPage.value[0], displayName: "Current session agent" }];
+    await act(async () => transport.releaseRevalidation());
+    expect(await screen.findByText("Current session agent")).toBeVisible();
+    expect(screen.getByText(replacementUser.displayName)).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(transport.meCalls()).toBe(2);
+    expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/auth/login")).toBe(false);
+  });
+
+  it.each(["success", "failure"] as const)("revalidates after suspending a pending logout and ignores its late %s", async outcome => {
+    const replacementUser = { ...viewer, homeAccountId: "replacement-account", displayName: "Replacement viewer" };
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, revalidatedUser: replacementUser, deferRevalidation: true,
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const abandoned = deferredResponse();
+    const current = deferredResponse();
+    const logoutSignals: (AbortSignal | null | undefined)[] = [];
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/auth/logout") {
+        logoutSignals.push(init?.signal);
+        return logoutSignals.length === 1 ? abandoned.promise : current.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />, { reactStrictMode: true });
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeDisabled();
+
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    expect(logoutSignals[0]?.aborted).toBe(true);
+    await act(async () => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    });
+    await waitFor(() => expect(transport.meCalls()).toBe(2));
+    expect(screen.getByText("Checking sign-in...")).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in with Entra ID" })).not.toBeInTheDocument();
+    await act(async () => transport.releaseRevalidation());
+    expect(await screen.findByText(replacementUser.displayName)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(logoutSignals).toHaveLength(2);
+    await act(async () => abandoned.resolve(outcome === "success" ? new Response(null, { status: 204 })
+      : Response.json({ code: "invalid_origin", detail: "Abandoned logout failed." }, { status: 403 })));
+    expect(screen.getByText(replacementUser.displayName)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeDisabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(logoutSignals[1]?.aborted).toBe(false);
+    expect(transport.meCalls()).toBe(2);
+    expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/auth/login")).toBe(false);
+
+    await act(async () => current.resolve(new Response(null, { status: 204 })));
+    expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+  });
+
+  it("revalidates a replaced account after an automatic-refresh CSRF rejection and withdraws its old cache", async () => {
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const replacementUser = { ...viewer, homeAccountId: "replacement-account", displayName: "Replacement viewer" };
+    const replacementPage = createUnifiedPage();
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, revalidatedUser: replacementUser,
+      deferRevalidation: true, unifiedResponse: replacementPage,
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const automaticRefresh = deferredResponse();
+    let automaticChecks = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh" && ++automaticChecks === 1) return automaticRefresh.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(automaticChecks).toBe(1));
+    const previousCache = ["saved", "previous-account-evidence"];
+    client.setQueryData(previousCache, { value: "Previous account data" });
+
+    await act(async () => automaticRefresh.resolve(Response.json({
+      code: "invalid_csrf", detail: "A valid CSRF token is required.",
+    }, { status: 403 })));
+    await waitFor(() => expect(transport.meCalls()).toBe(2));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(client.getQueryData(previousCache)).toBeUndefined();
+    expect(automaticChecks).toBe(1);
+    expect(screen.queryByText(/Automatic refresh access was denied/)).not.toBeInTheDocument();
+
+    replacementPage.value = [{ ...replacementPage.value[0], displayName: "Replacement account agent" }];
+    await act(async () => transport.releaseRevalidation());
+    expect(await screen.findByText("Replacement account agent")).toBeVisible();
+    expect(screen.getByText(replacementUser.displayName)).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    await waitFor(() => expect(automaticChecks).toBe(2));
+    const refreshCalls = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh");
+    expect(refreshCalls.map(([, init]) => new Headers(init?.headers).get("X-CSRF-Token"))).toEqual(["csrf-1", "csrf-2"]);
+    expect(transport.meCalls()).toBe(2);
   });
 
   it("reloads capability evidence for a batched same-principal session revalidation", async () => {
@@ -1601,11 +2603,19 @@ describe("App session revalidation", () => {
       } }).then(value => ({ value }), error => ({ error }));
       const unrelatedReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
         ["/api/capabilities", "/api/workbench/metadata", "/api/data-sync/state"].includes(input)).length;
+      if (deniedSource === "refresh history") {
+        await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+        await userEvent.click(screen.getByText("View diagnostics"));
+      }
       const before = unrelatedReads();
       try {
         deny = true;
-        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
-        await screen.findByText(/Saved agent access denied/);
+        if (deniedSource === "refresh history") {
+          await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+        } else {
+          fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+        }
+        await screen.findAllByText(/Saved agent access denied/);
         expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
         expect(peerSignal?.aborted).toBe(false);
         expect(client.getQueryData(["saved", ...peerKey])).toEqual(cached);
@@ -1624,7 +2634,13 @@ describe("App session revalidation", () => {
         expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
         expect(transport.meCalls()).toBe(1);
         deny = false;
-        await userEvent.click(await screen.findByRole("button", { name: "Reload saved agent inventory" }));
+        if (deniedSource === "refresh history") {
+          await userEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+          await waitFor(() => expect(screen.queryAllByText(/Saved agent access denied/)).toHaveLength(0));
+          await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+        } else {
+          await userEvent.click(await screen.findByRole("button", { name: "Reload saved agent inventory" }));
+        }
         await screen.findByText(agent.displayName);
       } finally {
         pending.resolve(Response.json(unifiedPage));
@@ -2130,6 +3146,203 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, agent.id))).toHaveLength(2);
   });
 
+  it("admits only one detail read when choosing an already-loaded paged published version", async () => {
+    const second = { ...agent, id: "package-alternate", displayName: "Second publication" };
+    const group = { ...unifiedPage.value[0], packages: [agent, second], packagesComplete: false, packageCount: 40 };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([group]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, second.id)
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    const versions = within(dialog).getByRole("combobox", { name: "Published version details" });
+    await waitFor(() => expect(versions).toBeEnabled());
+    await waitFor(() => expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument());
+    await userEvent.selectOptions(versions, second.id);
+    const requests = transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, second.id));
+    expect(requests).toHaveLength(1);
+    expect(requests[0][1]?.signal?.aborted).toBe(false);
+    expect(within(dialog).getByText("Loading saved agent details...")).toBeVisible();
+
+    await act(async () => pending.resolve(Response.json({ ...second, longDescription: "Selected publication details" })));
+    expect(await within(dialog).findByText("Selected publication details")).toBeVisible();
+    expect(versions).toHaveValue(second.id);
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+  });
+
+  it("shares a pending saved-detail retry when repeated clicks occur in one React batch", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let retry = false;
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, agent.id)
+      ? retry ? pending.promise
+        : Promise.resolve(Response.json({ code: "saved_details_unavailable", detail: "Saved details unavailable." }, { status: 503 }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    const retryButton = await within(dialog).findByRole("button", { name: "Retry saved details" });
+    retry = true;
+    act(() => {
+      fireEvent.click(retryButton);
+      fireEvent.click(retryButton);
+    });
+    const reads = transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, agent.id));
+    expect(reads).toHaveLength(2);
+    expect(reads[1][1]?.signal?.aborted).toBe(false);
+
+    await act(async () => pending.resolve(Response.json({ ...agent, longDescription: "Retried saved detail" })));
+    expect(await within(dialog).findByText("Retried saved detail")).toBeVisible();
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("retries a failed selected version outside the loaded preview without changing the target", async () => {
+    const second = { ...agent, id: "package-alternate", displayName: "Second publication" };
+    const group = { ...unifiedPage.value[0], packagesComplete: false, packageCount: 40 };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([group]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let recovered = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname.endsWith("/members")) return Response.json({
+        value: [{ domain: "packages", native_id: second.id, display_name: second.displayName }],
+        total: 40, nextCursor: null,
+      });
+      if (isPackageDetailRequest(input, second.id)) return recovered
+        ? Response.json({
+          ...second, longDescription: "Recovered publication details",
+          observation: { observedAt: packagePage.selection.evaluatedAt, expiresAt: packagePage.selection.expiresAt, scopeKind: "exact" },
+          selectedSource: {
+            selectionId: new URL(input, "http://localhost").searchParams.get("selectionId"),
+            recordId: group.id, sourceIdentity: second.id, sourceScopeId: "package-scope", generationId: "package-generation",
+          },
+        })
+        : Response.json({ code: "provider_error", detail: "Saved publication temporarily unavailable" }, { status: 503 });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    const versions = within(dialog).getByRole("combobox", { name: "Published version details" });
+    await waitFor(() => expect(versions).toBeEnabled());
+    await userEvent.selectOptions(versions, second.id);
+    await waitFor(() => expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument());
+    expect(versions).toHaveValue(second.id);
+    expect(within(dialog).getAllByRole("alert")[0]).toHaveTextContent("Saved publication temporarily unavailable");
+    expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, second.id))).toHaveLength(1);
+
+    recovered = true;
+    await userEvent.click(within(dialog).getByRole("button", { name: "Retry saved details" }));
+    expect(await within(dialog).findByText("Recovered publication details")).toBeVisible();
+    expect(versions).toHaveValue(second.id);
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, second.id))).toHaveLength(2);
+  });
+
+  it("retires the inventory selection when chosen published-version details invalidate it", async () => {
+    const second = { ...agent, id: "package-alternate", displayName: "Second publication" };
+    const group = { ...unifiedPage.value[0], packages: [agent, second], packagesComplete: false, packageCount: 40 };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([group]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, second.id)
+      ? Promise.resolve(Response.json({ code: "selection_invalidated", detail: "The selected inventory expired." }, { status: 409 }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    const versions = within(dialog).getByRole("combobox", { name: "Published version details" });
+    await waitFor(() => expect(versions).toBeEnabled());
+    await userEvent.selectOptions(versions, second.id);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: `View details for ${agent.displayName}` })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reload saved agent inventory" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Retry saved details" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, second.id))).toHaveLength(1);
+  });
+
+  it("does not cancel a replacement inventory read when the old published-version detail invalidates", async () => {
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const detail = deferredResponse(), replacement = deferredResponse();
+    let replacing = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (isPackageDetailRequest(input, agent.id)) return replacing
+        ? Response.json({ ...agent, longDescription: "Replacement version details" }) : detail.promise;
+      const response = await base(input, init);
+      if (replacing && new URL(input, "http://localhost").pathname === "/api/agent-inventory") await replacement.promise;
+      return response;
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    const priorSelection = currentInventorySelection(transport.fetchMock);
+    replacing = true;
+    await userEvent.click(within(dialog).getByRole("button", { name: "Reload saved inventory" }));
+    const inventoryReads = () => transport.fetchMock.mock.calls.filter(
+      ([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory",
+    );
+    await waitFor(() => expect(inventoryReads()).toHaveLength(2));
+    const replacementSignal = inventoryReads()[1][1]?.signal;
+    await act(async () => detail.resolve(Response.json({
+      code: "selection_invalidated", detail: "Previous version selection expired.",
+    }, { status: 409 })));
+    expect(replacementSignal?.aborted).toBe(false);
+    expect(screen.getByRole("dialog", { name: agent.displayName })).toBeVisible();
+    await act(async () => replacement.resolve(Response.json({})));
+    expect(await screen.findByText("Replacement version details")).toBeVisible();
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(priorSelection);
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(screen.queryByText("Previous version selection expired.")).not.toBeInTheDocument();
+    expect(inventoryReads()).toHaveLength(2);
+  });
+
+  it.each(["success", "failure", "invalidation"] as const)("cancels a paged version read and ignores its late %s after another version is selected", async outcome => {
+    const second = { ...agent, id: "package-alternate", displayName: "Second publication" };
+    const group = { ...unifiedPage.value[0], packages: [agent, second], packagesComplete: false, packageCount: 40 };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([group]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, second.id)
+      ? pending.promise : isPackageDetailRequest(input, agent.id)
+        ? Promise.resolve(Response.json({ ...agent, longDescription: "Current publication details" })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    expect(await within(dialog).findByText("Current publication details")).toBeVisible();
+    const versions = within(dialog).getByRole("combobox", { name: "Published version details" });
+    await waitFor(() => expect(versions).toBeEnabled());
+    await userEvent.selectOptions(versions, second.id);
+    const requests = transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, second.id));
+    expect(requests).toHaveLength(1);
+    expect(within(dialog).queryByText("Current publication details")).not.toBeInTheDocument();
+    await userEvent.selectOptions(versions, agent.id);
+    expect(requests[0][1]?.signal?.aborted).toBe(true);
+    expect(await within(dialog).findByText("Current publication details")).toBeVisible();
+
+    await act(async () => pending.resolve(outcome === "success"
+      ? Response.json({ ...second, longDescription: "Superseded publication details" })
+      : Response.json({ code: outcome === "invalidation" ? "selection_invalidated" : "provider_error",
+        detail: "Superseded publication error" }, { status: outcome === "invalidation" ? 409 : 500 })));
+    expect(versions).toHaveValue(agent.id);
+    expect(within(dialog).getByText("Current publication details")).toBeVisible();
+    expect(within(dialog).queryByText(/Superseded publication/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+  });
+
   it("preserves the chosen version and draft through inline access and block confirmations", async () => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
@@ -2247,6 +3460,63 @@ describe("App session revalidation", () => {
     expect(new URLSearchParams(window.location.search).get("inventorySnapshot")).toBe(native.observations.powerPlatform!.snapshotId);
     expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
     expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+  });
+
+  it("preserves one selected quarantine target when equivalent native GUID casing changes", async () => {
+    const nativeId = "abcdefab-2222-4222-8222-222222222222";
+    const native = powerPlatformRecord(nativeId, "Case-stable target");
+    const replacement = powerPlatformRecord(nativeId.toUpperCase(), native.displayName);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let changed = false;
+    transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+      ? Response.json(unifiedRecordsPage([changed ? replacement : native]))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select Case-stable target" }));
+    changed = true;
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(2));
+    expect(screen.getByRole("checkbox", { name: "Select Case-stable target" })).toBeChecked();
+    expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Case-stable target" }));
+    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([]);
+  });
+
+  it("retains mixed package selection when adding its quarantine target would mix snapshots", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Selected native agent");
+    const other = powerPlatformRecord("33333333-3333-4333-8333-333333333333", "Partially selected agent");
+    const merged: UnifiedAgentRecord = {
+      ...other, presence: "both", packages: [agent],
+      observations: {
+        ...other.observations,
+        powerPlatform: { ...other.observations.powerPlatform!, id: "other-snapshot", snapshotId: "other-snapshot" },
+      },
+    };
+    window.history.replaceState({}, "", `/agents?inventory=all&selected=${agent.id}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([native, merged]),
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const checkbox = await screen.findByRole("checkbox", { name: "Select Partially selected agent" });
+    expect(checkbox).toBePartiallyChecked();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Selected native agent" }));
+    const reads = transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory").length;
+    await userEvent.click(checkbox);
+    expect(screen.getByText("The saved inventory changed. Clear the previous quarantine selection before selecting more agents.")).toBeVisible();
+    expect(checkbox).toBePartiallyChecked();
+    expect(checkbox).toHaveFocus();
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([native.id]);
+    expect(new URLSearchParams(window.location.search).get("inventorySnapshot")).toBe(native.observations.powerPlatform!.snapshotId);
+    expect(transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(reads);
   });
 
   it("reconciles an open native-only detail through its canonical alias when package identities arrive", async () => {
@@ -2489,6 +3759,57 @@ describe("App session revalidation", () => {
     expect(window.location.search).not.toContain("linkState");
   });
 
+  it("reuses one inventory selection for equivalent environment bookmarks", async () => {
+    window.history.replaceState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("ENV-A"))}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const response = await base(input, init);
+      return new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+        ? Response.json({ ...await response.json(), value: unifiedPage.value, counts: unifiedPage.counts }) : response;
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const before = agentListRequests(transport.fetchMock).length;
+    act(() => {
+      window.history.pushState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("env-a"))}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(async () => {});
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(before);
+    expect(new URLSearchParams(window.location.search).get("environment")).toBe(encodeInventoryFacet("env-a"));
+  });
+
+  it("does not reuse a later inventory cursor when history restores the first page", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const response = await base(input, init);
+      const url = new URL(input, "http://localhost");
+      if (url.pathname !== "/api/agent-inventory") return response;
+      const page = await response.json() as UnifiedAgentInventoryPage;
+      const later = url.searchParams.get("cursor") === "later-page";
+      return Response.json({ ...page, value: later ? [{ ...page.value[0], displayName: "Later page agent" }] : page.value,
+        page: { limit: 50, nextCursor: later ? null : "later-page", previousCursor: later ? "first-page" : null } });
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const first = { state: window.history.state, href: window.location.href };
+    await userEvent.click(within(screen.getByRole("navigation", { name: "Agent inventory pages" })).getByRole("button", { name: "Next" }));
+    await screen.findByText("Later page agent");
+    const before = agentListRequests(transport.fetchMock).length;
+    act(() => {
+      window.history.pushState(first.state, "", first.href);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByText("Later page agent")).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(before);
+  });
+
   it("round trips organization views and new sorts through list requests, headings, export and clear", async () => {
     window.history.replaceState({}, "", "/agents?show=organization&sort=responses&direction=desc");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
@@ -2658,6 +3979,68 @@ describe("App session revalidation", () => {
     })).toBe(true));
   });
 
+  it("rejects invalid creation age without reloading inventory or changing its applied query", async () => {
+    window.history.replaceState({}, "", "/agents?createdWithinDays=30");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    const input = screen.getByRole("spinbutton", { name: "Created within days" });
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      ["/api/agent-inventory", "/api/agent-inventory/selections"].includes(new URL(input, "http://localhost").pathname));
+    const initialReads = reads().length;
+    for (const value of ["0", "-1", "1.5", "3651"]) {
+      fireEvent.change(input, { target: { value } });
+      expect(screen.getByText("Enter a whole number of days from 1 to 3650.")).toBeVisible();
+      expect(input).toHaveValue(30);
+      expect(new URLSearchParams(window.location.search).get("createdWithinDays")).toBe("30");
+      expect(reads()).toHaveLength(initialReads);
+    }
+    for (const value of ["3e1", "30.0", "030"]) {
+      fireEvent.change(input, { target: { value } });
+      await act(async () => {});
+      expect(new URLSearchParams(window.location.search).get("createdWithinDays")).toBe("30");
+      expect(reads()).toHaveLength(initialReads);
+    }
+    fireEvent.change(input, { target: { value: "3650" } });
+    await waitFor(() => expect(reads().some(([input]) =>
+      selectedInventoryUrl(input).searchParams.get("createdWithinDays") === "3650")).toBe(true));
+    expect(new URLSearchParams(window.location.search).get("createdWithinDays")).toBe("3650");
+  });
+
+  it("shows local filter validation errors without disrupting a pending replacement selection", async () => {
+    window.history.replaceState({}, "", "/agents?createdWithinDays=30");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const replacement = deferredResponse();
+    let replacing = false;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      replacing && new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+        ? replacement.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    replacing = true;
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory");
+    await waitFor(() => expect(reads()).toHaveLength(2));
+    const [request, init] = reads()[1];
+    const input = screen.getByRole("spinbutton", { name: "Created within days" });
+    fireEvent.change(input, { target: { value: "0" } });
+    expect(screen.getByText("Enter a whole number of days from 1 to 3650.")).toBeVisible();
+    expect(input).toHaveValue(30);
+    expect(new URLSearchParams(window.location.search).get("createdWithinDays")).toBe("30");
+    expect(init?.signal?.aborted).toBe(false);
+    expect(reads()).toHaveLength(2);
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("Updating...");
+    await act(async () => replacement.resolve(await base(request, init)));
+    await waitFor(() => expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("1 matching agent"));
+  });
+
   it("keeps bookmarked filters disclosed by chips and ignores obsolete source/link URL restrictions", async () => {
     window.history.replaceState({}, "", `/agents?${new URLSearchParams({ source: "power_platform", linkState: "matched",
       platform: encodeInventoryFacet("studio"), createdWithinDays: "30", host: encodeInventoryFacet("Teams"), availability: encodeInventoryFacet("some") })}`);
@@ -2718,7 +4101,7 @@ describe("App session revalidation", () => {
     page.identityCollection = {
       checkedPackages: 461, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 },
     };
-    page.verification = { ...createUnifiedVerification(page.verification, { packageMetadata: false }), status: "details_pending" };
+    page.verification = createUnifiedVerification(page.verification, { packageMetadata: false });
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -2814,6 +4197,8 @@ describe("App session revalidation", () => {
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(transport.fetchMock.mock.calls.slice(beforeExpansion)
       .filter(([path, init]) => path !== "/api/agent-inventory/selections" && init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method])).toEqual([]);
+    expect(transport.fetchMock.mock.calls.slice(beforeExpansion)
+      .filter(([path]) => ["/api/agent-inventory/selections", "/api/agent-inventory"].includes(new URL(path, "http://localhost").pathname))).toEqual([]);
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     expect(receipt.getByText("Resources stored / provider total").nextElementSibling).toHaveTextContent("4,178 / 4,178");
     expect(receipt.getByText("Provider pages collected").nextElementSibling).toHaveTextContent("42");
@@ -2821,7 +4206,7 @@ describe("App session revalidation", () => {
     const collectedTime = receipt.getByText("Graph source collected at").nextElementSibling?.textContent;
     const before = transport.fetchMock.mock.calls.length;
     verificationRequested = true;
-    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
+    await userEvent.dblClick(receipt.getByRole("button", { name: "Verify saved inventory" }));
     expect(receipt.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     const checkedAt = "2026-09-17T06:15:00.000Z";
@@ -2832,11 +4217,104 @@ describe("App session revalidation", () => {
     expect(receipt.getByText("Saved data verified at").nextElementSibling?.querySelector("time")).toHaveAttribute("datetime", checkedAt);
     expect(receipt.getByText("Graph source collected at").nextElementSibling).toHaveTextContent(collectedTime!);
     const requests = transport.fetchMock.mock.calls.slice(before);
+    expect(requests.filter(([input]) => input === "/api/agent-inventory/selections")).toHaveLength(1);
     expect(requests.filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(1);
     expect(requests.filter(([path, init]) => path !== "/api/agent-inventory/selections" && init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method])).toEqual([]);
     expect(new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost").searchParams.has("snapshotId")).toBe(false);
     expect(receipt.queryByText(/partial inventory|coverage unknown/i)).not.toBeInTheDocument();
   });
+
+  it.each(["capture", "page"] as const)("keeps one pending verification %s while switching between inventory consumers", async phase => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let deferNextRead = false;
+    let pendingResponse: Response | undefined;
+    let pendingSignal: AbortSignal | null | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const response = await base(input, init);
+      const path = new URL(input, "http://localhost").pathname;
+      if (deferNextRead && path === (phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory")) {
+        deferNextRead = false;
+        pendingResponse = response;
+        pendingSignal = init?.signal;
+        return pending.promise;
+      }
+      return response;
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+    await screen.findByText("Saved inventory verified");
+    const before = transport.fetchMock.mock.calls.length;
+    deferNextRead = true;
+    await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+    await waitFor(() => expect(pendingResponse).toBeDefined());
+    await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+    expect(pendingSignal?.aborted).toBe(false);
+    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+
+    await act(async () => pending.resolve(pendingResponse!));
+    await screen.findByText("Saved inventory verified");
+    const requests = transport.fetchMock.mock.calls.slice(before);
+    expect(requests.filter(([path]) => path === "/api/agent-inventory/selections")).toHaveLength(1);
+    expect(requests.filter(([path]) => new URL(path, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
+    expect(pendingSignal?.aborted).toBe(false);
+  });
+
+  it.each((["capture", "page"] as const).flatMap(phase =>
+    (["filter", "scope", "departure"] as const).map(boundary => ({ phase, boundary }))))(
+    "retires a pending verification $phase on $boundary and ignores its late denial", async ({ phase, boundary }) => {
+      window.history.replaceState({}, "", "/sync");
+      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let deferNextRead = false;
+      let pendingSignal: AbortSignal | null | undefined;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (deferNextRead && new URL(input, "http://localhost").pathname ===
+          (phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory")) {
+          deferNextRead = false;
+          pendingSignal = init?.signal;
+          return pending.promise;
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+      await screen.findByText("Saved inventory verified");
+      deferNextRead = true;
+      await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+      await waitFor(() => expect(pendingSignal).toBeDefined());
+      await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+      expect(pendingSignal?.aborted).toBe(false);
+      if (boundary === "filter") fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: agent.displayName } });
+      else if (boundary === "scope") await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
+      else {
+        await userEvent.click(screen.getByRole("button", { name: "Users" }));
+        await screen.findByRole("button", { name: "Ada" });
+      }
+      await waitFor(() => expect(pendingSignal?.aborted).toBe(true));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+      await receipt.findByText("Saved inventory verified");
+      const beforeLateResponse = transport.fetchMock.mock.calls.length;
+      await act(async () => pending.resolve(Response.json({
+        code: "unauthorized", detail: "Abandoned verification denied.",
+      }, { status: 401 })));
+      expect(receipt.getByText("Saved inventory verified")).toBeVisible();
+      expect(receipt.queryByRole("alert")).not.toBeInTheDocument();
+      expect(transport.meCalls()).toBe(1);
+      expect(transport.fetchMock.mock.calls.slice(beforeLateResponse)).toEqual([]);
+    },
+  );
 
   it("keeps Sync diagnostics and verification saved-only while the startup permission check is delayed", async () => {
     window.history.replaceState({}, "", "/sync");
@@ -2902,6 +4380,32 @@ describe("App session revalidation", () => {
       return url.pathname === "/api/agent-inventory" && url.searchParams.get("search") === "Sensitive"
         && url.searchParams.get("environmentId") === "env-a" && url.searchParams.get("cursor") === "fixture-page:50";
     })).toBe(true);
+  });
+
+  it("captures inventory only once when verifying from a later result page", async () => {
+    const page = { ...unifiedPage, counts: { ...unifiedPage.counts, filtered: 51 },
+      value: Array.from({ length: 51 }, (_, index) => ({ ...unifiedPage.value[0], id: `graph_packages:saved-${index}`,
+        displayName: `Saved agent ${index}`, packages: [{ ...agent, id: `saved-${index}` }] })) };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved agent 0");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText("Saved agent 50");
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("View diagnostics"));
+    const verify = screen.getByRole("button", { name: "Verify saved inventory" });
+    await waitFor(() => expect(verify).toBeEnabled());
+    const before = transport.fetchMock.mock.calls.length;
+    await userEvent.click(verify);
+    await waitFor(() => expect(verify).toBeEnabled());
+    const captures = transport.fetchMock.mock.calls.slice(before)
+      .filter(([path]) => path === "/api/agent-inventory/selections");
+    expect(captures).toHaveLength(1);
+    expect(captures[0][1]?.signal?.aborted).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByText("Saved agent 0")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeDisabled();
   });
 
   it.each([false, true])("keeps pending metadata visible without launching automatic provider backfill after Verify saved inventory (page correction: %s)", async correctPage => {
@@ -3009,6 +4513,74 @@ describe("App session revalidation", () => {
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
   });
+
+  it.each([
+    { boundary: "the same account", nextUser: viewer },
+    { boundary: "another account", nextUser: { ...viewer, homeAccountId: "replacement-account" } },
+    { boundary: "another tenant", nextUser: { ...viewer, tenantId: "replacement-tenant" } },
+  ].flatMap(owner => (["success", "denial"] as const).map(outcome => ({ ...owner, outcome }))))(
+    "retires a late verification $outcome after revalidating as $boundary without disturbing its replacement",
+    async ({ nextUser, outcome }) => {
+      window.history.replaceState({}, "", "/sync");
+      const page = verifiedSavedAgentPage();
+      const transport = appTransport({
+        revalidatedRoles: viewer.roles, revalidatedUser: nextUser, unifiedResponse: page, deferRevalidation: true,
+      });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const checkedAt = "2026-09-18T06:15:00.000Z";
+      let deferNextRead = false;
+      let replacementSession = false;
+      let retiredSignal: AbortSignal | null | undefined;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return base(input, init);
+        if (deferNextRead) {
+          deferNextRead = false;
+          retiredSignal = init?.signal;
+          return pending.promise;
+        }
+        const response = await base(input, init);
+        if (!replacementSession) return response;
+        const saved = await response.json() as UnifiedAgentInventoryPage;
+        return Response.json({ ...saved, verification: { ...saved.verification, checkedAt } });
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+      await screen.findByText("Saved inventory verified");
+      deferNextRead = true;
+      await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+      await waitFor(() => expect(retiredSignal).toBeDefined());
+      expect(retiredSignal?.aborted).toBe(false);
+      expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+
+      await act(async () => {
+        transport.failProtectedReadsWith = 401;
+        const expiredRequest = getAgents();
+        transport.failProtectedReadsWith = undefined;
+        await expect(expiredRequest).rejects.toMatchObject({ status: 401 });
+      });
+      await waitFor(() => expect(transport.meCalls()).toBe(2));
+      expect(retiredSignal?.aborted).toBe(true);
+      expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
+      replacementSession = true;
+      await act(async () => transport.releaseRevalidation());
+      await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+      const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+      await receipt.findByText("Saved inventory verified");
+      expect(receipt.getByText("Saved data verified at").nextElementSibling?.querySelector("time"))
+        .toHaveAttribute("datetime", checkedAt);
+      const beforeLateResponse = transport.fetchMock.mock.calls.length;
+      await act(async () => pending.resolve(outcome === "success" ? Response.json(page)
+        : Response.json({ code: "unauthorized", detail: "The previous session expired." }, { status: 401 })));
+      expect(receipt.getByText("Saved data verified at").nextElementSibling?.querySelector("time"))
+        .toHaveAttribute("datetime", checkedAt);
+      expect(receipt.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();
+      expect(transport.meCalls()).toBe(2);
+      expect(transport.fetchMock.mock.calls.slice(beforeLateResponse)).toEqual([]);
+    },
+  );
 
   it("keeps user collection in primary Sync navigation without duplicate page actions", async () => {
     window.history.replaceState({}, "", "/users");
@@ -3154,6 +4726,125 @@ describe("App session revalidation", () => {
     expect(restorePackageSelection(otherTenant, 1)).toEqual({ status: "restored", ids: ["other-tenant-package"] });
   });
 
+  it.each(["same principal", "another tenant"] as const)(
+    "does not restore saved job bookmarks after revalidating as %s",
+    async boundary => {
+      window.history.replaceState({}, "", "/sync?powerPlatformJob=previous-session-job");
+      const transport = appTransport({
+        revalidatedRoles: viewer.roles,
+        revalidatedUser: boundary === "another tenant" ? { ...viewer, tenantId: "tenant-2" } : viewer,
+      });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const path = "/api/inventory/refresh-jobs/previous-session-job";
+      transport.fetchMock.mockImplementation((input, init) => input === path
+        ? Promise.resolve(Response.json({ ...inventoryRefreshJob("failed", "previous-session-job"), message: "Previous session job details" }))
+        : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(/Previous session job details/);
+      await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+      await screen.findByText(agent.displayName);
+      const before = transport.fetchMock.mock.calls.filter(([input]) => input === path).length;
+      await revalidateTransportSession(transport);
+      await screen.findByText(agent.displayName);
+      await userEvent.click(screen.getByRole("button", { name: "Sync" }));
+      await screen.findByRole("heading", { name: "Sync history" });
+      expect(window.location.search).not.toContain("previous-session-job");
+      expect(screen.queryByText(/Previous session job details/)).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(before);
+    },
+  );
+
+  it.each(["active", "saved"] as const)("clears %s user detail routing on an account change", async state => {
+    window.history.replaceState({}, "", `/users?detail=${responsibilityOwnerId}&tab=responsibility`);
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles,
+      revalidatedUser: { ...viewer, homeAccountId: "replacement-viewer" },
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === `/api/copilot-usage/users/${responsibilityOwnerId}`) return Promise.resolve(Response.json({
+        code: "data_record_not_found", detail: "Record is not in the selected cohort.",
+      }, { status: 404 }));
+      if (input.startsWith("/api/agent-responsibility")) return Promise.resolve(Response.json(responsibilityFixture(responsibilityOwnerId)));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("dialog", { name: "Responsible only" });
+    if (state === "saved") await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    const before = transport.fetchMock.mock.calls.length;
+    await revalidateTransportSession(transport);
+    if (state === "saved") await userEvent.click(await screen.findByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(window.location.search).not.toContain(responsibilityOwnerId);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.slice(before).some(([input]) => input.includes(responsibilityOwnerId))).toBe(false);
+  });
+
+  it.each(["same", "replacement"] as const)("does not restore an earlier history selection after %s session revalidation", async account => {
+    window.history.replaceState({}, "", `/agents?selected=${agent.id}&q=Sensitive`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      revalidatedUser: account === "same" ? viewer : { ...viewer, homeAccountId: "replacement-viewer" },
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
+    const previous = { state: window.history.state, href: window.location.href };
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    await revalidateTransportSession(transport);
+    await screen.findByRole("button", { name: "Ada" });
+    act(() => {
+      window.history.pushState(previous.state, "", previous.href);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(new URLSearchParams(window.location.search).has("selected")).toBe(false);
+    expect(new URLSearchParams(window.location.search).get("q")).toBe("Sensitive");
+  });
+
+  it.each(["same", "replacement"] as const)("validates a persisted history entry against the %s account before restoring private routes", async account => {
+    window.history.replaceState({}, "", `/agents?selected=${agent.id}`);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const first = render(<App />);
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
+    first.unmount();
+    const next = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = next.fetchMock.getMockImplementation()!;
+    next.fetchMock.mockImplementation((input, init) => input === "/api/me"
+      ? Promise.resolve(Response.json({ user: { ...viewer, roles: ["AgentControl.Admin"],
+        homeAccountId: account === "same" ? viewer.homeAccountId : "replacement-viewer" },
+      csrfToken: "new-csrf", roleAssignmentRequired: false })) : base(input, init));
+    vi.stubGlobal("fetch", next.fetchMock);
+    render(<App />);
+    const selection = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    if (account === "same") expect(selection).toBeChecked();
+    else expect(selection).not.toBeChecked();
+    expect(new URLSearchParams(window.location.search).has("selected")).toBe(account === "same");
+  });
+
+  it.each(["agents", "users", "sync", "correction"] as const)("removes private %s deep links before the next sign-in", async view => {
+    const search = view === "agents" ? `?selected=${agent.id}&quarantineJob=previous-quarantine-job`
+      : view === "users" ? `?detail=${responsibilityOwnerId}&tab=responsibility`
+        : view === "correction" ? "?reports=import&correction=11111111-1111-4111-8111-111111111111"
+        : "?reports=snapshot&snapshot=11111111-1111-4111-8111-111111111111";
+    const path = view === "correction" ? "/sync" : `/${view}`;
+    window.history.replaceState({}, "", `${path}${search}`);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/auth/logout"
+      ? Promise.resolve(new Response(null, { status: 204 })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign out" }));
+    await screen.findByRole("button", { name: "Sign in with Entra ID" });
+    expect(window.location.pathname).toBe(path);
+    expect(window.location.search).toBe("");
+  });
+
   it.each([false, true])("keeps a restored unified agent detail open after the saved inventory resolves (Strict Mode: %s)", async reactStrictMode => {
     const detailId = unifiedPage.value[0].id;
     window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detailId)}`);
@@ -3253,9 +4944,260 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("dialog", { name: agent.displayName })).toBeInTheDocument();
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => unifiedDetailId(path) === detailId)).toBe(true);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/graph_packages"))).toBe(false);
   });
+
+  it.each(["close", "replace"] as const)("retires the previous detail immediately when browser history requests %s", async action => {
+    const current = { ...unifiedPage.value[0], id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    const replacement = powerPlatformRecord("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "Replacement agent");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([current]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => unifiedDetailId(input) === replacement.id
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    await screen.findByRole("dialog", { name: agent.displayName });
+    await waitFor(() => expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument());
+    act(() => {
+      window.history.pushState({}, "", action === "close" ? "/agents" : `/agents?detail=${encodeURIComponent(replacement.id)}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get("detail")).toBe(action === "close" ? null : replacement.id);
+    if (action === "replace") {
+      expect(await screen.findByText("Loading agent details...")).toBeVisible();
+      await act(async () => pending.resolve(Response.json(replacement)));
+      expect(await screen.findByRole("dialog", { name: replacement.displayName })).toBeVisible();
+    }
+  });
+
+  it.each(["pending", "settled"] as const)("preserves the same %s exact detail through tab-only browser history", async phase => {
+    const current = { ...unifiedPage.value[0], id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([current]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, agent.id)
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id))).toHaveLength(1));
+    const request = transport.fetchMock.mock.calls.find(([input]) => isPackageDetailRequest(input, agent.id))!;
+    if (phase === "settled") await act(async () => pending.resolve(Response.json({ ...agent, longDescription: "Retained detail" })));
+    act(() => {
+      window.history.pushState({}, "", `/agents?detail=${encodeURIComponent("agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")}&detailTab=controls`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.getByRole("dialog", { name: agent.displayName })).toBe(dialog);
+    expect(within(dialog).getByRole("tab", { name: "Manage" })).toHaveAttribute("aria-selected", "true");
+    expect(request[1]?.signal?.aborted).toBe(false);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id))).toHaveLength(1);
+    if (phase === "pending") await act(async () => pending.resolve(Response.json({ ...agent, longDescription: "Retained detail" })));
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Overview" }));
+    expect(await within(dialog).findByText("Retained detail")).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) !== null)).toHaveLength(0);
+  });
+
+  it("clears a failed bookmarked detail when browser history leaves that identity", async () => {
+    const id = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(id)}`);
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => unifiedDetailId(input) === id
+      ? Promise.resolve(Response.json({ code: "inventory_record_not_found", detail: "The bookmarked identity was withdrawn." }, { status: 404 }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText("The bookmarked identity was withdrawn.")).toBeVisible();
+    act(() => {
+      window.history.pushState({}, "", "/agents");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.queryByText("The bookmarked identity was withdrawn.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === id)).toHaveLength(1);
+  });
+
+  it("shares an off-page logical read between equivalent detail and quarantine bookmarks", async () => {
+    const native = powerPlatformRecord("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Shared bookmarked agent");
+    const alias = `power_platform:${native.environmentId}:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA`;
+    window.history.replaceState({}, "", `/agents?${new URLSearchParams({
+      detail: native.id, selectedResource: alias, inventorySnapshot: "pp-snapshot",
+    })}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => unifiedDetailId(input) === native.id
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Loading agent details...");
+    await screen.findByText(/Restoring 1 bookmarked quarantine selection/);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === native.id)).toHaveLength(1);
+    await act(async () => pending.resolve(Response.json(native)));
+    expect(await screen.findByRole("dialog", { name: native.displayName })).toBeVisible();
+    expect(await screen.findByText("1 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === native.id)).toHaveLength(1);
+  });
+
+  it("selects the exact encoded package alias rather than the first published version", async () => {
+    const second = { ...agent, id: "Opaque/Second%2Fversion", displayName: "Bookmarked publication" };
+    const group = { ...unifiedPage.value[0], id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", packages: [agent, second] };
+    window.history.replaceState({}, "", `/agents?${new URLSearchParams({ detail: "graph_packages:Opaque%2fSecond%252Fversion" })}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([group]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, second.id)
+      ? Promise.resolve(Response.json({ ...second, longDescription: "Exact bookmarked publication details" })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const dialog = await screen.findByRole("dialog", { name: group.displayName });
+    expect(await within(dialog).findByText("Exact bookmarked publication details")).toBeVisible();
+    expect(within(dialog).getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, agent.id))).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, second.id))).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) !== null)).toHaveLength(0);
+  });
+
+  it("shows and cancels loading for an off-page bookmarked agent", async () => {
+    const detailId = unifiedPage.value[0].id;
+    window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detailId)}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => unifiedDetailId(input) === detailId
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => unifiedDetailId(path) === detailId)).toBe(true));
+    expect(screen.getByText("Loading agent details...")).toBeVisible();
+    const request = transport.fetchMock.mock.calls.find(([path]) => unifiedDetailId(path) === detailId)!;
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(request[1]?.signal?.aborted).toBe(true);
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(Response.json(unifiedPage.value[0])));
+    expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
+  });
+
+  it.each(["logical detail", "package detail"] as const)(
+    "retires an inventory selection invalidated by bookmarked %s restoration", async phase => {
+      const offPage = { ...agent, id: "off-page-package", displayName: "Bookmarked agent" };
+      const detail = { ...unifiedPage.value[0], id: `graph_packages:${offPage.id}`, displayName: offPage.displayName, packages: [offPage] };
+      window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detail.id)}`);
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (unifiedDetailId(input) === detail.id) return phase === "logical detail" ? pending.promise : Promise.resolve(Response.json(detail));
+        if (isPackageDetailRequest(input, offPage.id)) return pending.promise;
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByRole("button", { name: `View details for ${agent.displayName}` });
+      const rejectedReads = () => transport.fetchMock.mock.calls.filter(([input]) => phase === "logical detail"
+        ? unifiedDetailId(input) === detail.id : isPackageDetailRequest(input, offPage.id));
+      await waitFor(() => expect(rejectedReads()).toHaveLength(1));
+      const previousSelection = currentInventorySelection(transport.fetchMock);
+      expect(screen.getByText("Loading agent details...")).toBeVisible();
+      await act(async () => pending.resolve(Response.json({
+        code: "selection_invalidated", detail: "Bookmarked inventory expired.",
+      }, { status: 409 })));
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+      expect(screen.queryByRole("button", { name: `View details for ${agent.displayName}` })).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+      expect(rejectedReads()).toHaveLength(1);
+      await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+      expect(await screen.findByRole("button", { name: `View details for ${agent.displayName}` })).toBeVisible();
+      expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(rejectedReads()).toHaveLength(1);
+      expect(refreshRequests(transport.fetchMock)).toEqual([]);
+    },
+  );
+
+  it.each(["logical detail", "package detail"] as const)(
+    "keeps saved inventory usable after an ordinary bookmarked %s failure", async phase => {
+      const offPage = { ...agent, id: "off-page-package", displayName: "Bookmarked agent" };
+      const detail = { ...unifiedPage.value[0], id: `graph_packages:${offPage.id}`, displayName: offPage.displayName, packages: [offPage] };
+      window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detail.id)}`);
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const failure = () => Response.json({ code: "saved_details_unavailable", detail: "Bookmarked details unavailable." }, { status: 503 });
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (unifiedDetailId(input) === detail.id) return Promise.resolve(phase === "logical detail" ? failure() : Response.json(detail));
+        if (isPackageDetailRequest(input, offPage.id)) return Promise.resolve(failure());
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Bookmarked details unavailable.");
+      expect(screen.getByRole("button", { name: `View details for ${agent.displayName}` })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === detail.id)).toHaveLength(1);
+      expect(refreshRequests(transport.fetchMock)).toEqual([]);
+    },
+  );
+
+  it.each(["pending", "settled"] as const)(
+    "does not retire %s replacement inventory for a late bookmarked-detail invalidation", async phase => {
+      const offPage = { ...agent, id: "off-page-package", displayName: "Bookmarked agent" };
+      const detail = { ...unifiedPage.value[0], id: `graph_packages:${offPage.id}`, displayName: offPage.displayName, packages: [offPage] };
+      window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detail.id)}`);
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse(), replacement = deferredResponse();
+      let replacing = false;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (unifiedDetailId(input) === detail.id) return replacing ? Response.json(detail) : pending.promise;
+        if (isPackageDetailRequest(input, offPage.id)) return Response.json(offPage);
+        const response = await base(input, init);
+        if (replacing && new URL(input, "http://localhost").pathname === "/api/agent-inventory") await replacement.promise;
+        return response;
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === detail.id)).toHaveLength(1));
+      const oldSignal = transport.fetchMock.mock.calls.find(([input]) => unifiedDetailId(input) === detail.id)?.[1]?.signal;
+      const previousSelection = currentInventorySelection(transport.fetchMock);
+      replacing = true;
+      await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
+      const inventoryReads = () => transport.fetchMock.mock.calls.filter(
+        ([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory",
+      );
+      await waitFor(() => expect(inventoryReads()).toHaveLength(2));
+      const replacementSignal = inventoryReads()[1][1]?.signal;
+      if (phase === "settled") await act(async () => replacement.resolve(Response.json({})));
+      await act(async () => pending.resolve(Response.json({
+        code: "selection_invalidated", detail: "Obsolete bookmark selection expired.",
+      }, { status: 409 })));
+      expect(replacementSignal?.aborted).toBe(false);
+      if (phase === "pending") await act(async () => replacement.resolve(Response.json({})));
+      expect(await screen.findByRole("button", { name: `View details for ${agent.displayName}` })).toBeVisible();
+      expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      expect(screen.queryByRole("heading", { name: "Agent inventory unavailable" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(await screen.findByRole("dialog", { name: offPage.displayName })).toBeVisible();
+      expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+      expect(oldSignal?.aborted).toBe(true);
+      expect(inventoryReads()).toHaveLength(2);
+      expect(refreshRequests(transport.fetchMock)).toEqual([]);
+    },
+  );
 
   it.each([false, true])("validates exact source-qualified package identity (matching: %s)", async matching => {
     window.history.replaceState({}, "", `/agents?detail=${agent.id}`);
@@ -3360,6 +5302,50 @@ describe("App session revalidation", () => {
     expect(transport.meCalls()).toBe(1);
   });
 
+  it("clears a failed sign-out error when retrying and after leaving the session", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let signOuts = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/auth/logout") return ++signOuts === 1
+        ? Promise.resolve(Response.json({ code: "invalid_origin", detail: "Previous session sign-out was rejected." }, { status: 403 }))
+        : pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign out" }));
+    await screen.findByText("Previous session sign-out was rejected.");
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(screen.queryByText("Previous session sign-out was rejected.")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(new Response(null, { status: 204 })));
+    await screen.findByRole("button", { name: "Sign in with Entra ID" });
+    expect(screen.queryByText("Previous session sign-out was rejected.")).not.toBeInTheDocument();
+    expect(transport.meCalls()).toBe(1);
+  });
+
+  it.each(["success", "failure"] as const)("ignores a late logout %s after a concurrent session denial", async outcome => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/auth/logout"
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    transport.failProtectedReadsWith = 401;
+    await act(async () => { await expect(getAgents()).rejects.toMatchObject({ status: 401 }); });
+    await screen.findByRole("button", { name: "Sign in with Entra ID" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(outcome === "success" ? new Response(null, { status: 204 })
+      : Response.json({ code: "invalid_origin", detail: "Previous session logout failed." }, { status: 403 })));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+    expect(transport.meCalls()).toBe(1);
+  });
+
   it("does not issue protected deep-link reads for an unassigned session", async () => {
     window.history.replaceState({}, "", "/agents?detail=package-private&refreshJob=private-job&selected=package-private");
     const transport = appTransport({ initialRoles: [], revalidatedRoles: [] });
@@ -3398,6 +5384,267 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Manage access for/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Block Sensitive/ })).not.toBeInTheDocument();
+  });
+
+  it.each(["capture", "page"] as const)("does not restart a pending bulk-reference %s for equivalent input", async phase => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let response: Response | undefined;
+    let signal: AbortSignal | null | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const isCapture = input === "/api/agent-inventory/selections"
+        && JSON.parse(String(init?.body)).query.operationIdPrefix === "a5331a93";
+      const url = selectedInventoryUrl(input);
+      const isPage = url.pathname === "/api/agent-inventory" && url.searchParams.get("operationIdPrefix") === "a5331a93";
+      if (phase === "capture" ? isCapture : isPage) {
+        response = await base(input, init);
+        signal = init?.signal;
+        return pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    fireEvent.change(search, { target: { value: "a5331a93" } });
+    await waitFor(() => expect(response).toBeDefined());
+    const requestSignal = signal;
+    const requests = transport.fetchMock.mock.calls.length;
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("Updating...");
+    fireEvent.change(search, { target: { value: " REF A5331A93 " } });
+    await act(async () => {});
+    expect(requestSignal?.aborted).toBe(false);
+    expect(transport.fetchMock.mock.calls).toHaveLength(requests);
+    await act(async () => pending.resolve(response!));
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections")).toHaveLength(2);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+  });
+
+  it("preserves bulk-reference paging and matching selection for equivalent input", async () => {
+    window.history.replaceState({}, "", "/agents?q=a5331a93");
+    const reads = vi.spyOn(AgentInventoryQueries.prototype, "read");
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const records = Array.from({ length: 51 }, (_, index) => ({
+      ...unifiedPage.value[0], id: `graph_packages:bulk-package-${index}`, displayName: `Bulk agent ${index}`,
+      packages: [{ ...agent, id: `bulk-package-${index}` }],
+    }));
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles, unifiedResponse: unifiedRecordsPage(records) });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Bulk agent 0");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText("Bulk agent 50");
+    await userEvent.click(screen.getByRole("button", { name: "Select all 51 matching published versions" }));
+    const previousReads = agentListRequests(transport.fetchMock).length;
+    for (const value of ["A5331A93", "ref a5331a93", " REF A5331A93 "]) {
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value } });
+      await act(async () => {});
+      expect(new URLSearchParams(window.location.search).get("page")).toBe("2");
+      expect(screen.getByText("Bulk agent 50")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Clear all-matching package selection" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+      expect(agentListRequests(transport.fetchMock)).toHaveLength(previousReads);
+    }
+    const beforeChange = reads.mock.calls.length;
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "b5331a93" } });
+    await screen.findByText("Bulk agent 0");
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Clear all-matching package selection" })).not.toBeInTheDocument();
+    expect(reads.mock.calls.slice(beforeChange).map(([, query]) => query.operationIdPrefix)).toEqual(["b5331a93"]);
+  });
+
+  it("shows loading rather than an empty bulk-reference result while the next reference is pending", async () => {
+    window.history.replaceState({}, "", "/agents?q=a5331a93");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let delayRead = true;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = selectedInventoryUrl(input);
+      return delayRead && url.pathname === "/api/agent-inventory" && url.searchParams.get("operationIdPrefix") === "b5331a93"
+        ? pending.promise : base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("heading", { name: "No matching agents" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "b5331a93" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    expect(screen.queryByRole("heading", { name: "No matching agents" })).not.toBeInTheDocument();
+    expect(screen.getByText("Loading Copilot agents...")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    await act(async () => pending.resolve(Response.json({
+      code: "inventory_read_failed", detail: "Bulk-reference inventory could not be loaded.",
+    }, { status: 503 })));
+    expect(screen.getByText(/^Bulk-reference inventory could not be loaded\./)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "No matching agents" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("Unavailable");
+    expect(screen.queryByText("Loading Copilot agents...")).not.toBeInTheDocument();
+    const rejectedSelection = currentInventorySelection(transport.fetchMock);
+    delayRead = false;
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await screen.findByRole("heading", { name: "No matching agents" });
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(rejectedSelection);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(3);
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("0 matching agents");
+    expect(screen.queryByText(/^Bulk-reference inventory could not be loaded\./)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "a5331a93" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(4));
+    await waitFor(() => expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("0 matching agents"));
+  });
+
+  it.each(["capture", "page"] as const)("does not select retained rows as matching after a bulk-reference %s fails", async phase => {
+    window.history.replaceState({}, "", "/agents?q=a5331a93");
+    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const isCapture = input === "/api/agent-inventory/selections"
+        && JSON.parse(String(init?.body)).query.operationIdPrefix === "b5331a93";
+      const url = selectedInventoryUrl(input);
+      const isPage = url.pathname === "/api/agent-inventory" && url.searchParams.get("operationIdPrefix") === "b5331a93";
+      return (phase === "capture" ? isCapture : isPage) ? Promise.resolve(Response.json({
+        code: "inventory_read_failed", detail: "The requested reference could not be loaded.",
+      }, { status: 503 })) : base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const originalSelection = currentInventorySelection(transport.fetchMock);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "b5331a93" } });
+    await screen.findByText(/^The requested reference could not be loaded\./);
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("Unavailable");
+    const selectMatching = screen.getByRole("button", { name: "Select all 1 matching published versions" });
+    expect(selectMatching).toBeDisabled();
+    await userEvent.click(selectMatching);
+    expect(screen.queryByRole("region", { name: "Exact package bulk actions" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    const reads = agentListRequests(transport.fetchMock).length;
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: " REF A5331A93 " } });
+    await waitFor(() => expect(selectMatching).toBeEnabled());
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent("1 matching agent");
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+    await userEvent.click(selectMatching);
+    expect(restorePackageSelection({ ...viewer, roles }, 1)).toMatchObject({
+      status: "restored", inventory: { id: originalSelection, allMatching: true },
+    });
+  });
+
+  it("disables existing all-matching actions after a bulk-reference page read fails", async () => {
+    window.history.replaceState({}, "", "/agents?q=a5331a93");
+    const records = Array.from({ length: 51 }, (_, index) => ({
+      ...unifiedPage.value[0], id: `graph_packages:bulk-package-${index}`, displayName: `Bulk agent ${index}`,
+      packages: [{ ...agent, id: `bulk-package-${index}` }],
+    }));
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = selectedInventoryUrl(input);
+      if (url.pathname === "/api/agent-inventory") return Promise.resolve(url.searchParams.has("cursor")
+        ? Response.json({ code: "inventory_read_failed", detail: "The next reference page could not be loaded." }, { status: 503 })
+        : Response.json(filterUnifiedResponse(unifiedRecordsPage(records), input)));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Bulk agent 0");
+    await userEvent.click(screen.getByRole("button", { name: "Select all 51 matching published versions" }));
+    expect(screen.getByRole("button", { name: "Block selected packages" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText(/^The next reference page could not be loaded\./);
+    const calls = transport.fetchMock.mock.calls.length;
+    const actions = within(screen.getByRole("region", { name: "Exact package bulk actions" }));
+    for (const name of ["Block selected packages", "Unblock selected packages", "Manage access"]) {
+      const button = actions.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      await userEvent.click(button);
+    }
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls).toHaveLength(calls);
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Select all 51 matching published versions" })).toBeEnabled());
+    expect(screen.queryByRole("region", { name: "Exact package bulk actions" })).not.toBeInTheDocument();
+  });
+
+  it.each(["success", "failure"] as const)("discards a replaced bulk-reference %s without poisoning the next search", async outcome => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let delayPrevious = true;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = selectedInventoryUrl(input);
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.has("operationIdPrefix")) {
+        if (delayPrevious && url.searchParams.get("operationIdPrefix") === "a5331a93") return pending.promise;
+        return Promise.resolve(Response.json(selectedInventoryPage(input, unifiedRecordsPage([{
+          ...unifiedPage.value[0], displayName: "Current reference agent",
+        }]))));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    fireEvent.change(search, { target: { value: "a5331a93" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    const previous = agentListRequests(transport.fetchMock).at(-1)!;
+    fireEvent.change(search, { target: { value: "b5331a93" } });
+    await screen.findByText("Current reference agent");
+    expect(previous[1]?.signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(outcome === "success" ? Response.json(selectedInventoryPage(previous[0], unifiedPage))
+      : Response.json({ code: "unauthorized", detail: "Previous reference denied." }, { status: 401 })));
+    expect(screen.getByText("Current reference agent")).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.queryByText("Previous reference denied.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(transport.meCalls()).toBe(1);
+    delayPrevious = false;
+    fireEvent.change(search, { target: { value: "ref a5331a93" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(4));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    fireEvent.change(search, { target: { value: "REF B5331A93" } });
+    await act(async () => {});
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(4);
+    expect(screen.getByText("Current reference agent")).toBeVisible();
+  });
+
+  it("retires bulk-reference rows and pending reads across account changes", async () => {
+    window.history.replaceState({}, "", "/agents?q=a5331a93");
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, revalidatedUser: { ...viewer, homeAccountId: "replacement-account" },
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = selectedInventoryUrl(input);
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("operationIdPrefix") === "b5331a93") {
+        return transport.meCalls() === 1 ? pending.promise : Promise.resolve(Response.json(selectedInventoryPage(input,
+          unifiedRecordsPage([{ ...unifiedPage.value[0], displayName: "Replacement account reference" }]))));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const originalSelection = currentInventorySelection(transport.fetchMock);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "b5331a93" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    const previous = agentListRequests(transport.fetchMock).at(-1)!;
+    await revalidateTransportSession(transport);
+    await screen.findByText("Replacement account reference");
+    expect(previous[1]?.signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(Response.json(selectedInventoryPage(previous[0], unifiedPage))));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.getByText("Replacement account reference")).toBeVisible();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "ref a5331a93" } });
+    await screen.findByText(agent.displayName);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(4);
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(originalSelection);
   });
 
   it("retires Security bookmarks to Agents without restoring tenant hunt filters or running a hunt", async () => {
@@ -3499,6 +5746,28 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).endsWith("/download") || String(path).includes("export.csv"))).toBe(false);
   });
 
+  it("retries a failed inventory export admission with the same intent and without reloading saved inventory", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let admissions = 0;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/data-exports" && ++admissions === 1
+      ? Promise.resolve(Response.json({ code: "request_failed", detail: "Admission response unavailable." }, { status: 500 })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await screen.findByText("Admission response unavailable.");
+    const first = inventoryExportRequest(transport.fetchMock);
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reload saved agent inventory" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry export request" }));
+    await waitFor(() => expect(admissions).toBe(2));
+    expect(inventoryExportRequest(transport.fetchMock)).toEqual(first);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    expect(screen.queryByText("Admission response unavailable.")).not.toBeInTheDocument();
+  });
+
   it("invalidates an export selection without automatic readmission and requires an explicit saved-data reload", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -3520,6 +5789,50 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(1);
   });
 
+  it.each([false, true])("does not invalidate a replacement inventory when an older export expires (replacement pending: %s)", async pendingReplacement => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const admission = deferredResponse();
+    const replacement = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/data-exports") return admission.promise;
+      const url = selectedInventoryUrl(input);
+      if (pendingReplacement && url.pathname === "/api/agent-inventory" && url.searchParams.get("search") === "Sensitive") {
+        return replacement.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(1));
+    const previousSelection = inventoryExportRequest(transport.fetchMock).selectionId;
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    const replacementRequest = agentListRequests(transport.fetchMock).at(-1)!;
+    if (!pendingReplacement) {
+      await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+      await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    }
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
+    await act(async () => admission.resolve(Response.json({ code: "selection_invalidated", detail: "Previous selection expired." }, { status: 409 })));
+    expect(replacementRequest[1]?.signal?.aborted).toBe(false);
+    if (pendingReplacement) {
+      await act(async () => replacement.resolve(Response.json(selectedInventoryPage(replacementRequest[0], unifiedPage))));
+    }
+    expect(screen.getByText(agent.displayName)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Reload saved agent inventory" })).not.toBeInTheDocument();
+    if (!pendingReplacement) expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(1);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "" } });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(3));
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
+  });
+
   it("uses authorized bulk references for package lists and unified agent exports", async () => {
     window.history.replaceState({}, "", "/agents?q=ref+a5331a93");
     const transport = appTransport({
@@ -3527,9 +5840,7 @@ describe("App session revalidation", () => {
       revalidatedRoles: ["AgentControl.Viewer"],
     });
     vi.stubGlobal("fetch", transport.fetchMock);
-    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:package-export") });
-    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    mockCsvDownload();
     render(<App />);
 
     expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
@@ -3678,8 +5989,8 @@ describe("App session revalidation", () => {
     }]));
     const page = { ...unifiedRecordsPage([row]), identityCollection: {
       checkedPackages: 0, pendingPackages: 1, pendingDetails: { missing: 0, stale: 1, invalidated: 0 } },
-      verification: { ...createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0,
-        logicalAgentCount: 1 }, { packageMetadata: false }), status: "details_pending" as const } };
+      verification: createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0,
+        logicalAgentCount: 1 }, { packageMetadata: false }) };
     const transport = appTransport({ initialRoles: viewer.roles, revalidatedRoles: viewer.roles, unifiedResponse: page });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -3782,7 +6093,8 @@ describe("App session revalidation", () => {
         exports += 1;
         if (exports === 1) {
           unifiedPage.selection.revision = "b".repeat(64);
-          return Response.json({ code: "selection_invalidated", detail: `${invalidation} invalidated the export.` }, { status: 409 });
+          return Response.json({ code: invalidation === "missing-reference" ? "export_selection_changed" : "selection_invalidated",
+            detail: `${invalidation} invalidated the export.` }, { status: 409 });
         }
       }
       return base(input, init);
@@ -3970,6 +6282,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Export PP agent inventory CSV" }));
 
+    expect(screen.queryByRole("dialog", { name: "Inventory diagnostics" })).not.toBeInTheDocument();
     await completeNativeInventoryDownload(download);
     expect(inventoryExportRequest(transport.fetchMock)).toEqual({
       selectionId: currentInventorySelection(transport.fetchMock), kind: "power_platform_agents", idempotencyKey: expect.any(String),
@@ -3978,6 +6291,482 @@ describe("App session revalidation", () => {
       environmentId: encodeInventoryFacet("env-a"), search: "linked",
     });
     expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("export.csv"))).toBe(false);
+  });
+
+  it.each(["pending", "failed"] as const)("exposes %s Power Platform export recovery outside diagnostics", async outcome => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/data-exports" && init?.method === "POST"
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Export PP agent inventory CSV" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.queryByRole("dialog", { name: "Inventory diagnostics" })).not.toBeInTheDocument();
+    const admitted = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-exports");
+    expect(admitted).toHaveLength(1);
+    if (outcome === "pending") {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel export" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(admitted[0][1]?.signal?.aborted).toBe(true);
+      expect(screen.getByRole("alert")).toHaveTextContent("Export request cancelled.");
+      await act(async () => pending.resolve(Response.json({ id: "abandoned-export" }, { status: 202 })));
+      await act(() => vi.advanceTimersByTimeAsync(3000));
+      expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("abandoned-export"))).toBe(false);
+    } else {
+      await act(async () => pending.resolve(Response.json({
+        code: "export_unavailable", detail: "Export admission is temporarily unavailable.",
+      }, { status: 500 })));
+      expect(screen.getByRole("alert")).toHaveTextContent("Export admission is temporarily unavailable.");
+      expect(screen.getByRole("button", { name: "Retry export request" })).toBeEnabled();
+    }
+  });
+
+  it.each(["Refresh agents", "Refresh PP agent inventory"] as const)(
+    "shows a failed %s command inside the still-open diagnostics and clears it on explicit retry",
+    async action => {
+      const transport = action === "Refresh agents" ? initialCatalogTransport()
+        : appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const path = action === "Refresh agents" ? "/api/agents/refresh-jobs" : "/api/inventory/refresh-jobs";
+      let attempts = 0;
+      transport.fetchMock.mockImplementation((input, init) => input === path && init?.method === "POST"
+        ? ++attempts === 1 ? Promise.resolve(Response.json({
+          code: "refresh_unavailable", detail: "Source refresh is temporarily unavailable.",
+        }, { status: 503 })) : pending.promise
+        : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      const dialog = within(screen.getByRole("dialog", { name: "Inventory diagnostics" }));
+      await waitFor(() => expect(dialog.getByRole("button", { name: action })).toBeEnabled());
+      await userEvent.click(dialog.getByRole("button", { name: action }));
+      expect(await dialog.findByRole("alert")).toHaveTextContent("Source refresh is temporarily unavailable.");
+      expect(dialog.getByText("Total").nextElementSibling).toHaveTextContent("1");
+      await userEvent.click(dialog.getByRole("button", { name: action }));
+      expect(dialog.queryByRole("alert")).not.toBeInTheDocument();
+      expect(attempts).toBe(2);
+      await act(async () => pending.resolve(Response.json(action === "Refresh agents"
+        ? completedRefreshJob() : inventoryRefreshJob("succeeded"))));
+    },
+  );
+
+  it.each(["Refresh agents", "Refresh matching details", "Refresh PP agent inventory", "Resume PP agent refresh"] as const)(
+    "admits only one same-batch %s request without cancelling the accepted command",
+    async action => {
+      const graph = action === "Refresh agents" || action === "Refresh matching details";
+      const transport = graph ? initialCatalogTransport() : appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const previousJob = inventoryRefreshJob("waiting_authorization");
+      const path = action === "Refresh agents" ? "/api/agents/refresh-jobs"
+        : action === "Refresh matching details" ? "/api/agents/refresh-selection"
+          : action === "Resume PP agent refresh" ? `/api/inventory/refresh-jobs/${previousJob.id}/resume`
+            : "/api/inventory/refresh-jobs";
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === path && init?.method === "POST") return pending.promise;
+        if (input === "/api/inventory/refresh-jobs" && !init?.method) return Promise.resolve(Response.json({
+          value: [previousJob], lastAttemptAt: null, lastSuccessAt: null,
+        }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      const button = screen.getByRole("button", { name: action });
+      await waitFor(() => expect(button).toBeEnabled());
+      act(() => { button.click(); button.click(); });
+      const commands = () => transport.fetchMock.mock.calls.filter(([input, init]) => input === path && init?.method === "POST");
+      await waitFor(() => expect(commands()).toHaveLength(1));
+      expect(commands()[0][1]?.signal?.aborted).toBe(false);
+      await act(async () => pending.resolve(Response.json(graph ? completedRefreshJob() : inventoryRefreshJob("succeeded"))));
+      await waitFor(() => expect(screen.queryByRole("button", { name: graph ? "Refreshing agents" : "Refreshing PP agents..." })).not.toBeInTheDocument());
+      expect(commands()).toHaveLength(1);
+    },
+  );
+
+  it("does not admit a Power Platform export from the inventory being replaced by a same-batch verification", async () => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: {
+      ...unifiedPage,
+      sources: { ...unifiedPage.sources, powerPlatform: {
+        state: "available", observation: powerPlatformSnapshot(), error: null,
+      } },
+    } });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let verifying = false;
+    transport.fetchMock.mockImplementation((input, init) =>
+      verifying && input === "/api/agent-inventory/selections" ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+    const exportButton = screen.getByRole("button", { name: "Export PP agent inventory CSV" });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    verifying = true;
+    act(() => {
+      screen.getByRole("button", { name: "Verify saved inventory" }).click();
+      exportButton.click();
+    });
+    await waitFor(() => expect(exportButton).toBeDisabled());
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(0);
+    await act(async () => pending.resolve(Response.json({
+      code: "unavailable", detail: "Saved inventory temporarily unavailable.",
+    }, { status: 503 })));
+    expect(exportButton).toBeDisabled();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-exports")).toHaveLength(0);
+  });
+
+  it.each(["succeeded", "failed", "cancelled"] as const)(
+    "uses one observer for an inspected latest source job and reloads only a %s publication",
+    async outcome => {
+      vi.useFakeTimers();
+      const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      window.history.replaceState({}, "", `/sync?powerPlatformJob=${id.toUpperCase()}`);
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      let currentJob = inventoryRefreshJob("running", id);
+      const path = `/api/inventory/refresh-jobs/${currentJob.id}`;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input.toLowerCase() === path) return Promise.resolve(Response.json(currentJob));
+        if (input === "/api/inventory/refresh-jobs") return Promise.resolve(Response.json({
+          value: [currentJob], lastAttemptAt: null, lastSuccessAt: null,
+        }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const reads = () => transport.fetchMock.mock.calls.filter(([input]) => input.toLowerCase() === path).length;
+      const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+      expect(reads()).toBe(1);
+      expect(within(screen.getByRole("region", { name: "Power Platform source job" })).getByRole("status")).toHaveTextContent("running");
+      const before = captures();
+      await act(() => vi.advanceTimersByTimeAsync(2500));
+      expect(reads()).toBe(2);
+      expect(captures()).toBe(before);
+      currentJob = inventoryRefreshJob(outcome, currentJob.id);
+      await act(() => vi.advanceTimersByTimeAsync(2500));
+      expect(reads()).toBe(3);
+      expect(captures()).toBe(before + (outcome === "succeeded" ? 1 : 0));
+      fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      expect(screen.getByText(new RegExp(`Latest agent refresh: ${outcome}`))).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Close inventory diagnostics" }));
+      fireEvent.click(screen.getByRole("button", { name: "Close source job" }));
+      await act(() => vi.advanceTimersByTimeAsync(5000));
+      expect(reads()).toBe(3);
+      expect(captures()).toBe(before + (outcome === "succeeded" ? 1 : 0));
+    },
+  );
+
+  it.each(["success", "authorization failure"] as const)(
+    "cancels the superseded background source read and ignores its late %s after exact-job cancellation",
+    async outcome => {
+      vi.useFakeTimers();
+      window.history.replaceState({}, "", "/sync");
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let currentJob = inventoryRefreshJob("running");
+      let reads = 0;
+      const path = `/api/inventory/refresh-jobs/${currentJob.id}`;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === path) return ++reads === 1 ? pending.promise : Promise.resolve(Response.json(currentJob));
+        if (input === `${path}/cancel`) {
+          currentJob = inventoryRefreshJob("cancelled");
+          return Promise.resolve(Response.json(currentJob));
+        }
+        if (input === "/api/inventory/refresh-jobs") return Promise.resolve(Response.json({
+          value: [currentJob], lastAttemptAt: null, lastSuccessAt: null,
+        }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      await act(() => vi.advanceTimersByTimeAsync(2500));
+      const retired = transport.fetchMock.mock.calls.find(([input]) => input === path)!;
+      expect(reads).toBe(1);
+      currentJob = inventoryRefreshJob("waiting_authorization");
+      fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      fireEvent.click(screen.getByRole("button", { name: "Inspect source job" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(retired[1]?.signal?.aborted).toBe(true);
+      const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+      const before = captures();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel source job" }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(within(screen.getByRole("region", { name: "Power Platform source job" })).getByRole("status")).toHaveTextContent("cancelled");
+      expect(captures()).toBe(before);
+      const sessions = transport.meCalls();
+      await act(async () => pending.resolve(outcome === "success"
+        ? Response.json(inventoryRefreshJob("succeeded"))
+        : Response.json({ code: "unauthorized", detail: "Retired source read." }, { status: 401 })));
+      expect(transport.meCalls()).toBe(sessions);
+      expect(captures()).toBe(before);
+      fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      expect(screen.getByText(/Latest agent refresh: cancelled/)).toBeVisible();
+    },
+  );
+
+  it("reconciles an inspected completion that arrives before older latest-job history", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync?powerPlatformJob=inspected-job");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const pendingExact = deferredResponse();
+    const completed = inventoryRefreshJob("succeeded", "inspected-job");
+    let delayHistory = true;
+    const path = `/api/inventory/refresh-jobs/${completed.id}`;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === path) return pendingExact.promise;
+      if (input === "/api/inventory/refresh-jobs") return delayHistory ? pending.promise.then(response => response.clone())
+        : Promise.resolve(Response.json({ value: [completed], lastAttemptAt: null, lastSuccessAt: null }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await act(async () => pendingExact.resolve(Response.json(completed)));
+    expect(within(screen.getByRole("region", { name: "Power Platform source job" })).getByRole("status")).toHaveTextContent("succeeded");
+    expect(captures()).toBe(before + 1);
+    delayHistory = false;
+    await act(async () => pending.resolve(Response.json({
+      value: [inventoryRefreshJob("running", completed.id)], lastAttemptAt: null, lastSuccessAt: null,
+    })));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText(/Latest agent refresh: succeeded/)).toBeVisible();
+    expect(captures()).toBe(before + 1);
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(1);
+    expect(captures()).toBe(before + 1);
+  });
+
+  it.each([
+    ["succeeded", "same-job"], ["succeeded", "new-job"],
+    ["failed", "same-job"], ["cancelled", "same-job"], ["waiting_authorization", "same-job"],
+  ] as const)("reconciles a history-discovered %s %s without retaining stale inventory or reloading twice", async (status, id) => {
+    vi.useFakeTimers();
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let latest = inventoryRefreshJob("running", "same-job");
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/inventory/refresh-jobs"
+      ? Promise.resolve(Response.json({ value: [latest], lastAttemptAt: null, lastSuccessAt: null })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    const before = captures();
+    latest = inventoryRefreshJob(status, id);
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText(new RegExp(`Latest agent refresh: ${status.replaceAll("_", " ")}`))).toBeVisible();
+    const expected = before + (status === "succeeded" ? 1 : 0);
+    expect(captures()).toBe(expected);
+    fireEvent.click(screen.getByRole("button", { name: "Close inventory diagnostics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(captures()).toBe(expected);
+    expect(transport.fetchMock.mock.calls.some(([input, init]) => input === "/api/inventory/refresh-jobs"
+      && init?.method === "POST")).toBe(false);
+  });
+
+  it("reconciles a completed non-latest source bookmark once per session without reloading it on reopening", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const completed = inventoryRefreshJob("succeeded", "completed-bookmark");
+    const latest = inventoryRefreshJob("waiting_authorization", "newer-job");
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === `/api/inventory/refresh-jobs/${completed.id}`) return Promise.resolve(Response.json(completed));
+      if (input === "/api/inventory/refresh-jobs") return Promise.resolve(Response.json({
+        value: [latest, completed], lastAttemptAt: null, lastSuccessAt: null,
+      }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    const before = captures();
+    const open = () => {
+      window.history.pushState({}, "", `/sync?powerPlatformJob=${completed.id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    };
+    act(open);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(within(screen.getByRole("region", { name: "Power Platform source job" })).getByRole("status")).toHaveTextContent("succeeded");
+    expect(captures()).toBe(before + 1);
+    fireEvent.click(screen.getByRole("button", { name: "Close source job" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    act(open);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(captures()).toBe(before + 1);
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText(/Latest agent refresh: waiting authorization/)).toBeVisible();
+    await revalidateTransportSession(transport);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const afterRevalidation = captures();
+    act(open);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(captures()).toBe(afterRevalidation + 1);
+    expect(transport.fetchMock.mock.calls.some(([input, init]) => input === "/api/inventory/refresh-jobs" && init?.method === "POST")).toBe(false);
+  });
+
+  it("hands commands to the source inspector only after workspace admission settles", async () => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const waiting = inventoryRefreshJob("waiting_authorization");
+    const path = `/api/inventory/refresh-jobs/${waiting.id}`;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === `${path}/resume`) return pending.promise;
+      if (input === path) return Promise.resolve(Response.json(waiting));
+      if (input === "/api/inventory/refresh-jobs") return Promise.resolve(Response.json({
+        value: [waiting], lastAttemptAt: null, lastSuccessAt: null,
+      }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Resume PP agent refresh" }));
+    await userEvent.click(screen.getByRole("button", { name: "Inspect source job" }));
+    expect(screen.getByText("Waiting for the current source command…")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Resume source job" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(0);
+    await act(async () => pending.resolve(Response.json(waiting)));
+    expect(await screen.findByRole("button", { name: "Resume source job" })).toBeEnabled();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByRole("button", { name: "Resume PP agent refresh" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh PP agent inventory" })).toBeDisabled();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `${path}/resume`)).toHaveLength(1);
+  });
+
+  it.each(["running", "waiting_authorization", "succeeded", "failed", "cancelled"] as const)(
+    "hands a retried %s source job to the inspector without discarding or rereading its response",
+    async status => {
+      vi.useFakeTimers();
+      const initial = inventoryRefreshJob("failed", "failed-job");
+      const submitted = { ...inventoryRefreshJob(status, "new-job"), message: "Accepted new source refresh" };
+      window.history.replaceState({}, "", `/sync?powerPlatformJob=${initial.id}`);
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const path = `/api/inventory/refresh-jobs/${submitted.id}`;
+      let latest = initial;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === `/api/inventory/refresh-jobs/${initial.id}`) return Promise.resolve(Response.json(initial));
+        if (input === path) return Promise.resolve(Response.json({ code: "unavailable", detail: "Status read failed." }, { status: 503 }));
+        if (input === "/api/inventory/refresh-jobs") {
+          if (init?.method === "POST") {
+            latest = submitted;
+            return Promise.resolve(Response.json(submitted));
+          }
+          return Promise.resolve(Response.json({ value: [latest], lastAttemptAt: null, lastSuccessAt: null }));
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+      const before = captures();
+      const retry = screen.getByRole("button", { name: "Start a new source refresh" });
+      act(() => { retry.click(); retry.click(); });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const inspector = within(screen.getByRole("region", { name: "Power Platform source job" }));
+      expect(inspector.getByRole("status")).toHaveTextContent(`${status.replaceAll("_", " ")} — Accepted new source refresh`);
+      expect(new URLSearchParams(window.location.search).get("powerPlatformJob")).toBe(submitted.id);
+      expect(transport.fetchMock.mock.calls.filter(([input, init]) => input === "/api/inventory/refresh-jobs" && init?.method === "POST")).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(0);
+      expect(captures()).toBe(before + (status === "succeeded" ? 1 : 0));
+      await act(() => vi.advanceTimersByTimeAsync(2499));
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(0);
+      await act(() => vi.advanceTimersByTimeAsync(5001));
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(status === "running" ? 1 : 0);
+      expect(captures()).toBe(before + (status === "succeeded" ? 1 : 0));
+      if (status === "running") expect(inspector.getByRole("alert")).toHaveTextContent("Status read failed.");
+      fireEvent.click(screen.getByRole("button", { name: "Close source job" }));
+      act(() => {
+        window.history.pushState({}, "", `/sync?powerPlatformJob=${submitted.id}`);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(within(screen.getByRole("region", { name: "Power Platform source job" })).getByRole("alert")).toHaveTextContent("Status read failed.");
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(status === "running" ? 2 : 1);
+      expect(captures()).toBe(before + (status === "succeeded" ? 1 : 0));
+    },
+  );
+
+  it.each((["read", "resume", "cancel", "retry"] as const).flatMap(action =>
+    (["job change", "account change"] as const).map(boundary => ({ action, boundary })),
+  ))("retires an inspected $action on $boundary without admitting its late authorization failure", async ({ action, boundary }) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    window.history.replaceState({}, "", "/sync?powerPlatformJob=retired-job");
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, inventoryReadAuthorized: true,
+      revalidatedUser: { ...viewer, homeAccountId: "replacement-account", tenantId: "replacement-tenant" },
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const initial = inventoryRefreshJob(action === "retry" ? "failed" : "waiting_authorization", "retired-job");
+    const next = { ...inventoryRefreshJob("failed", "current-job"), message: "Current source job" };
+    const requestPath = action === "read" ? `/api/inventory/refresh-jobs/${initial.id}`
+      : action === "retry" ? "/api/inventory/refresh-jobs" : `/api/inventory/refresh-jobs/${initial.id}/${action}`;
+    const isRetiredRequest = (path: string, init?: RequestInit) =>
+      path === requestPath && (action === "read" || init?.method === "POST");
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (isRetiredRequest(input, init)) return pending.promise;
+      if (input === `/api/inventory/refresh-jobs/${initial.id}`) return Promise.resolve(Response.json(initial));
+      if (input === `/api/inventory/refresh-jobs/${next.id}`) return Promise.resolve(Response.json(next));
+      if (input === "/api/inventory/refresh-jobs") return Promise.resolve(Response.json({
+        value: [initial], lastAttemptAt: null, lastSuccessAt: null,
+      }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    if (action !== "read") {
+      fireEvent.click(screen.getByRole("button", { name: action === "resume" ? "Resume source job"
+        : action === "cancel" ? "Cancel source job" : "Start a new source refresh" }));
+    }
+    const retired = transport.fetchMock.mock.calls.find(([path, init]) => isRetiredRequest(path, init))!;
+    expect(retired[1]?.signal?.aborted).toBe(false);
+    if (boundary === "account change") await revalidateTransportSession(transport);
+    act(() => {
+      window.history.pushState({}, "", `/sync?powerPlatformJob=${next.id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(retired[1]?.signal?.aborted).toBe(true);
+    expect(screen.getByText(/Current source job/)).toBeVisible();
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    const before = captures();
+    const sessions = transport.meCalls();
+    await act(async () => pending.resolve(Response.json({ code: "unauthorized", detail: "Retired source authorization." }, { status: 401 })));
+    expect(transport.meCalls()).toBe(sessions);
+    expect(captures()).toBe(before);
+    expect(screen.getByText(/Current source job/)).toBeVisible();
+    expect(screen.queryByText(/Retired source authorization/)).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) => isRetiredRequest(path, init))).toHaveLength(1);
   });
 
   it("refreshes only Power Platform agents and environments and exposes durable status", async () => {
@@ -4201,6 +6990,8 @@ describe("App session revalidation", () => {
       } else {
         app.unmount();
       }
+      expect(transport.fetchMock.mock.calls.find(([path, init]) =>
+        path === requestPath && init?.method === "POST")?.[1]?.signal?.aborted).toBe(true);
       const savedReads = () => transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/agent-inventory?")).length;
       const readsBeforeResult = savedReads();
       await act(async () => pending.resolve(outcome === "success"
@@ -4284,10 +7075,8 @@ describe("App session revalidation", () => {
       await screen.findByText(agent.displayName);
 
       delayHistory = true;
-      await userEvent.click(screen.getByRole("searchbox", { name: "Search" }));
-      await userEvent.paste("Sensitive");
-      await waitFor(() => expect(delayedHistoryRequested).toBe(true));
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await waitFor(() => expect(delayedHistoryRequested).toBe(true));
       await userEvent.click(screen.getByText("View diagnostics"));
       if (action !== "poll") {
         await userEvent.click(screen.getByRole("button", {
@@ -4314,14 +7103,16 @@ describe("App session revalidation", () => {
     },
   );
 
-  it("reports Power Platform history failures without discarding saved agent inventory", async () => {
+  it.each(["failure", "cancellation"] as const)("reports Power Platform history %s without discarding saved agent inventory", async outcome => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
+    const message = outcome === "failure" ? "Synthetic inventory history failure." : "The request was cancelled.";
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/inventory/refresh-jobs") {
+        if (outcome === "cancellation") throw new DOMException("History transport cancelled.", "AbortError");
         return Response.json({
           code: "inventory_history_unavailable",
-          detail: "Synthetic inventory history failure.",
+          detail: message,
         }, { status: 503 });
       }
       return base(input, init);
@@ -4330,11 +7121,74 @@ describe("App session revalidation", () => {
     render(<App />);
 
     expect(await screen.findByText(agent.displayName)).toBeVisible();
-    await waitFor(() => expect(screen.getByText(/Unable to load Power Platform agent refresh history: Synthetic inventory history failure/)).toBeVisible());
+    const historyError = `Unable to load Power Platform agent refresh history: ${message}`;
+    expect(await screen.findByText(historyError, { exact: false })).toBeVisible();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument());
+    expect(screen.getByText(historyError, { exact: false })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(screen.getByRole("heading", { name: "Agent inventory sources" })).toBeVisible();
+    expect(within(screen.getByRole("dialog", { name: "Inventory diagnostics" })).getByRole("alert"))
+      .toHaveTextContent(historyError);
     expect(screen.getByText("Total").nextElementSibling).toHaveTextContent("1");
+  });
+
+  it("labels cancelled refresh history as last observed and recovers without replaying provider work or late results", async () => {
+    vi.useFakeTimers();
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let delayHistory = false;
+    let historyReads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/inventory/refresh-jobs") {
+        historyReads += 1;
+        return delayHistory ? pending.promise : Promise.resolve(Response.json({
+          value: [inventoryRefreshJob("waiting_authorization")], lastAttemptAt: null, lastSuccessAt: null,
+        }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    const before = historyReads;
+    delayHistory = true;
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(historyReads).toBe(before + 1);
+    await act(async () => {
+      await client.cancelQueries({ queryKey: ["saved", "inventory-refresh-jobs"] });
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Unable to load Power Platform agent refresh history: The request was cancelled.");
+    expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText(/Last observed agent refresh: waiting authorization/)).toBeVisible();
+    expect(screen.queryByText(/Latest agent refresh/)).not.toBeInTheDocument();
+    expect(historyReads).toBe(before + 1);
+
+    delayHistory = false;
+    fireEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(historyReads).toBe(before + 2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText(/Latest agent refresh: waiting authorization/)).toBeVisible();
+    const captures = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+    await act(async () => {
+      pending.resolve(Response.json({
+        value: [inventoryRefreshJob("succeeded")], lastAttemptAt: null, lastSuccessAt: null,
+      }));
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(screen.getByText(/Latest agent refresh: waiting authorization/)).toBeVisible();
+    expect(historyReads).toBe(before + 2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections")).toHaveLength(captures);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("renders inventory without waiting for history and ignores superseded history failures", async () => {
@@ -4357,6 +7211,11 @@ describe("App session revalidation", () => {
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(historyRequests).toBe(1);
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await waitFor(() => expect(historyRequests).toBe(2));
 
     await act(async () => {
       releaseHistory(Response.json({
@@ -4614,6 +7473,249 @@ describe("App session revalidation", () => {
     expect(window.location.search).not.toContain("selected=");
   });
 
+  it("restores a history selection only after its search stops being deferred", async () => {
+    window.history.replaceState({}, "", "/agents?q=other");
+    const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
+    const inventory = { id: "history-pin",
+      query: JSON.stringify({ inventoryScope: "catalog", sortBy: "displayName", sortDirection: "asc" }),
+      page: 0, count: 40, allMatching: true };
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory") return Response.json({
+        ...unifiedPage, selection: { ...unifiedPage.selection, id: url.searchParams.get("selectionId") ?? "other-pin" },
+        counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    expect(storePackageSelection(owner, [], inventory)).toBe(true);
+    const before = agentListRequests(transport.fetchMock).length;
+
+    act(() => {
+      window.history.pushState({}, "", "/agents?selectionState=session&selectionCount=40");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+
+    expect(await screen.findByRole("button", { name: "Clear all-matching package selection" })).toBeEnabled();
+    expect(screen.queryByText(/could not be restored/)).not.toBeInTheDocument();
+    expect(restorePackageSelection(owner, 40)).toMatchObject({ status: "restored", inventory });
+    const reads = agentListRequests(transport.fetchMock).slice(before);
+    expect(reads).toHaveLength(1);
+    expect(new URL(String(reads[0][0]), "http://localhost").searchParams.get("selectionId")).toBe(inventory.id);
+  });
+
+  it.each(["filtered", "group"] as const)("retires stored targets when the %s selection is explicitly cleared", async kind => {
+    const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      });
+      if (input === "/api/agents/mutation-selection") return Response.json({ count: 40 });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const selection = await screen.findByRole(kind === "filtered" ? "button" : "checkbox", {
+      name: kind === "filtered" ? "Select all 40 matching published versions" : `Select ${agent.displayName}`,
+    });
+    await userEvent.click(selection);
+    await waitFor(() => expect(restorePackageSelection(owner, 40).status).toBe("restored"));
+    const reads = agentListRequests(transport.fetchMock).length;
+    await userEvent.click(selection);
+    expect(restorePackageSelection(owner, 40)).toEqual({ status: "unavailable" });
+    expect(screen.queryByText(/selected packages are preserved/)).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+  });
+
+  it("omits a restorable route marker when selection storage fails", async () => {
+    const transport = accessEditorTransport();
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const select = await screen.findByRole("button", { name: "Select all 1 matching published versions" });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => { throw new DOMException("Storage denied.", "SecurityError"); });
+    await userEvent.click(select);
+    expect(await screen.findByText(/selection remains active, but could not be preserved/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear all-matching package selection" })).toBeEnabled();
+    expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("selectionCount")).toBe(false);
+    expect(screen.getByRole("button", { name: "Block selected packages" })).toBeEnabled();
+  });
+
+  it("retries a failed group count once without reloading inventory or reviving its error", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const retry = deferredResponse();
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    let counts = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Promise.resolve(Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      }));
+      if (input === "/api/agents/mutation-selection") return ++counts === 1
+        ? Promise.resolve(Response.json({ code: "count_failed", detail: "Count temporarily unavailable." }, { status: 503 }))
+        : retry.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    const retryButton = await screen.findByRole("button", { name: "Retry selected package count" });
+    const reads = agentListRequests(transport.fetchMock).length;
+    act(() => { retryButton.click(); retryButton.click(); });
+    await waitFor(() => expect(counts).toBe(2));
+    expect(screen.queryByText(/Count temporarily unavailable/)).not.toBeInTheDocument();
+    expect(screen.getByText("Counting selected package targets...")).toBeInTheDocument();
+    await act(async () => retry.resolve(Response.json({ count: 40 })));
+    expect(await screen.findByRole("button", { name: "Block selected packages" })).toBeEnabled();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+    expect(counts).toBe(2);
+  });
+
+  it.each(["selection_invalidated", "inventory_changed"])("retires a restored group after its count reports %s", async code => {
+    const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    const inventory = { id: unifiedPage.selection.id,
+      query: JSON.stringify({ inventoryScope: "catalog", sortBy: "displayName", sortDirection: "asc" }),
+      page: 0, count: 40, groups: [group.id] };
+    expect(storePackageSelection(owner, [], inventory)).toBe(true);
+    window.history.replaceState({}, "", "/agents?selectionState=session&selectionCount=40");
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      });
+      if (input === "/api/agents/mutation-selection") return Response.json({ code, detail: "Saved group is no longer current." }, { status: 409 });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Reload saved agent inventory" })).toBeEnabled();
+    expect(screen.queryByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry selected package count" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/selected packages were restored/)).not.toBeInTheDocument();
+    expect(restorePackageSelection(owner, 40)).toEqual({ status: "unavailable" });
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it.each(["search", "sorting"])("does not relabel a stored group with replacement %s while inventory is pending", async change => {
+    const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    const page = { ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 } };
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = selectedInventoryUrl(input);
+      if (url.pathname === "/api/agent-inventory") return url.searchParams.get("search") === "replacement"
+        || url.searchParams.get("sortDirection") === "desc" ? pending.promise : Promise.resolve(Response.json(selectedInventoryPage(input, page)));
+      if (input === "/api/agents/mutation-selection") return Promise.resolve(Response.json({ count: 40 }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await waitFor(() => expect(restorePackageSelection(owner, 40).status).toBe("restored"));
+    const original = restorePackageSelection(owner, 40);
+    if (change === "search") fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "replacement" } });
+    else await userEvent.click(screen.getByRole("button", { name: "Sort by Agent" }));
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(2));
+    expect(restorePackageSelection(owner, 40)).toEqual(original);
+    expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+    await act(async () => pending.resolve(Response.json(selectedInventoryPage(String(agentListRequests(transport.fetchMock)[1][0]), page))));
+    expect(restorePackageSelection(owner, 40)).toEqual(original);
+    expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+  });
+
+  it("does not revive a settled group count while reselecting the same group", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    let counts = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Promise.resolve(Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      }));
+      if (input === "/api/agents/mutation-selection") return ++counts === 1 ? Promise.resolve(Response.json({ count: 40 })) : pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const checkbox = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    await userEvent.click(checkbox);
+    expect(await screen.findByRole("button", { name: "Block selected packages" })).toBeEnabled();
+    await userEvent.click(checkbox);
+    await userEvent.click(checkbox);
+    await waitFor(() => expect(counts).toBe(2));
+    expect(screen.getByText("Counting selected package targets...")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Block selected packages" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+    await act(async () => pending.resolve(Response.json({ count: 41 })));
+    expect(await screen.findByText("41 published versions selected")).toBeInTheDocument();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+  });
+
+  it.each(["account", "tenant", "roles"] as const)("retires group count and storage across A-B-A %s changes", async boundary => {
+    const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
+    const replacement = { ...owner, ...(boundary === "account" ? { homeAccountId: "other-account" }
+      : boundary === "tenant" ? { tenantId: "other-tenant" } : { roles: ["AgentControl.Viewer"] as SessionUser["roles"] }) };
+    let currentUser = owner;
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    let counts = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/me") return Promise.resolve(Response.json({ user: currentUser, csrfToken: "csrf-account", roleAssignmentRequired: false }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Promise.resolve(Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      }));
+      if (input === "/api/agents/mutation-selection") return ++counts === 1 ? Promise.resolve(Response.json({ count: 40 })) : pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await waitFor(() => expect(restorePackageSelection(owner, 40).status).toBe("restored"));
+    currentUser = replacement;
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(restorePackageSelection(owner, 40)).toEqual({ status: "unavailable" });
+    currentUser = owner;
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    const checkbox = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    expect(checkbox).not.toBeChecked();
+    await userEvent.click(checkbox);
+    await waitFor(() => expect(counts).toBe(2));
+    const request = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")[1];
+    currentUser = replacement;
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(request[1]?.signal?.aborted).toBe(true);
+    currentUser = owner;
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    await act(async () => pending.resolve(Response.json({ count: 40 })));
+    expect(screen.queryByRole("button", { name: "Block selected packages" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/selected packages are preserved/)).not.toBeInTheDocument();
+    expect(restorePackageSelection(owner, 40)).toEqual({ status: "unavailable" });
+    expect(counts).toBe(2);
+  });
+
   it("rejects a restored group belonging to different inventory filters without partial selection", async () => {
     const owner = { ...viewer, roles: ["AgentControl.Admin"] as SessionUser["roles"] };
     expect(storePackageSelection(owner, [], { id: "wrong-filter-pin",
@@ -4629,6 +7731,51 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.some(([input]) => String(input).includes("wrong-filter-pin"))).toBe(false);
   });
 
+  it.each((["filtered", "group"] as const).flatMap(kind =>
+    (["empty", "exact"] as const).map(route => [kind, route] as const)))(
+    "replaces a pinned %s selection with the %s selection from browser history without reloading inventory",
+    async (kind, route) => {
+      const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+      const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+        packageCount: 40, packagesComplete: false, memberCount: 40 };
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+          ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+        });
+        if (input === "/api/agents/mutation-selection") return Response.json({ count: 40 });
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole(kind === "filtered" ? "button" : "checkbox", {
+        name: kind === "filtered" ? "Select all 40 matching published versions" : `Select ${agent.displayName}`,
+      }));
+      await waitFor(() => expect(new URLSearchParams(window.location.search).get("selectionState")).toBe("session"));
+      const reads = agentListRequests(transport.fetchMock).length;
+      const counts = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection").length;
+      act(() => {
+        window.history.pushState({}, "", route === "exact" ? `/agents?selected=${agent.id}` : "/agents");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await act(async () => {});
+
+      expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+      expect(screen.queryByRole("button", { name: "Clear all-matching package selection" })).not.toBeInTheDocument();
+      expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+      expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(counts);
+      if (route === "exact") {
+        expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
+        await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+        await screen.findByRole("dialog", { name: "Block package?" });
+        const preview = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-preview")!;
+        expect(JSON.parse(String(preview[1]?.body))).toEqual({ action: "block", ids: [agent.id], mutationScope: "bulk" });
+      } else {
+        expect(screen.queryByRole("button", { name: "Block selected packages" })).not.toBeInTheDocument();
+      }
+    },
+  );
+
   it("restores all 5000 selected packages from bounded principal-scoped session routing", async () => {
     const selectedIds = Array.from({ length: 5_000 }, (_, index) => `package-${index}`);
     expect(storePackageSelection(viewer, selectedIds)).toBe(true);
@@ -4642,6 +7789,41 @@ describe("App session revalidation", () => {
     expect(window.location.href.length).toBeLessThan(4_096);
     expect(window.location.search).toContain("selectionState=session");
     expect(window.location.search).not.toContain("selected=");
+  });
+
+  it.each(["success", "failure"] as const)("cancels a group count on browser-history replacement and ignores its late %s", async outcome => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const group = { ...unifiedPage.value[0], id: "agent:11111111-1111-4111-8111-111111111111",
+      packageCount: 40, packagesComplete: false, memberCount: 40 };
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Promise.resolve(Response.json({
+        ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
+      }));
+      if (input === "/api/agents/mutation-selection") return pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(1));
+    const countRequest = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-selection")!;
+    const reads = agentListRequests(transport.fetchMock).length;
+    act(() => {
+      window.history.pushState({}, "", `/agents?selected=${agent.id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(countRequest[1]?.signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(outcome === "success" ? Response.json({ count: 40 }) : Response.json({
+      code: "selection_invalidated", detail: "Previous group expired.",
+    }, { status: 409 })));
+    expect(screen.getByRole("button", { name: "Block selected packages" })).toBeEnabled();
+    expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).not.toBeChecked();
+    expect(screen.queryByText("Previous group expired.")).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
+    expect(new URLSearchParams(window.location.search).has("selectionState")).toBe(false);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(1);
   });
 
   it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)("uses the durable initial sync instead of an automatic package scan for %s", async role => {
@@ -4699,6 +7881,46 @@ describe("App session revalidation", () => {
     expect(new Headers(request[1]?.headers).get("X-CSRF-Token")).toBe("csrf-1");
     expect(JSON.parse(String(request[1]?.body))).toEqual({ mode: "initial" });
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("opens first-sync permission recovery without reloading the session or restarting automatic work", async () => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/state") return Response.json({
+        onboardingRequired: true, usageImportRequired: true, run: null,
+        sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
+          source, status: "not_started", jobId: null, count: null, lastSuccessAt: null, updatedAt: null,
+          message: "", canRetry: false,
+        })),
+      });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("heading", { name: "Workspace data" });
+    await userEvent.click(screen.getByRole("button", { name: "Pause automatic refresh" }));
+    expect(screen.getByRole("button", { name: "Resume automatic refresh" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    const notice = await screen.findByRole("dialog", { name: "Set up your workspace" });
+    const sessionReads = transport.meCalls();
+    const syncRequests = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/data-sync/")).length;
+    const before = syncRequests();
+    const inventoryReads = agentListRequests(transport.fetchMock).length;
+
+    await userEvent.click(within(notice).getByRole("button", { name: "Review permissions" }));
+
+    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeVisible();
+    expect(window.location.pathname).toBe("/permissions");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(transport.meCalls()).toBe(sessionReads);
+    expect(syncRequests()).toBe(before);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    expect(screen.getByText(/Automatic sync is paused for this session/)).toBeVisible();
+    expect(syncRequests()).toBe(before);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(inventoryReads);
   });
 
   it.each(["/permissions", "/official-usage"])("does not start a package scan from %s or when Agents is later opened", async route => {
@@ -4803,7 +8025,8 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh agents" })).toBeEnabled());
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     await userEvent.click(screen.getByRole("button", { name: "Refresh agents" }));
-    expect(await screen.findByText("Synthetic initial refresh failed")).toBeInTheDocument();
+    expect(await within(screen.getByRole("dialog", { name: "Inventory diagnostics" })).findByRole("alert"))
+      .toHaveTextContent("Synthetic initial refresh failed");
     expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
@@ -4874,6 +8097,27 @@ describe("App session revalidation", () => {
     expect(calls.some(([path]) => String(path).includes("mutation-preview") || String(path).endsWith("/access"))).toBe(false);
   });
 
+  it("shares repeated table access preparation until it settles without restarting provider work", async () => {
+    const transport = accessEditorTransport(), pending = deferredResponse();
+    transport.exactResponse = () => pending.promise;
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const prepare = await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` });
+    act(() => { fireEvent.click(prepare); fireEvent.click(prepare); });
+    await userEvent.click(prepare);
+    const requests = () => transport.fetchMock.mock.calls.filter(([path]) => path === `/api/agents/${agent.id}/refresh-jobs`);
+    expect(requests()).toHaveLength(1);
+    expect(requests()[0][1]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(Response.json(completedRefreshJob())));
+    const editor = await screen.findByRole("dialog", { name: "Manage agent access" });
+    expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, agent.id))).toHaveLength(1);
+    await userEvent.click(within(editor).getByRole("button", { name: "Close access management" }));
+    transport.exactResponse = undefined;
+    await userEvent.click(prepare);
+    expect(await screen.findByRole("dialog", { name: "Manage agent access" })).toBeVisible();
+    expect(requests()).toHaveLength(2);
+  });
+
   it.each(["availability", "installation"] as const)("edits %s inline and verifies current exact settings only on Apply", async target => {
     const transport = accessEditorTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -4899,6 +8143,166 @@ describe("App session revalidation", () => {
     expect(within(saved).getByRole("radio", { name: /No users/ })).toBeChecked();
   });
 
+  it.each(["current settings", "mutation preview"] as const)(
+    "keeps a cancelled inline %s failure out of the retained access draft",
+    async phase => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const path = phase === "current settings" ? `/api/agents/${agent.id}/refresh-jobs` : "/api/agents/mutation-preview";
+      let delay = true;
+      transport.fetchMock.mockImplementation((input, init) =>
+        delay && input === path ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      const detail = await screen.findByRole("dialog", { name: agent.displayName });
+      await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+      await userEvent.click(within(detail).getByRole("radio", { name: /No users/ }));
+      await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+      await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(1));
+      expect(within(detail).getByRole("button", { name: "Applying" })).toBeDisabled();
+
+      await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
+      const request = transport.fetchMock.mock.calls.find(([input]) => input === path)!;
+      expect(request[1]?.signal?.aborted).toBe(true);
+      const sessionReads = transport.session.meCalls();
+      await act(async () => pending.resolve(Response.json({
+        code: "unauthorized", detail: "Retired inline access request.",
+      }, { status: 401 })));
+      await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+      expect(within(detail).getByRole("radio", { name: /No users/ })).toBeChecked();
+      expect(within(detail).queryByRole("alert")).not.toBeInTheDocument();
+      expect(within(detail).getByRole("button", { name: "Apply" })).toBeEnabled();
+      expect(transport.session.meCalls()).toBe(sessionReads);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(1);
+
+      delay = false;
+      await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+      expect(await within(detail).findByRole("region", { name: /update availability package/i })).toBeVisible();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(2);
+    },
+  );
+
+  it.each(["current settings", "mutation preview"] as const)(
+    "preserves a current inline %s error and retries only on Apply",
+    async phase => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const path = phase === "current settings" ? `/api/agents/${agent.id}/refresh-jobs` : "/api/agents/mutation-preview";
+      let fail = true;
+      transport.fetchMock.mockImplementation((input, init) => fail && input === path
+        ? Promise.resolve(Response.json({ code: "provider_error", detail: "Current access verification failed." }, { status: 503 }))
+        : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      const detail = await screen.findByRole("dialog", { name: agent.displayName });
+      await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+      await userEvent.click(within(detail).getByRole("radio", { name: /No users/ }));
+      await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+      expect(await within(detail).findByRole("alert")).toHaveTextContent("Current access verification failed.");
+      expect(within(detail).getByRole("radio", { name: /No users/ })).toBeChecked();
+      expect(within(detail).getByRole("button", { name: "Apply" })).toBeEnabled();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(1);
+
+      fail = false;
+      await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+      expect(await within(detail).findByRole("region", { name: /update availability package/i })).toBeVisible();
+      expect(within(detail).queryByText("Current access verification failed.")).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === path)).toHaveLength(2);
+    },
+  );
+
+  it("keeps a saved-detail failure separate from inline access preparation without retrying either", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, agent.id)
+      ? Promise.resolve(Response.json({ code: "saved_details_unavailable", detail: "Saved assignments unavailable." }, { status: 503 }))
+      : input === `/api/agents/${agent.id}/refresh-jobs`
+        ? Promise.resolve(Response.json({ code: "provider_error", detail: "Current access preparation failed." }, { status: 503 }))
+        : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const detail = await screen.findByRole("dialog", { name: agent.displayName });
+    expect(await within(detail).findByRole("alert")).toHaveTextContent("Saved assignments unavailable.");
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+    await userEvent.click(within(detail).getByRole("radio", { name: /No users/ }));
+    await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+    expect(await within(detail).findByText("Current access preparation failed.")).toBeVisible();
+    expect(within(detail).getByText(/Saved assignments unavailable\./)).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => isPackageDetailRequest(path, agent.id))).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `/api/agents/${agent.id}/refresh-jobs`)).toHaveLength(1);
+  });
+
+  it.each((["same account", "replacement account", "replacement tenant"] as const).flatMap(account =>
+    (["pending", "success", "failure"] as const).map(outcome => ({ account, outcome })),
+  ))(
+    "retires assignment drafts and $outcome directory searches when revalidating the $account",
+    async ({ account, outcome }) => {
+      const transport = accessEditorTransport({
+        ...viewer,
+        homeAccountId: account === "replacement account" ? "replacement-account" : viewer.homeAccountId,
+        tenantId: account === "replacement tenant" ? "replacement-tenant" : viewer.tenantId,
+      });
+      transport.exactCompleted = true;
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const results = { value: [
+        { resourceType: "user", resourceId: "22222222-2222-4222-8222-222222222222", displayName: "Retired directory result", principalKind: "user" },
+        { resourceType: "user", resourceId: "33333333-3333-4333-8333-333333333333", displayName: "Retired selected user", principalKind: "user" },
+      ] };
+      transport.fetchMock.mockImplementation((input, init) =>
+        new URL(input, "http://localhost").pathname === "/api/directory/principals" ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      const detail = await screen.findByRole("dialog", { name: agent.displayName });
+      await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+      await userEvent.click(within(detail).getByRole("button", { name: /^Installed for/ }));
+      await userEvent.click(await within(detail).findByRole("button", { name: "Remove Installed user" }));
+      expect(within(detail).getByText("0 selected")).toBeVisible();
+      fireEvent.change(within(detail).getByRole("searchbox"), { target: { value: "Retired" } });
+      fireEvent.change(within(detail).getByRole("combobox", { name: "Type" }), { target: { value: "users" } });
+      const searches = () => transport.fetchMock.mock.calls.filter(([input]) =>
+        new URL(input, "http://localhost").pathname === "/api/directory/principals");
+      await waitFor(() => expect(searches()).toHaveLength(1));
+      if (outcome === "success") {
+        await act(async () => pending.resolve(Response.json(results)));
+        await userEvent.click(within(detail).getByRole("button", { name: /Retired selected user/ }));
+        expect(within(detail).getByRole("button", { name: "Remove Retired selected user" })).toBeEnabled();
+        expect(within(detail).getByRole("button", { name: /Retired directory result/ })).toBeVisible();
+      } else if (outcome === "failure") {
+        await act(async () => pending.resolve(Response.json({
+          code: "directory_unavailable", detail: "Retired directory failure",
+        }, { status: 503 })));
+        expect(within(detail).getByRole("alert")).toHaveTextContent("Retired directory failure");
+      }
+      expect(searches()).toHaveLength(1);
+
+      await revalidateTransportSession(transport.session);
+      expect(detail).not.toBeInTheDocument();
+      expect(searches()[0][1]?.signal?.aborted).toBe(true);
+      if (outcome === "pending") await act(async () => pending.resolve(Response.json(results)));
+      await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      const replacement = await screen.findByRole("dialog", { name: agent.displayName });
+      await userEvent.click(within(replacement).getByRole("tab", { name: "Manage" }));
+      await userEvent.click(within(replacement).getByRole("button", { name: /^Installed for/ }));
+      expect(await within(replacement).findByRole("button", { name: "Remove Installed user" })).toBeEnabled();
+      expect(within(replacement).getByText("1 selected")).toBeVisible();
+      expect(within(replacement).getByRole("searchbox")).toHaveValue("");
+      expect(within(replacement).getByRole("combobox", { name: "Type" })).toHaveValue("all");
+      expect(within(replacement).getByText("Enter at least two characters.")).toBeVisible();
+      expect(screen.queryByText("Retired directory result")).not.toBeInTheDocument();
+      expect(screen.queryByText("Retired selected user")).not.toBeInTheDocument();
+      expect(screen.queryByText("Retired directory failure")).not.toBeInTheDocument();
+      expect(within(replacement).queryByText("Searching directory...")).not.toBeInTheDocument();
+      expect(searches()).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/directory/principals/resolve")).toHaveLength(2);
+    },
+  );
+
   it("keeps block confirmation inside the unified agent modal and returns to the editor on cancel", async () => {
     const transport = accessEditorTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -4917,6 +8321,38 @@ describe("App session revalidation", () => {
     expect(screen.getAllByRole("dialog")).toEqual([detail]);
     expect(within(detail).getByRole("heading", { name: "Select who can use this agent" })).toBeVisible();
     expect(new URLSearchParams(window.location.search).get("detail")).toBe(unifiedPage.value[0].id);
+  });
+
+  it("admits one block preview for repeated inline clicks and releases admission after cancellation", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let delay = true;
+    transport.fetchMock.mockImplementation((input, init) => delay && input === "/api/agents/mutation-preview"
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+    const detail = await screen.findByRole("dialog", { name: agent.displayName });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+    const block = within(detail).getByRole("button", { name: `Block ${agent.displayName} (${agent.id})` });
+    act(() => {
+      fireEvent.click(block);
+      fireEvent.click(block);
+    });
+    const previews = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/mutation-preview");
+    expect(previews()).toHaveLength(1);
+
+    await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
+    expect(previews()[0][1]?.signal?.aborted).toBe(true);
+    delay = false;
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+    await userEvent.click(within(detail).getByRole("button", { name: `Block ${agent.displayName} (${agent.id})` }));
+    const confirmation = await within(detail).findByRole("region", { name: /block package/i });
+    expect(previews()).toHaveLength(2);
+    await act(async () => pending.resolve(Response.json({ code: "provider_error", detail: "Retired preview failure" }, { status: 503 })));
+    expect(confirmation).toBeVisible();
+    expect(within(detail).queryByText("Retired preview failure")).not.toBeInTheDocument();
   });
 
   it.each(["export", "confirmation"] as const)("contains keyboard focus in the standalone %s dialog and restores its opener", async kind => {
@@ -4941,6 +8377,285 @@ describe("App session revalidation", () => {
     expect(opener).toHaveFocus();
   });
 
+  it.each([true, false])("retires stale projected row summaries after verified blocking (complete=%s)", async complete => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const record = { ...unifiedPage.value[0], packages: [{ ...agent, availableTo: "all" }],
+      packagesComplete: complete, packageCount: complete ? 1 : 40,
+      columns: { status: complete ? "Not blocked" : "2 not blocked · 38 blocked", availability: "All users",
+        publisher: "Saved publisher" } };
+    const page = unifiedRecordsPage([record]);
+    const count = complete ? 1 : 40;
+    const job: BulkActionJob = { ...waitingBulkJob(), status: "succeeded", canResume: false,
+      total: count, completed: count, succeeded: count, inconclusive: 0, queued: 0, reconciliationRequired: 0 };
+    let changed = false;
+    let delayReload = true;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return changed && delayReload ? pending.promise : Promise.resolve(Response.json(selectedInventoryPage(input,
+          changed ? { ...page, value: [{ ...record, packages: [{ ...record.packages[0], isBlocked: true }],
+            columns: { ...record.columns, status: complete ? "Blocked" : "1 not blocked · 39 blocked",
+              availability: complete ? "Not available" : "All users" } }] } : page)));
+      }
+      if (input === "/api/agents/mutation-selection") return Promise.resolve(Response.json({ count: 40 }));
+      if (input === "/api/agents/mutation-preview") {
+        const preview = await (await base(input, init)).json() as PackageMutationPreview;
+        return Response.json({ ...preview, selectionId: currentInventorySelection(transport.fetchMock),
+          summary: { ...preview.summary, targetCount: count, additionalTargetCount: count - 1 } });
+      }
+      if (input === "/api/agents/block") {
+        changed = true;
+        return Promise.resolve(Response.json(job));
+      }
+      if (input.startsWith(`/api/agents/bulk-jobs/${job.id}/items?`)) return Promise.resolve(Response.json({
+        value: Array.from({ length: count }, (_, index) => ({
+          id: index ? `other-version-${index}` : agent.id, displayName: agent.displayName, status: "succeeded",
+        })),
+        revision: job.resultRevision, counts: { total: count, filtered: count },
+        page: { limit: 50, nextCursor: null, previousCursor: null },
+      }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(await screen.findByRole("button", { name: "Block selected packages" }));
+    await userEvent.click(await screen.findByRole("button", { name: complete ? "Block package" : "Block 40 packages" }));
+    await screen.findByRole("status", { name: "Updating agent results" });
+    const row = within(screen.getByRole("table")).getAllByRole("row")[1];
+    if (complete) expect(within(row).getByRole("cell", { name: "Blocked" })).toBeVisible();
+    else expect(within(row).getAllByRole("cell", { name: "Unknown" })).toHaveLength(3);
+    expect(within(row).queryByText(record.columns.status)).not.toBeInTheDocument();
+    expect(within(row).queryByText("All users")).not.toBeInTheDocument();
+    expect(within(row).getByText("Saved publisher")).toBeVisible();
+    if (complete) expect(within(row).getByRole("button", { name: `Unblock ${agent.displayName}` })).toBeEnabled();
+    const reads = agentListRequests(transport.fetchMock).length;
+    await act(async () => pending.resolve(Response.json({
+      code: "inventory_unavailable", detail: "Replacement inventory unavailable.",
+    }, { status: 503 })));
+    expect(within(row).queryByText(record.columns.status)).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
+    delayReload = false;
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await waitFor(() => expect(within(row).getByText(complete ? "Blocked" : "1 not blocked · 39 blocked")).toBeVisible());
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(reads + 1);
+  });
+
+  it.each(["availability", "installation"] as const)("retires projected %s after verified access while inventory reloads", async target => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const record = { ...unifiedPage.value[0], packages: [{ ...agent, availableTo: "all", deployedTo: "all" }],
+      packagesComplete: true,
+      columns: { status: "Not blocked", availability: "All users", deployment: "All users", publisher: "Saved publisher" } };
+    let changed = false;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return changed ? pending.promise : Promise.resolve(Response.json(selectedInventoryPage(input, unifiedRecordsPage([record]))));
+      }
+      if (input === `/api/agents/${agent.id}/access` && init?.method === "PATCH") changed = true;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: `View details for ${agent.displayName}` });
+    await userEvent.click(screen.getByRole("button", { name: "Columns" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Installed for" }));
+    await userEvent.keyboard("{Escape}");
+    const row = within(screen.getByRole("table")).getAllByRole("row")[1];
+    await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    const detail = await screen.findByRole("dialog", { name: agent.displayName });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+    if (target === "installation") await userEvent.click(within(detail).getByRole("button", { name: /^Installed for/ }));
+    await userEvent.click(within(detail).getByRole("radio", { name: /No users/ }));
+    await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+    const confirmation = await within(detail).findByRole("region", { name: new RegExp(`update ${target} package`, "i") });
+    await userEvent.click(within(confirmation).getByRole("button", { name: `Confirm update ${target}` }));
+    await waitFor(() => expect(within(row).getByText(target === "availability" ? "Not available" : "No users")).toBeInTheDocument());
+    await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
+    const summary = () => within(detail).getByText(target === "availability" ? "End-user access" : "Installed for",
+      { selector: ".agent-overview-facts span" }).nextElementSibling;
+    expect(summary()).toHaveTextContent(target === "availability" ? /^Not available$/ : /^No users$/);
+    expect(summary()).toBeVisible();
+    expect(within(row).getByText("Saved publisher")).toBeInTheDocument();
+    await act(async () => pending.resolve(Response.json({
+      code: "inventory_unavailable", detail: "Replacement inventory unavailable.",
+    }, { status: 503 })));
+    expect(within(row).getByText(target === "availability" ? "Not available" : "No users")).toBeInTheDocument();
+    expect(summary()).toHaveTextContent(target === "availability" ? /^Not available$/ : /^No users$/);
+    expect(summary()).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}/access`)).toHaveLength(1);
+  });
+
+  it.each((["block", "availability", "installation"] as const).flatMap(operation =>
+    (["success", "failure", "replacement", "off-page", "invalid membership", "detail failure", "late replacement", "account change"] as const)
+      .map(outcome => ({ operation, outcome }))))(
+    "retains the exact off-preview version after verified $operation through inventory reload $outcome",
+    async ({ operation, outcome }) => {
+      const transport = accessEditorTransport(outcome === "account change" ? { ...viewer, homeAccountId: "replacement-admin" } : viewer);
+      const base = transport.fetchMock.getMockImplementation()!;
+      const second = { ...agent, id: "package-alternate", displayName: "Second publication", version: "2",
+        availableTo: "some", deployedTo: "some" };
+      const group: UnifiedAgentRecord = { ...unifiedPage.value[0], id: "agent:33333333-3333-4333-8333-333333333333",
+        packages: [agent], packagesComplete: false, packageCount: 40 };
+      const pending = deferredResponse();
+      const pendingDetail = deferredResponse();
+      const completed: BulkActionJob = { ...waitingBulkJob(), status: "succeeded", canResume: false,
+        total: 1, completed: 1, succeeded: 1, inconclusive: 0, queued: 0, reconciliationRequired: 0 };
+      const job: BulkActionJob = operation === "block" ? completed : {
+        ...completed, targetBlockedState: undefined, action: `update-${operation}`,
+        accessUpdate: { target: operation, mode: "replace", scope: "none", principals: [] },
+      };
+      const mutationPath = `/api/agents/${second.id}/${operation === "block" ? "block" : "access"}`;
+      const preparedReads = operation === "block" ? 1 : 2;
+      let changed = false;
+      let failDetail = outcome === "detail failure";
+      let delayInventory = true;
+      let delayedDetail: Response | undefined;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        const url = new URL(input, "http://localhost");
+        if (url.pathname === "/api/agent-inventory") return changed && delayInventory ? pending.promise
+          : Response.json(selectedInventoryPage(input, unifiedRecordsPage([group])));
+        if (unifiedDetailId(input)) return Response.json(group);
+        if (url.pathname.endsWith("/members")) return Response.json({
+          value: [{ domain: "packages", native_id: second.id, display_name: second.displayName }], nextCursor: null,
+        });
+        if (isPackageDetailRequest(input, second.id)) {
+          if (changed && failDetail) return Response.json({
+            code: "detail_unavailable", detail: "Replacement version detail unavailable.",
+          }, { status: 503 });
+          const response = Response.json({
+            ...second, isBlocked: changed && operation === "block",
+            availableTo: changed && operation === "availability" ? "none" : "some",
+            deployedTo: changed && operation === "installation" ? "none" : "some",
+            allowedUsersAndGroups: changed && operation === "availability" ? [] : [{ resourceType: "user", resourceId: "installed-user" }],
+            acquireUsersAndGroups: changed && operation === "installation" ? [] : [{ resourceType: "user", resourceId: "installed-user" }],
+            longDescription: changed ? "Reloaded second publication" : "Selected second publication",
+            selectedSource: { selectionId: url.searchParams.get("selectionId"),
+              recordId: changed && outcome === "invalid membership" ? "another-group" : group.id.replace(/^agent:/, ""),
+              sourceIdentity: second.id, sourceScopeId: "package-scope", generationId: "package-generation" },
+            observation: { observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              scopeKind: "broad", current: true },
+          });
+          if (changed && (outcome === "late replacement" || outcome === "account change")) {
+            delayedDetail = response;
+            return pendingDetail.promise;
+          }
+          return response;
+        }
+        if (input === `/api/agents/${second.id}/refresh-jobs`) return Response.json({
+          ...completedRefreshJob(), id: "alternate-access", scopeKind: "exact", requestedIds: [second.id],
+        });
+        if (input === "/api/agents/mutation-preview") {
+          const preview = await (await base(input, init)).json() as PackageMutationPreview;
+          return Response.json({ ...preview, summary: { ...preview.summary, targets: [{
+            ...preview.summary.targets[0], id: second.id, displayName: second.displayName,
+          }] } });
+        }
+        if (input === mutationPath) {
+          changed = true;
+          return Response.json(job);
+        }
+        if (input.startsWith(`/api/agents/bulk-jobs/${job.id}/items?`)) return Response.json({
+          value: [{ id: second.id, displayName: second.displayName, status: "succeeded" }],
+          revision: job.resultRevision, counts: { total: 1, filtered: 1 },
+          page: { limit: 50, nextCursor: null, previousCursor: null },
+        });
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      const detail = await screen.findByRole("dialog", { name: agent.displayName });
+      const versions = within(detail).getByRole("combobox", { name: "Published version details" });
+      await waitFor(() => expect(versions).toBeEnabled());
+      await userEvent.selectOptions(versions, second.id);
+      expect(await within(detail).findByText("Selected second publication")).toBeVisible();
+      await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
+      if (operation === "block") {
+        await userEvent.click(within(detail).getByRole("button", { name: `Block ${second.displayName} (${second.id})` }));
+      } else {
+        if (operation === "installation") await userEvent.click(within(detail).getByRole("button", { name: /^Installed for/ }));
+        await userEvent.click(within(detail).getByRole("radio", { name: /No users/ }));
+        await userEvent.click(within(detail).getByRole("button", { name: "Apply" }));
+      }
+      await userEvent.click(await within(detail).findByRole("button", {
+        name: operation === "block" ? "Block package" : `Confirm update ${operation}`,
+      }));
+      await screen.findByRole("status", { name: "Updating agent results" });
+      const changedControl = () => operation === "block"
+        ? within(detail).getByRole("button", { name: `Unblock ${second.displayName} (${second.id})` })
+        : within(detail).getByRole("radio", { name: /No users/ });
+      expect(within(detail).getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+      expect(changedControl()).toBeVisible();
+      if (operation !== "block") expect(changedControl()).toBeChecked();
+      expect(within(detail).queryByText(/is not in the loaded version list/)).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === mutationPath)).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, second.id))).toHaveLength(preparedReads);
+      if (outcome === "replacement") {
+        await userEvent.click(within(detail).getByRole("button", { name: /close/i }));
+        await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+      }
+      const read = agentListRequests(transport.fetchMock).at(-1)![0];
+      await act(async () => pending.resolve(outcome === "failure" ? Response.json({
+        code: "inventory_unavailable", detail: "Replacement inventory unavailable.",
+      }, { status: 503 }) : Response.json(selectedInventoryPage(read, unifiedRecordsPage(outcome === "off-page" ? [] : [group])))));
+      if (outcome === "late replacement" || outcome === "account change") {
+        await waitFor(() => expect(delayedDetail).toBeDefined());
+        const request = transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, second.id)).at(-1)!;
+        expect(request[1]?.signal?.aborted).toBe(false);
+        delayInventory = false;
+        if (outcome === "account change") {
+          await revalidateTransportSession(transport.session);
+          await screen.findByRole("button", { name: `View details for ${agent.displayName}` });
+        } else {
+          await userEvent.click(within(detail).getByRole("button", { name: /close/i }));
+          await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+        }
+        expect(request[1]?.signal?.aborted).toBe(true);
+        await act(async () => pendingDetail.resolve(delayedDetail!));
+        expect(screen.queryByText("Reloaded second publication")).not.toBeInTheDocument();
+        expect(screen.queryByRole("region", { name: `Manage ${second.displayName} (${second.id})` })).not.toBeInTheDocument();
+        if (outcome === "account change") expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
+        else expect(screen.getByRole("combobox", { name: "Published version details" })).toHaveValue(agent.id);
+        expect(transport.fetchMock.mock.calls.filter(([input]) => input === mutationPath)).toHaveLength(1);
+      } else if (outcome === "invalid membership" || outcome === "detail failure") {
+        await waitFor(() => expect(within(detail).queryAllByRole("alert").map(item => item.textContent)).toEqual(expect.arrayContaining([expect.stringContaining(outcome === "detail failure"
+          ? "Replacement version detail unavailable."
+          : "The selected published version does not belong to the displayed inventory group.")])));
+        expect(within(detail).queryByRole("region", { name: `Manage ${second.displayName} (${second.id})` })).not.toBeInTheDocument();
+        expect(screen.queryByText("Reloaded second publication")).not.toBeInTheDocument();
+        const reads = () => transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, second.id));
+        expect(reads()).toHaveLength(preparedReads + 1);
+        expect(within(detail).getByRole("button", { name: "Retry saved details" })).toBeEnabled();
+        if (outcome === "detail failure") {
+          failDetail = false;
+          await userEvent.click(within(detail).getByRole("button", { name: "Retry saved details" }));
+          await waitFor(() => expect(changedControl()).toBeEnabled());
+          if (operation === "installation") await userEvent.click(within(detail).getByRole("button", { name: /^Installed for/ }));
+          if (operation !== "block") expect(changedControl()).toBeChecked();
+          expect(reads()).toHaveLength(preparedReads + 2);
+          expect(within(detail).getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+          expect(within(detail).queryByText(/Replacement version detail unavailable/)).not.toBeInTheDocument();
+          expect(transport.fetchMock.mock.calls.filter(([input]) => input === mutationPath)).toHaveLength(1);
+        }
+      } else if (outcome === "replacement") {
+        const replacement = screen.getByRole("dialog", { name: agent.displayName });
+        expect(within(replacement).getByRole("combobox", { name: "Published version details" })).toHaveValue(agent.id);
+        expect(within(replacement).queryByRole("region", { name: `Manage ${second.displayName} (${second.id})` })).not.toBeInTheDocument();
+      } else {
+        expect(changedControl()).toBeVisible();
+        if (operation !== "block") expect(changedControl()).toBeChecked();
+        expect(within(detail).getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+        if (outcome !== "failure") {
+          await waitFor(() => expect(changedControl()).toBeEnabled());
+          const details = transport.fetchMock.mock.calls.filter(([input]) => isPackageDetailRequest(input, second.id));
+          expect(details).toHaveLength(preparedReads + 1);
+          expect(new URL(details.at(-1)![0], "http://localhost").searchParams.get("selectionId")).toBe(currentInventorySelection(transport.fetchMock));
+        }
+      }
+    },
+  );
+
   it("projects provider-verified access results into the unified row detail", async () => {
     const transport = accessEditorTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -4957,7 +8672,7 @@ describe("App session revalidation", () => {
     expect(restored).toBe(detail);
     expect(within(restored).getByRole("radio", { name: /No users/ })).toBeChecked();
     await waitFor(() => {
-      expect(within(restored).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      expect(within(restored).queryByText(/Loading saved agent details|Saved details will be loaded/)).not.toBeInTheDocument();
       expect(within(restored).getByRole("button", { name: /^Installed for/ })).toBeEnabled();
     });
     await userEvent.click(within(restored).getByRole("button", { name: /^Installed for/ }));
@@ -5086,6 +8801,94 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(new URLSearchParams(window.location.search).has("selectedResource")).toBe(false));
   });
 
+  it.each(["succeeded", "cancelled", "waiting_authorization"] as const)("preserves newer quarantine selection when a followed job becomes %s and reloads only for possible writes", async status => {
+    window.history.replaceState({}, "", "/agents?inventory=power_platform_only&quarantineJob=job-only");
+    const nextTarget = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "New quarantine target");
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      unifiedResponse: unifiedRecordsPage([nextTarget]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let jobReads = 0;
+    const complete: QuarantineJob = { ...quarantineJob("job-only"), status,
+      total: status === "waiting_authorization" ? 2 : 1, canResume: status === "waiting_authorization",
+      succeeded: status === "cancelled" ? 0 : 1, cancelled: status === "cancelled" ? 1 : 0 };
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/quarantine/jobs/job-only") return ++jobReads === 1
+        ? Response.json({ ...complete, status: "running", completed: 0, succeeded: 0, cancelled: 0 })
+        : pending.promise.then(response => response.clone());
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Quarantine job: Running");
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select New quarantine target" }));
+    await waitFor(() => expect(jobReads).toBe(2), { timeout: 2000 });
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await act(async () => pending.resolve(Response.json(complete)));
+    if (status !== "cancelled") await waitFor(() => expect(captures()).toBe(before + 1));
+    expect(screen.getByRole("checkbox", { name: "Select New quarantine target" })).toBeChecked();
+    expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh job status" }));
+    await waitFor(() => expect(jobReads).toBe(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh job status" })).toBeEnabled());
+    expect(captures()).toBe(before + (status === "cancelled" ? 0 : 1));
+  });
+
+  it("invalidates saved inventory after a detail quarantine result without starting a second job follower", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=power_platform_only");
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Detail quarantine target");
+    const observation = native.observations.powerPlatform!;
+    const resource = native.powerPlatformResource!;
+    const job = quarantineJob();
+    job.confirmation.targets = [{
+      resourceNativeId: resource.nativeId, displayName: native.displayName, environmentId: resource.environmentId!,
+      botId: resource.quarantineIdentity!.botId, currentState: false, requestedState: true,
+      currentProviderUpdatedAt: observation.observedAt, inventoryState: false, inventoryObservedAt: observation.observedAt,
+    }];
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      unifiedResponse: unifiedRecordsPage([native]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
+        const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!;
+        return Response.json({ value: [{ definition, decision: {
+          capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [],
+        } }] });
+      }
+      if (input === "/api/quarantine/preview") return Response.json({
+        confirmationHash: job.confirmationHash, summary: job.confirmation,
+        statuses: [{
+          target: job.confirmation.targets[0],
+          direct: { isBotQuarantined: false, providerUpdatedAt: observation.observedAt,
+            observedAt: observation.observedAt, correlationId: "status", source: "provider" },
+          inventory: { isQuarantined: false, quarantinedAt: null, observedAt: observation.observedAt, snapshotId: observation.id },
+          disagreesWithInventory: false,
+        }],
+      });
+      if (input === "/api/quarantine/jobs" && init?.method === "POST") return Response.json(job);
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "View details for Detail quarantine target" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Manage" }));
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    await waitFor(() => expect(captures()).toBe(before + 1));
+    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/quarantine/jobs/") || path.startsWith("/api/quarantine/jobs?"))).toHaveLength(0);
+  });
+
   it("loads an exact quarantine job even when its route has no selected targets", async () => {
     window.history.replaceState({}, "", "/agents?quarantineJob=job-only");
     const transport = appTransport({
@@ -5106,6 +8909,107 @@ describe("App session revalidation", () => {
       "/api/quarantine/jobs/job-only",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it.each(["success", "retry", "account-change"] as const)("preserves a cleared bulk quarantine receipt until %s", async outcome => {
+    window.history.replaceState({}, "", "/agents?inventory=power_platform_only");
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Retained bulk target");
+    const observation = native.observations.powerPlatform!;
+    const job = quarantineJob();
+    job.confirmation.targets = [{
+      resourceNativeId: native.powerPlatformResource!.nativeId, displayName: native.displayName,
+      environmentId: native.environmentId!, botId: native.powerPlatformResource!.quarantineIdentity!.botId,
+      currentState: false, requestedState: true, currentProviderUpdatedAt: observation.observedAt,
+      inventoryState: false, inventoryObservedAt: observation.observedAt,
+    }];
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      revalidatedUser: outcome === "account-change" ? { ...viewer, homeAccountId: "new-account" } : undefined,
+      unifiedResponse: unifiedRecordsPage([native]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let submissions = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
+        const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!;
+        return Response.json({ value: [{ definition, decision: {
+          capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [],
+        } }] });
+      }
+      if (input === "/api/quarantine/preview") return Response.json({
+        confirmationHash: job.confirmationHash, summary: job.confirmation,
+        statuses: [{
+          target: job.confirmation.targets[0],
+          direct: { isBotQuarantined: false, providerUpdatedAt: observation.observedAt,
+            observedAt: observation.observedAt, correlationId: "status", source: "provider" },
+          inventory: { isQuarantined: false, quarantinedAt: null, observedAt: observation.observedAt, snapshotId: observation.id },
+          disagreesWithInventory: false,
+        }],
+      });
+      if (input === "/api/quarantine/jobs" && init?.method === "POST") return ++submissions === 1 ? pending.promise : Response.json(job);
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select Retained bulk target" }));
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
+    const confirmation = screen.getByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    const writes = () => transport.fetchMock.mock.calls.filter(([path, init]) => path === "/api/quarantine/jobs" && init?.method === "POST");
+    const signal = writes()[0][1]?.signal;
+    act(() => { fireEvent.click(screen.getByRole("button", { name: "Clear" })); });
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByText("0 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    if (outcome === "account-change") await revalidateTransportSession(transport);
+    await act(async () => pending.resolve(outcome === "retry"
+      ? Response.json({ code: "receipt_unavailable", detail: "Submission receipt unavailable." }, { status: 502 })
+      : Response.json(job)));
+    if (outcome === "account-change") {
+      expect(signal?.aborted).toBe(true);
+      expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+    } else {
+      if (outcome === "retry") {
+        const recovery = screen.getByRole("dialog", { name: "Quarantine 1 agent" });
+        expect(within(recovery).getByRole("alert")).toHaveTextContent("Submission receipt unavailable.");
+        await userEvent.click(within(recovery).getByRole("checkbox"));
+        await userEvent.click(within(recovery).getByRole("button", { name: "Confirm quarantine" }));
+        expect(writes()[1][1]?.body).toEqual(writes()[0][1]?.body);
+        expect(new Headers(writes()[1][1]?.headers).get("Idempotency-Key"))
+          .toEqual(new Headers(writes()[0][1]?.headers).get("Idempotency-Key"));
+      }
+      expect(screen.getByText("Quarantine job: Succeeded")).toBeVisible();
+    }
+    expect(writes()).toHaveLength(outcome === "retry" ? 2 : 1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/quarantine/preview")).toHaveLength(1);
+  });
+
+  it.each([200, 401])("cancels the previous account's quarantine job read and ignores its late HTTP %s response", async status => {
+    window.history.replaceState({}, "", "/agents?quarantineJob=private-job");
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      revalidatedUser: { ...viewer, homeAccountId: "new-account" },
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => input === "/api/quarantine/jobs/private-job"
+      ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/quarantine/jobs/private-job")).toBe(true));
+    const signal = transport.fetchMock.mock.calls.find(([path]) => path === "/api/quarantine/jobs/private-job")![1]?.signal;
+    await revalidateTransportSession(transport);
+    expect(signal?.aborted).toBe(true);
+    const requests = transport.fetchMock.mock.calls.length;
+    await act(async () => pending.resolve(status === 200 ? Response.json(quarantineJob("private-job"))
+      : Response.json({ code: "authentication_required", detail: "Retired account denied." }, { status })));
+    expect(screen.queryByText("Quarantine job: Succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Retired account denied/)).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).has("quarantineJob")).toBe(false);
+    expect(transport.fetchMock.mock.calls.length).toBe(requests);
   });
 
   it.each(["table", "detail"] as const)("surfaces exact-read failures without offering a mutation confirmation from %s", async entry => {
@@ -5425,6 +9329,7 @@ describe("App session revalidation", () => {
   });
 
   it("keeps known inventory dashboard counts when retained reporting is unavailable", async () => {
+    unifiedPage.usageContext.reports = selectedAgentsPage().reports;
     const transport = appTransport({
       revalidatedRoles: viewer.roles,
       inventoryReadAuthorized: true,
@@ -5618,6 +9523,133 @@ describe("App session revalidation", () => {
     expect(await screen.findByRole("button", { name: "Researcher" })).toBeVisible();
   });
 
+  it.each(["Refresh agents", "Refresh matching details"] as const)(
+    "keeps %s as the only status owner while history details wait and publishes once", async action => {
+      vi.useFakeTimers();
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const complete = completedRefreshJob();
+      const running = { ...complete, status: "running", finishedAt: null };
+      const path = `/api/agents/refresh-jobs/${complete.id}?mode=delegated`;
+      const selectedId = action === "Refresh agents" ? complete.id : "other-history-job";
+      const selectedPath = `/api/agents/refresh-jobs/${selectedId}?mode=delegated`;
+      const commandPath = action === "Refresh agents" ? "/api/agents/refresh-jobs" : "/api/agents/refresh-selection";
+      let started = false;
+      let reads = 0;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === commandPath && init?.method === "POST") {
+          started = true;
+          return Promise.resolve(Response.json(running));
+        }
+        if (input === path) return ++reads === 1 ? pending.promise : Promise.resolve(Response.json(complete));
+        if (input === selectedPath) return Promise.resolve(Response.json({ ...complete, id: selectedId, status: "failed" }));
+        if (input === "/api/workbench/jobs") return Promise.resolve(Response.json({
+          value: started ? [{
+            id: selectedId, source: "package-refresh", label: "Selected package refresh", target: "Saved source",
+            status: "running", completed: 0, total: null, partial: false, updatedAt: complete.updatedAt,
+            href: `/sync?refreshJob=${selectedId}`,
+          }] : [],
+          unavailableSources: [], polledAt: complete.updatedAt, requestId: "history-selection",
+        }));
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      fireEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
+      const before = captures();
+      fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      const command = screen.getByRole("button", { name: action });
+      expect(command).toBeEnabled();
+      fireEvent.click(command);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      fireEvent.click(screen.getByRole("button", { name: "Close inventory diagnostics" }));
+      await act(() => vi.advanceTimersByTimeAsync(750));
+      expect(reads).toBe(1);
+      fireEvent.click(screen.getByRole("link", { name: /View details for Selected package refresh/ }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(reads).toBe(1);
+      expect(screen.getByText(/Waiting for the current package refresh/)).toBeVisible();
+      if (selectedId !== complete.id) {
+        expect(screen.queryByRole("region", { name: "Selected package refresh job" })).not.toBeInTheDocument();
+        expect(transport.fetchMock.mock.calls.some(([input]) => input === selectedPath)).toBe(false);
+      }
+      await act(async () => pending.resolve(Response.json(complete)));
+      const selected = screen.getByRole("region", { name: "Selected package refresh job" });
+      expect(selected).toHaveTextContent(selectedId);
+      expect(selected).toHaveTextContent(selectedId === complete.id ? "succeeded" : "failed");
+      expect(screen.queryByText(/Waiting for the current package refresh/)).not.toBeInTheDocument();
+      expect(reads).toBe(selectedId === complete.id ? 2 : 1);
+      expect(captures()).toBe(before + 1);
+      expect(transport.fetchMock.mock.calls.filter(([input, init]) => input === commandPath && init?.method === "POST")).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["package-refresh", "delegated"],
+    ["package-refresh", "application"],
+    ["power-platform", "delegated"],
+  ] as const)("opens %s %s history details without reloading Sync or losing table controls", async (source, mode) => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const history: WorkbenchJobSummary[] = Array.from({ length: 11 }, (_, index) => {
+      const id = `history-${String(index).padStart(2, "0")}`;
+      return {
+        id, source, tokenMode: mode, label: `History refresh ${String(index).padStart(2, "0")}`,
+        target: "Saved source", status: "failed", completed: null, total: null, partial: false,
+        updatedAt: "2026-09-15T08:00:00.000Z",
+        href: source === "power-platform" ? `/sync?powerPlatformJob=${id}`
+          : `/sync?refreshJob=${id}${mode === "application" ? "&mode=application" : ""}`,
+      };
+    });
+    const selected = history[10];
+    const detail = deferredResponse();
+    const path = source === "power-platform" ? `/api/inventory/refresh-jobs/${selected.id}`
+      : `/api/agents/refresh-jobs/${selected.id}?mode=${mode}`;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/workbench/jobs") return Response.json({
+        value: history, unavailableSources: [], polledAt: selected.updatedAt, requestId: "history-selection",
+      });
+      if (input === path) return detail.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const table = await screen.findByRole("table", { name: "Sync history" });
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Outcome" }), "incomplete");
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Scope" }));
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    const count = (path: string) => transport.fetchMock.mock.calls.filter(([input]) => input === path).length;
+    const unchangedReads = ["/api/me", "/api/workbench/jobs", "/api/data-sync/state", "/api/agent-inventory/selections"];
+    const before = unchangedReads.map(count);
+    const link = within(table).getByRole("link", { name: /View details for History refresh 10/ });
+    expect(link).toHaveAttribute("href", selected.href);
+    expect(fireEvent.click(link)).toBe(false);
+    expect(await screen.findByText(source === "power-platform" ? "Loading source job…" : "Loading package refresh status…")).toBeVisible();
+    expect(fireEvent.click(link)).toBe(false);
+    await act(async () => {});
+    expect(count(path)).toBe(1);
+    await act(async () => detail.resolve(Response.json(source === "power-platform"
+      ? inventoryRefreshJob("failed", selected.id)
+      : { ...completedRefreshJob(), id: selected.id, tokenMode: mode, status: "failed" })));
+    expect(await screen.findByRole("region", { name: source === "power-platform"
+      ? "Power Platform source job" : "Selected package refresh job" })).toHaveTextContent(selected.id);
+    expect(window.location.pathname + window.location.search).toBe(selected.href);
+    expect(screen.getByRole("table", { name: "Sync history" })).toBe(table);
+    expect(screen.getByText(/11-11 of 11 recent records/)).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Outcome" })).toHaveValue("incomplete");
+    expect(within(table).getByRole("columnheader", { name: "Scope" })).toHaveAttribute("aria-sort", "ascending");
+    expect(fireEvent.click(link)).toBe(false);
+    await act(async () => {});
+    expect(count(path)).toBe(1);
+    expect(unchangedReads.map(count)).toEqual(before);
+  });
+
   it.each(["/sync", "/agents"])("recovers an exact package refresh on Sync from a %s job link", async path => {
     window.history.replaceState({}, "", `${path}?refreshJob=retained-package-run&mode=application`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
@@ -5641,6 +9673,96 @@ describe("App session revalidation", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     expect(new URLSearchParams(window.location.search).get("refreshJob")).toBe("retained-package-run");
     expect(await screen.findByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("retained-package-run");
+  });
+
+  it.each(["syncRun", "refreshJob"] as const)("shares equivalent UUID %s bookmarks and displays the server's canonical ID", async field => {
+    const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    window.history.replaceState({}, "", `/sync?${field}=${id.toUpperCase()}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const path = field === "syncRun" ? `/api/data-sync/runs/${id}` : `/api/agents/refresh-jobs/${id}`;
+    const requests: Array<RequestInit | undefined> = [];
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname.toLowerCase() === path) {
+        requests.push(init);
+        return pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    act(() => {
+      window.history.pushState({}, "", `/sync?${field}=${id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(async () => {});
+    expect(requests[0]?.signal?.aborted).toBe(false);
+    expect(requests).toHaveLength(1);
+    await act(async () => pending.resolve(Response.json(field === "syncRun"
+      ? { id, mode: "full", status: "completed", startedAt: "2026-09-14T09:00:00.000Z",
+        updatedAt: "2026-09-14T09:01:00.000Z", completedAt: "2026-09-14T09:01:00.000Z", sources: [] }
+      : { ...completedRefreshJob(), id, status: "failed" })));
+    const region = await screen.findByRole(field === "syncRun" ? "dialog" : "region", {
+      name: field === "syncRun" ? "Sync run details" : "Selected package refresh job",
+    });
+    await waitFor(() => expect(region).toHaveTextContent(id));
+    expect(screen.queryByText(/Loading exact sync run|Loading package refresh status/)).not.toBeInTheDocument();
+    act(() => {
+      window.history.pushState({}, "", `/sync?${field}=${id.toUpperCase()}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(async () => {});
+    expect(region).toHaveTextContent(id);
+    expect(requests).toHaveLength(1);
+    expect(new URLSearchParams(window.location.search).get(field)).toBe(id);
+  });
+
+  it.each(["syncRun", "refreshJob"] as const)("retires exact %s responses through A-B-A browser history", async field => {
+    const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", otherId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    window.history.replaceState({}, "", `/sync?${field}=${id.toUpperCase()}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = [deferredResponse(), deferredResponse(), deferredResponse()];
+    const requests: Array<RequestInit | undefined> = [];
+    const prefix = field === "syncRun" ? "/api/data-sync/runs/" : "/api/agents/refresh-jobs/";
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname.startsWith(prefix)) {
+        requests.push(init);
+        return pending[requests.length - 1].promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    for (const [index, next] of [otherId, id].entries()) {
+      act(() => {
+        window.history.pushState({}, "", `/sync?${field}=${next}`);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await waitFor(() => expect(requests).toHaveLength(index + 2));
+      expect(requests[index]?.signal?.aborted).toBe(true);
+    }
+    await act(async () => pending[2].resolve(Response.json(field === "syncRun"
+      ? { id, mode: "full", status: "completed", startedAt: "2026-09-14T09:00:00.000Z",
+        updatedAt: "2026-09-14T09:01:00.000Z", completedAt: "2026-09-14T09:01:00.000Z", sources: [] }
+      : { ...completedRefreshJob(), id, status: "failed", message: "Current visit evidence" })));
+    const region = await screen.findByRole(field === "syncRun" ? "dialog" : "region", {
+      name: field === "syncRun" ? "Sync run details" : "Selected package refresh job",
+    });
+    await waitFor(() => expect(region).toHaveTextContent(id));
+    await act(async () => {
+      pending[0].resolve(Response.json({ code: "unauthorized", detail: "Retired visit error" }, { status: 401 }));
+      pending[1].resolve(Response.json({ id: otherId, status: "running", message: "Retired visit evidence" }));
+    });
+    expect(region).toHaveTextContent(id);
+    expect(screen.queryByText(/Retired visit/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Loading exact sync run|Loading package refresh status/)).not.toBeInTheDocument();
+    expect(transport.meCalls()).toBe(1);
+    expect(requests).toHaveLength(3);
+    expect(new URLSearchParams(window.location.search).get(field)).toBe(id);
   });
 
   it("keeps a linked package job live on Sync beyond thirty minutes until it finishes", async () => {
@@ -5672,6 +9794,183 @@ describe("App session revalidation", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(reads).toBe(5);
     view.unmount();
+  });
+
+  it("does not invalidate inventory again when revisiting a completed package job", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=refresh-first-load");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("succeeded"));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await screen.findByText(agent.displayName);
+    const before = transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    for (let index = 0; index < 2; index++) {
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await waitFor(() => expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("succeeded"));
+      await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+      await screen.findByText(agent.displayName);
+    }
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections")).toHaveLength(before);
+  });
+
+  it("recovers invalidated refresh target pages with one status read and no repeated inventory invalidation or provider admission", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=target-progress&mode=application");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const job = { ...completedRefreshJob(), id: "target-progress", scopeKind: "exact", tokenMode: "application", targetCount: 1 };
+    let statusReads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (input === "/api/agents/refresh-jobs/target-progress?mode=application") {
+        statusReads += 1;
+        return statusReads === 1 ? Promise.resolve(Response.json({ ...job, resultRevision: "1" })) : pending.promise;
+      }
+      if (url.pathname === "/api/agents/refresh-jobs/target-progress/targets") {
+        return Promise.resolve(url.searchParams.get("revision") === "1"
+          ? Response.json({ code: "selection_invalidated", detail: "Target progress changed." }, { status: 409 })
+          : Response.json({ value: [{ id: "Recovered target", ordinal: 0, status: "published" }], revision: "2",
+            counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Refresh progress changed. Refresh status to restart target pages.");
+    const inventoryReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      ["/api/agent-inventory", "/api/agent-inventory/selections"].includes(new URL(input, "http://localhost").pathname)).length;
+    const before = inventoryReads();
+    const button = screen.getByRole("button", { name: "Refresh status" });
+    act(() => { button.click(); button.click(); });
+    await screen.findByText("Loading package refresh status…");
+    expect(screen.queryByText("Refresh progress changed. Refresh status to restart target pages.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh status" })).not.toBeInTheDocument();
+    expect(statusReads).toBe(2);
+    await act(async () => pending.resolve(Response.json({ ...job, resultRevision: "2" })));
+    expect(await screen.findByText("Recovered target")).toBeVisible();
+    expect(screen.queryByText("Loading package refresh status…")).not.toBeInTheDocument();
+    const targetReads = transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/targets"));
+    expect(targetReads).toHaveLength(2);
+    expect(targetReads[1][0]).toBe("/api/agents/refresh-jobs/target-progress/targets?mode=application&revision=2&limit=50");
+    expect(inventoryReads()).toBe(before);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(selectedRefreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.filter(([input, init]) =>
+      input.startsWith("/api/agents/refresh-jobs") && (init?.method ?? "GET") !== "GET")).toHaveLength(0);
+  });
+
+  it("retries failed linked refresh status explicitly and cancels the retry when its bookmark changes", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=unavailable-refresh");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let oldReads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/agents/refresh-jobs/unavailable-refresh?mode=delegated") {
+        oldReads += 1;
+        return oldReads === 1 ? Promise.resolve(Response.json({ code: "unavailable", detail: "Status unavailable." }, { status: 503 }))
+          : pending.promise;
+      }
+      if (input === "/api/agents/refresh-jobs/current-refresh?mode=delegated") {
+        return Promise.resolve(Response.json({ ...completedRefreshJob(), id: "current-refresh" }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(/Status unavailable/)).toHaveTextContent("Unable to read package refresh status.");
+    expect(screen.queryByText("Loading package refresh status…")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await screen.findByText("Loading package refresh status…");
+    expect(oldReads).toBe(2);
+    const request = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/refresh-jobs/unavailable-refresh?mode=delegated").at(-1)!;
+    act(() => {
+      window.history.pushState({}, "", "/sync?refreshJob=current-refresh");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("current-refresh");
+    expect(request[1]?.signal?.aborted).toBe(true);
+    const sessionReads = transport.meCalls();
+    await act(async () => pending.resolve(Response.json({ code: "unauthorized", detail: "Retired account error" }, { status: 401 })));
+    expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("current-refresh");
+    expect(screen.queryByText(/Retired account error/)).not.toBeInTheDocument();
+    expect(transport.meCalls()).toBe(sessionReads);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("does not admit a manual linked refresh status read while its poll is pending", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync?refreshJob=pending-poll");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let statusReads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/agents/refresh-jobs/pending-poll?mode=delegated") {
+        statusReads += 1;
+        return statusReads === 1 ? Promise.resolve(Response.json({ ...completedRefreshJob(), id: "pending-poll", status: "running" }))
+          : pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const view = render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    expect(statusReads).toBe(2);
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(statusReads).toBe(2);
+    await act(async () => pending.resolve(Response.json({ ...completedRefreshJob(), id: "pending-poll" })));
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+    expect(screen.queryByText("Loading package refresh status…")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("succeeded");
+    view.unmount();
+  });
+
+  it("removes a linked refresh failure when its bookmark is no longer selected", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=missing-refresh");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/agents/refresh-jobs/missing-refresh?mode=delegated"
+      ? Promise.resolve(Response.json({ code: "job_not_found", detail: "Previous refresh is unavailable." }, { status: 404 }))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(/Previous refresh is unavailable/);
+    act(() => {
+      window.history.pushState({}, "", "/sync");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => expect(screen.queryByText(/Previous refresh is unavailable/)).not.toBeInTheDocument());
+  });
+
+  it("keeps independent control and refresh bookmark errors", async () => {
+    window.history.replaceState({}, "", "/agents?controlJob=missing-control&refreshJob=missing-refresh");
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/agents/refresh-jobs/missing-refresh?mode=delegated") {
+        return Promise.resolve(Response.json({ code: "job_not_found", detail: "Refresh bookmark failure." }, { status: 404 }));
+      }
+      if (input === "/api/agents/bulk-jobs/missing-control") {
+        return Promise.resolve(Response.json({ code: "job_not_found", detail: "Control bookmark failure." }, { status: 404 }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(/Refresh bookmark failure/)).toBeVisible();
+    expect(await screen.findByText(/Control bookmark failure/)).toBeVisible();
+    act(() => {
+      window.history.pushState({}, "", "/agents?controlJob=missing-control");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => expect(screen.queryByText(/Refresh bookmark failure/)).not.toBeInTheDocument());
+    expect(screen.getByText(/Control bookmark failure/)).toBeVisible();
   });
 
   it.each([false, true])("reloads saved inventory after a linked package refresh publishes (already finished: %s)", async initiallyComplete => {
@@ -5782,6 +10081,42 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.some(([input]) => String(input).endsWith("/retry"))).toBe(false);
   });
 
+  it("keeps bulk access preview failures in the current draft without leaking a global error", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    let failPreview = true;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/agents/mutation-preview" && failPreview) {
+        return Promise.resolve(Response.json({
+          code: "preview_failed", detail: "The previous bulk access preview failed.",
+        }, { status: 500 }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: "Manage access" }));
+    const editor = await screen.findByRole("dialog", { name: "Manage agent access" });
+    await userEvent.click(within(editor).getByRole("radio", { name: /No users/ }));
+    await userEvent.click(within(editor).getByRole("button", { name: "Apply" }));
+    await userEvent.click(within(editor).getByRole("button", { name: "Confirm and apply" }));
+    expect(await within(editor).findByText("The previous bulk access preview failed.")).toBeVisible();
+    expect(screen.getAllByText("The previous bulk access preview failed.")).toHaveLength(1);
+    const callsAfterFailure = transport.fetchMock.mock.calls.length;
+
+    await userEvent.click(within(editor).getByRole("button", { name: /^Installed for/ }));
+    expect(screen.queryByText("The previous bulk access preview failed.")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls).toHaveLength(callsAfterFailure);
+    failPreview = false;
+    await userEvent.click(within(editor).getByRole("button", { name: "Apply" }));
+    await userEvent.click(within(editor).getByRole("button", { name: "Confirm and apply" }));
+
+    expect(await screen.findByRole("dialog", { name: /update installation package\?/i })).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/mutation-preview")).toHaveLength(2);
+    expect(screen.queryByText("The previous bulk access preview failed.")).not.toBeInTheDocument();
+  });
+
   it("stages explicit access targets on the server without client detail enumeration", async () => {
     const transport = accessEditorTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -5867,12 +10202,484 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("dialog", { name: /^unblock package/i })).toBeInTheDocument();
   });
 
+  it.each(["exact targets", "grouped targets", "all-matching targets", "sort"].flatMap(boundary =>
+    [200, 401].map(status => ({ boundary, status }))))(
+    "retires a pending bulk preview after changing $boundary, ignoring late HTTP $status",
+    async ({ boundary, status }) => {
+      const transport = accessEditorTransport(), pending = deferredResponse();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const groupedPage = { ...unifiedPage, value: [{ ...unifiedPage.value[0],
+        id: "agent:11111111-1111-4111-8111-111111111111", packagesComplete: false, packageCount: 2 }] };
+      let preview!: Response;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (boundary === "grouped targets" && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+          return Response.json(selectedInventoryPage(input, groupedPage));
+        }
+        if (boundary === "grouped targets" && input === "/api/agents/mutation-selection") return Response.json({ count: 2 });
+        if (input === "/api/agents/mutation-preview") {
+          preview = await base(input, init);
+          return pending.promise;
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      const row = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+      if (boundary === "all-matching targets") {
+        await userEvent.click(screen.getByRole("button", { name: "Select all 1 matching published versions" }));
+      } else await userEvent.click(row);
+      await userEvent.click(await screen.findByRole("button", { name: "Block selected packages" }));
+      await waitFor(() => expect(preview).toBeDefined());
+      const request = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agents/mutation-preview")!;
+      if (boundary === "all-matching targets") {
+        await userEvent.click(screen.getByRole("button", { name: "Clear all-matching package selection" }));
+      } else if (boundary === "sort") {
+        await userEvent.click(screen.getByRole("button", { name: "Sort by Agent" }));
+      } else await userEvent.click(row);
+      await waitFor(() => expect(request[1]?.signal?.aborted).toBe(true));
+      expect(screen.queryByText("Preparing block preview…")).not.toBeInTheDocument();
+      const sessionReads = transport.session.meCalls();
+      await act(async () => pending.resolve(status === 200 ? preview
+        : Response.json({ code: "unauthorized", detail: "Retired selection preview." }, { status: 401 })));
+      expect(screen.queryByRole("dialog", { name: /^block package/i })).not.toBeInTheDocument();
+      expect(screen.queryByText("Retired selection preview.")).not.toBeInTheDocument();
+      expect(transport.session.meCalls()).toBe(sessionReads);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/mutation-preview")).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/block")).toHaveLength(0);
+    },
+  );
+
+  it.each(["success", "failure"] as const)("retires a pending block preview when Manage access replaces it (%s)", async outcome => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let preview!: Response;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/mutation-preview") {
+        preview = await base(input, init);
+        return pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+    await waitFor(() => expect(preview).toBeDefined());
+    await userEvent.click(screen.getByRole("button", { name: "Manage access" }));
+    expect(await screen.findByRole("dialog", { name: "Manage agent access" })).toBeVisible();
+    const request = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agents/mutation-preview");
+    expect(request?.[1]?.signal?.aborted).toBe(true);
+    expect(screen.queryByText("Preparing block preview…")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(outcome === "success" ? preview
+      : Response.json({ code: "preview_failed", detail: "Replaced block preview failed." }, { status: 500 })));
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.queryByRole("dialog", { name: /^block package/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("Replaced block preview failed.")).not.toBeInTheDocument();
+  });
+
+  it("admits one identical bulk preview and one confirmed submission in the same React batch", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pendingPreview = deferredResponse();
+    const pendingSubmit = deferredResponse();
+    let preview!: Response;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/mutation-preview") {
+        preview = await base(input, init);
+        return pendingPreview.promise;
+      }
+      if (input === "/api/agents/block") return pendingSubmit.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    const prepare = screen.getByRole("button", { name: "Block selected packages" });
+    act(() => { fireEvent.click(prepare); fireEvent.click(prepare); });
+    await waitFor(() => expect(preview).toBeDefined());
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/mutation-preview")).toHaveLength(1);
+    await act(async () => pendingPreview.resolve(preview));
+    const confirm = await screen.findByRole("button", { name: "Block package" });
+    act(() => { fireEvent.click(confirm); fireEvent.click(confirm); });
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/block")).toHaveLength(1);
+    await act(async () => pendingSubmit.resolve(Response.json(waitingBulkJob())));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+  });
+
+  it("shares terminal result reads and invalidates inventory once even when reading results fails", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const job: BulkActionJob = { ...waitingBulkJob(), status: "succeeded", canResume: false,
+      total: 1, completed: 1, succeeded: 1, inconclusive: 0, queued: 0, reconciliationRequired: 0 };
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let failResults = true;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/block") return Response.json(job);
+      if (input === endpoint) return Response.json(job);
+      if (input.startsWith(`${endpoint}/items?`)) return failResults ? pending.promise : Response.json({
+        value: [{ id: agent.id, displayName: agent.displayName, status: "succeeded" }],
+        revision: job.resultRevision, counts: { total: 1, filtered: 1 },
+        page: { limit: 50, nextCursor: null, previousCursor: null },
+      });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+    const confirm = await screen.findByRole("button", { name: "Block package" });
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(confirm);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith(`${endpoint}/items?`))).toHaveLength(1);
+    await act(async () => pending.resolve(Response.json({ code: "unavailable", detail: "Results unavailable." }, { status: 503 })));
+    await waitFor(() => expect(captures()).toBe(before + 1));
+    expect(panel.queryByRole("button", { name: "Retry results" })).not.toBeInTheDocument();
+    failResults = false;
+    await userEvent.click(await panel.findByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(panel.queryByRole("alert")).not.toBeInTheDocument());
+    await waitFor(() => expect(panel.getByText(agent.displayName)).toBeVisible());
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith(`${endpoint}/items?`))).toHaveLength(2);
+    expect(captures()).toBe(before + 1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/block")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeVisible();
+  });
+
+  it.each(["succeeded", "skipped", "unsent"] as const)(
+    "invalidates paused package job readbacks once, only when published (%s)",
+    async outcome => {
+      const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+      const published = outcome !== "unsent";
+      const job: BulkActionJob = { ...waitingBulkJob(), completed: published ? 1 : 0,
+        succeeded: outcome === "succeeded" ? 1 : 0, skipped: outcome === "skipped" ? 1 : 0,
+        inconclusive: 0, reconciliationRequired: 0, queued: published ? 1 : 2 };
+      let changed = false;
+      let resultsUnavailable = true;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === "/api/agents/block") {
+          changed = published;
+          return Promise.resolve(Response.json(job));
+        }
+        if (input === `/api/agents/bulk-jobs/${job.id}`) return Promise.resolve(Response.json(job));
+        if (resultsUnavailable && input.startsWith(`/api/agents/bulk-jobs/${job.id}/items?`)) {
+          return Promise.resolve(Response.json({ code: "selection_invalidated", detail: "Results changed." }, { status: 409 }));
+        }
+        if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+          return Promise.resolve(Response.json(selectedInventoryPage(input, {
+            ...unifiedPage, value: [{ ...unifiedPage.value[0], packages: [{ ...agent, isBlocked: changed }] }],
+          })));
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+      const confirm = await screen.findByRole("button", { name: "Block package" });
+      const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+      const before = captures();
+      await userEvent.click(confirm);
+      const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+      await waitFor(() => expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+      await waitFor(() => expect(captures()).toBe(before + (published ? 1 : 0)));
+      expect(await screen.findByRole("button", { name: `${published ? "Unblock" : "Block"} ${agent.displayName}` })).toBeVisible();
+      resultsUnavailable = false;
+      await userEvent.click(await panel.findByRole("button", { name: "Refresh status" }));
+      await waitFor(() => expect(panel.queryByText("Checking status...")).not.toBeInTheDocument());
+      await waitFor(() => expect(panel.queryByRole("alert")).not.toBeInTheDocument());
+      expect(captures()).toBe(before + (published ? 1 : 0));
+      expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/block")).toHaveLength(1);
+    },
+  );
+
+  it("invalidates verified package readbacks when polling is interrupted, without replaying the mutation", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job: BulkActionJob = { ...waitingBulkJob(), status: "running", canResume: false,
+      succeeded: 1, inconclusive: 0, reconciliationRequired: 0 };
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input === "/api/agents/block") return Promise.resolve(Response.json(job));
+      if (input === `/api/agents/bulk-jobs/${job.id}`) return Promise.resolve(Response.json({
+        code: "unavailable", detail: "Package status unavailable.",
+      }, { status: 503 }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+    const confirm = await screen.findByRole("button", { name: "Block package" });
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(confirm);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(await panel.findByRole("alert", {}, { timeout: 3_000 })).toHaveTextContent("Package status unavailable.");
+    await waitFor(() => expect(captures()).toBe(before + 1));
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Running");
+    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(panel.getByRole("button", { name: "Refresh status" })).toBeEnabled());
+    expect(captures()).toBe(before + 1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/block")).toHaveLength(1);
+  });
+
+  it.each((["succeeded", "failed"] as const).flatMap(status =>
+    (["single", "bulk"] as const).map(scope => ({ status, scope }))))(
+    "preserves an independent exact selection when recovering a $status $scope package job",
+    async ({ status, scope }) => {
+      const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+      const other = { ...agent, id: "newly-selected-package", displayName: "Newer selection" };
+      const page = unifiedRecordsPage([unifiedPage.value[0], {
+        ...unifiedPage.value[0], id: `graph_packages:${other.id}`, displayName: other.displayName, packages: [other],
+      }]);
+      const job: BulkActionJob = { ...waitingBulkJob(), status, canResume: false, total: 1, completed: 1,
+        succeeded: status === "succeeded" ? 1 : 0, failed: status === "failed" ? 1 : 0,
+        inconclusive: 0, queued: 0, reconciliationRequired: 0 };
+      const submitPath = scope === "bulk" ? "/api/agents/block" : `/api/agents/${agent.id}/block`;
+      let resultsUnavailable = true;
+      transport.fetchMock.mockImplementation((input, init) => {
+        if (input === submitPath || input === `/api/agents/bulk-jobs/${job.id}`) {
+          return Promise.resolve(Response.json(job));
+        }
+        if (input.startsWith(`/api/agents/bulk-jobs/${job.id}/items?`)) return Promise.resolve(resultsUnavailable
+          ? Response.json({ code: "unavailable", detail: "Package results unavailable." }, { status: 503 })
+          : Response.json({
+            value: [{ id: agent.id, displayName: agent.displayName, status }], revision: job.resultRevision,
+            counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+          }));
+        if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+          return Promise.resolve(Response.json(selectedInventoryPage(input, page)));
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${scope === "bulk" ? agent.displayName : other.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: scope === "bulk" ? "Block selected packages" : `Block ${agent.displayName}` }));
+      await userEvent.click(await screen.findByRole("button", { name: "Block package" }));
+      const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+      await panel.findByRole("button", { name: "Refresh status" });
+      const original = screen.getByRole("checkbox", { name: `Select ${agent.displayName}` });
+      await waitFor(() => expect(original).toBeEnabled());
+      const replacement = screen.getByRole("checkbox", { name: `Select ${other.displayName}` });
+      if (scope === "bulk") {
+        await userEvent.click(original);
+        await userEvent.click(replacement);
+      }
+      resultsUnavailable = false;
+      await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+      await waitFor(() => expect(panel.queryByRole("alert")).not.toBeInTheDocument());
+      await waitFor(() => expect(panel.getByText(agent.displayName)).toBeVisible());
+      expect(replacement).toBeChecked();
+      expect(original).not.toBeChecked();
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === submitPath)).toHaveLength(1);
+    },
+  );
+
+  it("does not restart an accepted package job when returning to Agents", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === `/api/agents/${agent.id}/block` ? Response.json(job) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+    await userEvent.click(await screen.findByRole("button", { name: "Block package" }));
+    await screen.findByRole("button", { name: "Resume unprocessed tasks" });
+    const statusReads = () => transport.fetchMock.mock.calls.filter(([path]) => path === `/api/agents/bulk-jobs/${job.id}`).length;
+    const before = statusReads();
+    await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(statusReads()).toBe(before);
+  });
+
+  it("does not let job restoration supersede a pending confirmed submission on return to Agents", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let submitting = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `/api/agents/${agent.id}/block`) {
+        submitting = true;
+        return pending.promise;
+      }
+      if (input.startsWith("/api/agents/bulk-jobs?") && submitting) return Response.json({ value: [waitingBulkJob()] });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+    await userEvent.click(await screen.findByRole("button", { name: "Block package" }));
+    const historyReads = () => transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/agents/bulk-jobs?")).length;
+    const before = historyReads();
+    await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(historyReads()).toBe(before);
+    const submission = transport.fetchMock.mock.calls.find(([path]) => path === `/api/agents/${agent.id}/block`);
+    expect(submission?.[1]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(Response.json({ ...waitingBulkJob(), id: "accepted-package-job" })));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe("accepted-package-job");
+  });
+
+  it("retains a restored package job's pending first status read across ordinary navigation", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    transport.fetchMock.mockImplementation(async (input, init) => input === endpoint ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const request = transport.fetchMock.mock.calls.find(([path]) => path === endpoint);
+    expect(request).toBeDefined();
+    await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(request?.[1]?.signal?.aborted).toBe(false);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(1);
+    await act(async () => pending.resolve(Response.json(job)));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+  });
+
+  it.each(["resume", "cancel"] as const)("invalidates inventory after an explicit bookmarked-job %s, even across navigation", async operation => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const pending = deferredResponse();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    const completed: BulkActionJob = { ...job, status: "succeeded", canResume: false,
+      total: 1, completed: 1, succeeded: 1, inconclusive: 0, queued: 0, reconciliationRequired: 0, resultRevision: "2" };
+    window.history.replaceState(null, "", `/agents?controlJob=${job.id}`);
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${endpoint}/${operation}`) return pending.promise;
+      if (input.startsWith(`${endpoint}/items?revision=2`)) return Response.json({
+        value: [{ id: agent.id, displayName: agent.displayName, status: "succeeded" }],
+        revision: "2", counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+      });
+      return base(input, init);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const label = operation === "resume" ? "Resume unprocessed tasks" : "Cancel unprocessed tasks";
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(await screen.findByRole("button", { name: label }));
+    await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    const command = transport.fetchMock.mock.calls.find(([path]) => path === `${endpoint}/${operation}`);
+    expect(command?.[1]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(Response.json(completed)));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    await waitFor(() => expect(panel.getByRole("status")).toHaveTextContent("Completed"));
+    await waitFor(() => expect(captures()).toBe(before + 1));
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/${operation}`)).toHaveLength(1);
+  });
+
+  it("reopens a retained exact job after inspecting a different job", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    window.history.replaceState(null, "", `/agents?controlJob=${job.id}`);
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${endpoint}/resume`) return Response.json(job);
+      if (input === "/api/agents/bulk-jobs/other-job") return Response.json({ ...job, id: "other-job", total: 3 });
+      return base(input, init);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Resume unprocessed tasks" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+    act(() => {
+      window.history.pushState({}, "", "/agents?controlJob=other-job");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await screen.findByText("3 published versions in this job");
+    act(() => {
+      window.history.pushState({}, "", `/agents?controlJob=${job.id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByText("2 published versions in this job")).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(2);
+  });
+
+  it("replaces a historical job link when submitting a newly confirmed package change", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    window.history.replaceState(null, "", `/agents?controlJob=${job.id}`);
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === endpoint) return Response.json({ ...job, status: "failed", canResume: false, queued: 0 });
+      if (input === "/api/agents/block") return Response.json({ ...job, id: "new-package-job" });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(await screen.findByRole("button", { name: "Block selected packages" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Block package" }));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(new URLSearchParams(window.location.search).has("controlJob")).toBe(false);
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe("new-package-job");
+    await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(1);
+  });
+
+  it("does not invalidate or project reconciled inventory again when status recovery rereads the same revision", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const reconciled: BulkActionJob = { ...job, status: "partial", canResume: false,
+      completed: 2, succeeded: 1, queued: 0, resultRevision: "2" };
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let checked = false;
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === endpoint) return Response.json(checked ? reconciled : job);
+      if (input === `${endpoint}/reconcile`) {
+        checked = true;
+        return Response.json({ ...reconciled, reconciliation: { attempted: 2, failed: 1, errors: [] } });
+      }
+      if (input.startsWith(`${endpoint}/items?revision=2`)) return Response.json({
+        value: [{ id: agent.id, displayName: agent.displayName, status: "succeeded" }],
+        revision: "2", counts: { total: 2, filtered: 2 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+      });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(await screen.findByRole("button", { name: "Check uncertain results" }));
+    await waitFor(() => expect(captures()).toBe(before + 1));
+    const panel = within(screen.getByRole("region", { name: "Exact package bulk actions" }));
+    await userEvent.click(await panel.findByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(panel.queryByRole("alert")).not.toBeInTheDocument());
+    expect(captures()).toBe(before + 1);
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeVisible();
+  });
+
   it.each([
     ["single", "session revalidation"], ["bulk", "session revalidation"],
     ["single", "scoped agent denial"], ["bulk", "scoped agent denial"],
-  ] as const)(
-    "does not track a delayed %s mutation response after %s",
-    async (scope, boundary) => {
+  ].flatMap(([scope, boundary]) => ["success", "unauthorized"].map(outcome => ({ scope, boundary, outcome }))))(
+    "does not track a delayed $scope mutation response after $boundary ($outcome)",
+    async ({ scope, boundary, outcome }) => {
       const transport = accessEditorTransport();
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
@@ -5903,7 +10710,11 @@ describe("App session revalidation", () => {
         await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
         await screen.findByText(agent.displayName);
       }
-      await act(async () => pending.resolve(Response.json(waitingBulkJob())));
+      const before = transport.session.meCalls();
+      expect(transport.fetchMock.mock.calls.find(([path]) => path === endpoint)?.[1]?.signal?.aborted).toBe(true);
+      await act(async () => pending.resolve(outcome === "success" ? Response.json(waitingBulkJob())
+        : Response.json({ code: "unauthorized", detail: "Retired mutation denial." }, { status: 401 })));
+      expect(transport.session.meCalls()).toBe(before);
       expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
       expect(screen.queryByRole("group", { name: "Package job progress" })).not.toBeInTheDocument();
     },
@@ -5912,9 +10723,9 @@ describe("App session revalidation", () => {
   it.each([
     ["resume", "session revalidation"], ["cancel", "session revalidation"], ["reconcile", "session revalidation"],
     ["resume", "scoped agent denial"], ["cancel", "scoped agent denial"], ["reconcile", "scoped agent denial"],
-  ] as const)(
-    "discards a delayed package-job %s response after %s",
-    async (operation, boundary) => {
+  ].flatMap(([operation, boundary]) => ["success", "unauthorized"].map(outcome => ({ operation, boundary, outcome }))))(
+    "discards a delayed package-job $operation response after $boundary ($outcome)",
+    async ({ operation, boundary, outcome }) => {
       const transport = accessEditorTransport();
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
@@ -5948,9 +10759,12 @@ describe("App session revalidation", () => {
         await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
         await screen.findByText(agent.displayName);
       }
-      await act(async () => pending.resolve(Response.json({
+      const before = transport.session.meCalls();
+      expect(transport.fetchMock.mock.calls.find(([path]) => path === endpoint)?.[1]?.signal?.aborted).toBe(true);
+      await act(async () => pending.resolve(outcome === "success" ? Response.json({
         ...job, reconciliation: { attempted: 1, failed: 0, errors: [] },
-      })));
+      }) : Response.json({ code: "unauthorized", detail: "Retired command denial." }, { status: 401 })));
+      expect(transport.session.meCalls()).toBe(before);
       expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
       expect(screen.queryByRole("group", { name: "Package job progress" })).not.toBeInTheDocument();
     },
@@ -5970,9 +10784,7 @@ describe("App session revalidation", () => {
     transport.fetchMock.mockImplementation(async (input, init) =>
       isExport(input) ? pending.promise : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
-    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:expired-export") });
-    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const { click: download } = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
     if (source === "unified") {
@@ -6094,10 +10906,11 @@ describe("App session revalidation", () => {
     },
   );
 
-  it("does not replace a cancellation response with an older running poll", async () => {
+  it.each(["success", "unauthorized"] as const)("retires an older running poll before cancellation settles (%s)", async outcome => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
+    const cancellation = deferredResponse();
     const job = { ...waitingBulkJob(), status: "running", canResume: false } satisfies BulkActionJob;
     const jobEndpoint = `/api/agents/bulk-jobs/${job.id}`;
     let polls = 0;
@@ -6107,7 +10920,7 @@ describe("App session revalidation", () => {
         polls += 1;
         return polls === 1 ? Response.json(job) : pending.promise;
       }
-      if (input === `${jobEndpoint}/cancel`) return Response.json({ ...job, status: "cancelled" });
+      if (input === `${jobEndpoint}/cancel`) return cancellation.promise;
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -6117,20 +10930,28 @@ describe("App session revalidation", () => {
     expect(panel.getByRole("group", { name: "Package job progress" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument();
     await userEvent.click(panel.getByRole("button", { name: "Cancel unprocessed tasks" }));
+    const before = transport.session.meCalls();
+    const poll = transport.fetchMock.mock.calls.filter(([path]) => path === jobEndpoint).at(-1);
+    expect(poll?.[1]?.signal?.aborted).toBe(true);
+    await act(async () => pending.resolve(outcome === "success" ? Response.json(job)
+      : Response.json({ code: "unauthorized", detail: "Retired poll denial." }, { status: 401 })));
+    expect(transport.session.meCalls()).toBe(before);
+    expect(panel.getByRole("button", { name: "Cancelling..." })).toBeDisabled();
+    await act(async () => cancellation.resolve(Response.json({ ...job, status: "cancelled" })));
     await waitFor(() => expect(panel.getByRole("status")).toHaveTextContent("Cancelled"));
-    await act(async () => pending.resolve(Response.json(job)));
     expect(panel.getByRole("status")).toHaveTextContent("Cancelled");
     expect(panel.queryByRole("button", { name: "Cancel unprocessed tasks" })).not.toBeInTheDocument();
     expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
     expect(panel.getByText("Unprocessed tasks were cancelled. Changes already in progress may still finish.")).toBeInTheDocument();
   });
 
-  it("restores interrupted tasks on Agents after sign-in even without a browser job pointer", async () => {
+  it.each([false, true])("restores interrupted tasks on Agents without a browser pointer, skipping cancelled history (%s)", async cancelledHistory => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
     const job = waitingBulkJob();
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input.startsWith("/api/agents/bulk-jobs?")) return Response.json({ value: [job] });
+      if (input.startsWith("/api/agents/bulk-jobs?")) return Response.json({ value: cancelledHistory
+        ? [{ ...job, id: "cancelled-job", status: "partial", canResume: false, cancelRequested: true }, job] : [job] });
       if (input === `/api/agents/bulk-jobs/${job.id}`) return Response.json(job);
       return base(input, init);
     });
@@ -6140,6 +10961,7 @@ describe("App session revalidation", () => {
     expect(await panel.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
     expect(panel.getByRole("link", { name: "Sign in again" })).toBeVisible();
     expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+    expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/agents/bulk-jobs/cancelled-job")).toBe(false);
     expect(transport.fetchMock.mock.calls.filter(([path]) => String(path).includes("/bulk-jobs"))
       .every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
   });
@@ -6191,6 +11013,362 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
     expect(transport.fetchMock.mock.calls.filter(([path, init]) =>
       String(path).includes("/bulk-jobs") && init?.method === "POST")).toHaveLength(1);
+  });
+
+  it.each(["saved pointer", "bookmark"] as const)("retries a restored job's initial status failure without submitting new work (%s)", async source => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    if (source === "saved pointer") window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    else window.history.replaceState(null, "", `/agents?controlJob=${job.id}`);
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === endpoint) {
+        reads += 1;
+        return reads === 1
+          ? Response.json({ code: "unavailable", detail: "Job status unavailable." }, { status: 503 })
+          : Response.json(job);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(await panel.findByRole("alert")).toHaveTextContent("Job status unavailable.");
+    const refresh = panel.getByRole("button", { name: "Refresh status" });
+    act(() => { fireEvent.click(refresh); fireEvent.click(refresh); });
+    expect(await panel.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reads).toBe(2);
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) =>
+      path.includes("/bulk-jobs") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  it.each(["waiting_authorization", "partial"] as const)(
+    "keeps an accepted resume queued while status still reports the pre-claim %s snapshot",
+    async status => {
+      const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+      const job: BulkActionJob = { ...waitingBulkJob(), status };
+      const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+      let resumed = false;
+      let polls = 0;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === `${endpoint}/resume`) {
+          resumed = true;
+          return Response.json({ ...job, status: "queued", canResume: false });
+        }
+        if (input === endpoint) {
+          if (!resumed || ++polls === 1) return Response.json(job);
+          return Response.json({ ...job, status: "waiting_authorization", updatedAt: "2026-09-15T08:01:00.000Z" });
+        }
+        return base(input, init);
+      });
+      window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+      await waitFor(() => expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(panel.getByRole("button", { name: "Resume unprocessed tasks" })));
+      expect(panel.getByRole("status")).toHaveTextContent("Queued");
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(polls).toBe(1);
+      expect(panel.getByRole("status")).toHaveTextContent("Queued");
+      expect(panel.queryByRole("button", { name: "Resume unprocessed tasks" })).not.toBeInTheDocument();
+      expect(panel.getByRole("button", { name: "Cancel unprocessed tasks" })).toBeEnabled();
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(panel.getByRole("status")).toHaveTextContent("Sign-in required");
+      expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(polls).toBe(2);
+      expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/resume`)).toHaveLength(1);
+      expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    },
+  );
+
+  it.each(["provider_pending", "constructor", null])(
+    "retains an accepted job receipt when its initial status is unsupported (%s)",
+    async status => {
+      const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+      const job = waitingBulkJob();
+      const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+      transport.fetchMock.mockImplementation(async (input, init) =>
+        input === `/api/agents/${agent.id}/block` ? Response.json({ ...job, status, canResume: false }) : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+      await userEvent.click(await screen.findByRole("button", { name: "Block package" }));
+      const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+      expect(await panel.findByRole("alert")).toHaveTextContent("unrecognized job status");
+      expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeDisabled();
+      expect(screen.getByRole("button", { name: `Manage access for ${agent.displayName}` })).toBeDisabled();
+      await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      expect(panel.queryByRole("button", { name: "Block selected packages" })).not.toBeInTheDocument();
+      expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+      const refresh = panel.getByRole("button", { name: "Refresh status" });
+      act(() => { fireEvent.click(refresh); fireEvent.click(refresh); });
+      expect(await panel.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeEnabled();
+      expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => path === `/api/agents/${agent.id}/block`)).toHaveLength(1);
+      expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    },
+  );
+
+  it("checks unsupported history status through the exact job instead of silently ignoring it", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    transport.fetchMock.mockImplementation(async (input, init) => input.startsWith("/api/agents/bulk-jobs?")
+      ? Response.json({ value: [{ ...job, status: "provider_pending", canResume: false, reconciliationRequired: 0 }] })
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) => path.includes("/bulk-jobs") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  it("stops an unsupported poll with retained last-reported progress and read-only status recovery", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job: BulkActionJob = { ...waitingBulkJob(), status: "running", canResume: false };
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === endpoint) {
+        reads += 1;
+        return Response.json(reads === 1 ? job : reads === 2
+          ? { ...job, status: "provider_pending", resultRevision: "2" }
+          : waitingBulkJob());
+      }
+      return base(input, init);
+    });
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(await panel.findByRole("alert", {}, { timeout: 3_000 })).toHaveTextContent("unrecognized job status");
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Running");
+    expect(panel.getByText("1 of 2 processed")).toBeVisible();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+    expect(transport.fetchMock.mock.calls.some(([path]) => path.startsWith(`${endpoint}/items?revision=2`))).toBe(false);
+    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+    expect(await panel.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reads).toBe(3);
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) => path.includes("/bulk-jobs") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  it("preserves a queued resume through status-only recovery and invalidates its terminal publication once", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job: BulkActionJob = { ...waitingBulkJob(), total: 1, completed: 0, inconclusive: 0, reconciliationRequired: 0 };
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let resumed = false;
+    let polls = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${endpoint}/resume`) {
+        resumed = true;
+        return Response.json({ ...job, status: "queued", canResume: false });
+      }
+      if (input === endpoint) {
+        if (!resumed) return Response.json(job);
+        polls += 1;
+        if (polls === 1) return Response.json({ code: "unavailable", detail: "Status read interrupted." }, { status: 503 });
+        return Response.json(polls < 4 ? job : {
+          ...job, status: "succeeded", canResume: false, completed: 1, succeeded: 1, queued: 0,
+          resultRevision: "2", updatedAt: "2026-09-15T08:01:00.000Z",
+        });
+      }
+      if (input.startsWith(`${endpoint}/items?`)) {
+        const revision = new URL(input, "http://localhost").searchParams.get("revision");
+        return Response.json({ value: [{ id: agent.id, displayName: agent.displayName, status: revision === "2" ? "succeeded" : "queued" }],
+          revision, counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
+      }
+      return base(input, init);
+    });
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    await waitFor(() => expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(panel.getByRole("button", { name: "Resume unprocessed tasks" })));
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(panel.getByRole("alert")).toHaveTextContent("Status read interrupted.");
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Queued");
+    const refresh = panel.getByRole("button", { name: "Refresh status" });
+    await act(async () => { fireEvent.click(refresh); fireEvent.click(refresh); });
+    expect(polls).toBe(2);
+    expect(panel.getByRole("status")).toHaveTextContent(/^Queued$/);
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(panel.queryByRole("button", { name: "Resume unprocessed tasks" })).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    expect(panel.getByRole("status")).toHaveTextContent("Completed");
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
+    expect(captures()).toBe(before + 1);
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(polls).toBe(4);
+    expect(captures()).toBe(before + 1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith(`${endpoint}/items?revision=2`))).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/resume`)).toHaveLength(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("retires a queued resume and its late poll when the session is revalidated", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    const pending = deferredResponse();
+    let resumed = false;
+    let revalidated = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${endpoint}/resume`) {
+        resumed = true;
+        return Response.json({ ...job, status: "queued", canResume: false });
+      }
+      if (input === endpoint) return resumed && !revalidated ? pending.promise : Response.json(job);
+      return base(input, init);
+    });
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    await waitFor(() => expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(panel.getByRole("button", { name: "Resume unprocessed tasks" })));
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    const oldPoll = transport.fetchMock.mock.calls.filter(([path]) => path === endpoint).at(-1);
+    vi.useRealTimers();
+    revalidated = true;
+    await revalidateTransportSession(transport.session);
+    expect(oldPoll?.[1]?.signal?.aborted).toBe(true);
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
+    act(() => {
+      window.history.pushState({}, "", `/agents?controlJob=${job.id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    const current = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(await current.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    await act(async () => pending.resolve(Response.json({ ...job, status: "provider_pending" })));
+    expect(current.getByRole("status")).toHaveTextContent("Sign-in required");
+    expect(current.queryByRole("alert")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/resume`)).toHaveLength(1);
+  });
+
+  it("bounds queued resume polling even if the worker never advances the paused snapshot", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    transport.fetchMock.mockImplementation(async (input, init) => input === `${endpoint}/resume`
+      ? Response.json({ ...job, status: "queued", canResume: false }) : base(input, init));
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    await waitFor(() => expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled());
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(panel.getByRole("button", { name: "Resume unprocessed tasks" })));
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(panel.getByRole("alert")).toHaveTextContent("Automatic status updates paused after five minutes");
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Queued");
+    expect(panel.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+    const polls = transport.fetchMock.mock.calls.filter(([path]) => path === endpoint).length;
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === endpoint)).toHaveLength(polls);
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/resume`)).toHaveLength(1);
+  });
+
+  it("does not publish unsupported reconciliation status or invalidate its claimed successes", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job = waitingBulkJob();
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let unsupported = false;
+    let recoveryFails = true;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${endpoint}/reconcile`) {
+        unsupported = true;
+        return Response.json({ ...job, status: "provider_pending", completed: 2, succeeded: 2, resultRevision: "2",
+          reconciliation: { attempted: 1, failed: 0, errors: [] } });
+      }
+      if (input === endpoint && unsupported && recoveryFails) {
+        return Response.json({ code: "unavailable", detail: "Status recovery unavailable." }, { status: 503 });
+      }
+      return base(input, init);
+    });
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    await waitFor(() => expect(panel.getByRole("button", { name: "Check uncertain results" })).toBeEnabled());
+    const captures = () => transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections").length;
+    const before = captures();
+    await userEvent.click(panel.getByRole("button", { name: "Check uncertain results" }));
+    expect(await panel.findByRole("alert")).toHaveTextContent("unrecognized job status");
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Sign-in required");
+    expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeDisabled();
+    expect(panel.getByRole("button", { name: "Check uncertain results" })).toBeDisabled();
+    expect(panel.getByRole("button", { name: "Cancel unprocessed tasks" })).toBeEnabled();
+    expect(panel.getByText("1 of 2 processed")).toBeVisible();
+    expect(captures()).toBe(before);
+    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+    expect(await panel.findByRole("alert")).toHaveTextContent("Status recovery unavailable.");
+    expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeDisabled();
+    expect(panel.getByRole("button", { name: "Check uncertain results" })).toBeDisabled();
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Sign-in required");
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeDisabled();
+    recoveryFails = false;
+    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(panel.queryByRole("alert")).not.toBeInTheDocument());
+    expect(panel.getByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(panel.getByRole("button", { name: "Check uncertain results" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeEnabled();
+    expect(captures()).toBe(before);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === `${endpoint}/reconcile`)).toHaveLength(1);
+  });
+
+  it("does not restore mutation admission from a stale running snapshot after unknown status and failed cancellation", async () => {
+    const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
+    const job: BulkActionJob = { ...waitingBulkJob(), status: "running", canResume: false };
+    const endpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let reads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === endpoint) return Response.json(++reads === 1 ? job : { ...job, status: "provider_pending" });
+      if (input === `${endpoint}/cancel`) return Response.json({ code: "unavailable", detail: "Cancellation unavailable." }, { status: 503 });
+      return base(input, init);
+    });
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
+    expect(await panel.findByRole("alert", {}, { timeout: 3_000 })).toHaveTextContent("unrecognized job status");
+    await userEvent.click(panel.getByRole("button", { name: "Cancel unprocessed tasks" }));
+    expect(await panel.findByRole("alert")).toHaveTextContent("Cancellation unavailable.");
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Running");
+    expect(screen.getByRole("button", { name: `Block ${agent.displayName}` })).toBeDisabled();
+    expect(panel.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
+    vi.useFakeTimers();
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(reads).toBe(2);
+    vi.useRealTimers();
+    await revalidateTransportSession(transport.session);
+    expect(await screen.findByRole("button", { name: `Block ${agent.displayName}` })).toBeEnabled();
+    expect(screen.queryByText("Cancellation unavailable.")).not.toBeInTheDocument();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
   });
 
   it.each(["cancel", "resume", "reconcile"] as const)("submits %s once and shows a retryable failure in the unified job panel", async operation => {
@@ -6364,6 +11542,67 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("dialog", { name: destination === "details" ? agent.displayName : "Manage agent access" })).toBeVisible();
   });
 
+  it.each(["access preparation", "block preview"] as const)(
+    "cancels %s transport so a retired authorization failure cannot clear the current session",
+    async operation => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const path = operation === "access preparation"
+        ? `/api/agents/${agent.id}/refresh-jobs` : "/api/agents/mutation-preview";
+      transport.fetchMock.mockImplementation((input, init) => input === path ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", {
+        name: operation === "access preparation" ? `Manage access for ${agent.displayName}` : `Block ${agent.displayName}`,
+      }));
+      await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input === path)).toBe(true));
+      const request = transport.fetchMock.mock.calls.find(([input]) => input === path)!;
+      await userEvent.click(screen.getByRole("button", { name: "Users" }));
+      await screen.findByRole("button", { name: "Ada" });
+      const sessionReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/me").length;
+      const before = sessionReads();
+      await act(async () => pending.resolve(Response.json({
+        code: "unauthorized", detail: "Retired request session expired.",
+      }, { status: 401 })));
+      expect(sessionReads()).toBe(before);
+      expect(request[1]?.signal?.aborted).toBe(true);
+      expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+      expect(screen.queryByText("Retired request session expired.")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["Refresh agents", "Refresh matching details"] as const)(
+    "aborts retired %s admission on browser navigation before processing late authorization errors",
+    async action => {
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const path = action === "Refresh agents" ? "/api/agents/refresh-jobs" : "/api/agents/refresh-selection";
+      transport.fetchMock.mockImplementation((input, init) => input === path && init?.method === "POST"
+        ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("View diagnostics"));
+      await userEvent.click(screen.getByRole("button", { name: action }));
+      await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input === path)).toBe(true));
+      const request = transport.fetchMock.mock.calls.find(([input]) => input === path)!;
+      act(() => {
+        window.history.pushState({}, "", "/users");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await screen.findByRole("button", { name: "Ada" });
+      const before = transport.session.meCalls();
+      await act(async () => pending.resolve(Response.json({ code: "unauthorized", detail: "Retired refresh session." }, { status: 401 })));
+      expect(transport.session.meCalls()).toBe(before);
+      expect(request[1]?.signal?.aborted).toBe(true);
+      expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+      expect(screen.queryByText("Retired refresh session.")).not.toBeInTheDocument();
+    },
+  );
+
   it("clears superseded detail loading when preparing a bulk preview", async () => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
@@ -6389,13 +11628,15 @@ function mockCsvDownload() {
   const filenames: string[] = [];
   const hrefs: string[] = [];
   const createObjectURL = vi.fn<(blob: Blob) => string>(() => "blob:unified-agent-export");
-  Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
-  Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
-  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+  vi.stubGlobal("URL", class extends URL {
+    static createObjectURL = createObjectURL;
+    static revokeObjectURL = vi.fn();
+  });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
     filenames.push(this.download);
     hrefs.push(this.getAttribute("href")!);
   });
-  return { filenames, hrefs, createObjectURL };
+  return { filenames, hrefs, createObjectURL, click };
 }
 
 async function completeNativeInventoryDownload(download: ReturnType<typeof mockCsvDownload>) {
@@ -6679,6 +11920,8 @@ function filterUnifiedResponse(response: UnifiedAgentInventoryPage, input: strin
       ? { total: response.summary.powerPlatformOnly, linked: 0, graphOnly: 0, powerPlatformOnly: response.summary.powerPlatformOnly, ambiguous: 0, conflicting: 0 }
       : response.summary;
   return { ...response, selection: selected.selection, inventoryScope, scopeSummary,
+    freshness: { ...response.freshness, capturedRevision: selected.selection.revision },
+    usageContext: { ...response.usageContext, revision: selected.selection.id },
     value,
     counts: { ...response.counts, scoped: scopeSummary.total, filtered: count },
     page: { limit, nextCursor: offset+limit<count ? `fixture-page:${offset+limit}` : null,
@@ -6720,7 +11963,9 @@ function selectedInventoryPage(input: string, page: UnifiedAgentInventoryPage) {
   const id = new URL(input, "http://localhost").searchParams.get("selectionId")!;
   const capture = inventorySelections.get(id);
   if (!capture) throw new Error("Unknown synthetic inventory selection");
-  return { ...page, selection: capture.selection };
+  return { ...page, selection: capture.selection,
+    freshness: { ...page.freshness, capturedRevision: capture.selection.revision },
+    usageContext: { ...page.usageContext, revision: capture.selection.id } };
 }
 
 function selectedInventoryUrl(input: string) {
@@ -6801,8 +12046,8 @@ function initialCatalogTransport(options: Partial<Parameters<typeof appTransport
   return transport;
 }
 
-function accessEditorTransport() {
-  const base = initialCatalogTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+function accessEditorTransport(revalidatedUser = viewer) {
+  const base = initialCatalogTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], revalidatedUser });
   base.page = packagePage;
   const transport = {
     session: base.session,

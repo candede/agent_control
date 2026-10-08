@@ -9,11 +9,12 @@ import * as api from "../api/client";
 import type { CapabilityView, CopilotPackage, CopilotPackageDetail, PackageAccessTarget, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
+import { deferred } from "../test/deferred";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
 import { createInventoryVerification } from "../test/inventoryVerification";
 import * as reportApi from "../api/reportData";
-import type { CandidateAgentUsageAssociations, CandidateAgentUsageSummary } from "../../../backend/src/types/officialReportApi";
+import type { CandidateAgentUsageAssociations, CandidateAgentUsageSummary, CandidateAgentUsageUsers } from "../../../backend/src/types/officialReportApi";
 import { reportAgent, reportPage, reports, selectionId } from "../test/reportDataFixture";
 import { automaticAgentUsageFixture, automaticUsageContext, automaticUsagePackageId, automaticUsageReportName } from "../test/automaticAgentUsageFixture";
 
@@ -248,6 +249,16 @@ describe("unified authoring and person evidence", () => {
     expect(lookup).not.toHaveBeenCalled();
   });
 
+  it("keeps inventory-only person references unverified and available for explicit lookup", () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople");
+    renderDetail({ record: { ...nativeRecord(), people: {} }, onOpenPerson: vi.fn() }, capabilitiesWithDirectory());
+    expect(field("Owner")).toHaveTextContent("Unverified directory identity.");
+    expect(field("Created by")).toHaveTextContent("Unverified directory identity.");
+    expect(screen.queryByRole("button", { name: /View responsibility for/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Look up people" })).toBeEnabled();
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
   it("does not discard a validated saved GUID match just because live lookup supports a narrower ID format", () => {
     const lookup = vi.spyOn(api, "resolveAgentPeople");
     const id = "cccccccc-cccc-7ccc-8ccc-cccccccccccc";
@@ -357,6 +368,31 @@ describe("unified authoring and person evidence", () => {
     expect(lookup).not.toHaveBeenCalled();
     expect(field("Owner")).toHaveTextContent("Saved owner");
     expect(screen.queryByRole("button", { name: "Look up people" })).not.toBeInTheDocument();
+  });
+
+  it.each(["saved", "returned"] as const)("rechecks %s person expiry before navigation when the expiry timer has not run", async source => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    const value = nativeRecord();
+    const person = { ...savedPerson, expiresAt: new Date(now + 1_000).toISOString() };
+    const people = { owner: person, createdBy: person };
+    if (source === "saved") value.people = people;
+    const openPerson = vi.fn();
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({ people, changed: false });
+    renderDetail({ record: value, onOpenPerson: openPerson }, capabilitiesWithDirectory());
+    if (source === "returned") await act(async () => fireEvent.click(screen.getByRole("button", { name: "Look up people" })));
+    const links = screen.getAllByRole("button", { name: "View responsibility for Saved owner" });
+    fireEvent.click(links[0]);
+    expect(openPerson).toHaveBeenCalledExactlyOnceWith(ownerId);
+    openPerson.mockClear();
+    vi.setSystemTime(now + 1_000);
+    links.forEach(link => fireEvent.click(link));
+    expect(openPerson).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(screen.queryByRole("button", { name: "View responsibility for Saved owner" })).not.toBeInTheDocument();
+    expect(field("Owner")).toHaveTextContent("Saved lookup expired");
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(lookup).toHaveBeenCalledTimes(source === "returned" ? 1 : 0);
   });
 
   it("keeps the last known name and explicit failure state without lookup-timestamp clutter", () => {
@@ -563,13 +599,6 @@ function quarantinePreview(observed = observedRecord()): QuarantinePreview {
   };
 }
 
-function queueNativeCloseEvents() {
-  vi.spyOn(HTMLDialogElement.prototype, "close").mockImplementation(function (this: HTMLDialogElement) {
-    this.removeAttribute("open");
-    queueMicrotask(() => this.dispatchEvent(new Event("close")));
-  });
-}
-
 beforeEach(() => {
   vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected detail transport request."));
   vi.spyOn(reportApi, "readAgentReportSummary").mockRejectedValue(new Error("Report data is unavailable. Reload usage to try again."));
@@ -613,10 +642,9 @@ describe("UnifiedAgentDetailModal", () => {
     expect(within(dialog).queryByText("View management audit")).not.toBeInTheDocument();
   });
 
-  it.each(["synchronous", "queued"] as const)("keeps details open through Strict Mode replay with %s close events", async timing => {
-    if (timing === "queued") queueNativeCloseEvents();
+  it("keeps details open through Strict Mode replay with queued native close events", async () => {
     const { props } = renderDetail({}, capabilities(), workbenchActions, { reactStrictMode: true });
-    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
     expect(screen.getByRole("dialog", { name: record.displayName })).toHaveAttribute("open");
     expect(props.onClose).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Close unified agent details" }));
@@ -631,11 +659,13 @@ describe("UnifiedAgentDetailModal", () => {
     ["right backdrop", 701, 100, true],
     ["top backdrop", 200, 79, true],
     ["bottom backdrop", 200, 581, true],
-  ] as const)("distinguishes a %s click from the dialog content", (_area, clientX, clientY, shouldClose) => {
+  ] as const)("distinguishes a %s click from the dialog content", async (_area, clientX, clientY, shouldClose) => {
     const { props } = renderDetail();
     const dialog = screen.getByRole("dialog", { name: record.displayName });
     vi.spyOn(dialog, "getBoundingClientRect").mockReturnValue(new DOMRect(100, 80, 600, 500));
     fireEvent.mouseDown(dialog, { clientX, clientY });
+    expect(dialog).toHaveProperty("open", !shouldClose);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
     expect(props.onClose).toHaveBeenCalledTimes(shouldClose ? 1 : 0);
   });
 
@@ -738,6 +768,31 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
 
+  it.each(["pending", "settled"] as const)("does not restart %s native configuration when the package version changes", async phase => {
+    const first = record.packages[0];
+    const second = { ...first, id: "second-package", displayName: "Second version" };
+    const group = { ...record, packages: [first, second], powerPlatformResource: {
+      ...record.powerPlatformResource, savedSource: { scopeId: "source", identity: "native" },
+      connectorCounts: { connectors: 0, operations: 0 },
+    } };
+    const pending = deferred<Awaited<ReturnType<typeof api.getInventoryChildren>>>();
+    const read = vi.spyOn(api, "getInventoryChildren").mockImplementation(async (_s, _r, _source, kind) => {
+      if (phase === "pending") return pending.promise;
+      return { value: kind === "detail:channels" ? [{ ordinal: 0, kind, value: "Teams", payload: {} }] : [],
+        total: kind === "detail:channels" ? 1 : 0, nextCursor: null };
+    });
+    const { props } = renderDetail({ record: group, selectionId: "selection", packageDetail: first });
+    if (phase === "settled") await screen.findByText("Teams");
+    expect(read).toHaveBeenCalledTimes(2);
+    const signals = read.mock.calls.map(call => call[5]?.signal);
+    fireEvent.change(screen.getByRole("combobox", { name: "Published version details" }), { target: { value: second.id } });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(second);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(signals.every(signal => !signal?.aborted)).toBe(true);
+    if (phase === "pending") await act(async () => pending.resolve({ value: [], total: 0, nextCursor: null }));
+    expect(await screen.findByText("No configured connectors were reported.")).toBeVisible();
+  });
+
   it("reloads stale parent-owned details without replacing or remounting the same Overview", () => {
     const { props, update } = renderDetail();
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
@@ -830,6 +885,60 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
 
+  it("disables version changes while the saved inventory is being replaced", async () => {
+    const first = record.packages[0];
+    const second = { ...first, id: "second-package", displayName: "Second version" };
+    const { props, update } = renderDetail({
+      record: { ...record, packages: [first, second] }, packageInventoryPending: true,
+    });
+    const versions = screen.getByRole("combobox", { name: "Published version details" });
+    expect(versions).toBeDisabled();
+    expect(screen.getByText("Saved details will be loaded when the saved inventory is ready.")).toBeVisible();
+    await userEvent.selectOptions(versions, second.id);
+    expect(versions).toHaveValue(first.id);
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    update({ packageInventoryPending: false });
+    expect(versions).toBeEnabled();
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(first);
+    await userEvent.selectOptions(versions, second.id);
+    expect(props.onInspectPackage).toHaveBeenLastCalledWith(second);
+  });
+
+  it.each([undefined, "Previous package read failed."])(
+    "waits for explicit inventory recovery before reading saved versions (detail error=%s)",
+    async packageDetailError => {
+      const first = record.packages[0];
+      const second = { ...first, id: "second-package", displayName: "Second version" };
+      const onRetryInventory = vi.fn();
+      const { props, update } = renderDetail({
+        record: { ...record, packages: [first, second] }, selectionId: "previous-selection",
+        packageInventoryPending: true, packageDetailError, onRetryInventory,
+      });
+      update({ packageInventoryPending: false, inventoryError: "Replacement inventory unavailable." });
+      expect(props.onInspectPackage).not.toHaveBeenCalled();
+      const versions = screen.getByRole("combobox", { name: "Published version details" });
+      expect(versions).toBeDisabled();
+      await userEvent.selectOptions(versions, second.id);
+      expect(versions).toHaveValue(first.id);
+      expect(screen.queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      if (packageDetailError) {
+        const retryDetails = screen.getByRole("button", { name: "Retry saved details" });
+        expect(retryDetails).toBeDisabled();
+        await userEvent.click(retryDetails);
+      } else expect(screen.getByText("Reload saved inventory before loading saved package details.")).toBeVisible();
+      expect(props.onInspectPackage).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: "Retry saved inventory" }));
+      expect(onRetryInventory).toHaveBeenCalledOnce();
+      update({ packageInventoryPending: true, inventoryError: "Replacement inventory unavailable." });
+      expect(props.onInspectPackage).not.toHaveBeenCalled();
+      update({ packageInventoryPending: false, inventoryError: undefined, selectionId: "replacement-selection" });
+      expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(first);
+      expect(versions).toBeEnabled();
+      update({ packageInventoryPending: false, inventoryError: undefined, selectionId: "replacement-selection", packageDetail: first });
+      expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    },
+  );
+
   it("respects a restored exact version and clears metadata when the agent changes", async () => {
     const first = record.packages[0];
     const second = { ...first, id: "second-package", displayName: "Second version" };
@@ -856,6 +965,32 @@ describe("UnifiedAgentDetailModal", () => {
     expect(packageId.parentElement).toHaveTextContent(`Package ID: ${agent.id}`);
     expect(packageId.closest("details")).toBeNull();
     expect(within(management).queryByText("Version details")).not.toBeInTheDocument();
+  });
+
+  it("blocks package mutations without pausing saved detail reads when job status is unrecognized", async () => {
+    const item = record.packages[0];
+    const reason = "The server returned an unrecognized job status. Refresh status before starting another change.";
+    const { props, update } = renderDetail({ activeTab: "controls", packageActionsBlockedReason: reason });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(item);
+    expect(screen.queryByText("Saved details will be loaded when the current management action finishes.")).not.toBeInTheDocument();
+    update({ packageDetail: { ...item, availableTo: "none" } });
+    const panel = within(screen.getByRole("tabpanel"));
+    const block = panel.getByRole("button", { name: `Block ${item.displayName} (${item.id})` });
+    expect(panel.getByRole("alert")).toHaveTextContent(reason);
+    expect(block).toBeDisabled();
+    const apply = panel.getByRole("button", { name: "Apply" });
+    expect(apply).toHaveAttribute("aria-disabled", "true");
+    await userEvent.click(block);
+    await userEvent.click(apply);
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    expect(panel.queryByRole("button", { name: "Please wait" })).not.toBeInTheDocument();
+    update({ packageActionsBlockedReason: undefined, packageDetail: { ...item, availableTo: "none" } });
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(block).toBeEnabled();
+    expect(apply).toBeEnabled();
+    expect(apply).toHaveAttribute("aria-disabled", "false");
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(1);
   });
 
   it("keeps same-name versions distinct and shows the selected package ID inline", async () => {
@@ -912,11 +1047,13 @@ describe("UnifiedAgentDetailModal", () => {
     update({ activeTab: "controls", packageDetail: detail, packageInventoryPending: true });
     expect(apply).toHaveFocus();
     expect(apply).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("button", { name: "Discard changes" })).toBeDisabled();
     expect(props.onInspectPackage).not.toHaveBeenCalled();
     update({ activeTab: "controls", packageDetail: detail, packageDetailStale: true, packageDetailLoading: true, inventoryRevision: "new-inventory" });
     expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
     expect(screen.getByRole("button", { name: "Apply" })).toBe(apply);
     expect(apply).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("button", { name: "Discard changes" })).toBeDisabled();
     fireEvent.click(apply);
     expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
     expect(apply).toHaveFocus();
@@ -926,6 +1063,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("button", { name: "Apply" })).toBe(apply);
     expect(apply).toBeEnabled();
     expect(apply).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Discard changes" })).toBeEnabled();
     expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
   });
 
@@ -939,6 +1077,206 @@ describe("UnifiedAgentDetailModal", () => {
     update({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: latest, packageDetailStale: true, packageDetailLoading: true });
     expect(screen.getByRole("radio", { name: /No users/ })).toBe(none);
     expect(none).toBeChecked();
+  });
+
+  it("pauses a draft during a detail retry without labelling unsaved assignments as saved", async () => {
+    const principals: api.DirectoryPrincipal[] = ["saved-a", "saved-b"].map(resourceId => ({
+      resourceId, resourceType: "group", displayName: resourceId, principalKind: "securityGroup",
+    }));
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: principals });
+    const detail = { ...record.packages[0], availableTo: "some", allowedUsersAndGroups: principals };
+    const { props, update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    fireEvent.click(await screen.findByRole("button", { name: "Remove saved-a" }));
+    const apply = screen.getByRole("button", { name: "Apply" });
+    apply.focus();
+
+    update({ packageDetail: undefined, packageDetailLoading: true });
+    expect(screen.queryByRole("group", { name: "Saved users and groups" })).not.toBeInTheDocument();
+    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Apply" })).toBe(apply);
+    expect(apply).toHaveFocus();
+    expect(apply).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(apply);
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+
+    update({ packageDetail: { ...detail } });
+    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Remove saved-a" })).not.toBeInTheDocument();
+    expect(resolve).toHaveBeenCalledOnce();
+  });
+
+  it("retains the displayed saved block state throughout a background detail refresh", () => {
+    const detail = { ...record.packages[0], isBlocked: true };
+    const { props, update } = renderDetail({ activeTab: "controls", packageDetail: detail });
+    const unblock = screen.getByRole("button", { name: "Unblock Package one (package-1)" });
+    update({ packageDetail: detail, packageDetailLoading: true, packageDetailStale: true });
+    expect(screen.getByRole("button", { name: "Unblock Package one (package-1)" })).toBe(unblock);
+    expect(unblock).toBeDisabled();
+    expect(screen.getByRole("group", { name: "Blocking for package-1" })).toHaveTextContent("Blocked");
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
+    update({ packageDetail: { ...detail, isBlocked: false } });
+    expect(screen.getByRole("button", { name: "Block Package one (package-1)" })).toBeEnabled();
+  });
+
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)(
+    "withdraws invalidated assignments after a failed saved-detail read for %s",
+    async role => {
+      const previous: api.DirectoryPrincipal = {
+        resourceType: "user", resourceId: "previous-assignment", displayName: "previous-assignment", principalKind: "user",
+      };
+      const current = { ...previous, resourceId: "current-assignment", displayName: "current-assignment" };
+      const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+        .mockResolvedValueOnce({ value: [previous] }).mockResolvedValue({ value: [current] });
+      const item = { ...record.packages[0], availableTo: "some" };
+      const { props, update } = renderDetail({
+        roles: [role], activeTab: "controls", record: { ...record, packages: [item] },
+        packageDetail: { ...item, allowedUsersAndGroups: [previous] },
+      }, capabilitiesWithDirectory());
+      expect(await screen.findByText("previous-assignment", { selector: "strong" })).toBeVisible();
+      update({ packageDetailLoading: true });
+      update({ packageDetail: undefined, packageDetailError: "Saved assignment details were denied." });
+      expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
+      expect(props.onInspectPackage).not.toHaveBeenCalled();
+      expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
+      update({ packageDetail: undefined, packageDetailLoading: true });
+      expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
+      update({ packageDetail: { ...item, allowedUsersAndGroups: [current] } });
+      expect(await screen.findByText("current-assignment", { selector: "strong" })).toBeVisible();
+      expect(props.onInspectPackage).toHaveBeenCalledOnce();
+      expect(resolve).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 2 : 0);
+    },
+  );
+
+  it("invalidates the draft when saved access assignments become unreadable", async () => {
+    const principal: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "previous-user", displayName: "Previous assignment", principalKind: "user",
+    };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: [principal] });
+    const detail = {
+      ...record.packages[0], availableTo: "some", deployedTo: "none",
+      allowedUsersAndGroups: [principal], acquireUsersAndGroups: [],
+    };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    expect(await screen.findByText("Previous assignment")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Previous assignment" }));
+    expect(screen.getByText("0 selected")).toBeVisible();
+
+    update({ packageDetail: {
+      ...detail, allowedUsersAndGroups: undefined,
+      accessReadError: "The saved access assignment exceeds the supported control limit.",
+    } });
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("Assignments not reported");
+    expect(screen.queryByText("No explicit user or group assignments")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
+    expect(resolve).toHaveBeenCalledOnce();
+  });
+
+  it("loads the complete saved baseline after an access-read error recovers", async () => {
+    const principal: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "current-user", displayName: "Current assignment", principalKind: "user",
+    };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: [principal] });
+    const detail = { ...record.packages[0], availableTo: "some", deployedTo: "none", acquireUsersAndGroups: [] };
+    const { props, update } = renderDetail({
+      activeTab: "controls", packageDetail: {
+        ...detail, accessReadError: "The saved access assignment exceeds the supported control limit.",
+      },
+    }, capabilitiesWithDirectory());
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("Assignments not reported");
+    expect(resolve).not.toHaveBeenCalled();
+
+    update({ packageDetail: { ...detail, allowedUsersAndGroups: [principal] } });
+    expect(await screen.findByText("Current assignment")).toBeVisible();
+    expect(resolve).toHaveBeenCalledExactlyOnceWith([principal], { signal: expect.any(AbortSignal) });
+    expect(screen.getByText("1 selected")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(props.onUpdatePackageAccess).toHaveBeenCalledExactlyOnceWith(record.packages[0], {
+      target: "availability", mode: "replace", scope: "specific",
+      principals: [{ resourceType: principal.resourceType, resourceId: principal.resourceId }],
+    }));
+  });
+
+  it("cancels obsolete assignment resolution and retains the unreadable baseline during a reread", async () => {
+    const previous: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "previous-user", displayName: "Previous assignment", principalKind: "user",
+    };
+    const current = { ...previous, resourceId: "current-user", displayName: "Current assignment" };
+    let complete!: (response: { value: api.DirectoryPrincipal[] }) => void;
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+      .mockReturnValueOnce(new Promise(done => { complete = done; }))
+      .mockResolvedValue({ value: [current] });
+    const detail = { ...record.packages[0], availableTo: "some", allowedUsersAndGroups: [previous] };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    await waitFor(() => expect(resolve).toHaveBeenCalledOnce());
+    const unreadable = {
+      ...detail, allowedUsersAndGroups: undefined,
+      accessReadError: "The saved access assignment exceeds the supported control limit.",
+    };
+    update({ packageDetail: unreadable });
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    update({ packageDetail: unreadable, packageDetailLoading: true, packageDetailStale: true });
+    expect(screen.getByText(/Access assignment editing is unavailable/)).toBeVisible();
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("Assignments not reported");
+    expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
+
+    await act(async () => complete({ value: [previous] }));
+    expect(screen.queryByText("Previous assignment")).not.toBeInTheDocument();
+    update({ packageDetail: { ...detail, allowedUsersAndGroups: [current] } });
+    expect(await screen.findByText("Current assignment")).toBeVisible();
+    expect(screen.queryByText("Previous assignment")).not.toBeInTheDocument();
+    expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(resolve).toHaveBeenLastCalledWith([current], { signal: expect.any(AbortSignal) });
+  });
+
+  it("discards only the active draft to the latest saved access values after a background read", async () => {
+    const detail = {
+      ...record.packages[0], availableTo: "all", deployedTo: "none",
+      allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+    };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail });
+    fireEvent.click(screen.getByRole("radio", { name: /Specific users or groups/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Specific users or groups/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Available to/ }));
+    update({ packageDetail: { ...detail, availableTo: "none", deployedTo: "all" } });
+    expect(screen.getByRole("radio", { name: /Specific users or groups/ })).toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    expect(within(screen.getByRole("region", { name: "Availability settings" })).getByText("Saved: No users")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("radio", { name: /Specific users or groups/ })).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(screen.getByRole("radio", { name: /All users/ })).toBeChecked();
+  });
+
+  it("resolves the latest saved principals on discard and ignores the superseded lookup", async () => {
+    const previous: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "previous-user", displayName: "Previous assignment", principalKind: "user",
+    };
+    const latest = { ...previous, resourceId: "latest-user", displayName: "Latest assignment" };
+    let complete!: (response: { value: api.DirectoryPrincipal[] }) => void;
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+      .mockReturnValueOnce(new Promise(done => { complete = done; }))
+      .mockResolvedValue({ value: [latest] });
+    const detail = { ...record.packages[0], availableTo: "some", allowedUsersAndGroups: [previous] };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    await waitFor(() => expect(resolve).toHaveBeenCalledOnce());
+
+    update({ packageDetail: { ...detail, allowedUsersAndGroups: [latest] } });
+    expect(resolve).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByText("Latest assignment")).toBeVisible();
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(resolve).toHaveBeenLastCalledWith([latest], { signal: expect.any(AbortSignal) });
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
+
+    await act(async () => complete({ value: [previous] }));
+    expect(screen.queryByText("Previous assignment")).not.toBeInTheDocument();
+    expect(screen.getByText("Latest assignment")).toBeVisible();
+    expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
   });
 
   it("rejects an unavailable restored version rather than reading or managing the first package", () => {
@@ -997,9 +1335,22 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["missing action", "missing role"] as const)("does not automatically inspect packages with %s", scenario => {
+  it("does not retry failed saved details when an unrelated package action finishes", async () => {
+    const { props, update } = renderDetail({ activeTab: "controls" });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    const packageDetailError = "Saved detail unavailable";
+    update({ packageDetailError, packageActionsBusy: true });
+    update({ packageDetailError, packageActionsBusy: false });
+    expect(screen.getByRole("alert")).toHaveTextContent(packageDetailError);
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["missing action", "duplicate action", "missing role"] as const)("does not automatically inspect packages with %s", scenario => {
+    const inspectAction = workbenchActions.find(action => action.id === "packages.inspect")!;
     const { props } = renderDetail({ roles: scenario === "missing role" ? [] : user.roles }, undefined,
-      scenario === "missing action" ? [] : undefined);
+      scenario === "missing action" ? [] : scenario === "duplicate action" ? [...workbenchActions, inspectAction] : undefined);
     expect(props.onInspectPackage).not.toHaveBeenCalled();
     expect(screen.getByText("Additional details require package read access.")).toBeVisible();
   });
@@ -1238,6 +1589,34 @@ describe("UnifiedAgentDetailModal", () => {
     expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups, { signal: expect.any(AbortSignal) });
   });
 
+  it("shows paused assignment resolution while inventory prevents editing, then resumes once", async () => {
+    const assigned: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "assigned-user", displayName: "Assigned user", principalKind: "user",
+    };
+    let complete!: (response: { value: api.DirectoryPrincipal[] }) => void;
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+      .mockReturnValueOnce(new Promise(done => { complete = done; }))
+      .mockResolvedValue({ value: [assigned] });
+    const detail = { ...record.packages[0], availableTo: "some", allowedUsersAndGroups: [assigned] };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    await waitFor(() => expect(resolve).toHaveBeenCalledOnce());
+    expect(screen.getByText("Resolving current assignments...")).toBeVisible();
+
+    update({ packageInventoryPending: true });
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
+    expect(screen.getByText("Assignment lookup is paused until editing resumes.")).toBeVisible();
+    await act(async () => complete({ value: [{ ...assigned, displayName: "Obsolete assignment" }] }));
+    expect(screen.queryByText("Obsolete assignment")).not.toBeInTheDocument();
+    expect(resolve).toHaveBeenCalledOnce();
+
+    update({ packageInventoryPending: false });
+    expect(await screen.findByText("Assigned user")).toBeVisible();
+    expect(screen.queryByText("Assignment lookup is paused until editing resumes.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+    expect(resolve).toHaveBeenCalledTimes(2);
+  });
+
   it("restarts pending assignment resolution after a saved-detail reload and ignores the cancelled response", async () => {
     type Resolution = Awaited<ReturnType<typeof api.resolveDirectoryPrincipals>>;
     let completeStale!: (response: Resolution) => void;
@@ -1350,6 +1729,11 @@ describe("UnifiedAgentDetailModal", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Current access could not be verified");
     expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^Available to/ }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Current access could not be verified");
+    expect(submit).toHaveBeenCalledOnce();
     await userEvent.click(screen.getByRole("button", { name: "Apply" }));
     expect(submit).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -1431,6 +1815,33 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("searchbox", { name: "Search agent users" })).toBe(search);
     expect(search).toHaveValue("Agent user");
     expect(search).toHaveFocus();
+  });
+
+  it("keeps usage mounted when the inventory selection UUID changes only in case", async () => {
+    const selected = "abcdefab-abcd-4abc-8abc-abcdefabcdef";
+    const context = { ...reportContext, selectionId: selected };
+    vi.mocked(reportApi.readAgentReportSummary).mockResolvedValue({
+      recordId: record.id, status: "linked", responses: 181, activeUsers: 7, lastActivityDateUtc: null, associationCount: 0, context,
+    });
+    vi.mocked(reportApi.readAgentReportAssociations).mockResolvedValue({
+      value: [], context, counts: { total: 0, filtered: 0 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+    });
+    const page = reportPage([{ username: "person@example.invalid", displayName: "Person", responses: 181 }]);
+    const usageUsers: CandidateAgentUsageUsers = { ...page, context, selection: { ...page.selection, id: selected } };
+    vi.mocked(reportApi.readReportPage).mockResolvedValue(usageUsers);
+    const { update } = renderDetail({
+      activeTab: "users", selectionId: selected.toUpperCase(), usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64),
+    });
+    await screen.findByText("person@example.invalid");
+    const search = screen.getByRole("searchbox");
+    search.focus();
+    update({ selectionId: selected });
+    expect(screen.getByRole("searchbox")).toBe(search);
+    expect(search).toHaveFocus();
+    expect(reportApi.readAgentReportHistory).toHaveBeenCalledOnce();
+    expect(reportApi.readAgentReportSummary).toHaveBeenCalledOnce();
+    expect(reportApi.readAgentReportAssociations).toHaveBeenCalledOnce();
+    expect(reportApi.readReportPage).toHaveBeenCalledOnce();
   });
 
   it("blocks reviewed-link removal while parent inventory verification is pending or failed", async () => {
@@ -1900,7 +2311,8 @@ describe("UnifiedAgentDetailModal", () => {
       isCanary: false, total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
       canResume: false, canReconcile: false, createdAt: snapshot.observedAt, updatedAt: snapshot.observedAt, results: [],
     });
-    const { props, update } = renderDetail({ record: observed, activeTab: "controls" });
+    const onQuarantineJobChange = vi.fn();
+    const { props, update } = renderDetail({ record: observed, activeTab: "controls", onQuarantineJobChange });
     await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
     expect(api.previewQuarantine).toHaveBeenCalledExactlyOnceWith({
       action: "quarantine", snapshotId: snapshot.id, resourceNativeIds: [record.powerPlatformResource.nativeId],
@@ -1920,13 +2332,15 @@ describe("UnifiedAgentDetailModal", () => {
     await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
     expect(api.submitQuarantine).toHaveBeenCalledExactlyOnceWith({
       action: "quarantine", snapshotId: snapshot.id, resourceNativeIds: [record.powerPlatformResource.nativeId], confirmationHash: preview.confirmationHash,
-    }, expect.stringMatching(/^[0-9a-f-]{36}$/));
+    }, expect.stringMatching(/^[0-9a-f-]{36}$/), { signal: expect.any(AbortSignal) });
+    expect(onQuarantineJobChange).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "job-1", status: "succeeded" }));
     expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
     expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
     expect(props.onClose).not.toHaveBeenCalled();
   });
 
-  it("does not carry a quarantine job and its recovery controls to a different native target", async () => {
+  it.each(["native target", "bot identity", "agent", "principal", "tenant", "roles"] as const)(
+    "does not carry a quarantine job and its recovery controls to a different %s", async boundary => {
     const observed = observedRecord();
     const preview = quarantinePreview(observed);
     const timestamp = observed.observations.powerPlatform!.observedAt;
@@ -1943,14 +2357,187 @@ describe("UnifiedAgentDetailModal", () => {
     await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
     expect(await screen.findByText("Quarantine job: Succeeded")).toBeVisible();
     expect(screen.getByRole("button", { name: "Refresh job status" })).toBeVisible();
-    update({ record: {
-      ...observed, id: "different-logical-agent",
-      powerPlatformResource: { ...observed.powerPlatformResource!, nativeId: "different-native-agent" },
-    } });
+    update({
+      record: { ...observed,
+        id: boundary === "agent" ? "different-logical-agent" : observed.id,
+        powerPlatformResource: { ...observed.powerPlatformResource!,
+          ...(boundary === "native target" ? { nativeId: "different-native-agent" } : {}),
+          ...(boundary === "bot identity" ? { quarantineIdentity: {
+            environmentId, botId: "33333333-3333-4333-8333-333333333333",
+          } } : {}),
+        },
+      },
+      roles: boundary === "roles" ? ["AgentControl.Viewer"] : user.roles,
+    }, capabilities(), { ...user,
+      ...(boundary === "principal" ? { homeAccountId: "other-account" } : {}),
+      ...(boundary === "tenant" ? { tenantId: "other-tenant" } : {}),
+    });
     expect(screen.queryByText("Quarantine job: Succeeded")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Refresh job status" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    if (boundary !== "roles") expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     expect(api.submitQuarantine).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an admitted quarantine job through tab changes and cancels its read on close", async () => {
+    const observed = observedRecord();
+    const preview = quarantinePreview(observed);
+    const timestamp = observed.observations.powerPlatform!.observedAt;
+    const job: api.QuarantineJob = {
+      id: "retained-job", action: "quarantine", status: "waiting_authorization", confirmationHash: preview.confirmationHash,
+      confirmation: preview.summary, isCanary: false, total: 1, completed: 0, succeeded: 0, failed: 0,
+      skipped: 0, inconclusive: 0, cancelled: 0, canResume: true, canReconcile: false,
+      createdAt: timestamp, updatedAt: timestamp, results: [],
+    };
+    const submitted = deferred<api.QuarantineJob>();
+    const refreshed = deferred<api.QuarantineJob>();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
+    vi.mocked(api.submitQuarantine).mockReturnValue(submitted.promise);
+    const readJob = vi.spyOn(api, "getQuarantineJob").mockReturnValue(refreshed.promise);
+    const onQuarantineJobChange = vi.fn();
+    const { update, unmount } = renderDetail({ record: observed, activeTab: "controls", onQuarantineJobChange });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    const submitSignal = vi.mocked(api.submitQuarantine).mock.calls[0][2]?.signal;
+    update({ activeTab: "identities" });
+    expect(submitSignal?.aborted).toBe(false);
+    expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
+    await act(async () => submitted.resolve(job));
+    expect(onQuarantineJobChange).toHaveBeenCalledExactlyOnceWith(job);
+    update({ activeTab: "controls" });
+    expect(screen.getByText("Quarantine job: Waiting Authorization")).toBeVisible();
+    expect(api.submitQuarantine).toHaveBeenCalledOnce();
+    expect(readJob).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh job status" }));
+    const signal = readJob.mock.calls[0][1]?.signal;
+    update({ activeTab: "identities" });
+    expect(signal?.aborted).toBe(false);
+    update({ activeTab: "controls" });
+    expect(readJob).toHaveBeenCalledOnce();
+    unmount();
+    expect(signal?.aborted).toBe(true);
+    await act(async () => refreshed.resolve({ ...job, status: "succeeded", completed: 1, succeeded: 1 }));
+    expect(onQuarantineJobChange).toHaveBeenCalledOnce();
+  });
+
+  it("does not retire a detail quarantine receipt for equivalent native GUID casing", async () => {
+    const observed = observedRecord();
+    const nativeId = "abcdefab-2222-4222-8222-222222222222";
+    observed.powerPlatformResource = { ...observed.powerPlatformResource!, nativeId };
+    const preview = quarantinePreview(observed);
+    const timestamp = observed.observations.powerPlatform!.observedAt;
+    const job: api.QuarantineJob = {
+      id: "retained-job", action: "quarantine", status: "succeeded", confirmationHash: preview.confirmationHash,
+      confirmation: preview.summary, isCanary: false, total: 1, completed: 1, succeeded: 1, failed: 0,
+      skipped: 0, inconclusive: 0, cancelled: 0, canResume: false, canReconcile: false,
+      createdAt: timestamp, updatedAt: timestamp, results: [],
+    };
+    const submitted = deferred<api.QuarantineJob>();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
+    vi.mocked(api.submitQuarantine).mockReturnValue(submitted.promise);
+    const { update } = renderDetail({ record: observed, activeTab: "controls" });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = screen.getByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    const signal = vi.mocked(api.submitQuarantine).mock.calls[0][2]?.signal;
+    update({ record: { ...observed, powerPlatformResource: { ...observed.powerPlatformResource!, nativeId: nativeId.toUpperCase() } } });
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByRole("dialog", { name: "Quarantine 1 agent" })).toBe(confirmation);
+    await act(async () => submitted.resolve(job));
+    expect(screen.getByText("Quarantine job: Succeeded")).toBeVisible();
+    expect(api.submitQuarantine).toHaveBeenCalledOnce();
+  });
+
+  it("cancels unsent quarantine preparation when Manage is left without showing its late confirmation", async () => {
+    const observed = observedRecord();
+    const preview = deferred<api.QuarantinePreview>();
+    vi.mocked(api.previewQuarantine).mockReturnValue(preview.promise);
+    const { update } = renderDetail({ record: observed, activeTab: "controls" });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const signal = vi.mocked(api.previewQuarantine).mock.calls[0][1]?.signal;
+    update({ activeTab: "identities" });
+    expect(signal?.aborted).toBe(true);
+    await act(async () => preview.resolve(quarantinePreview(observed)));
+    expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
+    update({ activeTab: "controls" });
+    expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    expect(api.previewQuarantine).toHaveBeenCalledOnce();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each(["replacement", "expired"] as const)("retains submitted native work across %s inventory evidence", async boundary => {
+    const observed = observedRecord();
+    const preview = quarantinePreview(observed);
+    const timestamp = observed.observations.powerPlatform!.observedAt;
+    const job: api.QuarantineJob = {
+      id: "retained-job", action: "quarantine", status: "waiting_authorization", confirmationHash: preview.confirmationHash,
+      confirmation: preview.summary, isCanary: false, total: 1, completed: 0, succeeded: 0, failed: 0,
+      skipped: 0, inconclusive: 0, cancelled: 0, canResume: true, canReconcile: false,
+      createdAt: timestamp, updatedAt: timestamp, results: [],
+    };
+    const submitted = deferred<api.QuarantineJob>();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
+    vi.mocked(api.submitQuarantine).mockReturnValue(submitted.promise);
+    const onQuarantineJobChange = vi.fn();
+    const { update } = renderDetail({ record: observed, activeTab: "controls", onQuarantineJobChange });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    const signal = vi.mocked(api.submitQuarantine).mock.calls[0][2]?.signal;
+    update({ record: { ...observed, observations: { ...observed.observations, powerPlatform: {
+      ...observed.observations.powerPlatform!, id: "replacement-snapshot", snapshotId: "replacement-snapshot",
+      ...(boundary === "expired" ? { expiresAt: "2020-01-01T00:00:00Z" } : {}),
+    } } } });
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByRole("dialog", { name: "Quarantine 1 agent" })).toBe(confirmation);
+    await act(async () => submitted.resolve(job));
+    expect(onQuarantineJobChange).toHaveBeenCalledExactlyOnceWith(job);
+    expect(screen.getByText("Quarantine job: Waiting Authorization")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh job status" })).toBeEnabled();
+    if (boundary === "expired") expect(screen.getByRole("button", { name: "Quarantine" })).toBeDisabled();
+    expect(api.submitQuarantine).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a lost submitted receipt after leaving Manage and replacing its expired snapshot", async () => {
+    const observed = observedRecord();
+    const preview = quarantinePreview(observed);
+    const timestamp = observed.observations.powerPlatform!.observedAt;
+    const job: api.QuarantineJob = {
+      id: "recovered-job", action: "quarantine", status: "succeeded", confirmationHash: preview.confirmationHash,
+      confirmation: preview.summary, isCanary: false, total: 1, completed: 1, succeeded: 1, failed: 0,
+      skipped: 0, inconclusive: 0, cancelled: 0, canResume: false, canReconcile: false,
+      createdAt: timestamp, updatedAt: timestamp, results: [],
+    };
+    const submitted = deferred<api.QuarantineJob>();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
+    vi.mocked(api.submitQuarantine).mockReturnValueOnce(submitted.promise).mockResolvedValueOnce(job);
+    const { update } = renderDetail({ record: observed, activeTab: "controls" });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    const replacement = { ...observed, observations: { ...observed.observations, powerPlatform: {
+      ...observed.observations.powerPlatform!, id: "expired-replacement", snapshotId: "expired-replacement",
+      expiresAt: "2020-01-01T00:00:00Z",
+    } } };
+    update({ activeTab: "identities", record: replacement });
+    await act(async () => submitted.reject(new Error("Submitted result unavailable.")));
+    expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
+    update({ activeTab: "controls", record: replacement });
+    const retry = screen.getByRole("dialog", { name: "Quarantine 1 agent" });
+    expect(within(retry).getByRole("alert")).toHaveTextContent("Submitted result unavailable.");
+    expect(within(retry).getByRole("checkbox")).not.toBeChecked();
+    await userEvent.click(within(retry).getByRole("checkbox"));
+    await userEvent.click(within(retry).getByRole("button", { name: "Confirm quarantine" }));
+    expect(api.submitQuarantine).toHaveBeenCalledTimes(2);
+    const [first, second] = vi.mocked(api.submitQuarantine).mock.calls;
+    expect(second.slice(0, 2)).toEqual(first.slice(0, 2));
+    expect(api.previewQuarantine).toHaveBeenCalledOnce();
+    expect(screen.getByText("Quarantine job: Succeeded")).toBeVisible();
   });
 
   it.each(["close button", "cancel button", "Escape"] as const)("dismisses only the quarantine confirmation using its %s", async action => {
@@ -1977,7 +2564,7 @@ describe("UnifiedAgentDetailModal", () => {
         name: action === "close button" ? "Close quarantine confirmation" : "Cancel",
       }));
     }
-    expect(confirmation).not.toBeInTheDocument();
+    await waitFor(() => expect(confirmation).not.toBeInTheDocument());
     expect(screen.getByRole("dialog", { name: record.displayName })).toHaveAttribute("open");
     expect(props.onClose).not.toHaveBeenCalled();
     expect(ancestorClose).not.toHaveBeenCalled();
@@ -2005,18 +2592,18 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
-  it.each(["synchronous", "queued"] as const)("keeps quarantine confirmation open through Strict Mode replay with %s close events", async timing => {
-    if (timing === "queued") queueNativeCloseEvents();
+  it("keeps quarantine confirmation open through Strict Mode replay with queued native close events", async () => {
     const observed = observedRecord();
     vi.mocked(api.previewQuarantine).mockResolvedValue(quarantinePreview(observed));
     const { props } = renderDetail({ record: observed, activeTab: "controls" }, capabilities(), workbenchActions, { reactStrictMode: true });
     await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
     expect(screen.getByRole("dialog", { name: "Quarantine 1 agent" })).toHaveAttribute("open");
     expect(props.onClose).not.toHaveBeenCalled();
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
-  it("cancels an inline package confirmation before closing the agent on Escape", () => {
+  it("cancels an inline package confirmation before closing the agent on Escape", async () => {
     const cancelConfirmation = vi.fn();
     const { props, update } = renderDetail({ packageConfirmation: <p>Exact package confirmation</p>, onCancelPackageConfirmation: cancelConfirmation });
     const dialog = screen.getByRole("dialog", { name: record.displayName });
@@ -2030,6 +2617,6 @@ describe("UnifiedAgentDetailModal", () => {
     fireEvent(dialog, nextCancel);
     expect(nextCancel.defaultPrevented).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Close unified agent details" }));
-    expect(props.onClose).toHaveBeenCalledOnce();
+    await waitFor(() => expect(props.onClose).toHaveBeenCalledOnce());
   });
 });

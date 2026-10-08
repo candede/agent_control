@@ -1,11 +1,15 @@
 import { ApiError, captureRequestSession, request } from "./client";
 import type { ReportQuery, CombinedUser, ReportUser, ReportAgent, ReportHistorySet, ReportOverviewAgent, ReportListPage, ReportPage } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail, OfficialReportExportRequest, OfficialReportExportStatus, OfficialReportFacetPage,
-  OfficialReportImportIntent, OfficialReportPreview, OfficialReportBundlePreview, OfficialReportBundleAcceptance, OfficialReportAccepted,
+  OfficialReportImportIntent, OfficialReportPreview, OfficialReportBundlePreview, OfficialReportBundleAcceptance, OfficialReportBundleInspection, OfficialReportAccepted,
   OfficialReportConfirmation, OfficialReportConfirmed, OfficialReportDiagnostics,
   CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageCandidates, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
 
 export type ReportPageRequest = ReportQuery & { selectionId?: string; inventorySelectionId?: string; cursor?: string; limit?: number };
+export function normalizeReportSearch(value: string): string {
+  // Match the server's reportSearch so equivalent edits retain selections and facet cursors.
+  return value.normalize("NFKC").toLowerCase().normalize("NFKC").trim();
+}
 export function encodeReportFacetValue(value: string | null): string {
   return value === null ? "~null" : `~string:${value}`;
 }
@@ -108,7 +112,7 @@ export function stageReport(file: File, intent: OfficialReportImportIntent, meta
 }
 export const readReportStage = (id: string, signal?: AbortSignal) => request<OfficialReportPreview>(`/api/official-usage/staging/${encodeURIComponent(id)}`, { signal });
 export const discardReportStage = (id: string, signal?: AbortSignal) => request<void>(`/api/official-usage/staging/${encodeURIComponent(id)}`, { method: "DELETE", signal });
-export const previewReportBundle = (id: string, signal?: AbortSignal) => post<OfficialReportBundlePreview>(`/api/official-usage/bundles/${encodeURIComponent(id)}/preview`, {}, signal);
+export const previewReportBundle = (id: string, signal?: AbortSignal, options: OfficialReportBundleInspection = {}) => post<OfficialReportBundlePreview>(`/api/official-usage/bundles/${encodeURIComponent(id)}/preview`, options, signal);
 export const acceptReportBundle = (id: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) => post<OfficialReportAccepted>(`/api/official-usage/bundles/${encodeURIComponent(id)}/accept`, input, signal);
 export const previewReportOperation = (id: string, operation: "select" | "delete", signal?: AbortSignal) => post<OfficialReportConfirmation>(`/api/official-usage/sets/${encodeURIComponent(id)}/preview`, { operation }, signal);
 export const confirmReportOperation = (input: OfficialReportConfirmation, signal?: AbortSignal) => post<OfficialReportConfirmed>(`/api/official-usage/confirmations/${encodeURIComponent(input.id)}`, input, signal);

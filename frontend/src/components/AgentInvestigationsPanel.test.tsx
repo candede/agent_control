@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { ApiError, getAgentInvestigationContext, getAgentPurviewRecords, resolveAgentInvestigationIdentity, type AgentInvestigationContext, type PurviewAuditRecord } from "../api/client";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
+import { createSavedQueryClient } from "../savedQueries";
 
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(),
@@ -140,6 +142,28 @@ describe("agent investigations", () => {
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
   });
 
+  it("admits one identity lookup and stays busy until fresh saved context finishes", async () => {
+    const lookup = deferred<AgentInvestigationContext>();
+    const readback = deferred<AgentInvestigationContext>();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce(unresolved).mockReturnValueOnce(readback.promise);
+    vi.mocked(resolveAgentInvestigationIdentity).mockReturnValue(lookup.promise);
+    render(panel());
+    const resolve = await screen.findByRole("button", { name: "Resolve log identity" });
+    act(() => {
+      fireEvent.click(resolve);
+      fireEvent.click(resolve);
+    });
+    expect(resolveAgentInvestigationIdentity).toHaveBeenCalledOnce();
+    await act(async () => lookup.resolve(investigation));
+    await waitFor(() => expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Resolving log identity..." })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh investigation access" })).toBeDisabled();
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    await act(async () => readback.resolve(investigation));
+    expect(await screen.findByLabelText("Scoped Defender hunt")).toHaveAttribute("data-current", "true");
+    expect(screen.queryByText("Verifying the selected agent with Microsoft Graph...")).not.toBeInTheDocument();
+  });
+
   it("surfaces lookup permission failures and supports an explicit retry without falsely unlocking hunts", async () => {
     vi.mocked(getAgentInvestigationContext).mockResolvedValue(unresolved);
     vi.mocked(resolveAgentInvestigationIdentity).mockRejectedValueOnce(new Error("AgentIdentity.Read.All requires administrator consent."));
@@ -225,6 +249,41 @@ describe("agent investigations", () => {
     expect(getAgentInvestigationContext).toHaveBeenCalledTimes(change === "role" ? 1 : 2);
   });
 
+  it.each(["pending", "failed"] as const)("does not revive a retired %s identity lookup when access returns", async outcome => {
+    const definition = capabilityDefinitions.find(item => item.id === "graph.agentIdentity.read")!;
+    const access: typeof capability = { ...capability, views: [{
+      definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+        previewQualification: "not_required", remediation: [] },
+    }] };
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue(unresolved);
+    const lookup = deferred<AgentInvestigationContext>();
+    vi.mocked(resolveAgentInvestigationIdentity).mockReturnValueOnce(lookup.promise);
+    const view = render(panel(recordId, ["AgentControl.Viewer"], access));
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve log identity" }));
+    const signal = vi.mocked(resolveAgentInvestigationIdentity).mock.calls[0][1]!.signal!;
+    if (outcome === "failed") {
+      await act(async () => lookup.reject(new Error("Retired lookup failure")));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Retired lookup failure");
+    }
+
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...access, views: [{
+      ...access.views[0], decision: { ...access.views[0].decision, authorized: false },
+    }] }));
+    if (outcome === "pending") expect(signal.aborted).toBe(true);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resolve log identity" })).toBeEnabled());
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], access));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resolve log identity" })).toBeEnabled());
+    expect(screen.queryByText(/Retired lookup failure/)).not.toBeInTheDocument();
+    if (outcome === "pending") await act(async () => lookup.resolve(investigation));
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    expect(resolveAgentInvestigationIdentity).toHaveBeenCalledOnce();
+
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue(investigation);
+    fireEvent.click(screen.getByRole("button", { name: "Resolve log identity" }));
+    await screen.findByLabelText("Scoped Defender hunt");
+    expect(resolveAgentInvestigationIdentity).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["unsupported_agent_type", "unsupported_identity_crosswalk"] as const)("distinguishes %s from disabled Microsoft telemetry", async reasonCode => {
     vi.mocked(getAgentInvestigationContext).mockResolvedValue({
       ...investigation, defender: { status: "unavailable", reasonCode, entraAgentIds: [] },
@@ -291,6 +350,127 @@ describe("agent investigations", () => {
     expect(screen.getByRole("region", { name: "Agent Purview audit" }).querySelector("details")).toBeNull();
   });
 
+  it("keeps audit pagination focused while admitting only one page move through loading and failure", async () => {
+    const nextPage = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentPurviewRecords)
+      .mockResolvedValueOnce({ recordId, mode: "saved_only", value: [auditRecord], count: 151, limit: 50, offset: 0 })
+      .mockReturnValueOnce(nextPage.promise)
+      .mockResolvedValue({ recordId, mode: "saved_only", value: [auditRecord], count: 151, limit: 50, offset: 0 });
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const next = screen.getByRole("button", { name: "Next audit records" });
+    const previous = screen.getByRole("button", { name: "Previous audit records" });
+    next.focus();
+    act(() => { next.click(); next.click(); });
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+    expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, expect.objectContaining({ offset: 50 }), expect.anything());
+    expect(screen.getByRole("button", { name: "Next audit records" })).toBe(next);
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(previous).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(screen.queryByText(/of 151/)).not.toBeInTheDocument();
+    fireEvent.click(next);
+    fireEvent.click(previous);
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    await act(async () => nextPage.reject(new Error("Audit page failed")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Audit page failed");
+    expect(next).toHaveFocus();
+    expect(previous).toHaveAttribute("aria-disabled", "false");
+    expect(screen.queryByText("0 records")).not.toBeInTheDocument();
+    fireEvent.click(previous);
+    expect(await screen.findByText("actor@example.invalid")).toBeVisible();
+    expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, expect.objectContaining({ offset: 0 }), expect.anything());
+  });
+
+  it("keeps a retrying audit search focused and suppresses the retired failure", async () => {
+    const retry = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentPurviewRecords).mockRejectedValueOnce(new Error("Audit unavailable")).mockReturnValueOnce(retry.promise);
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByRole("alert");
+    const search = screen.getByRole("button", { name: "Search saved audit" });
+    search.focus();
+    act(() => { search.click(); search.click(); });
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(search).toHaveAttribute("aria-disabled", "true"));
+    expect(search).not.toBeDisabled();
+    expect(search).toHaveFocus();
+    expect(search).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => retry.resolve({ recordId, mode: "saved_only", value: [], count: 0, limit: 50, offset: 0 }));
+    expect(await screen.findByText(/No matching saved audit records/)).toBeVisible();
+    expect(search).toHaveFocus();
+  });
+
+  it("preserves audit next-page focus when the last page makes that direction unavailable", async () => {
+    vi.mocked(getAgentPurviewRecords).mockImplementation(async (_id, query) => ({
+      recordId, mode: "saved_only", value: [auditRecord], count: 51, limit: 50, offset: query?.offset ?? 0,
+    }));
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const next = screen.getByRole("button", { name: "Next audit records" });
+    next.focus();
+    fireEvent.click(next);
+    await screen.findByText("51-51 of 51");
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(next).not.toBeDisabled();
+    fireEvent.click(next);
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects queued page and filter actions when shared audit invalidation precedes its observer notification", async () => {
+    const client = createSavedQueryClient();
+    const refreshing = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentPurviewRecords)
+      .mockResolvedValueOnce({ recordId, mode: "saved_only", value: [auditRecord], count: 151, limit: 50, offset: 0 })
+      .mockReturnValue(refreshing.promise);
+    const view = render(<QueryClientProvider client={client}>{panel()}</QueryClientProvider>);
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const next = screen.getByRole("button", { name: "Next audit records" });
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "queued filter" } });
+    act(() => {
+      void client.invalidateQueries({ queryKey: ["agent-purview-records"] });
+      next.click();
+      screen.getByRole("button", { name: "Search saved audit" }).click();
+    });
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, expect.objectContaining({ offset: 0, search: "" }), expect.anything());
+    expect(vi.mocked(getAgentPurviewRecords).mock.calls[1][2]?.signal?.aborted).toBe(false);
+    view.unmount();
+    client.clear();
+  });
+
+  it("rejects queued audit actions when investigation access is invalidated before the panel rerenders", async () => {
+    const client = createSavedQueryClient();
+    const access = deferred<AgentInvestigationContext>();
+    vi.mocked(getAgentPurviewRecords).mockResolvedValue({
+      recordId, mode: "saved_only", value: [auditRecord], count: 151, limit: 50, offset: 0,
+    });
+    const view = render(<QueryClientProvider client={client}>{panel()}</QueryClientProvider>);
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    vi.mocked(getAgentInvestigationContext).mockReturnValue(access.promise);
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "queued filter" } });
+    act(() => {
+      void client.invalidateQueries({ queryKey: ["agent-investigation-context"] });
+      screen.getByRole("button", { name: "Next audit records" }).click();
+      screen.getByRole("button", { name: "Search saved audit" }).click();
+    });
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    view.unmount();
+    client.clear();
+  });
+
   it("surfaces denied saved reads instead of presenting an empty result", async () => {
     vi.mocked(getAgentPurviewRecords).mockRejectedValue(new Error("Saved audit scope is unavailable."));
     render(panel());
@@ -299,6 +479,157 @@ describe("agent investigations", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved audit scope is unavailable.");
     expect(screen.queryByText(/0 matching saved records/)).not.toBeInTheDocument();
   });
+
+  it("revalidates saved Purview access when only the application configuration revision changes", async () => {
+    const definition = capabilityDefinitions.find(item => item.id === "purview.audit.search.application")!;
+    const access = (revision: number): typeof capability => ({ ...capability, views: [{
+      definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
+        previewQualification: "unqualified", remediation: [] },
+      configuration: { enabled: true, sharedDataScope: true, revision },
+    }] });
+    const refreshed = deferred<AgentInvestigationContext>();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce(investigation).mockReturnValueOnce(refreshed.promise);
+    vi.mocked(getAgentPurviewRecords).mockResolvedValueOnce({
+      recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0,
+    }).mockResolvedValueOnce({
+      recordId, mode: "saved_only", value: [], count: 0, limit: 50, offset: 0,
+    });
+    const view = render(panel(recordId, ["AgentControl.Viewer"], access(1)));
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], access(2)));
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    await act(async () => refreshed.resolve(investigation));
+    expect(await screen.findByText(/No matching saved audit records/)).toBeVisible();
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
+  });
+
+  it("retires a hidden Purview read and fetches fresh records on return without losing draft filters", async () => {
+    const retired = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    const fresh = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(retired.promise).mockReturnValueOnce(fresh.promise);
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledOnce());
+    const signal = vi.mocked(getAgentPurviewRecords).mock.calls[0][2]!.signal!;
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "unfinished edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Defender & Agent 365" }));
+    expect(signal.aborted).toBe(true);
+    expect(screen.queryByRole("region", { name: "Agent Purview audit" })).not.toBeInTheDocument();
+    await act(async () => retired.resolve({ recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0 }));
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("unfinished edit");
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading agent audit records");
+    await act(async () => fresh.resolve({
+      recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "fresh@example.invalid" }], count: 1, limit: 50, offset: 0,
+    }));
+    expect(await screen.findByText("fresh@example.invalid")).toBeVisible();
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+  });
+
+  it("shares pending context and Purview reads without letting a hidden observer cancel an active peer", async () => {
+    const client = createSavedQueryClient();
+    const context = deferred<AgentInvestigationContext>();
+    const records = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentInvestigationContext).mockReturnValue(context.promise);
+    vi.mocked(getAgentPurviewRecords).mockReturnValue(records.promise);
+    const view = render(<QueryClientProvider client={client}>{panel()}{panel()}</QueryClientProvider>);
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    await act(async () => context.resolve(investigation));
+    await screen.findAllByLabelText("Scoped Defender hunt");
+    const [first, second] = screen.getAllByRole("region", { name: "Investigations for Agent A" }).map(element => within(element));
+    fireEvent.click(first.getByRole("button", { name: "Purview audit" }));
+    fireEvent.click(second.getByRole("button", { name: "Purview audit" }));
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    const signal = vi.mocked(getAgentPurviewRecords).mock.calls[0][2]!.signal!;
+    fireEvent.click(first.getByRole("button", { name: "Defender & Agent 365" }));
+    expect(signal.aborted).toBe(false);
+    expect(second.getByRole("status")).toHaveTextContent("Loading agent audit records");
+    await act(async () => records.resolve({ recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0 }));
+    expect(await second.findByText("actor@example.invalid")).toBeVisible();
+    expect(first.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    view.unmount();
+    client.clear();
+  });
+
+  it("retires pending Purview data during an identity readback even when the query scope is unchanged", async () => {
+    const lookup = deferred<AgentInvestigationContext>();
+    const readback = deferred<AgentInvestigationContext>();
+    const retired = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce(unresolved).mockReturnValueOnce(readback.promise);
+    vi.mocked(resolveAgentInvestigationIdentity).mockReturnValue(lookup.promise);
+    vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(retired.promise).mockResolvedValue({
+      recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "current@example.invalid" }], count: 1, limit: 50, offset: 0,
+    });
+    render(panel());
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve log identity" }));
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledOnce());
+    const signal = vi.mocked(getAgentPurviewRecords).mock.calls[0][2]!.signal!;
+    await act(async () => lookup.resolve(investigation));
+    await waitFor(() => expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2));
+    expect(signal.aborted).toBe(true);
+    await act(async () => retired.resolve({ recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0 }));
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    await act(async () => readback.resolve(investigation));
+    expect(await screen.findByText("current@example.invalid")).toBeVisible();
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+  });
+
+  it.each(["principal", "tenant", "role", "sign-out"] as const)(
+    "clears private Purview rows and drafts, cancels pending reads and ignores late data after %s changes", async change => {
+      const retired = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+      const client = createSavedQueryClient();
+      const content = (access = capability) => <QueryClientProvider client={client}>{panel(recordId, ["AgentControl.Viewer"], access)}</QueryClientProvider>;
+      const view = render(content());
+      await screen.findByLabelText("Scoped Defender hunt");
+      fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+      await screen.findByText("actor@example.invalid");
+      vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(retired.promise).mockResolvedValue({
+        recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "current@example.invalid" }], count: 1, limit: 50, offset: 0,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Search saved audit" }));
+      await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+      const signal = vi.mocked(getAgentPurviewRecords).mock.calls[1][2]!.signal!;
+      fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "private draft" } });
+      const changed: typeof capability = { ...capability, user: change === "sign-out" ? undefined : {
+        ...capability.user!,
+        ...(change === "principal" ? { homeAccountId: "principal-b" }
+          : change === "tenant" ? { tenantId: "tenant-b" } : { roles: [] }),
+      } };
+      view.rerender(content(changed));
+      expect(signal.aborted).toBe(true);
+      expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+      expect(screen.queryByDisplayValue("private draft")).not.toBeInTheDocument();
+      await act(async () => retired.resolve({
+        recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "retired@example.invalid" }], count: 1, limit: 50, offset: 0,
+      }));
+      expect(screen.queryByText("retired@example.invalid")).not.toBeInTheDocument();
+      if (change === "role" || change === "sign-out") {
+        expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+        view.rerender(content());
+      }
+      await screen.findByLabelText("Scoped Defender hunt");
+      fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+      expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("");
+      expect(await screen.findByText("current@example.invalid")).toBeVisible();
+      expect(screen.queryByText("retired@example.invalid")).not.toBeInTheDocument();
+      expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
+      expect(getAgentPurviewRecords).toHaveBeenCalledTimes(3);
+      view.unmount();
+      client.clear();
+    },
+  );
 
   it("aborts the old context and discards late data when another agent is opened", async () => {
     let complete!: (value: AgentInvestigationContext) => void;
@@ -484,7 +815,14 @@ describe("agent investigations", () => {
       expect(await screen.findByRole("alert")).toHaveTextContent(failure.message);
       expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("draft");
+      const recovery = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+      vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(recovery.promise);
       fireEvent.click(screen.getByRole("button", { name: "Refresh investigation access" }));
+      await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(3));
+      expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+      await act(async () => recovery.resolve({
+        recordId, mode: "saved_only", value: [auditRecord], count: 1, offset: 0, limit: 50,
+      }));
       expect(await screen.findByText("actor@example.invalid")).toBeVisible();
       expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, expect.objectContaining({ search: "" }), expect.anything());
       expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("draft");
@@ -516,7 +854,8 @@ describe("agent investigations", () => {
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
   });
 
-  it("ignores permission-check timestamp renewals but rechecks real access changes without resetting the chosen source", async () => {
+  it.each(["timestamps", "freshness", "verification", "qualification"] as const)(
+    "ignores permission-check %s changes but rechecks real access without resetting the chosen source", async diagnostic => {
     const definition = capabilityDefinitions.find(item => item.id === "purview.audit.search.delegated")!;
     const access: typeof capability = { ...capability, views: [{
       definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
@@ -527,17 +866,49 @@ describe("agent investigations", () => {
     fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
     await screen.findByText("actor@example.invalid");
     const refreshed = structuredClone({ views: access.views });
-    refreshed.views[0].decision.checkedAt = "2026-09-26T10:01:00Z";
-    refreshed.views[0].decision.expiresAt = "2026-09-26T10:06:00Z";
+    if (diagnostic === "timestamps") {
+      refreshed.views[0].decision.checkedAt = "2026-09-26T10:01:00Z";
+      refreshed.views[0].decision.expiresAt = "2026-09-26T10:06:00Z";
+    }
+    if (diagnostic === "freshness") refreshed.views[0].decision.fresh = false;
+    if (diagnostic === "verification") refreshed.views[0].decision.verification = "provider";
+    if (diagnostic === "qualification") refreshed.views[0].decision.previewQualification = "qualified";
     view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...access, ...refreshed }));
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
     expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    expect(screen.getByText("actor@example.invalid")).toBeVisible();
     vi.mocked(getAgentInvestigationContext).mockRejectedValue(new Error("Saved access was revoked"));
     refreshed.views[0].decision.authorized = false;
     view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...access, ...refreshed }));
     expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved access was revoked");
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("does not cancel an explicit identity lookup when diagnostic verification changes", async () => {
+    const definition = capabilityDefinitions.find(item => item.id === "graph.agentIdentity.read")!;
+    const access: typeof capability = { ...capability, views: [{
+      definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+        verification: "token", previewQualification: "not_required", remediation: [] },
+    }] };
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue(unresolved);
+    const pending = deferred<AgentInvestigationContext>();
+    vi.mocked(resolveAgentInvestigationIdentity).mockReturnValue(pending.promise);
+    const view = render(panel(recordId, ["AgentControl.Viewer"], access));
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve log identity" }));
+    const signal = vi.mocked(resolveAgentInvestigationIdentity).mock.calls[0][1]?.signal;
+    const renewed = { ...access, views: [{ ...access.views[0], decision: {
+      ...access.views[0].decision, verification: "provider" as const,
+    } }] };
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], renewed));
+    expect(signal?.aborted).toBe(false);
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue(investigation);
+    await act(async () => pending.resolve(investigation));
+    await screen.findByLabelText("Scoped Defender hunt");
+    expect(resolveAgentInvestigationIdentity).toHaveBeenCalledOnce();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
   });
 
   it("refreshes the selected Purview data without clearing its filters", async () => {
@@ -550,6 +921,171 @@ describe("agent investigations", () => {
     await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("actor");
+  });
+
+  it("shares rapid access refreshes without cancelling and restarting the same read", async () => {
+    const pending = deferred<AgentInvestigationContext>();
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    vi.mocked(getAgentInvestigationContext).mockReturnValue(pending.promise);
+    const refresh = screen.getByRole("button", { name: "Refresh investigation access" });
+    act(() => {
+      fireEvent.click(refresh);
+      fireEvent.click(refresh);
+    });
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(getAgentInvestigationContext).mock.calls[1][1]!.signal!.aborted).toBe(false);
+    await act(async () => pending.resolve(investigation));
+    await waitFor(() => expect(refresh).toBeEnabled());
+  });
+
+  it("shows pending access recovery without the previous cached refresh failure", async () => {
+    const pending = deferred<AgentInvestigationContext>();
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    vi.mocked(getAgentInvestigationContext).mockRejectedValueOnce(new Error("Access refresh failed"));
+    const refresh = screen.getByRole("button", { name: "Refresh investigation access" });
+    fireEvent.click(refresh);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Access refresh failed");
+    vi.mocked(getAgentInvestigationContext).mockReturnValueOnce(pending.promise);
+    act(() => { fireEvent.click(refresh); fireEvent.click(refresh); });
+    expect(await screen.findByRole("status")).toHaveTextContent("Checking saved agent identity");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(getAgentInvestigationContext).mock.lastCall?.[1]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(investigation));
+    expect(await screen.findByLabelText("Scoped Defender hunt")).toHaveAttribute("data-current", "true");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("shows pending audit recovery without the previous cached search failure", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const form = screen.getByRole("button", { name: "Search saved audit" }).closest("form")!;
+    vi.mocked(getAgentPurviewRecords).mockRejectedValueOnce(new Error("Audit refresh failed"));
+    fireEvent.submit(form);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Audit refresh failed");
+    vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(pending.promise);
+    act(() => { fireEvent.submit(form); fireEvent.submit(form); });
+    expect(await screen.findByRole("status")).toHaveTextContent("Loading agent audit records");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(getAgentPurviewRecords).mock.lastCall?.[2]?.signal?.aborted).toBe(false);
+    await act(async () => pending.resolve({
+      recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0,
+    }));
+    expect(await screen.findByText("actor@example.invalid")).toBeVisible();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it.each(["resolve-first", "refresh-first"] as const)("does not overlap identity resolution and access refresh (%s)", async order => {
+    const lookup = deferred<AgentInvestigationContext>();
+    const readback = deferred<AgentInvestigationContext>();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce(unresolved).mockReturnValueOnce(readback.promise);
+    vi.mocked(resolveAgentInvestigationIdentity).mockReturnValueOnce(lookup.promise);
+    render(panel());
+    const resolve = await screen.findByRole("button", { name: "Resolve log identity" });
+    const refresh = screen.getByRole("button", { name: "Refresh investigation access" });
+    act(() => {
+      fireEvent.click(order === "resolve-first" ? resolve : refresh);
+      fireEvent.click(order === "resolve-first" ? refresh : resolve);
+    });
+    expect(resolveAgentInvestigationIdentity).toHaveBeenCalledTimes(order === "resolve-first" ? 1 : 0);
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(order === "resolve-first" ? 1 : 2);
+    if (order === "resolve-first") {
+      await act(async () => lookup.resolve(investigation));
+      await waitFor(() => expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2));
+    }
+    await act(async () => readback.resolve(investigation));
+    expect(await screen.findByLabelText("Scoped Defender hunt")).toHaveAttribute("data-current", "true");
+  });
+
+  it("shares rapid equivalent saved-audit searches without restarting the transport", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    vi.mocked(getAgentPurviewRecords).mockReturnValue(pending.promise);
+    const form = screen.getByRole("button", { name: "Search saved audit" }).closest("form")!;
+    act(() => {
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+    });
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(getAgentPurviewRecords).mock.calls[1][2]!.signal!.aborted).toBe(false);
+    await act(async () => pending.resolve({
+      recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0,
+    }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Search saved audit" })).toHaveAttribute("aria-disabled", "false"));
+  });
+
+  it.each(["error", "unmapped"] as const)("does not revive withdrawn audit rows while recovering from %s access", async outcome => {
+    const pending = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "private draft" } });
+    if (outcome === "error") vi.mocked(getAgentInvestigationContext).mockRejectedValueOnce(new Error("Saved access denied"));
+    else vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce({
+      ...investigation, purview: { status: "unavailable", mode: "saved_only", reason: "Mapping unavailable" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh investigation access" }));
+    await screen.findByText(outcome === "error" ? "Saved access denied" : "Mapping unavailable");
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(pending.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh investigation access" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("private draft");
+    await act(async () => pending.resolve({
+      recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "current@example.invalid" }],
+      count: 1, limit: 50, offset: 0,
+    }));
+    expect(await screen.findByText("current@example.invalid")).toBeVisible();
+  });
+
+  it("does not restore rejected investigation context while a replacement revision is loading", async () => {
+    const pending = deferred<AgentInvestigationContext>();
+    const view = render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    vi.mocked(getAgentInvestigationContext).mockRejectedValueOnce(new Error("Saved context denied"));
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+    await screen.findByText("Saved context denied");
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    vi.mocked(getAgentInvestigationContext).mockReturnValueOnce(pending.promise);
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "3"));
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Checking saved agent identity");
+    await act(async () => pending.resolve(unresolved));
+    expect(await screen.findByRole("button", { name: "Resolve log identity" })).toBeEnabled();
+  });
+
+  it("does not restore rejected context from a peer's older cached revision before revalidation", async () => {
+    const client = createSavedQueryClient();
+    const pending = deferred<AgentInvestigationContext>();
+    const content = (revision = "1") => <QueryClientProvider client={client}>
+      {panel(recordId, ["AgentControl.Viewer"], capability, revision)}{panel()}
+    </QueryClientProvider>;
+    const view = render(content());
+    await screen.findAllByLabelText("Scoped Defender hunt");
+    const first = within(screen.getAllByRole("region", { name: "Investigations for Agent A" })[0]);
+    vi.mocked(getAgentInvestigationContext).mockRejectedValueOnce(new Error("Saved context denied"));
+    view.rerender(content("2"));
+    await first.findByText("Saved context denied");
+    vi.mocked(getAgentInvestigationContext).mockReturnValueOnce(pending.promise);
+    view.rerender(content());
+    expect(first.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(investigation));
+    expect(await first.findByLabelText("Scoped Defender hunt")).toHaveAttribute("data-current", "true");
+    view.unmount();
+    client.clear();
   });
 
   it("rejects audit responses for a different agent and never displays their records", async () => {

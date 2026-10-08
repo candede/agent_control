@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { ApiError } from "../api/client";
 import { reportPages } from "../api/reportData";
+import { createSavedQueryClient } from "../savedQueries";
 import { historySet, reportPage } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
 import { CsvUsageReportsSection } from "./CsvUsageReportsSection";
@@ -79,6 +81,15 @@ describe("CSV usage reports section", () => {
     expect(screen.getByText("No dates found in imported reports")).toBeVisible();
     expect(screen.getByRole("region", { name: "CSV usage reports" }).querySelector("time")).toBeNull();
   });
+  it("keeps imported reports available without inventing an invalid import time", async () => {
+    const data = history(); data.analytics.history.latestAcceptedAt = "invalid";
+    vi.mocked(reportPages.history).mockResolvedValue(data);
+    render(<CsvUsageReportsSection {...props} />);
+    expect(await screen.findByText("Reports available")).toBeVisible();
+    expect(screen.getByText("Not recorded").closest("p")).toHaveTextContent("Last imported Not recorded");
+    expect(screen.getByRole("heading", { name: "8 saved report sets" })).toBeVisible();
+    expect(reportPages.history).toHaveBeenCalledOnce();
+  });
   it("shows a valid single-day range without requiring manual reporting dates", async () => {
     const data = history(); data.analytics.history.earliestActivityDateUtc = "2026-09-18";
     vi.mocked(reportPages.history).mockResolvedValue(data);
@@ -124,5 +135,70 @@ describe("CSV usage reports section", () => {
     await act(async () => pending.resolve(history(true)));
     expect(screen.queryByText("Import needed")).not.toBeInTheDocument();
     expect(reportPages.history).toHaveBeenCalledTimes(2);
+  });
+  it.each(["loading", "sharing"])("keeps retry %s correct after a cached summary fails revalidation", async check => {
+    const client = createSavedQueryClient();
+    render(<QueryClientProvider client={client}><CsvUsageReportsSection {...props} /></QueryClientProvider>);
+    await screen.findByText("Reports available");
+    vi.mocked(reportPages.history).mockRejectedValueOnce(new Error("Summary revalidation failed."));
+    await act(async () => { await client.invalidateQueries({ queryKey: ["saved", "csv-usage-reports"] }); });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Summary revalidation failed.");
+    const pending = deferred<ReturnType<typeof history>>();
+    vi.mocked(reportPages.history).mockReturnValue(pending.promise);
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => { fireEvent.click(retry); fireEvent.click(retry); });
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Loading reports"));
+    if (check === "sharing") {
+      expect(reportPages.history).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(reportPages.history).mock.calls[2][1]?.aborted).toBe(false);
+    } else {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByText("Reports available")).not.toBeInTheDocument();
+    }
+    await act(async () => pending.resolve(history(true)));
+    expect(await screen.findByText("Import needed")).toBeVisible();
+  });
+  it("shares concurrent summary reads without cancelling a remaining observer or following cursors", async () => {
+    const client = createSavedQueryClient(), pending = deferred<ReturnType<typeof history>>();
+    vi.mocked(reportPages.history).mockReturnValue(pending.promise);
+    const panels = (first: boolean) => <QueryClientProvider client={client}>
+      {first ? <CsvUsageReportsSection key="first" {...props} /> : null}
+      <CsvUsageReportsSection key="second" {...props} />
+    </QueryClientProvider>;
+    const view = render(panels(true));
+    await waitFor(() => expect(reportPages.history).toHaveBeenCalledOnce());
+    const signal = vi.mocked(reportPages.history).mock.calls[0][1];
+    view.rerender(panels(false));
+    expect(signal?.aborted).toBe(false);
+    await act(async () => pending.resolve(history()));
+    expect(await screen.findByText("Reports available")).toBeVisible();
+    expect(reportPages.history).toHaveBeenCalledOnce();
+  });
+  it("does not reload history for upload access, callback or focus changes", async () => {
+    const view = render(<CsvUsageReportsSection {...props} />);
+    await screen.findByText("Reports available");
+    view.rerender(<CsvUsageReportsSection {...props} canUploadUsage={false}
+      onOpenUsageImport={vi.fn()} onManageUsageReports={vi.fn()} />);
+    act(() => { window.dispatchEvent(new Event("focus")); });
+    expect(screen.getByText("Reports available")).toBeVisible();
+    expect(reportPages.history).toHaveBeenCalledOnce();
+  });
+  it("retires pending revision reads and unmounted session reads even when their transports settle late", async () => {
+    const previous = deferred<ReturnType<typeof history>>(), current = deferred<ReturnType<typeof history>>();
+    vi.mocked(reportPages.history).mockReturnValueOnce(previous.promise).mockReturnValueOnce(current.promise);
+    const view = render(<CsvUsageReportsSection {...props} />);
+    await waitFor(() => expect(reportPages.history).toHaveBeenCalledOnce());
+    const previousSignal = vi.mocked(reportPages.history).mock.calls[0][1];
+    view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
+    expect(previousSignal?.aborted).toBe(true);
+    await waitFor(() => expect(reportPages.history).toHaveBeenCalledTimes(2));
+    await act(async () => previous.reject(new Error("Obsolete revision error")));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading reports");
+    const currentSignal = vi.mocked(reportPages.history).mock.calls[1][1];
+    view.unmount();
+    expect(currentSignal?.aborted).toBe(true);
+    await act(async () => current.resolve(history()));
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
   });
 });

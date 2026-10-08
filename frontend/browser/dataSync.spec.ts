@@ -203,7 +203,7 @@ test("first-sync status failure and permission recovery stay visible outside Syn
   statusUnavailable = false;
   await statusError.getByRole("button", { name: "Retry status check" }).click();
   await expect(notice.getByRole("heading", { name: "First sync needs attention" })).toBeVisible();
-  await expect(notice.getByRole("link", { name: "Review permissions" })).toHaveAttribute("href", "/permissions");
+  await expect(notice.getByRole("button", { name: "Review permissions" })).toBeEnabled();
   await expect(notice.getByRole("link", { name: "Sign in again" })).toHaveCount(2);
   expect((await new AxeBuilder({ page }).include(".first-sync-dialog").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("first-sync-recovery.png") });

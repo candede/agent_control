@@ -41,11 +41,14 @@ export type BulkProgress = BulkProgressBase &
 type BulkActionsProps = {
   disabled: boolean;
   busyAction?: AuditAction;
+  preparingAction?: BlockAuditAction;
   progress?: BulkProgress;
   result?: BulkActionResult;
   job?: BulkActionJob;
+  jobId?: string;
   jobCommand?: BulkJobCommand;
   jobError?: string;
+  statusUnrecognized?: boolean;
   owner?: string;
   selectedCount: number;
   onBlockAll: () => void;
@@ -57,11 +60,14 @@ type BulkActionsProps = {
 export function BulkActions({
   disabled,
   busyAction,
+  preparingAction,
   progress,
   result,
   job,
+  jobId,
   jobCommand,
   jobError,
+  statusUnrecognized = false,
   owner,
   selectedCount,
   onBlockAll,
@@ -69,7 +75,7 @@ export function BulkActions({
   onUnblockAll,
   onJobCommand,
 }: BulkActionsProps) {
-  const active = Boolean(busyAction || jobCommand || (job && (isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization")));
+  const active = Boolean(busyAction || jobCommand || statusUnrecognized || (job && (isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization")));
   const summary = job ?? progress ?? result;
   const outcomes = job ? [] : result?.results ?? [];
   const inconclusive = job?.inconclusive ?? outcomes.filter(item => item.status === "inconclusive").length;
@@ -78,8 +84,10 @@ export function BulkActions({
   const completed = job?.completed ?? progress?.completed;
   const total = summary?.total ?? 0;
   const percent = completed === undefined ? undefined : total === 0 ? 100 : Math.round(completed / total * 100);
-  const canCancel = job && (isJobPolling(job.status) || job.canResume);
-  const message = job?.status === "waiting_authorization" ? "Sign in again, then resume unprocessed tasks."
+  const canCancel = job && !job.cancelRequested && (isJobPolling(job.status) || job.canResume);
+  const statusUnavailable = statusUnrecognized || Boolean(job && isJobPolling(job.status) && jobError && !busyAction && !jobCommand);
+  const message = job?.cancelRequested ? `Cancellation was requested. Changes already in progress may still finish.${needsReconciliation ? " Uncertain results remain recorded, but cancelled jobs cannot be reconciled or resumed." : ""}`
+    : job?.status === "waiting_authorization" ? "Sign in again, then resume unprocessed tasks."
     : job?.status === "cancelled" ? "Unprocessed tasks were cancelled. Changes already in progress may still finish."
     : needsReconciliation ? "Check uncertain results before starting another change. This only reads the current provider state."
     : undefined;
@@ -106,7 +114,7 @@ export function BulkActions({
         <button
           className="danger"
           type="button"
-          disabled={disabled || selectedCount === 0}
+          disabled={disabled || selectedCount === 0 || preparingAction === "block"}
           onClick={onBlockAll}
         >
           Block selected packages
@@ -115,7 +123,7 @@ export function BulkActions({
         <WorkbenchActionGate actionId="packages.unblock">
         <button
           type="button"
-          disabled={disabled || selectedCount === 0}
+          disabled={disabled || selectedCount === 0 || preparingAction === "unblock"}
           onClick={onUnblockAll}
         >
           Unblock selected packages
@@ -132,15 +140,20 @@ export function BulkActions({
           </button>
         </WorkbenchActionGate>
       </div> : null}
+      {preparingAction ? <p role="status">Preparing {preparingAction} preview…</p> : null}
+      {!job && jobId && (jobError || jobCommand === "refresh") ? <button type="button" className="secondary"
+        disabled={Boolean(jobCommand)} onClick={() => onJobCommand("refresh")}>
+        {jobCommand === "refresh" ? "Checking status..." : "Refresh status"}
+      </button> : null}
       {summary ? <div className="bulk-job" role="group" aria-label="Package job progress">
         <div className="bulk-job-heading">
           <div className="bulk-job-title">
             <strong>{bulkActionLabel(summary)}</strong>
             <span className="bulk-job-status" data-status={job?.status ?? "queued"} role="status">
-              {active && (jobCommand || !job || isJobPolling(job.status)) ? <LoaderCircle className="agent-refresh-spinner" size={15} aria-hidden="true" /> : null}
+              {active && !statusUnavailable && (jobCommand || !job || isJobPolling(job.status)) ? <LoaderCircle className="agent-refresh-spinner" size={15} aria-hidden="true" /> : null}
               {jobCommand === "cancel" ? "Cancelling" : jobCommand === "resume" ? "Resuming"
                 : jobCommand === "reconcile" ? "Checking results" : jobCommand === "refresh" ? "Checking status"
-                  : job ? jobStateLabels[job.status] : progress ? "Starting" : "Finished"}
+                  : job ? `${statusUnavailable ? "Last reported: " : ""}${jobStateLabels[job.status]}` : progress ? "Starting" : "Finished"}
             </span>
           </div>
           {job ? <div className="bulk-job-actions">
@@ -150,13 +163,13 @@ export function BulkActions({
             </button> : null}
             {job.status === "waiting_authorization" ? <a className="primary-link secondary" href="/api/auth/login">Sign in again</a> : null}
             {job.canResume ? <WorkbenchActionGate actionId="packages.resume" compact>
-              <button type="button" className="secondary" disabled={Boolean(jobCommand)}
+              <button type="button" className="secondary" disabled={Boolean(jobCommand) || statusUnrecognized}
                 onClick={() => onJobCommand("resume")} title="Resume only tasks that have not started. Uncertain changes are not replayed.">
                 <Play size={16} aria-hidden="true" />{jobCommand === "resume" ? "Resuming..." : "Resume unprocessed tasks"}
               </button>
             </WorkbenchActionGate> : null}
-            {needsReconciliation ? <WorkbenchActionGate actionId="packages.reconcile" compact>
-              <button type="button" className="secondary" disabled={Boolean(jobCommand) || isJobPolling(job.status)}
+            {needsReconciliation && !job.cancelRequested ? <WorkbenchActionGate actionId="packages.reconcile" compact>
+              <button type="button" className="secondary" disabled={Boolean(jobCommand) || statusUnrecognized || isJobPolling(job.status)}
                 onClick={() => onJobCommand("reconcile")} title="Read the provider state to check uncertain outcomes. No changes are retried.">
                 <RefreshCw size={16} aria-hidden="true" />{jobCommand === "reconcile" ? "Checking results..." : "Check uncertain results"}
               </button>
@@ -186,9 +199,12 @@ export function BulkActions({
             <span>{sideEffectErrors.length} audit/progress errors</span>
           ) : null}
         </div>
-        {job?.status === "running" && job.currentAgentName ? <p className="bulk-job-current">Current agent: <strong>{job.currentAgentName}</strong></p> : null}
+        {job?.status === "running" && job.currentAgentName ? <p className="bulk-job-current">{statusUnavailable ? "Last reported agent" : "Current agent"}: <strong>{job.currentAgentName}</strong></p> : null}
         {message ? <p className="bulk-job-message">{message}</p> : null}
-        {job ? <BulkJobItems key={`${owner ?? ""}:${job.id}`} job={job} owner={owner} /> : null}
+        {job ? <BulkJobItems key={`${owner ?? ""}:${job.id}`} job={job} owner={owner}
+          refreshing={jobCommand === "refresh"} disabled={Boolean(jobCommand)}
+          statusRecoveryAvailable={Boolean(jobError)}
+          onRefreshStatus={jobError ? undefined : () => onJobCommand("refresh")} /> : null}
         {failedResults.length > 0 ? (
           <details className="bulk-failures">
             <summary>Review {failedResults.length} {inconclusive ? "failed or uncertain changes" : "failed changes"}</summary>

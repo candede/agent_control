@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
 import { createUnifiedVerification } from "../test/inventoryVerification";
+import { deferred } from "../test/deferred";
 import { createReportExport, reportExportStatus, reportExportDownload, reportPages, readReportDetail, readAgentReportSummary, readAgentReportCandidates, mutateAgentReportAssociation, stageReport } from "./reportData";
 
 import {
   ApiError,
   blockAgent,
+  blockAgents,
+  unblockAgent,
+  unblockAgents,
+  cancelBulkActionJob,
   cancelDataSyncRun,
   cancelInventoryRefresh,
+  cancelQuarantineJob,
   cancelPurviewAuditSearch,
   cancelDefenderHunt,
   checkCapabilities,
@@ -23,6 +29,9 @@ import {
   getCurrentUser,
   getUnifiedAgents,
   getUnifiedAgentDetail,
+  getInventoryMembers,
+  getInventoryChildren,
+  getInventorySections,
   getAuditEvents,
   downloadPurviewAuditCsv,
   downloadDefenderHuntingCsv,
@@ -32,6 +41,8 @@ import {
   approvePurviewAuditQualification,
   approveDefenderHuntingQualification,
   getPackageRefreshJob,
+  getPackageRefreshJobs,
+  getPackageRefreshTargets,
   getDataSyncRun,
   getDataSyncState,
   getDefenderHuntingCatalog,
@@ -46,10 +57,15 @@ import {
   previewQuarantine,
   previewPackageMutation,
   reconcileBulkActionJob,
+  reconcileQuarantineJob,
+  resumeBulkActionJob,
+  resumeInventoryRefresh,
+  resumeQuarantineJob,
   resumePurviewAuditSearch,
   resumeDefenderHunt,
   revokeDefenderHuntingRetainedScope,
   refreshPackageIdentityDetails,
+  refreshInventory,
   request,
   searchDirectoryPrincipals,
   resolveDirectoryPrincipals,
@@ -65,6 +81,7 @@ import {
   submitPurviewAuditSearch,
   submitDefenderHunt,
   submitQuarantine,
+  submitSelectedPackageMutation,
   updateAgentAccess,
   updateAgentsAccess,
   type PackageAccessReplacement,
@@ -104,6 +121,65 @@ it("checks automatic refresh with an empty JSON body and the current session CSR
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("selected inventory detail page requests", () => {
+  const source = { source_scope_id: "11111111-1111-4111-8111-111111111111", source_identity: "source:opaque/identity" };
+  const readers = [
+    { name: "members", send: (signal: AbortSignal) => getInventoryMembers("selection", "agent:opaque/id", "next+page", { signal }) },
+    { name: "children", send: (signal: AbortSignal) => getInventoryChildren("selection", "agent:opaque/id", source,
+      "connectorOperation", "next+page", { signal, value: "0", limit: 10 }) },
+    { name: "sections", send: (signal: AbortSignal) => getInventorySections("selection", "agent:opaque/id", {
+      ...source, source_generation_id: "generation", domain: "packages", native_id: "package",
+      environment_id: null, display_name: "Package", observed_at: "2026-10-01", expires_at: "2026-10-02",
+    }, { signal, cursor: "next+page" }) },
+  ];
+
+  it.each(readers)("pins and bounds one $name page without capturing or draining other pages", async ({ name, send }) => {
+    const page = { value: [], total: 2000, nextCursor: "another-page" };
+    const fetchMock = mockJsonResponse(page), controller = new AbortController();
+    await expect(send(controller.signal)).resolves.toEqual(page);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [path, options] = fetchMock.mock.calls[0];
+    const url = new URL(String(path), "https://app.example.invalid");
+    expect(url.pathname).toBe(`/api/agent-inventory/agent%3Aopaque%2Fid/${name}`);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      selectionId: "selection", limit: name === "children" ? "10" : "50", cursor: "next+page",
+      ...name === "members" ? {} : { sourceScopeId: source.source_scope_id, sourceIdentity: source.source_identity },
+      ...name === "children" ? { kind: "connectorOperation", value: "0" } : {},
+    });
+    expect(options).toMatchObject({ credentials: "include", signal: controller.signal });
+  });
+
+  it.each(readers)("ignores late cancelled $name denials without revalidating the current session", async ({ send }) => {
+    const response = deferredResponse(), controller = new AbortController(), listener = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(response.promise));
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      const outcome = expect(send(controller.signal)).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+      controller.abort();
+      response.resolve(Response.json({ code: "missing_internal_role" }, { status: 403 }));
+      await outcome;
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each(readers)("rejects a stale $name body when the authenticated session changes", async ({ send }) => {
+    const body = deferred<{ value: string[] }>();
+    const response = Response.json({ value: [] });
+    const reading = deferred<void>();
+    const fetchMock = vi.fn().mockResolvedValueOnce(response).mockResolvedValueOnce(Response.json({ csrfToken: "replacement-token" }));
+    vi.spyOn(response, "json").mockImplementation(() => { reading.resolve(); return body.promise; });
+    vi.stubGlobal("fetch", fetchMock);
+    const outcome = expect(send(new AbortController().signal)).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+    await reading.promise;
+    await getCurrentUser();
+    body.resolve({ value: ["retired"] });
+    await outcome;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("request headers", () => {
@@ -670,12 +746,15 @@ describe("access API client", () => {
 
   it("starts and polls an explicit delegated package refresh", async () => {
     const fetchMock = mockJsonResponse({ id: "job-1", status: "succeeded" });
-    await startPackageRefresh();
-    await startExactPackageRefresh("package/one");
-    await getPackageRefreshJob("job/1");
+    const controller = new AbortController();
+    await startPackageRefresh("delegated", { signal: controller.signal });
+    await startExactPackageRefresh("package/one", "delegated", { signal: controller.signal });
+    await getPackageRefreshJob("job/1", "delegated", { signal: controller.signal });
+    await getPackageRefreshJobs("delegated", 20, { signal: controller.signal });
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/package%2Fone/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=delegated", expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock.mock.calls.every(([, init]) => init?.signal === controller.signal)).toBe(true);
   });
 
   it("cancels an exact data-sync run through the CSRF-protected endpoint with a cancellable request", async () => {
@@ -688,6 +767,18 @@ describe("access API client", () => {
       method: "POST", credentials: "include", signal: controller.signal,
     }));
     expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("cancel-csrf");
+  });
+
+  it("binds refresh target pages to their authorization mode, exact revision and cursor without starting work", async () => {
+    const fetchMock = mockJsonResponse({ value: [] });
+    const controller = new AbortController();
+    await getPackageRefreshTargets({ id: "job/one", tokenMode: "application", resultRevision: "2026-10-01 12:00:00+00" },
+      { cursor: "opaque+/cursor", signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "/api/agents/refresh-jobs/job%2Fone/targets?mode=application&revision=2026-10-01+12%3A00%3A00%2B00&limit=50&cursor=opaque%2B%2Fcursor",
+      expect.objectContaining({ credentials: "include", signal: controller.signal }),
+    );
+    expect(fetchMock.mock.calls[0][1]?.method ?? "GET").toBe("GET");
   });
 
   it("cancels an exact Power Platform refresh without acquiring provider authorization", async () => {
@@ -1052,6 +1143,103 @@ describe("access API client", () => {
   });
 });
 
+describe("durable mutation request cancellation", () => {
+  const id = "target/one";
+  const confirmationHash = "c".repeat(64);
+  const requests: Array<{
+    name: string; path: string; method: "POST" | "PATCH"; body?: unknown;
+    send: (options?: { signal?: AbortSignal }) => Promise<unknown>;
+  }> = [
+    { name: "inventory refresh", path: "/api/inventory/refresh-jobs", method: "POST", body: { environmentId: id },
+      send: options => refreshInventory({ environmentId: id }, options) },
+    { name: "inventory resume", path: "/api/inventory/refresh-jobs/target%2Fone/resume", method: "POST",
+      send: options => resumeInventoryRefresh(id, options) },
+    { name: "inventory cancel", path: "/api/inventory/refresh-jobs/target%2Fone/cancel", method: "POST",
+      send: options => cancelInventoryRefresh(id, options) },
+    { name: "quarantine submit", path: "/api/quarantine/jobs", method: "POST",
+      body: { action: "quarantine", snapshotId: "snapshot", resourceNativeIds: [id], confirmationHash },
+      send: options => submitQuarantine({ action: "quarantine", snapshotId: "snapshot", resourceNativeIds: [id], confirmationHash }, "stable-key", options) },
+    { name: "quarantine cancel", path: "/api/quarantine/jobs/target%2Fone/cancel", method: "POST",
+      send: options => cancelQuarantineJob(id, options) },
+    { name: "quarantine resume", path: "/api/quarantine/jobs/target%2Fone/resume", method: "POST", body: { confirmed: true },
+      send: options => resumeQuarantineJob(id, options) },
+    { name: "quarantine reconcile", path: "/api/quarantine/jobs/target%2Fone/reconcile", method: "POST", body: {},
+      send: options => reconcileQuarantineJob(id, options) },
+    { name: "single access", path: "/api/agents/target%2Fone/access", method: "PATCH", body: { ...accessUpdate, confirmationHash },
+      send: options => updateAgentAccess(id, accessUpdate, confirmationHash, options) },
+    { name: "bulk access", path: "/api/agents/access", method: "POST", body: { ids: [id], ...accessUpdate, confirmationHash },
+      send: options => updateAgentsAccess([id], accessUpdate, confirmationHash, options) },
+    { name: "selected mutation", path: "/api/agents/block", method: "POST", body: { selectionId: "selection", confirmationHash },
+      send: options => submitSelectedPackageMutation({ action: "block", selectionId: "selection", confirmationHash }, options) },
+    { name: "single block", path: "/api/agents/target%2Fone/block", method: "POST", body: { confirmationHash },
+      send: options => blockAgent(id, confirmationHash, { actionGroupId: "audit-group", ...options }) },
+    { name: "single unblock", path: "/api/agents/target%2Fone/unblock", method: "POST", body: { confirmationHash },
+      send: options => unblockAgent(id, confirmationHash, { actionGroupId: "audit-group", ...options }) },
+    { name: "bulk block", path: "/api/agents/block", method: "POST", body: { ids: [id], confirmationHash },
+      send: options => blockAgents([id], confirmationHash, options) },
+    { name: "bulk unblock", path: "/api/agents/unblock", method: "POST", body: { ids: [id], confirmationHash },
+      send: options => unblockAgents([id], confirmationHash, options) },
+    { name: "bulk reconcile", path: "/api/agents/bulk-jobs/target%2Fone/reconcile", method: "POST",
+      send: options => reconcileBulkActionJob(id, options) },
+    { name: "bulk cancel", path: "/api/agents/bulk-jobs/target%2Fone/cancel", method: "POST",
+      send: options => cancelBulkActionJob(id, options) },
+    { name: "bulk resume", path: "/api/agents/bulk-jobs/target%2Fone/resume", method: "POST", body: { confirmed: true },
+      send: options => resumeBulkActionJob(id, options) },
+  ];
+
+  describe.each(requests)("$name", ({ name, path, method, body, send }) => {
+    it.each([false, true])("preserves intent and session headers with cancellation supplied: %s", async cancellable => {
+      const fetchMock = mockJsonResponse({ csrfToken: "mutation-csrf" });
+      await getCurrentUser();
+      fetchMock.mockClear();
+      const signal = cancellable ? new AbortController().signal : undefined;
+      await send(signal ? { signal } : undefined);
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(path, expect.objectContaining({
+        credentials: "include", method, signal,
+      }));
+      expect(fetchMock.mock.calls[0][1]?.body).toBe(body === undefined ? undefined : JSON.stringify(body));
+      const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+      expect(headers.get("X-CSRF-Token")).toBe("mutation-csrf");
+      if (body !== undefined) expect(headers.get("Content-Type")).toBe("application/json");
+      if (name === "quarantine submit") expect(headers.get("Idempotency-Key")).toBe("stable-key");
+      else expect(headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+      if (name === "single block" || name === "single unblock") {
+        expect(headers.get("x-agent-control-action-group-id")).toBe("audit-group");
+      }
+    });
+
+    it("does not admit a write whose owner already cancelled", async () => {
+      const fetchMock = mockJsonResponse({});
+      const controller = new AbortController();
+      controller.abort();
+      await expect(send({ signal: controller.signal })).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(["success", "unauthorized", "invalid_csrf"])("retires a late %s without replay or session invalidation", async outcome => {
+      const pending = deferredResponse();
+      const fetchMock = vi.fn().mockReturnValue(pending.promise);
+      vi.stubGlobal("fetch", fetchMock);
+      const listener = vi.fn();
+      const unsubscribe = subscribeSessionRevalidationRequired(listener);
+      const controller = new AbortController();
+      try {
+        const result = send({ signal: controller.signal });
+        const settled = Promise.allSettled([result]);
+        controller.abort();
+        pending.resolve(Response.json(outcome === "success" ? { id } : { code: outcome }, {
+          status: outcome === "success" ? 200 : outcome === "unauthorized" ? 401 : 403,
+        }));
+        expect(await settled).toMatchObject([{ status: "rejected", reason: { code: "request_aborted", kind: "aborted" } }]);
+        expect(listener).not.toHaveBeenCalled();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+});
+
 describe("investigation request cancellation", () => {
   const id = "job/one";
   const auditFilters: PurviewAuditFilters = {
@@ -1115,48 +1303,6 @@ describe("investigation request cancellation", () => {
       expect(init.body).toBe(body);
     });
 
-    it.each(requests.filter(item => item.name.startsWith("Defender")))("binds $name to the exact selected agent on every lifecycle request", async ({ path, send }) => {
-      const fetchMock = mockJsonResponse({});
-      const agentRecordId = "power_platform:env/id:opaque%agent";
-      await send({ agentRecordId });
-      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(`${path}?${new URLSearchParams({ agentRecordId })}`,
-        expect.objectContaining({ credentials: "include" }));
-    });
-
-    it("sends only investigation choices, never client-supplied identities, for an agent-scoped hunt or approval", async () => {
-      const fetchMock = mockJsonResponse({});
-      const choices = { ...huntingFilters, agentIds: ["untrusted-agent"], entraAgentIds: ["untrusted-object"],
-        entraAgentApplicationIds: ["untrusted-application"], blueprintIds: ["untrusted-blueprint"], actorObjectIds: ["untrusted-actor"] };
-      await submitDefenderHunt("delegated", choices, { agentRecordId: "graph_packages:agent" });
-      await approveDefenderHuntingQualification("application", choices, { agentRecordId: "graph_packages:agent" });
-      for (const [, init] of fetchMock.mock.calls) {
-        expect(JSON.parse(init.body as string).filters).toEqual({
-          templateId: choices.templateId, startDateTime: choices.startDateTime, endDateTime: choices.endDateTime, operations: choices.operations,
-        });
-      }
-    });
-
-    it("binds saved context, history, details, rows and Purview paging to their agent", async () => {
-      const fetchMock = mockJsonResponse({});
-      const recordId = "power_platform:env/id:opaque%agent";
-      const options = { agentRecordId: recordId };
-      const agentQuery = new URLSearchParams({ agentRecordId: recordId }).toString();
-      await getDefenderHuntingCatalog(options);
-      await getDefenderHuntingJobs(20, 40, options);
-      await getDefenderHuntingJob("job/one", options);
-      await getDefenderHuntingRows("job/one", 100, 100, options);
-      await getAgentInvestigationContext(recordId);
-      await getAgentPurviewRecords(recordId, { limit: 50, offset: 50, search: "actor+correlation", operation: "InvokeAgent" });
-      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-        `/api/hunting/catalog?${agentQuery}`,
-        `/api/hunting/jobs?limit=20&offset=40&${agentQuery}`,
-        `/api/hunting/jobs/job%2Fone?${agentQuery}`,
-        `/api/hunting/jobs/job%2Fone/rows?limit=100&offset=100&${agentQuery}`,
-        `/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`,
-        `/api/agent-inventory/investigations/purview?${new URLSearchParams({ recordId, limit: "50", offset: "50", search: "actor+correlation", operation: "InvokeAgent" })}`,
-      ]);
-    });
-
     it("rejects an aborted response even when the transport completes late", async () => {
       const pending = deferredResponse();
       vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
@@ -1167,6 +1313,48 @@ describe("investigation request cancellation", () => {
       pending.resolve(Response.json({}));
       await cancelled;
     });
+  });
+
+  it.each(requests.filter(item => item.name.startsWith("Defender")))("binds $name to the exact selected agent on every lifecycle request", async ({ path, send }) => {
+    const fetchMock = mockJsonResponse({});
+    const agentRecordId = "power_platform:env/id:opaque%agent";
+    await send({ agentRecordId });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(`${path}?${new URLSearchParams({ agentRecordId })}`,
+      expect.objectContaining({ credentials: "include" }));
+  });
+
+  it("sends only investigation choices, never client-supplied identities, for an agent-scoped hunt or approval", async () => {
+    const fetchMock = mockJsonResponse({});
+    const choices = { ...huntingFilters, agentIds: ["untrusted-agent"], entraAgentIds: ["untrusted-object"],
+      entraAgentApplicationIds: ["untrusted-application"], blueprintIds: ["untrusted-blueprint"], actorObjectIds: ["untrusted-actor"] };
+    await submitDefenderHunt("delegated", choices, { agentRecordId: "graph_packages:agent" });
+    await approveDefenderHuntingQualification("application", choices, { agentRecordId: "graph_packages:agent" });
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.parse(init.body as string).filters).toEqual({
+        templateId: choices.templateId, startDateTime: choices.startDateTime, endDateTime: choices.endDateTime, operations: choices.operations,
+      });
+    }
+  });
+
+  it("binds saved context, history, details, rows and Purview paging to their agent", async () => {
+    const fetchMock = mockJsonResponse({});
+    const recordId = "power_platform:env/id:opaque%agent";
+    const options = { agentRecordId: recordId };
+    const agentQuery = new URLSearchParams({ agentRecordId: recordId }).toString();
+    await getDefenderHuntingCatalog(options);
+    await getDefenderHuntingJobs(20, 40, options);
+    await getDefenderHuntingJob("job/one", options);
+    await getDefenderHuntingRows("job/one", 100, 100, options);
+    await getAgentInvestigationContext(recordId);
+    await getAgentPurviewRecords(recordId, { limit: 50, offset: 50, search: "actor+correlation", operation: "InvokeAgent" });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      `/api/hunting/catalog?${agentQuery}`,
+      `/api/hunting/jobs?limit=20&offset=40&${agentQuery}`,
+      `/api/hunting/jobs/job%2Fone?${agentQuery}`,
+      `/api/hunting/jobs/job%2Fone/rows?limit=100&offset=100&${agentQuery}`,
+      `/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`,
+      `/api/agent-inventory/investigations/purview?${new URLSearchParams({ recordId, limit: "50", offset: "50", search: "actor+correlation", operation: "InvokeAgent" })}`,
+    ]);
   });
 
   it.each(["capability_unavailable", "hunting_scope_unqualified", "not_configured"])(
@@ -1284,6 +1472,39 @@ describe("API response failures", () => {
     expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
   });
 
+  it.each(["JSON", "CSV"] as const)("retires a rejected CSRF token and pending %s data without replaying the write", async format => {
+    const fetchMock = mockJsonResponse({ csrfToken: "previous-session-csrf" });
+    await getCurrentUser();
+    const pending = deferredResponse();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const read = format === "JSON"
+      ? getAgents({ selectionId: "previous-selection" })
+      : downloadPurviewAuditCsv("previous-job");
+    const outcome = Promise.allSettled([read]);
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      fetchMock.mockResolvedValueOnce(Response.json({ code: "invalid_csrf", detail: "A valid CSRF token is required." }, { status: 403 }));
+      await expect(checkAutomaticRefresh()).rejects.toMatchObject({ status: 403, code: "invalid_csrf", kind: "problem" });
+      expect(listener).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: 403, code: "invalid_csrf" }));
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      pending.resolve(format === "JSON" ? Response.json({ value: ["previous-account"] }) : new Response("previous,account"));
+      expect(await outcome).toMatchObject([{ status: "rejected", reason: { code: "request_aborted", kind: "aborted" } }]);
+      await checkCapabilities();
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
+      fetchMock.mockResolvedValueOnce(Response.json({ csrfToken: "replacement-session-csrf" }));
+      await getCurrentUser();
+      await checkCapabilities();
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("replacement-session-csrf");
+      expect(fetchMock.mock.calls.filter(([path]) => path === "/api/data-sync/auto-refresh")).toHaveLength(1);
+      expect(listener).toHaveBeenCalledOnce();
+    } finally {
+      pending.resolve(Response.json({}));
+      await outcome;
+      unsubscribe();
+    }
+  });
+
   it.each(["JSON", "CSV"] as const)("rejects a late %s success from a denied session", async format => {
     const pending = deferredResponse();
     const fetchMock = mockJsonResponse({});
@@ -1296,7 +1517,7 @@ describe("API response failures", () => {
     await cancelled;
   });
 
-  it("does not revalidate a replacement session for a cancelled request's late denial", async () => {
+  it.each(["missing_internal_role", "invalid_csrf"])("does not revalidate a replacement session for a cancelled request's late %s", async code => {
     const pending = deferredResponse();
     vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
     const listener = vi.fn();
@@ -1306,7 +1527,7 @@ describe("API response failures", () => {
       const result = getAgents({}, { signal: controller.signal });
       const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted" });
       controller.abort();
-      pending.resolve(Response.json({ code: "missing_internal_role" }, { status: 403 }));
+      pending.resolve(Response.json({ code }, { status: 403 }));
       await cancelled;
       expect(listener).not.toHaveBeenCalled();
     } finally {

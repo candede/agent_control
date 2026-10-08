@@ -89,6 +89,21 @@ describe("selected inventory query protocol", () => {
     }
   });
 
+  it("normalizes native GUID links and encoding without lowercasing opaque native or package identities", () => {
+    const nativeId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    expect(unifiedAgentRecordId({ source: "power_platform", environmentId: "Default-ENV", nativeId }))
+      .toBe(`power_platform:default-env:${nativeId.toLowerCase()}`);
+    expect(unifiedAgentInventoryQuery({ recordId: `power_platform:Default-ENV:${nativeId}` }).recordId)
+      .toBe(`power_platform:default-env:${nativeId.toLowerCase()}`);
+    for (const nativeId of ["Opaque/Native", "Native%2Fvalue", "公司/🌏"]) {
+      const formatted = unifiedAgentRecordId({ source: "power_platform", environmentId: "ENV", nativeId });
+      expect(parseUnifiedAgentRecordId(formatted)).toEqual({ source: "power_platform", environmentId: "env", nativeId });
+    }
+    expect(unifiedAgentRecordId({ source: "graph_packages", packageId: nativeId })).toBe(`graph_packages:${nativeId}`);
+    expect(unifiedAgentInventoryQuery({ recordId: "graph_packages:Package%2fone%252Ftwo" }).recordId)
+      .toBe("graph_packages:Package%2Fone%252Ftwo");
+  });
+
   it("validates exact responsibility identifiers without tenant or name overrides", () => {
     const selectionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", selectionId, cursor: "selected-page", limit: "100" }))

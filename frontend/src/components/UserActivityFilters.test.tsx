@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "../api/client";
 import * as api from "../api/reportData";
 import { deferred } from "../test/deferred";
 import { reportPage, selectionId } from "../test/reportDataFixture";
@@ -49,7 +50,7 @@ describe("user activity filter controls", () => {
     render(<Filters selection={selectionId} />);
     const { user, controls } = await openFilters();
     const company = controls.getByRole("combobox", { name: "Company" });
-    await waitFor(() => expect(company).toBeEnabled());
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
     await user.selectOptions(company, "~null");
     await user.selectOptions(controls.getByRole("combobox", { name: "Sort" }), "name:asc");
     await user.selectOptions(controls.getByRole("combobox", { name: "Agent responses" }), "low");
@@ -69,7 +70,7 @@ describe("user activity filter controls", () => {
   it("focuses an available filter when organization facets have no selection", async () => {
     render(<Filters />);
     const { user, trigger, controls } = await openFilters();
-    expect(controls.getByRole("combobox", { name: "Company" })).toBeDisabled();
+    expect(controls.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "true");
     expect(controls.getByRole("combobox", { name: "Agent responses" })).toHaveFocus();
     expect(api.readReportFacet).not.toHaveBeenCalled();
     await user.keyboard("{Escape}");
@@ -85,8 +86,55 @@ describe("user activity filter controls", () => {
     const cohort = controls.getByRole("combobox", { name: "Agent responses" });
     expect(cohort).toHaveFocus();
     await act(async () => pending.resolve(facetPage()));
-    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toBeEnabled());
+    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "false"));
     expect(cohort).toHaveFocus();
+  });
+
+  it.each(["next", "previous"] as const)("keeps keyboard focus while reading the %s option page and rejects unavailable choices", async direction => {
+    vi.mocked(api.readReportFacet).mockResolvedValue(facetPage("facet-next", "facet-previous"));
+    render(<Filters selection={selectionId} />);
+    const { user, controls } = await openFilters();
+    const company = controls.getByRole("combobox", { name: "Company" });
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    await user.selectOptions(company, "~string:Contoso");
+    const pending = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>();
+    vi.mocked(api.readReportFacet).mockReturnValueOnce(pending.promise);
+    await user.selectOptions(company, `${direction}-options`);
+    expect(company).not.toBeDisabled();
+    expect(company).toHaveAttribute("aria-disabled", "true");
+    expect(company).toHaveFocus();
+    fireEvent.change(company, { target: { value: "" } });
+    expect(api.readReportFacet).toHaveBeenCalledTimes(3);
+    expect(company).toHaveValue("~string:Contoso");
+    expect(screen.getByRole("button", { name: "Remove company filter" })).toBeInTheDocument();
+    await act(async () => pending.resolve(facetPage(null)));
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    expect(company).toHaveFocus();
+  });
+
+  it("keeps the focused facet available through filter application without admitting retired choices", async () => {
+    const view = render(<Filters selection={selectionId} />);
+    const { user, controls } = await openFilters();
+    const company = controls.getByRole("combobox", { name: "Company" });
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    await user.selectOptions(company, "~string:Contoso");
+    view.rerender(<Filters />);
+    expect(company).not.toBeDisabled();
+    expect(company).toHaveAttribute("aria-disabled", "true");
+    expect(company).toHaveFocus();
+    fireEvent.change(company, { target: { value: "" } });
+    expect(company).toHaveValue("~string:Contoso");
+    expect(api.readReportFacet).toHaveBeenCalledTimes(2);
+    const pending = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>();
+    vi.mocked(api.readReportFacet).mockReturnValue(pending.promise);
+    view.rerender(<Filters selection="replacement" />);
+    expect(company).toHaveFocus();
+    await act(async () => pending.resolve({
+      ...facetPage(null), selection: { ...reportPage([]).selection, id: "replacement" },
+    }));
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    expect(company).toHaveFocus();
+    expect(api.readReportFacet).toHaveBeenCalledTimes(4);
   });
 
   it.each(["company", "department"] as const)("restarts %s options on page one after searching and clearing", async field => {
@@ -95,18 +143,18 @@ describe("user activity filter controls", () => {
     render(<Filters selection={selectionId} />);
     const { user, controls } = await openFilters();
     const select = controls.getByRole("combobox", { name: field === "company" ? "Company" : "Department" });
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     await user.selectOptions(select, "next-options");
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/users", selectionId, field,
       expect.objectContaining({ search: "", cursor: "facet-next" }));
     const search = controls.getByRole("searchbox", { name: `Search ${field} options` });
     fireEvent.change(search, { target: { value: "Contoso" } });
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/users", selectionId, field,
-      expect.objectContaining({ search: "Contoso", cursor: undefined }));
+      expect.objectContaining({ search: "contoso", cursor: undefined }));
     fireEvent.change(search, { target: { value: "" } });
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/users", selectionId, field,
       expect.objectContaining({ search: "", cursor: undefined }));
   });
@@ -116,39 +164,62 @@ describe("user activity filter controls", () => {
     const { user, controls } = await openFilters();
     const search = await controls.findByRole("searchbox", { name: "Search company options" });
     await user.type(search, "C");
-    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toBeEnabled());
+    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "false"));
     const pending = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>();
     vi.mocked(api.readReportFacet).mockReturnValue(pending.promise);
     await user.clear(search);
     expect(search).toBeInTheDocument();
     expect(search).toHaveFocus();
     await act(async () => pending.resolve(facetPage(null)));
-    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toBeEnabled());
+    await waitFor(() => expect(controls.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "false"));
     expect(search).toBeInTheDocument();
     expect(search).toHaveFocus();
     await user.type(search, "D");
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/users", selectionId, "company",
-      expect.objectContaining({ search: "D", cursor: undefined }));
+      expect.objectContaining({ search: "d", cursor: undefined }));
   });
 
   it("discards a paged facet cursor when the parent selection is withdrawn and restored", async () => {
     const view = render(<Filters selection={selectionId} />);
     const { user, controls } = await openFilters();
     const company = controls.getByRole("combobox", { name: "Company" });
-    await waitFor(() => expect(company).toBeEnabled());
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
     await user.selectOptions(company, "next-options");
-    await waitFor(() => expect(company).toBeEnabled());
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/users", selectionId, "company",
       expect.objectContaining({ cursor: "facet-next" }));
     const calls = vi.mocked(api.readReportFacet).mock.calls.length;
     view.rerender(<Filters />);
-    expect(company).toBeDisabled();
+    expect(company).toHaveAttribute("aria-disabled", "true");
     expect(api.readReportFacet).toHaveBeenCalledTimes(calls);
     view.rerender(<Filters selection={selectionId} />);
-    await waitFor(() => expect(company).toBeEnabled());
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
     const requests = vi.mocked(api.readReportFacet).mock.calls.slice(calls);
     expect(requests).toHaveLength(2);
     expect(requests.every(([, , , options]) => options?.cursor === undefined)).toBe(true);
+  });
+
+  it.each(["read_failed", "invalid_cursor"] as const)("returns keyboard focus to the company filter after a %s retry", async code => {
+    render(<Filters selection={selectionId} />);
+    const { user, controls } = await openFilters();
+    const company = controls.getByRole("combobox", { name: "Company" });
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    vi.mocked(api.readReportFacet).mockRejectedValueOnce(new ApiError(400, code, "Options unavailable."));
+    await user.selectOptions(company, "next-options");
+    const retry = await controls.findByRole("button", { name: "Retry options" });
+    const pending = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>();
+    vi.mocked(api.readReportFacet).mockReturnValueOnce(pending.promise);
+    retry.focus();
+    await user.keyboard("{Enter}");
+    expect(await controls.findByRole("status")).toHaveTextContent("Loading company options");
+    expect(controls.queryByRole("alert")).not.toBeInTheDocument();
+    const request = vi.mocked(api.readReportFacet).mock.lastCall?.[3];
+    expect(request?.cursor).toBe(code === "invalid_cursor" ? undefined : "facet-next");
+    expect(api.readReportFacet).toHaveBeenCalledTimes(4);
+    await act(async () => pending.resolve(facetPage(null)));
+    await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
+    expect(company).toHaveFocus();
+    expect(api.readReportFacet).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -161,16 +232,16 @@ describe("shared report facet pagination", () => {
   it("restarts noncompact creator options after clearing a search without changing the selected filter", async () => {
     render(facet("official-usage/aggregate", "creatorType"));
     const select = screen.getByRole("combobox");
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(screen.getByRole("button", { name: "Next creator type options" }));
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/aggregate", selectionId, "creatorType",
       expect.objectContaining({ cursor: "facet-next" }));
     const search = screen.getByRole("searchbox");
     fireEvent.change(search, { target: { value: "Contoso" } });
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     fireEvent.change(search, { target: { value: "" } });
-    await waitFor(() => expect(select).toBeEnabled());
+    await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("official-usage/aggregate", selectionId, "creatorType",
       expect.objectContaining({ search: "", cursor: undefined }));
     expect(onChange).not.toHaveBeenCalled();
@@ -180,14 +251,46 @@ describe("shared report facet pagination", () => {
     ["official-usage/users", "company"], ["copilot-usage/users", "department"],
   ] as const)("does not send a previous facet cursor to %s/%s", async (path, field) => {
     const view = render(facet());
-    await waitFor(() => expect(screen.getByRole("combobox")).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(screen.getByRole("button", { name: "Next company options" }));
-    await waitFor(() => expect(screen.getByRole("combobox")).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith("copilot-usage/users", selectionId, "company",
       expect.objectContaining({ cursor: "facet-next" }));
     view.rerender(facet(path, field));
-    await waitFor(() => expect(screen.getByRole("combobox")).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false"));
     expect(api.readReportFacet).toHaveBeenLastCalledWith(path, selectionId, field,
       expect.objectContaining({ cursor: undefined }));
   });
+
+  it.each(["success", "failure", "focus moved", "owner changed"] as const)(
+    "restores only the current keyboard retry's focus after %s", async outcome => {
+      vi.mocked(api.readReportFacet).mockRejectedValueOnce(new Error("Options unavailable."));
+      const view = render(facet());
+      const user = userEvent.setup();
+      const retry = await screen.findByRole("button", { name: "Retry options" });
+      const pending = deferred<Awaited<ReturnType<typeof api.readReportFacet>>>();
+      vi.mocked(api.readReportFacet).mockReturnValueOnce(pending.promise);
+      retry.focus();
+      await user.keyboard("{Enter}");
+      expect(await screen.findByRole("status")).toHaveTextContent("Loading company options");
+      const signal = vi.mocked(api.readReportFacet).mock.lastCall?.[3]?.signal;
+      if (outcome === "focus moved") screen.getByRole("searchbox").focus();
+      if (outcome === "owner changed") view.rerender(facet("official-usage/users"));
+      await act(async () => outcome === "failure"
+        ? pending.reject(new Error("Retry unavailable.")) : pending.resolve(facetPage(null)));
+      if (outcome === "failure") {
+        expect(await screen.findByRole("alert")).toHaveTextContent("Retry unavailable.");
+        expect(screen.getByRole("button", { name: "Retry options" })).toHaveFocus();
+      } else {
+        await waitFor(() => expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false"));
+        if (outcome === "success") expect(screen.getByRole("combobox")).toHaveFocus();
+        else if (outcome === "focus moved") expect(screen.getByRole("searchbox")).toHaveFocus();
+        else {
+          expect(signal?.aborted).toBe(true);
+          expect(screen.getByRole("combobox")).not.toHaveFocus();
+        }
+      }
+      expect(api.readReportFacet).toHaveBeenCalledTimes(outcome === "owner changed" ? 3 : 2);
+    },
+  );
 });

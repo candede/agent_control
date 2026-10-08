@@ -44,6 +44,31 @@ test("the compact agent toolbar retains nonoverlapping query and column controls
     .toContain(".agent-grid-tools: Filters intersects div.agent-column-picker");
 });
 
+test("dynamic recovery diagnostics cannot overlap retry or hide clipped failure text", async ({ page }) => {
+  await renderLayout(page, `<div class="error-banner" role="alert" style="display:flex;gap:8px;position:relative">
+    <span aria-label="Failure detail">Saved inventory unavailable</span><button aria-label="Retry">Retry</button></div>`);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.getByRole("button", { name: "Retry" }).evaluate(element => {
+    element.style.position = "absolute";
+    element.style.left = "0";
+  });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain(".error-banner: Failure detail intersects Retry");
+  await page.getByRole("button", { name: "Retry" }).evaluate(element => { element.style.position = "static"; });
+  await page.getByRole("alert").evaluate(element => {
+    element.style.height = "18px";
+    element.style.overflow = "hidden";
+    element.querySelector("span")!.textContent = "Long diagnostic detail ".repeat(40);
+  });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain("div.error-banner clips its diagnostic");
+  await page.getByRole("alert").evaluate(element => {
+    element.style.height = "auto";
+    element.style.overflow = "visible";
+  });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+});
+
 test("field checks inspect every visible match without including hidden copies", async ({ page }) => {
   await renderLayout(page, `
     <div class="fields"><label>First<input></label></div>

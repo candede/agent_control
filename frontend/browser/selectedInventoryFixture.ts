@@ -60,6 +60,8 @@ export function fulfillInventoryPage(route: Route, data: UnifiedAgentInventoryPa
   const capture = selected(route);
   for (const record of data.value) capture.records.set(record.id, structuredClone(record));
   return route.fulfill({ json: { ...data, selection: capture.selection,
+    freshness: { ...data.freshness, capturedRevision: capture.selection.revision },
+    usageContext: { ...data.usageContext, revision: capture.selection.id },
     inventoryScope: capture.query.inventoryScope ?? data.inventoryScope,
     page: { ...data.page, limit: Number(new URL(route.request().url()).searchParams.get("limit") ?? 50) } } });
 }

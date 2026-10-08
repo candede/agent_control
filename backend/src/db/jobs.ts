@@ -86,6 +86,7 @@ function jobMetadata(job: JobMetadataRow) {
     : job.action === "reassign" ? { action: job.action, reassignUserId: job.reassign_user_id }
       : { action: job.action, targetBlockedState: job.action === "block" };
   return { id: job.id, capabilityId: job.capability, tokenMode: job.token_mode, status: job.status,
+    ...(job.cancel_requested ? { cancelRequested: true as const } : {}),
     confirmationHash: job.confirmation_hash, confirmation: job.confirmation_summary, confirmedAt: job.confirmed_at?.toISOString() ?? null,
     ...action, ...counts, resultRevision: job.result_revision, currentAgentName: job.current_agent_name ?? undefined,
     createdAt: job.created_at.toISOString(), updatedAt: job.updated_at.toISOString(),

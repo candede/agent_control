@@ -1,14 +1,14 @@
 import type { ReactNode } from "react";
 import { RefreshCw } from "lucide-react";
-import type { InventorySnapshot, UnifiedAgentInventoryPage, UnifiedAgentPowerPlatformObservation } from "../api/client";
+import type { InventorySnapshot, UnifiedAgentInventoryPage, UnifiedAgentInventoryUnavailable, UnifiedAgentPowerPlatformObservation } from "../api/client";
 import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, powerPlatformInventoryCaveat, savedInventoryTime } from "../inventoryVerification";
 import "./savedInventoryVerification.css";
 
 type ReadState = { loading?: boolean; error?: string };
 
 export function SavedAgentInventoryVerification({
-  inventory, loading = false, error, onVerify,
-}: ReadState & { inventory?: UnifiedAgentInventoryPage; onVerify?: () => void }) {
+  inventory, unavailable, loading = false, error, onVerify,
+}: ReadState & { inventory?: UnifiedAgentInventoryPage; unavailable?: UnifiedAgentInventoryUnavailable; onVerify?: () => void }) {
   const receipt = inventory?.verification;
   const observation = inventory?.sources.powerPlatform.observation;
   const powerPlatform = observation && "roleScope" in observation ? observation : undefined;
@@ -27,6 +27,7 @@ export function SavedAgentInventoryVerification({
     <p>Saved inventory is checked automatically. No manual verification or administrator approval is required after sync.</p>
     {loading ? <p role="status">Checking saved inventory. Any previous receipt is not the result of this check.</p>
       : error ? <p className="verification-attention" role="alert">Saved inventory verification failed. The previous receipt has not been reverified. {error}</p>
+        : unavailable ? <p role="status">{unavailable.message}</p>
         : !receipt || !inventory ? <p role="status">Saved inventory verification is not available. Read the saved inventory to obtain a receipt.</p>
           : <>
             <p className={needsAttention ? "verification-attention" : "verification-success"} role="status">

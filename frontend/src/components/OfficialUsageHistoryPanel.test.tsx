@@ -2,10 +2,11 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
-import type { ReportHistorySet, ReportPage } from "../../../backend/src/types/officialReportData";
+import type { ReportHistorySet, ReportObservation, ReportPage } from "../../../backend/src/types/officialReportData";
 import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { historySet, reportPage, selectionId } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 
 type HistoryPage = ReportPage<ReportHistorySet>;
 
@@ -28,6 +29,29 @@ beforeEach(() => {
 });
 
 describe("saved report history", () => {
+  it("keeps paging focused through failure and retry without presenting the old page as current", async () => {
+    const pending = deferred<HistoryPage>(), retry = deferred<HistoryPage>();
+    api.history.mockResolvedValueOnce(history(0, 51)).mockReturnValueOnce(pending.promise).mockReturnValueOnce(retry.promise);
+    render(<OfficialUsageHistoryPanel revision={0} />);
+    await screen.findByRole("table");
+    const next = screen.getByRole("button", { name: "Next report sets" });
+    next.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    await act(async () => pending.reject(new Error("Page unavailable.")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Page unavailable.");
+    expect(next).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    expect(next).toHaveFocus();
+    await act(async () => retry.resolve(history(50, 51)));
+    await screen.findByText("51 matching report sets; 1 on this page");
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(api.history).toHaveBeenCalledTimes(3);
+  });
+
   it("shows concise report rows without technical payloads, an extra current-report action, or routine refresh", async () => {
     render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
     await screen.findByRole("table");
@@ -48,6 +72,58 @@ describe("saved report history", () => {
     </SavedQueryProvider>);
     expect(await screen.findAllByRole("table")).toHaveLength(2);
     expect(api.history).toHaveBeenCalledOnce();
+  });
+
+  it("keeps retained history keyboard-scrollable and announces revalidation while row actions are disabled", async () => {
+    const pending = deferred<HistoryPage>();
+    api.history.mockResolvedValueOnce(history()).mockReturnValueOnce(pending.promise);
+    render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
+    const table = await screen.findByRole("region", { name: "Saved report history" });
+    expect(table).toHaveAttribute("tabindex", "0");
+    table.focus();
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(table).toHaveAttribute("aria-busy", "true"));
+    expect(screen.getByRole("region", { name: "Saved report history" })).toBe(table);
+    expect(table).toHaveFocus();
+    for (const button of within(table).getAllByRole("button")) expect(button).toBeDisabled();
+    await act(async () => pending.resolve(history()));
+    await waitFor(() => expect(table).toHaveAttribute("aria-busy", "false"));
+    expect(table).toHaveFocus();
+    expect(api.history).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])("withdraws idle peer history when observations invalidate an already-retired=%s capture", async retired => {
+    const observations = deferred<ReportPage<ReportObservation>>();
+    api.history.mockImplementation(async path => path.endsWith("/observations") ? observations.promise : history());
+    render(<SavedQueryProvider>
+      <section aria-label="Observing reader"><OfficialUsageHistoryPanel revision={0} /></section>
+      <section aria-label="Pinned reader"><OfficialUsageHistoryPanel revision={0} /></section>
+      <section aria-label="Restarting reader"><OfficialUsageHistoryPanel revision={0} /></section>
+    </SavedQueryProvider>);
+    expect(await screen.findAllByRole("table")).toHaveLength(3);
+    const observing = within(screen.getByRole("region", { name: "Observing reader" }));
+    const pinned = within(screen.getByRole("region", { name: "Pinned reader" }));
+    const restarting = within(screen.getByRole("region", { name: "Restarting reader" }));
+    fireEvent.click(observing.getAllByRole("button", { name: "Report observations" })[0]);
+    await waitFor(() => expect(api.history).toHaveBeenCalledTimes(2));
+    if (retired) {
+      const replacement = history();
+      replacement.selection = { ...replacement.selection, id: "replacement-selection" };
+      api.history.mockResolvedValueOnce(replacement);
+      fireEvent.click(restarting.getByRole("button", { name: "Load current report history" }));
+      await restarting.findByRole("table");
+    }
+    await act(async () => observations.reject(new ApiError(409, "selection_invalidated", "History changed.")));
+    await observing.findByRole("alert");
+    await waitFor(() => expect(pinned.queryByRole("table")).not.toBeInTheDocument());
+    expect(pinned.getByRole("button", { name: "Restart selection" })).toBeEnabled();
+    expect(pinned.queryByRole("button", { name: "View report" })).not.toBeInTheDocument();
+    expect(observing.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
+    if (retired) {
+      expect(restarting.getByRole("table")).toBeVisible();
+      expect(restarting.queryByRole("alert")).not.toBeInTheDocument();
+    } else expect(restarting.queryByRole("table")).not.toBeInTheDocument();
+    expect(api.history).toHaveBeenCalledTimes(retired ? 3 : 2);
   });
 
   it("cancels abandoned StrictMode reads without applying their late results", async () => {
@@ -137,8 +213,9 @@ describe("saved report history", () => {
     let finish!: (value: HistoryPage) => void;
     api.history.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     view.rerender(<OfficialUsageHistoryPanel revision={1} onSelect={vi.fn()} admin={admin} />);
-    expect(screen.getByRole("status")).toHaveTextContent("Loading saved data");
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading saved data...")).toHaveAttribute("role", "status");
+    expect(screen.queryByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })).not.toBeInTheDocument();
+    for (const button of screen.getAllByRole("button")) expect(button).toHaveAttribute("aria-disabled", "true");
     await act(async () => finish(history()));
     await waitFor(() => {
       for (const button of screen.getAllByRole("button", { name: /View report|Report observations|Delete report set|Load current report history/ })) expect(button).toBeEnabled();

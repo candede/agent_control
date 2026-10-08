@@ -220,5 +220,6 @@ export function canonicalRecord(id: string, record: UnifiedAgentRecord): Invento
     availability: agentUserAvailability(record), management: agentManagement(record),
     identity_expires_at: identityExpirations.length ? new Date(Math.min(...identityExpirations)).toISOString() : null,
     sort_key: record.displayName.normalize("NFKC").toLowerCase(), resource_type: null, publisher: null, modified_at: null,
-    residual: { identity: { reason: record.identity.reason } }, facts };
+    residual: { identity: { reason: record.identity.reason,
+      ...(record.identity.invalidMetadata ? { invalidMetadata: true } : {}) } }, facts };
 }

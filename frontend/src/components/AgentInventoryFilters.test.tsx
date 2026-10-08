@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentInventoryFilters, type AgentFilterValues } from "./AgentInventoryFilters";
 import { getInventoryFacets } from "../api/client";
 import { encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets";
+import { agentRouteSearch, parseAgentRoute } from "../workbenchRouting";
 
 vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(), getInventoryFacets: vi.fn() }));
 
@@ -29,7 +30,7 @@ const options = {
   environments: [{ value: "environment-a", label: "Finance" }],
 };
 beforeEach(() => {
-  vi.mocked(getInventoryFacets).mockImplementation(async (_selection, field) => {
+  vi.mocked(getInventoryFacets).mockReset().mockImplementation(async (_selection, field) => {
     const fields: Partial<Record<Parameters<typeof getInventoryFacets>[1], keyof typeof options>> = {
       type: "types", platform: "platforms", availableTo: "availability", host: "hosts", publisher: "publishers", environmentId: "environments",
     };
@@ -176,6 +177,142 @@ describe("inventory filter toolbar", () => {
     expect(screen.getByRole("button", { name: "Filters" })).toBeVisible();
   });
 
+  it("invalidates selected environment labels with the inventory selection and ignores cancelled responses", async () => {
+    const requests: { signal?: AbortSignal; resolve: (page: Awaited<ReturnType<typeof getInventoryFacets>>) => void }[] = [];
+    vi.mocked(getInventoryFacets).mockImplementation(async (_selection, _field, query, request) => {
+      if (!query?.selected) return { value: [], total: 0, nextCursor: null };
+      return new Promise(resolve => requests.push({ signal: request?.signal, resolve }));
+    });
+    const props = {
+      values: { ...defaults, environmentId: "environment-a" }, options: { ...options, environments: [] },
+      loading: false, onChange: vi.fn(), onClear: vi.fn(), onError: vi.fn(),
+    };
+    const { rerender } = render(<AgentInventoryFilters {...props} selectionId="selection-a" readOwnerKey="owner-a" />);
+    const chip = () => screen.getByRole("button", { name: "Remove environment filter" });
+    const result = (label: string) => ({ value: [{ value: "environment-a", label }], total: 1, nextCursor: null });
+    await act(async () => { requests[0].resolve(result("Old name")); });
+    expect(chip()).toHaveTextContent("Old name");
+    rerender(<AgentInventoryFilters {...props} loading selectionId="selection-a" readOwnerKey="owner-a" />);
+    expect(requests).toHaveLength(1);
+    expect(chip()).toHaveTextContent("Old name");
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-b" readOwnerKey="owner-a" />);
+    expect(chip()).toHaveTextContent("environment-a");
+    expect(chip()).not.toHaveTextContent("Old name");
+    await act(async () => { requests[1].resolve({ value: [], total: 0, nextCursor: null }); });
+    expect(chip()).toHaveTextContent("environment-a");
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-c" readOwnerKey="owner-a" />);
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-d" readOwnerKey="owner-b" />);
+    expect(requests[2].signal?.aborted).toBe(true);
+    await act(async () => { requests[3].resolve(result("Current name")); });
+    await act(async () => { requests[2].resolve(result("Cancelled name")); });
+    expect(chip()).toHaveTextContent("Current name");
+    expect(chip()).not.toHaveTextContent("Cancelled name");
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-d" readOwnerKey="owner-c" />);
+    expect(chip()).toHaveTextContent("environment-a");
+    expect(chip()).not.toHaveTextContent("Current name");
+    expect(requests).toHaveLength(5);
+    await act(async () => { requests[4].resolve(result("Other account name")); });
+    expect(chip()).toHaveTextContent("Other account name");
+    rerender(<AgentInventoryFilters {...props} readOwnerKey="owner-c" />);
+    expect(chip()).toHaveTextContent("environment-a");
+    expect(chip()).not.toHaveTextContent("Other account name");
+    expect(props.onError).not.toHaveBeenCalled();
+  });
+
+  it("resolves a bookmarked environment label using the server's case-insensitive identity", async () => {
+    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: "ENVIRONMENT-A" }}
+      options={{ ...options, environments: [] }} loading={false} onChange={vi.fn()} onClear={vi.fn()} onError={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("Finance"));
+  });
+
+  it("does not revive a retired environment label while a revisited selection is revalidated", async () => {
+    const props = {
+      selectionId: "selection-a", readOwnerKey: "owner-a", values: { ...defaults, environmentId: "environment-a" },
+      options: { ...options, environments: [] }, loading: false, onChange: vi.fn(), onClear: vi.fn(), onError: vi.fn(),
+    };
+    const { rerender } = render(<AgentInventoryFilters {...props} />);
+    const chip = screen.getByRole("button", { name: "Remove environment filter" });
+    await waitFor(() => expect(chip).toHaveTextContent("Finance"));
+    vi.mocked(getInventoryFacets).mockImplementation(() => new Promise(() => {}));
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-b" />);
+    rerender(<AgentInventoryFilters {...props} />);
+    expect(chip).toHaveTextContent("environment-a");
+    expect(chip).not.toHaveTextContent("Finance");
+  });
+
+  it("reads the selected environment label once per saved selection, not once per pending filter edit", async () => {
+    let resolve!: (page: Awaited<ReturnType<typeof getInventoryFacets>>) => void;
+    vi.mocked(getInventoryFacets).mockImplementation(async (_selection, _field, query) => query?.selected
+      ? new Promise(done => { resolve = done; }) : { value: [], total: 0, nextCursor: null });
+    const props = {
+      selectionId: "selection-a", readOwnerKey: "owner-a", values: { ...defaults, environmentId: "environment-a" },
+      options: { ...options, environments: [] }, loading: false, onChange: vi.fn(), onClear: vi.fn(), onError: vi.fn(),
+    };
+    const { rerender, unmount } = render(<AgentInventoryFilters {...props} />);
+    const selectedReads = () => vi.mocked(getInventoryFacets).mock.calls.filter(([, , query]) => query?.selected);
+    expect(selectedReads()).toHaveLength(1);
+    const signal = selectedReads()[0][3]!.signal!;
+    rerender(<AgentInventoryFilters {...props} loading values={{ ...props.values, environmentId: "environment-b" }} />);
+    expect(selectedReads()).toHaveLength(1);
+    expect(signal.aborted).toBe(false);
+    await act(async () => { resolve({ value: [{ value: "environment-a", label: "Finance" }], total: 1, nextCursor: null }); });
+    const chip = screen.getByRole("button", { name: "Remove environment filter" });
+    expect(chip).toHaveTextContent("environment-b");
+    expect(chip).not.toHaveTextContent("Finance");
+    rerender(<AgentInventoryFilters {...props} selectionId="selection-b" values={{ ...props.values, environmentId: "environment-b" }} />);
+    expect(selectedReads()).toHaveLength(2);
+    expect(signal.aborted).toBe(true);
+    await act(async () => { resolve({ value: [{ value: "environment-b", label: "Engineering" }], total: 1, nextCursor: null }); });
+    expect(chip).toHaveTextContent("Engineering");
+    unmount();
+    expect(selectedReads()[1][3]!.signal!.aborted).toBe(true);
+  });
+
+  it("keeps a newly chosen environment label when the captured selection's label arrives after dismissal", async () => {
+    let resolve!: (page: Awaited<ReturnType<typeof getInventoryFacets>>) => void;
+    vi.mocked(getInventoryFacets).mockImplementation(async (_selection, field, query) => {
+      if (query?.selected) return new Promise(done => { resolve = done; });
+      return field === "environmentId"
+        ? { value: [...options.environments, { value: "environment-b", label: "Engineering" }], total: 2, nextCursor: null }
+        : { value: [], total: 0, nextCursor: null };
+    });
+    const { user } = setup({ environmentId: "environment-a" });
+    await user.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Environment" }), encodeInventoryFacet("environment-b"));
+    await user.keyboard("{Escape}");
+    const chip = screen.getByRole("button", { name: "Remove environment filter" });
+    expect(chip).toHaveTextContent("Engineering");
+    await act(async () => { resolve({ value: options.environments, total: 1, nextCursor: null }); });
+    expect(chip).toHaveTextContent("Engineering");
+    expect(vi.mocked(getInventoryFacets).mock.calls.filter(([, , query]) => query?.selected)).toHaveLength(1);
+  });
+
+  it.each(["0", "-1", "1.5", "3651"])("rejects creation age %s rather than silently broadening or rounding the filter", async value => {
+    const { user, changed, error } = setup({ createdWithinDays: "30" });
+    await user.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    const input = screen.getByRole("spinbutton", { name: "Created within days" });
+    fireEvent.change(input, { target: { value } });
+    expect(error).toHaveBeenLastCalledWith("Enter a whole number of days from 1 to 3650.");
+    expect(changed).not.toHaveBeenCalled();
+    expect(input).toHaveValue(30);
+    expect(screen.getByRole("button", { name: "Remove created within filter" })).toHaveTextContent("30 days");
+    fireEvent.change(input, { target: { value: "3650" } });
+    expect(changed).toHaveBeenLastCalledWith({ createdWithinDays: "3650" });
+    fireEvent.change(input, { target: { value: "" } });
+    expect(changed).toHaveBeenLastCalledWith({ createdWithinDays: "" });
+  });
+
+  it.each(["3e1", "30.0", "030"])("normalizes the whole-day input %s for a stable bookmarked filter", async value => {
+    const { user, changed, error } = setup();
+    await user.click(screen.getByRole("button", { name: "Filters" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Created within days" }), { target: { value } });
+    expect(error).not.toHaveBeenCalled();
+    expect(changed).toHaveBeenLastCalledWith({ createdWithinDays: "30" });
+    const route = { ...parseAgentRoute(""), ...changed.mock.calls.at(-1)![0] };
+    expect(parseAgentRoute(agentRouteSearch(route).toString()).createdWithinDays).toBe("30");
+    expect(screen.getByRole("button", { name: "Remove created within filter" })).toHaveTextContent("30 days");
+  });
+
   it("combines Graph types with independent evidence filters and removes each without changing the type", async () => {
     const { user, changed } = setup();
     await screen.findByRole("option", { name: "3rd party agents" });
@@ -208,6 +345,22 @@ describe("inventory filter toolbar", () => {
     await user.click(screen.getByRole("button", { name: "Reset filters" }));
     expect(screen.getByRole("combobox", { name: "Built with" })).toHaveFocus();
     expect(environment).toHaveValue("");
+  });
+
+  it("resets to the first enabled filter when the inventory selection is unavailable", async () => {
+    function Filters() {
+      const [values, setValues] = useState<AgentFilterValues>({ ...defaults, management: "organization_managed" });
+      return <AgentInventoryFilters values={values} options={options} loading={false}
+        onChange={patch => setValues(current => ({ ...current, ...patch }))}
+        onClear={() => setValues(defaults)} onError={vi.fn()} />;
+    }
+    render(<Filters />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    expect(screen.getByRole("combobox", { name: "Built with" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(screen.getByRole("combobox", { name: "End-user access" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Reset filters" })).toBeDisabled();
   });
 
   it("fits the anchored panel into the remaining viewport and repositions on scroll", async () => {

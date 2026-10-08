@@ -180,6 +180,7 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
   }
   for (const selector of [
     ".agent-grid-tools", ".filter-action-buttons", ".inventory-actions", ".inline-actions", ".purview-search-actions", ".hunting-search-actions",
+    ".error-banner",
     ".report-section-header", ".report-header-actions", ".report-window-control",
     ".permission-heading", ".permission-body", ".permission-issue-list", ".permission-issue-list > li",
     ".permission-actions", ".permission-log-setup > header", ".permission-setup-heading",
@@ -214,6 +215,13 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
   )).filter(visible)) {
     if (content.clientWidth && content.scrollWidth > content.clientWidth + tolerance) {
       failures.push(`${name(content)} clips its permission guidance`);
+    }
+  }
+  for (const diagnostic of Array.from(document.querySelectorAll(".error-banner, [role=alert]")).filter(visible)) {
+    const css = getComputedStyle(diagnostic);
+    if (diagnostic.clientWidth && diagnostic.scrollWidth > diagnostic.clientWidth + tolerance && !["auto", "scroll"].includes(css.overflowX)
+      || diagnostic.clientHeight && diagnostic.scrollHeight > diagnostic.clientHeight + tolerance && !["auto", "scroll"].includes(css.overflowY)) {
+      failures.push(`${name(diagnostic)} clips its diagnostic`);
     }
   }
   // Wide evidence tables may scroll locally; their containing surface must not escape the grid.

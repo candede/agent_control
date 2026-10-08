@@ -3,9 +3,9 @@
 .user-activity-controls { display: grid; gap: 8px; }
 .user-activity-controls .agent-query-bar { grid-template-columns: minmax(160px, 1fr) auto auto; }
 .user-activity-controls .agent-query-bar:has(> .report-export) { grid-template-columns: minmax(160px, 1fr) auto auto auto; }
-.user-activity-controls .report-export { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.user-activity-controls .report-export { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
 .user-activity-controls .report-export > button { white-space: nowrap; }
-.user-activity-controls .report-export:has(p) { grid-column: 1 / -1; }
+.user-activity-controls .report-export:has(> button + button, > p) { grid-column: 1 / -1; }
 .user-activity-controls .agent-filter-fields input,
 .user-activity-controls .agent-filter-fields select { width: 100%; min-width: 0; }
 .reported-users-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
@@ -34,6 +34,7 @@
 .reported-agent-table td { overflow-wrap: anywhere; }
 .reported-agent-button { background: none; padding: 0; border: 0; color: var(--ink); text-decoration: underline; text-align: left; overflow-wrap: anywhere; }
 button.reported-agent-button:hover { background: #f5f2e9; color: var(--ink); }
+.reported-agent-button[aria-disabled="true"] { cursor: not-allowed; opacity: 0.58; }
 
 @media (max-width: 760px) {
   .user-activity-controls .agent-query-bar,
@@ -42,5 +43,5 @@ button.reported-agent-button:hover { background: #f5f2e9; color: var(--ink); }
   .user-activity-controls .agent-query-summary { grid-column: 1 / -1; grid-row: 2; }
   .user-activity-controls .agent-filter-picker { grid-column: 1; grid-row: 3; }
   .user-activity-controls .agent-query-bar > .report-export { grid-column: 2; grid-row: 3; }
-  .user-activity-controls .agent-query-bar > .report-export:has(p) { grid-column: 1 / -1; grid-row: 4; }
+  .user-activity-controls .agent-query-bar > .report-export:has(> button + button, > p) { grid-column: 1 / -1; grid-row: 4; }
 }

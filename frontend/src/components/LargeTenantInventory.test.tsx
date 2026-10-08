@@ -16,6 +16,10 @@ import { encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets
 import { AgentInventoryQueries } from "../agentInventoryQueries";
 import { UnifiedAgentTable } from "./UnifiedAgentTable";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "../test/inventoryVerification";
+import { deferred } from "../test/deferred";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createSavedQueryClient } from "../savedQueries";
+import { SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
 
 vi.mock("../api/reportData", () => ({
   createReportExport: vi.fn(), reportExportStatus: vi.fn(), cancelReportExport: vi.fn(),
@@ -139,7 +143,8 @@ describe("large inventory outcome consumers", () => {
       bytes: 600100, expiresAt: new Date(Date.now() + 600000).toISOString(), error: null, limit: null, observed: null });
     render(<ReportExportButton kind="unified_agents" selectionId="pinned-large-selection" label="Prepare inventory CSV" autoStart />);
     await act(async () => { await Promise.resolve(); });
-    expect(createReportExport).toHaveBeenCalledWith({ kind: "unified_agents", selectionId: "pinned-large-selection", ids: undefined }, expect.any(AbortSignal));
+    expect(createReportExport).toHaveBeenCalledWith({ kind: "unified_agents", selectionId: "pinned-large-selection", ids: undefined,
+      idempotencyKey: expect.any(String) }, expect.any(AbortSignal));
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(screen.getByRole("status")).toHaveTextContent("6,001 rows");
     const link = screen.getByRole("link", { name: "Download CSV" });
@@ -202,11 +207,13 @@ describe("large inventory outcome consumers", () => {
     expect(await screen.findByText("selected target")).toBeVisible();
     expect(screen.getByText("Refresh targets (5,000)")).toBeVisible();
     expect(getPackageRefreshTargets).toHaveBeenCalledTimes(1);
-    const signal = vi.mocked(getPackageRefreshTargets).mock.calls[0][1]!.signal!;
+    const pending = deferred<Awaited<ReturnType<typeof getPackageRefreshTargets>>>();
+    vi.mocked(getPackageRefreshTargets).mockReturnValueOnce(pending.promise);
     await userEvent.click(screen.getByRole("button", { name: "Next targets" }));
-    expect(signal.aborted).toBe(true);
+    const signal = vi.mocked(getPackageRefreshTargets).mock.calls[1][1]!.signal!;
     expect(getPackageRefreshTargets).toHaveBeenLastCalledWith(expect.objectContaining({ resultRevision: "1" }), expect.objectContaining({ cursor: "next-targets" }));
     view.rerender(<InventoryRefreshTargets job={{ ...refresh, resultRevision: "2" }} owner="principal" />);
+    expect(signal.aborted).toBe(true);
     await waitFor(() => expect(getPackageRefreshTargets).toHaveBeenLastCalledWith(expect.objectContaining({ resultRevision: "2" }), expect.objectContaining({ cursor: undefined })));
   });
 
@@ -220,6 +227,129 @@ describe("large inventory outcome consumers", () => {
     expect(await screen.findByText("second")).toBeVisible();
     expect(screen.queryByText("first")).not.toBeInTheDocument();
     expect(getBulkActionJobItems).toHaveBeenLastCalledWith("job", { revision: "10", cursor: "next" }, expect.anything());
+  });
+
+  describe("large saved configuration pages", () => {
+    const props = { selectionId: "configuration-selection", recordId: "agent:configuration",
+      source: { scopeId: "source-scope", identity: "native-agent" } };
+    type ChildPage = Awaited<ReturnType<typeof getInventoryChildren>>;
+    function configurationPage(kind: string, label = "First"): ChildPage {
+      return { value: [{ ordinal: 0, kind, value: kind === "detail:channels" ? `${label} channel` : "0",
+        payload: kind === "detail:connectors" ? { connectorId: `${label} connector`, operations: [] }
+          : kind === "connectorOperation" ? { operationId: `${label} operation` } : {} }],
+      total: 9000, nextCursor: "next-configuration" };
+    }
+    it.each(["connectors", "channels", "operations"] as const)(
+      "keeps %s paging focused while loading and can leave a rejected cursor without draining details", async section => {
+        const kind = section === "operations" ? "connectorOperation" : `detail:${section}`;
+        const read = vi.mocked(getInventoryChildren).mockReset().mockImplementation(async (_s, _r, _m, requestedKind) => configurationPage(requestedKind));
+        render(section === "channels" ? <SavedAgentChannels {...props} /> : <SavedAgentConnectors {...props} />);
+        const label = section === "operations" ? "First operation" : section === "channels" ? "First channel" : "First connector";
+        await screen.findByText(label);
+        if (section !== "channels") await screen.findByText("First operation");
+        expect(screen.getByText(`1 shown of 9,000 saved ${section}`)).toBeVisible();
+        const initialCalls = read.mock.calls.length;
+        expect(initialCalls).toBe(section === "channels" ? 1 : 2);
+        const pending = deferred<ChildPage>();
+        read.mockImplementationOnce(() => pending.promise);
+        const next = screen.getByRole("button", { name: `Next ${section}` });
+        next.focus();
+        fireEvent.click(next);
+        expect(next).toBeInTheDocument();
+        expect(next).toHaveFocus();
+        expect(next).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(next);
+        expect(read).toHaveBeenCalledTimes(initialCalls + 1);
+        expect(read).toHaveBeenLastCalledWith(props.selectionId, props.recordId,
+          { source_scope_id: props.source.scopeId, source_identity: props.source.identity },
+          kind, "next-configuration", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+        expect(screen.queryByText(label)).not.toBeInTheDocument();
+        expect(screen.queryByText(`1 shown of 9,000 saved ${section}`)).not.toBeInTheDocument();
+        await act(async () => pending.reject(new ApiError(400, "invalid_cursor", "Saved detail cursor rejected.")));
+        expect(await screen.findByRole("alert")).toHaveTextContent("Saved detail cursor rejected.");
+        expect(next).toHaveFocus();
+        const previous = screen.getByRole("button", { name: `Previous ${section}` });
+        expect(previous).toHaveAttribute("aria-disabled", "false");
+        previous.focus();
+        fireEvent.click(previous);
+        expect(await screen.findByText(label)).toBeVisible();
+        expect(previous).toHaveFocus();
+        expect(previous).toHaveAttribute("aria-disabled", "true");
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(read.mock.calls.filter(call => call[3] === kind).map(call => call[4]))
+          .toEqual([undefined, "next-configuration", undefined]);
+      },
+    );
+    it.each(["page", "invalidation"] as const)("withdraws revalidating connectors, cancels pending operations and ignores a late child %s", async outcome => {
+      const queries = createSavedQueryClient();
+      const oldOperations = deferred<ChildPage>(), replacement = deferred<ChildPage>();
+      const invalidated = vi.fn();
+      const read = vi.mocked(getInventoryChildren).mockReset().mockImplementation(async (_s, _r, _m, kind) => configurationPage(kind));
+      read.mockImplementationOnce(async () => configurationPage("detail:connectors"))
+        .mockReturnValueOnce(oldOperations.promise);
+      const view = render(<QueryClientProvider client={queries}><SavedAgentConnectors {...props} onInvalidated={invalidated} /></QueryClientProvider>);
+      try {
+        await screen.findByText("First connector");
+        await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+        const oldSignal = read.mock.calls[1][5]!.signal!;
+        read.mockReturnValueOnce(replacement.promise);
+        act(() => { void queries.invalidateQueries({ predicate: query => query.queryKey[6] === "detail:connectors" }); });
+        await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+        expect(screen.queryByText("First connector")).not.toBeInTheDocument();
+        expect(oldSignal.aborted).toBe(true);
+        await act(async () => {
+          if (outcome === "page") oldOperations.resolve(configurationPage("connectorOperation", "Retired"));
+          else oldOperations.reject(new ApiError(409, "selection_invalidated", "Retired operation selection."));
+        });
+        expect(screen.queryByText("Retired operation")).not.toBeInTheDocument();
+        expect(invalidated).not.toHaveBeenCalled();
+        await act(async () => replacement.reject(new Error("Saved configuration unavailable.")));
+        expect(await screen.findByRole("alert")).toHaveTextContent("Saved configuration unavailable.");
+        const retry = deferred<ChildPage>();
+        read.mockReturnValueOnce(retry.promise);
+        const retryButton = screen.getByRole("button", { name: "Retry configuration" });
+        act(() => { retryButton.click(); retryButton.click(); });
+        await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+        expect(screen.getByRole("status")).toHaveTextContent("Loading saved configuration");
+        expect(read).toHaveBeenCalledTimes(4);
+        await act(async () => retry.resolve(configurationPage("detail:connectors", "Current")));
+        expect(await screen.findByText("Current connector")).toBeVisible();
+        expect(await screen.findByText("First operation")).toBeVisible();
+        expect(read).toHaveBeenCalledTimes(5);
+        expect(screen.queryByText("Retired operation")).not.toBeInTheDocument();
+        expect(invalidated).not.toHaveBeenCalled();
+      } finally {
+        view.unmount();
+        queries.clear();
+      }
+    });
+    it("keeps configuration paging focused through revalidation but withdraws it when the selection is invalidated", async () => {
+      const queries = createSavedQueryClient(), invalidated = vi.fn();
+      const pending = deferred<ChildPage>();
+      const read = vi.mocked(getInventoryChildren).mockReset().mockResolvedValueOnce(configurationPage("detail:channels"))
+        .mockReturnValueOnce(pending.promise);
+      const view = render(<QueryClientProvider client={queries}><SavedAgentChannels {...props} onInvalidated={invalidated} /></QueryClientProvider>);
+      try {
+        await screen.findByText("First channel");
+        const next = screen.getByRole("button", { name: "Next channels" });
+        next.focus();
+        act(() => { void queries.invalidateQueries(); });
+        await waitFor(() => expect(next).toHaveAttribute("aria-disabled", "true"));
+        expect(next).toHaveFocus();
+        expect(screen.queryByText("First channel")).not.toBeInTheDocument();
+        fireEvent.click(next);
+        expect(read).toHaveBeenCalledTimes(2);
+        await act(async () => pending.reject(new ApiError(409, "selection_invalidated", "Selection retired.")));
+        expect(await screen.findByRole("alert")).toHaveTextContent("Reload saved inventory.");
+        expect(screen.queryByRole("button")).not.toBeInTheDocument();
+        expect(screen.queryByRole("status")).not.toBeInTheDocument();
+        expect(invalidated).toHaveBeenCalledOnce();
+        expect(read).toHaveBeenCalledTimes(2);
+      } finally {
+        view.unmount();
+        queries.clear();
+      }
+    });
   });
 
   describe("selected inventory child and facet consumers", () => {
@@ -254,6 +384,47 @@ describe("large inventory outcome consumers", () => {
       expect(screen.queryByRole("region", { name: "Source detail rows" })).not.toBeInTheDocument();
       expect(screen.queryByText("wide-element")).not.toBeInTheDocument();
       expect(getInventoryChildren).toHaveBeenCalledOnce();
+    });
+    it.each(["sections", "rows"] as const)("stops loading after a failed detail %s read and retries only explicitly", async phase => {
+      const read = phase === "sections" ? vi.mocked(getInventorySections) : vi.mocked(getInventoryChildren);
+      read.mockRejectedValueOnce(new Error("Saved details unavailable."));
+      render(<InventoryMembers selectionId="selected" recordId="agent:one" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Primary package" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Saved details unavailable.");
+      expect(screen.queryByText(/Loading detail/)).not.toBeInTheDocument();
+      expect(read).toHaveBeenCalledTimes(1);
+      if (phase === "sections") expect(getInventoryChildren).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: `Retry detail ${phase}` }));
+      expect(await screen.findByText("wide-element")).toBeVisible();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(read).toHaveBeenCalledTimes(2);
+    });
+    it("withdraws old sections and rows while paging, and ignores abandoned child responses", async () => {
+      vi.mocked(getInventorySections).mockResolvedValueOnce({
+        value: [{ kind: "element", total: 9000 }], nextCursor: "section-next",
+      });
+      render(<InventoryMembers selectionId="selected" recordId="agent:one" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Primary package" }));
+      await screen.findByText("wide-element");
+      let finishRows!: (page: Awaited<ReturnType<typeof getInventoryChildren>>) => void;
+      let finishSections!: (page: Awaited<ReturnType<typeof getInventorySections>>) => void;
+      vi.mocked(getInventoryChildren).mockReturnValueOnce(new Promise(resolve => { finishRows = resolve; }));
+      await userEvent.click(screen.getByRole("button", { name: "Next detail rows" }));
+      const rowsSignal = vi.mocked(getInventoryChildren).mock.calls.at(-1)?.[5]?.signal;
+      vi.mocked(getInventorySections).mockReturnValueOnce(new Promise(resolve => { finishSections = resolve; }));
+      await userEvent.click(screen.getByRole("button", { name: "More detail sections" }));
+      expect(rowsSignal?.aborted).toBe(true);
+      expect(screen.getByRole("combobox", { name: "Detail section" })).toBeDisabled();
+      expect(screen.queryByText("wide-element")).not.toBeInTheDocument();
+      expect(screen.getByText("Loading detail sections…")).toBeVisible();
+      await act(async () => finishRows({
+        value: [{ ordinal: 1, kind: "element", value: "retired-element", payload: {} }], total: 9000, nextCursor: null,
+      }));
+      expect(screen.queryByText("retired-element")).not.toBeInTheDocument();
+      expect(getInventoryChildren).toHaveBeenCalledTimes(2);
+      await act(async () => finishSections({ value: [{ kind: "owner", total: 2 }], nextCursor: null }));
+      await waitFor(() => expect(getInventoryChildren).toHaveBeenLastCalledWith("selected", "agent:one", member, "owner", undefined, expect.anything()));
+      expect(getInventoryChildren).toHaveBeenCalledTimes(3);
     });
     it("keeps 6000 members and 9000 detail rows server-counted without downloading unseen pages", async () => {
       render(<InventoryMembers selectionId="selected" recordId="agent:one" />);

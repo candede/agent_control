@@ -9,13 +9,14 @@ vi.mock("./api/client", async importOriginal => ({
   getUnifiedAgents: vi.fn(),
 }));
 
-function page(expiresAt = "2026-09-20T12:10:00.000Z"): UnifiedAgentInventoryPage {
+function page(expiresAt = "2026-09-20T12:10:00.000Z",
+  selection?: Partial<Omit<UnifiedAgentInventoryPage["selection"], "expiresAt">>): UnifiedAgentInventoryPage {
   const summary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
   return {
-    ...inventoryPageMetadata(undefined, expiresAt),
+    ...inventoryPageMetadata(undefined, expiresAt, selection),
     inventoryScope: "all", scopeSummary: summary,
     value: [], summary, filteredSummary: summary,
-    verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
+    verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
     partial: true, errors: [],
     sources: {
       graphPackages: {
@@ -59,6 +60,13 @@ function pageWithEnvironment(expiresAt: string): UnifiedAgentInventoryPage {
     },
   };
   return result;
+}
+
+function deferredPage() {
+  let resolve!: (value: UnifiedAgentInventoryPage) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<UnifiedAgentInventoryPage>((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 describe("AgentInventoryQueries", () => {
@@ -105,9 +113,216 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
+  it("shares concurrent reads without one caller cancelling the remaining reader", async () => {
+    const response = deferredPage();
+    read.mockReturnValueOnce(response.promise);
+    const controller = new AbortController();
+    const cancelled = expect(queries.read("owner", {}, controller.signal)).rejects.toMatchObject({
+      code: "request_aborted", kind: "aborted",
+    });
+    const current = expect(queries.read("owner", {}, signal())).resolves.toEqual(page());
+
+    controller.abort();
+    await cancelled;
+    expect(read).toHaveBeenCalledOnce();
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    response.resolve(page());
+    await current;
+    expect(queries.getCached("owner", {})).toEqual(page());
+  });
+
+  it("aborts a shared transport only after its last caller cancels and allows a new read", async () => {
+    read.mockImplementationOnce(() => new Promise(() => {}));
+    const first = new AbortController();
+    const second = new AbortController();
+    const cancelled = [first, second].map(controller =>
+      expect(queries.read("owner", {}, controller.signal)).rejects.toMatchObject({ code: "request_aborted" }));
+    first.abort();
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    second.abort();
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(page());
+    await Promise.all(cancelled);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["not_collected", "preparing"] as const)("shares a %s outcome with every concurrent reader without caching it", async state => {
+    const unavailable = { state, message: "Waiting for inventory." };
+    read.mockResolvedValueOnce(unavailable);
+    await expect(Promise.all([
+      queries.read("owner", {}, signal()),
+      queries.read("owner", {}, signal()),
+    ])).resolves.toEqual([unavailable, unavailable]);
+    expect(read).toHaveBeenCalledOnce();
+    expect(queries.getCached("owner", {})).toBeUndefined();
+    await expect(queries.read("owner", {}, signal())).resolves.toEqual(page());
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [401, "unauthorized"], [403, "forbidden"], [409, "selection_invalidated"], [409, "inventory_changed"],
+  ] as const)("shares a %s %s error with every concurrent reader", async (status, code) => {
+    read.mockRejectedValueOnce(new ApiError(status, code, "Saved inventory is no longer available."));
+    const denied = [0, 1].map(() =>
+      expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ status, code }));
+    await Promise.all(denied);
+    expect(read).toHaveBeenCalledOnce();
+    expect(queries.getCached("owner", {})).toBeUndefined();
+  });
+
+  it.each(["success", "access denial"] as const)("ignores a late shared %s after the principal changes", async outcome => {
+    const response = deferredPage();
+    const currentPage = page("2026-09-20T12:05:00.000Z", { id: "current-account-selection", revision: "2" });
+    read.mockReturnValueOnce(response.promise).mockResolvedValueOnce(currentPage);
+    const cancelled = [0, 1].map(() =>
+      expect(queries.read("old-owner", {}, signal())).rejects.toMatchObject({ code: "request_aborted" }));
+
+    await expect(queries.read("current-owner", {}, signal())).resolves.toEqual(currentPage);
+    await Promise.all(cancelled);
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    if (outcome === "success") response.resolve(page());
+    else response.reject(new ApiError(403, "forbidden", "Previous account denied."));
+    await Promise.resolve();
+    expect(queries.getCached("old-owner", {})).toBeUndefined();
+    expect(queries.getCached("current-owner", {})).toEqual(currentPage);
+    await expect(queries.read("current-owner", {}, signal())).resolves.toEqual(currentPage);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels every shared reader on selection invalidation without reviving it from a late response", async () => {
+    const response = deferredPage();
+    const pinned = { selectionId: page().selection.id };
+    read.mockReturnValueOnce(response.promise);
+    const cancelled = [0, 1].map(() =>
+      expect(queries.read("owner", pinned, signal())).rejects.toMatchObject({ code: "request_aborted" }));
+    queries.invalidateSelection(pinned.selectionId);
+    await Promise.all(cancelled);
+    expect(read.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    response.resolve(page());
+    await Promise.resolve();
+    expect(queries.getCached("owner", pinned)).toBeUndefined();
+    await expect(queries.read("owner", pinned, signal())).resolves.toEqual(page());
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an already-cancelled read change the cache owner", async () => {
+    await queries.read("current-owner", {}, signal());
+    const controller = new AbortController();
+    controller.abort();
+    await expect(queries.read("old-owner", {}, controller.signal)).rejects.toMatchObject({ code: "request_aborted" });
+    expect(queries.getCached("current-owner", {})).toEqual(page());
+    expect(read).toHaveBeenCalledOnce();
+  });
+
+  it("does not join an old pinned selection to an unfinished recapture", async () => {
+    const original = page();
+    const recaptured = page(undefined, { id: "recaptured-selection", revision: "2" });
+    const response = deferredPage();
+    read.mockResolvedValueOnce(original).mockReturnValueOnce(response.promise).mockResolvedValueOnce(original);
+    const pinned = { selectionId: original.selection.id };
+    await queries.read("owner", pinned, signal());
+    vi.advanceTimersByTime(30_001);
+
+    const superseded = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "request_aborted" });
+    await Promise.resolve();
+    const current = expect(queries.read("owner", pinned, signal())).resolves.toEqual(original);
+    response.resolve(recaptured);
+    await Promise.all([superseded, current]);
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(read.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    expect(queries.getCached("owner", pinned)).toEqual(original);
+    expect(queries.getCached("owner", { selectionId: recaptured.selection.id })).toBeUndefined();
+  });
+
+  it("does not evict a pending adjacent page when the current page is read again", async () => {
+    const first = { ...page(), page: { limit: 50, previousCursor: null, nextCursor: "next" } };
+    const next = { ...page(), page: { limit: 50, previousCursor: "back", nextCursor: null } };
+    const response = deferredPage();
+    read.mockResolvedValueOnce(first).mockReturnValueOnce(response.promise);
+    const pinned = { selectionId: first.selection.id };
+    await queries.read("owner", pinned, signal());
+
+    const pending = expect(queries.read("owner", { ...pinned, cursor: "next" }, signal())).resolves.toEqual(next);
+    await expect(queries.read("owner", pinned, signal())).resolves.toEqual(first);
+    expect(read.mock.calls[1][1]?.signal?.aborted).toBe(false);
+    response.resolve(next);
+    await pending;
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(queries.getCached("owner", pinned)).toEqual(first);
+    expect(queries.getCached("owner", { ...pinned, cursor: "next" })).toEqual(next);
+  });
+
+  it.each(["first", "next"] as const)("retains adjacent pages whose transports finish together, %s page first", async leading => {
+    const first = { ...page(), page: { limit: 50, previousCursor: null, nextCursor: "next" } };
+    const next = { ...page(), page: { limit: 50, previousCursor: "back", nextCursor: null } };
+    const firstResponse = deferredPage(), nextResponse = deferredPage();
+    read.mockReturnValueOnce(firstResponse.promise).mockReturnValueOnce(nextResponse.promise);
+    const pinned = { selectionId: first.selection.id };
+    const pending = Promise.all([
+      queries.read("owner", pinned, signal()),
+      queries.read("owner", { ...pinned, cursor: "next" }, signal()),
+    ]);
+    if (leading === "first") {
+      firstResponse.resolve(first);
+      nextResponse.resolve(next);
+    } else {
+      nextResponse.resolve(next);
+      firstResponse.resolve(first);
+    }
+    await expect(pending).resolves.toEqual([first, next]);
+
+    expect(queries.getCached("owner", pinned)).toEqual(first);
+    expect(queries.getCached("owner", { ...pinned, cursor: "next" })).toEqual(next);
+    await queries.read("owner", { ...pinned, cursor: "next" }, signal());
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds retained pages after several adjacent reads finish together", async () => {
+    const responses = Array.from({ length: 4 }, () => deferredPage());
+    const pages = responses.map((_, index) => ({
+      ...page(), page: { limit: 50, previousCursor: index ? `back-${index - 1}` : null, nextCursor: `next-${index + 1}` },
+    }));
+    const pinned = { selectionId: page().selection.id };
+    responses.forEach(response => read.mockReturnValueOnce(response.promise));
+    const pending = Promise.all(pages.map((_, index) =>
+      queries.read("owner", { ...pinned, ...(index ? { cursor: `next-${index}` } : {}) }, signal())));
+    responses.forEach((response, index) => response.resolve(pages[index]));
+    await expect(pending).resolves.toEqual(pages);
+
+    expect(queries.getCached("owner", pinned)).toBeUndefined();
+    expect(queries.getCached("owner", { ...pinned, cursor: "next-1" })).toBeUndefined();
+    for (const index of [2, 3]) {
+      expect(queries.getCached("owner", { ...pinned, cursor: `next-${index}` })).toEqual(pages[index]);
+    }
+    expect(read).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["clear", "selection", "principal", "replacement", "eviction"] as const)(
+    "cancels a finalized cache hit before caller delivery on %s invalidation", async invalidation => {
+      const pinned = { selectionId: page().selection.id };
+      await queries.read("owner", pinned, signal());
+      const pending = expect(queries.read("owner", pinned, signal())).rejects.toMatchObject({
+        code: "request_aborted", kind: "aborted",
+      });
+      await Promise.resolve();
+      if (invalidation === "clear") queries.clear();
+      else if (invalidation === "selection") queries.invalidateSelection(pinned.selectionId);
+      else if (invalidation === "principal") await queries.read("replacement-owner", pinned, signal());
+      else if (invalidation === "replacement") {
+        const replacement = { ...page(), selection: { ...page().selection, id: "replacement-selection" } };
+        read.mockResolvedValueOnce(replacement);
+        await queries.read("owner", { selectionId: replacement.selection.id }, signal());
+      } else {
+        await Promise.all(Array.from({ length: 4 }, (_, index) =>
+          queries.read("owner", { search: String(index) }, signal())));
+      }
+      await pending;
+    },
+  );
+
   it("does not return a recaptured selection under the old pinned request key", async () => {
     const original = page();
-    const refreshed = { ...page(), selection: { ...page().selection, id: "new-selection" } };
+    const refreshed = page(undefined, { id: "new-selection", revision: "2" });
     read.mockResolvedValueOnce(original).mockResolvedValueOnce(refreshed);
     const pinned = { selectionId: original.selection.id };
     await queries.read("owner", pinned, signal());
@@ -194,6 +409,26 @@ describe("AgentInventoryQueries", () => {
     expect(queries.getCached("owner", catalog)).toBeUndefined();
     expect(queries.getCached("other-owner", platform)).toBeUndefined();
     await queries.read("owner", catalog, signal());
+    expect(read).toHaveBeenCalledTimes(4);
+  });
+
+  it("invalidates only an export's selection and aborts its pending pages without discarding other families", async () => {
+    const original = page();
+    const replacement = { ...page(), selection: { ...page().selection, id: "replacement-selection" } };
+    read.mockResolvedValueOnce(original).mockResolvedValueOnce(replacement);
+    await queries.read("owner", {}, signal());
+    await queries.read("owner", { search: "current" }, signal());
+    read.mockImplementationOnce(() => new Promise(() => {}));
+    const pending = expect(queries.read("owner", { selectionId: original.selection.id, cursor: "next" }, signal()))
+      .rejects.toMatchObject({ code: "request_aborted" });
+    queries.invalidateSelection(original.selection.id);
+    await pending;
+    expect(read.mock.calls[2][1]?.signal?.aborted).toBe(true);
+    expect(queries.getCached("owner", {})).toBeUndefined();
+    expect(queries.getCached("owner", { search: "current" })).toBe(replacement);
+    expect(await queries.read("owner", { search: "current" }, signal())).toBe(replacement);
+    expect(read).toHaveBeenCalledTimes(3);
+    await queries.read("owner", {}, signal());
     expect(read).toHaveBeenCalledTimes(4);
   });
 
@@ -500,6 +735,7 @@ describe("AgentInventoryQueries", () => {
     vi.advanceTimersByTime(30_001);
     read.mockRejectedValueOnce(new ApiError(503, "database_unavailable", "Saved inventory is unavailable."));
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "database_unavailable" });
+    expect(queries.getCached("owner", {})).toBeUndefined();
     expect(read).toHaveBeenCalledTimes(2);
   });
 

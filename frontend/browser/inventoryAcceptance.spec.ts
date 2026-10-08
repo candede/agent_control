@@ -70,8 +70,8 @@ test("already-stale optional identity stays readable with stale diagnostics and 
   await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route, {
     ...unifiedAgents, value: [record],
     identityCollection: { checkedPackages: 0, pendingPackages: 1, pendingDetails: { missing: 0, stale: 1, invalidated: 0 } },
-    verification: { ...createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 },
-      { packageMetadata: false }, layoutTime), status: "details_pending" },
+    verification: createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 },
+      { packageMetadata: false }, layoutTime),
   }));
   await page.goto("/agents");
   await expect(page.getByRole("checkbox", { name: `Select ${record.displayName}` })).toBeVisible();

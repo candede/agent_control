@@ -20,6 +20,7 @@ export type WorkbenchViewDefinition = {
 };
 
 export type WorkbenchActionDefinition = {
+  /** Unique within a metadata response; consumers reject ambiguous IDs. */
   id: string;
   label: string;
   roles: AppRole[];

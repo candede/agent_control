@@ -422,7 +422,7 @@ test("paid users remain searchable beyond four thousand without exposing checked
   await page.getByRole("button", { name: "Next users", exact: true }).click();
   await expect(table.locator("tbody tr").first()).toContainText("Person0050");
   await expect(page.getByLabel("users pages")).toContainText("4,053 matching users; 50 on this page");
-  expect(evidence.reads.some(read => read.path === "/api/copilot-usage/users" && read.query.get("cursor") === "fixture:50")).toBe(true);
+  expect(evidence.reads.some(read => read.path === "/api/copilot-usage/users" && read.query.get("cursor")?.startsWith("paid:"))).toBe(true);
   const responsesHeading = table.getByRole("button", { name: "Agent responses", exact: true });
   await responsesHeading.click();
   await expect(page.getByRole("button", { name: "Previous users" })).toBeDisabled();

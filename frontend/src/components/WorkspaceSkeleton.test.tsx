@@ -6,11 +6,17 @@ describe("WorkspaceSkeleton", () => {
   it.each(["agents", "users", "audit"] as const)("shows a non-interactive %s layout with an accessible loading status", view => {
     const { container } = render(<WorkspaceSkeleton view={view} />);
     expect(screen.getByRole("region", { name: `Loading ${view}` })).toHaveAttribute("aria-busy", "true");
-    expect(screen.getByRole("status")).toHaveTextContent(`Loading ${view === "audit" ? "audit events" : view}...`);
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent(`Loading ${view === "audit" ? "audit events" : view}...`);
+    expect(status.closest('[aria-busy="true"], [aria-hidden="true"]')).toBeNull();
     expect(container.querySelectorAll(".workspace-skeleton-metric")).toHaveLength(4);
     expect(container.querySelectorAll(".workspace-skeleton-row")).toHaveLength(9);
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading")).not.toBeInTheDocument();
+    for (const placeholder of container.querySelectorAll(".skeleton-block")) {
+      expect(placeholder.closest('[aria-hidden="true"]')).not.toBeNull();
+    }
   });
 
   it("reuses the table placeholders without duplicating an existing header or non-paid user summary", () => {
@@ -19,5 +25,24 @@ describe("WorkspaceSkeleton", () => {
     expect(container.querySelector(".workspace-skeleton-summary")).toBeNull();
     expect(container.querySelector(".workspace-skeleton-context")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent("Loading users...");
+  });
+
+  it("updates the sole loading announcement and layout when the pending destination changes", () => {
+    const { container, rerender } = render(<WorkspaceSkeleton view="agents" />);
+    rerender(<WorkspaceSkeleton view="users" contentOnly showSummary={false} />);
+    expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading users...");
+    expect(screen.getByRole("status").closest('[aria-busy="true"]')).toBeNull();
+    expect(container.querySelector("header")).toBeNull();
+    expect(container.querySelector(".workspace-skeleton-summary")).toBeNull();
+    expect(container.querySelector(".workspace-skeleton-avatar")).toBeNull();
+
+    rerender(<WorkspaceSkeleton view="audit" />);
+    expect(screen.queryByRole("region", { name: "Loading users" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Loading audit" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading audit events...");
+    expect(container.querySelector(".workspace-skeleton-context")).toBeNull();
   });
 });

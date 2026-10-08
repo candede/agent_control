@@ -13,7 +13,7 @@ export type UserActivityFilterValues<Cohort extends string = NonNullable<ReportQ
 
 export function UserActivityFilters<Cohort extends string>({ values, path, selectionId, cohorts, defaultCohort,
   cohortLabel = "Agent responses", searchLabel = "Search reported users or agents", search, searchRef, sort, sorts, matchingCount,
-  loading, validThreshold, agent, onChange, onSearch, onSort, onClear, onClearAgent, onRestartSelection, exportButton }: {
+  loading, validThreshold, agent, onChange, onSearch, onSort, onClear, onClearAgent, onRestartSelection, onSelectionInvalidated, exportButton }: {
   values: UserActivityFilterValues<Cohort>;
   path: string;
   selectionId?: string;
@@ -35,6 +35,7 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
   onClear: () => void;
   onClearAgent?: () => void;
   onRestartSelection: () => void;
+  onSelectionInvalidated?: () => void;
   exportButton?: ReactNode;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
@@ -76,7 +77,8 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
       <FilterPopover label="Filter users" activeCount={chips.length} triggerRef={trigger}>
         <div className="agent-filter-fields">
           {fields.map(field => <ReportFacet key={field.key} compact path={path} selectionId={selectionId}
-            field={field.key} value={values[field.key]} onChange={value => onChange({ ...values, [field.key]: value })} onRestartSelection={onRestartSelection} />)}
+            field={field.key} value={values[field.key]} onChange={value => onChange({ ...values, [field.key]: value })} onRestartSelection={onRestartSelection}
+            onSelectionInvalidated={onSelectionInvalidated} />)}
           <label><span>{cohortLabel}</span><select value={values.cohort} className={values.cohort === defaultCohort ? undefined : "active-filter-select"}
             onChange={event => {
               const choice = cohorts.find(item => item.value === event.target.value);

@@ -13,6 +13,7 @@ import { OfficialReportHistory } from "./officialReportHistory.js";
 import { streamOfficialReport, officialReportLimits, type OfficialRow, type StreamedOfficialReport } from "../services/officialReportStream.js";
 import { reportBase } from "../services/officialReportFields.js";
 import type { OfficialUsageMetadata, OfficialUsageReportKind } from "../types/officialReportRecords.js";
+import type { OfficialReportBundleInspection } from "../types/officialReportApi.js";
 import { CursorCodec, type SelectionIdentity } from "../services/dataSelections.js";
 import { measurePublication } from "../services/peakMemory.js";
 import { completeReportVersionSql } from "./reportCapacitySchema.js";
@@ -302,7 +303,7 @@ export class OfficialReportImports {
     });
   }
 
-  async bundle(identity: SelectionIdentity, bundleId: string) {
+  async bundle(identity: SelectionIdentity, bundleId: string, options: OfficialReportBundleInspection = {}) {
     reportUuid(bundleId);
     return this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
@@ -315,7 +316,7 @@ export class OfficialReportImports {
           AND i.session_epoch=$4 AND s.expires_at>clock_timestamp() ORDER BY s.kind LIMIT 4`,
       [identity.tenantId, identity.principalId, bundleId, identity.sessionEpoch])).rows;
       if (rows.length > 3) throw unavailable();
-      compatible(rows);
+      if (options.forDiscard !== true) compatible(rows);
       const stages = rows.map(row => ({ stagingId: row.id as string, kind: row.kind as OfficialUsageReportKind,
         revision: row.revision as number, contentHash: row.content_hash as string, rowCount: row.row_count as number,
         reconciliation: row.reconciliation as Record<string, unknown> }));
@@ -709,10 +710,12 @@ export class OfficialReportImports {
         AND s.status='active' AND i.state='ready' AND i.session_epoch=$4 FOR UPDATE OF s,i`,
       [stagingId, identity.tenantId, identity.principalId, identity.sessionEpoch])).rows[0];
       if (!row) throw unavailable();
+      await client.query("UPDATE official_usage_ingestions SET state='cancelled' WHERE id=$1", [row.id]);
+      await client.query("UPDATE official_usage_staging SET status='cancelled' WHERE id=$1", [stagingId]);
       await this.audit(client, identity, "discarded", row.kind, stagingId, row.row_count);
       return row.id as string;
     });
-    await this.cancel(identity, ingestionId);
+    await this.cleanupIngestion(ingestionId);
   }
   diagnostics(identity: SelectionIdentity, stagingId: string, options: { limit?: number; cursor?: string }, codec: CursorCodec) {
     const limit = options.limit ?? 50;

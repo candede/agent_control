@@ -34,14 +34,19 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
   const [accepted, setAccepted] = useState<OfficialReportAccepted>(), [verified, setVerified] = useState<Verified>();
   const [attempt, setAttempt] = useState<{ bundleId: string; input: OfficialReportBundleAcceptance }>();
   const [selection, setSelection] = useState<OfficialReportConfirmation>();
+  const selectionReceipt = useRef<OfficialReportConfirmation | undefined>(undefined);
   const [busy, setBusy] = useState<Busy>(), [error, setError] = useState<string>(), [recovery, setRecovery] = useState<Recovery>();
   const [metadata, setMetadata] = useState<ReportUploadMetadata>({});
   const [dragging, setDragging] = useState(false);
   const [cancelConfirm, setCancelConfirm] = useState(false), [denied, setDenied] = useState(false);
+  const cancelRequested = useRef(false);
   const [correction, setCorrection] = useState(correctionOfSetId);
   const [initialId] = useState(() => initialBundleId ?? crypto.randomUUID());
   const id = useRef(initialId), receipts = useRef(new Map<string, OfficialReportPreview>()), notified = useRef(false);
-  const lifetime = useRef<AbortController | undefined>(undefined), operation = useRef<AbortController | undefined>(undefined);
+  const bundleResolved = useRef(!initialStagingId);
+  const bundleUnverified = useRef(Boolean(initialStagingId || initialBundleId));
+  const lifetime = useRef<AbortController | undefined>(undefined);
+  const operation = useRef<{ controller: AbortController; kind: Busy } | undefined>(undefined);
   const work = useRef<Promise<void> | undefined>(undefined), picker = useRef<HTMLInputElement>(null);
   const successTitle = useRef<HTMLHeadingElement>(null), previouslyReady = useRef(false);
   const reviewTitle = useRef<HTMLHeadingElement>(null);
@@ -56,28 +61,36 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
   }, [readyToFinish]);
   useLayoutEffect(() => {
     const current = new AbortController(); lifetime.current = current;
-    return () => { current.abort(); operation.current?.abort(); };
+    return () => { current.abort(); operation.current?.controller.abort(); selectionReceipt.current = undefined; };
   }, []);
   const failed = useCallback((cause: unknown, next?: Recovery, prefix = "") => {
     if (cause instanceof ApiError && [401, 403].includes(cause.status)) {
       setDenied(true); setFiles([]); setBundle(undefined); setAccepted(undefined); setVerified(undefined); setAttempt(undefined);
-      setSelection(undefined); setMetadata({}); receipts.current.clear(); setRecovery(undefined);
-    } else if (cause instanceof ApiError && cause.code === "staging_unavailable") {
-      setFiles([]); setBundle(undefined); setAttempt(undefined); setMetadata({});
-      receipts.current.clear(); setRecovery("fresh");
+      selectionReceipt.current = undefined; setSelection(undefined); setMetadata({}); receipts.current.clear(); setRecovery(undefined);
+    } else if (cause instanceof ApiError && cause.code === "staging_unavailable" && next !== "verify") {
+      setFiles([]); setBundle(undefined); setAttempt(undefined);
+      receipts.current.clear();
+      // One unavailable companion does not prove the resolved bundle is empty.
+      bundleUnverified.current = bundleResolved.current;
+      setRecovery(bundleResolved.current ? "bundle" : "fresh");
     } else setRecovery(next);
     setError(`${prefix}${cause instanceof Error ? cause.message : "The import could not be verified."}`);
   }, []);
   const begin = useCallback((kind: Busy, action: (signal: AbortSignal) => Promise<void>, failure: (cause: unknown) => void) => {
     const life = lifetime.current;
-    if (!life || life.signal.aborted) return Promise.resolve();
-    operation.current?.abort();
-    const current = new AbortController(); operation.current = current;
+    if (!life || life.signal.aborted || cancelRequested.current && kind !== "discarding") return Promise.resolve();
+    if (operation.current && !operation.current.controller.signal.aborted) return work.current ?? Promise.resolve();
+    const current = new AbortController(); operation.current = { controller: current, kind };
     setBusy(kind); setError(undefined);
     const pending = (async () => {
       try { await action(current.signal); }
       catch (cause) { if (!life.signal.aborted && !current.signal.aborted) failure(cause); }
-      finally { if (!life.signal.aborted && operation.current === current) setBusy(undefined); }
+      finally {
+        if (!life.signal.aborted && operation.current?.controller === current) {
+          operation.current = undefined;
+          setBusy(undefined);
+        }
+      }
     })();
     work.current = pending;
     return pending;
@@ -94,21 +107,44 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
       || value.complete !== kinds.every(kind => value.stages.some(stage => stage.kind === kind))) throw new Error("The returned bundle does not contain a consistent set of companion kinds.");
     return value;
   }, []);
-  async function refreshBundle(signal: AbortSignal) {
+  async function refreshBundle(signal: AbortSignal, reuseReceipts = false) {
     const preview = checkedBundle(await previewReportBundle(id.current, signal));
-    signal.throwIfAborted(); setBundle(preview); setRecovery(undefined);
-    if (preview.stages[0]) onStaged?.(preview.stages[0].stagingId);
+    signal.throwIfAborted();
+    const staged = new Set(preview.stages.map(stage => stage.stagingId));
+    for (const key of receipts.current.keys()) if (!staged.has(key)) receipts.current.delete(key);
+    const restored: OfficialReportPreview[] = [];
+    for (const stage of preview.stages) {
+      // Recovery must reread acceptance status; a different tab may have saved this bundle.
+      const row = (reuseReceipts ? receipts.current.get(stage.stagingId) : undefined) ?? await readReportStage(stage.stagingId, signal);
+      signal.throwIfAborted(); remember(row); restored.push(row);
+    }
+    setFiles(rows => [...rows.flatMap(file => {
+      const previous = file.preview;
+      if (!previous) return [file];
+      const preview = restored.find(row => row.id === previous.id);
+      return preview ? [{ ...file, preview }] : [];
+    }),
+      ...restored.filter(row => !rows.some(file => file.preview?.id === row.id))
+        .map(row => ({ name: kindLabel(row.kind), size: row.wireBytes, preview: row }))]);
+    if (restored[0]) {
+      setMetadata(companionMetadata(restored[0])); setCorrection(restored[0].correctionOfSetId ?? undefined);
+    }
+    bundleUnverified.current = false;
+    setBundle(preview); setRecovery(undefined);
+    onStaged?.(preview.stages[0]?.stagingId);
     return preview;
   }
+  const restoreInitialStage = useCallback(async (signal: AbortSignal) => {
+    if (!initialStagingId) return;
+    const first = await readReportStage(initialStagingId, signal); signal.throwIfAborted();
+    id.current = first.bundleId; remember(first); bundleResolved.current = true;
+    setFiles([{ name: kindLabel(first.kind), size: first.wireBytes, preview: first }]);
+    setMetadata(companionMetadata(first)); setCorrection(first.correctionOfSetId ?? undefined);
+    return first;
+  }, [initialStagingId, remember]);
   const restore = useCallback(() => {
     return begin("resuming", async signal => {
-      let first: OfficialReportPreview | undefined;
-      if (initialStagingId) {
-        first = await readReportStage(initialStagingId, signal); signal.throwIfAborted();
-        id.current = first.bundleId; remember(first);
-        setFiles([{ name: kindLabel(first.kind), size: first.wireBytes, preview: first }]);
-        setMetadata(companionMetadata(first)); setCorrection(first.correctionOfSetId ?? undefined);
-      }
+      const first = await restoreInitialStage(signal); signal.throwIfAborted();
       const preview = checkedBundle(await previewReportBundle(id.current, signal)); signal.throwIfAborted();
       receipts.current.clear();
       const rows: CheckedFile[] = [];
@@ -116,15 +152,17 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
         const row = first?.id === stage.stagingId ? first : await readReportStage(stage.stagingId, signal);
         signal.throwIfAborted(); remember(row); rows.push({ name: kindLabel(row.kind), size: row.wireBytes, preview: row });
       }
+      bundleUnverified.current = false;
       setFiles(rows); setBundle(preview); setRecovery(undefined);
       setMetadata(companionMetadata(first ?? rows[0]?.preview)); setCorrection((first ?? rows[0]?.preview)?.correctionOfSetId ?? correctionOfSetId);
     }, cause => failed(cause, "resume"));
-  }, [begin, checkedBundle, correctionOfSetId, failed, initialStagingId, remember]);
+  }, [begin, checkedBundle, correctionOfSetId, failed, remember, restoreInitialStage]);
   useEffect(() => {
     if (initialStagingId || initialBundleId) void restore();
   }, [initialStagingId, initialBundleId, restore]);
   function upload(selected: FileList | File[]) {
-    if (busy || denied || cancelConfirm || attempt || accepted || recovery === "resume" || recovery === "fresh") return;
+    if (operation.current || busy || denied || cancelRequested.current || attempt || accepted || bundleUnverified.current
+      || recovery === "resume" || recovery === "fresh") return;
     if (!selected.length || selected.length + receipts.current.size > 3) {
       setError("Select the remaining companion CSVs, at most three files per report set."); return;
     }
@@ -133,7 +171,8 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
     if (invalid) {
       setError(`${invalid.name}: ${!invalid.size ? "This file is empty." : invalid.size > 268435456 ? "This file exceeds the 256 MiB limit." : "Choose a CSV file."}`); return;
     }
-    setFiles(rows => rows.filter(row => row.preview)); setRecovery(undefined);
+    bundleUnverified.current = true;
+    setFiles(rows => rows.filter(row => row.preview)); setBundle(undefined); setRecovery(undefined);
     return begin("uploading", async signal => {
       let rejected: unknown;
       for (const file of next) {
@@ -152,12 +191,13 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
           break;
         }
       }
-      if (receipts.current.size) {
-        try { await refreshBundle(signal); } catch (cause) { if (!rejected) throw cause; }
+      // A committed upload can lose its response before the first receipt arrives.
+      try { await refreshBundle(signal, true); } catch (cause) {
+        if (!rejected || cause instanceof ApiError && [401, 403].includes(cause.status)) throw cause;
       }
       signal.throwIfAborted();
       if (rejected) throw rejected;
-    }, cause => failed(cause, receipts.current.size ? "bundle" : undefined));
+    }, cause => failed(cause, receipts.current.size || bundleUnverified.current ? "bundle" : undefined));
   }
   async function inspect(receipt: OfficialReportAccepted, signal: AbortSignal, finish = false) {
     const data = await reportPages.agents({ setId: receipt.setId, limit: 1 }, signal); signal.throwIfAborted();
@@ -166,20 +206,23 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
       throw new Error("The complete accepted report set could not be verified. No current-report substitute is allowed.");
     }
     setVerified({ reports: data.reports, summary: data.summary }); setRecovery(undefined); setError(undefined);
-    if (!notified.current) { notified.current = true; onChanged(); }
+    notifyChanged();
     if (finish) {
       if (data.reports.activeSetId !== receipt.setId) setError("The shared report selection changed. Confirm use of the imported report before continuing.");
       else onDone(receipt.setId);
     }
   }
+  function notifyChanged() {
+    if (!notified.current) { notified.current = true; onChanged(); }
+  }
   function accept() {
-    if (busy || denied || cancelConfirm || !bundle?.complete && !attempt) return;
+    if (operation.current || busy || denied || cancelRequested.current || !bundle?.complete && !attempt) return;
     const admitted = attempt ?? { bundleId: bundle!.bundleId,
       input: Object.freeze({ bundleHash: bundle!.bundleHash, expectedActiveRevision: bundle!.expectedActiveRevision }) };
     setAttempt(admitted); setRecovery(undefined);
     return begin("accepting", async signal => {
       const receipt = await acceptReportBundle(admitted.bundleId, admitted.input, signal); signal.throwIfAborted();
-      setAccepted(receipt);
+      setAccepted(receipt); setBusy("verifying"); notifyChanged();
       for (const [key, value] of receipts.current) receipts.current.set(key, { ...value, status: "accepted" });
       try { await inspect(receipt, signal); }
       catch (cause) {
@@ -193,13 +236,13 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
     });
   }
   function verify(finish = false) {
-    if (!accepted || busy || denied) return;
+    if (!accepted || operation.current || busy || denied) return;
     const receipt = accepted;
-    setVerified(undefined); setSelection(undefined);
+    setVerified(undefined); selectionReceipt.current = undefined; setSelection(undefined);
     return begin("verifying", signal => inspect(receipt, signal, finish), cause => failed(cause, "verify", "Your reports were saved. "));
   }
   function prepareImportedSelection() {
-    if (!accepted || !verified || busy || denied) return;
+    if (!accepted || !verified || selection || operation.current || busy || denied) return;
     const expected = verified.reports, receipt = accepted;
     return begin("selecting", async signal => {
       const next = await previewReportOperation(receipt.setId, "select", signal); signal.throwIfAborted();
@@ -207,38 +250,51 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
         || next.historyRevision !== expected.historyRevision || next.historyEpoch !== expected.historyEpoch) {
         throw new Error("The shared report selection changed. Verify the saved import before preparing a new confirmation.");
       }
-      setSelection(next);
-    }, cause => failed(cause, "verify"));
+      selectionReceipt.current = next; setSelection(next);
+    }, cause => { selectionReceipt.current = undefined; setSelection(undefined); setVerified(undefined); failed(cause, "verify"); });
   }
   function confirmSelection() {
-    if (!accepted || !selection || busy || denied) return;
+    if (!accepted || !selection || selectionReceipt.current !== selection || operation.current || busy || denied) return;
     const confirmation = selection, receipt = accepted;
-    setSelection(undefined);
+    selectionReceipt.current = undefined; setSelection(undefined); setVerified(undefined); notified.current = false;
     return begin("selecting", async signal => {
-      await confirmReportOperation(confirmation, signal); signal.throwIfAborted(); await inspect(receipt, signal);
+      await confirmReportOperation(confirmation, signal); signal.throwIfAborted(); notifyChanged(); await inspect(receipt, signal);
     }, cause => { setVerified(undefined); failed(cause, "verify", "Selection may already have changed. Verify its outcome; do not replay this confirmation. "); });
   }
+  function cancelImport() {
+    if (lifetime.current?.signal.aborted) return;
+    lifetime.current?.abort(); selectionReceipt.current = undefined;
+    onCancel();
+  }
   function dismiss() {
-    if (accepted && busy) return;
-    if (busy === "accepting" || attempt && !accepted && !denied) {
+    if (!lifetime.current || lifetime.current.signal.aborted) return;
+    if (denied) { cancelImport(); return; }
+    const active = operation.current?.kind;
+    if (accepted && active) return;
+    if (active === "accepting" || attempt && !accepted && !denied) {
       setError("Acceptance may already have completed. Verify its outcome before discarding staged files."); return;
     }
-    if (accepted && verified) {
-      if (verified.reports.activeSetId === accepted.setId) void verify(true);
-      else onCancel();
+    if (accepted) {
+      if (verified?.reports.activeSetId === accepted.setId) void verify(true);
+      else { notifyChanged(); cancelImport(); }
       return;
     }
-    if (!accepted && (receipts.current.size || busy)) setCancelConfirm(true); else onCancel();
+    if (receipts.current.size || active || bundleUnverified.current) {
+      cancelRequested.current = true; setCancelConfirm(true);
+    } else cancelImport();
   }
   useImperativeHandle(ref, () => ({ dismiss }));
   function discard() {
-    if (busy === "accepting" || attempt && !accepted || denied) return;
+    if (!cancelRequested.current || operation.current?.kind === "accepting" || operation.current?.kind === "discarding" || attempt && !accepted || denied) return;
     const pending = work.current;
-    operation.current?.abort();
+    operation.current?.controller.abort();
     setBundle(undefined);
     return begin("discarding", async signal => {
       await pending; signal.throwIfAborted();
-      const current = checkedBundle(await previewReportBundle(id.current, signal)); signal.throwIfAborted();
+      setFiles(rows => rows.filter(row => row.preview || row.error));
+      if (!bundleResolved.current) await restoreInitialStage(signal);
+      signal.throwIfAborted();
+      const current = checkedBundle(await previewReportBundle(id.current, signal, { forDiscard: true })); signal.throwIfAborted();
       for (const stage of current.stages) {
         const receipt = await readReportStage(stage.stagingId, signal); signal.throwIfAborted();
         if (receipt.bundleId !== id.current) throw new Error("Cancellation receipt belongs to another bundle.");
@@ -247,21 +303,23 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
         setFiles(rows => rows.filter(row => row.preview?.id !== receipt.id));
       }
       receipts.current.clear();
-      onCancel();
-    }, cause => failed(cause));
+      cancelImport();
+    }, cause => failed(cause, bundleResolved.current ? undefined : "resume"));
   }
   const present = files.filter(file => file.preview), missing = kinds.filter(kind => !present.some(file => file.preview?.kind === kind));
+  const savedBundle = Boolean(bundle?.complete && present.length === 3 && present.every(file => file.preview?.status === "accepted"));
   const selected = Boolean(verified && accepted && verified.reports.activeSetId === accepted.setId);
   const summary = verified && selected && !error;
-  const canChoose = !accepted && !attempt && recovery !== "resume" && recovery !== "fresh" && missing.length > 0;
+  const canChoose = !accepted && !attempt && recovery !== "resume" && recovery !== "fresh"
+    && (recovery !== "bundle" || Boolean(bundle)) && missing.length > 0;
   const status = busy === "uploading" ? "Checking CSV files..."
     : busy === "resuming" ? "Loading your reports..."
-      : busy === "accepting" ? "Importing reports..."
+      : busy === "accepting" ? savedBundle ? "Verifying saved report set..." : "Importing reports..."
         : busy === "discarding" ? "Cancelling import..."
           : busy ? "Verifying import..." : undefined;
   if (denied) return <section className="official-usage-import" aria-label="Import CSV reports">
     <div className="usage-import-body"><p role="alert">{error}</p></div>
-    <footer className="usage-import-footer"><button type="button" onClick={onCancel}>Back to Sync</button></footer></section>;
+    <footer className="usage-import-footer"><button type="button" onClick={cancelImport}>Back to Sync</button></footer></section>;
   return <section className="official-usage-import" aria-label="Import CSV reports" aria-busy={Boolean(busy)}>
     <div className="usage-import-body">
     {summary ? <div className="usage-import-success"><CheckCircle2 size={44} aria-hidden="true" /><h3 ref={successTitle} tabIndex={-1}>Reports imported</h3><p role="status">Your report set is ready in Agents.</p><section aria-label="Imported CSV summary"><dl className="usage-import-statistics">
@@ -272,18 +330,19 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
       {error ? <div className="report-status error" role="alert"><h3>{accepted ? "Reports saved" : "Import needs attention"}</h3><p>{error}</p>
         {recovery === "fresh" ? <p>Cancel this import and add the three CSV files again.</p> : null}</div> : null}
       {status ? <p className="usage-import-progress" role="status"><LoaderCircle size={20} aria-hidden="true" />{status}</p> : null}
-      {bundle && !accepted && !busy && !recovery ? <section aria-label="Confirm report import">
-        <h3 ref={reviewTitle} tabIndex={-1}>{bundle.complete ? "Ready to import" : "Add the remaining reports"}</h3>
-        <p className="usage-import-hint">{bundle.complete ? "All three reports are ready to add." : `Still needed: ${missing.map(kindLabel).join(", ")}.`}</p>
+      {bundle && !accepted && !busy && !recovery && !cancelConfirm ? <section aria-label="Confirm report import">
+        <h3 ref={reviewTitle} tabIndex={-1}>{savedBundle ? "Reports already saved" : bundle.complete ? "Ready to import" : "Add the remaining reports"}</h3>
+        <p className="usage-import-hint">{savedBundle ? "Verify the saved report set's current availability and selection before continuing."
+          : bundle.complete ? "All three reports are ready to add." : `Still needed: ${missing.map(kindLabel).join(", ")}.`}</p>
       </section> : null}
       {files.length && !accepted ? <ul className="usage-upload-files" aria-label="Selected CSV files">{files.map(file => <li key={file.preview?.id ?? file.name}
         data-status={file.preview ? "validated" : file.error ? "rejected" : "validating"}>
         {file.preview ? <CheckCircle2 size={20} aria-hidden="true" /> : file.error ? <XCircle size={20} aria-hidden="true" /> : <FileText size={20} aria-hidden="true" />}
         <div><strong>{file.name}</strong><span>{file.preview
           ? `${kindLabel(file.preview.kind)} - ${file.preview.rowCount.toLocaleString()} ${file.preview.rowCount === 1 ? "row" : "rows"}`
-          : file.error ? "Could not import" : "Checking..."}</span></div>
+          : file.error ? "Upload needs attention" : busy === "discarding" ? "Waiting for upload cancellation..." : "Checking..."}</span></div>
       </li>)}</ul> : null}
-      {correction && !accepted ? <p className="usage-context-warning" role="status">This import replaces the saved report and invalidates its existing history and exports.</p> : null}
+      {correction && !accepted && !savedBundle && !cancelConfirm ? <p className="usage-context-warning" role="status">This import replaces the saved report and invalidates its existing history and exports.</p> : null}
       {canChoose ? <>
         <div className={`usage-upload-zone${dragging ? " is-dragging" : ""}`}
           onDragOver={event => { event.preventDefault(); if (!busy && !cancelConfirm) setDragging(true); }}
@@ -303,28 +362,31 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
       </> : null}
       {verified && accepted && !selected ? <>{!error ? <h3>Reports saved</h3> : null}<p>The imported report is saved, but another report is currently selected.</p>
         <p>You can keep the current selection or explicitly select the imported report. Older historical uploads do not replace a newer selected report.</p>
-        <button type="button" disabled={Boolean(busy)} onClick={() => void prepareImportedSelection()}>Use imported reports</button></> : null}
+        {!selection ? <button type="button" disabled={Boolean(busy)} onClick={() => void prepareImportedSelection()}>Use imported reports</button> : null}</> : null}
       {selection ? <section className="usage-import-section" aria-label="Confirm imported report selection"><p>This changes the shared current report to {selection.setId}, not existing pinned pages.</p>
         <button type="button" disabled={Boolean(busy)} onClick={() => void confirmSelection()}>Confirm use of imported reports</button>
-        <button type="button" disabled={Boolean(busy)} onClick={() => setSelection(undefined)}>Cancel selection</button></section> : null}
-      {cancelConfirm ? <section ref={cancelPrompt} tabIndex={-1} className="usage-import-section" role="alertdialog" aria-label="Discard staged import"><p>Discard staged files and cancel the upload? Accepted sets are not deleted.</p>
+        <button type="button" disabled={Boolean(busy)} onClick={() => {
+          selectionReceipt.current = undefined; setSelection(undefined);
+        }}>Cancel selection</button></section> : null}
+      {cancelConfirm ? <section ref={cancelPrompt} tabIndex={-1} className="usage-import-section" role="alertdialog" aria-label="Discard staged import"><p>Check this import and discard any unaccepted staged files before closing? Accepted report sets will not be deleted. The import stays open if cleanup cannot be verified.</p>
         <button type="button" disabled={busy === "discarding"} onClick={() => void discard()}>Discard staged import</button>
         <button type="button" disabled={busy === "discarding"} onClick={() => {
-          setCancelConfirm(false);
-          if (!bundle && present.length) void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"));
+          if (operation.current?.kind === "discarding") return;
+          cancelRequested.current = false; setCancelConfirm(false);
+          if (!bundle && bundleResolved.current) void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"));
         }}>Continue import</button></section> : null}
     </>}
     </div>
     <footer className="usage-import-footer">
       {summary ? <button type="button" disabled={Boolean(busy)} onClick={() => void verify(true)}>OK</button> : <>
         <button type="button" className="secondary" disabled={cancelConfirm || busy === "accepting" || Boolean(accepted && busy || attempt && !accepted)} onClick={dismiss}>
-          {accepted && verified && !selected ? "Keep current report" : "Cancel import"}</button>
+          {accepted && verified && !selected ? "Keep current report" : accepted || savedBundle ? "Close saved import" : "Cancel import"}</button>
         {recovery === "resume" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void restore()}>Reload saved draft</button> : null}
         {recovery === "bundle" ? <button type="button" disabled={Boolean(busy) || cancelConfirm} onClick={() => void begin("verifying", async signal => { await refreshBundle(signal); }, cause => failed(cause, "bundle"))}>Refresh bundle validation</button> : null}
         {recovery === "acceptance" ? <button type="button" disabled={Boolean(busy)} onClick={() => void accept()}>Verify acceptance</button> : null}
         {recovery === "verify" ? <button type="button" disabled={Boolean(busy)} onClick={() => void verify()}>Verify saved import</button> : null}
         {bundle?.complete && !accepted && !attempt && !recovery ? <button type="button" disabled={!readyToImport} onClick={() => void accept()}>
-          {present.length === 3 && present.every(file => file.preview?.status === "accepted") ? "Verify saved report set" : "Import reports"}</button> : null}
+          {savedBundle ? "Verify saved report set" : "Import reports"}</button> : null}
       </>}
     </footer>
   </section>;

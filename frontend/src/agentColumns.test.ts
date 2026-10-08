@@ -3,8 +3,8 @@ import { agentAccessOptions, agentColumns, agentUsageOptions, defaultAgentColumn
 import { unifiedAgentSortKeys } from "../../backend/src/types/unifiedAgents";
 
 afterEach(() => {
-  window.localStorage.clear();
   vi.restoreAllMocks();
+  window.localStorage.clear();
 });
 
 describe("agent column preferences", () => {
@@ -34,6 +34,46 @@ describe("agent column preferences", () => {
     expect(loadAgentColumns("tenant-b:user-a").visibility).toEqual(defaultAgentColumnVisibility);
     expect(saveAgentColumns(undefined, choices)).toBeUndefined();
     expect(window.localStorage.length).toBe(1);
+    expect(JSON.parse(window.localStorage.getItem(window.localStorage.key(0)!)!)).toEqual({ version: 1, visibility: choices });
+  });
+
+  it("does not read or write browser storage without an account owner", () => {
+    const get = vi.spyOn(Storage.prototype, "getItem");
+    const set = vi.spyOn(Storage.prototype, "setItem");
+    expect(loadAgentColumns()).toEqual({ visibility: defaultAgentColumnVisibility });
+    expect(saveAgentColumns(undefined, { ...defaultAgentColumnVisibility, hosts: true })).toBeUndefined();
+    expect(get).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it("returns independent defaults and fills missing columns without rewriting stored preferences", () => {
+    const first = loadAgentColumns("new-account");
+    first.visibility.publisher = false;
+    expect(loadAgentColumns("new-account").visibility.publisher).toBe(true);
+    expect(defaultAgentColumnVisibility.publisher).toBe(true);
+    saveAgentColumns("existing-admin", { publisher: false, hosts: true });
+    const set = vi.spyOn(Storage.prototype, "setItem");
+    expect(loadAgentColumns("existing-admin").visibility).toEqual({
+      ...defaultAgentColumnVisibility, publisher: false, hosts: true,
+    });
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "{",
+    "null",
+    "[]",
+    JSON.stringify({ version: 2, visibility: {} }),
+    JSON.stringify({ version: 1, visibility: [] }),
+    JSON.stringify({ version: 1, visibility: { publisher: "false" } }),
+  ])("reports malformed stored preferences without overwriting them: %s", raw => {
+    saveAgentColumns("owner", defaultAgentColumnVisibility);
+    const key = window.localStorage.key(0)!;
+    window.localStorage.setItem(key, raw);
+    expect(loadAgentColumns("owner")).toEqual({
+      visibility: defaultAgentColumnVisibility, error: expect.stringContaining("Column preferences could not be loaded."),
+    });
+    expect(window.localStorage.getItem(key)).toBe(raw);
   });
 
   it("preserves existing admins' saved visibility rather than forcing the new defaults", () => {

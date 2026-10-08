@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, downloadAdministrativeAuditCsv, getAuditEvents, type AuditEvent } from "../api/client";
@@ -8,6 +8,10 @@ import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { createSavedQueryClient } from "../savedQueries";
 import { AuditLogView } from "./AuditLogView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
+import { mockNativeDialogs } from "../test/dialog";
+import { WorkbenchDialog } from "./WorkbenchDialog";
+
+mockNativeDialogs();
 
 vi.mock("./CapabilityGate", () => ({ CapabilityGate: ({ children }: { children: React.ReactNode }) => children }));
 vi.mock("../downloadFile", () => ({ downloadFile: vi.fn() }));
@@ -37,6 +41,52 @@ beforeEach(() => {
 });
 
 describe("AuditLogView routing", () => {
+  it("does not cancel a background audit dialog when Escape belongs to a native workbench dialog", async () => {
+    const overflow = document.body.style.overflow, onClose = vi.fn();
+    vi.mocked(getAuditEvents).mockResolvedValue({ value: [associationEvent], count: 1 });
+    const content = (open: boolean) => <>
+      <AuditLogView agents={[]} />
+      <WorkbenchDialog open={open} title="Sync status" onClose={onClose}>Status</WorkbenchDialog>
+    </>;
+    const { rerender, unmount } = render(content(false));
+    try {
+      await userEvent.click(await screen.findByRole("button", { name: "View event details: Usage association evidence" }));
+      rerender(content(true));
+      const heading = screen.getByRole("heading", { name: "Sync status" });
+      expect(heading).toHaveFocus();
+      expect(fireEvent.keyDown(heading, { key: "Escape" })).toBe(true);
+      expect(screen.getByRole("dialog", { name: "Event details" })).toBeInTheDocument();
+      fireEvent(screen.getByRole("dialog", { name: "Sync status" }), new Event("cancel", { cancelable: true }));
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(screen.getByRole("dialog", { name: "Event details" })).toBeInTheDocument();
+    } finally {
+      unmount();
+      document.body.style.overflow = overflow;
+    }
+  });
+
+  it("keeps the shared scroll lock when refreshed audit details close beneath a workbench dialog", async () => {
+    const overflow = document.body.style.overflow;
+    vi.mocked(getAuditEvents).mockResolvedValue({ value: [associationEvent], count: 1 });
+    const content = (open: boolean) => <>
+      <AuditLogView agents={[]} />
+      <WorkbenchDialog open={open} title="Sync status">Status</WorkbenchDialog>
+    </>;
+    const { rerender, unmount } = render(content(false));
+    try {
+      await userEvent.click(await screen.findByRole("button", { name: "View event details: Usage association evidence" }));
+      rerender(content(true));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh audit log" }));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument());
+      expect(document.body.style.overflow).toBe("hidden");
+      rerender(content(false));
+      expect(document.body.style.overflow).toBe(overflow);
+    } finally {
+      unmount();
+      document.body.style.overflow = overflow;
+    }
+  });
+
   it("bounds typed searches to the accepted audit search length", async () => {
     window.history.replaceState({}, "", "/audit");
     render(<AuditLogView agents={[]} />);
@@ -254,6 +304,445 @@ describe("AuditLogView routing", () => {
     expect(await screen.findByRole("region", { name: "Audit events" })).toBeVisible();
   });
 
+  it("does not revive a cancelled export or private details when returning to the same filter", async () => {
+    let finish!: (blob: Blob) => void;
+    let signal!: AbortSignal;
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [associationEvent] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce((_ids, requestSignal) => {
+      signal = requestSignal!;
+      return new Promise(resolve => { finish = resolve; });
+    }).mockResolvedValue(new Blob(["current"]));
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: "View event details: Usage association evidence" }));
+    act(() => {
+      window.history.replaceState({}, "", "/audit?action=remove-agent-usage-association");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await screen.findByRole("region", { name: "Audit events" });
+    expect(signal.aborted).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    act(() => {
+      window.history.replaceState({}, "", "/audit?q=saved+actor&action=block&status=failed");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await screen.findByRole("region", { name: "Audit events" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    const exportButton = screen.getByRole("button", { name: "Export current audit page CSV" });
+    expect(exportButton).toBeEnabled();
+    await act(async () => finish(new Blob(["obsolete"])));
+    expect(downloadFile).not.toHaveBeenCalled();
+    await userEvent.click(exportButton);
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledTimes(2);
+    expect(downloadFile).toHaveBeenCalledExactlyOnceWith("administrative-audit.csv", expect.any(Blob));
+  });
+
+  it.each(["succeeded", "denied"] as const)(
+    "retires exports and details when the shared audit page is invalidated (%s read)", async outcome => {
+      const client = createSavedQueryClient();
+      let finishRead!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+      let failRead!: (cause: Error) => void;
+      let finishExport!: (blob: Blob) => void;
+      let exportSignal!: AbortSignal;
+      vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
+        .mockImplementationOnce(() => new Promise((resolve, reject) => { finishRead = resolve; failRead = reject; }));
+      vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce((_ids, signal) => {
+        exportSignal = signal!;
+        return new Promise(resolve => { finishExport = resolve; });
+      });
+      const view = render(<SavedQueryProvider client={client}>
+        <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+      </SavedQueryProvider>);
+      try {
+        await screen.findByRole("region", { name: "Audit events" });
+        await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+        await userEvent.click(screen.getByRole("button", { name: "View event details: Usage association evidence" }));
+        act(() => { void client.invalidateQueries({ queryKey: ["audit-events"] }); });
+        await waitFor(() => expect(getAuditEvents).toHaveBeenCalledTimes(2));
+        expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(exportSignal.aborted).toBe(true);
+        expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeDisabled();
+        await act(async () => finishExport(new Blob(["obsolete"])));
+        expect(downloadFile).not.toHaveBeenCalled();
+        await act(async () => {
+          if (outcome === "succeeded") finishRead({ count: 1, value: [associationEvent] });
+          else failRead(new ApiError(403, "forbidden", "Audit access denied"));
+        });
+        if (outcome === "succeeded") {
+          expect(await screen.findByRole("region", { name: "Audit events" })).toBeVisible();
+          expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeEnabled();
+        } else {
+          expect(await screen.findByRole("alert")).toHaveTextContent("Audit access denied");
+          expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+        }
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      } finally {
+        view.unmount();
+        client.clear();
+      }
+    },
+  );
+
+  it.each([
+    new ApiError(404, "not_found", "An audit export event is absent, expired or outside the current source scope."),
+    new ApiError(409, "dataset_invalidated", "The exact audit selection changed or was deleted."),
+  ])("withdraws an export-invalidated page until a fresh saved read (%s)", async failure => {
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
+      .mockResolvedValueOnce({ count: 0, value: [] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockRejectedValue(failure);
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(failure.message);
+    expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Audit events unavailable" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeDisabled();
+    expect(getAuditEvents).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "Retry audit log" }));
+    expect(await screen.findByRole("heading", { name: "No audit events" })).toBeVisible();
+    expect(getAuditEvents).toHaveBeenCalledTimes(2);
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledOnce();
+  });
+
+  it("does not read the old search at the reset offset while the new search is deferred", async () => {
+    window.history.replaceState({}, "", "/audit?q=saved+actor&page=3");
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 300, value: [associationEvent] });
+    render(<AuditLogView agents={[]} />);
+    await screen.findByRole("region", { name: "Audit events" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "new actor" } });
+    await waitFor(() => expect(getAuditEvents).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: "new actor", offset: 0 }), expect.anything(),
+    ));
+    expect(vi.mocked(getAuditEvents).mock.calls.map(([query]) => [query?.search, query?.offset]))
+      .toEqual([["saved actor", 200], ["new actor", 0]]);
+  });
+
+  it("does not reload unchanged effective filters on agent-label updates, focus or equivalent navigation", async () => {
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [associationEvent] });
+    const view = render(<AuditLogView agents={[]} />);
+    await screen.findByRole("region", { name: "Audit events" });
+    view.rerender(<AuditLogView agents={[{ id: "package", displayName: "Updated package label" }]} />);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: " saved actor " } });
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.history.replaceState({}, "", "/audit?status=failed&q=saved+actor&action=block");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.getByRole("region", { name: "Audit events" })).toBeVisible();
+    expect(getAuditEvents).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the selected page, details and export when only surrounding search whitespace changes", async () => {
+    window.history.replaceState({}, "", "/audit?q=saved+actor&page=3");
+    let finishExport!: (blob: Blob) => void;
+    let exportSignal!: AbortSignal;
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 300, value: [associationEvent] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce((_ids, signal) => {
+      exportSignal = signal!;
+      return new Promise(resolve => { finishExport = resolve; });
+    });
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: "View event details: Usage association evidence" }));
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: " saved actor " } });
+
+    expect(screen.getByRole("combobox", { name: "Audit page" })).toHaveValue("2");
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(exportSignal.aborted).toBe(false);
+    expect(window.location.search).toBe("?q=saved+actor&page=3");
+    expect(getAuditEvents).toHaveBeenCalledOnce();
+    const blob = new Blob(["current"]);
+    await act(async () => finishExport(blob));
+    expect(downloadFile).toHaveBeenCalledExactlyOnceWith("administrative-audit.csv", blob);
+  });
+
+  it("shows a pending shared retry rather than its previous cached read failure", async () => {
+    const client = createSavedQueryClient();
+    let finishRead!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
+      .mockRejectedValueOnce(new Error("Previous saved read failed"))
+      .mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      await screen.findByRole("region", { name: "Audit events" });
+      await act(async () => { await client.invalidateQueries({ queryKey: ["audit-events"] }); });
+      expect(await screen.findByRole("alert")).toHaveTextContent("Previous saved read failed");
+      act(() => { void client.invalidateQueries({ queryKey: ["audit-events"] }); });
+      await waitFor(() => expect(getAuditEvents).toHaveBeenCalledTimes(3));
+
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry audit log" })).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Loading audit events");
+      expect(screen.getByRole("button", { name: "Refreshing audit log" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeDisabled();
+      expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+      await act(async () => finishRead({ count: 1, value: [associationEvent] }));
+      expect(await screen.findByRole("region", { name: "Audit events" })).toBeVisible();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(getAuditEvents).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it("ends the initial skeleton after cancellation and retries without reviving the abandoned response", async () => {
+    const client = createSavedQueryClient();
+    let finishOld!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+    let finishCurrent!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+    vi.mocked(getAuditEvents)
+      .mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve; }))
+      .mockImplementationOnce(() => new Promise(resolve => { finishCurrent = resolve; }));
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      expect(screen.getByRole("region", { name: "Loading audit" })).toBeVisible();
+      expect(screen.getAllByRole("heading", { name: "Local control audit" })).toHaveLength(1);
+      await act(async () => { await client.cancelQueries({ queryKey: ["audit-events"] }); });
+      expect(await screen.findByRole("alert")).toHaveTextContent("The saved audit read was cancelled");
+      expect(screen.queryByRole("region", { name: "Loading audit" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "No audit events" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeDisabled();
+      expect(vi.mocked(getAuditEvents).mock.calls[0][1]?.signal?.aborted).toBe(true);
+      expect(getAuditEvents).toHaveBeenCalledOnce();
+
+      await userEvent.click(screen.getByRole("button", { name: "Retry audit log" }));
+      expect(screen.getByRole("status")).toHaveTextContent("Loading audit events");
+      expect(screen.queryByRole("region", { name: "Loading audit" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      await act(async () => finishOld({ count: 1, value: [associationEvent] }));
+      expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Loading audit events");
+      await act(async () => finishCurrent({ count: 0, value: [] }));
+      expect(await screen.findByRole("heading", { name: "No audit events" })).toBeVisible();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(getAuditEvents).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it.each(["after rendering", "before rendering"] as const)("withdraws invalidated audit evidence when shared revalidation is cancelled %s", async timing => {
+    const client = createSavedQueryClient();
+    let finishOld!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+    let finishExport!: (blob: Blob) => void;
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce(() => new Promise(resolve => { finishExport = resolve; }));
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
+      .mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve; }))
+      .mockResolvedValueOnce({ count: 1, value: [{ ...associationEvent, message: "Recovered audit" }] });
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      await screen.findByRole("region", { name: "Audit events" });
+      await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+      await userEvent.click(screen.getByRole("button", { name: "View event details: Usage association evidence" }));
+      if (timing === "after rendering") {
+        act(() => { void client.invalidateQueries({ queryKey: ["audit-events"] }); });
+        await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Loading audit events"));
+        await act(async () => { await client.cancelQueries({ queryKey: ["audit-events"] }); });
+      } else {
+        await act(async () => {
+          void client.invalidateQueries({ queryKey: ["audit-events"] });
+          await client.cancelQueries({ queryKey: ["audit-events"] });
+        });
+      }
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("Saved audit evidence needs reloading");
+      expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "No audit events" })).not.toBeInTheDocument();
+      expect(within(screen.getByRole("region", { name: "Audit summary" })).getAllByText("Unknown")).toHaveLength(4);
+      expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeDisabled();
+      expect(vi.mocked(getAuditEvents).mock.calls[1][1]?.signal?.aborted).toBe(true);
+      expect(vi.mocked(downloadAdministrativeAuditCsv).mock.calls[0][1]?.aborted).toBe(true);
+      await act(async () => {
+        finishOld({ count: 1, value: [associationEvent] });
+        finishExport(new Blob(["obsolete"]));
+      });
+      expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(getAuditEvents).toHaveBeenCalledTimes(2);
+
+      await userEvent.click(screen.getByRole("button", { name: "Retry audit log" }));
+      expect(await screen.findByRole("region", { name: "Audit events" })).toHaveTextContent("Recovered audit");
+      expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeEnabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(getAuditEvents).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it.each(["changed", "unchanged", "denied"] as const)("retires page actions when a fast shared refresh settles within the same millisecond (%s)", async outcome => {
+    const client = createSavedQueryClient();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    let finishExport!: (blob: Blob) => void;
+    let exportSignal!: AbortSignal;
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] });
+    if (outcome === "denied") vi.mocked(getAuditEvents).mockRejectedValueOnce(new ApiError(403, "forbidden", "Audit access denied"));
+    else vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [
+      outcome === "changed" ? { ...associationEvent, message: "Updated audit evidence" } : associationEvent,
+    ] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce((_ids, signal) => {
+      exportSignal = signal!;
+      return new Promise(resolve => { finishExport = resolve; });
+    }).mockResolvedValue(new Blob(["current"]));
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      await screen.findByRole("region", { name: "Audit events" });
+      await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+      await userEvent.click(screen.getByRole("button", { name: "View event details: Usage association evidence" }));
+      await act(async () => { await client.invalidateQueries({ queryKey: ["audit-events"] }); });
+      if (outcome === "denied") expect(await screen.findByRole("alert")).toHaveTextContent("Audit access denied");
+      else await screen.findByRole("button", { name: `View event details: ${outcome === "changed" ? "Updated audit e..." : "Usage association evidence"}` });
+
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(exportSignal.aborted).toBe(true);
+      await act(async () => finishExport(new Blob(["obsolete"])));
+      expect(downloadFile).not.toHaveBeenCalled();
+      const exportButton = screen.getByRole("button", { name: "Export current audit page CSV" });
+      if (outcome === "denied") {
+        expect(exportButton).toBeDisabled();
+        expect(screen.queryByRole("region", { name: "Audit events" })).not.toBeInTheDocument();
+      } else {
+        await userEvent.click(exportButton);
+        expect(downloadAdministrativeAuditCsv).toHaveBeenCalledTimes(2);
+        expect(downloadFile).toHaveBeenCalledExactlyOnceWith("administrative-audit.csv", expect.any(Blob));
+      }
+      expect(getAuditEvents).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      client.clear();
+      clock.mockRestore();
+    }
+  });
+
+  it.each(["succeeded", "denied"] as const)("ignores an export settling after shared revalidation but before its render (%s)", async outcome => {
+    const client = createSavedQueryClient();
+    let finishExport!: (blob: Blob) => void;
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] });
+    if (outcome === "denied") vi.mocked(getAuditEvents).mockRejectedValueOnce(new ApiError(403, "forbidden", "Audit access denied"));
+    else vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementationOnce(() => new Promise(resolve => { finishExport = resolve; }));
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      await screen.findByRole("region", { name: "Audit events" });
+      await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: ["audit-events"] });
+        finishExport(new Blob(["obsolete"]));
+      });
+
+      expect(downloadFile).not.toHaveBeenCalled();
+      if (outcome === "denied") expect(await screen.findByRole("alert")).toHaveTextContent("Audit access denied");
+      else expect(screen.getByRole("button", { name: "Export current audit page CSV" })).toBeEnabled();
+      expect(getAuditEvents).toHaveBeenCalledTimes(2);
+      expect(downloadAdministrativeAuditCsv).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it("does not admit an export from old rendered rows before shared revalidation renders", async () => {
+    const client = createSavedQueryClient();
+    let finishRead!: (value: Awaited<ReturnType<typeof getAuditEvents>>) => void;
+    vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
+      .mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+    const view = render(<SavedQueryProvider client={client}>
+      <WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>
+    </SavedQueryProvider>);
+    try {
+      await screen.findByRole("region", { name: "Audit events" });
+      const exportButton = screen.getByRole("button", { name: "Export current audit page CSV" });
+      act(() => {
+        void client.invalidateQueries({ queryKey: ["audit-events"] });
+        exportButton.click();
+      });
+
+      expect(downloadAdministrativeAuditCsv).not.toHaveBeenCalled();
+      await waitFor(() => expect(exportButton).toBeDisabled());
+      await act(async () => finishRead({ count: 1, value: [associationEvent] }));
+      expect(await screen.findByRole("region", { name: "Audit events" })).toBeVisible();
+      expect(exportButton).toBeEnabled();
+      expect(getAuditEvents).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it("blocks duplicate exports and ignores an obsolete failure while the replacement export is pending", async () => {
+    let failPrevious!: (cause: Error) => void;
+    let finishCurrent!: (blob: Blob) => void;
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [associationEvent] });
+    vi.mocked(downloadAdministrativeAuditCsv)
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { failPrevious = reject; }))
+      .mockImplementationOnce(() => new Promise(resolve => { finishCurrent = resolve; }));
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    const exportButton = screen.getByRole("button", { name: "Export current audit page CSV" });
+    act(() => {
+      exportButton.click();
+      exportButton.click();
+    });
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledOnce();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Action" }), "remove-agent-usage-association");
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await userEvent.click(exportButton);
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledTimes(2);
+    await act(async () => failPrevious(new ApiError(403, "forbidden", "Obsolete audit denial")));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Audit events" })).toBeVisible();
+    expect(exportButton).toBeDisabled();
+    const current = new Blob(["current"]);
+    await act(async () => finishCurrent(current));
+    expect(downloadFile).toHaveBeenCalledExactlyOnceWith("administrative-audit.csv", current);
+    expect(exportButton).toBeEnabled();
+  });
+
+  it.each(["request", "activation"] as const)("recovers an export %s failure without reloading its displayed evidence", async stage => {
+    const failure = new Error(`CSV ${stage} failed`);
+    const blob = new Blob(["saved audit rows"]);
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [associationEvent] });
+    vi.mocked(downloadAdministrativeAuditCsv).mockResolvedValue(blob);
+    if (stage === "request") vi.mocked(downloadAdministrativeAuditCsv).mockRejectedValueOnce(failure);
+    else vi.mocked(downloadFile).mockImplementationOnce(() => { throw failure; });
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    const button = screen.getByRole("button", { name: "Export current audit page CSV" });
+
+    await act(async () => { button.click(); button.click(); });
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledOnce();
+    expect(screen.getByRole("alert")).toHaveTextContent(failure.message);
+    expect(button).toBeEnabled();
+    expect(screen.getByRole("region", { name: "Audit events" })).toBeVisible();
+
+    await act(async () => { button.click(); button.click(); });
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledTimes(2);
+    expect(downloadFile).toHaveBeenLastCalledWith("administrative-audit.csv", blob);
+    expect(downloadFile).toHaveBeenCalledTimes(stage === "activation" ? 2 : 1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(button).toBeEnabled();
+    expect(getAuditEvents).toHaveBeenCalledOnce();
+  });
+
   it("withholds prior audit rows and CSV actions while a different exact filter is loading", async () => {
     let finish!: (value: { count: number; value: AuditEvent[] }) => void;
     vi.mocked(getAuditEvents).mockResolvedValueOnce({ count: 1, value: [associationEvent] })
@@ -312,6 +801,7 @@ describe("AuditLogView routing", () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [associationEvent] });
     render(<AuditLogView agents={[]} />, { reactStrictMode: true });
     expect(await screen.findByRole("region", { name: "Audit events" })).toBeVisible();
+    expect(vi.mocked(getAuditEvents).mock.calls.filter(([, options]) => !options?.signal?.aborted)).toHaveLength(1);
     expect(downloadAdministrativeAuditCsv).not.toHaveBeenCalled();
   });
 
@@ -340,6 +830,7 @@ describe("AuditLogView routing", () => {
       await first.findByRole("region", { name: "Audit events" });
       await second.findByRole("region", { name: "Audit events" });
       const initialCalls = vi.mocked(getAuditEvents).mock.calls.length;
+      expect(initialCalls).toBe(1);
       phase = "old";
       await userEvent.click(first.getByRole("button", { name: "Refresh audit log" }));
       expect(getAuditEvents).toHaveBeenCalledTimes(initialCalls + 1);

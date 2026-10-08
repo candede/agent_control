@@ -1,18 +1,38 @@
-import { useState } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import { QueryClientProvider, useQuery } from "@tanstack/react-query";
 import type { InventoryConnectorOperation, PowerPlatformResource } from "../../../backend/src/types/powerPlatformInventory";
 import { formatPackageFacetLabel } from "../../../backend/src/types/copilotPackage";
-import { getInventoryChildren } from "../api/client";
-import { useSavedQuery } from "../savedQueries";
+import { ApiError, getInventoryChildren } from "../api/client";
+import { useSavedQueryClient } from "../savedQueries";
 import { useReportPrincipalScope } from "../useReportPage";
 
-type Props = { selectionId: string; recordId: string; source: NonNullable<PowerPlatformResource["savedSource"]> };
-type Fact = Awaited<ReturnType<typeof getInventoryChildren>>["value"][number];
-function useConfigurationPage({ selectionId, recordId, source }: Props, kind: string, value?: string) {
+type Props = {
+  selectionId: string; recordId: string; source: NonNullable<PowerPlatformResource["savedSource"]>; onInvalidated?: () => void;
+};
+type Page = Awaited<ReturnType<typeof getInventoryChildren>>;
+type Fact = Page["value"][number];
+function selectionInvalidated(error: Error | null) {
+  return error instanceof ApiError && error.code === "selection_invalidated";
+}
+function useConfigurationPage({ selectionId, recordId, source, onInvalidated }: Props, kind: string, value?: string) {
   const principal = useReportPrincipalScope();
-  const [cursors, setCursors] = useState<(string | undefined)[]>([undefined]);
+  const client = useSavedQueryClient();
+  const owner = JSON.stringify([principal, selectionId, recordId, source.scopeId, source.identity, kind, value]);
+  const [navigation, setNavigation] = useState<{ owner: string; cursors: (string | undefined)[]; paged?: boolean }>({ owner, cursors: [undefined] });
+  const cursors = navigation.owner === owner ? navigation.cursors : [undefined];
+  if (navigation.owner !== owner) setNavigation({ owner, cursors });
   const cursor = cursors.at(-1);
-  const read = useSavedQuery({
-    queryKey: ["saved", "agent-configuration", principal, selectionId, recordId, source, kind, value, cursor], gcTime: 0,
+  const queryKey = ["saved", "agent-configuration", principal, selectionId, recordId, source, kind, value, cursor];
+  const pageKey = JSON.stringify([owner, cursor]);
+  const actions = useRef<{ key: string; moved: boolean } | undefined>(undefined);
+  useLayoutEffect(() => {
+    actions.current = { key: pageKey, moved: false };
+    return () => { actions.current = undefined; };
+  }, [client, pageKey]);
+  const read = useQuery<Page>({
+    // A selection pins immutable rows; share them while observed, but do not retain abandoned pages.
+    queryKey, staleTime: Infinity, gcTime: 0,
+    enabled: query => !selectionInvalidated(query.state.error),
     queryFn: async ({ signal }) => {
       const page = await getInventoryChildren(selectionId, recordId,
         { source_scope_id: source.scopeId, source_identity: source.identity }, kind, cursor, { signal, value, limit: 10 });
@@ -23,22 +43,65 @@ function useConfigurationPage({ selectionId, recordId, source }: Props, kind: st
       }
       return page;
     },
-  });
-  return { ...read, previous: () => setCursors(values => values.slice(0, -1)), canPrevious: cursors.length > 1,
-    next: () => { if (read.data?.nextCursor) setCursors(values => [...values, read.data!.nextCursor!]); } };
+  }, client);
+  const invalidated = selectionInvalidated(read.error);
+  const notifyInvalidated = useEffectEvent(() => onInvalidated?.());
+  useEffect(() => {
+    if (!selectionInvalidated(read.error)) return;
+    // A child rejection retires the same selection's parent and sibling reads too.
+    for (const cached of client.getQueryCache().findAll({
+      queryKey: ["saved", "agent-configuration", principal, selectionId],
+    })) {
+      if (selectionInvalidated(cached.state.error)) continue;
+      void client.cancelQueries({ queryKey: cached.queryKey, exact: true });
+      cached.setState({ error: read.error, errorUpdatedAt: Date.now(),
+        errorUpdateCount: cached.state.errorUpdateCount + 1, status: "error", isInvalidated: true });
+    }
+    notifyInvalidated();
+  }, [client, principal, read.error, selectionId]);
+  const page = !read.isError && !read.isFetching ? read.data : undefined;
+  if (page?.nextCursor && (navigation.owner !== owner || !navigation.paged)) setNavigation({ owner, cursors, paged: true });
+  const canPrevious = !invalidated && !read.isFetching && cursors.length > 1;
+  const canNext = !read.isFetching && Boolean(page?.nextCursor);
+  function currentState() {
+    if (actions.current?.key !== pageKey || actions.current.moved) return;
+    const state = client.getQueryState<Page>(queryKey);
+    // Cache notifications can arrive after an already-queued click.
+    if (state?.fetchStatus === "idle" && !selectionInvalidated(state.error)) return state;
+  }
+  return { ...read, client, page, invalidated, paged: navigation.owner === owner && navigation.paged,
+    canPrevious, previous: () => {
+      if (canPrevious && currentState() && actions.current) {
+        actions.current.moved = true;
+        setNavigation({ owner, cursors: cursors.slice(0, -1), paged: true });
+      }
+    },
+    canNext, next: () => {
+      const state = currentState();
+      if (canNext && page?.nextCursor && state?.status === "success" && state.data === page && !state.isInvalidated && actions.current) {
+        actions.current.moved = true;
+        setNavigation({ owner, cursors: [...cursors, page.nextCursor], paged: true });
+      }
+    },
+    retry: () => {
+      if (currentState()?.status === "error") void read.refetch({ cancelRefetch: false });
+    },
+  };
 }
 type Read = ReturnType<typeof useConfigurationPage>;
 function ConfigurationStatus({ read }: { read: Read }) {
-  return read.error ? <p className="error-banner" role="alert">{read.error.message}{" "}
-    <button type="button" className="secondary" onClick={() => { void read.refetch(); }}>Retry configuration</button></p>
-    : read.isPending ? <p role="status">Loading saved configuration...</p> : null;
+  return <>{read.error && !read.isFetching ? <p className="error-banner" role="alert">{read.invalidated
+    ? "This saved inventory selection changed or expired. Reload saved inventory." : <>{read.error.message}{" "}
+      <button type="button" className="secondary"
+        onClick={read.retry}>Retry configuration</button></>}</p> : null}
+    {read.isFetching ? <p role="status">Loading saved configuration...</p> : null}</>;
 }
 function ConfigurationPages({ read, label }: { read: Read; label: string }) {
-  if (!read.data || read.isError || !read.canPrevious && !read.data.nextCursor) return null;
+  if (read.invalidated || !read.paged && !read.page?.nextCursor) return null;
   return <div className="agent-insight-pagination" aria-label={`${label} detail pages`}>
-    <span>{read.data.value.length} shown of {read.data.total.toLocaleString()} saved {label}</span>
-    <button type="button" className="secondary" disabled={!read.canPrevious || read.isFetching} onClick={read.previous}>Previous {label}</button>
-    <button type="button" className="secondary" disabled={!read.data.nextCursor || read.isFetching} onClick={read.next}>Next {label}</button>
+    {read.page ? <span>{read.page.value.length} shown of {read.page.total.toLocaleString()} saved {label}</span> : null}
+    <button type="button" className="secondary" aria-disabled={!read.canPrevious} onClick={read.previous}>Previous {label}</button>
+    <button type="button" className="secondary" aria-disabled={!read.canNext} onClick={read.next}>Next {label}</button>
   </div>;
 }
 function isOperation(value: Record<string, unknown>): value is Record<string, unknown> & InventoryConnectorOperation {
@@ -57,29 +120,29 @@ export function AgentConnectorOperations({ operations }: { operations: Inventory
     </div>)}</dl>
   </li>)}</ul>;
 }
-function SavedOperations({ connector, ...props }: Props & { connector: Fact }) {
-  const read = useConfigurationPage(props, "connectorOperation", connector.value);
-  const rows = read.isError ? undefined : read.data?.value;
+function SavedOperations({ connector, partial, ...props }: Props & { connector: Fact; partial: boolean }) {
+  const read = useConfigurationPage({ ...props, onInvalidated: undefined }, "connectorOperation", connector.value);
+  const rows = read.page?.value;
   return <><ConfigurationStatus read={read} />
     {rows?.length ? <AgentConnectorOperations operations={rows.map(row => {
       if (!isOperation(row.payload)) throw new Error("Invalid saved connector operation.");
       return row.payload;
-    })} /> : rows ? <span>No operations reported.</span> : null}
+    })} /> : rows ? <span>{partial ? "Operation details are incomplete." : "No operations reported."}</span> : null}
     <ConfigurationPages read={read} label="operations" /></>;
 }
-export function SavedAgentConnectors(props: Props) {
+export function SavedAgentConnectors({ partial = false, ...props }: Props & { partial?: boolean }) {
   const read = useConfigurationPage(props, "detail:connectors");
-  const rows = read.isError ? undefined : read.data?.value;
-  return <><ConfigurationStatus read={read} />
+  const rows = read.page?.value;
+  return <QueryClientProvider client={read.client}><ConfigurationStatus read={read} />
     {rows?.length ? <ul className="agent-service-list" aria-label="Configured connector details">
       {rows.map(row => <li key={row.ordinal}><strong>{String(row.payload.connectorId)}</strong>
-        {Array.isArray(row.payload.operations) ? <SavedOperations key={row.ordinal} {...props} connector={row} /> : <span>Operation details not supplied.</span>}
-      </li>)}</ul> : rows ? <p>No configured connectors were reported.</p> : null}
-    <ConfigurationPages read={read} label="connectors" /></>;
+        {Array.isArray(row.payload.operations) ? <SavedOperations key={row.ordinal} {...props} connector={row} partial={partial} /> : <span>Operation details not supplied.</span>}
+      </li>)}</ul> : rows ? <p>{partial ? "Configured connector details are unavailable. Refresh inventory in Sync." : "No configured connectors were reported."}</p> : null}
+    <ConfigurationPages read={read} label="connectors" /></QueryClientProvider>;
 }
 export function SavedAgentChannels(props: Props) {
   const read = useConfigurationPage(props, "detail:channels");
-  return <><ConfigurationStatus read={read} />{!read.isError && read.data
-    ? <>{read.data.value.map(row => formatPackageFacetLabel(row.value)).join(", ") || "Not reported"}</> : null}
+  return <><ConfigurationStatus read={read} />{read.page
+    ? <>{read.page.value.map(row => formatPackageFacetLabel(row.value)).join(", ") || "Not reported"}</> : null}
     <ConfigurationPages read={read} label="channels" /></>;
 }

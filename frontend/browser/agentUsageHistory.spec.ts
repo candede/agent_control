@@ -24,6 +24,7 @@ for (const missing of [false, true]) test(`read-only agent snapshot comparisons 
   const latest = points.at(-1)!, shared = points[0];
   shared.acceptedAt = "2026-10-20T12:00:00Z";
   const metadata = (point: AgentUsageHistoryPoint) => ({ ...selectedFixtureReports, setId: point.setId, activeSetId: shared.setId,
+    acceptedAt: point.acceptedAt,
     reportingPeriod: { startDate: point.reportingStart, endDate: point.reportingEnd, provenance: "activity_range" as const, days: 31 } });
   const record = { ...unifiedAgents.value[0], displayName: "Snapshot trend agent", usage: {
     recordId: unifiedAgents.value[0].id, status: shared.status, reportSetId: shared.setId, responses: shared.responses,
@@ -49,7 +50,8 @@ for (const missing of [false, true]) test(`read-only agent snapshot comparisons 
     });
     if (url.pathname.endsWith("/usage-history")) {
       historyReads++;
-      return route.fulfill({ json: agentUsageHistoryFixture(context(shared), record.id, [...points].reverse()) });
+      return route.fulfill({ json: agentUsageHistoryFixture(context(shared), record.id, points,
+        { limit: Number(url.searchParams.get("limit") ?? 50), cursor: url.searchParams.get("cursor") ?? undefined }) });
     }
     if (url.pathname.endsWith("/usage")) {
       expect(missing ? [latest.setId, points[2].setId] : [latest.setId]).toContain(url.searchParams.get("setId"));
@@ -60,7 +62,7 @@ for (const missing of [false, true]) test(`read-only agent snapshot comparisons 
     if (url.pathname.endsWith("/usage-users")) {
       userReads.push(url.searchParams);
       return route.fulfill({ json: { ...reportPage([{ username: "history.user@example.invalid", displayName: "Historical report user", responses: point.responses ?? 0 }],
-        { reports: metadata(point), selection: { ...reportPage([]).selection, id: pin.id } }), context: context(point) } });
+        { reports: metadata(point), selection: pin }), context: context(point) } });
     }
     return route.fulfill({ json: { value: [], context: context(point), counts: { total: 0, filtered: 0 },
       page: { limit: 50, nextCursor: null, previousCursor: null } } });

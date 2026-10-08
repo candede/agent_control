@@ -38,9 +38,9 @@ export function CsvUsageReportsSection({
     </header>
     <div className="data-sync-details">
       {loading ? <p role="status">Loading reports...</p> : null}
-      {read.isError ? <div className="error-banner" role="alert">
+      {!loading && read.isError ? <div className="error-banner" role="alert">
         {read.error.message || "The CSV report summary could not be loaded."}
-        <button type="button" className="secondary" disabled={loading} onClick={() => void read.refetch()}>Retry</button>
+        <button type="button" className="secondary" onClick={() => void read.refetch({ cancelRefetch: false })}>Retry</button>
       </div> : null}
       {summary ? <>
         <div className="csv-usage-coverage">

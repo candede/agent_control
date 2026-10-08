@@ -87,7 +87,7 @@
 .permission-metadata > div { min-width: 0; }
 .permission-metadata dt { color: #53605a; font-size: 13px; font-weight: 700; }
 .permission-metadata dd { margin: 4px 0 0; }
-.permission-center p, .permission-center dd, .permission-center code, .permission-center li, .permission-center a, .permission-details { overflow-wrap: anywhere; }
+.permission-center p, .permission-center dd, .permission-center code, .permission-center li, .permission-center a, .permission-center .error-banner, .permission-details { overflow-wrap: anywhere; }
 .permission-actions { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
 .permission-actions a { color: #20584d; display: inline-flex; align-items: center; gap: 5px; font-size: 13px; text-underline-offset: 3px; }
 button.permission-text-button { padding: 4px 0; border: 0; border-radius: 0; background: transparent; color: var(--ink); font-size: 13px; text-decoration: underline; text-underline-offset: 3px; }
@@ -98,7 +98,7 @@ button.permission-text-button { padding: 4px 0; border: 0; border-radius: 0; bac
 .permission-details .permission-metadata { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: 13px; }
 .preview-badge { display: inline-flex; padding: 4px 8px; font-size: 13px; font-weight: 700; border: 1px solid #786650; border-radius: 4px; background: #fff8e6; color: #594313; }
 .preview-badge { position: relative; cursor: help; }
-.preview-badge [role="tooltip"] { display: none; position: absolute; right: 0; top: 100%; width: 230px; max-width: 65vw; padding: 12px; background: #fffdf7; color: #10211f; border: 1px solid #53605a; z-index: 10; font-weight: 400; }
+.preview-badge [role="tooltip"] { display: none; position: absolute; left: 0; top: 100%; width: 230px; max-width: 65vw; padding: 12px; background: #fffdf7; color: #10211f; border: 1px solid #53605a; z-index: 10; font-weight: 400; }
 .preview-badge:hover [role="tooltip"], .preview-badge:focus [role="tooltip"] { display: block; }
 .capability-gate { display: inline-flex; flex-direction: column; gap: 6px; min-width: 0; max-width: 100%; vertical-align: top; }
 .gate-explanation { display: grid; gap: 4px; max-width: 300px; color: #644236; font-size: 12px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }

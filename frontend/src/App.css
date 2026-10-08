@@ -854,6 +854,13 @@ select {
   cursor: pointer;
 }
 
+@media (forced-colors: active) {
+  select {
+    appearance: auto;
+    background-image: none;
+  }
+}
+
 select.active-filter-select {
   border-color: #b66a2c;
   background-color: #fff8ec;
@@ -887,6 +894,11 @@ button:hover,
 }
 
 button:disabled,
+select:disabled,
+.report-export a[aria-disabled="true"],
+.report-facet select[aria-disabled="true"],
+.inventory-facet select[aria-disabled="true"],
+.report-facet-pages button[aria-disabled="true"],
 .copilot-users-pagination button[aria-disabled="true"] {
   cursor: not-allowed;
   opacity: 0.58;
@@ -1274,6 +1286,7 @@ button.secondary:hover,
 
 .selected-principals {
   min-width: 0;
+  container: selected-principals / inline-size;
   overflow: hidden;
   border: 1px solid #e2ded4;
   border-radius: 7px;
@@ -1344,6 +1357,27 @@ button.secondary:hover,
 .selected-principals-empty {
   padding: 18px;
   text-align: center;
+}
+
+@container selected-principals (max-width: 560px) {
+  .selected-principals-header {
+    display: none;
+  }
+
+  .principal-row {
+    grid-template-columns: 34px minmax(0, 1fr) 34px;
+    gap: 5px 10px;
+  }
+
+  .principal-row small,
+  .principal-type {
+    grid-column: 2;
+  }
+
+  .principal-row .icon-button {
+    grid-column: 3;
+    grid-row: 1 / span 3;
+  }
 }
 
 .principal-search-row {
@@ -2837,6 +2871,7 @@ button.audit-result-button:focus-visible {
 
 .error-banner {
   padding: 14px 16px;
+  overflow-wrap: anywhere;
   color: #7c211b;
   background: #fff0ea;
 }
@@ -2937,6 +2972,10 @@ button.audit-result-button:focus-visible {
   border-radius: 8px;
   background: var(--surface);
   box-shadow: 0 22px 70px rgba(16, 33, 31, 0.24);
+}
+
+dialog.inventory-detail-modal:not([open]) {
+  display: none;
 }
 
 .inventory-detail-modal::backdrop {
@@ -3425,25 +3464,6 @@ button.audit-result-button:focus-visible {
 
   .access-change-control {
     align-self: start;
-  }
-
-  .selected-principals-header {
-    display: none;
-  }
-
-  .principal-row {
-    grid-template-columns: 34px minmax(0, 1fr) 34px;
-    gap: 5px 10px;
-  }
-
-  .principal-row small,
-  .principal-type {
-    grid-column: 2;
-  }
-
-  .principal-row .icon-button {
-    grid-column: 3;
-    grid-row: 1 / span 3;
   }
 
   .modal-backdrop {

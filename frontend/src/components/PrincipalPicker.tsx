@@ -7,6 +7,9 @@ import {
 
 type PrincipalFilter = "all" | "users" | "security" | "microsoft365";
 
+const searchLimit = 40;
+const maxSearchQueryLength = 120;
+
 type PrincipalPickerProps = {
   selected: DirectoryPrincipal[];
   onChange: (selected: DirectoryPrincipal[]) => void;
@@ -19,11 +22,15 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
   const [results, setResults] = useState<DirectoryPrincipal[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  const [settledQuery, setSettledQuery] = useState<string>();
+  const normalizedQuery = query.trim();
+  const queryTooLong = normalizedQuery.length > maxSearchQueryLength;
+  const displayedError = queryTooLong
+    ? `Directory searches cannot exceed ${maxSearchQueryLength} characters.`
+    : error;
 
   useEffect(() => {
-    const normalized = query.trim();
-
-    if (disabled || normalized.length < 2) {
+    if (disabled || normalizedQuery.length < 2 || queryTooLong || settledQuery === normalizedQuery) {
       return;
     }
 
@@ -33,7 +40,7 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
       setError(undefined);
 
       try {
-        const response = await searchDirectoryPrincipals(normalized, 40, { signal: controller.signal });
+        const response = await searchDirectoryPrincipals(normalizedQuery, searchLimit, { signal: controller.signal });
         if (!controller.signal.aborted) {
           setResults(response.value);
         }
@@ -45,6 +52,7 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
       } finally {
         if (!controller.signal.aborted) {
           setLoading(false);
+          setSettledQuery(normalizedQuery);
         }
       }
     }, 300);
@@ -53,7 +61,7 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
       controller.abort();
       window.clearTimeout(timerId);
     };
-  }, [disabled, query]);
+  }, [disabled, normalizedQuery, queryTooLong, settledQuery]);
 
   const selectedKeys = new Set(selected.map(principalKey));
   const visibleResults = results.filter(
@@ -73,11 +81,15 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
               type="search"
               value={query}
               disabled={disabled}
+              aria-invalid={queryTooLong || undefined}
               placeholder="Name or email"
               onChange={(event) => {
                 const nextQuery = event.target.value;
-                const canSearch = nextQuery.trim().length >= 2;
+                const nextNormalizedQuery = nextQuery.trim();
+                const canSearch = nextNormalizedQuery.length >= 2 && nextNormalizedQuery.length <= maxSearchQueryLength;
                 setQuery(nextQuery);
+                if (nextNormalizedQuery === normalizedQuery) return;
+                setSettledQuery(undefined);
                 setResults([]);
                 setError(undefined);
                 setLoading(canSearch);
@@ -106,17 +118,24 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
         className="principal-results"
         role="group"
         aria-label="Directory results"
+        aria-busy={loading && !disabled}
       >
-        {loading && !disabled ? <p role="status">Searching directory...</p> : null}
-        {error ? <p className="inline-error">{error}</p> : null}
-        {!loading && !error && query.trim().length < 2 ? (
+        {loading ? <p role="status">{disabled
+          ? "Directory search is paused until editing resumes."
+          : "Searching directory..."}</p> : null}
+        {displayedError ? <p className="inline-error" role="alert">{displayedError}</p> : null}
+        {error ? <p>Change the search, or clear and re-enter it to try again.</p> : null}
+        {!loading && !displayedError && normalizedQuery.length < 2 ? (
           <p>Enter at least two characters.</p>
         ) : null}
+        {!loading && !displayedError && settledQuery === normalizedQuery ? (
+          <p>Search returns up to {searchLimit} users and groups. Type filters apply only to these results; refine your search if a principal is missing.</p>
+        ) : null}
         {!loading &&
-        !error &&
-        query.trim().length >= 2 &&
+        !displayedError &&
+        settledQuery === normalizedQuery &&
         visibleResults.length === 0 ? (
-          <p>No matching unselected principals.</p>
+          <p>No matching unselected principals in these results.</p>
         ) : null}
         {visibleResults.map((principal) => (
           <button

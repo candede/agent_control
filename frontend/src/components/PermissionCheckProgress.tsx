@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { LoaderCircle } from "lucide-react";
-import { getCapabilityCheckProgress, type CapabilityCheckProgress, type CapabilityView } from "../api/client";
+import { ApiError, captureRequestSession, getCapabilityCheckProgress, type CapabilityCheckProgress, type CapabilityView } from "../api/client";
 import { permissionFeatureName } from "../permissionIssues";
 import { retryPermissionRead } from "../useCapabilities";
 
@@ -11,52 +11,89 @@ type Props = {
 };
 
 export function PermissionCheckProgress(props: Props) {
-  return <CheckRun key={props.activeCheck?.id ?? "catalog"} {...props} />;
+  return <CheckRun key={props.activeCheck ? `${props.activeCheck.id}:${props.activeCheck.retryFailed}` : "catalog"} {...props} />;
 }
 
 function CheckRun({ loading, activeCheck, views }: Props) {
   const [progress, setProgress] = useState<CapabilityCheckProgress>();
   const [unavailable, setUnavailable] = useState(false);
+  const checkId = activeCheck?.id;
+  const retryFailed = activeCheck?.retryFailed;
   useEffect(() => {
-    if (!activeCheck) return;
-    const controller = new AbortController();
+    if (checkId === undefined) return;
+    const assertCurrentSession = captureRequestSession();
+    let controller = new AbortController();
     let timer: number | undefined;
+    let retryAt = 0;
     let reading = false;
+    let stopped = false;
+    let hidden = document.visibilityState === "hidden";
     const poll = async () => {
-      if (controller.signal.aborted || reading || document.visibilityState === "hidden") return;
+      if (stopped || reading || document.visibilityState === "hidden") return;
+      const current = new AbortController();
+      controller = current;
       reading = true;
+      let nextPollDelay = 1_000;
       try {
+        assertCurrentSession();
+        const remainingCooldown = retryAt - Date.now();
+        if (remainingCooldown > 0) {
+          nextPollDelay = remainingCooldown;
+          return;
+        }
         const result = await retryPermissionRead(() => getCapabilityCheckProgress({
-          signal: controller.signal, retryFailed: activeCheck.retryFailed,
-        }), controller.signal);
-        if (!controller.signal.aborted) {
+          signal: current.signal, retryFailed,
+        }), current.signal);
+        if (!current.signal.aborted) {
+          assertCurrentSession();
           setProgress(result.progress ?? undefined);
           setUnavailable(false);
         }
-      } catch {
-        if (!controller.signal.aborted) {
+      } catch (cause) {
+        if (!current.signal.aborted) {
           setProgress(undefined);
-          setUnavailable(true);
+          if (cause instanceof ApiError && cause.kind === "aborted") {
+            stopped = true;
+            current.abort();
+            setUnavailable(false);
+          } else {
+            setUnavailable(true);
+            if (cause instanceof ApiError && [401, 403].includes(cause.status)) stopped = true;
+            const retryAfterMs = cause instanceof ApiError && cause.status === 429 ? (cause.retryAfterSeconds ?? 0) * 1_000 : 0;
+            if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+              nextPollDelay = Math.max(nextPollDelay, retryAfterMs);
+              retryAt = Date.now() + nextPollDelay;
+            }
+          }
         }
       } finally {
-        reading = false;
-        if (!controller.signal.aborted) timer = window.setTimeout(() => void poll(), 1_000);
+        if (controller === current) {
+          reading = false;
+          if (!stopped && !current.signal.aborted) timer = window.setTimeout(() => void poll(), Math.min(nextPollDelay, 2_147_483_647));
+        }
       }
     };
-    const resume = () => {
-      if (document.visibilityState !== "hidden" && !reading) {
+    const visibilityChanged = () => {
+      const wasHidden = hidden;
+      hidden = document.visibilityState === "hidden";
+      if (hidden) {
+        window.clearTimeout(timer);
+        controller.abort();
+        reading = false;
+      } else if (wasHidden) {
         window.clearTimeout(timer);
         void poll();
       }
     };
     timer = window.setTimeout(() => void poll(), 500);
-    document.addEventListener("visibilitychange", resume);
+    document.addEventListener("visibilitychange", visibilityChanged);
     return () => {
+      stopped = true;
       controller.abort();
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", resume);
+      document.removeEventListener("visibilitychange", visibilityChanged);
     };
-  }, [activeCheck]);
+  }, [checkId, retryFailed]);
 
   const checks = progress?.checks.flatMap(check => {
     const view = views.find(item => item.definition.id === check.capabilityId);

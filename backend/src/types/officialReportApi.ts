@@ -18,6 +18,7 @@ export type OfficialReportBundlePreview = {
     reconciliation: OfficialReportPreview["reconciliation"] }>;
 };
 export type OfficialReportBundleAcceptance = { bundleHash: string; expectedActiveRevision: string };
+export type OfficialReportBundleInspection = { forDiscard?: boolean };
 export type OfficialReportAccepted = { setId: string; activeRevision: string; complete: boolean };
 export type OfficialReportConfirmation = { id: string; setId: string; operation: "select" | "delete";
   activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };

@@ -1,4 +1,5 @@
 import type { CopilotPackage } from "./copilotPackage.js";
+import { normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 import type { CandidateAgentUsageSummary } from "./officialReportApi.js";
 import type { ReportMetadata } from "./officialReportData.js";
 import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
@@ -48,7 +49,7 @@ export function unifiedAgentRecordId(target: UnifiedAgentTarget) {
   return target.source === "canonical" ? `agent:${target.agentId.toLowerCase()}`
     : target.source === "graph_packages"
     ? `graph_packages:${encodeURIComponent(target.packageId)}`
-    : `power_platform:${encodeURIComponent(target.environmentId ?? "")}:${encodeURIComponent(target.nativeId)}`;
+    : `power_platform:${encodeURIComponent(target.environmentId?.toLowerCase() ?? "")}:${encodeURIComponent(normalizeNativeIdentity(target.nativeId))}`;
 }
 
 export function parseUnifiedAgentRecordId(value: string): UnifiedAgentTarget | undefined {

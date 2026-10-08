@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, type RenderOptions } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -44,6 +44,7 @@ function capabilities(directoryAllowed: boolean, now: number): CapabilityView[] 
 function renderAccessModal(
   directoryAllowed: boolean,
   overrides: Partial<ComponentProps<typeof AccessAssignmentModal>> = {},
+  options: Pick<RenderOptions, "reactStrictMode"> = {},
 ) {
   let props: ComponentProps<typeof AccessAssignmentModal> = {
     context: "single", agentCount: 1, initialStatus: "some", initialPrincipals: principals,
@@ -59,7 +60,7 @@ function renderAccessModal(
       <AccessAssignmentModal {...props} />
     </WorkbenchActionProvider></CapabilityContext>;
   };
-  const result = render(content());
+  const result = render(content(), options);
   return {
     ...result,
     props,
@@ -77,8 +78,9 @@ function renderAccessModal(
 function pendingDirectoryLookup() {
   type Response = Awaited<ReturnType<typeof api.resolveDirectoryPrincipals>>;
   let resolve!: (response: Response) => void;
-  const promise = new Promise<Response>(complete => { resolve = complete; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<Response>((complete, fail) => { resolve = complete; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function pendingAccessUpdate() {
@@ -88,6 +90,26 @@ function pendingAccessUpdate() {
 }
 
 describe("AccessAssignmentModal scope-dependent directory resolution", () => {
+  it("admits initial directory resolution once during Strict Mode effect replay", async () => {
+    const request = pendingDirectoryLookup();
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockReturnValue(request.promise);
+    renderAccessModal(true, {}, { reactStrictMode: true });
+
+    await waitFor(() => expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) }));
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    await act(async () => request.resolve({ value: resolved }));
+    expect(screen.getByText("Assigned user")).toBeVisible();
+  });
+
+  it("does not admit directory resolution if the editor closes before admission", async () => {
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: resolved });
+    const { unmount } = renderAccessModal(true);
+    unmount();
+
+    await act(async () => {});
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it.each(["availability", "installation"] as const)(
     "can confirm no users for %s without directory access",
     async target => {
@@ -118,6 +140,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
 
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    await waitFor(() => expect(resolve).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
     expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
     expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
@@ -154,7 +177,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
 
     expect(resolve).not.toHaveBeenCalled();
     setDirectoryAllowed(true);
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
+    await waitFor(() => expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) }));
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
 
@@ -183,7 +206,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
     expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
   });
 
-  it("ignores a cancelled lookup and waits for the replacement lookup", async () => {
+  it.each(["success", "failure"] as const)("ignores a cancelled lookup's %s while its replacement is pending", async outcome => {
     const first = pendingDirectoryLookup();
     const second = pendingDirectoryLookup();
     const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
@@ -191,11 +214,17 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
       .mockReturnValueOnce(second.promise);
     const { setDirectoryAllowed } = renderAccessModal(true);
 
+    await waitFor(() => expect(resolve).toHaveBeenCalledOnce());
     setDirectoryAllowed(false);
     expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
-    await act(async () => first.resolve({ value: resolved }));
     setDirectoryAllowed(true);
-    expect(resolve).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(resolve).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      if (outcome === "success") first.resolve({ value: resolved });
+      else first.reject(new Error("Obsolete lookup failed."));
+    });
+    expect(screen.queryByText("Assigned user")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
 
@@ -205,13 +234,35 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
   });
 
   it("reports lookup failures without preventing a no-users replacement", async () => {
-    vi.spyOn(api, "resolveDirectoryPrincipals").mockRejectedValue(new Error("Directory lookup failed."));
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockRejectedValue(new Error("Directory lookup failed."));
     renderAccessModal(true);
 
     expect(await screen.findByText("Directory lookup failed.")).toBeVisible();
     expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    expect(screen.queryByText("Directory lookup failed.")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("radio", { name: /Specific users or groups/ }));
+    expect(screen.getByText("Directory lookup failed.")).toBeVisible();
+    expect(resolve).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a failed no-users preview distinct from an initial directory failure", async () => {
+    vi.spyOn(api, "resolveDirectoryPrincipals").mockRejectedValue(new Error("Directory lookup failed."));
+    const onSubmit = vi.fn().mockRejectedValue(new Error("Package preview failed."));
+    renderAccessModal(true, { onSubmit });
+
+    expect(await screen.findByText("Directory lookup failed.")).toBeVisible();
+    fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and apply" }));
+    expect(await screen.findByText("Package preview failed.")).toBeVisible();
+    expect(screen.queryByText("Directory lookup failed.")).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      target: "availability", mode: "replace", scope: "none", principals: [],
+    });
   });
 
   it("keeps no-users replacements behind the package action gate", () => {
@@ -234,7 +285,7 @@ describe("AccessAssignmentModal draft stability", () => {
     const { setProps } = renderAccessModal(true);
 
     setProps({ initialPrincipals: principals.map(principal => ({ ...principal })) });
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
+    await waitFor(() => expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) }));
 
     await act(async () => request.resolve({ value: resolved }));
     expect(screen.getByText("Assigned user")).toBeVisible();
@@ -302,6 +353,63 @@ describe("AccessAssignmentModal draft stability", () => {
 });
 
 describe("AccessAssignmentModal pending submissions", () => {
+  it("admits only one submission when repeated clicks share a React batch", async () => {
+    const request = pendingAccessUpdate();
+    const onSubmit = vi.fn().mockReturnValueOnce(request.promise).mockResolvedValue(undefined);
+    renderAccessModal(false, { initialStatus: "none", initialPrincipals: [], onSubmit });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    const confirm = screen.getByRole("button", { name: "Confirm and apply" });
+
+    act(() => {
+      fireEvent.click(confirm);
+      fireEvent.click(confirm);
+    });
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      target: "availability", mode: "replace", scope: "none", principals: [],
+    });
+    await act(async () => request.reject(new Error("Preview failed.")));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and apply" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+  });
+
+  it.each(["scope", "target", "mode", "principals"] as const)(
+    "retires the failed preview error when the draft's %s changes",
+    async change => {
+      vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: resolved });
+      renderAccessModal(true, {
+        context: "bulk", agentCount: 2,
+        onSubmit: vi.fn().mockRejectedValue(new Error("Previous draft preview failed.")),
+      });
+      expect(await screen.findByText("Assigned user")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm and apply" }));
+      expect(await screen.findByText("Previous draft preview failed.")).toBeVisible();
+
+      if (change === "scope") fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
+      else if (change === "target") fireEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+      else if (change === "mode") fireEvent.click(screen.getByRole("button", { name: "Add" }));
+      else fireEvent.click(screen.getByRole("button", { name: "Remove Assigned user" }));
+
+      expect(screen.queryByText("Previous draft preview failed.")).not.toBeInTheDocument();
+    },
+  );
+
+  it("clears the previous failure when beginning replacement confirmation again", async () => {
+    const onSubmit = vi.fn().mockRejectedValue(new Error("Previous preview failed."));
+    renderAccessModal(false, { initialStatus: "none", initialPrincipals: [], onSubmit });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and apply" }));
+    expect(await screen.findByText("Previous preview failed.")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+    expect(screen.getByText("Confirm replacement")).toBeVisible();
+    expect(screen.queryByText("Previous preview failed.")).not.toBeInTheDocument();
+    expect(onSubmit).toHaveBeenCalledOnce();
+  });
+
   it.each(["availability", "installation"] as const)(
     "locks the %s draft until a failed submission finishes, then permits a confirmed retry",
     async target => {
@@ -348,6 +456,8 @@ describe("AccessAssignmentModal pending submissions", () => {
     const { setProps } = renderAccessModal(true, { context: "bulk", busy: true });
 
     expect(await screen.findByText("Assigned user")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Applying" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Please wait" })).toBeDisabled();
     for (const control of screen.getAllByRole("button")) expect(control).toBeDisabled();
     for (const control of screen.getAllByRole("radio")) expect(control).toBeDisabled();
     expect(screen.getByRole("searchbox")).toBeDisabled();

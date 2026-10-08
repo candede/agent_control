@@ -3,6 +3,7 @@ import { maximumPackageSelection } from "./workbenchRouting";
 
 const storageVersion = 2;
 const storagePrefix = "agent-control:package-selection:v2:";
+const failedClears = new Set<string>();
 
 export type StoredInventorySelection = {
   id: string;
@@ -29,19 +30,29 @@ type StoredPackageSelectionResult =
 export function storePackageSelection(user: SessionUser, selectedIds: string[], inventory?: StoredInventorySelection) {
   const ids = [...new Set(selectedIds)];
   if ((!ids.length && !inventory) || ids.length > maximumPackageSelection || ids.some(id => !validId(id))
-    || inventory && !validInventorySelection(inventory, ids)) return false;
+    || inventory && !validInventorySelection(inventory, ids)) {
+    clearPackageSelection(user);
+    return false;
+  }
   const owner = selectionOwner(user);
   try {
     window.sessionStorage.setItem(storageKey(user), JSON.stringify({
       version: storageVersion, owner, roles: [...user.roles].sort(), ids, ...(inventory ? { inventory } : {}),
     } satisfies StoredSelection));
+    failedClears.delete(owner);
     return true;
   } catch {
+    // A count-only route must not revive an older selection after a failed replacement.
+    clearPackageSelection(user);
     return false;
   }
 }
 
 export function restorePackageSelection(user: SessionUser, expectedCount: number): StoredPackageSelectionResult {
+  if (failedClears.has(selectionOwner(user))) {
+    clearPackageSelection(user);
+    return { status: "unavailable" };
+  }
   try {
     const parsed = JSON.parse(window.sessionStorage.getItem(storageKey(user)) ?? "null") as Partial<StoredSelection> | null;
     if (!parsed || parsed.version !== storageVersion || parsed.owner !== selectionOwner(user) || !Array.isArray(parsed.ids)
@@ -49,7 +60,8 @@ export function restorePackageSelection(user: SessionUser, expectedCount: number
       return { status: "unavailable" };
     }
     const ids = [...new Set(parsed.ids)];
-    if ((parsed.inventory?.count ?? ids.length) !== expectedCount || ids.length > maximumPackageSelection || ids.some(id => !validId(id))
+    if ((!ids.length && !parsed.inventory) || (parsed.inventory?.count ?? ids.length) !== expectedCount
+      || ids.length > maximumPackageSelection || ids.some(id => !validId(id))
       || parsed.inventory !== undefined && !validInventorySelection(parsed.inventory, ids)) {
       return { status: "unavailable" };
     }
@@ -61,11 +73,14 @@ export function restorePackageSelection(user: SessionUser, expectedCount: number
 
 export function clearPackageSelection(user: SessionUser | undefined) {
   if (!user) return;
+  const owner = selectionOwner(user);
   try {
     window.sessionStorage.removeItem(storageKey(user));
-    window.sessionStorage.removeItem(`agent-control:package-selection:v1:${encodeURIComponent(selectionOwner(user))}`);
+    window.sessionStorage.removeItem(`agent-control:package-selection:v1:${encodeURIComponent(owner)}`);
+    failedClears.delete(owner);
   } catch {
-    // Selection storage is optional UI continuity, never an authorization source.
+    // Denied cleanup must not revive retired targets when storage becomes readable again.
+    failedClears.add(owner);
   }
 }
 

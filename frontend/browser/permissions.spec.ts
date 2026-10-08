@@ -8,7 +8,7 @@ import type { ReportAgent, ReportHistorySet, ReportPage, ReportUser } from "../.
 import { capabilityViews, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { selectedFixtureRead, selectedUsersPage } from "../src/test/selectedUsageFixture";
 import { downloadedCsvRows } from "./usageCsvFixture";
-import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
+import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand, permissionLayoutRequestKind } from "./permissionFixtures";
 import { isAutomaticRefreshRequest, mockAutomaticRefresh } from "./automaticRefreshFixtures";
 import { isInventorySelectionRequest } from "./selectedInventoryFixture";
 
@@ -277,14 +277,16 @@ test("administrator prerequisites replace in-app consent before and after a miss
     });
   }
   await page.route("**/api/**", route => {
-    const path = new URL(route.request().url()).pathname;
-    if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request()) && !isInventorySelectionRequest(route.request())) posts.push(path);
+    const url = new URL(route.request().url()), path = url.pathname;
+    if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request()) && !isInventorySelectionRequest(route.request())) posts.push(path + url.search);
     if (path === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic administrator", username: "fixture@example.invalid", homeAccountId: "consent-fixture", roles: ["AgentControl.Admin"] },
       csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
     } });
     if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
-    if (path === "/api/capabilities" || path === "/api/capabilities/check") return route.fulfill({ json: { value: views() } });
+    if ((path === "/api/capabilities" || path === "/api/capabilities/check") && permissionLayoutRequestKind(route.request().method(), url)) {
+      return route.fulfill({ json: { value: views() } });
+    }
     if (path === "/api/agents") return route.fulfill({ json: savedPackagePage(new Date().toISOString(), new Date(Date.now() + 300_000).toISOString()) });
     return route.fallback();
   });
@@ -333,8 +335,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
   await check.click();
   await expect(packageIssue).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Issues", exact: true }).getByText("No issues reported.", { exact: true })).toBeVisible();
-  expect(posts.length).toBeGreaterThanOrEqual(3);
-  expect(posts.every(path => path === "/api/capabilities/check")).toBe(true);
+  expect(posts).toEqual(["/api/capabilities/check", "/api/capabilities/check?retry=failed", "/api/capabilities/check?retry=failed"]);
   expect(unexpectedRequests).toEqual([]);
 });
 
@@ -429,6 +430,7 @@ test("first Agents visit is saved-only and explicit collection enables exact sav
 test("timeout recovery retries failed checks without presenting unused operations as problems", async ({ page }, info) => {
   const now = Date.now();
   let recovered = false;
+  let recoveryRequested = false;
   const requests: string[] = [];
   const unexpected = await mockLayoutApi(page);
   const views = (): CapabilityView[] => capabilityDefinitions.map(definition => {
@@ -438,7 +440,7 @@ test("timeout recovery retries failed checks without presenting unused operation
     const status = disabled ? "not_configured" : timedOut ? "provider_error" : "available";
     return {
       definition, enabled: !disabled,
-      ...(disabled ? { configuration: { enabled: false, sharedDataScope: false } } : {}),
+      ...(disabled ? { configuration: { enabled: false, sharedDataScope: false, revision: 1 } } : {}),
       decision: {
         capabilityId: definition.id, status, authorized: status === "available", fresh: true,
         verification: status !== "available" ? undefined : onDemand ? "on_demand" : definition.mode === "local" ? "local"
@@ -465,8 +467,8 @@ test("timeout recovery retries failed checks without presenting unused operation
     if (route.request().method() === "GET" && ["/api/official-usage/aggregate", "/api/official-usage/users"].includes(url.pathname)) {
       return route.fulfill({ json: {} });
     }
-    if (url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check") {
-      if (url.searchParams.get("retry") === "failed" && requests.filter(path => path === "/api/capabilities/check?retry=failed").length > 1) recovered = true;
+    if ((url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check") && permissionLayoutRequestKind(route.request().method(), url)) {
+      if (permissionLayoutRequestKind(route.request().method(), url) === "retry-failed" && recoveryRequested) recovered = true;
       return route.fulfill({ json: { value: views() } });
     }
     return route.fallback();
@@ -479,10 +481,16 @@ test("timeout recovery retries failed checks without presenting unused operation
   await expect(catalog.getByText("Microsoft did not respond after retrying.", { exact: true })).toBeVisible();
   await expect(issues.getByRole("button", { name: "Details: Package blocking" })).toHaveCount(0);
   await expect(issues.getByText(/Purview|Defender/)).toHaveCount(0);
+  expect(requests.filter(path => path.startsWith("/api/capabilities") && !path.includes("/check-progress"))).toEqual([
+    "/api/capabilities", "/api/capabilities/check?retry=failed",
+  ]);
+  recoveryRequested = true;
   await page.getByRole("button", { name: "Check status", exact: true }).click();
   await expect(issues.getByText("No issues reported.", { exact: true })).toBeVisible();
   await expect(catalog).toHaveCount(0);
-  expect(requests.filter(path => path === "/api/capabilities/check?retry=failed")).toHaveLength(2);
+  expect(requests.filter(path => path.startsWith("/api/capabilities") && !path.includes("/check-progress"))).toEqual([
+    "/api/capabilities", "/api/capabilities/check?retry=failed", "/api/capabilities", "/api/capabilities/check?retry=failed",
+  ]);
   expect(unexpected).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);

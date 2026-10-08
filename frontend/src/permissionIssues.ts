@@ -1,6 +1,6 @@
 import type { CapabilityId, CapabilityView } from "./api/client";
 import { supportsAutomaticCapabilityCheck, type CapabilityDecision } from "../../backend/src/types/capability";
-import { capabilityModeEnabled } from "./capabilityState";
+import { capabilityModeEnabled, currentOperationFailure, evidenceIsFresh } from "./capabilityState";
 
 const featureNames: Partial<Record<CapabilityId, string>> = {
   "graph.package.read.delegated": "Agent inventory",
@@ -32,10 +32,10 @@ export function permissionFeatureName(view: CapabilityView) {
   return featureNames[view.definition.id] ?? view.definition.displayName;
 }
 
-export function isTransientPermissionCheck(view: CapabilityView) {
+export function isTransientPermissionCheck(view: CapabilityView, now = Date.now()) {
   const evidence = view.decision.evidence;
   return view.definition.mode === "delegated" && supportsAutomaticCapabilityCheck(view.definition.id)
-    && view.decision.status === "provider_error" && (
+    && evidenceIsFresh(view, now) && view.decision.status === "provider_error" && (
       ["provider_timeout", "provider_network_error"].includes(evidence?.category ?? "")
       || [408, 500, 502, 503, 504].includes(evidence?.httpStatus ?? 0));
 }
@@ -49,14 +49,11 @@ export function permissionIssue(view: CapabilityView, now = Date.now(), awaiting
   if (!definition.probe.adapterRegistered || !capabilityModeEnabled(view) || definition.mode === "local"
     || view.decision.capabilityId !== definition.id || view.decision.status === "missing_internal_role"
     || view.decision.status === "preview_disabled") return undefined;
-  const failure = view.operationFailure;
-  const operationCheckedAt = Date.parse(failure?.checkedAt ?? "");
-  const operationExpiresAt = Date.parse(failure?.expiresAt ?? "");
-  const decision: CapabilityDecision = failure && Number.isFinite(operationCheckedAt) && operationCheckedAt <= now
-    && Number.isFinite(operationExpiresAt) && operationExpiresAt > now
+  const failure = currentOperationFailure(view, now);
+  const decision: CapabilityDecision = failure
     ? { ...failure, capabilityId: definition.id, authorized: false, fresh: true, previewQualification: "not_required" }
     : view.decision;
-  if (decision === view.decision && awaitingInitialCheck && isTransientPermissionCheck(view)) return undefined;
+  if (decision === view.decision && awaitingInitialCheck && isTransientPermissionCheck(view, now)) return undefined;
   const checkedAt = Date.parse(decision.checkedAt ?? "");
   const expiresAt = Date.parse(decision.expiresAt ?? "");
   if (!decision.fresh

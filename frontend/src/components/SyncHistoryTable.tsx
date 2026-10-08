@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import type { SortingState } from "@tanstack/react-table";
 import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../api/client";
@@ -12,16 +12,32 @@ const pageSize = 10;
 const syncHistorySources = new Set(["data-sync", "package-refresh", "power-platform"]);
 const defaultSorting: SortingState = [{ id: "started", desc: true }];
 
-export function SyncHistoryTable({ state, error, loading = false, onRefresh, onOpenSyncRun }: {
+export function SyncHistoryTable({ state, error, loading = false, refreshing = false, onRefresh, onOpenSyncRun, onOpenSourceJob }: {
   state?: WorkbenchJobsResponse;
   error: string;
   loading?: boolean;
+  refreshing?: boolean;
   onRefresh: () => void;
   onOpenSyncRun?: (runId: string) => void;
+  onOpenSourceJob?: (href: string) => void;
 }) {
   const [outcome, setOutcome] = useState("all");
   const [page, setPage] = useState(0);
   const [sorting, setSorting] = useState<SortingState>(defaultSorting);
+  const action = {};
+  const committed = useRef<{ action: object; changed: boolean } | undefined>(undefined);
+  useLayoutEffect(() => {
+    committed.current = { action, changed: false };
+    return () => { committed.current = undefined; };
+  });
+  function actionIsCurrent() {
+    return committed.current?.action === action && !committed.current.changed;
+  }
+  function admitAction() {
+    if (!actionIsCurrent() || !committed.current) return false;
+    committed.current.changed = true;
+    return true;
+  }
   const jobs = state?.value.filter(job => syncHistorySources.has(job.source) && matchesOutcome(job, outcome))
     .sort((left, right) => left.id.localeCompare(right.id))
     ?? [];
@@ -52,6 +68,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
     sorting,
     getRowId: job => `${job.source}:${job.id}`,
     onSortingChange: update => {
+      if (!admitAction()) return;
       setSorting(previous => typeof update === "function" ? update(previous) : update);
       setPage(0);
     },
@@ -60,7 +77,14 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
   const unavailable = state?.unavailableSources.filter(source => syncHistorySources.has(source.source)) ?? [];
   const lastPage = Math.max(0, Math.ceil(jobs.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
+  if (page !== currentPage) setPage(currentPage);
+  const [tableVisible, setTableVisible] = useState(false);
+  const [paginationVisible, setPaginationVisible] = useState(false);
+  if (state && !tableVisible) setTableVisible(true);
+  if (lastPage > 0 && !paginationVisible) setPaginationVisible(true);
   const rows = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const previousDisabled = !state || currentPage === 0;
+  const nextDisabled = !state || currentPage === lastPage;
 
   return (
     <section className="jobs-view sync-history" aria-labelledby="jobs-heading" aria-busy={loading}>
@@ -69,14 +93,19 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
           <h2 id="jobs-heading">Sync history</h2>
           <p className="jobs-note">Previous collection attempts, separate from your workspace's last successful data.</p>
         </div>
-        <button type="button" className="secondary" onClick={onRefresh}>
+        <button type="button" className="secondary" aria-disabled={refreshing}
+          onClick={() => { if (!refreshing && actionIsCurrent()) onRefresh(); }}>
           <RefreshCw size={15} aria-hidden="true" />Refresh history
         </button>
       </div>
       <div className="sync-history-controls">
         <label className="sync-history-filter">
           Outcome
-          <select value={outcome} onChange={event => { setOutcome(event.target.value); setPage(0); }}>
+          <select value={outcome} onChange={event => {
+            if (event.target.value === outcome || !admitAction()) return;
+            setOutcome(event.target.value);
+            setPage(0);
+          }}>
             <option value="all">All outcomes</option>
             <option value="complete">Complete</option>
             <option value="active">In progress</option>
@@ -84,13 +113,13 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
           </select>
         </label>
       </div>
-      {error ? <div className="error-banner" role="alert">{error}</div> : null}
-      {!state && !error ? <p role="status">Loading sync history...</p> : null}
+      {error && !loading ? <div className="error-banner" role="alert">{error}</div> : null}
+      {loading ? <p role="status">{state ? "Updating sync history..." : "Loading sync history..."}</p> : null}
       {unavailable.length ? <p className="notice" role="status">History is temporarily unavailable for {unavailable.map(source => source.source === "data-sync" ? "sync runs" : source.source === "package-refresh" ? "Graph packages" : "Power Platform").join(" and ")}. Displayed rows may be incomplete.</p> : null}
-      {state && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"
+      {state && !loading && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"
         ? "No recent records match this outcome."
         : "No recent sync history. Your next sync or refresh will appear here."}</p> : null}
-      {rows.length ? (
+      {tableVisible ? (
         <div className="sync-table-scroll" role="region" aria-label="Scrollable sync history" tabIndex={0}>
           <table className="sync-history-table" aria-label="Sync history">
             <ListTableHead table={table} titles={{ duration: "Time from the recorded start to completion" }} />
@@ -115,9 +144,17 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
                   <td><a href={job.source === "data-sync" ? `/sync?syncRun=${encodeURIComponent(job.id)}` : job.href}
                     aria-label={`View details for ${job.label} from ${formatJobInstant(startDate(job))}`}
                     onClick={event => {
-                      if (job.source === "data-sync" && onOpenSyncRun && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+                      if (!actionIsCurrent()) {
+                        event.preventDefault();
+                        return;
+                      }
+                      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                      if (job.source === "data-sync" && onOpenSyncRun) {
                         event.preventDefault();
                         onOpenSyncRun(job.id);
+                      } else if (job.source !== "data-sync" && onOpenSourceJob) {
+                        event.preventDefault();
+                        onOpenSourceJob(job.href);
                       }
                     }}>View details</a></td>
                 </tr>;
@@ -126,12 +163,16 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
           </table>
         </div>
       ) : null}
-      {state ? <div className="sync-history-pagination">
-        <p className="jobs-note">{jobs.length ? `${currentPage * pageSize + 1}-${Math.min((currentPage + 1) * pageSize, jobs.length)} of ${jobs.length} recent records. ` : ""}
+      {tableVisible ? <div className="sync-history-pagination">
+        <p className="jobs-note">{state
+          ? jobs.length ? `${currentPage * pageSize + 1}-${Math.min((currentPage + 1) * pageSize, jobs.length)} of ${jobs.length} recent records. ` : ""
+          : loading ? "Loading recent records. " : "Recent records unavailable. "}
           Recent history only; filters apply to the loaded records.</p>
-        {lastPage > 0 ? <div>
-          <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
-          <button type="button" className="secondary" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>Next</button>
+        {paginationVisible ? <div>
+          <button type="button" className="secondary" aria-disabled={previousDisabled}
+            onClick={() => { if (!previousDisabled && admitAction()) setPage(currentPage - 1); }}>Previous</button>
+          <button type="button" className="secondary" aria-disabled={nextDisabled}
+            onClick={() => { if (!nextDisabled && admitAction()) setPage(currentPage + 1); }}>Next</button>
         </div> : null}
       </div> : null}
       <p className="jobs-note">{state ? <>Last checked <time dateTime={state.polledAt}>{formatJobInstant(state.polledAt)}</time>. </> : null}

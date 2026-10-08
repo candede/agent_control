@@ -12,7 +12,7 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage,
   if (!inventory.verification.checks.sourceScopes && !reasons.size) {
     reasons.add("Saved source coverage is incomplete. Check source permissions and refresh the affected source in Data sync.");
   }
-  const pending = inventory.identityCollection?.pendingPackages ?? 0;
+  const pending = inventoryDetailsPending(inventory);
   const invalid = inventory.identityCollection?.invalidPackages ?? 0;
   if (invalid) reasons.add(`${invalid.toLocaleString()} package${invalid === 1 ? "" : "s"} with invalid matching metadata. Use diagnostics to refresh matching details for the affected packages.`);
   if (!inventory.verification.checks.packageMetadata && !pending && !invalid) {

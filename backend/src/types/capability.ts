@@ -128,6 +128,7 @@ export type CapabilityView = {
   configuration?: {
     enabled: boolean;
     sharedDataScope: boolean;
+    revision: number;
   };
 };
 

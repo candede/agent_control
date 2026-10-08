@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import type { CapabilityView, SessionUser, UnifiedAgentRecord } from "../api/client";
@@ -11,6 +11,13 @@ import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { createInventoryVerification } from "../test/inventoryVerification";
 import { automaticAgentUsageFixture, automaticUsageContext } from "../test/automaticAgentUsageFixture";
 import { usageCoverageLabel } from "../usageInsights";
+import { defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "../agentColumns";
+import { projectVerifiedAgentMutation } from "../packageMutationState";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  window.localStorage.clear();
+});
 
 const packageBase = {
   displayName: "Builder package",
@@ -207,6 +214,129 @@ describe("UnifiedAgentTable", () => {
     expect(onSortChange).toHaveBeenLastCalledWith("responses", "desc");
   });
 
+  it("switches account and tenant column preferences without requesting data or changing sort", () => {
+    const owner = JSON.stringify(["tenant-a", "user-a"]);
+    const otherAccount = JSON.stringify(["tenant-a", "user-b"]);
+    const otherTenant = JSON.stringify(["tenant-b", "user-a"]);
+    saveAgentColumns(owner, { ...defaultAgentColumnVisibility, hosts: true });
+    saveAgentColumns(otherAccount, { ...defaultAgentColumnVisibility, publisher: false });
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const onSortChange = vi.fn();
+    const { update, props } = renderTable({ columnPreferenceOwner: owner, onSortChange });
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
+    update({ columnPreferenceOwner: otherAccount });
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Publisher" })).not.toBeInTheDocument();
+    update({ columnPreferenceOwner: otherTenant });
+    expect(screen.getByRole("columnheader", { name: "Publisher" })).toBeVisible();
+    update({ columnPreferenceOwner: owner });
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "Environment" })).toBeVisible();
+    update({ columnPreferenceOwner: undefined });
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    expect(loadAgentColumns(otherAccount).visibility.publisher).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(onSortChange).not.toHaveBeenCalled();
+    expect(props.onToggleSelection).not.toHaveBeenCalled();
+    expect(props.onViewDetails).not.toHaveBeenCalled();
+    expect(props.onManageAccess).not.toHaveBeenCalled();
+    expect(props.onSetBlocked).not.toHaveBeenCalled();
+  });
+
+  it("shows unsaved column choices with a warning, without carrying them to another account", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("Full", "QuotaExceededError"); });
+    const { update } = renderTable({ columnPreferenceOwner: "owner-a" });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Column preferences could not be saved.");
+    update({ columnPreferenceOwner: "owner-b" });
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Column preferences could not be saved/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    JSON.stringify(["tenant-a", "user-b"]),
+    JSON.stringify(["tenant-b", "user-a"]),
+    undefined,
+  ])("retires the open column picker and its search when the preference owner changes to %s", nextOwner => {
+    const { update } = renderTable({ columnPreferenceOwner: JSON.stringify(["tenant-a", "user-a"]) });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    const search = screen.getByRole("searchbox", { name: "Find columns" });
+    fireEvent.change(search, { target: { value: "Hosts" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
+    update({ records: [{ ...record, displayName: "Updated agent" }] });
+    expect(screen.getByRole("searchbox", { name: "Find columns" })).toBe(search);
+    expect(search).toHaveValue("Hosts");
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    update({ columnPreferenceOwner: nextOwner });
+    expect(screen.queryByRole("dialog", { name: "Choose agent columns" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Columns" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    expect(screen.getByRole("searchbox", { name: "Find columns" })).toHaveValue("");
+    expect(screen.getByRole("checkbox", { name: "Publisher" })).toBeChecked();
+  });
+
+  it("keeps column choices through loading and replacement rows without duplicate storage or data requests", () => {
+    const get = vi.spyOn(Storage.prototype, "getItem");
+    const set = vi.spyOn(Storage.prototype, "setItem");
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const onSortChange = vi.fn();
+    const { update } = renderTable({ columnPreferenceOwner: "owner", onSortChange });
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(set).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
+    expect(set).toHaveBeenCalledTimes(1);
+    update({ records: [], loading: true });
+    expect(screen.getByRole("status")).toHaveTextContent("Loading Copilot agents...");
+    expect(screen.getByRole("checkbox", { name: "Hosts" })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
+    expect(set).toHaveBeenCalledTimes(2);
+    update({ records: [{ ...record, displayName: "Replacement agent" }], loading: false });
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "Environment" })).toBeVisible();
+    expect(screen.queryByText("Loading Copilot agents...")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reset defaults" }));
+    expect(set).toHaveBeenCalledTimes(3);
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(onSortChange).not.toHaveBeenCalled();
+  });
+
+  it("keeps storage failures visible until an explicit successful save, without blocking column changes", () => {
+    saveAgentColumns("owner", defaultAgentColumnVisibility);
+    const key = window.localStorage.key(0)!;
+    window.localStorage.setItem(key, "{");
+    const set = vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => {
+      throw new DOMException("Full", "QuotaExceededError");
+    });
+    const { update } = renderTable({ columnPreferenceOwner: "owner" });
+    expect(screen.getByRole("status")).toHaveTextContent("Column preferences could not be loaded. Default columns are shown.");
+    expect(set).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(key)).toBe("{");
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Column preferences could not be saved.");
+    update({ records: [] });
+    expect(screen.getByRole("status")).toHaveTextContent("Column preferences could not be saved.");
+    expect(screen.getByRole("checkbox", { name: "Hosts" })).toBeChecked();
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem(key)).toBe("{");
+    fireEvent.click(screen.getByRole("button", { name: "Reset defaults" }));
+    expect(set).toHaveBeenCalledTimes(2);
+    expect(loadAgentColumns("owner")).toEqual({ visibility: defaultAgentColumnVisibility });
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it("preserves mounted controls and uses current callbacks after a parent render", () => {
     const { update, props } = renderTable();
     const checkbox = screen.getByRole("checkbox", { name: `Select ${record.displayName}` });
@@ -239,26 +369,33 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("button", { name: "Columns" })).toBeEnabled();
   });
 
-  it("shows automatic report counts only for an available matching snapshot", () => {
+  it.each([false, true])("shows report values only for an available matching snapshot (projected=%s)", projected => {
+    const usage = automaticAgentUsageFixture();
     const { update } = renderTable({
-      records: [{ ...record, usage: automaticAgentUsageFixture() }], usageContext: automaticUsageContext,
+      records: [{
+        ...record, usage,
+        ...(projected ? { columns: { responses: usage.responses, activeUsers: usage.activeUsers,
+          lastActivity: Date.parse(usage.lastActivityDateUtc!) } } : {}),
+      }], usageContext: automaticUsageContext,
     });
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Active users" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Last used" }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
     expect(screen.getByRole("cell", { name: "7" })).toBeVisible();
+    expect(document.querySelector("time")).toHaveAttribute("datetime", usage.lastActivityDateUtc);
     const range = screen.getByText(usageCoverageLabel(automaticUsageContext.reports));
     expect(range.closest(".agent-grid-toolbar")).not.toBeNull();
     expect(screen.queryByText(/Usage covers the selected Microsoft 365 report/)).not.toBeInTheDocument();
     expect(screen.queryByText("Selected report.")).not.toBeInTheDocument();
     update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, setId: "different-snapshot" } } });
-    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(3);
     expect(screen.queryByRole("cell", { name: "181" })).not.toBeInTheDocument();
     update({ usageContext: undefined });
-    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(3);
     update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, availability: "deleted" } } });
-    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(3);
     update({ usageContext: { ...automaticUsageContext, reports: { ...automaticUsageContext.reports, availability: "stale" } } });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
   });
@@ -336,6 +473,23 @@ describe("UnifiedAgentTable", () => {
     expect(checkbox).toBeChecked();
     expect(checkbox).not.toBePartiallyChecked();
     expect(screen.getByText("1 agent selected on this page")).toBeInTheDocument();
+    update({ selectedPackageIds: new Set(), selectedPowerPlatformKeys: new Set() });
+    expect(checkbox).not.toBeChecked();
+    expect(checkbox).not.toBePartiallyChecked();
+  });
+
+  it("preserves mixed selection when the parent declines a target change", () => {
+    const { props, update } = renderTable({ selectedPackageIds: new Set(["package-1"]) });
+    const checkbox = screen.getByRole("checkbox");
+    expect(checkbox).toBePartiallyChecked();
+    fireEvent.click(checkbox);
+    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(record);
+    expect(checkbox).toBePartiallyChecked();
+    update({ records: [...props.records] });
+    expect(checkbox).toBePartiallyChecked();
+    update({ selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
+    expect(checkbox).toBeChecked();
+    expect(checkbox).not.toBePartiallyChecked();
     update({ selectedPackageIds: new Set(), selectedPowerPlatformKeys: new Set() });
     expect(checkbox).not.toBeChecked();
     expect(checkbox).not.toBePartiallyChecked();
@@ -575,6 +729,45 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByText("Not available")).toBeInTheDocument();
   });
 
+  it.each((["block", "unblock", "availability", "installation"] as const).flatMap(operation =>
+    [true, false].map(complete => ({ operation, complete }))))(
+    "replaces only mutation-dependent saved columns for $operation (complete=$complete)",
+    ({ operation, complete }) => {
+      const initiallyBlocked = operation === "unblock";
+      const saved: UnifiedAgentRecord = { ...record, powerPlatformResource: null,
+        packages: [{ ...record.packages[0], isBlocked: initiallyBlocked, availableTo: "all", deployedTo: "all" }],
+        packagesComplete: complete, packageCount: complete ? 1 : 40,
+        columns: { status: initiallyBlocked ? "Blocked" : "Not blocked",
+          availability: initiallyBlocked ? "Not available" : "All users", deployment: "All users",
+          publisher: "Saved publisher", versions: "1 / 2" } };
+      const original = structuredClone(saved);
+      const mutation = operation === "block" || operation === "unblock" ? { isBlocked: operation === "block" }
+        : { accessUpdate: { target: operation, mode: "replace" as const, scope: "none" as const, principals: [] } };
+      const projected = projectVerifiedAgentMutation(saved, new Set([saved.packages[0].id]), mutation);
+      const { update } = renderTable({ records: [projected] });
+      fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+      fireEvent.click(screen.getByRole("checkbox", { name: "Installed for" }));
+      fireEvent.keyDown(document, { key: "Escape" });
+      const cells = () => within(screen.getAllByRole("row")[1]).getAllByRole("cell");
+      const blockChange = "isBlocked" in mutation;
+      expect(cells()[5]).toHaveTextContent(!complete && (blockChange || operation === "availability") ? "Unknown"
+        : operation === "block" || operation === "availability" ? "Not available" : "All users");
+      expect(cells()[6]).toHaveTextContent(!complete && blockChange ? "Unknown" : operation === "block" ? "Blocked" : "Not blocked");
+      expect(cells()[7]).toHaveTextContent(operation === "installation" ? complete ? "No users" : "Unknown" : "All users");
+      expect(screen.getByText("Saved publisher")).toBeVisible();
+      expect(projected.columns?.versions).toBe("1 / 2");
+      expect(saved).toEqual(original);
+      expect(projectVerifiedAgentMutation(saved, new Set(), mutation)).toBe(saved);
+      const unrelated = projectVerifiedAgentMutation(saved, new Set(["off-preview-package"]), mutation);
+      if (complete) expect(unrelated).toBe(saved);
+      else expect(unrelated.columns).toEqual(projected.columns);
+      update({ records: [saved] });
+      expect(cells()[5]).toHaveTextContent(String(saved.columns!.availability));
+      expect(cells()[6]).toHaveTextContent(String(saved.columns!.status));
+      expect(cells()[7]).toHaveTextContent("All users");
+    },
+  );
+
   it.each([false, true])("retains exact one-package quick action callbacks (blocked=%s)", isBlocked => {
     const single = { ...record, packages: [{ ...record.packages[0], isBlocked }] };
     const { props, update } = renderTable({ records: [single] });
@@ -584,6 +777,23 @@ describe("UnifiedAgentTable", () => {
     expect(props.onSetBlocked).toHaveBeenCalledExactlyOnceWith(single, !isBlocked);
     update({ busyPackageId: "package-1" });
     expect(screen.getByRole("button", { name: `${isBlocked ? "Unblock" : "Block"} Builder agent` })).toBeDisabled();
+  });
+
+  it.each([false, true])("does not mistake a bounded package preview for a single-version action target (blocked=%s)", isBlocked => {
+    const grouped = { ...record, packages: [{ ...record.packages[0], isBlocked }], packageCount: 40, packagesComplete: false };
+    const { props, update } = renderTable({ records: [grouped] });
+    expect(screen.queryAllByRole("button", { name: /^Manage access for |^Block |^Unblock / })).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${record.displayName}` }));
+    expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(grouped);
+    fireEvent.click(screen.getByRole("checkbox", { name: `Select ${record.displayName}` }));
+    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(grouped);
+    expect(props.onManageAccess).not.toHaveBeenCalled();
+    expect(props.onSetBlocked).not.toHaveBeenCalled();
+    update({ records: [{ ...grouped, packageCount: 1, packagesComplete: true }] });
+    expect(screen.getByRole("button", { name: `Manage access for ${record.displayName}` })).toBeEnabled();
+    expect(screen.getByRole("button", { name: `${isBlocked ? "Unblock" : "Block"} ${record.displayName}` })).toBeEnabled();
+    update({ records: [grouped] });
+    expect(screen.queryAllByRole("button", { name: /^Manage access for |^Block |^Unblock / })).toHaveLength(0);
   });
 
   it.each(["missing", "stale", "denied", "missing-metadata"] as const)("does not bypass %s capability gates for quick actions", scenario => {

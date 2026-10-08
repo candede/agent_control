@@ -198,6 +198,27 @@ describe("typed canonical identity registry", () => {
     expect((await first.queries.exact(first.selection.id, first.identity, [first.page.value[0].id.slice(6)]))).toHaveLength(1);
   });
 
+  it("resolves selected native GUID aliases case-insensitively while retaining distinct opaque native IDs", async () => {
+    const scope = newScope();
+    const result = await publish(scope, [], [
+      nativeValue(nativeGuid.toUpperCase(), environmentId.toUpperCase()),
+      nativeValue("Opaque/Native"), nativeValue("opaque/native"),
+    ]);
+    for (const nativeId of [nativeGuid, nativeGuid.toUpperCase(), "Opaque/Native", "opaque/native"]) {
+      const recordId = `power_platform:${environmentId.toUpperCase()}:${encodeURIComponent(nativeId)}`;
+      const selected = inventoryPresentation(await result.queries.page(result.selection.id, result.identity, { recordId, limit: 2 }));
+      expect(selected.value).toHaveLength(1);
+      const expected = result.page.value.find(row => row.powerPlatformResource?.nativeId
+        === (nativeId.toLowerCase() === nativeGuid ? nativeGuid.toUpperCase() : nativeId))!;
+      expect(selected.value[0].id).toBe(expected.id);
+      expect((await new LiveInventory(fixture.runtime).record(scope, recordId)).id).toBe(expected.id);
+    }
+    const wrongEnvironment = inventoryPresentation(await result.queries.page(result.selection.id, result.identity, {
+      recordId: `power_platform::${nativeGuid}`, limit: 2,
+    }));
+    expect(wrongEnvironment.value).toEqual([]);
+  });
+
   it("admits unified export audit events only with null blocked state", async () => {
     const scope = newScope(), audit = new AuditLog(scope, fixture.runtime);
     const started = await audit.startEvent({

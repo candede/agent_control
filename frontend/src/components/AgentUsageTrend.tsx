@@ -1,17 +1,17 @@
 import { useId } from "react";
 import type { AgentUsageHistoryPoint, CandidateAgentUsageHistory } from "../../../backend/src/types/officialReportApi";
 import { snapshotChange, usagePeriodLabel } from "../agentUsageTrends";
-import { usageCount, usageDate } from "../usageInsights";
+import { isValidUsageCount, usageCount, usageDate, usageDateRange } from "../usageInsights";
 
 export function AgentUsageTrend({ data, sharedSetId, onPage, loading, disabled }: {
   data: CandidateAgentUsageHistory; sharedSetId?: string | null;
   onPage: (cursor: string) => void; loading: boolean; disabled?: boolean;
 }) {
   const caption = useId();
-  const dated = data.value.filter(point => point.reportingEnd).reverse();
-  const points = [...dated, ...data.value.filter(point => !point.reportingEnd)];
+  const dated = data.value.filter(point => usageDateRange(point.reportingStart, point.reportingEnd)).reverse();
+  const points = [...dated, ...data.value.filter(point => !usageDateRange(point.reportingStart, point.reportingEnd))];
   const latest = dated.at(-1), change = latest ? snapshotChange(latest, dated.at(-2)) : undefined;
-  const maximum = Math.max(1, ...dated.map(point => point.responses ?? 0));
+  const maximum = Math.max(1, ...dated.flatMap(point => isValidUsageCount(point.responses) ? [point.responses] : []));
   const firstDate = Date.parse(dated[0]?.reportingEnd ?? ""), lastDate = Date.parse(latest?.reportingEnd ?? "");
   const x = (point: AgentUsageHistoryPoint) => firstDate === lastDate ? 340
     : 64 + (Date.parse(point.reportingEnd!) - firstDate) / (lastDate - firstDate) * 548;
@@ -20,11 +20,11 @@ export function AgentUsageTrend({ data, sharedSetId, onPage, loading, disabled }
     <header><div><h4>Reported usage trend</h4><p>Response counts across saved report snapshots</p></div>
       {change ? <strong className={change.comparable && change.difference ? change.difference > 0 ? "trend-up" : "trend-down" : undefined}>
         {change.comparable && change.difference ? change.difference > 0 ? "Increasing: " : "Decreasing: "
-          : latest?.responses === null ? "Latest report: " : ""}{change.label}
+          : !isValidUsageCount(latest?.responses) ? "Latest report shown: " : ""}{change.label}
         {change.comparable ? <small>versus the previous report shown</small> : null}
       </strong> : null}
     </header>
-    {dated.some(point => point.responses !== null) ? <svg viewBox="0 0 660 236" role="img"
+    {dated.some(point => isValidUsageCount(point.responses)) ? <svg viewBox="0 0 660 236" role="img"
       aria-label="Reported responses by report end date" aria-describedby={caption}>
       <text x="12" y="18" className="trend-axis-label">Responses</text>
       {[0, 0.5, 1].map(fraction => <g key={fraction}>
@@ -38,7 +38,7 @@ export function AgentUsageTrend({ data, sharedSetId, onPage, loading, disabled }
           {previous && change.comparable ? <line x1={x(previous)} y1={y(previous)} x2={x(point)} y2={y(point)} className="trend-line" /> : null}
           <g className="trend-point">
             <title>{usagePeriodLabel(point)}: {usageCount(point.responses)} responses. {change.label}</title>
-            {point.responses === null
+            {!isValidUsageCount(point.responses)
               ? <path d={`M${x(point) - 5},179 l10,10 m-10,0 l10,-10`} className="trend-missing" />
               : <circle className="trend-dot" cx={x(point)} cy={y(point)} r="5" />}
           </g>
@@ -47,7 +47,8 @@ export function AgentUsageTrend({ data, sharedSetId, onPage, loading, disabled }
       <text x="64" y="208" className="trend-axis-label">{usageDate(dated[0].reportingEnd)}</text>
       {dated.length > 1 ? <text x="612" y="208" textAnchor="end" className="trend-axis-label">{usageDate(latest?.reportingEnd)}</text> : null}
       <text x="338" y="230" textAnchor="middle" className="trend-axis-label">Report end / latest observed date</text>
-    </svg> : <p>{data.latestReported ? "No reported response counts in this page's dated reports." : "No usage reported in saved reports."}</p>}
+    </svg> : <p>{data.counts.total === 0 ? "No CSV reports available. Import a complete CSV report in Sync to see usage."
+      : data.latestReported ? "No reported response counts in this page's dated reports." : "No usage reported in saved reports."}</p>}
     <p id={caption} className="agent-trend-caption">Each point represents an uploaded report. Periods may overlap; values are compared, not added.
       Missing usage is a gap, not zero. Observed activity dates are not verified reporting windows.</p>
     {points.length ? <div className="agent-trend-snapshots">

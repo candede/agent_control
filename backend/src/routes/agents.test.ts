@@ -12,6 +12,7 @@ import { createInventoryMutationsRouter } from "./inventoryMutations.js";
 import { reportIdentity } from "../services/reportIdentity.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
+import { pool } from "../db/pool.js";
 import { capabilities } from "../services/capabilities.js";
 import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
 import type { FetchLike } from "../services/graphPackages.js";
@@ -30,7 +31,7 @@ import {
 } from "./agents.js";
 
 vi.mock("../db/pool.js", () => ({
-  pool: {},
+  pool: { query: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }) },
   secretValue: vi.fn((name: string) => {
     const settings: Record<string, string> = {
       TENANTS_JSON: JSON.stringify([{
@@ -64,6 +65,30 @@ afterEach(() => vi.restoreAllMocks());
 
 const groupId = "11111111-1111-4111-8111-111111111111";
 const userId = "22222222-2222-4222-8222-222222222222";
+
+describe("package job cancellation metadata", () => {
+  it.each([false, true])("exposes requested cancellation in status and history without changing uncertain counts (%s)", async cancelled => {
+    const row = {
+      id: groupId, capability: "graph.package.block.manage", token_mode: "delegated", status: "partial",
+      cancel_requested: cancelled, confirmation_summary: null, confirmed_at: null,
+      action: "block", access_update: null, result_revision: "1", within_budget: true,
+      created_at: new Date("2026-09-24T12:00:00.000Z"), updated_at: new Date("2026-09-24T12:00:00.000Z"),
+      counts: { total: "1", completed: "1", succeeded: "0", failed: "0", skipped: "0", inconclusive: "1",
+        cancelled: "0", queued: "0", reconciliationRequired: "1", retryEligible: "0" },
+    };
+    const response = { rows: [row], command: "SELECT", rowCount: 1, oid: 0, fields: [] };
+    vi.mocked(pool.query).mockResolvedValueOnce(response).mockResolvedValueOnce(response);
+    const jobs = new JobRepository();
+    const scope = { tenantId: groupId, principalId: "operator" };
+    const status = await jobs.get(groupId, scope);
+    const history = await jobs.list(scope);
+    for (const result of [status, history.value[0]]) {
+      expect(result).toMatchObject({ status: "partial", canResume: false, inconclusive: 1, reconciliationRequired: 1 });
+      if (cancelled) expect(result).toHaveProperty("cancelRequested", true);
+      else expect(result).not.toHaveProperty("cancelRequested");
+    }
+  });
+});
 
 describe("package refresh admission responses", () => {
   it.each(["/agents/refresh-jobs", "/agents/:id/refresh-jobs", "/agents/refresh-jobs/:id/resume"])(
@@ -441,7 +466,7 @@ describe("package mutation worker admission", () => {
     vi.spyOn(bulkJobs, "recover").mockResolvedValue(undefined);
 
     expect(await requestMutation("/agents/bulk-jobs/:id/resume", { confirmed: true }))
-      .toHaveBeenCalledWith(expect.objectContaining({ id: receipt.id, status: "queued" }));
+      .toHaveBeenCalledWith(expect.objectContaining({ id: receipt.id, status: "queued", canResume: false }));
     expect(launchBulkJob).toHaveBeenCalledWith(receipt.id, scope, true);
   });
 

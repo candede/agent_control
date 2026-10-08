@@ -11,12 +11,9 @@ export function jobResultCount(job: WorkbenchJobSummary) {
 }
 
 export function formatJobInstant(value?: string) {
-  return value && Number.isFinite(Date.parse(value)) ? formatSyncInstant(value) : "Not recorded";
+  return formatSyncInstant(value);
 }
 
 export function jobDuration(job: WorkbenchJobSummary) {
-  const start = Date.parse(job.startedAt ?? "");
-  const end = Date.parse(job.completedAt ?? "");
-  return Number.isFinite(start) && Number.isFinite(end) && end >= start
-    ? syncDuration(job.startedAt!, job.completedAt!) : "Not recorded";
+  return syncDuration(job.startedAt, job.completedAt);
 }

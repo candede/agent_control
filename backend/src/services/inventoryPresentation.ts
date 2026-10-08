@@ -35,6 +35,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
   const counts = page.verificationCounts;
   const partial = page.partial || graph.state === "unavailable" || native.state !== "available";
   const pendingPackages = counts.packages - counts.checked_packages;
+  const invalidPackages = counts.invalid_packages;
   const identityLinks = page.summary.ambiguous === 0 && page.summary.conflicting === 0;
   const sourceScopes = !partial && counts.represented === counts.unique_sources;
   const value: UnifiedAgentRecord[] = page.value.map(row => {
@@ -59,7 +60,8 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
         quarantineIdentity: resource.quarantine_identity } as PowerPlatformResource : null,
       identity: { state: row.linkState, evidence: row.members[0]?.evidence ?? [],
         packageEvidence: packages.map(member => ({ packageId: member.native_id, evidence: member.evidence })),
-        reason: row.identity?.reason ?? null },
+        reason: row.identity?.reason ?? null,
+        ...(row.identity?.invalidMetadata === true ? { invalidMetadata: true } : {}) },
       observations: {
         graphPackages: graph.observation as UnifiedAgentPackageObservation | null,
         powerPlatform: resource && nativeObservation ? { ...nativeObservation,
@@ -94,14 +96,14 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     inventoryOverview: page.inventoryOverview as UnifiedAgentInventoryPage["inventoryOverview"],
     sources: { graphPackages: graph, powerPlatform: native }, partial,
     errors: [graph.error, native.error].filter((error): error is NonNullable<typeof error> => error !== null),
-    identityCollection: { checkedPackages: counts.checked_packages, pendingPackages,
+    identityCollection: { checkedPackages: counts.checked_packages, pendingPackages, invalidPackages,
       pendingDetails: { missing: Math.max(0, pendingPackages - counts.stale_packages - counts.invalidated_packages),
         stale: counts.stale_packages, invalidated: counts.invalidated_packages } },
-    verification: { status: !sourceScopes || !identityLinks ? "needs_attention" : pendingPackages ? "details_pending" : "verified", scope: "authorized_saved_sources",
+    verification: { status: !sourceScopes || !identityLinks || invalidPackages > 0 ? "needs_attention" : pendingPackages ? "details_pending" : "verified", scope: "authorized_saved_sources",
       checkedAt: new Date(page.selection.evaluatedAt as string).toISOString(), graphPackageCount: counts.packages,
       powerPlatformAgentCount: counts.native_agents, representedSourceCount: counts.represented,
       uniqueSourceCount: counts.unique_sources, logicalAgentCount: page.counts.total,
-      checks: { sourceScopes, packageMetadata: pendingPackages === 0, identityLinks, sourceMemberships: true } },
+      checks: { sourceScopes, packageMetadata: pendingPackages === 0 && invalidPackages === 0, identityLinks, sourceMemberships: true } },
   };
 }
 

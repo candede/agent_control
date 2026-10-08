@@ -63,7 +63,7 @@ export class CapabilityService {
         decision: current,
         enabled: configuration?.enabled ?? true,
         ...(operationFailure ? { operationFailure } : {}),
-        ...(configuration ? { configuration: { enabled: configuration.enabled, sharedDataScope: configuration.sharedDataScope } } : {}),
+        ...(configuration ? { configuration: { enabled: configuration.enabled, sharedDataScope: configuration.sharedDataScope, revision: configuration.revision } } : {}),
       };
     });
     for (const { definition, generation } of entries) this.requireGeneration(definition.id, user, generation);

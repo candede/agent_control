@@ -1,23 +1,8 @@
 import { useEffect, useEffectEvent, useId, useRef, type ReactNode, type RefObject } from "react";
 import { X } from "lucide-react";
-import { trapDialogFocus } from "../dialogFocus";
+import { lockBodyScroll } from "../bodyScrollLock";
+import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import "./workbenchDialog.css";
-
-const bodyScrollLocks = new WeakMap<HTMLElement, { count: number; previousOverflow: string }>();
-
-function lockBodyScroll(body: HTMLElement) {
-  const lock = bodyScrollLocks.get(body) ?? { count: 0, previousOverflow: body.style.overflow };
-  bodyScrollLocks.set(body, lock);
-  lock.count += 1;
-  body.style.overflow = "hidden";
-  return () => {
-    lock.count -= 1;
-    if (lock.count === 0) {
-      body.style.overflow = lock.previousOverflow;
-      bodyScrollLocks.delete(body);
-    }
-  };
-}
 
 export function WorkbenchDialog({ open, title, description, className = "", fallbackFocusRef, onClose, children }: {
   open: boolean;
@@ -42,9 +27,11 @@ export function WorkbenchDialog({ open, title, description, className = "", fall
     const document = element.ownerDocument;
     const opener = document.activeElement;
     element.showModal();
+    const stopObservingFocus = observeDialogFocus(element);
     const unlockBodyScroll = lockBodyScroll(document.body);
     heading.current?.focus();
     return () => {
+      stopObservingFocus();
       element.close();
       unlockBodyScroll();
       if (opener instanceof HTMLElement && opener !== document.body && opener.isConnected) {

@@ -6,17 +6,19 @@ import { automaticSyncSources, syncSourceDetails, syncStatusLabel } from "./sync
 import { WorkbenchDialog } from "./WorkbenchDialog";
 
 export function FirstSyncNotice({
-  state, loading, busy, error, automaticRefresh, cannotStart, onStart, onCheckStatus, onOpenSync,
+  state, loading, busy, error, stale, automaticRefresh, cannotStart, onStart, onCheckStatus, onOpenSync, onOpenPermissions,
 }: {
   state: DataSyncState;
   loading: boolean;
   busy: boolean;
   error: string;
+  stale: boolean;
   automaticRefresh?: AutomaticRefreshStatus;
   cannotStart: boolean;
   onStart: (sources: DataSyncSourceId[]) => void;
   onCheckStatus: () => void;
   onOpenSync: () => void;
+  onOpenPermissions: () => void;
 }) {
   const attempts = state.run?.sources.filter(source => automaticSyncSources.some(id => id === source.source)) ?? [];
   const sources = automaticSyncSources.map(id => {
@@ -33,13 +35,15 @@ export function FirstSyncNotice({
   const needsSignIn = automaticRefresh?.phase === "sign_in_required"
     || progressing && attempts.some(source => source.status === "waiting_authorization");
   const preparing = busy || !state.run && automaticRefresh?.checking;
-  const title = error ? "Sync status is unavailable"
-    : needsAttention ? "First sync needs attention"
-      : collecting ? "Your first sync is in progress"
-        : state.run?.status === "cancelled" ? "First sync was cancelled"
-          : preparing ? "Preparing your first sync" : "Set up your workspace";
-  const automaticMessage = automaticRefresh?.paused ? "Automatic sync is paused for this session. You can still start a sync below."
-    : automaticRefresh && !automaticRefresh.online ? "You are offline. Reconnect to continue syncing."
+  const updating = busy && Boolean(state.run);
+  const title = stale ? "Sync status is unavailable"
+    : updating ? "Updating sync status"
+      : needsAttention ? "First sync needs attention"
+        : collecting ? "Your first sync is in progress"
+          : state.run?.status === "cancelled" ? "First sync was cancelled"
+            : preparing ? "Preparing your first sync" : "Set up your workspace";
+  const automaticMessage = automaticRefresh && !automaticRefresh.online ? "You are offline. Reconnect to continue syncing."
+    : automaticRefresh?.paused ? "Automatic sync is paused for this session. You can still start a sync below."
       : automaticRefresh?.message
         ?? (automaticRefresh && !automaticRefresh.enabled ? "Automatic sync is waiting for workbench access."
           : !state.run ? "Automatic sync starts when this page is visible, online, and authorized." : undefined);
@@ -47,13 +51,14 @@ export function FirstSyncNotice({
   return <WorkbenchDialog open title={title} className="first-sync-dialog"
     description="We're preparing your users and agent inventory. This can take several minutes, especially for large tenants. Your workspace will open automatically when all three sources are saved.">
     <div className="first-sync-notice">
-    {error ? <div className="error-banner" role="alert">{error} Progress below is the last reported status.</div> : null}
+    {error ? <div className="error-banner" role="alert">{error}{stale ? " Progress below is the last reported status." : null}</div> : null}
       <div className="first-sync-completion">
-        <span role="status">{!error && (collecting || preparing)
+        <span role="status">{!stale && !updating && (collecting || preparing)
           ? <LoaderCircle size={18} className="data-sync-spinning" aria-hidden="true" /> : null}
           {savedCount} of {automaticSyncSources.length} sources saved</span>
         <progress aria-label="First sync sources saved" value={savedCount} max={automaticSyncSources.length} />
       </div>
+      {updating ? <p role="status">Progress below is the last reported status while the sync operation finishes.</p> : null}
       <ul className="first-sync-sources" aria-label="First sync sources">
         {sources.map(({ id, saved, observation }) => <li key={id}>
           <div><strong>{syncSourceDetails[id].label}</strong><span>{syncStatusLabel(observation?.status ?? "not_started")}</span></div>
@@ -64,7 +69,7 @@ export function FirstSyncNotice({
           {!saved && observation?.count !== null && observation?.count !== undefined && observation.status === "running"
             ? <p>{observation.count.toLocaleString()} processed in this stage</p> : null}
           {observation?.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
-          {observation?.status === "permission_required" ? <a href="/permissions">Review permissions</a> : null}
+          {observation?.status === "permission_required" ? <button type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button> : null}
         </li>)}
       </ul>
     {automaticMessage ? <p>{automaticMessage}</p> : null}
@@ -73,19 +78,21 @@ export function FirstSyncNotice({
       CSV usage reports are a separate step in Sync and do not block this collection.</p>
     <div className="first-sync-actions">
       {!progressing ? <WorkbenchActionGate actionId="data-sync.start">
-        <button type="button" disabled={cannotStart || Boolean(error) || automaticRefresh?.checking || automaticRefresh?.online === false}
+        <button type="button" disabled={cannotStart || loading || stale || automaticRefresh?.checking || automaticRefresh?.online === false}
           onClick={() => onStart(sources.filter(source => !source.saved).map(source => source.id))}>
           {busy ? "Starting sync..." : state.run ? "Retry incomplete sources" : "Start initial sync"}
         </button>
       </WorkbenchActionGate> : null}
       {error ? <WorkbenchActionGate actionId="data-sync.read" compact>
-        <button type="button" className="secondary" disabled={loading || busy} onClick={onCheckStatus}>Retry status check</button>
+        <button type="button" className="secondary" disabled={loading || busy} onClick={onCheckStatus}>
+          {loading ? "Checking status..." : "Retry status check"}
+        </button>
       </WorkbenchActionGate> : null}
       <button type="button" className="secondary" onClick={onOpenSync}>View sync details</button>
       {needsSignIn && !sources.some(({ observation }) => observation?.status === "waiting_authorization")
         ? <a href="/api/auth/login">Sign in again</a> : null}
       {!sources.some(({ observation }) => observation?.status === "permission_required")
-        ? <a href="/permissions">Review permissions</a> : null}
+        ? <button type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button> : null}
     </div>
     </div>
   </WorkbenchDialog>;

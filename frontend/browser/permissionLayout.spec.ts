@@ -15,7 +15,7 @@ function permissions(): CapabilityView[] {
     const provider = ["graph.package.read.delegated", "graph.directory.read", "powerPlatform.inventory.read"].includes(definition.id);
     return {
       definition, enabled: !application,
-      ...(application ? { configuration: { enabled: false, sharedDataScope: false } } : {}),
+      ...(application ? { configuration: { enabled: false, sharedDataScope: false, revision: 1 } } : {}),
       decision: {
         capabilityId: definition.id, status: application ? "not_configured" : "available",
         authorized: !application, fresh: true,
@@ -334,13 +334,14 @@ test("Check status shows real progress, animated work and reduced-motion feedbac
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   let completeInventory = false;
-  const progressRequests: string[] = [];
+  const progressRequests: Array<{ query: string; startedAt: number }> = [];
   await page.route(url => url.pathname === "/api/capabilities/check", async route => {
     await held;
     return route.fulfill({ json: { value: permissions() } });
   });
   await page.route(url => url.pathname === "/api/capabilities/check-progress", route => {
-    progressRequests.push(new URL(route.request().url()).search);
+    expect(route.request().method()).toBe("GET");
+    progressRequests.push({ query: new URL(route.request().url()).search, startedAt: performance.now() });
     return route.fulfill({ json: { progress: { checks: [
       { capabilityId: "graph.package.read.delegated", state: completeInventory ? "complete" : "checking" },
       { capabilityId: "graph.directory.read", state: "complete" },
@@ -375,7 +376,11 @@ test("Check status shows real progress, animated work and reduced-motion feedbac
   await expectQuietPermissions(page);
   await expect(page.getByRole("region", { name: "Permission check progress" })).toHaveCount(0);
   expect(progressRequests.length).toBeGreaterThanOrEqual(2);
-  expect(progressRequests.every(query => query === "?retry=failed")).toBe(true);
+  expect(progressRequests.every(request => request.query === "?retry=failed")).toBe(true);
+  for (let index = 1; index < progressRequests.length; index++) {
+    // Allow browser/runner clock precision, not extra polling within the one-second cadence.
+    expect(progressRequests[index].startedAt - progressRequests[index - 1].startedAt).toBeGreaterThanOrEqual(950);
+  }
   expect(posts).toEqual(["/api/capabilities/check", "/api/capabilities/check?retry=failed"]);
   expect(unexpected).toEqual([]);
 });

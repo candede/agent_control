@@ -450,6 +450,12 @@
   margin-right: auto;
 }
 
+.agent-insight-pagination button[aria-disabled="true"],
+.agent-insight-toolbar button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .agent-insight-provenance summary {
   cursor: pointer;
   font-weight: 600;

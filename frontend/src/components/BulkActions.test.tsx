@@ -1,15 +1,18 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import { getBulkActionJobItems, type BulkActionJob, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
+import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
+import { ApiError, getBulkActionJobItems, type BulkActionJob, type BulkJobItemPage, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { BulkActions } from "./BulkActions";
+import { BulkJobItems } from "./BulkJobItems";
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getBulkActionJobItems: vi.fn(),
 }));
 beforeEach(() => {
+  vi.mocked(getBulkActionJobItems).mockReset();
   vi.mocked(getBulkActionJobItems).mockResolvedValue({ value: [], revision: "1", counts: { total: 4, filtered: 4 },
     page: { limit: 50, nextCursor: null, previousCursor: null } });
 });
@@ -31,7 +34,11 @@ function mount(overrides: Partial<Parameters<typeof BulkActions>[0]> = {}, roles
     ...overrides,
   };
   const view = render(<CapabilityContext value={{
-    user: { ...user, roles }, views: [], loading: false, pending: false, error: undefined, now: Date.now(),
+    user: { ...user, roles }, views: [{
+      definition: capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!,
+      decision: { capabilityId: "graph.package.block.manage", status: "available", authorized: true, fresh: true,
+        verification: "on_demand", previewQualification: "not_required", remediation: [] },
+    }], loading: false, pending: false, error: undefined, now: Date.now(),
     reload: vi.fn(), openPermissions: vi.fn(),
   }}>
     <WorkbenchActionProvider value={metadata ? workbenchActions : undefined}>
@@ -49,6 +56,20 @@ describe("unified access job panel", () => {
     expect(panel.getByRole("button", { name: "Unblock selected packages" })).toBeVisible();
     expect(panel.getByRole("button", { name: "Manage access" })).toBeVisible();
     expect(panel.queryByRole("group", { name: "Package job progress" })).not.toBeInTheDocument();
+  });
+
+  it("labels preview preparation and permits replacing it with a different action", () => {
+    const { panel } = mount({ selectedCount: 2, preparingAction: "block" });
+    expect(panel.getByRole("status")).toHaveTextContent("Preparing block preview…");
+    expect(panel.getByRole("button", { name: "Block selected packages" })).toBeDisabled();
+    expect(panel.getByRole("button", { name: "Unblock selected packages" })).toBeEnabled();
+  });
+
+  it("does not offer status recovery for a submission that returned no job identity", () => {
+    const { panel } = mount({ selectedCount: 2, jobError: "Submission denied." });
+    expect(panel.getByRole("alert")).toHaveTextContent("Submission denied.");
+    expect(panel.queryByRole("button", { name: "Refresh status" })).not.toBeInTheDocument();
+    expect(panel.getByRole("button", { name: "Block selected packages" })).toBeEnabled();
   });
 
   it("shows one job summary with progress and cancellation, not duplicate or disabled selection actions", async () => {
@@ -106,10 +127,15 @@ describe("unified access job panel", () => {
     expect(await panel.findByText("Provider response lost.")).toBeVisible();
   });
 
-  it.each(["cancel", "resume", "reconcile"] as const)("disables recovery controls while %s is pending", operation => {
+  it.each(["cancel", "resume", "reconcile"] as const)("disables recovery controls while %s is pending", async operation => {
+    vi.mocked(getBulkActionJobItems).mockResolvedValueOnce({
+      value: [{ id: "result", displayName: "Saved result", status: "succeeded" }], revision: "1",
+      counts: { total: 4, filtered: 4 }, page: { limit: 1, nextCursor: "next", previousCursor: "previous" },
+    });
     const { panel } = mount({ jobCommand: operation, job: {
       ...running, status: "partial", canResume: true, inconclusive: 1, reconciliationRequired: 1,
     } });
+    await panel.findByText("Saved result");
     for (const button of panel.getAllByRole("button")) expect(button).toBeDisabled();
     expect(panel.getByRole("status")).toHaveTextContent(operation === "cancel" ? "Cancelling" : operation === "resume" ? "Resuming" : "Checking results");
   });
@@ -132,6 +158,18 @@ describe("unified access job panel", () => {
     expect(panel.queryByRole("button", { name: /Cancel|Resume/ })).not.toBeInTheDocument();
   });
 
+  it.each(["running", "partial"] as const)("does not offer unavailable reconciliation or repeat cancellation after a %s job was cancelled", async status => {
+    vi.mocked(getBulkActionJobItems).mockResolvedValue({
+      value: [{ id: "uncertain", displayName: "Uncertain agent", status: "inconclusive", reconciliationStatus: "required" }],
+      revision: "1", counts: { total: 4, filtered: 4 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+    });
+    const { panel } = mount({ job: { ...running, status, cancelRequested: true, inconclusive: 1, reconciliationRequired: 1 } });
+    expect(panel.queryByRole("button", { name: /Check uncertain results|Cancel unprocessed tasks|Resume unprocessed tasks/ })).not.toBeInTheDocument();
+    expect(panel.getByText(/cancelled jobs cannot be reconciled or resumed/)).toBeVisible();
+    expect(panel.getByText("1 uncertain")).toBeVisible();
+    expect(await panel.findByText("Uncertain agent")).toBeVisible();
+  });
+
   it("uses the right operation for access jobs and keeps request errors in the panel", () => {
     const { panel } = mount({
       job: { ...running, action: "update-installation", targetBlockedState: undefined,
@@ -152,5 +190,67 @@ describe("unified access job panel", () => {
     const { panel, props } = mount({ job: running, jobError: "Automatic status updates paused." });
     await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
     expect(props.onJobCommand).toHaveBeenCalledExactlyOnceWith("refresh");
+  });
+
+  it("labels interrupted status as last reported without implying that polling is still running", () => {
+    const { panel, container } = mount({ job: running, jobError: "Automatic status updates paused." });
+    expect(panel.getByRole("status")).toHaveTextContent("Last reported: Running");
+    expect(panel.getByText(/Last reported agent:/)).toHaveTextContent("Support agent");
+    expect(container.querySelector(".agent-refresh-spinner")).not.toBeInTheDocument();
+    expect(panel.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+  });
+
+  it("keeps current status while following running work after a cancellation failure", () => {
+    const { panel, container } = mount({ job: running, busyAction: "block", jobError: "Cancellation unavailable." });
+    expect(panel.getByRole("status")).toHaveTextContent(/^Running$/);
+    expect(panel.getByText(/Current agent:/)).toHaveTextContent("Support agent");
+    expect(container.querySelector(".agent-refresh-spinner")).toBeInTheDocument();
+  });
+
+  it("retries a failed result page once without refreshing the job or replaying a mutation", async () => {
+    let resolve!: (page: BulkJobItemPage) => void;
+    vi.mocked(getBulkActionJobItems).mockRejectedValueOnce(new Error("Result read unavailable."))
+      .mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const { panel, props } = mount({ job: running });
+    expect(await panel.findByRole("alert")).toHaveTextContent("Result read unavailable.");
+    const retry = panel.getByRole("button", { name: "Retry results" });
+    act(() => { fireEvent.click(retry); fireEvent.click(retry); });
+    await waitFor(() => expect(getBulkActionJobItems).toHaveBeenCalledTimes(2));
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(panel.getByText("Loading job results…")).toBeVisible();
+    await act(async () => resolve({ value: [], revision: "1", counts: { total: 4, filtered: 4 },
+      page: { limit: 50, nextCursor: null, previousCursor: null } }));
+    expect(panel.getByText("No results.")).toBeVisible();
+    expect(props.onJobCommand).not.toHaveBeenCalled();
+  });
+
+  it("offers status recovery when only the result-page revision has expired", async () => {
+    vi.mocked(getBulkActionJobItems).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "changed"));
+    const { panel, props } = mount({ job: { ...running, status: "partial" } });
+    expect(await panel.findByRole("alert")).toHaveTextContent("Job results changed");
+    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
+    expect(props.onJobCommand).toHaveBeenCalledExactlyOnceWith("refresh");
+    expect(getBulkActionJobItems).toHaveBeenCalledOnce();
+  });
+
+  it.each(["owner", "job", "revision"] as const)("cancels obsolete result reads across a changed %s and ignores late results", async boundary => {
+    let resolve!: (page: BulkJobItemPage) => void;
+    vi.mocked(getBulkActionJobItems).mockImplementationOnce(() => new Promise(done => { resolve = done; }))
+      .mockResolvedValueOnce({ value: [{ id: "new", displayName: "Current result", status: "succeeded" }],
+        revision: "2", counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
+    const view = render(<BulkJobItems job={running} owner="first-session" />);
+    await waitFor(() => expect(getBulkActionJobItems).toHaveBeenCalledOnce());
+    const signal = vi.mocked(getBulkActionJobItems).mock.calls[0][2]!.signal!;
+    view.rerender(<BulkJobItems owner={boundary === "owner" ? "next-session" : "first-session"}
+      job={{ ...running, id: boundary === "job" ? "next-job" : running.id, resultRevision: boundary === "revision" ? "2" : "1" }} />);
+    expect(await screen.findByText("Current result")).toBeVisible();
+    expect(signal.aborted).toBe(true);
+    await act(async () => resolve({
+      value: [{ id: "old", displayName: "Retired result", status: "failed" }], revision: "1",
+      counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
+    }));
+    expect(screen.queryByText("Retired result")).not.toBeInTheDocument();
+    expect(screen.getByText("Current result")).toBeVisible();
+    expect(getBulkActionJobItems).toHaveBeenCalledTimes(2);
   });
 });

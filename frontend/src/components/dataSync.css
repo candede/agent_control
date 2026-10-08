@@ -1,6 +1,7 @@
 .first-sync-dialog { width: min(760px, calc(100% - 32px)); }
 .first-sync-dialog::backdrop { background: #eef1f8f5; }
-.first-sync-notice { min-width: 0; }
+.first-sync-notice { min-width: 0; overflow-wrap: anywhere; }
+.sync-dialog { overflow-wrap: anywhere; }
 
 .first-sync-notice p { margin: 8px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .first-sync-notice a { color: var(--ink); text-underline-offset: 3px; }
@@ -34,6 +35,11 @@
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
+  overflow-wrap: anywhere;
+}
+
+:is(.first-sync-notice, .data-sync-panel, .data-sync-reports, .sync-history, .sync-inventory-tools, .sync-dialog) button {
+  max-width: 100%;
 }
 
 .data-sync-panel a,
@@ -95,6 +101,7 @@
 
 .data-sync-details {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 24px;
   padding: 24px;
   min-width: 0;
@@ -388,6 +395,7 @@
 .sync-history { padding: 24px; }
 .sync-history .section-heading { align-items: center; }
 .sync-history .jobs-note { margin: 0; }
+.sync-history button[aria-disabled="true"] { cursor: not-allowed; opacity: 0.58; }
 .sync-history-controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
 .sync-history-filter { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .sync-table-scroll { overflow-x: auto; min-width: 0; border: 1px solid var(--border); border-radius: 8px; }

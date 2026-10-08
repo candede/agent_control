@@ -1,5 +1,6 @@
 import type { Page, Route } from "@playwright/test";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
+import { permissionLayoutRequestKind } from "./permissionFixtures";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
@@ -9,7 +10,7 @@ import { historySet, overviewAgent, reportAgent, reportPage, reportUser } from "
 import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, ReportUser } from "../../backend/src/types/officialReportData";
 import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
 import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
-import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
+import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery, inventoryFixtureSelection } from "./selectedInventoryFixture";
 import { encodeInventoryFacet } from "../../backend/src/types/inventoryFacets";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
@@ -329,7 +330,9 @@ export async function mockLayoutApi(page: Page) {
     "/api/workbench/jobs": jobs,
   };
   await page.route(url => isLocalFixtureUrl(url) && url.pathname.startsWith("/api/"), route => {
-    const path = new URL(route.request().url()).pathname, method = route.request().method();
+    const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
+    if (["/api/capabilities", "/api/capabilities/check", "/api/capabilities/check-progress"].includes(path)
+      && !permissionLayoutRequestKind(method, url)) return unexpectedRequest(route);
     if (path === "/api/agent-inventory/selections") return captureInventorySelection(route, unifiedAgents.selection);
     if (path === "/api/agents/selections") return captureInventorySelection(route, packages.selection);
     if (isAutomaticRefreshRequest(route.request())) {
@@ -339,9 +342,10 @@ export async function mockLayoutApi(page: Page) {
     if (path === "/api/agents" && route.request().method() === "GET") {
       const query = inventoryFixtureQuery(route);
       const recordId = query.get("recordId");
-      const value = recordId ? packages.value.filter(item => recordId === `graph_packages:${encodeURIComponent(item.id)}`) : packages.value;
-      return route.fulfill({ json: { ...packages, value, selection: { ...packages.selection, id: query.get("selectionId") },
-        counts: { total: packages.counts.total, scoped: packages.counts.scoped, filtered: value.length } } });
+      const rows = recordId ? packages.value.filter(item => recordId === `graph_packages:${encodeURIComponent(item.id)}`) : packages.value;
+      const { value, page } = selectedFixtureWindow(route.request().url(), rows, reportPage(rows));
+      return route.fulfill({ json: { ...packages, value, page, selection: inventoryFixtureSelection(route),
+        counts: { total: packages.counts.total, scoped: packages.counts.scoped, filtered: rows.length } } });
     }
     const detail = /^\/api\/agent-inventory\/([^/]+)\/detail$/.exec(path);
     if (detail) return fulfillInventoryDetail(route, decodeURIComponent(detail[1]));
@@ -357,11 +361,9 @@ export async function mockLayoutApi(page: Page) {
     }
     if (path === "/api/agent-inventory" && route.request().method() === "GET") {
       const recordId = inventoryFixtureQuery(route).get("recordId");
-      if (recordId) {
-        const value = unifiedAgents.value.filter(record => record.id === recordId);
-        return fulfillInventoryPage(route, { ...unifiedAgents, value, counts: { ...unifiedAgents.counts, filtered: value.length } });
-      }
-      return fulfillInventoryPage(route, unifiedAgents);
+      const rows = recordId ? unifiedAgents.value.filter(record => record.id === recordId) : unifiedAgents.value;
+      const { value, page } = selectedFixtureWindow(route.request().url(), rows, reportPage(rows));
+      return fulfillInventoryPage(route, { ...unifiedAgents, value, page, counts: { ...unifiedAgents.counts, filtered: rows.length } });
     }
     if (path === "/api/agent-responsibility" && route.request().method() === "GET") {
       const query = new URL(route.request().url()).searchParams;
@@ -427,10 +429,15 @@ export async function mockLayoutApi(page: Page) {
         return route.fulfill({ json: selected({ ...users, value, counts: { total: users.counts.total, filtered: value.length },
           analytics: { ...users.analytics, ...responseAnalytics(value.map(row => row.reportedResponses), query.lowResponseThreshold ?? 5) } }) });
       }
-      if (path === "/api/official-usage/history") return route.fulfill({ json: selected(usageHistory) });
-      if (path === "/api/official-usage/history/options") {
-        const { value, page, counts, selection, reports } = selected(usageHistory);
-        return route.fulfill({ json: { value, page, counts, selection, reports } });
+      if (path === "/api/official-usage/history" || path === "/api/official-usage/history/options") {
+        const filtered = selectedHistoryPage(usageHistory.value, reports.activeSetId, query);
+        const result = selected({ ...filtered, sources: usageHistory.sources, summary: usageHistory.summary,
+          analytics: filtered.value.length ? usageHistory.analytics : filtered.analytics });
+        if (path.endsWith("/options")) {
+          const { value, page, counts, selection, reports } = result;
+          return route.fulfill({ json: { value, page, counts, selection, reports } });
+        }
+        return route.fulfill({ json: result });
       }
       const agent = /^\/api\/official-usage\/agents\/([^/]+)(?:\/(users))?$/.exec(path);
       const person = /^\/api\/official-usage\/users\/([^/]+)(?:\/(agents|directory))?$/.exec(path);

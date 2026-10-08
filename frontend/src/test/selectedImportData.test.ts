@@ -1,13 +1,76 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { parseSelectedCsv, selectedImportData, selectedImportMetadata } from "../../browser/selectedImportData";
 
 const agents = "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\n";
 const bridge = "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\n";
 const users = "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\n";
 const context = { setId: "10000000-0000-4000-8000-000000000001", activeSetId: "10000000-0000-4000-8000-000000000001",
-  activeRevision: "2", historyRevision: "2", historyEpoch: "0", acceptedAt: "2026-09-12T14:45:00.000Z", expiresAt: "2027-03-11T14:45:00.000Z" };
+  activeRevision: "2", historyRevision: "2", historyEpoch: "0", acceptedAt: "2026-09-12T14:45:00.000Z", expiresAt: "2027-03-11T14:45:00.000Z",
+  evaluatedAt: "2026-09-12T14:45:00.000Z" };
 
 describe("bounded native CSV browser fixture", () => {
+  it("separates canonical observation hashes from wire bytes and download timestamps", async () => {
+    const csv = users + "u,User,1,2,\nv,Other,0,0,\n";
+    const first = await parseSelectedCsv(Buffer.from(csv));
+    const reordered = await parseSelectedCsv(Buffer.from("\uFEFF" + users.replaceAll("\n", "\r\n") + "v,Other,0,0,\r\nu,User,1,2,\r\n"));
+    expect(first.fileHash).not.toBe(reordered.fileHash);
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const payloads = [
+      '{"username": "u", "displayName": "User", "numberOfAgentsUsed": 1, "agentResponsesReceived": 2}',
+      '{"username": "v", "displayName": "Other", "numberOfAgentsUsed": 0, "agentResponsesReceived": 0}',
+    ].map(digest).sort();
+    const expected = digest(JSON.stringify({ kind: first.kind, parserVersion: first.parserVersion, schemaVersion: first.schemaVersion,
+      reportingPeriod: first.reportingPeriod, sourceAsOfProvenance: "absent", sourceFreshness: "unknown" }) + payloads.join(""));
+    expect(first.contentHash).toBe(expected);
+    expect(reordered.contentHash).toBe(expected);
+    const downloaded = await parseSelectedCsv(Buffer.from(csv), { downloadedAt: "2026-09-12T10:00:00Z" });
+    expect(downloaded.contentHash).toBe(expected);
+    const asserted = await parseSelectedCsv(Buffer.from(csv), {
+      reportingPeriod: { startDate: "2026-08-14", endDate: "2026-09-12", provenance: "operator_asserted" },
+    });
+    expect(asserted.fileHash).toBe(first.fileHash);
+    expect(asserted.contentHash).not.toBe(expected);
+    const lineage = selectedImportMetadata([first], context).lineages[0];
+    expect(lineage).toMatchObject({ contentHash: expected, versionId: first.versionId });
+    expect(selectedImportMetadata([first], context).lineages[0]).toEqual(lineage);
+    expect(reordered.versionId).not.toBe(first.versionId);
+  });
+  it("keeps relationship identity bound to payload rather than input row position", async () => {
+    const rows = ["a,Assistant,Your org,u,2,\n", "b,Other,Your org,v,3,\n"];
+    const project = async (input: string[]) => {
+      const file = await parseSelectedCsv(Buffer.from(bridge + input.join("")));
+      return selectedImportData([file], selectedImportMetadata([file], context)).relationships;
+    };
+    const first = await project(rows), reordered = await project([...rows].reverse());
+    expect(reordered.find(row => row.agentId === "a")?.id).toBe(first[0].id);
+    const changed = await project([rows[0].replace(",2,", ",4,"), rows[1]]);
+    expect(changed[0].id).not.toBe(first[0].id);
+    expect(changed[1].id).toBe(first[1].id);
+  });
+  it("evaluates stale report evidence at the pinned UTC capture instead of treating every import as new", async () => {
+    const file = await parseSelectedCsv(Buffer.from(users + "u,User,1,2,2026-09-12\n"));
+    for (const [evaluatedAt, periodAgeDays, availability] of [
+      ["2026-10-18T23:59:59.998Z", 35, "active"],
+      ["2026-10-18T23:59:59.999Z", 36, "stale"],
+    ] as const) {
+      expect(selectedImportMetadata([file], { ...context, acceptedAt: evaluatedAt, evaluatedAt }))
+        .toMatchObject({ availability, periodAgeDays, acceptedAgeDays: 0 });
+    }
+    const undated = await parseSelectedCsv(Buffer.from(users + "u,User,0,0,\n"));
+    expect(selectedImportMetadata([undated], { ...context, evaluatedAt: "2026-10-18T14:45:00.000Z" }))
+      .toMatchObject({ availability: "stale", periodAgeDays: null, acceptedAgeDays: 36 });
+    expect(selectedImportMetadata([file], context)).toMatchObject({ availability: "active", acceptedAgeDays: 0, periodAgeDays: 0 });
+  });
+  it("rejects incompatible observation bases instead of changing reporting provenance with input order", async () => {
+    const plain = await parseSelectedCsv(Buffer.from(agents + "a,Assistant,Your org,1,0,2,2026-09-12\n"));
+    const asserted = await parseSelectedCsv(Buffer.from(users + "u,User,1,2,2026-09-12\n"), {
+      reportingPeriod: { startDate: "2026-08-14", endDate: "2026-09-12", provenance: "operator_asserted" },
+    });
+    for (const ordered of [[plain, asserted], [asserted, plain]]) {
+      expect(() => selectedImportMetadata(ordered, context)).toThrowError(expect.objectContaining({ code: "incompatible_bundle", status: 409 }));
+    }
+  });
   it("uses the streaming parser, retains every small synthetic input row and caps preview examples at twenty", async () => {
     const file = await parseSelectedCsv(Buffer.from(users + Array.from({ length: 26 }, (_, i) => `user${i}@example.invalid,User ${i},1,2,2026-09-12\n`).join("")));
     expect(file.rowCount).toBe(26); expect(file.rows).toHaveLength(26); expect(file.examples).toHaveLength(20);

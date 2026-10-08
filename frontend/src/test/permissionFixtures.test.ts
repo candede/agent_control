@@ -7,7 +7,7 @@ import {
   permissionLayoutRequestKind,
 } from "../../browser/permissionFixtures";
 import {
-  blockAgent, blockAgents, checkCapabilities, getCapabilities, getCurrentUser,
+  blockAgent, blockAgents, checkCapabilities, getCapabilities, getCapabilityCheckProgress, getCurrentUser,
   startPackageRefresh, submitPurviewAuditSearch, unblockAgent, unblockAgents,
 } from "../api/client";
 import { stageReport } from "../api/reportData";
@@ -58,6 +58,8 @@ describe("permission layout request contract", () => {
     ["GET", "/api/capabilities", "catalog"],
     ["POST", "/api/capabilities/check", "automatic-check"],
     ["POST", "/api/capabilities/check?retry=failed", "retry-failed"],
+    ["GET", "/api/capabilities/check-progress", "progress"],
+    ["GET", "/api/capabilities/check-progress?retry=failed", "retry-failed-progress"],
   ])("classifies %s %s as %s", (method, path, kind) => {
     expect(permissionLayoutRequestKind(method, new URL(path, "http://localhost:3001"))).toBe(kind);
   });
@@ -70,9 +72,14 @@ describe("permission layout request contract", () => {
     expect(permissionLayoutRequestKind(method, new URL("http://localhost:3001/api/capabilities/check?retry=failed"))).toBeUndefined();
   });
 
+  it.each(["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])("rejects %s progress requests", method => {
+    expect(permissionLayoutRequestKind(method, new URL("http://localhost:3001/api/capabilities/check-progress?retry=failed"))).toBeUndefined();
+  });
+
   it.each(["retry=all", "retry=", "retry=failed&retry=failed", "retry=failed&force=true", "force=true"])(
     "rejects unsupported check options (%s)", query => {
       expect(permissionLayoutRequestKind("POST", new URL(`http://localhost:3001/api/capabilities/check?${query}`))).toBeUndefined();
+      expect(permissionLayoutRequestKind("GET", new URL(`http://localhost:3001/api/capabilities/check-progress?${query}`))).toBeUndefined();
     },
   );
 
@@ -81,15 +88,20 @@ describe("permission layout request contract", () => {
     expect(permissionLayoutRequestKind("POST", new URL("http://localhost:3001/api/capabilities/example/probe?retry=failed"))).toBeUndefined();
   });
 
-  it("distinguishes the current API client's catalog, automatic check and explicit retry", async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ value: [] }));
+  it("distinguishes catalog, checks and progress for each retry scope without dropping cancellation", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async url =>
+      Response.json(String(url).includes("/check-progress") ? { progress: null } : { value: [] }));
     vi.stubGlobal("fetch", fetchMock);
-    await getCapabilities();
-    await checkCapabilities();
-    await checkCapabilities({ retryFailed: true });
+    const { signal } = new AbortController();
+    await getCapabilities({ signal });
+    await checkCapabilities({ signal });
+    await checkCapabilities({ retryFailed: true, signal });
+    await getCapabilityCheckProgress({ signal });
+    await getCapabilityCheckProgress({ retryFailed: true, signal });
     expect(fetchMock.mock.calls.map(([url, init]) =>
       permissionLayoutRequestKind(init?.method ?? "GET", new URL(String(url), "http://localhost:3001")),
-    )).toEqual(["catalog", "automatic-check", "retry-failed"]);
+    )).toEqual(["catalog", "automatic-check", "retry-failed", "progress", "retry-failed-progress"]);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.signal === signal)).toBe(true);
   });
 });
 

@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { createHash, randomUUID } from "node:crypto";
 import { AppError } from "../../backend/src/errors";
 import { streamOfficialReport, type OfficialRow, type StreamedOfficialReport } from "../../backend/src/services/officialReportStream";
 import type { OfficialUsageMetadata } from "../../backend/src/types/officialReportRecords";
@@ -6,7 +7,17 @@ import type { UserSourceMetadata } from "../../backend/src/types/userSources";
 import type { ReportAgent, ReportMetadata, ReportObservation, ReportRelationship, ReportSummary, ReportUser } from "../../backend/src/types/officialReportData";
 import { reportAgent, reportPage, reportUser } from "../src/test/reportDataFixture";
 
-export type SelectedCsvFixture = StreamedOfficialReport & { rows: OfficialRow[] };
+export type SelectedCsvFixture = StreamedOfficialReport & {
+  rows: OfficialRow[]; readonly contentHash: string; readonly versionId: string;
+  observation?: Pick<ReportObservation, "acceptedAt" | "supersedesVersionId">;
+};
+export function selectedImportRowHash(row: OfficialRow): string {
+  // PostgreSQL jsonb text orders these flat, parser-owned ASCII keys by length, then bytes.
+  const fields = Object.entries(row).filter(([, value]) => value !== undefined)
+    .sort(([a], [b]) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, value]) => `${JSON.stringify(key)}: ${JSON.stringify(value)}`);
+  return createHash("sha256").update(`{${fields.join(", ")}}`).digest("hex");
+}
 export async function parseSelectedCsv(bytes: Buffer, metadata?: OfficialUsageMetadata): Promise<SelectedCsvFixture> {
   const rows: OfficialRow[] = [];
   const identities = new Set<string>();
@@ -23,12 +34,24 @@ export async function parseSelectedCsv(bytes: Buffer, metadata?: OfficialUsageMe
       rows.push(...batch);
     },
   });
-  return { ...report, rows };
+  const hash = createHash("sha256").update(JSON.stringify({
+    kind: report.kind, parserVersion: report.parserVersion, schemaVersion: report.schemaVersion,
+    reportingPeriod: report.reportingPeriod, sourceAsOf: report.sourceAsOf,
+    sourceAsOfProvenance: report.sourceAsOfProvenance, sourceFreshness: report.sourceFreshness,
+  }));
+  for (const payload of rows.map(selectedImportRowHash).sort()) hash.update(payload);
+  return { ...report, rows, contentHash: hash.digest("hex"), versionId: randomUUID() };
 }
 
 export function selectedImportPeriod(files: readonly SelectedCsvFixture[]): ReportMetadata["reportingPeriod"] {
   const first = files[0];
   if (!first) return null;
+  if (files.some(file => file.reportingPeriod.provenance !== first.reportingPeriod.provenance
+    || file.sourceAsOfProvenance !== first.sourceAsOfProvenance || file.sourceAsOf !== first.sourceAsOf
+    || file.reportingPeriod.provenance !== "activity_range" && (file.reportingPeriod.startDate !== first.reportingPeriod.startDate
+      || file.reportingPeriod.endDate !== first.reportingPeriod.endDate))) {
+    throw new AppError(409, "incompatible_bundle", "Report observation bases differ.");
+  }
   const dates = files.flatMap(file => [file.reportingPeriod.startDate, file.reportingPeriod.endDate])
     .filter((date): date is string => date !== null).sort();
   const startDate = dates[0] ?? null, endDate = dates.at(-1) ?? null;
@@ -36,12 +59,17 @@ export function selectedImportPeriod(files: readonly SelectedCsvFixture[]): Repo
     provenance: first.reportingPeriod.provenance };
 }
 
-export function selectedImportMetadata(files: readonly SelectedCsvFixture[], context:
-  Pick<ReportMetadata, "setId" | "activeSetId" | "activeRevision" | "historyRevision" | "historyEpoch" | "acceptedAt" | "expiresAt">): ReportMetadata {
-  return { ...context, availability: context.setId ? "active" : "never_imported", staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: context.setId ? 0 : null,
-    reportingPeriod: selectedImportPeriod(files),
-    lineages: files.map(file => ({ kind: file.kind, versionId: `${file.fileHash.slice(0, 8)}-${file.fileHash.slice(8, 12)}-4000-8000-${file.fileHash.slice(20, 32)}`,
-      contentHash: file.fileHash, rowCount: file.rowCount, sourceAsOf: file.sourceAsOf ?? null, sourceAsOfProvenance: file.sourceAsOfProvenance,
+export function selectedImportMetadata(files: readonly SelectedCsvFixture[], { evaluatedAt, ...context }:
+  Pick<ReportMetadata, "setId" | "activeSetId" | "activeRevision" | "historyRevision" | "historyEpoch" | "acceptedAt" | "expiresAt">
+  & { evaluatedAt: string }): ReportMetadata {
+  const reportingPeriod = selectedImportPeriod(files);
+  const age = (date: string | null) => date === null ? null : Math.max(0, Math.floor((Date.parse(evaluatedAt) - Date.parse(date)) / 86400000));
+  const periodAgeDays = age(reportingPeriod?.endDate ? `${reportingPeriod.endDate}T23:59:59.999Z` : null), acceptedAgeDays = age(context.acceptedAt);
+  const staleAfterDays = 35, stale = (periodAgeDays ?? 0) > staleAfterDays || (acceptedAgeDays ?? 0) > staleAfterDays;
+  return { ...context, availability: context.setId ? stale ? "stale" : "active" : "never_imported", staleAfterDays, periodAgeDays, acceptedAgeDays,
+    reportingPeriod,
+    lineages: [...files].sort((a, b) => a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0).map(file => ({ kind: file.kind, versionId: file.versionId,
+      contentHash: file.contentHash, rowCount: file.rowCount, sourceAsOf: file.sourceAsOf ?? null, sourceAsOfProvenance: file.sourceAsOfProvenance,
       sourceFreshness: file.sourceFreshness, periodProvenance: file.reportingPeriod.provenance })) };
 }
 
@@ -51,8 +79,8 @@ export function selectedImportData(files: readonly SelectedCsvFixture[], metadat
   const rawAgents = agentsFile?.rows.filter(row => "activeUsersLicensed" in row) ?? [];
   const rawLinks = bridgeFile?.rows.filter(row => "agentId" in row && "username" in row) ?? [];
   const rawUsers = usersFile?.rows.filter(row => "agentResponsesReceived" in row) ?? [];
-  const relationships: ReportRelationship[] = rawLinks.map((row, index) => ({
-    id: `synthetic-relationship-${index}`, agentId: row.agentId, agentName: row.agentName, creatorType: row.creatorType,
+  const relationships: ReportRelationship[] = rawLinks.map(row => ({
+    id: selectedImportRowHash(row), agentId: row.agentId, agentName: row.agentName, creatorType: row.creatorType,
     username: row.username, responses: row.responsesSentToUsers, lastActivityDateUtc: row.lastActivityDateUtc?.slice(0, 10) ?? null, identityStatus: "unresolved",
   }));
   const agentIds = [...new Set([...rawAgents.map(row => row.agentId), ...relationships.map(row => row.agentId)])];
@@ -102,11 +130,14 @@ export function selectedImportData(files: readonly SelectedCsvFixture[], metadat
     responseReconciliation: totals.length < 2 ? "not_comparable" : Math.max(...totals) === Math.min(...totals) ? "matching" : "mismatch",
     activeUsersAreNonAdditive: true,
   };
-  const observations: ReportObservation[] = metadata.lineages.map(lineage => ({
-    versionId: lineage.versionId, kind: lineage.kind, contentHash: lineage.contentHash, rowCount: lineage.rowCount,
-    acceptedAt: metadata.acceptedAt!, sourceAsOf: lineage.sourceAsOf, sourceAsOfProvenance: lineage.sourceAsOfProvenance,
-    sourceFreshness: lineage.sourceFreshness, supersedesVersionId: null,
-  }));
+  const observations: ReportObservation[] = metadata.lineages.map(lineage => {
+    const file = files.find(file => file.versionId === lineage.versionId);
+    const acceptedAt = file?.observation?.acceptedAt ?? metadata.acceptedAt;
+    if (!file || !acceptedAt) throw new Error("Selected CSV observations require their exact accepted receipt.");
+    return { versionId: lineage.versionId, kind: lineage.kind, contentHash: lineage.contentHash, rowCount: lineage.rowCount,
+      acceptedAt, sourceAsOf: lineage.sourceAsOf, sourceAsOfProvenance: lineage.sourceAsOfProvenance,
+      sourceFreshness: lineage.sourceFreshness, supersedesVersionId: file.observation?.supersedesVersionId ?? null };
+  });
   const directory = reportPage([], { reports: metadata, summary, counts: { total: 0, filtered: 0 },
     analytics: { basis: "filtered_rows", rowCount: 0, responses: null, zeroResponses: null, unknownResponses: null,
       review: null, agents: null, history: null, overview: null } });

@@ -1,6 +1,9 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as api from "../api/client";
 import type { CopilotPackage, UnifiedAgentRecord } from "../api/client";
+import { CapabilityContext } from "../capabilityContext";
+import { createInventoryVerification } from "../test/inventoryVerification";
 import { AgentOverview } from "./AgentOverview";
 
 const resource: NonNullable<UnifiedAgentRecord["powerPlatformResource"]> = {
@@ -23,6 +26,8 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
   observation: { id: "environment-snapshot", snapshotId: "environment-snapshot", current: true,
     observedAt: "2026-09-01T12:00:00Z", expiresAt: "2099-09-02T12:00:00Z" },
 };
+
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("purposeful saved agent context", () => {
   it("preserves server-counted high-fanout configuration and package totals without embedding children", () => {
@@ -171,6 +176,67 @@ describe("purposeful saved agent context", () => {
     expect(within(connectors).getByText(expected)).toBeVisible();
   });
 
+  it.each([
+    { partial: false, operations: false, expected: "No configured connectors were reported." },
+    { partial: true, operations: false, expected: "Configured connector details are unavailable. Refresh inventory in Sync." },
+    { partial: false, operations: true, expected: "No operations reported." },
+    { partial: true, operations: true, expected: "Operation details are incomplete." },
+  ])("preserves empty-list evidence after paging storage: $partial partial, $operations operations", async ({ partial, operations, expected }) => {
+    const read = vi.spyOn(api, "getInventoryChildren").mockImplementation(async (_selection, _record, _source, kind) => ({
+      value: operations && kind === "detail:connectors"
+        ? [{ ordinal: 0, kind, value: "0", payload: { connectorId: "Saved connector", operations: [] } }] : [],
+      total: operations && kind === "detail:connectors" ? 1 : 0, nextCursor: null,
+    }));
+    render(<AgentOverview record={{ ...record, powerPlatformResource: {
+      ...resource, savedSource: { scopeId: "source", identity: "native" },
+      connectorCounts: { connectors: operations ? 1 : 0, operations: 0 },
+      details: { channels: [], connectorDetailsStatus: partial ? "partial" : "complete" },
+    } }} selectionId="selection" peopleState={peopleState} />);
+    expect(await screen.findByText(expected)).toBeVisible();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(read).toHaveBeenCalledTimes(operations ? 2 : 1);
+    if (partial) {
+      expect(screen.queryByText("No configured connectors were reported.")).not.toBeInTheDocument();
+      expect(screen.queryByText("No operations reported.")).not.toBeInTheDocument();
+    }
+  });
+
+  it.each(["timer", "focus", "visibility"] as const)("updates saved environment and configuration expiry on %s without reloading", async trigger => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    const read = vi.spyOn(api, "getInventoryChildren");
+    const selected: UnifiedAgentRecord = {
+      ...record,
+      environment: { ...environment, observation: { ...environment.observation, expiresAt: new Date(now + 1_000).toISOString() } },
+      observations: { ...record.observations, powerPlatform: {
+        ...environment.observation, expiresAt: new Date(now + 2_000).toISOString(), roleScope: "full",
+        environmentScope: null, coverage: "covered", coveredCount: 1, observedCount: 1, totalRecords: 1,
+        pageCount: 1, verification: createInventoryVerification(1),
+      } },
+    };
+    render(<CapabilityContext value={{ views: [], user: undefined, now, loading: false, pending: false,
+      error: undefined, reload: vi.fn(), openPermissions: vi.fn() }}>
+      <AgentOverview record={selected} peopleState={peopleState} />
+    </CapabilityContext>);
+    expect(screen.queryByText(/Environment details are out of date|Configuration details have expired/)).not.toBeInTheDocument();
+    if (trigger === "timer") {
+      await act(async () => vi.advanceTimersByTime(1_001));
+      expect(screen.getByText("Environment details are out of date. Refresh them in Sync.")).toBeVisible();
+      expect(screen.queryByText("Configuration details have expired. Refresh them in Sync.")).not.toBeInTheDocument();
+      await act(async () => vi.advanceTimersByTime(1_000));
+    } else {
+      vi.setSystemTime(now + 2_001);
+      act(() => {
+        if (trigger === "focus") window.dispatchEvent(new Event("focus"));
+        else document.dispatchEvent(new Event("visibilitychange"));
+      });
+    }
+    expect(screen.getByText("Environment details are out of date. Refresh them in Sync.")).toBeVisible();
+    expect(screen.getByText("Configuration details have expired. Refresh them in Sync.")).toBeVisible();
+    expect(field("Environment name")).toHaveTextContent("Finance production");
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it("shows exact environment facts once, preserves false, and omits ingestion diagnostics", () => {
     render(<AgentOverview record={{ ...record, environment }} peopleState={peopleState} />);
     expect(field("Environment name")).toHaveTextContent("Finance production");
@@ -267,6 +333,21 @@ describe("purposeful saved agent context", () => {
     expect(screen.queryByText("connector-0")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Next connectors" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Previous connectors" }));
+    expect(screen.getByText("connector-0")).toBeVisible();
+  });
+
+  it("retires inline connector paging when the saved selection changes, including on return", () => {
+    const selected = { ...record, powerPlatformResource: { ...resource, details: {
+      connectors: Array.from({ length: 11 }, (_, index) => ({ connectorId: `connector-${index}`, operations: [] })),
+      connectorDetailsStatus: "complete" as const,
+    } } };
+    const { rerender } = render(<AgentOverview record={selected} selectionId="first" peopleState={peopleState} />);
+    fireEvent.click(screen.getByRole("button", { name: "Next connectors" }));
+    expect(screen.getByText("connector-10")).toBeVisible();
+    rerender(<AgentOverview record={selected} selectionId="second" peopleState={peopleState} />);
+    expect(screen.getByText("connector-0")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Previous connectors" })).toBeDisabled();
+    rerender(<AgentOverview record={selected} selectionId="first" peopleState={peopleState} />);
     expect(screen.getByText("connector-0")).toBeVisible();
   });
 

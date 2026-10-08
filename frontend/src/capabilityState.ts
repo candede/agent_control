@@ -47,6 +47,13 @@ export function evidenceIsStale(view: CapabilityView, now = Date.now()) {
   return view.definition.mode !== "local" && Boolean(view.decision.checkedAt) && !providerEvidenceIsFresh(view, now);
 }
 
+export function currentOperationFailure(view: CapabilityView, now = Date.now()) {
+  const failure = view.operationFailure;
+  const checkedAt = Date.parse(failure?.checkedAt ?? "");
+  const expiresAt = Date.parse(failure?.expiresAt ?? "");
+  return failure && Number.isFinite(checkedAt) && checkedAt <= now && expiresAt > now ? failure : undefined;
+}
+
 export function currentVerification(view: CapabilityView, now = Date.now()) {
   const { definition, decision } = view;
   if (!hasCurrentAuthorization(view)) return undefined;

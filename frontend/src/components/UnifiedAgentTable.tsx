@@ -68,8 +68,8 @@ const columns: ColumnDef<typeof features, AgentRow>[] = [
       id, header: definition.label,
       accessorFn: row => {
         try {
-          if (row.record.columns && id in row.record.columns) return row.record.columns[id];
           if (definition.group === "Usage" && !row.usageMatchesReport) return null;
+          if (row.record.columns && id in row.record.columns) return row.record.columns[id];
           return id === "environment" ? row.environmentName : agentColumnValue(row.record, id);
         } catch (error) {
           if (error instanceof RangeError) return error;
@@ -172,7 +172,7 @@ export function UnifiedAgentTable({
         <div className="agent-grid-tools">
         {controls}
         {selectionAction}
-        <AgentColumnPicker columns={agentColumns.map(definition => {
+        <AgentColumnPicker key={columnPreferenceOwner} columns={agentColumns.map(definition => {
           const column = requiredColumn(definition.id);
           return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
         })} onToggle={id => requiredColumn(id).toggleVisibility()} onReset={() => changeVisibility({ ...defaultAgentColumnVisibility })} />
@@ -254,11 +254,12 @@ function AgentNameCell({ row }: CellContext<typeof features, AgentRow>) {
 function AgentActionsCell({ row }: CellContext<typeof features, AgentRow>) {
   const { busyPackageId, packageOperationsAllowed, packageActionsDisabled, onViewDetails, onManageAccess, onSetBlocked } = useAgentTableActions();
   const record = row.original.record;
+  const singlePackage = record.packagesComplete !== false && record.packages.length === 1;
   const packageBusy = record.packages.some(item => item.id === busyPackageId);
   return <div className="row-actions">
     <button className="icon-button" type="button" aria-label={`View details for ${record.displayName}`} title="View agent details" onClick={() => onViewDetails(record)}><Info aria-hidden="true" /></button>
-    {packageOperationsAllowed && record.packages.length === 1 ? <WorkbenchActionGate actionId="packages.access" compact><button className="icon-button" type="button" aria-label={`Manage access for ${record.displayName}`} title="Manage access" disabled={packageActionsDisabled} onClick={() => onManageAccess(record)}><ShieldCheck aria-hidden="true" /></button></WorkbenchActionGate> : null}
-    {packageOperationsAllowed && record.packages.length === 1 && typeof record.packages[0].isBlocked === "boolean" ? <WorkbenchActionGate actionId={record.packages[0].isBlocked ? "packages.unblock" : "packages.block"} compact><button className={`icon-button${record.packages[0].isBlocked ? "" : " danger"}`} type="button" aria-label={`${record.packages[0].isBlocked ? "Unblock" : "Block"} ${record.displayName}`} title={`${record.packages[0].isBlocked ? "Unblock" : "Block"} agent`} disabled={packageActionsDisabled || packageBusy} onClick={() => onSetBlocked(record, !record.packages[0].isBlocked)}>{record.packages[0].isBlocked ? <LockOpen aria-hidden="true" /> : <Lock aria-hidden="true" />}</button></WorkbenchActionGate> : null}
+    {packageOperationsAllowed && singlePackage ? <WorkbenchActionGate actionId="packages.access" compact><button className="icon-button" type="button" aria-label={`Manage access for ${record.displayName}`} title="Manage access" disabled={packageActionsDisabled} onClick={() => onManageAccess(record)}><ShieldCheck aria-hidden="true" /></button></WorkbenchActionGate> : null}
+    {packageOperationsAllowed && singlePackage && typeof record.packages[0].isBlocked === "boolean" ? <WorkbenchActionGate actionId={record.packages[0].isBlocked ? "packages.unblock" : "packages.block"} compact><button className={`icon-button${record.packages[0].isBlocked ? "" : " danger"}`} type="button" aria-label={`${record.packages[0].isBlocked ? "Unblock" : "Block"} ${record.displayName}`} title={`${record.packages[0].isBlocked ? "Unblock" : "Block"} agent`} disabled={packageActionsDisabled || packageBusy} onClick={() => onSetBlocked(record, !record.packages[0].isBlocked)}>{record.packages[0].isBlocked ? <LockOpen aria-hidden="true" /> : <Lock aria-hidden="true" />}</button></WorkbenchActionGate> : null}
   </div>;
 }
 
@@ -276,7 +277,11 @@ function SelectionCheckbox({ label, title, checked, indeterminate, disabled, onC
   useEffect(() => {
     if (ref.current) ref.current.indeterminate = indeterminate;
   }, [indeterminate]);
-  return <input ref={ref} type="checkbox" aria-label={label} title={title} checked={checked} disabled={disabled} onChange={disabled ? undefined : onChange} />;
+  return <input ref={ref} type="checkbox" aria-label={label} title={title} checked={checked} disabled={disabled} onChange={disabled ? undefined : event => {
+    // A click clears the DOM's mixed state even when the parent rejects the selection.
+    event.currentTarget.indeterminate = indeterminate;
+    onChange();
+  }} />;
 }
 
 export function AgentAvailability({ record }: { record: UnifiedAgentRecord }) {

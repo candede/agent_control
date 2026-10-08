@@ -13,6 +13,10 @@ export type AgentFilterValues = Pick<AgentRouteState,
   | "createdWithinDays" | "publisher" | "environmentId" | "sortBy" | "sortDirection">;
 
 type Option = { value: InventoryFacetValue; label: string };
+function environmentFacetKey(value: InventoryFacetValue) {
+  return encodeInventoryFacet(typeof value === "string" ? value.toLowerCase() : value);
+}
+
 type Props = {
   selectionId?: string;
   readOwnerKey?: string;
@@ -29,7 +33,7 @@ type Props = {
   matchingCount?: number;
   onChange: (values: Partial<AgentFilterValues>) => void;
   onClear: () => void;
-  onError: (message: string) => void;
+  onError: (message: string, readSelectionId?: string) => void;
   onInvalidated?: () => void;
 };
 
@@ -42,24 +46,35 @@ const statusOptions = [
 export function AgentInventoryFilters({ values, options, loading, matchingCount, selectionId, readOwnerKey, onChange, onClear, onError, onInvalidated }: Props) {
   const trigger = useRef<HTMLButtonElement>(null);
   const firstField = useRef<HTMLSelectElement>(null);
-  const [environmentLabel, setEnvironmentLabel] = useState<{ key: string; label: string }>();
+  const firstEnabledFieldIndex = selectionId ? 0 : 1;
+  const [environmentLabel, setEnvironmentLabel] = useState<{ owner: string; key: string; label: string }>();
+  const environmentLabelOwner = JSON.stringify([readOwnerKey, selectionId]);
+  if (environmentLabel && environmentLabel.owner !== environmentLabelOwner) setEnvironmentLabel(undefined);
+  const environmentKey = values.environmentId === undefined ? undefined : environmentFacetKey(values.environmentId);
+  const hasEnvironmentFilter = environmentKey !== undefined;
   const callbacks = useRef({ onError, onInvalidated });
   useEffect(() => { callbacks.current = { onError, onInvalidated }; }, [onError, onInvalidated]);
   useEffect(() => {
-    if (!selectionId || values.environmentId === undefined) return;
-    const controller = new AbortController(), key = encodeInventoryFacet(values.environmentId);
+    if (!selectionId || !hasEnvironmentFilter) return;
+    const controller = new AbortController();
     void getInventoryFacets(selectionId, "environmentId", { selected: true }, { signal: controller.signal }).then(page => {
       if (controller.signal.aborted) return;
-      const option = page.value.find(option => encodeInventoryFacet(option.value) === key);
-      if (option) setEnvironmentLabel({ key, label: option.label || inventoryFacetLabel(option.value) });
+      // The server resolves the captured selection's value, not the pending filter edit.
+      const option = page.value[0];
+      if (option) setEnvironmentLabel(current => {
+        const key = environmentFacetKey(option.value);
+        // Preserve a different option chosen while this selection-bound read was pending.
+        return current?.owner === environmentLabelOwner && current.key !== key ? current
+          : { owner: environmentLabelOwner, key, label: option.label || inventoryFacetLabel(option.value) };
+      });
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof ApiError && ["selection_invalidated", "selection_expired", "unauthorized", "forbidden"].includes(error.code)) {
         callbacks.current.onInvalidated?.();
-      } else callbacks.current.onError(error instanceof Error ? error.message : "Selected environment label unavailable.");
+      } else callbacks.current.onError(error instanceof Error ? error.message : "Selected environment label unavailable.", selectionId);
     });
     return () => controller.abort();
-  }, [selectionId, values.environmentId]);
+  }, [selectionId, hasEnvironmentFilter, environmentLabelOwner]);
   function changeChoice<T extends string>(value: InventoryFacetValue | undefined, choices: readonly { value: T }[], change: (value: T) => void) {
     const choice = choices.find(option => option.value === value);
     if (!choice) {
@@ -106,7 +121,7 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
   });
   if (values.environmentId !== undefined) chips.push({
     key: "environment", label: "Environment",
-    value: environmentLabel?.key === encodeInventoryFacet(values.environmentId) ? environmentLabel.label
+    value: environmentLabel?.owner === environmentLabelOwner && environmentLabel.key === environmentKey ? environmentLabel.label
       : options.environments.find(option => typeof option.value === "string" && typeof values.environmentId === "string"
       && option.value.toLowerCase() === values.environmentId.toLowerCase())?.label ?? inventoryFacetLabel(values.environmentId),
     remove: () => onChange({ environmentId: undefined }),
@@ -146,12 +161,12 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
           <div className="agent-filter-fields">
             {fields.map((field, index) => selectionId && ["platform", "availability", "host", "publisher"].includes(field.key)
               ? <InventoryFacetSelect key={field.key} selectionId={selectionId} scopeKey={readOwnerKey} loading={loading} onInvalidated={onInvalidated} onError={onError}
-                selectRef={index === 0 ? firstField : undefined}
+                selectRef={index === firstEnabledFieldIndex ? firstField : undefined}
                 field={(field.key === "availability" ? "availableTo" : field.key) as InventoryFacetField}
                 value={field.value} label={field.label} allLabel={field.all} onChange={field.change} />
               : <label key={field.key}>
               <span>{field.label}</span>
-              <select ref={index === 0 ? firstField : undefined} value={field.dynamic
+              <select ref={index === firstEnabledFieldIndex ? firstField : undefined} value={field.dynamic
                 ? field.value === undefined ? "" : encodeInventoryFacet(field.value) : String(field.value)}
                 disabled={["platform", "availability", "host", "publisher"].includes(field.key)}
                 className={(field.dynamic ? field.value === undefined : field.value === "all") ? undefined : "active-filter-select"}
@@ -179,16 +194,23 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
               <span>Created within</span>
               <div className="number-with-unit">
                 <input type="number" min="1" max="3650" value={values.createdWithinDays} placeholder="Any"
-                  onChange={event => onChange({ createdWithinDays: event.target.value })} />
+                  onChange={event => {
+                    if (!event.target.validity.valid) {
+                      onError("Enter a whole number of days from 1 to 3650.");
+                      return;
+                    }
+                    onChange({ createdWithinDays: event.target.value === "" ? "" : String(event.target.valueAsNumber) });
+                  }} />
                 <span>days</span>
               </div>
             </label>
             {selectionId ? <InventoryFacetSelect key="environmentId" selectionId={selectionId} scopeKey={readOwnerKey} field="environmentId" loading={loading} onInvalidated={onInvalidated} onError={onError}
               label="Environment" allLabel="All environments" value={values.environmentId}
               onOptionLabel={(value, label) => setEnvironmentLabel(current => {
-                const key = encodeInventoryFacet(value);
+                const key = environmentFacetKey(value);
                 const display = label || inventoryFacetLabel(value);
-                return current?.key === key && current.label === display ? current : { key, label: display };
+                return current?.owner === environmentLabelOwner && current.key === key && current.label === display
+                  ? current : { owner: environmentLabelOwner, key, label: display };
               })}
               onChange={environmentId => changeLiteral("environmentId", environmentId)} />
               : <label><span>Environment</span><select disabled value={values.environmentId === undefined ? "" : encodeInventoryFacet(values.environmentId)}>

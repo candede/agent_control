@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
@@ -103,7 +103,7 @@ describe("package management UI", () => {
     expect(within(list).getAllByRole("listitem")).toHaveLength(20);
     expect(within(list).getByText("package-0")).toBeVisible();
     expect(within(list).getByText("package-19")).toBeVisible();
-    expect(screen.getByText(`Showing 20 of 25 packages. All 25 will be ${operation === "block" ? "blocked" : "unblocked"}.`)).toBeVisible();
+    expect(screen.getByText("Showing 20 of 25 packages. All 25 are included in the request. Individual changes may fail or be skipped.")).toBeVisible();
     expect(screen.queryByText(/affected principals/)).not.toBeInTheDocument();
   });
 
@@ -130,6 +130,34 @@ describe("package management UI", () => {
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(cancel).toHaveBeenCalledOnce();
     expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("retires a cancelled confirmation before another click in the same batch can submit it", () => {
+    const confirm = vi.fn(), cancel = vi.fn();
+    renderWithCapabilities(<BulkConfirmModal confirmation={mutationConfirmation("block")} onCancel={cancel} onConfirm={confirm} />,
+      [onDemandCapability("graph.package.block.manage")]);
+    const submit = screen.getByRole("button", { name: "Block package" });
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      fireEvent.click(submit);
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("admits a confirmation once before its parent dismisses it", () => {
+    const confirm = vi.fn(), cancel = vi.fn();
+    renderWithCapabilities(<BulkConfirmModal confirmation={mutationConfirmation("block")} onCancel={cancel} onConfirm={confirm} />,
+      [onDemandCapability("graph.package.block.manage")]);
+    const submit = screen.getByRole("button", { name: "Block package" });
+    act(() => {
+      fireEvent.click(submit);
+      fireEvent.click(submit);
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(cancel).not.toHaveBeenCalled();
   });
 
   it("projects only the provider-verified access scope while a new saved observation remains explicit", () => {

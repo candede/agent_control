@@ -6,7 +6,17 @@ import { isWorkbenchPath } from "../workbenchRouting";
 const usernameStorageKey = "agent-control:signin-username:v1";
 
 function validUsername(value: string) {
-  return value.length <= 320 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  if (value.length > 254 || !/^[^\s@]+@[^\s@]+$/.test(value)) return false;
+  const inputDomain = value.slice(value.lastIndexOf("@") + 1);
+  if (!/^[\p{L}\p{N}\p{M}.-]+$/u.test(inputDomain)) return false;
+  try {
+    // URL applies the same IDNA normalization as the backend's domainToASCII.
+    const domain = new URL(`https://${inputDomain}`).hostname;
+    return domain.length <= 253 && domain.includes(".") && domain.split(".").every(label =>
+      /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
+  } catch {
+    return false;
+  }
 }
 
 function readRememberedUsername(): { username: string; remember: boolean; error?: string } {
@@ -46,7 +56,19 @@ export function SignInForm({ disabled }: { disabled: boolean }) {
   const [pending, setPending] = useState(false);
   const usernameInput = useRef<HTMLInputElement>(null);
   const request = useRef<AbortController | undefined>(undefined);
-  useEffect(() => () => request.current?.abort(), []);
+  useEffect(() => {
+    // History caching can preserve this component without running React's unmount cleanup.
+    function abandonSignIn() {
+      request.current?.abort();
+      request.current = undefined;
+      setPending(false);
+    }
+    window.addEventListener("pagehide", abandonSignIn);
+    return () => {
+      window.removeEventListener("pagehide", abandonSignIn);
+      request.current?.abort();
+    };
+  }, []);
 
   async function handleSubmit() {
     if (disabled || request.current) return;
@@ -96,7 +118,7 @@ export function SignInForm({ disabled }: { disabled: boolean }) {
           autoComplete="username"
           autoCapitalize="none"
           spellCheck={false}
-          maxLength={320}
+          maxLength={254}
           placeholder="name@organization.com"
           required
           disabled={disabled || pending}

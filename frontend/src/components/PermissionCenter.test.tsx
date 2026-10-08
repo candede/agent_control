@@ -1,11 +1,13 @@
-import { fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import axe from "axe-core";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import type { CapabilityId, CapabilityStatus, CapabilityView, SessionUser } from "../api/client";
-import { CapabilityContext } from "../capabilityContext";
+import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
+import { useCapabilities } from "../useCapabilities";
 import { CapabilityHealth, PermissionCenter } from "./PermissionCenter";
 
 mockNativeDialogs();
@@ -25,15 +27,23 @@ function fixture(status: CapabilityStatus = "available", id: CapabilityId = "gra
 function context(views: CapabilityView[]) {
   return { views, user, loading: false, pending: false, error: undefined as string | undefined, now, reload: vi.fn(), openPermissions: vi.fn() };
 }
-function Page({ value }: { value: ReturnType<typeof context> & { awaitingInitialCheck?: boolean } }) {
+function Page({ value }: { value: ReturnType<typeof useCapabilityContext> }) {
   return <CapabilityContext value={value}><CapabilityHealth /><PermissionCenter /></CapabilityContext>;
+}
+function SessionPage({ principal, epoch = 0, open = true }: {
+  principal: SessionUser | undefined; epoch?: number; open?: boolean;
+}) {
+  const capabilities = useCapabilities(principal, epoch);
+  return <CapabilityContext value={{ ...capabilities, openPermissions: vi.fn() }}>
+    <CapabilityHealth />{open ? <PermissionCenter /> : null}
+  </CapabilityContext>;
 }
 async function openRequirements() {
   const setup = within(screen.getByRole("region", { name: "App prerequisites" }));
   await userEvent.click(setup.getByText("Required API permissions"));
   return setup;
 }
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState({}, "", "/"); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); window.history.replaceState({}, "", "/"); });
 
 describe("Permissions setup and issues", () => {
   it("keeps the user guide focused on Microsoft roles, even without an app-role assignment", () => {
@@ -85,6 +95,35 @@ describe("Permissions setup and issues", () => {
     expect(task("Search Purview audit for a user")).toHaveTextContent("Audit Reader is a Purview role group");
     expect(task("Run Defender and Agent 365 hunts")).toHaveTextContent("Security Reader");
     expect(task("Run Defender and Agent 365 hunts")).toHaveTextContent("data sources and device groups");
+  });
+
+  it("keeps the role reference independent of identity and permission-check state", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const value = context([fixture("missing_permission")]);
+    const { rerender } = render(<Page value={value} />);
+    const reference = screen.getByRole("region", { name: "Signed-in user roles" }).textContent;
+    const replacement = { ...user, homeAccountId: "fixture-b", tenantId: "tenant-b", displayName: "Other account" };
+    const states: ReturnType<typeof useCapabilityContext>[] = [
+      { ...value, views: [], loading: true },
+      { ...value, pending: true, activeCheck: { id: 1, retryFailed: true } },
+      { ...value, views: [], error: "Permission checks could not be loaded. Use Check status to retry." },
+      { ...value, user: replacement, views: [], loading: true },
+      { ...value, user: { ...replacement, roles: ["AgentControl.Viewer"] }, views: [fixture()] },
+      { ...value, user: { ...replacement, roles: [] }, views: [] },
+      { ...value, user: undefined, views: [] },
+    ];
+    for (const state of states) {
+      rerender(<Page value={state} />);
+      const guide = screen.getByRole("region", { name: "Signed-in user roles" });
+      expect(guide).toBeVisible();
+      expect(guide.textContent).toBe(reference);
+      expect(within(guide).queryByRole("status")).not.toBeInTheDocument();
+      expect(within(guide).queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByText(`Setup and troubleshooting for ${state.user?.displayName || "your account"}.`)).toBeVisible();
+    }
+    expect(value.reload).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("provides a compact, fully visible reference with Microsoft sources and no extra controls", () => {
@@ -294,16 +333,230 @@ describe("Permissions setup and issues", () => {
     expect(trigger).toHaveFocus();
   });
 
-  it.each(["account", "tenant", "roles", "sign-out"] as const)("closes old issue details on %s change", async change => {
+  it.each(["account", "tenant", "roles", "role removal", "sign-out"] as const)("closes old issue details on %s change", async change => {
     const value = context([fixture("missing_permission")]);
     const { rerender } = render(<Page value={value} />);
     await userEvent.click(screen.getByRole("button", { name: "Details: Agent inventory" }));
-    const nextUser: SessionUser = { ...user };
-    if (change === "account") nextUser.homeAccountId = "other";
-    else if (change === "tenant") nextUser.tenantId = "other";
-    else nextUser.roles = change === "roles" ? ["AgentControl.Viewer"] : [];
+    const nextUser: SessionUser | undefined = change === "sign-out" ? undefined : {
+      ...user,
+      ...(change === "account" ? { homeAccountId: "other" }
+        : change === "tenant" ? { tenantId: "other" }
+          : { roles: change === "roles" ? ["AgentControl.Viewer"] : [] }),
+    };
     rerender(<Page value={{ ...value, user: nextUser }} />);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  describe("Permissions request lifecycle", () => {
+    it("distinguishes pending prerequisites, catalog failure, retry, and recovered requirements", async () => {
+      vi.useFakeTimers({ now });
+      const reads: Array<{ release: (response: Response) => void; signal?: AbortSignal | null }> = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === "/api/capabilities") return new Promise<Response>(release => { reads.push({ release, signal: init?.signal }); });
+        return Response.json({ value: [fixture()] });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      render(<SessionPage principal={user} />);
+      fireEvent.click(screen.getByText("Required API permissions"));
+      const setup = within(screen.getByRole("region", { name: "App prerequisites" }));
+      expect(setup.getByText("Loading feature permission requirements...")).toBeVisible();
+      expect(setup.queryByText(/feature permission list is unavailable/)).not.toBeInTheDocument();
+      expect(screen.queryByText("No issues reported.")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
+      await act(async () => reads[0].release(Response.json({ code: "request_throttled" }, { status: 429 })));
+      expect(setup.getByText(/feature permission list is unavailable/)).toBeVisible();
+      expect(setup.queryByText(/Loading feature/)).not.toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("could not be loaded");
+      expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: check failed");
+      expect(screen.queryByText("No issues reported.")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      expect(setup.getByText("Loading feature permission requirements...")).toBeVisible();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      const retry = screen.getByRole("button", { name: "Checking..." });
+      fireEvent.click(retry);
+      expect(reads).toHaveLength(2);
+      expect(reads[1].signal?.aborted).toBe(false);
+      await act(async () => reads[1].release(Response.json({ value: [fixture()] })));
+      expect(within(setup.getByRole("region", { name: "Microsoft Graph / Delegated" })).getByText("CopilotPackages.Read.All")).toBeVisible();
+      expect(setup.queryByText(/Loading feature|feature permission list is unavailable/)).not.toBeInTheDocument();
+      expect(screen.getByText("No issues reported.")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        "/api/capabilities", "/api/capabilities", "/api/capabilities/check?retry=failed",
+      ]);
+    });
+
+    it("retains known issues and requirements during one recheck, without restarting it on navigation", async () => {
+      vi.useFakeTimers({ now });
+      const held: Array<{ url: string; release: (response: Response) => void; signal?: AbortSignal | null }> = [];
+      let hold = false;
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+        if (hold) return new Promise<Response>(release => { held.push({ url, release, signal: init?.signal }); });
+        return Response.json({ value: [fixture("missing_permission")] });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const { rerender } = render(<SessionPage principal={user} />);
+      await act(async () => {});
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      hold = true;
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      fireEvent.click(screen.getByRole("button", { name: "Checking..." }));
+      fireEvent.click(screen.getByText("Required API permissions"));
+      const setup = within(screen.getByRole("region", { name: "App prerequisites" }));
+      expect(within(setup.getByRole("region", { name: "Microsoft Graph / Delegated" })).getByText("CopilotPackages.Read.All")).toBeVisible();
+      expect(setup.queryByText(/Loading feature|feature permission list is unavailable/)).not.toBeInTheDocument();
+      expect(screen.getByText("Loading permission results")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Details: Agent inventory" })).toBeVisible();
+      expect(held).toHaveLength(1);
+      expect(held[0].signal?.aborted).toBe(false);
+      await act(async () => held[0].release(Response.json({ value: [fixture("missing_permission")] })));
+      expect(screen.getByText("Checking permissions")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Checking..." }));
+      await act(() => vi.advanceTimersByTimeAsync(500));
+      expect(held.map(request => request.url)).toEqual([
+        "/api/capabilities", "/api/capabilities/check?retry=failed", "/api/capabilities/check-progress?retry=failed",
+      ]);
+      fireEvent.click(screen.getByRole("button", { name: "Details: Agent inventory" }));
+      expect(screen.getByRole("dialog", { name: "Agent inventory" })).toBeVisible();
+
+      rerender(<SessionPage principal={user} open={false} />);
+      expect(held[1].signal?.aborted).toBe(false);
+      expect(held[2].signal?.aborted).toBe(true);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      rerender(<SessionPage principal={user} />);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      await act(async () => {
+        held[1].release(Response.json({ value: [fixture()] }));
+        held[2].release(Response.json({ progress: { checks: [{ capabilityId: "graph.package.read.delegated", state: "checking" }] } }));
+      });
+      expect(screen.getByText("No issues reported.")).toBeVisible();
+      expect(screen.queryByRole("region", { name: "Permission check progress" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Details:/ })).not.toBeInTheDocument();
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    });
+
+    it.each(["account", "tenant", "roles", "epoch", "sign-out", "role removal"] as const)(
+      "retires old details, evidence, checks, and progress after a %s transition",
+      async change => {
+        vi.useFakeTimers({ now });
+        const held: Array<{ url: string; release: (response: Response) => void; signal?: AbortSignal | null }> = [];
+        let replacement = false;
+        const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+          if (!replacement && url === "/api/capabilities") return Response.json({ value: [fixture("missing_permission")] });
+          if (replacement && url.startsWith("/api/capabilities/check") && !url.includes("progress")) {
+            return Response.json({ value: [fixture("missing_role", "graph.directory.read")] });
+          }
+          return new Promise<Response>(release => { held.push({ url, release, signal: init?.signal }); });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        const { rerender } = render(<SessionPage principal={user} />);
+        await act(async () => {});
+        fireEvent.click(screen.getByRole("button", { name: "Details: Agent inventory" }));
+        await act(() => vi.advanceTimersByTimeAsync(500));
+        expect(held).toHaveLength(2);
+        replacement = true;
+        const principal: SessionUser | undefined = change === "sign-out" ? undefined : {
+          ...user,
+          ...(change === "account" ? { homeAccountId: "fixture-b" }
+            : change === "tenant" ? { tenantId: "tenant-b" }
+              : change === "roles" ? { roles: ["AgentControl.Viewer"] }
+                : change === "role removal" ? { roles: [] } : {}),
+        };
+        rerender(<SessionPage principal={principal} epoch={change === "epoch" ? 1 : 0} />);
+        expect(held[0].signal?.aborted).toBe(true);
+        expect(held[1].signal?.aborted).toBe(true);
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /Details:/ })).not.toBeInTheDocument();
+        await act(async () => {
+          held[0].release(Response.json({ value: [fixture("missing_permission")] }));
+          held[1].release(Response.json({ code: "session_invalidated" }, { status: 401 }));
+        });
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(screen.queryByText("Agent inventory")).not.toBeInTheDocument();
+        if (change === "sign-out" || change === "role removal") {
+          expect(fetchMock).toHaveBeenCalledTimes(3);
+          expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
+          expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: app role required");
+        } else {
+          expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
+          expect(screen.queryByText("No issues reported.")).not.toBeInTheDocument();
+          expect(held[2].signal?.aborted).toBe(false);
+          await act(async () => held[2].release(Response.json({ value: [fixture("missing_role", "graph.directory.read")] })));
+          expect(screen.getByRole("button", { name: "Details: Agent people" })).toBeVisible();
+          expect(screen.queryByRole("button", { name: "Details: Agent inventory" })).not.toBeInTheDocument();
+          expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+          expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+          expect(fetchMock).toHaveBeenCalledTimes(5);
+        }
+      },
+    );
+
+    it("preserves details across equivalent principals and ages issues without refetching", async () => {
+      vi.useFakeTimers({ now });
+      const fetchMock = vi.fn(async () => Response.json({ value: [fixture("missing_permission")] }));
+      vi.stubGlobal("fetch", fetchMock);
+      const principal: SessionUser = { ...user, roles: ["AgentControl.Admin", "AgentControl.Viewer"] };
+      const { rerender } = render(<SessionPage principal={principal} />);
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Details: Agent inventory" }));
+      const dialog = screen.getByRole("dialog");
+      rerender(<SessionPage principal={{ ...principal, displayName: "Updated name", roles: [...principal.roles].reverse() }} />);
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(screen.getByText("Setup and troubleshooting for Updated name.")).toBeInTheDocument();
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(screen.getByRole("dialog")).toBeVisible();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(60_001));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.getByText("No issues reported.")).toBeVisible();
+      expect(screen.getByRole("heading", { name: "Permissions", level: 2 })).toHaveFocus();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["check", "operation"] as const)("expires a displayed %s issue when its deadline passes during a reload commit", async source => {
+      vi.useFakeTimers({ now });
+      const expiresAt = now + 60_000;
+      const view = fixture("missing_permission");
+      if (source === "operation") {
+        view.operationFailure = { status: "missing_permission", checkedAt: view.decision.checkedAt!,
+          expiresAt: view.decision.expiresAt!, remediation: [] };
+        view.decision = { ...view.decision, status: "available", authorized: true,
+          expiresAt: new Date(expiresAt + 60_000).toISOString() };
+      }
+      let release!: (response: Response) => void;
+      const fetchMock = vi.fn(async (url: string) => url === "/api/capabilities/check?retry=failed"
+        ? new Promise<Response>(resolve => { release = resolve; })
+        : Response.json({ value: [view] }));
+      vi.stubGlobal("fetch", fetchMock);
+      function DelayedCommitPage() {
+        const capabilities = useCapabilities(user);
+        useLayoutEffect(() => {
+          if (capabilities.now === expiresAt - 1) vi.setSystemTime(expiresAt + 1);
+        }, [capabilities.now]);
+        return <Page value={{ ...capabilities, openPermissions: vi.fn() }} />;
+      }
+      render(<DelayedCommitPage />);
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Details: Agent inventory" }));
+      expect(screen.getByRole("dialog", { name: "Agent inventory" })).toBeVisible();
+      vi.setSystemTime(expiresAt - 1);
+      await act(async () => release(Response.json({ value: [view] })));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.getByText("No issues reported.")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions and setup");
+      expect(screen.getByRole("heading", { name: "Permissions", level: 2 })).toHaveFocus();
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
   });
 
   it.each(["success", "expiry", "removed"] as const)("closes resolved details and restores focus when the failure is %s", async change => {

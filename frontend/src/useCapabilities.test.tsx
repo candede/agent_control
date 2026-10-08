@@ -1,10 +1,12 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
-import type { CapabilityId, CapabilityView, SessionUser } from "./api/client";
+import { checkCapabilities, getCapabilities, getCurrentUser, subscribeSessionRevalidationRequired, type CapabilityId, type CapabilityView, type SessionUser } from "./api/client";
 import { evidenceIsFresh, providerActionAllowed } from "./capabilityState";
-import { useCapabilities } from "./useCapabilities";
+import { retryPermissionRead, useCapabilities } from "./useCapabilities";
 import { permissionIssues } from "./permissionIssues";
+import { createSavedQueryClient } from "./savedQueries";
 
 const user: SessionUser = {
   displayName: "Fixture",
@@ -67,6 +69,473 @@ it("gives a manual recheck a new run identity and hides completed progress", asy
     await reload;
   });
   expect(result.current.activeCheck).toBeUndefined();
+});
+
+it.each(["catalog", "check"] as const)("shares overlapping manual rechecks while the %s is pending", async phase => {
+  let release!: (response: Response) => void;
+  let pendingSignal: AbortSignal | null | undefined;
+  let hold = false;
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (hold && (phase === "catalog" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check"))) {
+      pendingSignal = init?.signal;
+      return new Promise<Response>(resolve => { release = resolve; });
+    }
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+  hold = true;
+  let first!: Promise<void>;
+  let second!: Promise<void>;
+  await act(async () => { first = result.current.reload(); });
+  const signal = pendingSignal;
+  const requests = fetchMock.mock.calls.length;
+  act(() => { second = result.current.reload(); });
+  expect(signal?.aborted).toBe(false);
+  expect(fetchMock).toHaveBeenCalledTimes(requests);
+  expect(result.current.loading || result.current.pending).toBe(true);
+  hold = false;
+  await act(async () => {
+    release(Response.json({ value: [available()] }));
+    await Promise.all([first, second]);
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(4);
+  expect(result.current.loading || result.current.pending).toBe(false);
+  await act(async () => result.current.reload());
+  expect(fetchMock).toHaveBeenCalledTimes(6);
+});
+
+it.each(["catalog", "check"] as const)("clears an earlier %s transport error when a manual retry starts", async phase => {
+  let fail = true;
+  let release!: (response: Response) => void;
+  const fetchMock = vi.fn(async (url: string) => {
+    if (fail && (phase === "catalog" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check"))) {
+      return Response.json({ code: "request_throttled", detail: "Retry later." }, { status: 429 });
+    }
+    if (!fail && url === "/api/capabilities") return new Promise<Response>(resolve => { release = resolve; });
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await waitFor(() => expect(result.current.error).toBeDefined());
+  fail = false;
+  let retry!: Promise<void>;
+  act(() => { retry = result.current.reload(); });
+  expect(result.current.loading).toBe(true);
+  expect(result.current.error).toBeUndefined();
+  await act(async () => {
+    release(Response.json({ value: [available()] }));
+    await retry;
+  });
+  expect(result.current.error).toBeUndefined();
+  expect(result.current.loading || result.current.pending).toBe(false);
+});
+
+it.each(["catalog", "check"] as const)("retires a manual %s recheck without interfering with the replacement account's recheck", async phase => {
+  const held: Array<{ release: (response: Response) => void; signal: AbortSignal | null | undefined }> = [];
+  let hold = false;
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (hold && (phase === "catalog" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check"))) {
+      return new Promise<Response>(release => { held.push({ release, signal: init?.signal }); });
+    }
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const revalidate = vi.fn();
+  const unsubscribe = subscribeSessionRevalidationRequired(revalidate);
+  try {
+    const { result, rerender } = renderHook(({ principal }) => useCapabilities(principal),
+      { initialProps: { principal: user } });
+    await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+    hold = true;
+    let oldReload!: Promise<void>;
+    await act(async () => { oldReload = result.current.reload(); });
+    hold = false;
+    rerender({ principal: { ...user, homeAccountId: "fixture-b" } });
+    expect(result.current.views).toEqual([]);
+    expect(held[0].signal?.aborted).toBe(true);
+    await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+    hold = true;
+    let newReload!: Promise<void>;
+    await act(async () => { newReload = result.current.reload(); });
+    expect(held).toHaveLength(2);
+    await act(async () => {
+      held[0].release(Response.json({ code: "session_invalidated" }, { status: 401 }));
+      await oldReload;
+    });
+    const requestCount = fetchMock.mock.calls.length;
+    let duplicate!: Promise<void>;
+    act(() => { duplicate = result.current.reload(); });
+    expect(fetchMock).toHaveBeenCalledTimes(requestCount);
+    expect(held[1].signal?.aborted).toBe(false);
+    expect(result.current.loading || result.current.pending).toBe(true);
+    expect(result.current.error).toBeUndefined();
+    expect(revalidate).not.toHaveBeenCalled();
+    hold = false;
+    await act(async () => {
+      held[1].release(Response.json({ value: [available()] }));
+      await Promise.all([newReload, duplicate]);
+    });
+    expect(result.current.views).toHaveLength(1);
+    expect(result.current.loading || result.current.pending).toBe(false);
+  } finally { unsubscribe(); }
+});
+
+it("does not reload capabilities for equivalent accounts or reordered roles", async () => {
+  const fetchMock = vi.fn(async () => Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const principal: SessionUser = { ...user, roles: ["AgentControl.Admin", "AgentControl.Viewer"] };
+  const { result, rerender } = renderHook(({ principal }) => useCapabilities(principal),
+    { initialProps: { principal } });
+  await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+  const reload = result.current.reload;
+  rerender({ principal: { ...principal, roles: [...principal.roles].reverse(), displayName: "Updated display name" } });
+  await act(async () => {
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(result.current.views).toHaveLength(1);
+  expect(result.current.user?.displayName).toBe("Updated display name");
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  await act(async () => reload());
+  expect(fetchMock).toHaveBeenCalledTimes(4);
+});
+
+it.each(["account", "tenant", "roles", "epoch", "sign-in"] as const)(
+  "ignores a retained reload callback across %s changes without cancelling the current catalog",
+  async change => {
+    let hold = false;
+    let release!: (response: Response) => void;
+    let currentSignal: AbortSignal | null | undefined;
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (hold && url === "/api/capabilities") {
+        currentSignal = init?.signal;
+        return new Promise<Response>(resolve => { release = resolve; });
+      }
+      return Response.json({ value: [available()] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { result, rerender } = renderHook(
+      ({ principal, epoch }: { principal: SessionUser | undefined; epoch: number }) => useCapabilities(principal, epoch),
+      { initialProps: { principal: user as SessionUser | undefined, epoch: 0 } },
+    );
+    await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+    const retiredReload = result.current.reload;
+    if (change === "sign-in") rerender({ principal: undefined, epoch: 0 });
+    hold = true;
+    rerender({
+      principal: {
+        ...user,
+        ...(change === "account" ? { homeAccountId: "fixture-b" }
+          : change === "tenant" ? { tenantId: "tenant-b" }
+            : change === "roles" ? { roles: ["AgentControl.Admin"] as SessionUser["roles"] } : {}),
+      },
+      epoch: change === "epoch" ? 1 : 0,
+    });
+    const signal = currentSignal;
+    const requests = fetchMock.mock.calls.length;
+    act(() => { void retiredReload(); });
+    expect(fetchMock).toHaveBeenCalledTimes(requests);
+    expect(signal?.aborted).toBe(false);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.views).toEqual([]);
+    hold = false;
+    await act(async () => release(Response.json({ value: [available()] })));
+    await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+    expect(result.current.loading || result.current.pending).toBe(false);
+    expect(result.current.error).toBeUndefined();
+    await act(async () => result.current.reload());
+    expect(fetchMock).toHaveBeenCalledTimes(requests + 3);
+  },
+);
+
+it.each(["logout", "role removal", "unmount"] as const)("does not admit a retained reload after %s", async change => {
+  const fetchMock = vi.fn(async () => Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result, rerender, unmount } = renderHook(
+    ({ principal }: { principal: SessionUser | undefined }) => useCapabilities(principal),
+    { initialProps: { principal: user as SessionUser | undefined } },
+  );
+  await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+  const retiredReload = result.current.reload;
+  if (change === "unmount") unmount();
+  else rerender({ principal: change === "logout" ? undefined : { ...user, roles: [] } });
+  await act(async () => retiredReload());
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  if (change !== "unmount") {
+    expect(result.current.views).toEqual([]);
+    expect(result.current.loading || result.current.pending).toBe(false);
+    expect(result.current.error).toBeUndefined();
+  }
+});
+
+it.each(["reload", "hidden initial check"] as const)("does not admit a %s into a replacement request session before account props update", async trigger => {
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue(trigger === "reload" ? "visible" : "hidden");
+  const fetchMock = vi.fn(async (url: string) => url === "/api/me"
+    ? Response.json({ user, csrfToken: "fixture-csrf", roleAssignmentRequired: false })
+    : Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result, rerender } = renderHook(({ epoch }) => useCapabilities(user, epoch), { initialProps: { epoch: 0 } });
+  await act(async () => {});
+  const retiredReload = result.current.reload;
+  await act(async () => getCurrentUser());
+  const requests = fetchMock.mock.calls.length;
+
+  visibility.mockReturnValue("visible");
+  if (trigger === "hidden initial check") {
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(result.current.pending).toBe(false);
+    expect(result.current.activeCheck).toBeUndefined();
+  }
+  await act(async () => {
+    if (trigger === "reload") await retiredReload();
+    else {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    }
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(requests);
+  expect(result.current.loading || result.current.pending).toBe(false);
+  expect(result.current.error).toBeUndefined();
+
+  rerender({ epoch: 1 });
+  await act(async () => {});
+  expect(fetchMock).toHaveBeenCalledTimes(requests + 2);
+  expect(result.current.awaitingInitialCheck).toBeUndefined();
+  await act(async () => retiredReload());
+  expect(fetchMock).toHaveBeenCalledTimes(requests + 2);
+});
+
+it.each([
+  ["initial", "success"], ["initial", "failure"], ["reload", "success"], ["reload", "failure"],
+] as const)("does not publish a %s catalog %s or start its check if the request session changes during cache delivery", async (phase, outcome) => {
+  const queries = createSavedQueryClient();
+  let revalidation: Promise<unknown> | undefined;
+  let observe = phase === "initial";
+  let fail = observe && outcome === "failure";
+  const unsubscribe = queries.getQueryCache().subscribe(event => {
+    if (observe && event.type === "updated" && event.action.type === (outcome === "success" ? "success" : "error") && !revalidation) {
+      revalidation = getCurrentUser();
+    }
+  });
+  const fetchMock = vi.fn(async (url: string) => url === "/api/me"
+    ? Response.json({ user, csrfToken: "fixture-csrf", roleAssignmentRequired: false })
+    : fail ? Response.json({ code: "request_throttled" }, { status: 429 })
+      : Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result, rerender, unmount } = renderHook(({ epoch }) => useCapabilities(user, epoch), {
+    initialProps: { epoch: 0 },
+    wrapper: ({ children }) => <QueryClientProvider client={queries}>{children}</QueryClientProvider>,
+  });
+  try {
+    let previous = result.current.views;
+    if (phase === "reload") {
+      await act(async () => {});
+      previous = result.current.views;
+      observe = true;
+      fail = outcome === "failure";
+      await act(async () => result.current.reload());
+    }
+    await act(async () => {});
+    await revalidation;
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      ...(phase === "reload" ? ["/api/capabilities", "/api/capabilities/check"] : []),
+      "/api/capabilities", "/api/me",
+    ]);
+    if (phase === "reload") expect(result.current.views).toBe(previous);
+    else expect(result.current.views).toEqual([]);
+    expect(result.current.loading || result.current.pending).toBe(false);
+    expect(result.current.error).toBeUndefined();
+    expect(result.current.awaitingInitialCheck).toBe(phase === "initial" ? true : undefined);
+    fail = false;
+    rerender({ epoch: 1 });
+    await act(async () => {});
+    expect(result.current.views).toHaveLength(1);
+    expect(result.current.awaitingInitialCheck).toBeUndefined();
+  } finally {
+    unmount();
+    unsubscribe();
+    queries.clear();
+  }
+});
+
+it("shares the initial catalog without letting its first caller's unmount cancel the remaining caller", async () => {
+  const queries = createSavedQueryClient();
+  let release!: (response: Response) => void;
+  let catalogSignal: AbortSignal | null | undefined;
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === "/api/capabilities") {
+      catalogSignal = init?.signal;
+      return new Promise<Response>(resolve => { release = resolve; });
+    }
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const wrapper = ({ children }: { children: React.ReactNode }) => <QueryClientProvider client={queries}>{children}</QueryClientProvider>;
+  const first = renderHook(() => useCapabilities(user), { wrapper });
+  const second = renderHook(() => useCapabilities(user), { wrapper });
+  const retiredReload = first.result.current.reload;
+  try {
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(first.result.current.loading && second.result.current.loading).toBe(true);
+    first.unmount();
+    await act(async () => retiredReload());
+    expect(catalogSignal?.aborted).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(second.result.current.loading).toBe(true);
+
+    await act(async () => release(Response.json({ value: [available()] })));
+    expect(second.result.current.views).toHaveLength(1);
+    expect(second.result.current.loading || second.result.current.pending).toBe(false);
+    expect(second.result.current.error).toBeUndefined();
+    expect(second.result.current.awaitingInitialCheck).toBeUndefined();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/capabilities", "/api/capabilities/check"]);
+  } finally {
+    first.unmount();
+    second.unmount();
+    queries.clear();
+  }
+});
+
+it.each(
+  [200, 401, 503].flatMap(status => (["account", "roles", "epoch"] as const).map(boundary => ({ status, boundary }))),
+)("fences shared-cache $boundary A-B-A catalog and check responses, including late HTTP $status", async ({ status, boundary }) => {
+  const queries = createSavedQueryClient();
+  const held: Array<{ release: (response: Response) => void; signal?: AbortSignal | null }> = [];
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+    new Promise<Response>(release => { held.push({ release, signal: init?.signal }); }));
+  vi.stubGlobal("fetch", fetchMock);
+  const revalidate = vi.fn();
+  const unsubscribe = subscribeSessionRevalidationRequired(revalidate);
+  const previous = available();
+  previous.operationFailure = { status: "missing_role", checkedAt: previous.decision.checkedAt!,
+    expiresAt: previous.decision.expiresAt!, remediation: [] };
+  const replacement = available(undefined, "graph.directory.read");
+  const { result, rerender, unmount } = renderHook(({ principal, epoch }) => useCapabilities(principal, epoch), {
+    initialProps: { principal: user, epoch: 0 },
+    wrapper: ({ children }) => <QueryClientProvider client={queries}>{children}</QueryClientProvider>,
+  });
+  try {
+    await act(async () => held[0].release(Response.json({ value: [previous] })));
+    expect(result.current.pending).toBe(true);
+    expect(permissionIssues(result.current.views, result.current.now)).toHaveLength(1);
+    const retiredReload = result.current.reload;
+    rerender({
+      principal: { ...user, ...(boundary === "account" ? { homeAccountId: "fixture-b" }
+        : boundary === "roles" ? { roles: ["AgentControl.Admin"] as SessionUser["roles"] } : {}) },
+      epoch: boundary === "epoch" ? 1 : 0,
+    });
+    rerender({ principal: user, epoch: 0 });
+    expect(result.current.views).toEqual([]);
+    expect(result.current.loading).toBe(true);
+    expect(held).toHaveLength(4);
+    expect(held[1].signal?.aborted).toBe(true);
+    expect(held[2].signal?.aborted).toBe(true);
+    await act(async () => retiredReload());
+    expect(held).toHaveLength(4);
+    expect(held[3].signal?.aborted).toBe(false);
+    await act(async () => held[3].release(Response.json({ value: [replacement] })));
+    const activeCheck = result.current.activeCheck;
+    expect(held).toHaveLength(5);
+    await act(async () => {
+      const body = status === 200 ? { value: [previous] } : { code: status === 401 ? "session_invalidated" : "temporarily_unavailable" };
+      held[1].release(Response.json(body, { status }));
+      held[2].release(Response.json(body, { status }));
+    });
+    expect(result.current.views).toEqual([replacement]);
+    expect(result.current.activeCheck).toEqual(activeCheck);
+    expect(result.current.pending).toBe(true);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBeUndefined();
+    expect(held[4].signal?.aborted).toBe(false);
+    expect(revalidate).not.toHaveBeenCalled();
+    await act(async () => held[4].release(Response.json({ value: [replacement] })));
+    expect(result.current.views).toEqual([replacement]);
+    expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
+    expect(result.current.loading || result.current.pending).toBe(false);
+    expect(result.current.awaitingInitialCheck).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  } finally {
+    unmount();
+    unsubscribe();
+    queries.clear();
+  }
+});
+
+it("waits for an invalidated catalog's replacement before publishing evidence or starting one check", async () => {
+  vi.useFakeTimers();
+  const queries = createSavedQueryClient();
+  const held: Array<{ release: (response: Response) => void; signal?: AbortSignal | null }> = [];
+  let hold = false;
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (hold && url === "/api/capabilities") return new Promise<Response>(release => { held.push({ release, signal: init?.signal }); });
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const wrapper = ({ children }: { children: React.ReactNode }) => <QueryClientProvider client={queries}>{children}</QueryClientProvider>;
+  const initial = renderHook(() => useCapabilities(user), { wrapper });
+  await act(async () => {});
+  initial.unmount();
+  hold = true;
+  const { result, unmount } = renderHook(() => useCapabilities(user), { wrapper });
+  try {
+    expect(held).toHaveLength(1);
+    act(() => { void queries.invalidateQueries({ queryKey: ["saved", "capabilities"] }); });
+    expect(held).toHaveLength(2);
+    expect(held[0].signal?.aborted).toBe(true);
+    expect(held[1].signal?.aborted).toBe(false);
+    await act(async () => held[0].release(Response.json({ code: "session_invalidated" }, { status: 401 })));
+    expect(result.current.views).toEqual([]);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeUndefined();
+    await act(async () => held[1].release(Response.json({ value: [available()] })));
+    expect(result.current.views).toHaveLength(1);
+    expect(result.current.loading || result.current.pending).toBe(false);
+    expect(result.current.awaitingInitialCheck).toBeUndefined();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/capabilities", "/api/capabilities/check",
+      "/api/capabilities", "/api/capabilities", "/api/capabilities/check",
+    ]);
+  } finally {
+    unmount();
+    queries.clear();
+  }
+});
+
+it.each(["catalog", "check"] as const)("shares manual rechecks during the %s transport backoff without restarting its timer", async phase => {
+  vi.useFakeTimers();
+  let fail = false;
+  const fetchMock = vi.fn(async (url: string) => {
+    const target = phase === "catalog" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check");
+    if (fail && target) {
+      fail = false;
+      return Response.json({ code: "temporarily_unavailable" }, { status: 503 });
+    }
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  fail = true;
+  let first!: Promise<void>;
+  await act(async () => { first = result.current.reload(); });
+  const requests = fetchMock.mock.calls.length;
+  await act(() => vi.advanceTimersByTimeAsync(999));
+  let duplicate!: Promise<void>;
+  act(() => { duplicate = result.current.reload(); });
+  expect(duplicate).toBe(first);
+  expect(fetchMock).toHaveBeenCalledTimes(requests);
+  expect(result.current.loading || result.current.pending).toBe(true);
+  expect(result.current.error).toBeUndefined();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([first, duplicate]);
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+  expect(result.current.loading || result.current.pending).toBe(false);
+  expect(result.current.error).toBeUndefined();
 });
 
 it("refreshes reported operation issues only on an explicit check", async () => {
@@ -167,6 +636,32 @@ it("cancels a queued retry when the current session is removed", async () => {
   expect(result.current.error).toBeUndefined();
 });
 
+it.each(["catalog", "check"] as const)("does not replay a delayed %s retry into a newly validated request session", async phase => {
+  vi.useFakeTimers();
+  const path = phase === "catalog" ? "/api/capabilities" : "/api/capabilities/check";
+  let attempts = 0;
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url === "/api/me") return Response.json({
+      user: { ...user, homeAccountId: "fixture-b" }, csrfToken: "fixture-csrf", roleAssignmentRequired: false,
+    });
+    if (url === path && ++attempts === 1) return Response.json({ code: "temporarily_unavailable" }, { status: 503 });
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const controller = new AbortController();
+  const read = phase === "catalog" ? getCapabilities : checkCapabilities;
+  const outcome = Promise.allSettled([retryPermissionRead(() => read({ signal: controller.signal }), controller.signal)]);
+  await act(async () => {});
+  expect(attempts).toBe(1);
+
+  await getCurrentUser();
+  await act(() => vi.advanceTimersByTimeAsync(1_000));
+
+  expect(attempts).toBe(1);
+  expect(await outcome).toMatchObject([{ status: "rejected", reason: { kind: "aborted", code: "request_aborted" } }]);
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([path, "/api/me"]);
+});
+
 it.each([400, 401, 403, 429])("does not retry deterministic/security/throttling API failure %s", async status => {
   vi.useFakeTimers();
   const fetchMock = vi.fn(async (url: string) => url.startsWith("/api/capabilities/check")
@@ -199,6 +694,31 @@ it("confirms a cached transient failure with retry=failed before exposing it as 
   expect(result.current.awaitingInitialCheck).toBeUndefined();
   expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
   expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
+});
+
+it("does not let a timeout that expires while hidden force retries of other fresh failures", async () => {
+  vi.useFakeTimers();
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+  const timeout = available(new Date(Date.now() + 1000).toISOString());
+  timeout.decision = { ...timeout.decision, status: "provider_error", authorized: false, verification: undefined,
+    evidence: { category: "provider_timeout" } };
+  const denied = available(undefined, "graph.directory.read");
+  denied.decision = { ...denied.decision, status: "missing_permission", authorized: false, verification: undefined };
+  const fetchMock = vi.fn<(url: string) => Promise<Response>>(async () => Response.json({ value: [timeout, denied] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(1001));
+  visibility.mockReturnValue("visible");
+  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/capabilities", "/api/capabilities/check"]);
+  expect(permissionIssues(result.current.views, result.current.now).map(issue => issue.view.definition.id))
+    .toEqual(["graph.directory.read"]);
+  expect(result.current.pending).toBe(false);
+  expect(result.current.awaitingInitialCheck).toBeUndefined();
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
 it("loads decisions then runs one bounded automatic check", async () => {
@@ -404,7 +924,7 @@ it("does not load or check protected capabilities without an assigned current ro
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-it("hides prior evidence and fences a stale check across principal changes", async () => {
+it.each(["account", "tenant", "roles"] as const)("hides prior evidence and fences a stale check across %s changes", async scope => {
   let resolveFirstCheck!: (value: Response) => void;
   let resolveSecondRead!: (value: Response) => void;
   let call = 0;
@@ -420,7 +940,12 @@ it("hides prior evidence and fences a stale check across principal changes", asy
   );
   await waitFor(() => expect(result.current.pending).toBe(true));
 
-  rerender({ principal: { ...user, homeAccountId: "fixture-b" } });
+  rerender({ principal: {
+    ...user,
+    ...(scope === "account" ? { homeAccountId: "fixture-b" }
+      : scope === "tenant" ? { tenantId: "tenant-b" }
+        : { roles: ["AgentControl.Admin"] as SessionUser["roles"] }),
+  } });
   expect(result.current.views).toEqual([]);
   await act(async () => {
     resolveFirstCheck(Response.json({ value: [available()] }));
@@ -504,6 +1029,41 @@ it.each([
   await act(async () => result.current.reload());
   expect(result.current.views).toHaveLength(1);
   expect(result.current.error).toBeUndefined();
+});
+
+it.each([
+  { status: 401, code: "session_invalidated" },
+  { status: 403, code: "missing_internal_role" },
+])("still discards evidence when a $status denial itself invalidates the request session", async ({ status, code }) => {
+  vi.useFakeTimers();
+  let deny = true;
+  const fetchMock = vi.fn(async (url: string) => deny && url.startsWith("/api/capabilities/check")
+    ? Response.json({ code }, { status }) : Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const revalidate = vi.fn();
+  const unsubscribe = subscribeSessionRevalidationRequired(revalidate);
+  const { result, rerender } = renderHook(({ epoch }) => useCapabilities(user, epoch), { initialProps: { epoch: 0 } });
+  try {
+    await act(async () => {});
+    expect(revalidate).toHaveBeenCalledOnce();
+    expect(result.current.views).toEqual([]);
+    expect(result.current.error).toMatch(/denied/i);
+    expect(result.current.loading || result.current.pending).toBe(false);
+    await act(async () => {
+      await result.current.reload();
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    deny = false;
+    rerender({ epoch: 1 });
+    await act(async () => {});
+    expect(result.current.views).toHaveLength(1);
+    expect(result.current.error).toBeUndefined();
+    expect(result.current.awaitingInitialCheck).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  } finally { unsubscribe(); }
 });
 
 it("aborts an in-flight automatic check on logout", async () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import type { CapabilityId, CapabilityStatus, CapabilityView } from "./api/client";
-import { capabilityExplanation, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
+import { capabilityExplanation, currentOperationFailure, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
 
 function view(status: CapabilityStatus): CapabilityView {
   return { definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
@@ -10,6 +10,31 @@ function view(status: CapabilityStatus): CapabilityView {
 const onDemandIds = capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id);
 
 describe("capability UX decisions", () => {
+  it("expires operation failures without mutating the admission decision", () => {
+    const now = Date.now();
+    const candidate = view("available");
+    candidate.operationFailure = {
+      status: "missing_permission", checkedAt: new Date(now - 1_000).toISOString(),
+      expiresAt: new Date(now + 1_000).toISOString(), remediation: [],
+    };
+    expect(currentOperationFailure(candidate, now)).toBe(candidate.operationFailure);
+    expect(currentOperationFailure(candidate, now + 1_000)).toBeUndefined();
+    expect(providerActionAllowed(candidate, false, now + 1_000)).toBe(true);
+    expect(candidate.operationFailure.status).toBe("missing_permission");
+  });
+
+  it.each([
+    { checkedAt: "invalid" }, { checkedAt: "2999-01-01T00:00:00Z" },
+    { expiresAt: "invalid" }, { expiresAt: "1970-01-01T00:00:00Z" },
+  ])("ignores malformed or noncurrent operation failures: %j", override => {
+    const candidate = view("available");
+    candidate.operationFailure = {
+      status: "missing_role", checkedAt: new Date(Date.now() - 1_000).toISOString(),
+      expiresAt: new Date(Date.now() + 1_000).toISOString(), remediation: [], ...override,
+    };
+    expect(currentOperationFailure(candidate)).toBeUndefined();
+  });
+
   it.each(["interaction_required", "authorization_expired"])("keeps application %s recovery separate from user sign-in", category => {
     const application = view("unknown");
     application.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;

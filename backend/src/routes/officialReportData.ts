@@ -216,7 +216,11 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await imports.preview((await options.identity(request)).identity, reportUuid(request.params.id)));
   }));
   route("post", "/official-usage/bundles/:id/preview", "admin", failSafe(async (request, response) => {
-    response.json(await imports.bundle((await options.identity(request)).identity, reportUuid(request.params.id)));
+    const forDiscard = request.body?.forDiscard;
+    if (forDiscard !== undefined && typeof forDiscard !== "boolean") {
+      throw new AppError(400, "invalid_import_intent", "Bundle cleanup inspection must be a boolean.");
+    }
+    response.json(await imports.bundle((await options.identity(request)).identity, reportUuid(request.params.id), { forDiscard }));
   }));
   route("post", "/official-usage/bundles/:id/accept", "admin", failSafe(async (request, response) => {
     response.json(await imports.acceptBundle((await options.identity(request)).identity, reportUuid(request.params.id), request.body));

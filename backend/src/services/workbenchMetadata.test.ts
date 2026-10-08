@@ -68,6 +68,7 @@ describe("workbench metadata", () => {
 
   it("uses only typed roles and capabilities and keeps write targets explicit", () => {
     const metadata = getWorkbenchMetadata();
+    expect(new Set(metadata.actions.map(action => action.id)).size).toBe(metadata.actions.length);
     for (const action of metadata.actions) {
       expect(action.route).toMatch(/^\/api\//);
       expect(action.roles.every(role => appRoles.includes(role))).toBe(true);

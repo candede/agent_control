@@ -129,7 +129,7 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (!job.canResume) throw new AppError(409,"not_resumable","No authorized unsent work can be resumed.");
   await commitAccountSessionValidation(validation, async () => launchBulkJob(id, scope, true));
-  response.status(202).json({ ...job, status: "queued" });
+  response.status(202).json({ ...job, status: "queued", canResume: false });
 });
 policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/reconcile", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   response.json(await reconcileBulkJob(jobId(request), requestScope(request)));

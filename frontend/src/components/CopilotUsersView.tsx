@@ -1,8 +1,9 @@
-import { useContext, useId, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { CombinedUser, ReportQuery, UnresolvedReportIdentity } from "../../../backend/src/types/officialReportData";
 import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
-import { useReportPage } from "../useReportPage";
+import { normalizeReportSearch } from "../api/reportData";
+import { useReportPage, useReportPrincipalScope } from "../useReportPage";
 import type { UsersRouteState } from "../workbenchRouting";
 import { usageCount, isValidLowResponseThreshold, usageDate } from "../usageInsights";
 import { ReportReadStatus, ReportPageControls } from "./ReportPageControls";
@@ -33,8 +34,9 @@ const userSorts = [
 ] as const;
 export function CopilotUsersView(props: Props) {
   const capability = useContext(CapabilityContext), principal = capability?.user;
+  const scope = useReportPrincipalScope();
   if (capability && !hasRole(principal, "AgentControl.Viewer")) return <section aria-label="Users and adoption"><p role="alert">Current Viewer access is required to read saved users.</p></section>;
-  return <CopilotUsersSession key={JSON.stringify([principal?.tenantId, principal?.homeAccountId, principal?.roles])} {...props} />;
+  return <CopilotUsersSession key={scope} {...props} />;
 }
 function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, reportSelector }: Props) {
   const cohortDescriptionId = useId();
@@ -73,24 +75,24 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   const [lastThreshold, setLastThreshold] = useState(5);
   const [selected, setSelected] = useState<{ id: string; selectionId: string; queryKey: string }>();
   const [unresolvedSelectionId, setUnresolvedSelectionId] = useState<string>();
-  const [invalidatedSelectionId, setInvalidatedSelectionId] = useState<string>();
   const focus = useRef<HTMLInputElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const valid = isValidLowResponseThreshold(threshold);
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
-  const query = { ...filters, search: route.search || undefined, setId: route.reportSetId,
+  const query = { ...filters, search: normalizeReportSearch(route.search) || undefined, setId: route.reportSetId?.toLowerCase(),
     lowResponseThreshold: valid ? Number(threshold) : lastThreshold };
-  const pageRead = useReportPage<CombinedUser>("copilot-usage/users", query, revision);
-  const queryKey = JSON.stringify([query, pageRead.recoveryRevision]);
-  const read = pageRead.data && pageRead.data.selection.id === invalidatedSelectionId
-    ? { ...pageRead, data: undefined, invalidated: true } : pageRead;
+  const read = useReportPage<CombinedUser>("copilot-usage/users", query, revision);
+  const queryKey = JSON.stringify([query, revision, read.recoveryRevision]);
   const data = read.data;
   const [initialReadComplete, setInitialReadComplete] = useState(false);
   if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
+  const [hasShownPageControls, setHasShownPageControls] = useState(false);
+  const showPageControls = Boolean(read.loading || read.error || read.invalidated || data && data.counts.filtered > 0);
+  if (!hasShownPageControls && initialReadComplete && showPageControls) setHasShownPageControls(true);
   if (selected && (selected.queryKey !== queryKey || read.error || read.invalidated || !data && !read.loading
     || data && data.selection.id !== selected.selectionId)) setSelected(undefined);
   if (unresolvedSelectionId && (!data || data.selection.id !== unresolvedSelectionId || !data.summary.unresolvedIdentities)) setUnresolvedSelectionId(undefined);
-  function restartSelection() { setSelected(undefined); setUnresolvedSelectionId(undefined); setInvalidatedSelectionId(undefined); pageRead.restart(); }
+  function restartSelection() { setSelected(undefined); setUnresolvedSelectionId(undefined); read.restart(); }
   if (!initialReadComplete && read.loading && !data && !read.error && !read.invalidated) {
     return <WorkspaceSkeleton view="users" contentOnly />;
   }
@@ -109,7 +111,8 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
     {data && !read.loading && ["stale", "unavailable"].includes(data.sources.app_activity.state) ? <p className="copilot-users-notice" role="status">
       Office app activity {data.sources.app_activity.state === "stale" ? "is out of date. Run Users sync in Sync." : "unavailable. Review the connection in Permissions."}</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
-      <UserActivityFilters path="copilot-usage/users" selectionId={data?.selection.id} onRestartSelection={restartSelection}
+      <UserActivityFilters path="copilot-usage/users" selectionId={read.selectionId} onRestartSelection={restartSelection}
+      onSelectionInvalidated={read.invalidateSelection}
       values={{ company: filters.company, department: filters.department, cohort: filters.cohort ?? "licensed", lowResponseThreshold: threshold }}
       cohorts={cohorts.map(([value, label]) => ({ value, label: value === "licensed" ? "All paid users" : label }))} defaultCohort="licensed" cohortLabel="Activity"
       searchLabel="Search users or agents" search={route.search} searchRef={focus} sort={`${filters.sort}:${filters.order}`}
@@ -118,9 +121,9 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
       }} onSort={value => { const [sort, order] = value.split(":"); setFilters({ ...filters, sort: sort as ReportQuery["sort"], order: order as ReportQuery["order"] }); }}
       onClear={() => { setFilters({ cohort: "licensed", sort: filters.sort, order: filters.order }); setThreshold("5"); change({ ...route, search: "", page: 0 }); }}
-      exportButton={<ReportExportButton key={data?.selection.id} kind="copilot_users" selectionId={data?.selection.id} label="Export users CSV"
-        onSelectionInvalidated={() => setInvalidatedSelectionId(data?.selection.id)} disabled={read.loading || !valid} />} />
-      {read.loading || data?.value.length ? <div className="table-shell copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
+      exportButton={<ReportExportButton key={read.selectionId} kind="copilot_users" selectionId={read.selectionId} label="Export users CSV"
+        onSelectionInvalidated={read.invalidateSelection} disabled={!read.selectionId || !valid} />} />
+      <div className="table-shell copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
         <table className="agent-table copilot-users-table reported-users-table"><thead><tr>{([["User", "name"], ["Agent responses", "responses"], ["Agents used", "agentsUsed"],
           ["Company", "company"], ["Department", "department"], ["Last activity", "lastActivity"]] as const).map(([label, sort]) =>
           <ReportSortHeading key={sort} label={label} sort={sort} query={filters} onChange={setFilters} />)}</tr></thead>
@@ -131,11 +134,12 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
             {user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</th>
             <td data-numeric>{usageCount(user.reportedResponses)}</td><td data-numeric>{usageCount(user.reportedAgentsUsed)}</td><td>{user.directory.companyName?.trim() || "Not set"}</td>
             <td>{user.directory.department?.trim() || "Not set"}</td><td>{usageDate(user.userLastActivityDateUtc)}</td></tr>)}</tbody></table>
-      </div> : data ? <div className="reported-users-empty">
+      </div>
+      {data && !data.value.length ? <div className="reported-users-empty">
         <h3>{data.counts.filtered ? "No users on this page" : "No users match"}</h3>
         <p>{data.counts.filtered ? "Continue to the next page." : "Try another search or clear filters."}</p>
       </div> : null}
-      {read.loading || data && data.counts.filtered > 0 ? <ReportPageControls {...read} label="users" /> : null}
+      {showPageControls || hasShownPageControls ? <ReportPageControls {...read} label="users" /> : null}
     </div>
     {data ? <>
       <details className="copilot-users-provenance" onToggle={event => {
@@ -151,16 +155,24 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
           aria-expanded={unresolvedSelectionId === data.selection.id}
           onClick={() => setUnresolvedSelectionId(value => value === data.selection.id ? undefined : data.selection.id)}>
           Unresolved report identities ({data.summary.unresolvedIdentities.toLocaleString()})</button> : null}
-        {unresolvedSelectionId === data.selection.id ? <UnresolvedIdentities selectionId={data.selection.id} onRestartSelection={restartSelection} /> : null}
+        {unresolvedSelectionId === data.selection.id ? <UnresolvedIdentities selectionId={data.selection.id} onRestartSelection={restartSelection}
+          onSelectionInvalidated={read.invalidateSelection} /> : null}
       </details>
     </> : null}
     {selected ? <UserDetailModal key={selected.selectionId + selected.id} identity={selected.id} selectionId={selected.selectionId} kind="directory"
       returnFocusTo={trigger} closeLabel="Close user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
-      dataRevision={revision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection} /> : null}
+      dataRevision={revision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
+      onSelectionInvalidated={read.invalidateSelection} /> : null}
   </>;
 }
-function UnresolvedIdentities({ selectionId, onRestartSelection }: { selectionId: string; onRestartSelection: () => void }) {
+function UnresolvedIdentities({ selectionId, onRestartSelection, onSelectionInvalidated }: {
+  selectionId: string; onRestartSelection: () => void; onSelectionInvalidated: () => void;
+}) {
   const read = useReportPage<UnresolvedReportIdentity>("copilot-usage/users/unresolved-identities", { selectionId }, 0, true, onRestartSelection);
+  useEffect(() => {
+    if (read.invalidated) onSelectionInvalidated();
+  }, [read.invalidated, onSelectionInvalidated]);
+  if (read.invalidated) return null;
   return <section aria-label="Unresolved report identities"><ReportReadStatus read={read} />
     <ul>{read.data?.value.map(row => <li key={row.username}>{row.username}: {row.reason}; {usageCount(row.responses)} responses</li>)}</ul><ReportPageControls {...read} label="identities" /></section>;
 }

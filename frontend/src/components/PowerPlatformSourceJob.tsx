@@ -3,85 +3,102 @@ import { cancelInventoryRefresh, getInventoryRefreshJob, refreshInventory, resum
 import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 
-export function PowerPlatformSourceJob({ jobId, onSelect, onChanged, onCancelRequested }: {
+export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved, onCancelRequested, paused = false }: {
   jobId: string;
-  onSelect: (id: string | undefined) => void;
-  onChanged: () => void;
+  initialJob?: InventoryRefreshJob;
+  onSelect: (id: string | undefined, initialJob?: InventoryRefreshJob) => void;
+  onObserved: (job: InventoryRefreshJob, previous?: InventoryRefreshJob) => void;
   onCancelRequested?: () => void;
+  paused?: boolean;
 }) {
-  const [job, setJob] = useState<InventoryRefreshJob>();
+  const [initial] = useState(() => initialJob?.id === jobId ? initialJob : undefined);
+  const [job, setJob] = useState(initial);
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [revision, setRevision] = useState(0);
   const generation = useRef(0);
   const lifetime = useRef({ active: false });
-  const previousStatus = useRef<InventoryRefreshJob["status"] | undefined>(undefined);
-  const changed = useEffectEvent(onChanged);
+  const actionRequest = useRef<AbortController | undefined>(undefined);
+  const readRequest = useRef<AbortController | undefined>(undefined);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const previousJob = useRef(initial);
+  const observed = useEffectEvent(onObserved);
   const readSaved = useSavedRead();
   const selected = job?.id === jobId ? job : undefined;
+  const jobUrl = `/sync?${new URLSearchParams({ powerPlatformJob: jobId })}`;
 
   useEffect(() => {
     const owner = { active: true };
     lifetime.current = owner;
-    return () => { owner.active = false; };
+    return () => { owner.active = false; actionRequest.current?.abort(); clearTimeout(pollTimer.current); };
   }, []);
 
   useEffect(() => {
-    if (busy || error) return;
+    if (paused || error || actionRequest.current) return;
+    // A retry hands off an already-observed response, not a stale saved read.
+    if (revision === 0 && initial) {
+      if (initial.status === "running") pollTimer.current = setTimeout(() => setRevision(value => value + 1), 2500);
+      return () => clearTimeout(pollTimer.current);
+    }
     const request = ++generation.current;
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    readRequest.current = controller;
     void readSaved(["power-platform-source-job", jobId, revision], signal =>
       getInventoryRefreshJob(jobId, { signal }), controller.signal).then(result => {
       if (controller.signal.aborted || generation.current !== request) return;
       if (result.id !== jobId) throw new Error("The source returned a different job. Reload the exact job.");
       setJob(result);
       setError(undefined);
-      if (previousStatus.current && ["running", "waiting_authorization"].includes(previousStatus.current)
-        && !["running", "waiting_authorization"].includes(result.status)) changed();
-      previousStatus.current = result.status;
-      if (result.status === "running") timer = setTimeout(() => setRevision(value => value + 1), 2500);
+      observed(result, previousJob.current);
+      previousJob.current = result;
+      if (result.status === "running") pollTimer.current = setTimeout(() => setRevision(value => value + 1), 2500);
     }).catch(caught => {
       if (controller.signal.aborted || generation.current !== request) return;
       setJob(undefined);
       setError(caught instanceof Error ? caught.message : "Unable to read this source job.");
     });
-    return () => { controller.abort(); clearTimeout(timer); generation.current += 1; };
-  }, [jobId, revision, busy, error, readSaved]);
+    return () => { controller.abort(); clearTimeout(pollTimer.current); generation.current += 1; };
+  }, [jobId, revision, paused, error, readSaved, initial]);
 
   async function act(action: "resume" | "cancel" | "retry") {
-    if (!selected || busy || error) return;
+    if (!selected || paused || busy || error || actionRequest.current) return;
     if (action === "cancel") onCancelRequested?.();
     generation.current += 1;
+    readRequest.current?.abort();
+    clearTimeout(pollTimer.current);
     const owner = lifetime.current;
+    const controller = new AbortController();
+    actionRequest.current = controller;
     setBusy(true);
     try {
       const result = action === "retry"
-        ? await refreshInventory({ types: selected.requestedTypes, ...(selected.environmentScope ? { environmentId: selected.environmentScope } : {}) })
-        : action === "resume" ? await resumeInventoryRefresh(jobId) : await cancelInventoryRefresh(jobId);
+        ? await refreshInventory({ types: selected.requestedTypes, ...(selected.environmentScope ? { environmentId: selected.environmentScope } : {}) }, { signal: controller.signal })
+        : action === "resume" ? await resumeInventoryRefresh(jobId, { signal: controller.signal }) : await cancelInventoryRefresh(jobId, { signal: controller.signal });
       if (!owner.active) return;
       if (action !== "retry" && result.id !== jobId) throw new Error("The source returned a different job. Reload the exact job.");
       setJob(result);
-      previousStatus.current = result.status;
-      setRevision(value => value + 1);
-      onChanged();
-      if (action === "retry") onSelect(result.id);
+      onObserved(result, previousJob.current);
+      previousJob.current = result;
+      if (action === "retry") onSelect(result.id, result);
+      else if (result.status === "running") pollTimer.current = setTimeout(() => setRevision(value => value + 1), 2500);
     } catch (caught) {
       if (!owner.active) return;
       setJob(undefined);
       setError(caught instanceof Error ? caught.message : "Unable to update this source job.");
     } finally {
+      if (actionRequest.current === controller) actionRequest.current = undefined;
       if (owner.active) setBusy(false);
     }
   }
 
-  return <section className="sync-inventory-tools" aria-label="Power Platform source job">
+  return <section className="sync-inventory-tools" aria-label="Power Platform source job" aria-busy={paused || busy || !error && !selected}>
     <div className="section-heading"><h3>Power Platform source job</h3><button type="button" className="secondary" onClick={() => onSelect(undefined)}>Close source job</button></div>
     <p>Exact job: <code>{jobId}</code></p>
-    {error ? <div role="alert">{error} <button type="button" onClick={() => { setError(undefined); setRevision(value => value + 1); }}>Reload source job</button></div>
+    {paused ? <p role="status">Waiting for the current source command…</p>
+      : error ? <div role="alert">{error} <button type="button" onClick={() => { setError(undefined); setRevision(value => value + 1); }}>Reload source job</button></div>
       : !selected ? <p role="status">Loading source job…</p>
         : <>
-          <p role="status">{selected.status.replaceAll("_", " ")}{selected.errorCode ? ` (${selected.errorCode})` : ""}{selected.message ? ` — ${selected.message}` : ""}</p>
+          <p role="status">{busy ? "Updating source job… Last observed: " : ""}{selected.status.replaceAll("_", " ")}{selected.errorCode ? ` (${selected.errorCode})` : ""}{selected.message ? ` — ${selected.message}` : ""}</p>
           <dl className="sync-inventory-counts">
             <div><dt>Observed rows</dt><dd>{selected.observedCount.toLocaleString()}</dd></div>
             <div><dt>Provider total</dt><dd>{selected.totalRecords === null ? "Unknown" : selected.totalRecords.toLocaleString()}</dd></div>
@@ -90,7 +107,7 @@ export function PowerPlatformSourceJob({ jobId, onSelect, onChanged, onCancelReq
           </dl>
           <p>Scope: {selected.roleScope}; {selected.environmentScope ?? "all authorized environments"}. Requested: {selected.requestedTypes.join(", ")}.</p>
           <p>Created: {selected.createdAt}. Updated: {selected.updatedAt}. {selected.snapshotId ? `Saved snapshot: ${selected.snapshotId}` : "No snapshot published by this job."}</p>
-          {selected.status === "waiting_authorization" ? <p><a href="/api/auth/login">Sign in again</a>, then resume this exact job.</p> : null}
+          {selected.status === "waiting_authorization" ? <p><a href={`/api/auth/login?${new URLSearchParams({ returnTo: jobUrl })}`}>Sign in again</a>, then resume this exact job.</p> : null}
           <div className="inline-actions">
             {selected.status === "waiting_authorization" ? <WorkbenchActionGate actionId="power-platform.resume"><button type="button" disabled={busy} onClick={() => void act("resume")}>Resume source job</button></WorkbenchActionGate> : null}
             {["waiting_authorization", "running"].includes(selected.status) ? <WorkbenchActionGate actionId="power-platform.cancel"><button type="button" disabled={busy} onClick={() => void act("cancel")}>Cancel source job</button></WorkbenchActionGate> : null}

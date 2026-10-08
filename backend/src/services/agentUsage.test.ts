@@ -351,7 +351,8 @@ describe("strict native association contracts", () => {
       { source: "power_platform" as const, nativeId: text, environmentId: text }]) {
       const value = { ...input(), reportAgentId: text, target };
       expect(officialAgentUsageMutation(value)).toEqual(value);
-      expect(parseRecordId(unifiedAgentRecordId(target))).toEqual(target);
+      expect(parseRecordId(unifiedAgentRecordId(target))).toEqual(target.source === "power_platform"
+        ? { ...target, environmentId: text.toLowerCase() } : target);
     }
     expect(reportQuery("official_agents", { search: text }).search).toBe(text.normalize("NFKC").toLowerCase());
   });

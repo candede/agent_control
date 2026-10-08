@@ -18,14 +18,17 @@ export function isExternalFixtureRequest(url: URL) {
   return !["localhost", "127.0.0.1"].includes(url.hostname);
 }
 
-export type PermissionLayoutRequestKind = "catalog" | "automatic-check" | "retry-failed";
+export type PermissionLayoutRequestKind = "catalog" | "automatic-check" | "retry-failed" | "progress" | "retry-failed-progress";
 
 export function permissionLayoutRequestKind(method: string, url: URL): PermissionLayoutRequestKind | undefined {
   if (method === "GET" && url.pathname === "/api/capabilities") return "catalog";
-  if (method !== "POST" || url.pathname !== "/api/capabilities/check") return undefined;
+  const progress = method === "GET" && url.pathname === "/api/capabilities/check-progress";
+  if (!progress && (method !== "POST" || url.pathname !== "/api/capabilities/check")) return undefined;
   const options = [...url.searchParams];
-  if (!options.length) return "automatic-check";
-  if (options.length === 1 && options[0][0] === "retry" && options[0][1] === "failed") return "retry-failed";
+  if (!options.length) return progress ? "progress" : "automatic-check";
+  if (options.length === 1 && options[0][0] === "retry" && options[0][1] === "failed") {
+    return progress ? "retry-failed-progress" : "retry-failed";
+  }
   return undefined;
 }
 

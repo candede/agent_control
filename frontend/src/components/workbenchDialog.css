@@ -8,7 +8,8 @@
   color: var(--text);
   background: var(--surface);
   box-shadow: 0 24px 80px #142c4033;
-  overflow: hidden;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .workbench-dialog[open] { display: flex; flex-direction: column; }
@@ -19,7 +20,7 @@
 .workbench-dialog-header h2 { margin: 0; font-size: 21px; }
 .workbench-dialog-header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .workbench-dialog .workbench-dialog-close { flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; display: grid; place-items: center; padding: 8px; }
-.workbench-dialog-body { display: grid; gap: 20px; padding: 24px; overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.workbench-dialog-body { display: grid; align-content: start; gap: 20px; padding: 24px; overflow: auto; min-height: min(10rem, 50dvh); overscroll-behavior: contain; }
 
 @media (max-width: 600px) {
   .workbench-dialog { width: calc(100% - 16px); max-height: calc(100dvh - 24px); border-radius: 10px; }

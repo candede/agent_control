@@ -63,6 +63,19 @@ function deferred<T>() {
 }
 
 describe("capability list database admission", () => {
+  it("publishes the saved-data configuration revision even when application flags are unchanged", async () => {
+    const { value, probes } = service();
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
+    for (const revision of [2, 3]) {
+      await value.configureApplication("purview.audit.search.application", administrator, true, true);
+      const views = await value.list(administrator);
+      expect(views.find(view => view.definition.id === "purview.audit.search.application")?.configuration)
+        .toEqual({ enabled: true, sharedDataScope: true, revision });
+    }
+    expect(probes.delegatedToken).not.toHaveBeenCalled();
+    expect(probes.applicationToken).not.toHaveBeenCalled();
+  });
+
   it("retains registry order and complete policy results without saturating the three foreground connections", async () => {
     const { repository, value, probes } = service();
     let active = 0, maximum = 0;
@@ -1083,7 +1096,7 @@ describe("capability decisions", () => {
       expect.objectContaining({ definition: expect.objectContaining({ id: "purview.audit.search.delegated" }), decision: expect.objectContaining({ verification: "token", authorized: true }) }),
       expect.objectContaining({ definition: expect.objectContaining({ id: "reports.official.import" }), decision: expect.objectContaining({ status: "missing_internal_role" }) }),
       expect.objectContaining({ definition: expect.objectContaining({ id: "graph.package.read.delegated" }), enabled: true }),
-      expect.objectContaining({ definition: expect.objectContaining({ id: "graph.package.read.application" }), enabled: false, configuration: { enabled: false, sharedDataScope: false } }),
+      expect.objectContaining({ definition: expect.objectContaining({ id: "graph.package.read.application" }), enabled: false, configuration: { enabled: false, sharedDataScope: false, revision: 1 } }),
     ]));
     await value.check(reader);
     expect(probes.delegatedToken).toHaveBeenCalledTimes(6);

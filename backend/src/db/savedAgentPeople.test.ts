@@ -88,7 +88,7 @@ describe("selected persisted directory people", () => {
     const scope = { tenantId: "saved-people", principalId: "private-reader" };
     await inventory(scope);
     const before = await selected(scope);
-    expect(before.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect(before.page.value[0].people?.createdBy).toBeUndefined();
     await publish({ ...scope, tenantId: "other-tenant" }, [directoryUser("Other tenant")]);
     await publish({ ...scope, principalId: "other-reader" }, [directoryUser("Other principal")]);
     const stages = new UserSourceStages(fixture.runtime);
@@ -97,10 +97,10 @@ describe("selected persisted directory people", () => {
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
     const isolated = await selected(scope);
-    expect(isolated.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect(isolated.page.value[0].people?.createdBy).toBeUndefined();
     expect(isolated.page.value[0].id).toBe(before.page.value[0].id);
     await publish(scope, [directoryUser("Unmatched", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")]);
-    expect((await selected(scope)).page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect((await selected(scope)).page.value[0].people?.createdBy).toBeUndefined();
     const expiresAt = new Date(Date.now() + 1500);
     await publish(scope, [directoryUser()], expiresAt);
     const saved = await selected(scope);
@@ -112,7 +112,7 @@ describe("selected persisted directory people", () => {
     expect(saved.page.value[0].id).toBe(before.page.value[0].id);
     await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now()) + 20));
     const expired = await selected(scope);
-    expect(expired.page.value[0].people?.createdBy?.status).not.toBe("resolved");
+    expect(expired.page.value[0].people?.createdBy).toBeUndefined();
     expect(expired.page.value[0].powerPlatformResource?.details.ownerId).toBe(personId.toUpperCase());
     expect(expired.page.value[0].id).toBe(saved.page.value[0].id);
     await expect(saved.queries.page(saved.selection.id, saved.identity)).rejects.toMatchObject({ code: "selection_invalidated" });

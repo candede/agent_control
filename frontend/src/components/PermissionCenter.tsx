@@ -138,7 +138,7 @@ function PermissionCenterContent() {
             </div>
           </li>)}</ul> : !error && !loading && !pending && !awaitingInitialCheck ? <p className="permission-quiet" role="status">No issues reported.</p> : null}
       </section>
-      <AppPrerequisites views={views} />
+      <AppPrerequisites views={views} loading={loading} />
       <InvestigationSetup />
       <SignedInUserRoles />
     </div>
@@ -154,7 +154,7 @@ function PermissionCenterContent() {
   </section>;
 }
 
-function AppPrerequisites({ views }: { views: CapabilityView[] }) {
+function AppPrerequisites({ views, loading }: { views: CapabilityView[]; loading: boolean }) {
   const definitions = views.map(view => view.definition).filter(definition => definition.probe.adapterRegistered && definition.mode !== "local");
   const groups = new Map<string, { label: string; permissions: Map<string, Set<string>> }>([
     ["sign-in", { label: "Sign-in / OpenID Connect", permissions: new Map([
@@ -182,7 +182,9 @@ function AppPrerequisites({ views }: { views: CapabilityView[] }) {
     <p className="permission-setup-note">Administrator: add the API permissions in Entra, then <strong>Grant admin consent</strong>.</p>
     <details><summary>Required API permissions</summary>
       <p className="permission-setup-note">App registrations &gt; this app &gt; API permissions. After setup, sign in again. This app does not request or grant permissions.</p>
-      {!definitions.length ? <p className="permission-setup-note">The feature permission list is unavailable. Consult the deployment setup guide; this is not an empty requirements list.</p> : null}
+      {!definitions.length ? <p className="permission-setup-note">{loading
+        ? "Loading feature permission requirements..."
+        : "The feature permission list is unavailable. Consult the deployment setup guide; this is not an empty requirements list."}</p> : null}
       <div className="permission-requirements">{[...groups.entries()].filter(([key]) => !key.endsWith(":application"))
         .map(([key, group]) => <PermissionReference key={key} {...group} />)}</div>
       {[...groups.keys()].some(key => key.endsWith(":application")) ? <details className="permission-optional">

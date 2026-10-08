@@ -6,10 +6,11 @@ import {
   type CopilotPackage,
   type CopilotPackageDetail,
   type PackageAccessUpdate,
+  type QuarantineJob,
   type UnifiedAgentRecord,
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
-import { quarantineTargetReason } from "../quarantineTarget";
+import { quarantineTargetKey, quarantineTargetReason } from "../quarantineTarget";
 import { CapabilityContext } from "../capabilityContext";
 import { providerActionAllowed } from "../capabilityState";
 import { useAgentPeople } from "../useAgentPeople";
@@ -46,6 +47,7 @@ type Props = {
   packageDetailLoading?: boolean;
   packageDetailError?: string;
   packageActionsBusy?: boolean;
+  packageActionsBlockedReason?: string;
   onUpdatePackageAccess: (item: CopilotPackage, update: PackageAccessUpdate) => Promise<void>;
   onSetPackageBlocked: (item: CopilotPackage, blocked: boolean) => void;
   packageAccessRevisions?: ReadonlyMap<string, number>;
@@ -57,9 +59,11 @@ type Props = {
   usageContext?: import("../../../backend/src/types/unifiedAgents").InventoryReportContext;
   inventoryRevision?: string;
   inventoryError?: string;
+  onInventoryInvalidated?: (selectionId: string) => void;
   onRetryInventory?: () => void;
   onUsageChanged?: () => void;
   onPeopleChanged?: () => void;
+  onQuarantineJobChange?: (job: QuarantineJob) => void;
   onOpenPerson?: (id: string) => void;
 };
 
@@ -78,6 +82,7 @@ export function UnifiedAgentDetailModal({
   packageDetailLoading = false,
   packageDetailError,
   packageActionsBusy = false,
+  packageActionsBlockedReason,
   onUpdatePackageAccess,
   onSetPackageBlocked,
   packageAccessRevisions,
@@ -89,9 +94,11 @@ export function UnifiedAgentDetailModal({
   usageContext,
   inventoryRevision,
   inventoryError,
+  onInventoryInvalidated,
   onRetryInventory,
   onUsageChanged,
   onPeopleChanged,
+  onQuarantineJobChange,
   onOpenPerson,
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
@@ -138,9 +145,11 @@ export function UnifiedAgentDetailModal({
   const selectedPackage = record.packages.find(item => item.id === preferredPackageId);
   const packageLabels = record.packages.map(item => `${item.displayName}${item.version ? ` - Version ${item.version}` : ""}`);
   const missingPackageSelection = preferredPackageId !== undefined && !selectedPackage;
+  const packageTarget = selectedPackage ?? (record.packagesComplete === false && preferredPackageId !== undefined
+    ? { id: preferredPackageId } : undefined);
   const selectedDetail = packageDetail?.id === selectedPackage?.id ? packageDetail : undefined;
   const overviewKey = JSON.stringify([
-    capabilities?.user?.tenantId, capabilities?.user?.homeAccountId, [...roles].sort(), record.id, selectedPackage?.id,
+    capabilities?.user?.tenantId, capabilities?.user?.homeAccountId, [...roles].sort(), record.id,
   ]);
   const currentDetail = packageDetailStale ? undefined : selectedDetail;
   const hasPackageConfirmation = Boolean(packageConfirmation);
@@ -161,10 +170,16 @@ export function UnifiedAgentDetailModal({
   });
 
   useEffect(() => {
-    if (packageActionsBusy || packageInventoryPending || hasPackageConfirmation || !selectedPackage) {
+    if (!selectedPackage) {
       requestedPackage.current = undefined;
       return;
     }
+    if (packageActionsBusy || hasPackageConfirmation) {
+      if (!packageDetailError) requestedPackage.current = undefined;
+      return;
+    }
+    // A pending inventory read has not invalidated the selected detail request.
+    if (packageInventoryPending || inventoryError) return;
     if (currentDetail) {
       requestedPackage.current = packageDetailLoading ? packageKey : undefined;
       return;
@@ -173,7 +188,7 @@ export function UnifiedAgentDetailModal({
       || requestedPackage.current === packageKey) return;
     requestedPackage.current = packageKey;
     inspectSelectedPackage();
-  }, [usesPackageDetails, canInspectPackage, selectedPackage, currentDetail, packageKey, packageDetailLoading, packageActionsBusy, packageInventoryPending, hasPackageConfirmation]);
+  }, [usesPackageDetails, canInspectPackage, selectedPackage, currentDetail, packageKey, packageDetailLoading, packageDetailError, packageActionsBusy, packageInventoryPending, inventoryError, hasPackageConfirmation]);
 
   useEffect(() => {
     if (panel.current) panel.current.scrollTop = 0;
@@ -194,6 +209,11 @@ export function UnifiedAgentDetailModal({
   function selectTab(tab: DetailTab) {
     setInternalTab(tab);
     onTabChange(tab);
+  }
+
+  function selectPackage(id: string) {
+    setPackageSelection(current => ({ ...current, recordId: record.id, packageId: id }));
+    if (!record.packages.some(item => item.id === id)) onInspectPackage({ id });
   }
 
   function close() {
@@ -255,12 +275,12 @@ export function UnifiedAgentDetailModal({
         {usesPackageDetails && (selectedPackage || missingPackageSelection) ? <>
           {record.packagesComplete === false && selectionId ? <AgentPublishedVersions key={`${selectionId}:${record.id}`}
             selectionId={selectionId} record={record} selectedId={preferredPackageId}
-            disabled={!canInspectPackage || packageActionsBusy || packageInventoryPending || hasPackageConfirmation}
-            onSelect={id => onInspectPackage({ id })} />
+            disabled={!canInspectPackage || packageActionsBusy || packageInventoryPending || Boolean(inventoryError) || hasPackageConfirmation}
+            onSelect={selectPackage} onInvalidated={() => onInventoryInvalidated?.(selectionId)} />
             : record.packages.length > 1 || missingPackageSelection ? <div className="agent-version-selector">
             <label htmlFor={packageSelectId}>Published version details</label>
-            <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || hasPackageConfirmation}
-              onChange={event => setPackageSelection(current => ({ ...current, recordId: record.id, packageId: event.target.value }))}>
+            <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || packageInventoryPending || Boolean(inventoryError) || hasPackageConfirmation}
+              onChange={event => selectPackage(event.target.value)}>
               {missingPackageSelection ? <option value="" disabled>{packageDetailLoading ? "Loading selected version..." : "Selected version unavailable"}</option> : null}
               {record.packages.map((item, index) => <option key={item.id} value={item.id}>
                 {packageLabels[index]}{packageLabels.indexOf(packageLabels[index]) !== packageLabels.lastIndexOf(packageLabels[index]) ? ` (${index + 1})` : ""}
@@ -274,17 +294,22 @@ export function UnifiedAgentDetailModal({
             {packageDetailError ? ` ${packageDetailError}` : ""}
             Choose an available version explicitly or <a href="/sync">refresh agent inventory</a>.
           </p> : null}
-          {selectedPackage && !selectedDetail && !hasPackageConfirmation ? packageDetailError ? <WorkbenchActionGate actionId="packages.inspect" compact>
-            <button type="button" className="secondary" disabled={packageActionsBusy || packageDetailLoading} onClick={() => onInspectPackage(selectedPackage)}>Retry saved details</button>
-          </WorkbenchActionGate> : canInspectPackage ? <p className="agent-metadata-status" role="status">{packageActionsBusy
+          {packageTarget && !selectedDetail && !hasPackageConfirmation && packageDetailError ? <WorkbenchActionGate actionId="packages.inspect" compact>
+            <button type="button" className="secondary" disabled={packageActionsBusy || packageDetailLoading || packageInventoryPending || Boolean(inventoryError)}
+              onClick={() => onInspectPackage(packageTarget)}>Retry saved details</button>
+          </WorkbenchActionGate> : null}
+          {selectedPackage && !selectedDetail && !hasPackageConfirmation && !packageDetailError ? canInspectPackage ? <p className="agent-metadata-status" role="status">{packageActionsBusy
             ? "Saved details will be loaded when the current management action finishes."
+            : packageInventoryPending && !packageDetailLoading ? "Saved details will be loaded when the saved inventory is ready."
+            : inventoryError && !packageDetailLoading ? "Reload saved inventory before loading saved package details."
             : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional details require package read access.</p> : null}
         </> : null}
         {selectedTab === "identities" ? <AgentOverview onOpenPerson={onOpenPerson} key={overviewKey}
-          record={record} selectionId={selectionId} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
+          record={record} selectionId={selectionId} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState}
+          onInvalidated={() => { if (selectionId) onInventoryInvalidated?.(selectionId); }} /> : null}
         {selectedTab === "reports" || selectedTab === "users" ? <AgentUsagePanel key={record.id}
           view={selectedTab === "reports" ? "usage" : "users"}
-          record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId, inventoryRevision])} dataRevision={dataRevision}
+          record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId?.toLowerCase(), inventoryRevision])} dataRevision={dataRevision}
           inventorySelectionId={selectionId} onReloadInventory={onRetryInventory}
           canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy || packageInventoryPending || Boolean(inventoryError)} onChanged={onUsageChanged} /> : null}
@@ -295,7 +320,7 @@ export function UnifiedAgentDetailModal({
           <h3>Manage</h3>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
           {canManage && !canEditAccess ? <p className="agent-insight-note">Access settings are read-only until access-management permissions are available.</p> : null}
-          {controlError ? <p className="error-banner" role="alert">{controlError}</p> : null}
+          {packageActionsBlockedReason || controlError ? <p className="error-banner" role="alert">{packageActionsBlockedReason ?? controlError}</p> : null}
           {packageResult ? <p className={packageResult.status === "succeeded" ? "notice" : "error-banner"} role={packageResult.status === "succeeded" ? "status" : "alert"}>
             {packageResult.message ?? (packageResult.status === "succeeded" ? "The change completed for this published version." : "The change was not applied to this published version.")}
           </p> : null}
@@ -303,33 +328,31 @@ export function UnifiedAgentDetailModal({
         </> : null}
         {selectedPackage && capabilities ? <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
           <AgentAccessManagement key={`${record.id}:${selectedPackage.id}`} revision={packageAccessRevisions?.get(selectedPackage.id) ?? 0}
-            agent={selectedPackage} detail={packageDetailLoading ? undefined : currentDetail} canManage={canManage} canEditAccess={canEditAccess}
+            agent={selectedPackage} detail={selectedDetail} canManage={canManage} canEditAccess={canEditAccess}
+            detailUnavailable={!selectedDetail && Boolean(packageDetailError)}
             showName={selectedPackage.displayName !== record.displayName}
             active={selectedTab === "controls" && !hasPackageConfirmation && !packageDetailLoading
-              && !packageDetailStale && !packageInventoryPending && !inventoryError}
+              && !packageDetailStale && !packageInventoryPending && !inventoryError && !packageActionsBlockedReason}
             busy={packageActionsBusy || hasPackageConfirmation} loading={packageDetailLoading && !selectedDetail}
             onUpdate={onUpdatePackageAccess} onSetBlocked={onSetPackageBlocked} />
         </div> : null}
         {selectedTab === "controls" && !hasPackageConfirmation ? <>
           {!record.packages.length ? <p>No published version is available for availability or installation settings.</p> : null}
           {!record.packages.length && quarantineReason ? <p className="agent-insight-note">No supported management target is present in the saved inventory. <a href="/sync">Refresh agent inventory</a> and <a href="/permissions">review permissions</a> before choosing a control.</p> : null}
+        </> : null}
+        <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
           <div className="agent-management-sections">
-            {resource && !quarantineReason ? <article className="agent-management-card">
-              <div className="management-card-heading">
-                <h4>Quarantine and restore</h4>
-              </div>
-              <CopilotStudioQuarantineControls
-                key={JSON.stringify([resource.type, resource.environmentId, resource.nativeId])}
+            {resource ? <CopilotStudioQuarantineControls
+                key={JSON.stringify([overviewKey, resource.type, quarantineTargetKey(resource)])}
                 snapshot={record.observations.powerPlatform}
                 targets={[resource]}
                 variant="detail"
                 canManage={canManage}
-              />
-            </article> : resource ? <details className="agent-insight-provenance"><summary>Additional control availability</summary>
-              <p>Quarantine is unavailable: {quarantineReason}</p><a href="/sync">Review inventory coverage</a>
-            </details> : null}
+                active={selectedTab === "controls" && !hasPackageConfirmation}
+                onJobChange={onQuarantineJobChange}
+              /> : null}
           </div>
-        </> : null}
+        </div>
       </section>
     </dialog>
   );

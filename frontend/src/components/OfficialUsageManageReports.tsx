@@ -6,7 +6,7 @@ import { ApiError } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
 import { useReportPrincipalScope } from "../useReportPage";
-import { trapDialogFocus } from "../dialogFocus";
+import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
 
 type Props = { revision: number; canManage?: boolean; onChanged?: () => void; onViewSnapshot: (id: string) => void; onCorrect?: (id: string) => void };
@@ -19,26 +19,43 @@ export function OfficialUsageManageReports(props: Props) {
 }
 function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorrect }: Props) {
   const [target, setTarget] = useState<Target>(), [confirmation, setConfirmation] = useState<OfficialReportConfirmation>();
-  const [busy, setBusy] = useState<"preview" | "confirm">(), [error, setError] = useState<string>(), [reload, setReload] = useState(0);
+  const [busy, setBusy] = useState<"preview" | "confirm">(), [error, setError] = useState<string>();
+  const [reload, setReload] = useState({ sequence: 0, revision });
   const [recovery, setRecovery] = useState<Recovery>(), [denied, setDenied] = useState(false), [notice, setNotice] = useState<string>();
   const [seenRevision, setSeenRevision] = useState(revision);
-  const operation = useRef<AbortController | undefined>(undefined), returnFocus = useRef<HTMLElement | null>(null);
+  const [interaction, setInteraction] = useState(0), interactionSequence = useRef(0);
+  const operation = useRef<{ controller: AbortController; kind: "preview" | "confirm" } | undefined>(undefined);
+  const management = useRef<HTMLElement>(null);
+  const returnFocus = useRef<HTMLElement | null>(null);
   const restoreFocus = useRef(false);
-  const status = useRef<HTMLParagraphElement>(null);
-  useLayoutEffect(() => () => operation.current?.abort(), [revision]);
+  const status = useRef<HTMLParagraphElement>(null), denial = useRef<HTMLParagraphElement>(null);
+  useLayoutEffect(() => () => operation.current?.controller.abort(), [revision]);
   useLayoutEffect(() => {
-    if (!target && !busy && restoreFocus.current) {
+    if (target) restoreFocus.current = true;
+    else if (!busy && restoreFocus.current) {
       restoreFocus.current = false;
-      returnFocus.current?.focus();
+      const opener = returnFocus.current;
+      if (opener?.isConnected) opener.focus();
+      if (!opener || document.activeElement !== opener) management.current?.focus();
     }
-  }, [target, busy]);
+  }, [target, busy, interaction]);
   useEffect(() => { status.current?.focus(); }, [notice]);
+  useEffect(() => { if (denied) denial.current?.focus(); }, [denied]);
   if (seenRevision !== revision) {
-    setSeenRevision(revision); setTarget(undefined); setConfirmation(undefined); setBusy(undefined); setError(undefined); setRecovery(undefined);
+    setSeenRevision(revision); setTarget(undefined); setConfirmation(undefined); setBusy(undefined); setRecovery(undefined);
+    if (!denied) setError(undefined);
+  }
+  function retireHandlers() {
+    // Retire this render's handlers before React replaces a cancelled or consumed dialog.
+    setInteraction(++interactionSequence.current);
   }
   function dismiss() {
+    if (interactionSequence.current !== interaction
+      || operation.current?.kind === "confirm" && !operation.current.controller.signal.aborted) return false;
+    retireHandlers();
     restoreFocus.current = true;
-    operation.current?.abort(); setTarget(undefined); setConfirmation(undefined); setError(undefined); setRecovery(undefined); setBusy(undefined);
+    operation.current?.controller.abort(); setTarget(undefined); setConfirmation(undefined); setError(undefined); setRecovery(undefined); setBusy(undefined);
+    return true;
   }
   function failed(cause: unknown, mode: Recovery) {
     setConfirmation(undefined); setRecovery(mode);
@@ -46,13 +63,16 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     if (cause instanceof ApiError && [401, 403].includes(cause.status)) { setDenied(true); setTarget(undefined); }
   }
   function reloadHistory() {
-    dismiss(); setDenied(false); setNotice(undefined); setReload(value => value + 1); onChanged?.();
+    if (!dismiss()) return;
+    setDenied(false); setNotice(undefined); setReload(value => ({ sequence: value.sequence + 1, revision })); onChanged?.();
   }
   async function prepare(nextTarget: Target) {
-    if (!canManage || busy) return;
-    if (!target) returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    operation.current?.abort();
-    const abort = new AbortController(); operation.current = abort;
+    if (interactionSequence.current !== interaction || !canManage || busy || operation.current && !operation.current.controller.signal.aborted) return;
+    if (!target) {
+      const focused = document.activeElement;
+      returnFocus.current = focused instanceof HTMLElement && focused !== document.body && focused !== document.documentElement ? focused : null;
+    }
+    const abort = new AbortController(); operation.current = { controller: abort, kind: "preview" };
     setTarget(nextTarget); setConfirmation(undefined); setBusy("preview"); setError(undefined); setRecovery(undefined); setNotice(undefined);
     try {
       const next = await previewReportOperation(nextTarget.report.id, "delete", abort.signal);
@@ -65,17 +85,22 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
       setConfirmation(next);
     } catch (cause) {
       if (!abort.signal.aborted) failed(cause, cause instanceof ApiError && [404, 409, 410].includes(cause.status) ? "refresh" : "prepare");
-    } finally { if (!abort.signal.aborted) setBusy(undefined); }
+    } finally {
+      if (operation.current?.controller === abort) {
+        operation.current = undefined;
+        if (!abort.signal.aborted) setBusy(undefined);
+      }
+    }
   }
   async function remove() {
-    if (!confirmation || !target || !canManage || busy) return;
-    operation.current?.abort();
-    const abort = new AbortController(); operation.current = abort;
+    if (interactionSequence.current !== interaction || !confirmation || !target || !canManage || busy || operation.current && !operation.current.controller.signal.aborted) return;
+    retireHandlers();
+    const abort = new AbortController(); operation.current = { controller: abort, kind: "confirm" };
     setBusy("confirm"); setError(undefined);
     try {
       await confirmReportOperation(confirmation, abort.signal);
       if (!abort.signal.aborted) {
-        setTarget(undefined); setConfirmation(undefined); setRecovery(undefined); setReload(value => value + 1);
+        setTarget(undefined); setConfirmation(undefined); setRecovery(undefined); setReload(value => ({ sequence: value.sequence + 1, revision }));
         setNotice("Report set deleted."); onChanged?.();
       }
     } catch (cause) {
@@ -83,17 +108,24 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
         failed(cause, "refresh");
         if (!(cause instanceof ApiError) || cause.status === 0) setError("Deletion may already have completed. Reload report history to verify; do not repeat this confirmation.");
       }
-    } finally { if (!abort.signal.aborted) setBusy(undefined); }
+    } finally {
+      if (operation.current?.controller === abort) {
+        operation.current = undefined;
+        if (!abort.signal.aborted) setBusy(undefined);
+      }
+    }
   }
-  return <section className="usage-manage-reports" aria-label="Manage saved reports" tabIndex={0}>
+  return <section ref={management} className="usage-manage-reports" aria-label="Manage saved reports" tabIndex={0}>
     {notice ? <p ref={status} role="status" tabIndex={-1}>{notice}</p> : null}
-    {denied ? <p role="alert">{error} <button type="button" onClick={reloadHistory}>Reload report history</button></p>
-      : <OfficialUsageHistoryPanel key={reload} revision={revision} onSelect={onViewSnapshot}
+    {denied ? <p ref={denial} role="alert" tabIndex={-1}>{error} <button type="button" onClick={reloadHistory}>Reload report history</button></p>
+      : <OfficialUsageHistoryPanel key={reload.sequence} revision={revision}
+        freshCaptureOnMount={reload.sequence > 0 && reload.revision === revision} onSelect={onViewSnapshot}
+        onSelectionRetired={() => { if (target && recovery !== "refresh") dismiss(); }}
         admin={canManage ? { busy: Boolean(busy), onDelete: (report, evidence) => void prepare({ report, evidence }) } : undefined} />}
     {target && canManage ? <DeleteReportDialog report={target.report} active={target.report.id === target.evidence.activeSetId}
       ready={Boolean(confirmation)} busy={busy} error={error} recovery={recovery} onCancel={dismiss}
       onConfirm={() => void remove()} onRetry={() => void prepare(target)} onReload={reloadHistory}
-      onCorrect={onCorrect ? () => { const id = target.report.id; dismiss(); onCorrect(id); } : undefined} /> : null}
+      onCorrect={onCorrect ? () => { if (dismiss()) onCorrect(target.report.id); } : undefined} /> : null}
   </section>;
 }
 function DeleteReportDialog({ report, active, ready, busy, error, recovery, onCancel, onConfirm, onRetry, onReload, onCorrect }: {
@@ -101,7 +133,13 @@ function DeleteReportDialog({ report, active, ready, busy, error, recovery, onCa
   onCancel: () => void; onConfirm: () => void; onRetry: () => void; onReload: () => void; onCorrect?: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  useLayoutEffect(() => { const element = dialog.current; element?.showModal(); return () => element?.close(); }, []);
+  useLayoutEffect(() => {
+    const element = dialog.current;
+    if (!element) return;
+    element.showModal();
+    const stopObservingFocus = observeDialogFocus(element);
+    return () => { stopObservingFocus(); element.close(); };
+  }, []);
   return <dialog ref={dialog} className="confirm-modal" aria-labelledby="usage-delete-title" aria-describedby="usage-delete-description"
     onKeyDown={event => { event.stopPropagation(); trapDialogFocus(event, dialog.current); }}
     onCancel={event => { event.preventDefault(); if (busy !== "confirm") onCancel(); }}>

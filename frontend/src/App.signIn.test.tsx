@@ -7,13 +7,15 @@ const usernameStorageKey = "agent-control:signin-username:v1";
 
 function loginTransport({
   authConfigured = true,
+  status,
   login = async () => Response.json({ code: "tenant_not_configured", detail: "Your organization is not configured for sign-in." }, { status: 400 }),
 }: {
   authConfigured?: boolean;
+  status?: () => Promise<Response>;
   login?: (init?: RequestInit) => Promise<Response>;
 } = {}) {
   const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
-    if (input === "/api/auth/status") return Response.json({
+    if (input === "/api/auth/status") return status ? status() : Response.json({
       authConfigured,
       callback: "http://localhost/api/auth/callback",
       ...(!authConfigured ? { setup: "Ask your administrator to configure Microsoft sign-in." } : {}),
@@ -24,6 +26,14 @@ function loginTransport({
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+function mockSignInNavigation() {
+  const location = { ...window.location, assign: vi.fn(), reload: vi.fn() };
+  vi.stubGlobal("window", new Proxy(window, {
+    get: (target, key) => key === "location" ? location : Reflect.get(target, key),
+  }));
+  return location;
 }
 
 describe("username-first sign-in", () => {
@@ -54,7 +64,13 @@ describe("username-first sign-in", () => {
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(["/api/auth/status", "/api/me"]);
   });
 
-  it.each(["", "username", "name@", "name@@example.com", "name@organization."])(
+  it.each([
+    "", "username", "name@", "name@@example.com", "name@organization.",
+    "name@example..com", "name@-organization.com", "name@organization-.com",
+    "name@organization.com/path", "name@organization.com:443", "name@under_score.example",
+    "name@a\u3002example.com", "name@a\u200b.example", `name@${"a".repeat(64)}.example`,
+    `${"a".repeat(243)}@example.com`,
+  ])(
     "validates the organization username before submitting: %j",
     async username => {
       const fetchMock = loginTransport();
@@ -69,6 +85,23 @@ describe("username-first sign-in", () => {
     },
   );
 
+  it.each(["Reader@B\u00dcCHER.Example", `${"a".repeat(242)}@example.com`])(
+    "accepts a backend-valid routing username without replacing its spelling: %s",
+    async username => {
+      const fetchMock = loginTransport();
+      render(<App />);
+      const input = await screen.findByRole("textbox", { name: "Work or school username" });
+      expect(input).toHaveAttribute("maxlength", "254");
+      fireEvent.change(input, { target: { value: username } });
+      fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+      await screen.findByRole("alert");
+      expect(fetchMock).toHaveBeenCalledWith("/api/auth/login", expect.objectContaining({
+        body: JSON.stringify({ username, returnTo: "/agents" }),
+      }));
+      expect(input).toHaveAttribute("aria-invalid", "false");
+    },
+  );
+
   it("posts a trimmed username and safe return path once while announcing pending sign-in", async () => {
     window.history.replaceState({}, "", "/permissions?authorization=failed&returnTo=https%3A%2F%2Fexternal.example");
     let release!: (response: Response) => void;
@@ -77,7 +110,10 @@ describe("username-first sign-in", () => {
     const app = render(<App />);
     const input = await screen.findByRole("textbox", { name: "Work or school username" });
     fireEvent.change(input, { target: { value: "  Admin+ops@Example.com  " } });
-    await userEvent.click(screen.getByRole("button", { name: "Sign in with Entra ID" }));
+    act(() => {
+      fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+      fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    });
     expect(fetchMock).toHaveBeenCalledWith("/api/auth/login", expect.objectContaining({
       method: "POST",
       credentials: "include",
@@ -96,6 +132,71 @@ describe("username-first sign-in", () => {
     expect(signal?.aborted).toBe(true);
     await act(async () => release(Response.json({ authorizationUrl: "https://login.microsoftonline.com/example/oauth2/v2.0/authorize" })));
     expect(window.localStorage.getItem(usernameStorageKey)).toBeNull();
+  });
+
+  it.each(["success", "failure"] as const)("abandons a page-hidden login and ignores its late %s during a new attempt", async outcome => {
+    const navigation = mockSignInNavigation();
+    const completions: Array<(response: Response) => void> = [];
+    const fetchMock = loginTransport({
+      login: () => new Promise<Response>(resolve => completions.push(resolve)),
+    });
+    render(<App />);
+    fireEvent.change(await screen.findByRole("textbox", { name: "Work or school username" }), {
+      target: { value: "abandoned@example.com" },
+    });
+    fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    const signal = fetchMock.mock.calls.find(([path]) => path === "/api/auth/login")![1]?.signal;
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    expect(signal?.aborted).toBe(true);
+    expect(screen.getByRole("form", { name: "Sign in" })).toHaveAttribute("aria-busy", "false");
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/me")).toHaveLength(2);
+    fireEvent.change(await screen.findByRole("textbox", { name: "Work or school username" }), {
+      target: { value: "replacement@example.com" },
+    });
+    fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    expect(completions).toHaveLength(2);
+    await act(async () => completions[0](outcome === "success"
+      ? Response.json({ authorizationUrl: "https://login.microsoftonline.com/abandoned" })
+      : Response.json({ code: "authentication_unavailable", detail: "Abandoned login failure." }, { status: 503 })));
+    expect(navigation.assign).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(usernameStorageKey)).toBeNull();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preparing sign-in..." })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    expect(completions).toHaveLength(2);
+    await act(async () => completions[1](Response.json({ authorizationUrl: "https://login.microsoftonline.com/replacement" })));
+    expect(navigation.assign).toHaveBeenCalledExactlyOnceWith("https://login.microsoftonline.com/replacement");
+    expect(window.localStorage.getItem(usernameStorageKey)).toBe("replacement@example.com");
+    expect(navigation.reload).not.toHaveBeenCalled();
+  });
+
+  it("rechecks sign-in after returning from Microsoft without restoring a locked form or restarting login", async () => {
+    const navigation = mockSignInNavigation();
+    const login = vi.fn()
+      .mockResolvedValueOnce(Response.json({ authorizationUrl: "https://login.microsoftonline.com/authorize" }))
+      .mockResolvedValueOnce(Response.json({ code: "authentication_unavailable", detail: "Please retry sign-in." }, { status: 503 }));
+    const fetchMock = loginTransport({ login });
+    render(<App />);
+    fireEvent.change(await screen.findByRole("textbox", { name: "Work or school username" }), {
+      target: { value: "reader@example.com" },
+    });
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: false })));
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/me")).toHaveLength(1);
+    fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    await waitFor(() => expect(navigation.assign).toHaveBeenCalledOnce());
+    expect(screen.getByRole("button", { name: "Preparing sign-in..." })).toBeDisabled();
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(await screen.findByRole("textbox", { name: "Work or school username" })).toHaveValue("reader@example.com");
+    expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/me")).toHaveLength(2);
+    expect(login).toHaveBeenCalledOnce();
+    fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Please retry sign-in.");
+    expect(login).toHaveBeenCalledTimes(2);
+    expect(navigation.assign).toHaveBeenCalledOnce();
+    expect(navigation.reload).not.toHaveBeenCalled();
   });
 
   it("restores an editable routing username without submitting or replacing it with an account alias", async () => {
@@ -132,7 +233,7 @@ describe("username-first sign-in", () => {
     expect(window.localStorage.getItem(usernameStorageKey)).toBeNull();
   });
 
-  it.each(["not-an-email", " name@example.com ", `${"a".repeat(310)}@example.com`])(
+  it.each(["not-an-email", " name@example.com ", `${"a".repeat(243)}@example.com`, "name@organization.com/path"])(
     "does not populate an invalid saved email: %j",
     async saved => {
       window.localStorage.setItem(usernameStorageKey, saved);
@@ -221,6 +322,27 @@ describe("username-first sign-in", () => {
     fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
     expect(fetchMock.mock.calls.some(([path]) => path === "/api/auth/login")).toBe(false);
   });
+
+  it.each(["network", "invalid JSON", "HTTP error", "invalid status"] as const)(
+    "checks the session and leaves manual sign-in available after a configuration %s failure",
+    async failure => {
+      const fetchMock = loginTransport({ status: async () => {
+        if (failure === "network") throw new TypeError("internal configuration network diagnostic");
+        if (failure === "invalid JSON") return new Response("internal proxy response");
+        if (failure === "HTTP error") return Response.json({ detail: "internal configuration failure" }, { status: 503 });
+        return Response.json({ authConfigured: "false", callback: {} });
+      } });
+      render(<App />);
+      const input = await screen.findByRole("textbox", { name: "Work or school username" });
+      expect(screen.getByRole("status")).toHaveTextContent("Sign-in configuration could not be checked. You can still try signing in.");
+      expect(screen.queryByText(/internal configuration|internal proxy/)).not.toBeInTheDocument();
+      expect(fetchMock.mock.calls.filter(([path]) => path === "/api/me")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+      await userEvent.type(input, "reader@example.com{Enter}");
+      expect(await screen.findByRole("alert")).toHaveTextContent("Your organization is not configured for sign-in.");
+      expect(fetchMock.mock.calls.filter(([path]) => path === "/api/me")).toHaveLength(1);
+    },
+  );
 
   it.each([
     ["cancelled", "Microsoft permission setup was cancelled or denied."],

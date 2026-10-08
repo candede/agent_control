@@ -1,4 +1,5 @@
-import { render, screen, within } from "@testing-library/react";
+import { Children, isValidElement, type MouseEvent, type ReactNode } from "react";
+import { act, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../api/client";
@@ -19,14 +20,92 @@ function projection(value: WorkbenchJobSummary[]): WorkbenchJobsResponse {
   return { value, polledAt: "2026-09-20T12:00:00.000Z", requestId: "history-request", unavailableSources: [] };
 }
 
+function buttonHandler(node: ReactNode, label: string): (() => void) | undefined {
+  if (!isValidElement<{ children?: ReactNode; onClick?: () => void }>(node)) return;
+  const children = Children.toArray(node.props.children);
+  if (node.type === "button" && children.includes(label)) return node.props.onClick;
+  return children.map(child => buttonHandler(child, label)).find(handler => handler !== undefined);
+}
+
+function detailHandler(node: ReactNode): ((event: MouseEvent<HTMLAnchorElement>) => void) | undefined {
+  if (!isValidElement<{ children?: ReactNode; onClick?: (event: MouseEvent<HTMLAnchorElement>) => void }>(node)) return;
+  const children = Children.toArray(node.props.children);
+  if (node.type === "a" && children.includes("View details")) return node.props.onClick;
+  return children.map(detailHandler).find(handler => handler !== undefined);
+}
+
 describe("SyncHistoryTable", () => {
+  it.each(["data-sync", "package-refresh", "power-platform"] as const)(
+    "retires ordinary and modified %s detail navigation on replacement, withdrawal and unmount", source => {
+      const onOpenSyncRun = vi.fn();
+      const onOpenSourceJob = vi.fn();
+      const props = {
+        state: projection([job(1, { source })]) as WorkbenchJobsResponse | undefined,
+        error: "", onRefresh: vi.fn(), onOpenSyncRun, onOpenSourceJob,
+      };
+      function expectRetired(handler: NonNullable<ReturnType<typeof detailHandler>>) {
+        const handled: boolean[] = [];
+        const probe = render(<div onClick={event => {
+          handled.push(event.defaultPrevented);
+          event.preventDefault();
+        }}><a href="/sync" onClick={handler}>Retained details</a></div>);
+        for (const gesture of [{}, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+          fireEvent.click(probe.getByRole("link", { name: "Retained details" }), gesture);
+        }
+        expect(handled).toEqual([true, true, true, true, true, true]);
+        probe.unmount();
+      }
+      const view = renderHook(SyncHistoryTable, { initialProps: props });
+      const original = detailHandler(view.result.current)!;
+      view.rerender({ ...props, state: projection([job(2, { source })]) });
+      expectRetired(original);
+      const replacement = detailHandler(view.result.current)!;
+      view.rerender({ ...props, state: undefined });
+      expectRetired(replacement);
+      view.rerender(props);
+      expectRetired(original);
+      const restored = detailHandler(view.result.current)!;
+      view.unmount();
+      expectRetired(restored);
+      expect(onOpenSyncRun).not.toHaveBeenCalled();
+      expect(onOpenSourceJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects retained pager and refresh handlers after replacement and unmount", () => {
+    const records = Array.from({ length: 23 }, (_, index) => job(index));
+    const onRefresh = vi.fn();
+    const props = { state: projection(records), error: "", onRefresh };
+    const view = renderHook(SyncHistoryTable, { initialProps: props });
+    const firstNext = buttonHandler(view.result.current, "Next")!;
+    const firstRefresh = buttonHandler(view.result.current, "Refresh history")!;
+    act(firstNext);
+    const secondNext = buttonHandler(view.result.current, "Next")!;
+    view.rerender({ ...props, state: projection(records.slice(0, 13)) });
+    act(firstNext);
+    expect(buttonHandler(view.result.current, "Next")).toBeDefined();
+    act(secondNext);
+    view.rerender(props);
+    const currentNext = buttonHandler(view.result.current, "Next")!;
+    act(() => { firstRefresh(); secondNext(); });
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(buttonHandler(view.result.current, "Next")).toBe(currentNext);
+    const currentRefresh = buttonHandler(view.result.current, "Refresh history")!;
+    act(currentRefresh);
+    expect(onRefresh).toHaveBeenCalledOnce();
+    view.unmount();
+    act(currentRefresh);
+    expect(onRefresh).toHaveBeenCalledOnce();
+  });
+
   it("combines sync runs and refreshes without dashboard tabs or recovery controls, preserving units and detail links", async () => {
     const onOpenSyncRun = vi.fn();
+    const onOpenSourceJob = vi.fn();
     render(<SyncHistoryTable state={projection([
       job(1, { status: "partial" }),
       job(2, { id: "run-1", source: "package-refresh", label: "Old Graph refresh", status: "succeeded", completed: 40, href: "/sync?refreshJob=old-job" }),
       job(5, { source: "power-platform", label: "Power Platform refresh", status: "succeeded", completed: 0, href: "/sync?powerPlatformJob=platform-job" }),
-    ])} error="" onRefresh={vi.fn()} onOpenSyncRun={onOpenSyncRun} />);
+    ])} error="" onRefresh={vi.fn()} onOpenSyncRun={onOpenSyncRun} onOpenSourceJob={onOpenSourceJob} />);
     const table = screen.getByRole("table", { name: "Sync history" });
     expect(screen.queryByRole("group", { name: "History type" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Sync runs|Source jobs/ })).not.toBeInTheDocument();
@@ -44,7 +123,32 @@ describe("SyncHistoryTable", () => {
     expect(within(table).queryByRole("button", { name: /Retry|Cancel|Resume/ })).not.toBeInTheDocument();
     await userEvent.click(within(table).getByRole("link", { name: /View details for Sync 1/ }));
     expect(onOpenSyncRun).toHaveBeenCalledExactlyOnceWith("run-1");
+    await userEvent.click(within(table).getByRole("link", { name: /View details for Old Graph refresh/ }));
+    await userEvent.click(within(table).getByRole("link", { name: /View details for Power Platform refresh/ }));
+    expect(onOpenSourceJob.mock.calls).toEqual([["/sync?refreshJob=old-job"], ["/sync?powerPlatformJob=platform-job"]]);
   });
+
+  it.each(["data-sync", "package-refresh", "power-platform"] as const)(
+    "preserves native modified-click navigation for %s details", source => {
+      const onOpenSyncRun = vi.fn();
+      const onOpenSourceJob = vi.fn();
+      const handled: boolean[] = [];
+      render(<div onClick={event => {
+        handled.push(event.defaultPrevented);
+        event.preventDefault();
+      }}>
+        <SyncHistoryTable state={projection([job(1, { source })])} error="" onRefresh={vi.fn()}
+          onOpenSyncRun={onOpenSyncRun} onOpenSourceJob={onOpenSourceJob} />
+      </div>);
+      const link = screen.getByRole("link", { name: /View details/ });
+      for (const gesture of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+        fireEvent.click(link, gesture);
+      }
+      expect(handled).toEqual([false, false, false, false, false]);
+      expect(onOpenSyncRun).not.toHaveBeenCalled();
+      expect(onOpenSourceJob).not.toHaveBeenCalled();
+    },
+  );
 
   it("sorts and paginates all three sources together and resets the page on outcome changes", async () => {
     render(<SyncHistoryTable state={projection(Array.from({ length: 13 }, (_, index) => job(index, {
@@ -63,8 +167,77 @@ describe("SyncHistoryTable", () => {
     expect(within(screen.getByRole("table")).getAllByRole("row")[1]).toHaveTextContent("Sync 0");
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Outcome" }), "incomplete");
     expect(screen.getByText(/1-1 of 1 recent records/)).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Previous" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("button", { name: "Next" })).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByRole("table")).toHaveTextContent("Sync 1");
+  });
+
+  it.each([0, 13])("keeps the visible page after history shrinks to %s records and then grows", async count => {
+    const records = Array.from({ length: 23 }, (_, index) => job(index));
+    const onRefresh = vi.fn();
+    const view = render(<SyncHistoryTable state={projection(records)} error="" onRefresh={onRefresh} />);
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText(/21-23 of 23 recent records/)).toBeVisible();
+
+    view.rerender(<SyncHistoryTable state={projection(records.slice(0, count))} error="" onRefresh={onRefresh} />);
+    expect(screen.getByText(count ? /11-13 of 13 recent records/ : /No recent sync history/)).toBeVisible();
+    view.rerender(<SyncHistoryTable state={projection(records)} error="" onRefresh={onRefresh} />);
+    expect(screen.getByText(count ? /11-20 of 23 recent records/ : /1-10 of 23 recent records/)).toBeVisible();
+    expect(onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("keeps mounted sort controls focused when cancelled or unauthorized history is withdrawn", async () => {
+    const onRefresh = vi.fn();
+    const view = render(<SyncHistoryTable state={projection([job(1)])} error="" onRefresh={onRefresh} />);
+    const heading = screen.getByRole("button", { name: "Sort by Started" });
+    heading.focus();
+    view.rerender(<SyncHistoryTable error="History read was cancelled." onRefresh={onRefresh} />);
+    expect(screen.queryByText("Sync 1")).not.toBeInTheDocument();
+    expect(heading).toHaveFocus();
+    expect(screen.getByRole("alert")).toHaveTextContent("History read was cancelled.");
+    view.rerender(<SyncHistoryTable error="" loading onRefresh={onRefresh} />);
+    expect(heading).toHaveFocus();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sync history...");
+    await userEvent.keyboard("{Enter}");
+    view.rerender(<SyncHistoryTable state={projection([job(1), job(2)])} error="" onRefresh={onRefresh} />);
+    expect(heading).toHaveFocus();
+    expect(within(screen.getByRole("table")).getAllByRole("row")[1]).toHaveTextContent("Sync 1");
+    expect(onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("retains focusable paging through boundaries, empty and withdrawn history without reviving a stale page", async () => {
+    const records = Array.from({ length: 13 }, (_, index) => job(index));
+    const onRefresh = vi.fn();
+    const view = render(<SyncHistoryTable state={projection(records)} error="" onRefresh={onRefresh} />);
+    const next = screen.getByRole("button", { name: "Next" });
+    next.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByText(/11-13 of 13 recent records/)).toBeVisible();
+    expect(next).not.toBeDisabled();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(next).toHaveFocus();
+    await userEvent.keyboard("{Enter} ");
+    expect(screen.getByText(/11-13 of 13 recent records/)).toBeVisible();
+
+    view.rerender(<SyncHistoryTable state={projection([])} error="" onRefresh={onRefresh} />);
+    expect(screen.getByText(/No recent sync history/)).toBeVisible();
+    expect(next).toHaveFocus();
+    view.rerender(<SyncHistoryTable error="History read was cancelled." onRefresh={onRefresh} />);
+    expect(next).toHaveFocus();
+    expect(screen.queryByText(/No recent sync history/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/of 13 recent records/)).not.toBeInTheDocument();
+    await userEvent.keyboard("{Enter} ");
+    view.rerender(<SyncHistoryTable error="" loading onRefresh={onRefresh} />);
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "true");
+    view.rerender(<SyncHistoryTable state={projection(records)} error="" onRefresh={onRefresh} />);
+    expect(next).toHaveFocus();
+    expect(next).toHaveAttribute("aria-disabled", "false");
+    expect(screen.getByText(/1-10 of 13 recent records/)).toBeVisible();
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByText(/11-13 of 13 recent records/)).toBeVisible();
+    expect(onRefresh).not.toHaveBeenCalled();
   });
 
   it("does not invent durations for older metadata and surfaces partial history failures", async () => {

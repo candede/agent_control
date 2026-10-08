@@ -1,3 +1,10 @@
+.reporting-view,
+.usage-report-selector,
+.official-usage-history-panel,
+.official-usage-modal {
+  overflow-wrap: anywhere;
+}
+
 .usage-report-context {
   display: flex;
   align-items: center;
@@ -219,6 +226,11 @@
   overflow-wrap: anywhere;
 }
 
+.usage-agent-name:hover {
+  background: transparent;
+  color: var(--ink-hover);
+}
+
 .report-agent-table small { display: block; margin-top: 0.25rem; color: var(--muted); }
 .report-agent-table td { overflow-wrap: anywhere; }
 .usage-agent-detail,
@@ -247,12 +259,13 @@
   background: var(--surface);
   color: var(--text);
   box-shadow: 0 22px 70px rgba(16, 33, 31, 0.24);
-  overflow: hidden;
+  overflow: auto;
 }
 
 .official-usage-modal[open] {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  /* Let the dialog scroll before its header can collapse the evidence area. */
+  grid-template-rows: auto minmax(min(12rem, 50dvh), 1fr);
 }
 
 .official-usage-modal.usage-import-modal { width: min(600px, calc(100% - 2rem)); }
@@ -285,6 +298,7 @@
 
 .usage-modal-header-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
 }
@@ -301,7 +315,7 @@
   display: flex;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   padding: 0;
 }
 
@@ -338,7 +352,7 @@
   align-content: start;
   gap: 1rem;
   flex: 1;
-  min-height: 0;
+  min-height: min(14rem, 70dvh);
   min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
@@ -523,6 +537,7 @@
   }
 
   .usage-modal-header {
+    grid-template-columns: minmax(0, 1fr);
     padding: 1rem;
   }
 

@@ -59,6 +59,10 @@
   @keyframes workspace-skeleton-pulse { to { opacity: 0.45; } }
 }
 
+@media (forced-colors: active) {
+  .skeleton-block { border: 1px solid CanvasText; }
+}
+
 @media (max-width: 1100px) {
   .workspace-skeleton-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .workspace-skeleton-context { grid-column: 1 / -1; border-top: 1px solid var(--border); }

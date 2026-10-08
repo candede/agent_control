@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   ChevronLeft,
   ChevronRight,
@@ -23,7 +24,8 @@ import {
   type LocalAuditAction,
 } from "../api/client";
 import { downloadFile } from "../downloadFile";
-import { useSavedQuery } from "../savedQueries";
+import { lockBodyScroll } from "../bodyScrollLock";
+import { useSavedQueryClient } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
@@ -110,7 +112,7 @@ function LocalAuditLogView({
   route: AuditRouteState;
 }) {
   const [refreshToken, setRefreshToken] = useState<string>();
-  const [exportError, setExportError] = useState<{ key: string; message: string; denied: boolean }>();
+  const [exportError, setExportError] = useState<{ key: string; message: string; invalidated: boolean }>();
   const [detailSelection, setDetailSelection] = useState<{ key: string; id: string }>();
   const [exportKey, setExportKey] = useState<string>();
   const exportRequest = useRef<AbortController | undefined>(undefined);
@@ -119,6 +121,7 @@ function LocalAuditLogView({
   const statusFilter = route.status as StatusFilter;
   const pageIndex = route.page;
   const deferredQuery = useDeferredValue(query);
+  const deferredMatches = query.trim() === deferredQuery.trim();
   const auditQuery = useMemo(() => ({
     limit: auditPageSize,
     offset: pageIndex * auditPageSize,
@@ -126,28 +129,40 @@ function LocalAuditLogView({
     status: statusFilter === "all" ? undefined : statusFilter,
     search: deferredQuery.trim() || undefined,
   }), [actionFilter, deferredQuery, pageIndex, statusFilter]);
-  const key = JSON.stringify([auditQuery, refreshToken, query.trim()]);
+  const queryClient = useSavedQueryClient();
+  const queryKey = ["audit-events", auditQuery, refreshToken];
+  const auditRead = useQuery({
+    queryKey,
+    queryFn: ({ signal }) => getAuditEvents(auditQuery, { signal }),
+    enabled: deferredMatches,
+  }, queryClient);
+  const queryState = queryClient.getQueryState(queryKey);
+  // Evidence actions belong to one displayed page, not just its reusable filters.
+  // Counters also retire batched refreshes that settle within the same millisecond.
+  const key = JSON.stringify([auditQuery, refreshToken, query.trim(), queryState?.dataUpdateCount, queryState?.errorUpdateCount, queryState?.isInvalidated, auditRead.isFetching]);
   const exporting = exportKey === key;
   useEffect(() => () => {
     exportRequest.current?.abort();
     exportRequest.current = undefined;
+    setExportKey(undefined);
+    setExportError(undefined);
+    setDetailSelection(undefined);
   }, [key]);
-  const auditRead = useSavedQuery({
-    queryKey: ["audit-events", auditQuery, refreshToken],
-    queryFn: ({ signal }) => getAuditEvents(auditQuery, { signal }),
-  });
   const lastPageIndex = auditRead.data
     ? Math.min(Math.max(Math.ceil(auditRead.data.count / auditPageSize) - 1, 0), maximumAuditPageIndex)
     : 0;
-  const deferredMatches = query.trim() === deferredQuery.trim();
-  const exportDenial = exportError?.key === key && exportError.denied ? exportError.message : undefined;
-  const page = !exportDenial && !auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex <= lastPageIndex && deferredMatches
+  const exportReadError = exportError?.key === key && exportError.invalidated ? exportError.message : undefined;
+  const incompleteRead = deferredMatches && !auditRead.isFetching && !auditRead.isError
+    && (auditRead.isPending || queryState?.isInvalidated);
+  const readError = exportReadError ?? (deferredMatches && !auditRead.isFetching && auditRead.error ? errorMessage(auditRead.error)
+    : incompleteRead ? auditRead.isPending ? "The saved audit read was cancelled. Retry audit log."
+      : "Saved audit evidence needs reloading. Retry audit log." : undefined);
+  const page = !readError && !auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex <= lastPageIndex && deferredMatches
     ? auditRead.data
     : undefined;
   const events = page?.value ?? [];
   const detailEvent = detailSelection?.key === key ? events.find(event => event.id === detailSelection.id) : undefined;
   const totalCount = page?.count ?? 0;
-  const readError = exportDenial ?? (deferredMatches && auditRead.error ? errorMessage(auditRead.error) : undefined);
   const loading = !page && !readError;
   const error = readError ?? (exportError?.key === key ? exportError.message : undefined);
   const [initialReadComplete, setInitialReadComplete] = useState(false);
@@ -166,10 +181,10 @@ function LocalAuditLogView({
   );
 
   useEffect(() => {
-    if (!auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex > lastPageIndex) {
+    if (deferredMatches && !incompleteRead && !auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex > lastPageIndex) {
       syncClampedPage(lastPageIndex);
     }
-  }, [auditRead.data, auditRead.isError, auditRead.isFetching, lastPageIndex, pageIndex]);
+  }, [auditRead.data, auditRead.isError, auditRead.isFetching, deferredMatches, incompleteRead, lastPageIndex, pageIndex]);
 
   const succeededCount = events.filter(
     (event) => event.status === "succeeded",
@@ -195,19 +210,25 @@ function LocalAuditLogView({
   }
 
   async function handleExportAuditCsv() {
-    if (loading || !events.length || exportRequest.current) return;
+    // Query notifications may be batched until after an export's promise settles.
+    const ownsRead = () => queryClient.getQueryState(queryKey) === queryState;
+    if (loading || !events.length || exportRequest.current || !ownsRead()) return;
     const controller = new AbortController();
     exportRequest.current = controller;
     setExportKey(key);
     setExportError(undefined);
     try {
       const blob = await downloadAdministrativeAuditCsv(events.map(event => event.id), controller.signal);
-      if (!controller.signal.aborted) downloadFile("administrative-audit.csv", blob);
+      if (!controller.signal.aborted && ownsRead()) downloadFile("administrative-audit.csv", blob);
     } catch (requestError) {
-      if (!controller.signal.aborted) setExportError({
+      if (!controller.signal.aborted && ownsRead()) setExportError({
         key,
         message: errorMessage(requestError),
-        denied: requestError instanceof ApiError && (requestError.status === 401 || requestError.status === 403),
+        invalidated: requestError instanceof ApiError && (
+          requestError.status === 401 || requestError.status === 403
+          || requestError.status === 404 && requestError.code === "not_found"
+          || requestError.status === 409 && requestError.code === "dataset_invalidated"
+        ),
       });
     } finally {
       if (exportRequest.current === controller) exportRequest.current = undefined;
@@ -241,7 +262,8 @@ function LocalAuditLogView({
             value={query}
             maxLength={auditMaximumSearchLength}
             onChange={(event) => {
-              updateRoute({ search: event.target.value, page: 0 });
+              const search = event.target.value;
+              updateRoute({ search, page: search.trim() === query.trim() ? pageIndex : 0 });
             }}
             placeholder="Agent, user, group"
           />
@@ -584,11 +606,12 @@ function AuditDetailsModal({
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const unlockBodyScroll = lockBodyScroll(document.body);
     closeButton.current?.focus();
 
     function handleKeyDown(keyboardEvent: KeyboardEvent) {
+      if (keyboardEvent.defaultPrevented || !(keyboardEvent.target instanceof Node)
+        || !dialogRef.current?.contains(keyboardEvent.target)) return;
       if (keyboardEvent.key === "Escape") {
         keyboardEvent.preventDefault();
         closeOnEscape();
@@ -609,7 +632,7 @@ function AuditDetailsModal({
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
+      unlockBodyScroll();
       previousFocus?.focus();
     };
   }, []);

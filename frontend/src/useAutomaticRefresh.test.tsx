@@ -125,15 +125,19 @@ describe("automatic saved-data refresh", () => {
     await advance(10 * 60_000);
     expect(check).toHaveBeenCalledTimes(1);
     expect(hook.result.current.checking).toBe(false);
+    expect(hook.result.current.phase).toBe("backoff");
     await act(async () => pending.resolve(response()));
-    await advance(60_000);
+    await advance(0);
     expect(check).toHaveBeenCalledTimes(2);
+    await advance(60_000);
+    expect(check).toHaveBeenCalledTimes(3);
   });
 
   it("does not admit hidden or offline checks, resumes overdue checks immediately, and preserves cadence otherwise", async () => {
     await visible(false);
     renderHook(useAutomaticRefresh, { initialProps: options() });
     await advance(120_000);
+    act(() => window.dispatchEvent(new Event("focus")));
     expect(check).not.toHaveBeenCalled();
     await visible(true);
     expect(check).toHaveBeenCalledTimes(1);
@@ -143,6 +147,8 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(1);
     await online(false);
     await advance(120_000);
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(check).toHaveBeenCalledTimes(1);
     await visible(false);
     await online(true);
     expect(check).toHaveBeenCalledTimes(1);
@@ -202,6 +208,101 @@ describe("automatic saved-data refresh", () => {
     expect(hook.result.current.checking).toBe(false);
   });
 
+  it.each((["paused", "hidden", "offline"] as const).flatMap(reason =>
+    (["success", "sign-in", "denied", "failure"] as const).map(outcome => ({ reason, outcome })),
+  ))("retires a check when $reason before a same-turn $outcome response settles", async ({ reason, outcome }) => {
+    const pending = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(pending.promise);
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    const signal = check.mock.calls[0][0]!.signal!;
+    await act(async () => {
+      if (reason === "paused") hook.result.current.setPaused(true);
+      else if (reason === "hidden") {
+        vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+        document.dispatchEvent(new Event("visibilitychange"));
+      } else {
+        vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+        window.dispatchEvent(new Event("offline"));
+      }
+      if (outcome === "success") pending.resolve(response({ run: sourceRun("users", "failed") }));
+      else pending.reject(outcome === "sign-in" ? new ApiError(401, "interaction_required", "Retired sign-in failure")
+        : outcome === "denied" ? new ApiError(403, "forbidden", "Retired permission failure")
+          : new Error("Retired network failure"));
+    });
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    expect(props.onRunsChanged).not.toHaveBeenCalled();
+    expect(signal.aborted).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
+    expect(hook.result.current.message).toBeUndefined();
+    if (reason === "paused") act(() => hook.result.current.setPaused(false));
+    else if (reason === "hidden") await visible(true);
+    else await online(true);
+    await settle();
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(hook.result.current.phase).toBe("ready");
+  });
+
+  it("does not admit an overdue focus check in the same turn as a session pause", async () => {
+    const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
+    await settle();
+    vi.setSystemTime(Date.now() + 120_000);
+    act(() => {
+      hook.result.current.setPaused(true);
+      window.dispatchEvent(new Event("focus"));
+    });
+    await settle();
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.paused).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
+    act(() => hook.result.current.setPaused(false));
+    await settle();
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["paused", "hidden", "offline"] as const)("keeps a check retired across batched %s and recovery events", async reason => {
+    const retired = deferred<AutomaticRefreshResult>();
+    const current = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(retired.promise).mockReturnValueOnce(current.promise);
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    const signal = check.mock.calls[0][0]!.signal!;
+    act(() => {
+      if (reason === "paused") {
+        hook.result.current.setPaused(true);
+        hook.result.current.setPaused(false);
+      } else if (reason === "hidden") {
+        vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+        document.dispatchEvent(new Event("visibilitychange"));
+        vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+        document.dispatchEvent(new Event("visibilitychange"));
+      } else {
+        vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+        window.dispatchEvent(new Event("offline"));
+        vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+        window.dispatchEvent(new Event("online"));
+      }
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(signal.aborted).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
+    await advance(30_000);
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.message).toBeUndefined();
+    await act(async () => retired.reject(new ApiError(401, "interaction_required", "Retired sign-in failure")));
+    await advance(0);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(hook.result.current.checking).toBe(true);
+    await act(async () => current.resolve(response()));
+    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onRunsChanged).not.toHaveBeenCalled();
+    expect(hook.result.current.phase).toBe("ready");
+    expect(hook.result.current.checking).toBe(false);
+  });
+
   it("does not revive an aborted request indicator when pausing and resuming before the transport settles", async () => {
     const previous = deferred<AutomaticRefreshResult>();
     const current = deferred<AutomaticRefreshResult>();
@@ -255,6 +356,50 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(2);
   });
 
+  it("wakes an overdue check on focus after timer suspension without duplicating work", async () => {
+    const pending = deferred<AutomaticRefreshResult>();
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    expect(check).toHaveBeenCalledTimes(1);
+    check.mockReturnValueOnce(pending.promise);
+    vi.setSystemTime(Date.now() + 120_000);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(check).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(response()));
+    expect(props.onSourcesChanged).toHaveBeenCalledTimes(1);
+    expect(props.onRunsChanged).not.toHaveBeenCalled();
+    await advance(59_999);
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(check).toHaveBeenCalledTimes(2);
+    await advance(1);
+    expect(check).toHaveBeenCalledTimes(3);
+    hook.unmount();
+    vi.setSystemTime(Date.now() + 120_000);
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(check).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not bypass retry delays or a session pause on focus", async () => {
+    check.mockRejectedValue(new Error("transport"));
+    const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
+    await settle();
+    vi.setSystemTime(Date.now() + 30_000);
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(check).toHaveBeenCalledTimes(1);
+    act(() => hook.result.current.setPaused(true));
+    vi.setSystemTime(Date.now() + 120_000);
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.message).not.toContain("Retrying with a delay");
+    act(() => hook.result.current.setPaused(false));
+    await settle();
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
   it("bounds a stalled check and backs off rather than overlapping it", async () => {
     check.mockImplementationOnce(({ signal } = {}) => new Promise((_resolve, reject) => {
       signal!.addEventListener("abort", () => reject(new ApiError(0, "request_aborted", "aborted", { kind: "aborted" })), { once: true });
@@ -272,6 +417,31 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["resolve", "reject"] as const)("reports a timeout even if the aborted transport settles late by %s", async outcome => {
+    const pending = deferred<AutomaticRefreshResult>();
+    const props = options();
+    check.mockReturnValueOnce(pending.promise);
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    await advance(30_000);
+    expect(check.mock.calls[0][0]!.signal!.aborted).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
+    expect(hook.result.current.phase).toBe("backoff");
+    expect(hook.result.current.message).toContain("could not be checked");
+    await advance(120_000);
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(props.onSourcesChanged).not.toHaveBeenCalled();
+    await act(async () => {
+      if (outcome === "resolve") pending.resolve(response({ run: sourceRun("users", "failed") }));
+      else pending.reject(new ApiError(401, "interaction_required", "Retired authentication failure"));
+    });
+    await advance(0);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(props.onSourcesChanged).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(props.onRunsChanged).not.toHaveBeenCalled();
+    expect(hook.result.current.phase).toBe("ready");
+  });
+
   it("retains the sign-in requirement across permission changes until the session changes", async () => {
     check.mockRejectedValueOnce(new ApiError(401, "interaction_required", "Sign-in needed"));
     const props = options();
@@ -279,6 +449,7 @@ describe("automatic saved-data refresh", () => {
     await settle();
     hook.rerender({ ...props, authorizationKey: "permission-rechecked" });
     await advance(600_000);
+    act(() => window.dispatchEvent(new Event("focus")));
     expect(hook.result.current.phase).toBe("sign_in_required");
     expect(check).toHaveBeenCalledTimes(1);
   });
@@ -319,7 +490,7 @@ describe("automatic saved-data refresh", () => {
     await advance(60_000);
     expect(check).toHaveBeenCalledTimes(2);
     expect(hook.result.current.phase).toBe("sign_in_required");
-    expect(hook.result.current.message).toContain("other eligible sources continue automatically");
+    expect(hook.result.current.message).toContain("this does not block other eligible sources");
     expect(props.onSourcesChanged).toHaveBeenLastCalledWith(["users"]);
     check.mockResolvedValueOnce(response(kind === "source"
       ? { run: sourceRun("graph_packages", "succeeded") }
@@ -374,11 +545,27 @@ describe("automatic saved-data refresh", () => {
     expect(hook.result.current.phase).toBe("permission_required");
     expect(hook.result.current.checking).toBe(false);
     await advance(3_600_000);
+    act(() => window.dispatchEvent(new Event("focus")));
     expect(check).toHaveBeenCalledTimes(1);
     check.mockImplementation(async () => response());
     hook.rerender({ ...props, authorizationKey: "new-permission-evidence" });
     await settle();
     expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks changed permission evidence without invalidating unchanged publications or jobs", async () => {
+    const run = sourceRun("users", "succeeded");
+    check.mockImplementation(async () => response({ run }));
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    expect(props.onSourcesChanged).toHaveBeenCalledOnce();
+    expect(props.onRunsChanged).toHaveBeenCalledOnce();
+    hook.rerender({ ...props, authorizationKey: "permission-rechecked" });
+    await settle();
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(props.onSourcesChanged).toHaveBeenCalledOnce();
+    expect(props.onRunsChanged).toHaveBeenCalledOnce();
   });
 
   it("lets users pause new work for this session without erasing saved data and resets for another session", async () => {
@@ -396,6 +583,30 @@ describe("automatic saved-data refresh", () => {
     await settle();
     expect(check).toHaveBeenCalledTimes(2);
     expect(hook.result.current.paused).toBe(false);
+  });
+
+  it("does not let a retired account's pause control resume the current account", async () => {
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    const retiredSetPaused = hook.result.current.setPaused;
+    hook.rerender({ ...props, principalKey: "another-account" });
+    await settle();
+    act(() => hook.result.current.setPaused(true));
+    act(() => retiredSetPaused(false));
+    expect(hook.result.current.paused).toBe(true);
+    await advance(120_000);
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains source authorization guidance without claiming paused sources are refreshing", async () => {
+    check.mockResolvedValueOnce(response({ run: sourceRun("graph_packages", "waiting_authorization") }));
+    const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
+    await settle();
+    act(() => hook.result.current.setPaused(true));
+    expect(hook.result.current.phase).toBe("sign_in_required");
+    expect(hook.result.current.message).toContain("Some sources require Microsoft authorization");
+    expect(hook.result.current.message).not.toContain("other eligible sources continue automatically");
   });
 
   it("updates Sync history when jobs change even without a new source publication", async () => {

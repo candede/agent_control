@@ -7,7 +7,8 @@ import { ApiError } from "../api/client";
 import { createSavedQueryClient } from "../savedQueries";
 import { useReportPage } from "../useReportPage";
 import { deferred } from "../test/deferred";
-import { combinedUser, reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { combinedUser, historySet, reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { ReportExportButton } from "./ReportExportButton";
@@ -28,15 +29,19 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.useRealTimers(); });
 
 describe("selected users and reports client boundary", () => {
-  it.each(["licenses", "activity"] as const)("shows refresh progress rather than sync-again warnings for the %s cohort", async view => {
+  it.each(["licenses", "activity"] as const)("reports saved source availability without routine refresh banners for the %s cohort", async view => {
     const data = reportPage([]);
     data.sources.directory = { ...data.sources.directory, state: "unavailable", attemptStatus: "running" };
     data.sources.app_activity = { ...data.sources.app_activity, state: "stale", attemptStatus: "running" };
     vi.mocked(api.readReportPage).mockResolvedValueOnce(data);
     render(<CopilotUsersView route={{ view, search: "", page: 0 }} />);
-    await screen.findByText("Refreshing license data. Showing the last saved data until sync completes.");
-    if (view === "licenses") expect(screen.getByText("Refreshing Office app activity. Showing the last saved data until sync completes.")).toBeVisible();
-    expect(screen.queryByText(/Run Users sync|Office app activity is out of date/)).not.toBeInTheDocument();
+    if (view === "licenses") {
+      expect(await screen.findByText("License data unavailable. Run Users sync in Sync or review Permissions.")).toBeVisible();
+      expect(screen.getByText("Office app activity is out of date. Run Users sync in Sync.")).toBeVisible();
+    } else {
+      expect(await screen.findByText("License data unavailable. Current directory verification is required. Run Users sync to verify licensing.")).toBeVisible();
+    }
+    expect(screen.queryByText(/Refreshing license data|Refreshing Office app activity|Showing the last saved data/)).not.toBeInTheDocument();
   });
   it.each(["available", "stale"] as const)("withholds old Office freshness notices during a read and reports the settled %s state", async state => {
     const stale = reportPage([combinedUser()]);
@@ -66,7 +71,7 @@ describe("selected users and reports client boundary", () => {
     try {
       render(<Host />);
       const select = screen.getByRole("combobox");
-      await waitFor(() => expect(select).toBeEnabled());
+      await waitFor(() => expect(select).toHaveAttribute("aria-disabled", "false"));
       const options = within(select).getAllByRole<HTMLOptionElement>("option");
       expect(new Set(options.map(option => option.value)).size).toBe(values.length + 1);
       for (const [index, value] of values.entries()) {
@@ -82,12 +87,13 @@ describe("selected users and reports client boundary", () => {
       expect(errors).not.toHaveBeenCalled();
     } finally { errors.mockRestore(); }
   });
-  it("does not restore an earlier cursor or selection when a changed filter returns to its original value", async () => {
+  it("reuses a recent first page without restoring an earlier cursor when a changed filter returns to its original value", async () => {
+    const first = reportPage([combinedUser(1)], { page: { limit: 50, nextCursor: "page-two", previousCursor: null } });
+    const filtered = reportPage([combinedUser(3)], { selection: { ...first.selection, id: "20000000-0000-4000-8000-000000000003" } });
     vi.mocked(api.readReportPage)
-      .mockResolvedValueOnce(reportPage([combinedUser(1)], { page: { limit: 50, nextCursor: "page-two", previousCursor: null } }))
+      .mockResolvedValueOnce(first)
       .mockResolvedValueOnce(reportPage([combinedUser(2)], { page: { limit: 50, nextCursor: null, previousCursor: "page-one" } }))
-      .mockResolvedValueOnce(reportPage([combinedUser(3)]))
-      .mockResolvedValueOnce(reportPage([combinedUser(4)]));
+      .mockResolvedValueOnce(filtered);
     const { result, rerender } = renderHook(({ search }) => useReportPage<ReturnType<typeof combinedUser>>(
       "copilot-usage/users", { search: search || undefined }), { initialProps: { search: "" } });
     await waitFor(() => expect(result.current.data?.value[0].directory.displayName).toBe("User 1"));
@@ -97,10 +103,16 @@ describe("selected users and reports client boundary", () => {
       expect.objectContaining({ selectionId, cursor: "page-two" }), expect.any(AbortSignal));
     rerender({ search: "changed" });
     await waitFor(() => expect(result.current.data?.value[0].directory.displayName).toBe("User 3"));
+    expect(result.current.data?.selection.id).toBe(filtered.selection.id);
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ search: "changed", limit: 50 });
     rerender({ search: "" });
-    await waitFor(() => expect(result.current.data?.value[0].directory.displayName).toBe("User 4"));
+    expect(result.current.data).toEqual(first);
+    expect(result.current.loading).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(result.current.loading).toBe(false));
     expect(api.readReportPage).toHaveBeenCalledTimes(4);
-    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ search: undefined, limit: 50 });
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]).toEqual({ search: undefined, selectionId, limit: 50 });
   });
   it("aborts a bounded dependent read when its enabling exact evidence is withdrawn", async () => {
     const pending = deferred<ReturnType<typeof reportPage>>();
@@ -188,8 +200,7 @@ describe("selected users and reports client boundary", () => {
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "User 1" });
     fireEvent.click(screen.getByRole("button", { name: "Filters" }));
-    const facet = screen.getByRole("group", { name: "Company options" });
-    fireEvent.click(await within(facet).findByRole("button", { name: "Restart selection" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restart selection" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users",
       expect.not.objectContaining({ selectionId }), expect.any(AbortSignal));
@@ -259,7 +270,8 @@ describe("selected users and reports client boundary", () => {
 
   it("uses server counts and follows a byte-short page's cursor, not row length", async () => {
     vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => reportPage([combinedUser(query?.cursor ? 2 : 1)],
-      { page: { limit: 50, nextCursor: query?.cursor ? null : "byte-short-next", previousCursor: query?.cursor ? "previous" : null } }));
+      { counts: { total: 100000, filtered: 50000 },
+        page: { limit: 50, nextCursor: query?.cursor ? null : "byte-short-next", previousCursor: query?.cursor ? "previous" : null } }));
     render(<CopilotUsersView />);
     await waitFor(() => expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("50,000 matching users"));
     fireEvent.click(screen.getByRole("button", { name: "Next users" }));
@@ -297,13 +309,22 @@ describe("selected users and reports client boundary", () => {
     }
     await waitFor(() => expect(client.getQueryCache().findAll({ queryKey: ["saved", "record-page"] }).length).toBeLessThanOrEqual(3));
     view.unmount();
+    client.clear();
     const pending = render(<CopilotUsersView />);
+    expect(screen.getByRole("region", { name: "Loading users" })).toBeVisible();
+    const search = await screen.findByRole("searchbox", { name: "Search users or agents" });
     vi.mocked(api.readReportPage).mockReturnValue(new Promise(() => {}));
-    fireEvent.change(screen.getByLabelText("Search users or agents"), { target: { value: "pending" } });
+    fireEvent.change(search, { target: { value: "pending" } });
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", expect.objectContaining({ search: "pending" }), expect.any(AbortSignal)));
     const signal = vi.mocked(api.readReportPage).mock.calls.at(-1)![2];
-    pending.unmount();
+    expect(signal?.aborted).toBe(false);
+    fireEvent.change(search, { target: { value: "replacement" } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", expect.objectContaining({ search: "replacement" }), expect.any(AbortSignal)));
     expect(signal?.aborted).toBe(true);
+    const replacementSignal = vi.mocked(api.readReportPage).mock.calls.at(-1)![2];
+    expect(replacementSignal?.aborted).toBe(false);
+    pending.unmount();
+    expect(replacementSignal?.aborted).toBe(true);
   });
   it("automatically recaptures after a paged root selection is invalidated", async () => {
     vi.mocked(api.readReportPage).mockResolvedValueOnce(reportPage([combinedUser()], { page: { limit: 50, nextCursor: "next", previousCursor: null } }))
@@ -328,6 +349,30 @@ describe("selected users and reports client boundary", () => {
     expect(screen.getByRole("button", { name: "Next plans" })).toHaveAttribute("aria-disabled", "false");
     expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/service-plans"), expect.objectContaining({ selectionId, limit: 50 }), expect.any(AbortSignal));
   });
+  it("preserves a user's current relationship page for surrounding search whitespace", async () => {
+    const row = { id: "relationship", agentId: "agent", agentName: "Reported agent", creatorType: "Your org",
+      username: combinedUser().directory.userPrincipalName, responses: 10, lastActivityDateUtc: null, identityStatus: "unresolved" as const };
+    vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("/agents") ? reportPage([row],
+      { page: { limit: 50, nextCursor: query?.cursor ? null : "relationship-next", previousCursor: query?.cursor ? "previous" : null } })
+      : reportPage([combinedUser()]));
+    render(<CopilotUsersView />);
+    fireEvent.click(await screen.findByRole("button", { name: "User 1" }));
+    await screen.findByRole("heading", { name: "User 1" });
+    fireEvent.click(screen.getByRole("tab", { name: "Usage & agents" }));
+    await screen.findByText("Reported agent");
+    fireEvent.click(screen.getByRole("button", { name: "Next agents" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Previous agents" })).toHaveAttribute("aria-disabled", "false"));
+    const search = screen.getByRole("searchbox", { name: "Search this user's agents" });
+    fireEvent.change(search, { target: { value: " " } });
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Reported agent")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Previous agents" })).toHaveAttribute("aria-disabled", "false");
+    fireEvent.change(search, { target: { value: "Reported" } });
+    await screen.findByText("Reported agent");
+    fireEvent.change(search, { target: { value: " Reported " } });
+    expect(api.readReportPage).toHaveBeenCalledTimes(4);
+    expect(search).toHaveValue(" Reported ");
+  });
   it("keeps one history selection across more than 32 sets and pages observations separately", async () => {
     vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("observations") ? reportPage([])
       : reportPage([{ id: reports.setId!, bundleId: reports.setId!, contentHash: "a".repeat(64), reportingStart: null, reportingEnd: null,
@@ -339,6 +384,80 @@ describe("selected users and reports client boundary", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/history", expect.objectContaining({ selectionId, cursor: "history-next" }), expect.any(AbortSignal)));
     fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith(`official-usage/history/${reports.setId}/observations`, expect.objectContaining({ selectionId }), expect.any(AbortSignal)));
+  });
+  it.each(["revision", "restart", "denial", "account"] as const)(
+    "cancels history observations across a %s boundary without silently reopening them", async boundary => {
+      const pending = deferred<ReturnType<typeof reportPage>>();
+      const first = reportPage([historySet()]);
+      vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/observations") ? pending.promise : first);
+      const capability: ReturnType<typeof useCapabilityContext> = {
+        user: { tenantId: "tenant", homeAccountId: "first", username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"] },
+        now: Date.now(), views: [], loading: false, pending: false, error: undefined, reload: vi.fn(async () => {}), openPermissions: vi.fn(),
+      };
+      const panel = (revision: number, account = "first") => <CapabilityContext value={{ ...capability, user: { ...capability.user!, homeAccountId: account } }}>
+        <OfficialUsageHistoryPanel revision={revision} />
+      </CapabilityContext>;
+      const view = render(panel(0));
+      fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+      const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
+      if (boundary === "revision") view.rerender(panel(1));
+      else if (boundary === "account") view.rerender(panel(0, "second"));
+      else if (boundary === "restart") fireEvent.click(screen.getByRole("button", { name: "Load current report history" }));
+      else {
+        vi.mocked(api.readReportPage).mockImplementation(async path => {
+          if (path.endsWith("/observations")) return pending.promise;
+          throw new ApiError(403, "access_denied", "History access denied");
+        });
+        fireEvent.focus(window);
+        await screen.findByText("History access denied");
+      }
+      await waitFor(() => expect(signal?.aborted).toBe(true));
+      if (boundary === "denial") {
+        vi.mocked(api.readReportPage).mockResolvedValue(first);
+        fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+      }
+      await waitFor(() => expect(screen.getByRole("button", { name: "View report" })).toBeEnabled());
+      expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
+      await act(async () => pending.reject(new ApiError(409, "selection_invalidated", "Obsolete observation")));
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
+      expect(vi.mocked(api.readReportPage).mock.calls.filter(([path]) => path.endsWith("/observations"))).toHaveLength(1);
+    },
+  );
+  it("preserves independently pending history observations while paging the same parent selection", async () => {
+    const pending = deferred<ReturnType<typeof reportPage>>();
+    vi.mocked(api.readReportPage).mockImplementation(async (path, query) => path.endsWith("/observations") ? pending.promise
+      : reportPage([historySet(query?.cursor ? 2 : 1)], { page: { limit: 50, nextCursor: query?.cursor ? null : "next", previousCursor: null } }));
+    render(<OfficialUsageHistoryPanel revision={0} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const signal = vi.mocked(api.readReportPage).mock.calls[1][2];
+    const observations = screen.getByRole("region", { name: "Report observations" });
+    fireEvent.click(screen.getByRole("button", { name: "Next report sets" }));
+    await waitFor(() => expect(screen.getByRole("table")).toHaveTextContent(historySet(2).id));
+    expect(signal?.aborted).toBe(false);
+    expect(screen.getByRole("region", { name: "Report observations" })).toBe(observations);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    await act(async () => pending.resolve(reportPage([])));
+    await waitFor(() => expect(within(observations).queryByText("Loading saved data...")).not.toBeInTheDocument());
+  });
+  it("withdraws history actions when independently paged observations invalidate their selection", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async path => {
+      if (path.endsWith("/observations")) throw new ApiError(409, "selection_invalidated", "History changed");
+      return reportPage([historySet()]);
+    });
+    render(<OfficialUsageHistoryPanel revision={0} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Report observations" }));
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("button", { name: "View report" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Report observations" })).not.toBeInTheDocument();
+    fireEvent.focus(window);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    expect(await screen.findByRole("button", { name: "View report" })).toBeEnabled();
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
   });
   it("polls metadata only and offers a native download instead of buffering CSV", async () => {
     vi.useFakeTimers();

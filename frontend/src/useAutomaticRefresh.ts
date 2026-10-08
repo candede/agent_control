@@ -18,7 +18,7 @@ type Options = {
 function sourceIssueObservation(issues: Map<string, SourceIssue>): Observation | undefined {
   const phases = [...issues.values()];
   if (phases.includes("sign_in_required")) {
-    return { phase: "sign_in_required", message: "Some sources require Microsoft authorization. Sign in again to refresh those sources; other eligible sources continue automatically." };
+    return { phase: "sign_in_required", message: "Some sources require Microsoft authorization. Sign in again to refresh those sources; this does not block other eligible sources." };
   }
   if (phases.includes("permission_required")) {
     return { phase: "permission_required", message: "Some sources need permission. Review Sync and Permissions; saved data remains available." };
@@ -68,6 +68,7 @@ export function useAutomaticRefresh({
   const session = useRef<{
     owner: string;
     authorization: string;
+    paused: boolean;
     dueAt: number;
     failures: number;
     interaction: boolean;
@@ -83,7 +84,12 @@ export function useAutomaticRefresh({
   const observeJobs = useEffectEvent(onRunsChanged);
 
   useEffect(() => {
-    const changed = () => setAvailability({ visible: document.visibilityState === "visible", online: navigator.onLine });
+    const changed = () => {
+      const visible = document.visibilityState === "visible";
+      const online = navigator.onLine;
+      if (!visible || !online) inFlight.current?.abort();
+      setAvailability({ visible, online });
+    };
     document.addEventListener("visibilitychange", changed);
     window.addEventListener("online", changed);
     window.addEventListener("offline", changed);
@@ -97,7 +103,7 @@ export function useAutomaticRefresh({
   useEffect(() => {
     if (session.current?.owner !== principalKey) {
       session.current = {
-        owner: principalKey, authorization: authorizationKey, dueAt: 0, failures: 0,
+        owner: principalKey, authorization: authorizationKey, paused, dueAt: 0, failures: 0,
         interaction: false, denied: false, sourceIssues: new Map(),
       };
     }
@@ -105,17 +111,25 @@ export function useAutomaticRefresh({
     if (current.authorization !== authorizationKey) {
       current.authorization = authorizationKey;
       current.denied = false;
-      current.revisions = undefined;
-      current.jobs = undefined;
       current.dueAt = 0;
     }
     let active = true;
     let timer: number | undefined;
     let requestTimeout: number | undefined;
-    const admitted = () => active && enabled && !paused && !current.interaction && !current.denied
+    const admitted = () => active && enabled && !current.paused && !current.interaction && !current.denied
       && document.visibilityState === "visible" && navigator.onLine;
     const publish = (value: Observation) => setObservation({ ...value, owner: principalKey, authorization: authorizationKey });
     if (current.interaction) publish({ phase: "sign_in_required", message: "Sign in again to continue automatic refresh." });
+
+    const backoff = () => {
+      current.failures += 1;
+      current.dueAt = Date.now() + Math.min(maximumBackoffMs, checkIntervalMs * 2 ** Math.min(current.failures - 1, 4));
+      const issue = sourceIssueObservation(current.sourceIssues);
+      publish({
+        phase: issue?.phase ?? "backoff",
+        message: `${issue?.message ? `${issue.message} ` : ""}Automatic refresh could not be checked. The next eligible check will retry after a delay; saved data remains available.`,
+      });
+    };
 
     async function check() {
       if (!admitted() || inFlight.current) return;
@@ -130,15 +144,17 @@ export function useAutomaticRefresh({
       setCheckingRequest(request);
       const finishChecking = () => setCheckingRequest(current => current === request ? undefined : current);
       controller.signal.addEventListener("abort", finishChecking, { once: true });
-      let timedOut = false;
-      const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, requestTimeoutMs);
+      const timeout = window.setTimeout(() => {
+        if (controller.signal.aborted) return;
+        controller.abort();
+        // Report the deadline without releasing the lock on a transport still settling.
+        backoff();
+      }, requestTimeoutMs);
       requestTimeout = timeout;
       publish(sourceIssueObservation(current.sourceIssues) ?? { phase: "checking" });
       try {
         const result = await checkAutomaticRefresh({ signal: controller.signal });
-        if (!active) return;
-        if (timedOut) throw new Error("Automatic refresh check timed out.");
-        if (controller.signal.aborted) return;
+        if (!active || controller.signal.aborted) return;
         if (!result?.revisions || automaticDataSyncSourceIds.some(source => typeof result.revisions[source] !== "string")) {
           throw new Error("The server returned invalid automatic refresh status.");
         }
@@ -155,7 +171,7 @@ export function useAutomaticRefresh({
         current.dueAt = Date.now() + Math.max(checkIntervalMs, Math.min(maximumBackoffMs, Number.isFinite(suggested) ? suggested - Date.now() : checkIntervalMs));
         publish({ ...next, checkedAt: new Date().toISOString() });
       } catch (cause) {
-        if (!active || controller.signal.aborted && !timedOut) return;
+        if (!active || controller.signal.aborted) return;
         if (cause instanceof ApiError && (cause.status === 401 || ["interaction_required", "authorization_expired"].includes(cause.code))) {
           current.interaction = true;
           publish({ phase: "sign_in_required", message: "Sign in again to continue automatic refresh. Saved data has not been cleared." });
@@ -164,13 +180,7 @@ export function useAutomaticRefresh({
           current.revisions = undefined;
           publish({ phase: "permission_required", message: "Automatic refresh access was denied. Review Sync and Permissions." });
         } else {
-          current.failures += 1;
-          current.dueAt = Date.now() + Math.min(maximumBackoffMs, checkIntervalMs * 2 ** Math.min(current.failures - 1, 4));
-          const issue = sourceIssueObservation(current.sourceIssues);
-          publish({
-            phase: issue?.phase ?? "backoff",
-            message: `${issue?.message ? `${issue.message} ` : ""}Automatic refresh could not be checked. Retrying with a delay; saved data remains available.`,
-          });
+          backoff();
         }
       } finally {
         controller.signal.removeEventListener("abort", finishChecking);
@@ -184,12 +194,15 @@ export function useAutomaticRefresh({
       }
     }
 
-    wake.current = () => void check();
+    const requestCheck = () => void check();
+    wake.current = requestCheck;
+    window.addEventListener("focus", requestCheck);
     // StrictMode can retire this owner before admitting the first transport.
     void Promise.resolve().then(() => check());
     return () => {
       active = false;
       wake.current = undefined;
+      window.removeEventListener("focus", requestCheck);
       if (timer !== undefined) window.clearTimeout(timer);
       if (requestTimeout !== undefined) window.clearTimeout(requestTimeout);
       inFlight.current?.abort();
@@ -207,7 +220,13 @@ export function useAutomaticRefresh({
     paused,
     enabled,
     ...availability,
-    setPaused: (value: boolean) => setPausedOwner(value ? principalKey : undefined),
+    setPaused: (value: boolean) => {
+      if (session.current?.owner !== principalKey) return;
+      // Fence admission and publication before React commits the pause.
+      session.current.paused = value;
+      if (value) inFlight.current?.abort();
+      setPausedOwner(value ? principalKey : undefined);
+    },
   };
 }
 

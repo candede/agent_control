@@ -97,6 +97,13 @@ describe("sync presentation", () => {
     expect(formatSyncInstant(instant)).toBe(formatSyncInstant("2026-09-15T10:05:30.000Z"));
   });
 
+  it.each([null, undefined, "", "invalid", "2026-13-01T00:00:00.000Z"])(
+    "keeps missing or invalid timestamp %s unknown",
+    instant => {
+      expect(formatSyncInstant(instant)).toBe("Not recorded");
+    },
+  );
+
   it.each([
     [0, "0s"],
     [999, "0s"],
@@ -121,7 +128,15 @@ describe("sync presentation", () => {
     expect(syncDuration("2026-03-29T01:59:30+01:00", "2026-03-29T03:00:30+02:00")).toBe("1m 0s");
   });
 
-  it("preserves nonnegative duration output when completion precedes the start", () => {
-    expect(syncDuration("2026-09-15T10:01:00.000Z", "2026-09-15T10:00:00.000Z")).toBe("0s");
+  it("does not invent a zero duration when completion precedes the start", () => {
+    expect(syncDuration("2026-09-15T10:01:00.000Z", "2026-09-15T10:00:00.000Z")).toBe("Not recorded");
   });
+
+  it.each([null, undefined, "", "invalid", "2026-13-01T00:00:00.000Z"])(
+    "keeps durations with missing or invalid endpoint %s unknown",
+    instant => {
+      expect(syncDuration(instant, "2026-09-15T10:00:00.000Z")).toBe("Not recorded");
+      expect(syncDuration("2026-09-15T10:00:00.000Z", instant)).toBe("Not recorded");
+    },
+  );
 });

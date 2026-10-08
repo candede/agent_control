@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
+import { lockBodyScroll } from "../bodyScrollLock";
 import type { SyncReportRouteState } from "../workbenchRouting";
-import { trapDialogFocus } from "../dialogFocus";
+import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import { OfficialUsageImportPanel, type OfficialUsageImportHandle } from "./OfficialUsageImportPanel";
 import { OfficialUsageManageReports } from "./OfficialUsageManageReports";
 import { OfficialUsageSnapshot } from "./OfficialUsageSnapshot";
@@ -58,6 +59,7 @@ export function OfficialUsageImportModal({
       element.showModal();
       (element.querySelector<HTMLButtonElement>(".usage-upload-zone button") ?? closeButton.current ?? title.current)?.focus({ preventScroll: true });
     } else if (!open && element.open) element.close();
+    if (open) return observeDialogFocus(element);
   }, [open]);
 
   useEffect(() => {
@@ -68,9 +70,7 @@ export function OfficialUsageImportModal({
 
   useEffect(() => {
     if (!open) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = previousOverflow; };
+    return lockBodyScroll(document.body);
   }, [open]);
 
   function navigate(nextView: SyncReportRouteState["view"], reportSetId?: string) {

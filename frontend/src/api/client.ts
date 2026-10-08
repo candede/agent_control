@@ -176,6 +176,7 @@ export type BulkJobStatus = "queued" | "running" | "waiting_authorization" | "su
 type BulkActionJobBase = {
   id: string;
   status: BulkJobStatus;
+  cancelRequested?: true;
   canResume: boolean;
   total: number;
   completed: number;
@@ -301,6 +302,7 @@ type AuditEventsResponse = {
 
 type AuditRequestContext = {
   actionGroupId?: string;
+  signal?: AbortSignal;
 };
 
 export class ApiError extends Error {
@@ -527,11 +529,12 @@ export function getAgentResponsibility(query: AgentResponsibilityQuery = {}, opt
   return request<AgentResponsibilityPage>(`/api/agent-responsibility${params.size ? `?${params}` : ""}`, { signal: options.signal });
 }
 
-export function startPackageRefresh(mode: "delegated" | "application" = "delegated", options: { idempotencyKey?: string } = {}) {
+export function startPackageRefresh(mode: "delegated" | "application" = "delegated", options: { idempotencyKey?: string; signal?: AbortSignal } = {}) {
   return request<PackageRefreshJob>("/api/agents/refresh-jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}) },
     body: JSON.stringify({ mode }),
+    signal: options.signal,
   });
 }
 
@@ -554,11 +557,16 @@ export async function refreshPackageIdentityDetails(
   });
 }
 
-export function startExactPackageRefresh(id: string, mode: "delegated" | "application" = "delegated") {
+export function startExactPackageRefresh(
+  id: string,
+  mode: "delegated" | "application" = "delegated",
+  options: { signal?: AbortSignal } = {},
+) {
   return request<PackageRefreshJob>(`/api/agents/${encodeURIComponent(id)}/refresh-jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
+    signal: options.signal,
   });
 }
 
@@ -570,9 +578,10 @@ export function getPackageRefreshJob(
   return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(id)}?mode=${mode}`, { signal: options.signal });
 }
 
-export function getPackageRefreshJobs(mode: "delegated" | "application" = "delegated", limit = 20) {
+export function getPackageRefreshJobs(mode: "delegated" | "application" = "delegated", limit = 20, options: { signal?: AbortSignal } = {}) {
   return request<{ value: PackageRefreshJob[]; lastAttemptAt: string | null; lastSuccessAt: string | null }>(
     `/api/agents/refresh-jobs?mode=${mode}&limit=${limit}`,
+    { signal: options.signal },
   );
 }
 
@@ -590,9 +599,10 @@ export function getPackageRefreshTargets(job: Pick<PackageRefreshJob, "id" | "to
   return request<PackageRefreshTargetPage>(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}/targets?${query}`, { signal: options.signal });
 }
 
-export function refreshInventory(scope: { types?: PowerPlatformResourceType[]; environmentId?: string } = {}) {
+export function refreshInventory(scope: { types?: PowerPlatformResourceType[]; environmentId?: string } = {}, options: { signal?: AbortSignal } = {}) {
   return request<InventoryRefreshJob>("/api/inventory/refresh-jobs", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scope),
+    signal: options.signal,
   });
 }
 
@@ -604,12 +614,12 @@ export function getInventoryRefreshJob(id: string, options: { signal?: AbortSign
   return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
 
-export function resumeInventoryRefresh(id: string) {
-  return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/resume`, { method: "POST" });
+export function resumeInventoryRefresh(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/resume`, { method: "POST", signal: options.signal });
 }
 
-export function cancelInventoryRefresh(id: string) {
-  return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export function cancelInventoryRefresh(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
 }
 
 export function getQuarantineStatus(snapshotId: string, nativeId: string, force = false, options: { signal?: AbortSignal } = {}) {
@@ -624,9 +634,10 @@ export function previewQuarantine(input: { action: QuarantineAction; snapshotId:
   });
 }
 
-export function submitQuarantine(input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; confirmationHash: string }, idempotencyKey: string) {
+export function submitQuarantine(input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; confirmationHash: string }, idempotencyKey: string, options: { signal?: AbortSignal } = {}) {
   return request<QuarantineJob>("/api/quarantine/jobs", {
     method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, body: JSON.stringify(input),
+    signal: options.signal,
   });
 }
 
@@ -638,19 +649,21 @@ export function getQuarantineJob(id: string, options: { signal?: AbortSignal } =
   return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
 
-export function cancelQuarantineJob(id: string) {
-  return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export function cancelQuarantineJob(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
 }
 
-export function resumeQuarantineJob(id: string) {
+export function resumeQuarantineJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}/resume`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }),
+    signal: options.signal,
   });
 }
 
-export function reconcileQuarantineJob(id: string) {
+export function reconcileQuarantineJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}/reconcile`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+    signal: options.signal,
   });
 }
 
@@ -882,11 +895,13 @@ export async function updateAgentAccess(
   id: string,
   update: PackageAccessReplacement,
   confirmationHash: string,
+  options: { signal?: AbortSignal } = {},
 ) {
   return request<BulkActionJob>(`/api/agents/${encodeURIComponent(id)}/access`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...update, confirmationHash }),
+    signal: options.signal,
   });
 }
 
@@ -894,11 +909,13 @@ export async function updateAgentsAccess(
   ids: string[],
   update: PackageAccessUpdate,
   confirmationHash: string,
+  options: { signal?: AbortSignal } = {},
 ) {
   return request<BulkActionJob>("/api/agents/access", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids, ...update, confirmationHash }),
+    signal: options.signal,
   });
 }
 
@@ -933,11 +950,12 @@ export function previewPackageMutation(input: {
 
 export function submitSelectedPackageMutation(input: {
   action: AuditAction; selectionId: string; confirmationHash: string; accessUpdate?: PackageAccessUpdate; ids?: string[]; recordIds?: string[];
-}) {
+}, options: { signal?: AbortSignal } = {}) {
   const path = input.accessUpdate ? "access" : input.action;
   return request<BulkActionJob>(`/api/agents/${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ selectionId: input.selectionId, ids: input.ids, recordIds: input.recordIds, confirmationHash: input.confirmationHash, ...input.accessUpdate }),
+    signal: options.signal,
   });
 }
 
@@ -946,6 +964,7 @@ export async function blockAgent(id: string, confirmationHash: string, context?:
     method: "POST",
     headers: { "Content-Type": "application/json", ...auditContextHeaders(context) },
     body: JSON.stringify({ confirmationHash }),
+    signal: context?.signal,
   });
 }
 
@@ -954,22 +973,25 @@ export async function unblockAgent(id: string, confirmationHash: string, context
     method: "POST",
     headers: { "Content-Type": "application/json", ...auditContextHeaders(context) },
     body: JSON.stringify({ confirmationHash }),
+    signal: context?.signal,
   });
 }
 
-export async function blockAgents(ids: string[], confirmationHash: string) {
+export async function blockAgents(ids: string[], confirmationHash: string, options: { signal?: AbortSignal } = {}) {
   return request<BulkActionJob>("/api/agents/block", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids, confirmationHash }),
+    signal: options.signal,
   });
 }
 
-export async function unblockAgents(ids: string[], confirmationHash: string) {
+export async function unblockAgents(ids: string[], confirmationHash: string, options: { signal?: AbortSignal } = {}) {
   return request<BulkActionJob>("/api/agents/unblock", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids, confirmationHash }),
+    signal: options.signal,
   });
 }
 
@@ -991,10 +1013,10 @@ export function getBulkActionJobItems(id: string, query: { revision: string; cur
   return request<BulkJobItemPage>(`/api/agents/bulk-jobs/${encodeURIComponent(id)}/items?${search}`, { signal: options.signal });
 }
 
-export function reconcileBulkActionJob(id: string) {
+export function reconcileBulkActionJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<BulkActionJob & { reconciliation: { attempted: number; failed: number; errors: Array<{ id: string; message: string }> } }>(
     `/api/agents/bulk-jobs/${encodeURIComponent(id)}/reconcile`,
-    { method: "POST" },
+    { method: "POST", signal: options.signal },
   );
 }
 
@@ -1139,13 +1161,14 @@ function assertCurrentRequest(generation: number, signal?: AbortSignal | null) {
   }
 }
 
-export function cancelBulkActionJob(id: string) {
-  return request<BulkActionJob>(`/api/agents/bulk-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export function cancelBulkActionJob(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<BulkActionJob>(`/api/agents/bulk-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
 }
 
-export function resumeBulkActionJob(id: string) {
+export function resumeBulkActionJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<BulkActionJob>(`/api/agents/bulk-jobs/${encodeURIComponent(id)}/resume`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }),
+    signal: options.signal,
   });
 }
 
@@ -1172,12 +1195,14 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
 
 function notifySessionRevalidation(error: ApiError) {
   const unclassifiedDenial = (error.status === 401 || error.status === 403) && error.code === "request_failed";
+  // Signing in in another tab replaces the session cookie and its CSRF token.
+  const rejectedCsrf = error.status === 403 && error.code === "invalid_csrf";
   const sessionRevalidationRequired = error.authenticationExpired
     || (error.status === 403 && error.code === "missing_internal_role")
-    || unclassifiedDenial;
+    || unclassifiedDenial || rejectedCsrf;
   if (sessionRevalidationRequired) {
     sessionGeneration += 1;
-    if (error.authenticationExpired || unclassifiedDenial && error.status === 401) csrfToken = undefined;
+    if (error.authenticationExpired || rejectedCsrf || unclassifiedDenial && error.status === 401) csrfToken = undefined;
     for (const listener of sessionRevalidationListeners) {
       try {
         listener(error);

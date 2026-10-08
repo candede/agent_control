@@ -59,6 +59,40 @@ function provider() {
 }
 
 describe("typed package observation identity and provenance", () => {
+  it("keeps invalid metadata actionable across filtered selections until replacement details repair it", async () => {
+    const source = provider();
+    await nativeInventoryFixture(database.runtime, source.scope, [], { resourceTypes: ["microsoft.copilotstudio/agents"] });
+    await source.catalogPage([packageValue("invalid"), packageValue("pending")]);
+    source.exact.set("invalid", { ...packageValue("invalid"), elementDetails: [
+      { elementType: "AgentMetadatas", elements: [
+        { id: "metadata", definition: JSON.stringify({ SourceIds: { CdsBotId: "not-a-guid" } }) },
+      ] },
+    ] });
+    await source.exactPage(["invalid"], true);
+    const invalid = await source.read();
+    expect(invalid.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 1, invalidPackages: 1 });
+    expect(invalid.page.verification).toMatchObject({ status: "needs_attention",
+      checks: { sourceScopes: true, packageMetadata: false, identityLinks: true } });
+    expect(invalid.page.value.find(row => row.packages.some(value => value.id === "invalid"))?.identity)
+      .toMatchObject({ state: "unmatched", invalidMetadata: true });
+
+    const filtered = await source.read({ search: "pending" });
+    expect(filtered.page.value.flatMap(row => row.packages.map(value => value.id))).toEqual(["pending"]);
+    expect(filtered.page.identityCollection?.invalidPackages).toBe(1);
+    expect(filtered.page.verification.status).toBe("needs_attention");
+
+    source.exact.set("invalid", { ...packageValue("invalid"), elementDetails: [] });
+    await source.exactPage(["invalid"], true);
+    const repaired = await source.read();
+    expect(repaired.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 1, invalidPackages: 0 });
+    expect(repaired.page.verification.status).toBe("details_pending");
+    expect(repaired.page.value.every(row => !row.identity.invalidMetadata)).toBe(true);
+
+    source.exact.set("pending", { ...packageValue("pending"), elementDetails: [] });
+    await source.exactPage(["pending"], true);
+    expect((await source.read()).page.verification).toMatchObject({ status: "verified", checks: { packageMetadata: true } });
+  });
+
   it("preserves immutable identity expiry through compaction and splits expired detail-only matches off GET", async () => {
     const source = provider(), environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", botId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     await nativeInventoryFixture(database.runtime, source.scope, [{ nativeId: botId, environmentId,

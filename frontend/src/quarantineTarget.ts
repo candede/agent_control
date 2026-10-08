@@ -15,7 +15,9 @@ export function quarantineTargetReason(resource: QuarantineSelectableTarget | un
   if (!snapshot) return "A saved inventory snapshot is required.";
   if (snapshot.current === false) return "This read is historical. Refresh inventory before changing quarantine.";
   if (resource.quarantineEligibility && !resource.quarantineEligibility.eligible) return resource.quarantineEligibility.reason ?? "The server did not qualify this saved inventory record as an exact quarantine target.";
-  if (Date.parse(snapshot.expiresAt) <= now || Date.parse(snapshot.observedAt) < now - 24 * 60 * 60_000) return "The saved inventory target is stale. Refresh inventory before changing quarantine.";
+  const observedAt = Date.parse(snapshot.observedAt);
+  const expiresAt = Date.parse(snapshot.expiresAt);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(expiresAt) || observedAt > now || expiresAt <= now || observedAt < now - 24 * 60 * 60_000) return "The saved inventory target is stale. Refresh inventory before changing quarantine.";
   const nativeGuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
   const environmentGuid = new RegExp(`^(?:Default-)?${nativeGuid.source.slice(1, -1)}$`, "i");
   if (!resource.environmentId || !environmentGuid.test(resource.environmentId)) return "The inventory record does not contain a valid native environment ID.";

@@ -170,7 +170,11 @@ another capture or aggregate calculation. Cache
 keys include account/tenant/roles, report, filters and data revision; selection
 expiry, source/report revision changes, explicit restart and session teardown
 prevent reuse. Focus revalidates the selected evidence. Continuations and detail
-pages are not retained by this cache; uncached filters start a fresh
+pages are not retained by this cache. A rejected selection withdraws peer
+evidence for the same selected query, including other local revisions, and
+cancels their pending reads; late cancelled responses cannot restore it.
+After its last observer leaves, that rejected cache entry is discarded so the
+next visit can retain a fresh capture. Uncached filters start a fresh
 selection. Nothing is saved to browser storage. During a replacement read,
 old source-freshness notices are withheld; genuine stale/unavailable results
 and persistent read errors remain visible after the read settles. Routine
@@ -187,6 +191,8 @@ Canonical links use `/users?view=activity`; old `view=matrix` links are still ac
 The **User cohort** selector contains only paid M365 Copilot users and active users without paid Copilot. The former **Agent responsibility** cohort and standalone people list are removed. Responsibility lives in the user modal's **Responsibility** tab, showing an agent count, compact linked agent rows, explicit **Owner**, **Created by** and **Last modified by** badges, source observation dates, and paged results. A last modifier is not necessarily an owner or ongoing maintainer; these relationships do not grant access or management permissions.
 
 Partial inventory coverage alone does not show a warning banner or direct the user to refresh manually. Saved relationships remain visible, and scheduled inventory refresh is unchanged. Failed reads and unavailable responsibility data still have explicit error or unavailable states.
+
+Responsibility pages retain the exact selection ID, revision, evaluation time and expiry; paging cannot renew or replace that selection. Selections last at most ten minutes and can expire earlier with their sources. While a saved read is refreshing, its previous relationships may remain visible, but cancelling an invalidated read withdraws them and offers **Retry saved responsibility**. Retrying captures a fresh first page rather than silently resuming the old cursor.
 
 Collection coverage comes only from the saved source metadata. Missing owner, creator or last-modifier fields do not make a successfully collected inventory partial, and Graph-only agents are not required to provide Power Platform relationships. Reported roles remain available independently; malformed identity references are counted separately and never guessed into user relationships.
 

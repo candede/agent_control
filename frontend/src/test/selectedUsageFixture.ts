@@ -3,6 +3,7 @@ import type {
 } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail, OfficialReportFacetPage } from "../../../backend/src/types/officialReportApi";
 import type { UserSourcePlan } from "../../../backend/src/types/userSources";
+import { normalizeReportSearch as normalized } from "../api/reportData";
 import { combinedUser, historySet, overviewAgent, reportAgent, reportPage, reports, reportSetId, reportUser } from "./reportDataFixture";
 
 export const selectedFixtureNow = new Date("2026-09-18T10:00:00.000Z");
@@ -61,9 +62,6 @@ const relationships: ReportRelationship[] = ([
 ] satisfies Array<[string, string, string, string, number, string]>).map(([agentId, agentName, creatorType, username, responses, lastActivityDateUtc], index) => ({
   id: `relationship-${index}`, agentId, agentName, creatorType, username, responses, lastActivityDateUtc, identityStatus: "unresolved",
 }));
-function normalized(value: string): string {
-  return value.trim().normalize("NFKC").toLowerCase();
-}
 function sortFixtureRows<T>(rows: T[], query: ReportQuery, value: (row: T) => string | number | null): T[] {
   return rows.sort((a, b) => {
     const left = value(a), right = value(b);
@@ -72,10 +70,10 @@ function sortFixtureRows<T>(rows: T[], query: ReportQuery, value: (row: T) => st
       ? left - right : normalized(String(left)).localeCompare(normalized(String(right))));
   });
 }
-function latestDate(dates: Array<string | null>): string | null {
+export function latestDate(dates: Array<string | null>): string | null {
   return dates.reduce<string | null>((latest, date) => date && (!latest || date > latest) ? date : latest, null);
 }
-function matchesActivity(date: string | null, query: ReportQuery, anchor: string | null): boolean {
+export function matchesActivity(date: string | null, query: ReportQuery, anchor: string | null): boolean {
   const day = date?.slice(0, 10);
   if (query.startDate && (!day || day < query.startDate) || query.endDate && (!day || day > query.endDate)) return false;
   if (!query.reportActivity || query.reportActivity === "all") return true;
@@ -100,7 +98,7 @@ export function responseAnalytics(values: Array<number | null>, threshold?: numb
 }
 function fixturePage<T>(value: T[], query: ReportQuery = {}): ReportPage<T> {
   const result = reportPage(structuredClone(value));
-  return { ...result, reports: { ...structuredClone(selectedFixtureReports), setId: query.setId ?? reportSetId }, filters: query,
+  return { ...result, reports: { ...structuredClone(selectedFixtureReports), setId: query.setId ?? reportSetId }, filters: structuredClone(query),
     counts: { total: value.length, filtered: value.length }, summary: { ...result.summary,
       reportedResponses: 270, bridgeResponses: 267, userReportedResponses: 267, distinctActiveReportUsers: 3,
       licensedOccurrences: 4, unlicensedOccurrences: 1, activeWithoutPaidUsers: 1 },
@@ -109,7 +107,7 @@ function fixturePage<T>(value: T[], query: ReportQuery = {}): ReportPage<T> {
 }
 export function selectedAgentsPage(query: ReportQuery = {}): ReportPage<ReportAgent> {
   const search = normalized(query.search ?? ""), anchor = latestDate(agents.map(row => row.lastActivityDateUtc));
-  const rows = agents.filter(row => (!search || `${row.agentName} ${row.agentId} ${row.creatorType}`.toLowerCase().includes(search))
+  const rows = agents.filter(row => (!search || normalized(`${row.agentName} ${row.agentId} ${row.creatorType}`).includes(search))
     && matchesLink(row, query) && matchesActivity(row.lastActivityDateUtc, query, anchor));
   sortFixtureRows(rows, { ...query, order: query.order ?? "desc" }, row => query.sort === "name" ? row.agentName
     : query.sort === "activeUsers" ? row.activeUsers : query.sort === "licensedUsers" ? row.licensedUserOccurrences
@@ -140,12 +138,12 @@ export function selectedReportUsersPage(query: ReportQuery = {}): ReportPage<Rep
       objectId: index === 3 ? null : selectedLicensedUser(index + 1, String(name), Number(responses)).directory.objectId,
       company: index === 3 ? null : "Contoso Health", department: index === 3 ? null : "Operations",
       entitlement: index === 3 ? "unknown" : index === 0 ? "paid_active" : "no_paid", reportedResponses: Number(responses),
-      reportedAgentsUsed: Number(count), bridgeResponses: query.licenseCohort && index === 1 ? 3 : Number(responses),
-      relationshipCount: Number(count), responseProducingAgentCount: Number(responses) ? Number(count) : query.licenseCohort && index === 1 ? 1 : 0,
+      reportedAgentsUsed: Number(count), bridgeResponses: Number(responses),
+      relationshipCount: Number(count), responseProducingAgentCount: Number(responses) ? Number(count) : 0,
       userLastActivityDateUtc: index === 0 ? "2026-09-09" : null, lastActivityDateUtc: index === 2 ? "2026-09-11" : "2026-09-12",
-      missingUserReport: false, hasReportMismatch: Boolean(query.licenseCohort && index === 1),
+      missingUserReport: false, hasReportMismatch: false,
       reviewCohort: responseCohort(Number(responses), query.lowResponseThreshold ?? 5),
-      hasActivity: Boolean(Number(responses) || query.licenseCohort && index === 1) }));
+      hasActivity: Boolean(Number(responses)) }));
   const search = normalized(query.search ?? ""), anchor = latestDate(rows.map(row => row.userLastActivityDateUtc));
   const selected = rows.filter(row => {
     const links = relationships.filter(link => link.username === row.username && matchesLink(link, query));
@@ -162,15 +160,16 @@ export function selectedReportUsersPage(query: ReportQuery = {}): ReportPage<Rep
   sortFixtureRows(selected, query, row => query.sort === "responses" ? row.reportedResponses : query.sort === "agentsUsed" ? row.reportedAgentsUsed
     : query.sort === "lastActivity" ? row.userLastActivityDateUtc : row.displayName);
   const result = fixturePage(selected, query);
-  return { ...result, summary: { ...result.summary, activeWithoutPaidUsers: query.licenseCohort ? 2 : 1 },
+  return { ...result,
     counts: { total: rows.length, filtered: selected.length },
     analytics: { ...result.analytics, ...responseAnalytics(selected.map(row => row.reportedResponses), query.lowResponseThreshold ?? 5) } };
 }
-export function selectedRelationshipsPage(query: ReportQuery = {}): ReportPage<ReportRelationship> {
-  const scoped = relationships.filter(row => (query.agentId === undefined || row.agentId === query.agentId)
-    && (query.username === undefined || row.username === query.username));
+export function selectedRelationshipsPage(query: ReportQuery = {}, owner: Pick<ReportQuery, "agentId" | "username"> = query): ReportPage<ReportRelationship> {
+  const scoped = relationships.filter(row => (owner.agentId === undefined || row.agentId === owner.agentId)
+    && (owner.username === undefined || row.username === owner.username));
   const search = normalized(query.search ?? ""), anchor = latestDate(scoped.map(row => row.lastActivityDateUtc));
-  const rows = scoped.filter(row => matchesLink(row, query) && matchesActivity(row.lastActivityDateUtc, query, anchor)
+  const rows = scoped.filter(row => matchesLink(row, query) && (query.username === undefined || row.username === query.username)
+    && matchesActivity(row.lastActivityDateUtc, query, anchor)
     && (!search || normalized(`${row.agentName} ${row.agentId} ${row.creatorType} ${row.username}`).includes(search)));
   sortFixtureRows(rows, query, row => query.sort === "responses" ? row.responses : query.sort === "lastActivity" ? row.lastActivityDateUtc
     : query.sort === "creatorType" ? row.creatorType : row.agentName);
@@ -201,14 +200,25 @@ export function selectedOverviewPage(query: ReportQuery = {}): ReportPage<Report
 }
 export function selectedHistoryPage(sets: ReportHistorySet[] = [historySet(1, {
   reportingStart: "2026-08-14", reportingEnd: "2026-09-12", acceptedAt: selectedFixtureReports.acceptedAt!,
-})], activeSetId: string | null = reportSetId): ReportPage<ReportHistorySet> {
-  const result = fixturePage(sets);
-  return { ...result, reports: { ...result.reports, activeSetId }, analytics: { ...result.analytics, history: {
-    imports: sets.length, uniqueObservations: sets.length * 3, observationRows: sets.length * 11, uniquePayloads: sets.length * 3, repeatedRowsReused: 0,
-    earliestAcceptedAt: sets.at(-1)?.acceptedAt ?? null, latestAcceptedAt: sets[0]?.acceptedAt ?? null,
-    earliestActivityDateUtc: sets.length ? "2026-09-09" : null, latestActivityDateUtc: sets.length ? "2026-09-12" : null,
-    earliestReportingStart: sets.length ? "2026-08-14" : null, latestReportingEnd: sets.length ? "2026-09-12" : null,
-    knownWindows: sets.length, unknownWindows: 0, overlappingKnownWindows: Math.max(0, sets.length - 1),
+})], activeSetId: string | null = reportSetId, query: ReportQuery = {}): ReportPage<ReportHistorySet> {
+  const search = normalized(query.search ?? "");
+  const rows = sets.filter(row => !search || normalized(`${row.id} ${row.acceptedAt}`).includes(search));
+  rows.sort((a, b) => a.id.localeCompare(b.id) * (query.order === "asc" ? 1 : -1));
+  sortFixtureRows(rows, { ...query, order: query.order ?? "desc" }, row => query.sort === "acceptedAt" ? row.acceptedAt
+    : row.reportingEnd === null ? null : `${row.reportingEnd}/${row.reportingStart ?? ""}/${row.acceptedAt}`);
+  const result = fixturePage(rows, query);
+  const accepted = rows.map(row => row.acceptedAt).sort();
+  const known = rows.filter((row): row is ReportHistorySet & { reportingStart: string; reportingEnd: string } =>
+    row.periodProvenance !== "activity_range" && row.reportingStart !== null && row.reportingEnd !== null);
+  const starts = known.map(row => row.reportingStart).sort(), ends = known.map(row => row.reportingEnd).sort();
+  return { ...result, counts: { total: sets.length, filtered: rows.length }, reports: { ...result.reports, activeSetId }, analytics: { ...result.analytics, history: {
+    imports: rows.length, uniqueObservations: rows.length * 3, observationRows: rows.length * 11, uniquePayloads: rows.length * 11, repeatedRowsReused: 0,
+    earliestAcceptedAt: accepted[0] ?? null, latestAcceptedAt: accepted.at(-1) ?? null,
+    earliestActivityDateUtc: rows.length ? "2026-09-09" : null, latestActivityDateUtc: rows.length ? "2026-09-12" : null,
+    earliestReportingStart: starts[0] ?? null, latestReportingEnd: ends.at(-1) ?? null,
+    knownWindows: known.length, unknownWindows: rows.length - known.length,
+    overlappingKnownWindows: known.filter(row => known.some(other => other.id !== row.id
+      && other.reportingStart <= row.reportingEnd && other.reportingEnd >= row.reportingStart)).length,
     additive: false, activityRangeProvesCoverage: false,
   } } };
 }
@@ -217,6 +227,33 @@ export function selectedFixtureQuery(input: string): ReportQuery {
   const url = new URL(input, "http://localhost"), params = url.searchParams;
   const history = url.pathname === "/api/official-usage/history" || url.pathname === "/api/official-usage/history/options";
   const aggregate = url.pathname === "/api/official-usage/aggregate";
+  for (const key of params.keys()) {
+    if (params.getAll(key).length !== 1) throw new Error("Expected one synthetic query value per field");
+  }
+  function choice<T extends string>(key: string, values: readonly T[]): T | undefined {
+    const value = params.get(key);
+    if (value === null) return undefined;
+    const match = values.find(option => option === value);
+    if (match === undefined) throw new Error(`Invalid synthetic query ${key}`);
+    return match;
+  }
+  function number(key: string, maximum: number, fallback: number): number {
+    const value = params.has(key) ? Number(params.get(key)) : fallback;
+    if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new Error(`Invalid synthetic query ${key}`);
+    return value;
+  }
+  function date(key: string): string | undefined {
+    const value = params.get(key);
+    if (value === null) return undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))
+      || new Date(value).toISOString().slice(0, 10) !== value) throw new Error(`Invalid synthetic query ${key}`);
+    return value;
+  }
+  const search = params.get("search"), startDate = date("startDate"), endDate = date("endDate");
+  if (search !== null && (search.length > 256 || normalized(search).length > 256 || /[\p{Cc}\p{Cs}]/u.test(search))) {
+    throw new Error("Invalid synthetic query search");
+  }
+  if (startDate && endDate && startDate > endDate) throw new Error("Invalid synthetic query date range");
   function organization(field: "company" | "department") {
     const value = params.get(field);
     if (value === null) return undefined;
@@ -224,26 +261,40 @@ export function selectedFixtureQuery(input: string): ReportQuery {
     if (!value.startsWith("~string:")) throw new Error("Expected the frozen nullable organization encoding");
     return value.slice("~string:".length);
   }
-  return { setId: params.get("setId") ?? undefined, search: params.get("search") ?? undefined,
-    scope: params.get("scope") === "history" ? "history" : params.get("scope") === "selected" ? "selected" : undefined,
+  const query: ReportQuery = { setId: params.get("setId")?.toLowerCase(), search: search === null ? undefined : normalized(search),
+    scope: choice("scope", ["history", "selected"]),
     company: organization("company"), department: organization("department"),
-    entitlement: (["paid_active", "paid_inactive", "no_paid", "unknown"] as const).find(value => value === params.get("entitlement")),
-    serviceState: (["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"] as const).find(value => value === params.get("serviceState")),
-    appActivity: (["active", "inactive", "unknown"] as const).find(value => value === params.get("appActivity")),
+    entitlement: choice("entitlement", ["paid_active", "paid_inactive", "no_paid", "unknown"]),
+    serviceState: choice("serviceState", ["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"]),
+    appActivity: choice("appActivity", ["active", "inactive", "unknown"]),
     creatorType: params.get("creatorType") ?? undefined,
-    responsesOnly: params.has("responsesOnly") ? params.get("responsesOnly") === "true" : undefined,
-    startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
+    responsesOnly: params.has("responsesOnly") ? choice("responsesOnly", ["true", "false"]) === "true" : undefined,
+    startDate, endDate,
     agentId: params.get("agentId") ?? undefined, username: params.get("username") ?? undefined,
-    licenseCohort: params.get("licenseCohort") === "active_without_paid" ? "active_without_paid" : undefined,
-    cohort: (["all", "zero", "low", "review", "licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"] as const).find(value => value === params.get("cohort")),
-    reportActivity: (["all", "recent", "inactive", "no-activity"] as const).find(value => value === params.get("reportActivity")),
-    lowResponseThreshold: params.has("lowResponseThreshold") ? Number(params.get("lowResponseThreshold")) : undefined,
-    inactiveDays: params.has("inactiveDays") ? Number(params.get("inactiveDays")) : undefined,
-    activityWindowDays: params.has("activityWindowDays") ? Number(params.get("activityWindowDays")) : undefined,
-    sort: (["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity", "creatorType", "activeUsers", "licensedUsers", "unlicensedUsers", "acceptedAt"] as const).find(value => value === params.get("sort"))
-      ?? (history ? "acceptedAt" : aggregate ? "responses" : "name"),
-    order: params.get("order") === "asc" ? "asc" : params.get("order") === "desc" ? "desc" : history || aggregate ? "desc" : "asc",
+    licenseCohort: choice("licenseCohort", ["active_without_paid"]),
+    cohort: choice("cohort", ["all", "zero", "low", "review", "licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"]),
+    reportActivity: choice("reportActivity", ["all", "recent", "inactive", "no-activity"]),
+    lowResponseThreshold: number("lowResponseThreshold", 100000000, 5),
+    inactiveDays: number("inactiveDays", 365, 30),
+    activityWindowDays: number("activityWindowDays", 365, 30),
+    sort: choice("sort", ["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity", "creatorType", "activeUsers", "licensedUsers", "unlicensedUsers", "acceptedAt", "reportingPeriod"])
+      ?? (history ? "reportingPeriod" : aggregate ? "responses" : "name"),
+    order: choice("order", ["asc", "desc"]) ?? (history || aggregate ? "desc" : "asc"),
   };
+  const allowed = [...Object.keys(query), "selectionId", "cursor", "limit", "field"];
+  for (const [key, value] of params) {
+    if (!allowed.includes(key)) throw new Error(`Unsupported synthetic query ${key}`);
+    if (key === "company" || key === "department" || key === "creatorType" || key === "agentId" || key === "username") {
+      const maximum = key === "agentId" || key === "username" ? 512 : 256;
+      const text = key === "company" || key === "department" ? query[key] : value;
+      if (text !== null && text !== undefined && (text.length > maximum || /[\0\r\n]/.test(text)
+        || (key === "agentId" || key === "username") && !text.trim())) throw new Error(`Invalid synthetic query ${key}`);
+    }
+  }
+  if (query.setId !== undefined && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(query.setId)) {
+    throw new Error("Invalid synthetic query setId");
+  }
+  return query;
 }
 export function selectedFixtureWindow<T>(input: string, rows: T[], base: ReportPage<T>): ReportPage<T> {
   const params = new URL(input, "http://localhost").searchParams;
@@ -251,10 +302,10 @@ export function selectedFixtureWindow<T>(input: string, rows: T[], base: ReportP
   const start = cursor === null ? 0 : Number(cursor.slice("fixture:".length)), limit = Number(text);
   if (cursor !== null && !/^fixture:\d+$/.test(cursor) || !/^\d{1,3}$/.test(text)
     || !Number.isSafeInteger(start) || start < 0 || limit < 1 || limit > 100) throw new Error("Invalid synthetic cursor page");
-  return { ...base, value: rows.slice(start, start + limit), counts: { ...base.counts, filtered: rows.length },
+  return structuredClone({ ...base, value: rows.slice(start, start + limit), counts: { ...base.counts, filtered: rows.length },
     selection: { ...base.selection, id: params.get("selectionId") ?? base.selection.id },
     page: { limit, nextCursor: start + limit < rows.length ? `fixture:${start + limit}` : null,
-      previousCursor: start > 0 ? `fixture:${Math.max(0, start - limit)}` : null } };
+      previousCursor: start > 0 ? `fixture:${Math.max(0, start - limit)}` : null } });
 }
 export function selectedFixtureLicensedRows(directory: ReportPage<CombinedUser>, query: ReportQuery): CombinedUser[] {
   const threshold = query.lowResponseThreshold ?? 5, search = normalized(query.search ?? "");
@@ -290,7 +341,9 @@ export function selectedFixtureLicensedRows(directory: ReportPage<CombinedUser>,
 }
 export function selectedFixtureRead(input: string, directory = selectedUsersPage()):
   ReportListPage<ReportRow> | OfficialReportDetail<CombinedUser | ReportUser | ReportAgent> | OfficialReportFacetPage | undefined {
-  const url = new URL(input, "http://localhost"), query = selectedFixtureQuery(input), path = url.pathname;
+  const url = new URL(input, "http://localhost"), path = url.pathname;
+  if (!/^\/api\/(?:copilot-usage\/users|official-usage\/(?:history|overview|aggregate|agents|users))(?:\/|$)/.test(path)) return undefined;
+  const query = selectedFixtureQuery(input);
   const selectedReports = { ...structuredClone(directory.reports), setId: query.setId ?? directory.reports.setId };
   const selection = { ...directory.selection, id: url.searchParams.get("selectionId") ?? directory.selection.id };
   const selected = <T>(page: ReportPage<T>): ReportPage<T> => selectedFixtureWindow(input, page.value,
@@ -301,18 +354,19 @@ export function selectedFixtureRead(input: string, directory = selectedUsersPage
     if (field !== "company" && field !== "department" && field !== "creatorType") throw new Error("Unexpected selected fixture facet");
     const facetQuery = { ...query, search: undefined };
     delete facetQuery[field];
-    const options = field === "creatorType" ? selectedAgentsPage(facetQuery).value.map(row => row.creatorType)
-      : path === "/api/copilot-usage/users/facets" ? selectedFixtureLicensedRows(directory, facetQuery)
+    const facetValues = (query: ReportQuery) => field === "creatorType" ? selectedAgentsPage(query).value.map(row => row.creatorType)
+      : path === "/api/copilot-usage/users/facets" ? selectedFixtureLicensedRows(directory, query)
         .map(row => field === "company" ? row.directory.companyName : row.directory.department)
-        : selectedReportUsersPage(facetQuery).value.map(row => row[field]);
+        : selectedReportUsersPage(query).value.map(row => row[field]);
     const values = new Map<string | null, number>(), search = normalized(query.search ?? "");
-    for (const option of options) {
+    for (const option of facetValues(facetQuery)) {
       const value = option?.trim() || null;
       if (!search || normalized(value ?? "").includes(search)) values.set(value, (values.get(value) ?? 0) + 1);
     }
     const rows = [...values].sort(([a], [b]) => a === null ? 1 : b === null ? -1 : a.localeCompare(b)).map(([value, count]) => ({ value, count }));
-    const page = selectedFixtureWindow(input, rows, reportPage(rows, { counts: { total: rows.length, filtered: rows.length } }));
-    return { value: page.value, counts: page.counts, page: page.page, selection };
+    const total = new Set(facetValues({}).map(value => value?.trim() || null)).size;
+    const page = selectedFixtureWindow(input, rows, reportPage(rows, { counts: { total, filtered: rows.length } }));
+    return { value: page.value, counts: page.counts, page: page.page, selection: structuredClone(selection) };
   }
   if (path === "/api/copilot-usage/users") {
     const value = selectedFixtureLicensedRows(directory, query);
@@ -325,17 +379,17 @@ export function selectedFixtureRead(input: string, directory = selectedUsersPage
   if (path.startsWith("/api/copilot-usage/users/")) {
     const [objectId, child, extra] = path.slice("/api/copilot-usage/users/".length).split("/");
     if (extra !== undefined) return undefined;
-    const row = directory.value.find(user => user.directory.objectId === decodeURIComponent(objectId));
+    const row = directory.value.find(user => user.directory.objectId.toLowerCase() === decodeURIComponent(objectId).toLowerCase());
     if (!row) return undefined;
     if (child === "service-plans") return selected(row.servicePlanCount ? selectedPlansPage()
       : reportPage<UserSourcePlan>([], { counts: { total: 0, filtered: 0 } }));
     if (child === "agents") return selected(row.reportMatch === "matched" && row.reportedUsername !== null
-      ? selectedRelationshipsPage({ ...query, username: row.reportedUsername }) : fixturePage<ReportRelationship>([], query));
-    if (!child) return { value: row, selection, reports: selectedReports, sources: directory.sources };
+      ? selectedRelationshipsPage(query, { username: row.reportedUsername }) : fixturePage<ReportRelationship>([], query));
+    if (!child) return structuredClone({ value: row, selection, reports: selectedReports, sources: directory.sources });
   }
-  if (path === "/api/official-usage/history") return selected(selectedHistoryPage());
+  if (path === "/api/official-usage/history") return selected(selectedHistoryPage(undefined, directory.reports.activeSetId, query));
   if (path === "/api/official-usage/history/options") {
-    const { value, page, counts, selection, reports } = selected(selectedHistoryPage());
+    const { value, page, counts, selection, reports } = selected(selectedHistoryPage(undefined, directory.reports.activeSetId, query));
     return { value, page, counts, selection, reports };
   }
   if (path === "/api/official-usage/overview") return selected(selectedOverviewPage(query));
@@ -344,13 +398,13 @@ export function selectedFixtureRead(input: string, directory = selectedUsersPage
   if (path.startsWith("/api/official-usage/agents/")) {
     const [encodedId, child, extra] = path.slice("/api/official-usage/agents/".length).split("/"), agentId = decodeURIComponent(encodedId);
     if (extra !== undefined || !agents.some(row => row.agentId === agentId)) return undefined;
-    if (child === "users") return selected(selectedRelationshipsPage({ ...query, agentId }));
-    if (!child) return { ...selectedAgentDetail(agentId), selection, reports: selectedReports, sources: directory.sources };
+    if (child === "users") return selected(selectedRelationshipsPage(query, { agentId }));
+    if (!child) return structuredClone({ ...selectedAgentDetail(agentId), selection, reports: selectedReports, sources: directory.sources });
   }
   if (path.startsWith("/api/official-usage/users/")) {
     const [encodedId, child, extra] = path.slice("/api/official-usage/users/".length).split("/"), username = decodeURIComponent(encodedId);
     if (extra !== undefined || !selectedReportUsersPage().value.some(row => row.username === username)) return undefined;
-    if (child === "agents") return selected(selectedRelationshipsPage({ ...query, username }));
+    if (child === "agents") return selected(selectedRelationshipsPage(query, { username }));
     const value = selectedReportUsersPage(query).value.find(row => row.username === username);
     if (child === "service-plans" && value?.objectId) {
       const user = directory.value.find(row => row.directory.objectId === value.objectId);
@@ -358,9 +412,9 @@ export function selectedFixtureRead(input: string, directory = selectedUsersPage
     }
     if (child === "directory" && value?.objectId) {
       const user = directory.value.find(row => row.directory.objectId === value.objectId);
-      if (user) return { value: user, selection, reports: selectedReports, sources: directory.sources };
+      if (user) return structuredClone({ value: user, selection, reports: selectedReports, sources: directory.sources });
     }
-    if (!child && value) return { value, selection, reports: selectedReports, sources: directory.sources };
+    if (!child && value) return structuredClone({ value, selection, reports: selectedReports, sources: directory.sources });
   }
   return undefined;
 }

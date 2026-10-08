@@ -89,7 +89,9 @@ function AccessAssignmentForm({
     && !principalsInitialized;
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const submissionInFlight = useRef(false);
   const locked = busy || submitting || readOnly || !active;
+  const [resolutionError, setResolutionError] = useState<string>();
   const [error, setError] = useState<string>();
   const dialogRef = useRef<HTMLElement>(null);
 
@@ -130,18 +132,20 @@ function AccessAssignmentForm({
 
     const controller = new AbortController();
 
-    void resolveDirectoryPrincipals(initialAccess.principals, { signal: controller.signal })
-      .then((response) => {
+    void Promise.resolve().then(async () => {
+      if (controller.signal.aborted) return;
+      try {
+        const response = await resolveDirectoryPrincipals(initialAccess.principals, { signal: controller.signal });
         if (!controller.signal.aborted) {
           setAssignments({ selected: response.value, initialized: true });
         }
-      })
-      .catch((requestError) => {
+      } catch (requestError) {
         if (!controller.signal.aborted) {
           setAssignments({ selected: initialAccess.principals.map(fallbackPrincipal), initialized: true });
-          setError(errorMessage(requestError));
+          setResolutionError(errorMessage(requestError));
         }
-      });
+      }
+    });
 
     return () => {
       controller.abort();
@@ -151,13 +155,14 @@ function AccessAssignmentForm({
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
     setConfirming(false);
+    if (nextMode !== mode) setError(undefined);
     if (nextMode === "add") {
       setScope("specific");
     }
   }
 
   async function handleApply() {
-    if (locked) return;
+    if (locked || submissionInFlight.current) return;
     if (!scope) {
       setError("Choose an access scope.");
       return;
@@ -173,12 +178,13 @@ function AccessAssignmentForm({
       return;
     }
 
+    setError(undefined);
     if (!inline && !confirming && mode === "replace") {
       setConfirming(true);
       return;
     }
 
-    setError(undefined);
+    submissionInFlight.current = true;
     setSubmitting(true);
     try {
       if (scope === "none") {
@@ -203,6 +209,7 @@ function AccessAssignmentForm({
       setError(errorMessage(requestError));
       setConfirming(false);
     } finally {
+      submissionInFlight.current = false;
       setSubmitting(false);
     }
   }
@@ -256,6 +263,7 @@ function AccessAssignmentForm({
                 if (onTargetChange) onTargetChange("availability");
                 else setTarget("availability");
                 setConfirming(false);
+                if (!onTargetChange && target !== "availability") setError(undefined);
               }}
             >
               <strong>Available to</strong>
@@ -269,6 +277,7 @@ function AccessAssignmentForm({
                 if (onTargetChange) onTargetChange("installation");
                 else setTarget("installation");
                 setConfirming(false);
+                if (!onTargetChange && target !== "installation") setError(undefined);
               }}
             >
               <strong>Installed for</strong>
@@ -352,6 +361,7 @@ function AccessAssignmentForm({
                     onChange={() => {
                       setScope("none");
                       setConfirming(false);
+                      setError(undefined);
                     }}
                   />
                   <span>
@@ -368,6 +378,7 @@ function AccessAssignmentForm({
                     onChange={() => {
                       setScope("specific");
                       setConfirming(false);
+                      setError(undefined);
                     }}
                   />
                   <span>
@@ -401,7 +412,7 @@ function AccessAssignmentForm({
                   <AssignmentList values={readOnly && !initialAccess.principalsReported ? undefined : selected} saved={readOnly} />
                 </> : resolving ? (
                   <p className="access-resolving" role="status">
-                    Resolving current assignments...
+                    {active ? "Resolving current assignments..." : "Assignment lookup is paused until editing resumes."}
                   </p>
                 ) : (
                   <PrincipalPicker
@@ -410,9 +421,11 @@ function AccessAssignmentForm({
                     onChange={(principals) => {
                       setAssignments({ selected: principals, initialized: true });
                       setConfirming(false);
+                      setError(undefined);
                     }}
                   />
                 )}
+                {resolutionError ? <div className="inline-error" role="alert">{resolutionError}</div> : null}
               </section>
             ) : scope === "none" && !readOnly ? (
               <div className="access-empty-scope">
@@ -445,7 +458,7 @@ function AccessAssignmentForm({
           <button
             type="button"
             className="secondary"
-            disabled={busy || submitting}
+            disabled={busy || submitting || !active}
             onClick={onCancel}
           >
             {inline ? "Discard changes" : "Cancel"}
@@ -464,11 +477,13 @@ function AccessAssignmentForm({
             aria-disabled={locked}
             onClick={() => void handleApply()}
           >
-            {busy || submitting
+            {submitting
               ? "Applying"
-              : confirming
-                ? "Confirm and apply"
-                : "Apply"}
+              : busy
+                ? "Please wait"
+                : confirming
+                  ? "Confirm and apply"
+                  : "Apply"}
           </button>
                   </WorkbenchActionGate>
         </footer> : null}

@@ -36,9 +36,89 @@ describe("reported snapshot comparisons", () => {
     expect(snapshotChange(point(210), point(200)).label).toBe("Same report end date");
     expect(snapshotChange(point(210, "2026-10-04", { reportingEnd: null }), point(200)).comparable).toBe(false);
   });
+  it.each([NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])("does not compare invalid response count %s as activity", responses => {
+    expect(snapshotChange(point(responses, "2026-10-04"), point(200))).toMatchObject({ comparable: false, label: "Usage not reported" });
+    expect(snapshotChange(point(210, "2026-10-04"), point(responses))).toMatchObject({ comparable: false, label: "Previous report not reported" });
+  });
+  it.each([
+    { reportingStart: null }, { reportingEnd: "invalid" }, { reportingEnd: "2026-09-31" }, { reportingStart: "2026-11-01" },
+  ])("does not compare partial, invalid or backwards windows %j", dates => {
+    expect(snapshotChange(point(210, "2026-10-04", dates), point(200)))
+      .toMatchObject({ comparable: false, label: "Report dates unavailable" });
+    expect(snapshotChange(point(210, "2026-10-04"), point(200, "2026-10-01", dates)))
+      .toMatchObject({ comparable: false, label: "Previous report dates unavailable" });
+  });
+  it("does not classify a backwards comparison as increasing activity", () => {
+    expect(snapshotChange(point(210), point(200, "2026-10-04")))
+      .toMatchObject({ comparable: false, label: "Report dates out of order" });
+  });
 });
 
 describe("usage trend chart", () => {
+  it.each([NaN, Infinity, -1, 0.5])("keeps invalid count %s as a gap without poisoning the scale", responses => {
+    const data = agentUsageHistoryFixture(context, "agent", [point(responses, "2026-10-04"), point(0)]);
+    const view = render(<AgentUsageTrend data={data} onPage={vi.fn()} loading={false} />);
+    const chart = screen.getByRole("img"), table = screen.getByRole("table");
+    expect(chart.outerHTML).not.toMatch(/NaN|Infinity/);
+    expect(view.container.querySelectorAll(".trend-dot")).toHaveLength(1);
+    expect(view.container.querySelectorAll(".trend-missing")).toHaveLength(1);
+    expect(view.container.querySelectorAll(".trend-line")).toHaveLength(0);
+    expect(within(table).getByRole("cell", { name: "Unknown" })).toBeVisible();
+    expect(within(table).getByRole("cell", { name: "0" })).toBeVisible();
+    expect(screen.queryByText(/Increasing:|Decreasing:/)).not.toBeInTheDocument();
+  });
+  it.each([
+    { reportingStart: null }, { reportingEnd: "invalid" }, { reportingEnd: "2026-09-31" }, { reportingStart: "2026-11-01" },
+  ])("retains counts without plotting invalid dates %j", dates => {
+    const data = agentUsageHistoryFixture(context, "agent", [point(20, "2026-10-04", dates), point(0)]);
+    const view = render(<AgentUsageTrend data={data} onPage={vi.fn()} loading={false} />);
+    expect(screen.getByRole("img").outerHTML).not.toMatch(/NaN|Infinity/);
+    expect(view.container.querySelectorAll(".trend-dot")).toHaveLength(1);
+    expect(view.container.querySelectorAll(".trend-line")).toHaveLength(0);
+    expect(within(screen.getByRole("table")).getByRole("cell", { name: "20" })).toBeVisible();
+    expect(screen.queryByText(/Increasing:|Decreasing:/)).not.toBeInTheDocument();
+    expect(within(screen.getByRole("table")).getAllByText(/Report dates unavailable|Dates not supplied/).length).toBeGreaterThan(0);
+  });
+  it("distinguishes no saved reports from saved reports with no usage for this agent", () => {
+    const view = render(<AgentUsageTrend data={agentUsageHistoryFixture(context, "agent", [])}
+      onPage={vi.fn()} loading={false} />);
+    expect(screen.getByText("No CSV reports available. Import a complete CSV report in Sync to see usage.")).toBeVisible();
+    expect(screen.queryByText("No usage reported in saved reports.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    view.rerender(<AgentUsageTrend data={agentUsageHistoryFixture(context, "agent", [point(null)])}
+      onPage={vi.fn()} loading={false} />);
+    expect(screen.getByText("No usage reported in saved reports.")).toBeVisible();
+    expect(within(screen.getByRole("table")).getByText("Not reported")).toBeVisible();
+    expect(screen.queryByText(/Import a complete CSV report/)).not.toBeInTheDocument();
+  });
+
+  it("qualifies missing usage on an older page without contradicting the latest saved report", () => {
+    const newest = point(200), older = point(null, "2026-09-27");
+    const data = { ...agentUsageHistoryFixture(context, "agent", [newest, older]), value: [older],
+      page: { limit: 50, nextCursor: null, previousCursor: "newer" } };
+    render(<AgentUsageTrend data={data} onPage={vi.fn()} loading={false} />);
+    expect(screen.getByText("Latest report shown: Usage not reported")).toBeVisible();
+    expect(screen.queryByText("Latest report: Usage not reported")).not.toBeInTheDocument();
+    expect(screen.getByText("No reported response counts in this page's dated reports.")).toBeVisible();
+    expect(screen.queryByText("No usage reported in saved reports.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Newer reports" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Older reports" })).toBeDisabled();
+  });
+
+  it("keeps reported zero counts in the table when dates cannot support a chart", () => {
+    const data = agentUsageHistoryFixture(context, "agent", [
+      point(0, "2026-10-01", { reportingStart: null, reportingEnd: null, periodProvenance: "unknown" }),
+    ]);
+    render(<AgentUsageTrend data={data} onPage={vi.fn()} loading={false} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("No reported response counts in this page's dated reports.")).toBeVisible();
+    expect(screen.queryByText("No usage reported in saved reports.")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("table")).getByRole("cell", { name: "0" })).toBeVisible();
+    expect(within(screen.getByRole("table")).getByText("Dates not supplied")).toBeVisible();
+    expect(within(screen.getByRole("table")).getByText("Report dates unavailable")).toBeVisible();
+  });
+
   it("renders read-only chronological comparisons without selectable dates, points or viewing markers", () => {
     const points = [point(230, "2026-10-12"), point(195, "2026-10-08"), point(210, "2026-10-04"), point(200)];
     const data = agentUsageHistoryFixture(context, "agent", points);
@@ -73,11 +153,11 @@ describe("usage trend chart", () => {
     expect(within(screen.getByRole("table")).getByText("Not reported")).toBeVisible();
     expect(screen.queryByText(/Increasing:/)).not.toBeInTheDocument();
   });
-  it("keeps history pagination and disables navigation while revalidating", () => {
+  it.each(["loading", "disabled"])("keeps history pagination and disables navigation while %s", state => {
     const onPage = vi.fn();
     const data = { ...agentUsageHistoryFixture(context, "agent", [point(200)]),
       page: { limit: 50, nextCursor: "older", previousCursor: "newer" } };
-    const view = render(<AgentUsageTrend data={data} onPage={onPage} loading />);
+    const view = render(<AgentUsageTrend data={data} onPage={onPage} loading={state === "loading"} disabled={state === "disabled"} />);
     expect(screen.getByRole("button", { name: "Older reports" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Newer reports" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Older reports" }));
