@@ -76,7 +76,7 @@ describe("focused selected official agent reporting", () => {
     expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
-  it.each(["revision", "search", "dates"] as const)("permanently retires open agent details across a %s boundary", async boundary => {
+  it.each(["revision", "search", "dates"] as const)("keeps agent details across a revision but retires them on a changed %s filter", async boundary => {
     vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/users") ? reportPage([]) : page());
     const view = render(<ReportingView setId={reportSetId} />);
     fireEvent.click(await screen.findByRole("button", { name: "Researcher" }));
@@ -86,12 +86,12 @@ describe("focused selected official agent reporting", () => {
     if (boundary === "revision") view.rerender(<ReportingView setId={reportSetId} revision={1} />);
     else fireEvent.change(screen.getByLabelText(boundary === "search" ? "Search agents" : "Activity start date"),
       { target: { value: boundary === "search" ? "changed" : "2026-01-01" } });
-    expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
-    if (boundary === "revision") expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Exact reported agent details" }) !== null).toBe(boundary === "revision");
+    if (boundary === "revision") expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
     await act(async () => pending.resolve(page()));
     await screen.findByRole("button", { name: "Researcher" });
-    expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
-    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("region", { name: "Exact reported agent details" }) !== null).toBe(boundary === "revision");
+    expect(api.readReportDetail).toHaveBeenCalledTimes(boundary === "revision" ? 2 : 1);
   });
   it("does not reload or close exact details for report UUID casing or surrounding search whitespace", async () => {
     const setId = "abcdefab-1234-4567-8901-abcdefabcdef";
@@ -396,13 +396,13 @@ describe("focused selected official agent reporting", () => {
     fireEvent.focus(window);
     await screen.findByRole("alert");
     expect(screen.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Exact reported agent details" }) !== null).toBe(status === 503);
     expect(screen.queryByText("Loading saved data...")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
     vi.mocked(api.readReportPage).mockResolvedValue(page());
-    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Retry saved data" })[0]);
     await screen.findByRole("button", { name: "Researcher" });
-    expect(screen.queryByRole("region", { name: "Exact reported agent details" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Exact reported agent details" }) !== null).toBe(status === 503);
   });
 
   it("closes details immediately across historical A-B-A selections and aborts stale requests", async () => {
@@ -440,7 +440,7 @@ describe("exact reported-agent evidence lifetime", () => {
     expect(screen.getByRole("navigation", { name: "relationships pages" })).toHaveTextContent(`${filtered} matching relationships; 0 on this page`);
     if (filtered) expect(screen.getByRole("button", { name: "Previous relationships" })).toHaveAttribute("aria-disabled", "false");
   });
-  it("shows initial loading, withdraws old details on revision, and defers dependent rows until exact evidence succeeds", async () => {
+  it("shows initial loading and retains visible agent details during a revision refresh", async () => {
     const initial = deferred<ReturnType<typeof evidence>>(), replacement = deferred<ReturnType<typeof evidence>>();
     vi.mocked(api.readReportDetail).mockReturnValueOnce(initial.promise).mockReturnValueOnce(replacement.promise);
     vi.mocked(api.readReportPage).mockResolvedValue(reportPage([]));
@@ -451,9 +451,9 @@ describe("exact reported-agent evidence lifetime", () => {
     await screen.findByText(/Exact report identity/);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledOnce());
     view.rerender(<ReportAgentDetail {...props} revision={1} />);
-    expect(screen.queryByText(/Exact report identity/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Exact report identity/)).toBeVisible();
     expect(screen.getByText("Loading exact agent details...")).toBeVisible();
-    expect(api.readReportPage).toHaveBeenCalledOnce();
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     await act(async () => replacement.resolve(evidence()));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
   });
@@ -511,7 +511,7 @@ describe("exact reported-agent evidence lifetime", () => {
       else { vi.spyOn(performance, "now").mockReturnValue(performance.now() + 2000); fireEvent.focus(window); }
     });
     expect(screen.getByText(/Exact report identity/)).toBeVisible();
-    expect(screen.getByText(/Showing previously loaded saved agent details/)).toBeVisible();
+    expect(screen.queryByText(/Showing previously loaded saved agent details/)).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(signal?.aborted).toBe(false);
     expect(api.readReportDetail).toHaveBeenCalledOnce();

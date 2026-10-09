@@ -106,7 +106,7 @@ function Selector({ revision, onChanged }: { revision: number; onChanged: (selec
       {data?.page.nextCursor ? <option value="older-reports">Older report sets...</option> : null}
     </select>
     <span className="sr-only" role="status">{busy ? "Selecting report set..." : read.loading ? "Loading report sets..." : ""}</span>
-    {read.leaseEnded && !read.error ? <p role="status">Showing saved report sets. <button type="button" onClick={read.restart}>Reload report sets</button> before changing the shared report.</p> : null}
+    {read.leaseEnded && !read.error && !read.renewing ? <p role="status">Showing saved report sets. <button type="button" onClick={read.restart}>Reload report sets</button> before changing the shared report.</p> : null}
     {!canManage ? <p>An administrator can change the shared report selection. Historical reports remain available in Manage reports.</p> : null}
     {error || denied || read.error ? <div className="report-status error" role="alert">{error ?? denied?.message ?? read.error?.message}{" "}
       <button type="button" className="secondary" disabled={Boolean(busy) || read.loading} onClick={() => {

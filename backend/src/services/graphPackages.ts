@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { normalizePackageStatus } from "../types/copilotPackage.js";
 import { inventoryLimits, type InventoryPage } from "../types/inventoryRecords.js";
+import { dataLimits } from "../db/dataBounds.js";
 import type {
   CopilotPackage,
   CopilotPackageDetail,
@@ -240,7 +241,8 @@ export class GraphPackagesClient {
       signal.throwIfAborted();
       if (!response.ok) throw await graphError(response, signal);
       if (response.status === 204) return undefined as T;
-      return await boundedProviderJson<T>(response, signal);
+      const maximumBytes = read && /\/packages\/[^/]+/.test(target.pathname) ? dataLimits.agentDefinitionWorkBytes : undefined;
+      return await boundedProviderJson<T>(response, signal, maximumBytes);
     } catch (error) {
       options.signal?.throwIfAborted();
       // Error-body timeouts must not erase an observed denial or throttle cooldown.

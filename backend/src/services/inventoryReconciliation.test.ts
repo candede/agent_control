@@ -21,6 +21,7 @@ import { StreamedInventory } from "./streamedInventory.js";
 import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisions.js";
 import { checkpointQueries, observePeakMemory, observeQueryWork } from "./peakMemory.js";
 import { inventoryReconciliationAdmissionSql, verifyInventoryReconciliationAdmissionSchema } from "../db/inventoryReconciliationAdmissionSchema.js";
+import { dataLimits } from "../db/dataBounds.js";
 
 describe("durable bounded reconciliation", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -285,6 +286,68 @@ describe("durable bounded reconciliation", () => {
     await observe(false, false);
     expect((await nativeInventory.resolveQuarantineTargets(scope, latest, ["native-readback"]))[0].inventoryQuarantineState).toBe(true);
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_native_control_pending WHERE principal_id=$1", [principal])).rows[0].count).toBe(0);
+  });
+  it("reconciles a large identity definition and preserves it through catalog and control publication", async () => {
+    const principal = randomUUID();
+    const definition = JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: bot }, padding: "x".repeat(3 * 1024 ** 2) });
+    const value = { id: "large-identity", displayName: "Large identity", isBlocked: false,
+      version: "1", lastModifiedDateTime: new Date().toISOString(), identityDetailsCollected: true,
+      detailFreshness: { state: "fresh" as const, observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() },
+      elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity", definition }] }] };
+    const source = await publish(principal, "packages", [packageInventoryRecord(value)]);
+    const nativeSource = await publish(principal, "power_platform", [native("large-identity-native")]);
+    const input = inventoryInput(principal, "canonical");
+    await reconcile.request(input, [source, nativeSource]);
+    const canonical = (await reconcile.runNext(input, async () => {}))!;
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-large-identity-reconciliation-secret");
+    const identity = { ...selectionIdentity, principalId: principal };
+    const pin = await queries.capture(identity, canonical.scopeId);
+    const page = await queries.page(pin.id, identity);
+    expect(page.value).toHaveLength(1);
+    expect(page.value[0].linkState).toBe("matched");
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(dataLimits.batchBytes);
+    const members = (await queries.members(pin.id, identity, page.value[0].id)).value;
+    const member = members.find(row => row.domain === "packages")!;
+    const children = await queries.children(pin.id, identity, page.value[0].id, { kind: "element",
+      sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity });
+    expect(children.value[0].payload.definition).toBe(definition);
+    expect(Buffer.byteLength(JSON.stringify(children))).toBeLessThanOrEqual(dataLimits.agentDefinitionTransferBytes);
+    const stream = new StreamedInventory(fixture.runtime);
+    const catalogValue = { ...value, elementDetails: undefined };
+    await sources.execute(inventoryInput(principal), { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
+      await sources.visit(lease, "catalog");
+      await stream.packageObservation(lease, catalogValue, "catalog");
+      await sources.acceptPage(lease, { token: "catalog", nextToken: null, records: [catalogValue], rawCount: 1, expectedCount: 1, page: 1 }, 1);
+    }, { authorize: async () => {} });
+    const blocked = allowlistedPackage({ ...value, isBlocked: true });
+    await sources.generations.connections.run(client => publishPackageReadback(
+      { tenantId: source.tenantId, principalId: principal }, blocked, client, null, capturePackageMutationState(blocked, "block")));
+    expect(await new InventoryRuntime(fixture.runtime, async () => {}).publishControls({ tenantId: source.tenantId, principalId: principal })).toBe(1);
+    const retained = (await fixture.runtime.query(`SELECT f.payload FROM inventory_roots r JOIN inventory_memberships m
+      ON m.baseline_id=r.baseline_id AND m.valid_from_revision<=r.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>r.revision)
+      JOIN inventory_facts f ON f.generation_id=m.generation_id AND f.identity=m.identity AND f.kind='element'
+      WHERE r.current AND r.scope_id=$1 AND m.identity=$2`, [source.scopeId, value.id])).rows;
+    expect(retained).toHaveLength(1);
+    expect(retained[0].payload.definition).toBe(definition);
+  });
+  it("reduces singleton work batches when an unmatched agent contains a large definition", async () => {
+    const principal = randomUUID();
+    const definition = JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: bot }, padding: "x".repeat(3 * 1024 ** 2) });
+    const source = await publish(principal, "packages", [
+      packageInventoryRecord({ id: "large-unmatched", displayName: "Large unmatched", isBlocked: false,
+        elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity", definition }] }] }),
+      packaged("small-unmatched", false),
+    ]);
+    const input = inventoryInput(principal, "canonical");
+    await reconcile.request(input, [source]);
+    const canonical = (await reconcile.runNext(input, async () => {}))!;
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-large-singleton-cursor-secret");
+    const identity = { ...selectionIdentity, principalId: principal };
+    const pin = await queries.capture(identity, canonical.scopeId);
+    const page = await queries.page(pin.id, identity);
+    expect(page.value).toHaveLength(2);
+    expect(page.value.every(row => row.linkState === "unmatched")).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(dataLimits.batchBytes);
   });
   it("publishes and independently pages five thousand legal child definitions without loading them into canonical work", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");

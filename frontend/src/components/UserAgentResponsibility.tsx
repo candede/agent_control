@@ -1,4 +1,4 @@
-import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useContext, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { useQuery, type Query } from "@tanstack/react-query";
 import { isDirectoryObjectId } from "../../../backend/src/types/copilotPackage";
 import { responsibilityLabels, type AgentResponsibilityQuery, type ResponsibilityPerson } from "../../../backend/src/types/agentResponsibility";
@@ -50,7 +50,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   const [navigation, setNavigation] = useState<{ scope: string; page: number; selection: AgentResponsibilityPage["selection"]; cursor: string }>();
   const personId = objectId?.toLowerCase();
   const valid = personId !== undefined && isDirectoryObjectId(personId);
-  const owner = JSON.stringify([scope, personId, retry]);
+  const owner = JSON.stringify([scope, personId]);
   const boundary = JSON.stringify([scope, personId, dataRevision, agentInventoryRevision, retry]);
   // Retained relationships must not turn a cancelled replacement query into a success.
   const [retained, setRetained] = useState<{ owner: string; cursor?: string; data: AgentResponsibilityPage }>();
@@ -79,12 +79,12 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
     && current.selectionId !== read.data.selection.id.toLowerCase()) {
     setEvidence({ boundary, selectionId: read.data.selection.id.toLowerCase(), selection: read.data.selection });
   }
-  const retainedPage = !read.data && read.isFetching && retained?.owner === owner && retained.cursor === cursor && !selectionId ? retained : undefined;
+  const retainedPage = !read.data && read.isFetching && retained?.owner === owner && !selectionId ? retained : undefined;
   const value = read.data ?? (isExpiredSelection(read.error) ? retained?.data : retainedPage?.data);
   const leaseActive = useSelectedReadLease(value?.selection ?? current.selection);
   const expired = Boolean((value || current.selection) && !leaseActive) || isExpiredSelection(read.error);
   const invalidated = read.error instanceof ApiError && read.error.code === "selection_invalidated" && !isExpiredSelection(read.error);
-  const error = !read.isFetching ? read.error?.message ?? (incompleteRead ? read.isPending ? "Saved responsibility was cancelled. Retry saved responsibility."
+  const error = !read.isFetching ? (!isExpiredSelection(read.error) ? read.error?.message : undefined) ?? (incompleteRead ? read.isPending ? "Saved responsibility was cancelled. Retry saved responsibility."
       : "Saved responsibility needs reloading. Retry saved responsibility." : undefined) : undefined;
   const data = canRead && valid && !invalidated && (!read.isError || isExpiredSelection(read.error)) && !incompleteRead ? value : undefined;
   const admitPublication = publication?.admit;
@@ -92,16 +92,23 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   const observedPublication = useRef<{ owner: string; revision: string } | undefined>(undefined);
   const published = publication?.revisions;
   const publicationRevision = published ? JSON.stringify([published.graph_packages, published.power_platform]) : undefined;
-  const refetchPublication = read.refetch;
+  const renewedCapture = useRef<string | undefined>(undefined);
+  const liveCapture = useRef<string | undefined>(undefined);
+  const renew = useEffectEvent(() => { setRetry(value => value + 1); });
   useEffect(() => {
-    if (!data || !publicationRevision || read.isFetching || read.isError) return;
+    if (data && leaseActive) liveCapture.current = data.selection.id;
+    if (!valid || !canRead || !data || read.isFetching || invalidated || error
+      || document.visibilityState !== "visible" || !navigator.onLine) return;
     const previous = observedPublication.current?.owner === owner ? observedPublication.current.revision : undefined;
-    if (previous === publicationRevision) return;
-    observedPublication.current = { owner, revision: publicationRevision };
     const captured = data.selection.publicationRevisions;
-    if (!previous && JSON.stringify([captured.graph_packages, captured.power_platform]) === publicationRevision) return;
-    if (selectedReadRemaining(data.selection)) void refetchPublication({ cancelRefetch: false });
-  }, [data, owner, publicationRevision, read.isError, read.isFetching, refetchPublication]);
+    const publicationChanged = publicationRevision && previous !== publicationRevision
+      && (previous !== undefined || JSON.stringify([captured.graph_packages, captured.power_platform]) !== publicationRevision);
+    if (publicationRevision) observedPublication.current = { owner, revision: publicationRevision };
+    const expiredSelection = expired && liveCapture.current === data.selection.id && renewedCapture.current !== data.selection.id;
+    if (!publicationChanged && !expiredSelection) return;
+    renewedCapture.current = data.selection.id;
+    renew();
+  });
   const selected = data?.selected;
   const paginationOwner = JSON.stringify([scope, personId]);
   const hasPages = Boolean(data?.page.nextCursor || data?.page.previousCursor);
@@ -177,7 +184,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
       : <>
         {!error && read.isFetching && !data ? <p role="status">Loading saved responsibility...</p> : null}
         {!error && read.isFetching && data ? <p className="sr-only" role="status">Refreshing saved responsibility. Showing the last loaded relationships.</p> : null}
-        {expired && data ? <p role="status">Showing previously loaded saved responsibility. <button type="button" onClick={retryRead}>Load new responsibility selection</button> before paging.</p> : null}
+        {expired && data && !error ? <p className="sr-only" role="status">Refreshing saved responsibility...</p> : null}
         {error ? <p role="alert" className="error-banner">{error} <button type="button" className="secondary"
           onClick={retryRead}>Retry saved responsibility</button></p> : null}
         {data ? <>

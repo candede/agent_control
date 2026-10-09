@@ -8,6 +8,7 @@ import { ApiError, getAgentResponsibility } from "../api/client";
 import * as api from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { createSavedQueryClient } from "../savedQueries";
+import { PublicationContext } from "../publicationContext";
 import { combinedUser, reportPage, reportSelection, reportSetId, reportUser, selectionId } from "../test/reportDataFixture";
 import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 import { deferred } from "../test/deferred";
@@ -78,6 +79,19 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("selected active users without paid Copilot", () => {
+  it.each(["queued", "running"] as const)("describes license verification during %s Users sync without assigning a manual task", async status => {
+    const saved = page({ value: [], counts: { total: 3, filtered: 0 } });
+    saved.sources.directory.state = "partial";
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status } }}>
+      <ReportedUserActivity route={initial} onRouteChange={vi.fn()} />
+    </PublicationContext>);
+    expect(await screen.findByRole("heading", { name: "Verifying user licenses" })).toBeVisible();
+    expect(screen.getByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toBeVisible();
+    expect(screen.queryByText(/Run Users sync|Non-paid user activity unavailable/)).not.toBeInTheDocument();
+    expect(screen.getByText("Users will appear automatically when license verification completes.")).toBeVisible();
+  });
+
   it("reads the retained stale directory cohort with truthful age while its successor fails", async () => {
     const saved = page();
     saved.sources.directory = { ...saved.sources.directory, state: "stale", attemptStatus: "failed",
@@ -89,7 +103,7 @@ describe("selected active users without paid Copilot", () => {
     expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
-  it.each(["success", "denied"] as const)("preserves detail tab and draft during explicit frozen replacement (%s)", async outcome => {
+  it.each(["success", "denied"] as const)("preserves detail tab and draft during automatic saved-data renewal (%s)", async outcome => {
     const saved = page(), replacement = page({ selection: reportSelection(9) });
     const pending = deferred<ReportPage<ReportUser>>();
     vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/agents") ? reportPage([relationship]) : saved);
@@ -100,11 +114,12 @@ describe("selected active users without paid Copilot", () => {
     fireEvent.change(search, { target: { value: "Researcher" } });
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringMatching(/\/agents$/),
       expect.objectContaining({ search: "researcher" }), expect.any(AbortSignal)));
+    vi.mocked(api.readReportPage).mockImplementation(async (path, request) => path === "official-usage/users"
+      ? pending.promise : reportPage([relationship], { selection: request?.selectionId === saved.selection.id ? saved.selection : replacement.selection }));
     const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(saved.selection.expiresAt) - Date.parse(saved.selection.validatedAt) + 1);
     fireEvent.focus(window);
     expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise).mockImplementation(async () => reportPage([relationship], { selection: replacement.selection }));
-    fireEvent.click(screen.getAllByRole("button", { name: "Restart selection" })[0]);
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
     expect(screen.getByRole("dialog")).toBe(dialog);
     expect(search).toHaveValue("Researcher");
     expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/users",
@@ -153,12 +168,35 @@ describe("selected active users without paid Copilot", () => {
     expect(api.readReportDetail).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
-  it("keeps global unverified identity coverage beside filtered results, without calling unknown identities unpaid", async () => {
+  it("does not ask for another sync for unknown identities or call those identities unpaid", async () => {
     vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [], counts: { total: 100000, filtered: 0 } }));
     renderActivity();
-    expect(await screen.findByText(/50 active report users need a license check/)).toHaveTextContent("Run Users sync");
-    expect(screen.getByText(/No matching reported users/)).toBeVisible();
+    expect(await screen.findByText(/No matching reported users/)).toBeVisible();
+    expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("0");
+  });
+  it("shows newly verified report users when background sync publishes, without a manual action or prompt", async () => {
+    const before = page({ value: [], counts: { total: 1, filtered: 0 } });
+    const after = page({ value: [ada], selection: reportSelection(9), counts: { total: 1, filtered: 1 } });
+    after.selection.publicationRevisions.users = "4".repeat(64);
+    const admit = vi.fn(), client = createSavedQueryClient();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(before).mockResolvedValue(after);
+    const surface = (revisions = before.selection.publicationRevisions) => <SavedQueryProvider client={client}>
+      <PublicationContext value={{ admit, revisions }}>
+        <ReportedUserActivity route={initial} onRouteChange={vi.fn()} />
+      </PublicationContext>
+    </SavedQueryProvider>;
+    const view = render(surface());
+    try {
+      expect(await screen.findByText(/No matching reported users/)).toBeVisible();
+      expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
+      view.rerender(surface(after.selection.publicationRevisions));
+      expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+      expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("1");
+      expect(api.readReportPage).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
+      expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
+    } finally { view.unmount(); client.clear(); }
   });
   it("makes unavailable directory verification explicit and disables export until a new valid revision", async () => {
     const missing = page();
@@ -579,7 +617,7 @@ describe("selected active users without paid Copilot", () => {
     expect(within(screen.getByRole("region", { name: "Current" })).queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
   });
   it.each(["tenant", "principal", "roles", "revision"] as const)(
-    "retires pending details, revalidation and export before changing the %s owner", async boundary => {
+    "retires pending reads on a %s change, preserving exports only across data revisions", async boundary => {
       const current: typeof viewer = { ...viewer, user: { ...viewer.user!, roles: ["AgentControl.Viewer", "AgentControl.Admin"] } };
       const changed: typeof viewer = { ...current, user: { ...current.user!,
         ...(boundary === "tenant" ? { tenantId: "other" } : boundary === "principal" ? { homeAccountId: "other" }
@@ -613,10 +651,10 @@ describe("selected active users without paid Copilot", () => {
       const pageReads = vi.mocked(api.readReportPage).mock.calls.length;
       view.rerender(panel(true));
       expect(detailSignal?.aborted).toBe(true);
-      expect(exportSignal?.aborted).toBe(true);
+      expect(exportSignal?.aborted).toBe(boundary !== "revision");
       expect(pageSignal?.aborted).toBe(true);
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog") !== null).toBe(boundary === "revision");
+      expect(screen.queryByRole("button", { name: "Ada" }) !== null).toBe(boundary === "revision");
       expect(api.readReportPage).toHaveBeenCalledTimes(pageReads + 1);
       assertQuery(boundary === "revision" ? { sort: "name", order: "asc", lowResponseThreshold: 8 }
         : { sort: "responses", order: "desc", lowResponseThreshold: 5 });
@@ -627,14 +665,15 @@ describe("selected active users without paid Copilot", () => {
         previous.reject(new ApiError(409, "selection_invalidated", "Obsolete selection"));
       });
       expect(api.readReportPage).toHaveBeenCalledTimes(pageReads + 1);
-      expect(api.readReportDetail).toHaveBeenCalledOnce();
+      expect(api.readReportDetail).toHaveBeenCalledTimes(boundary === "revision" ? 2 : 1);
       expect(api.reportExportStatus).not.toHaveBeenCalled();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-      expect(screen.queryByText("Obsolete detail")).not.toBeInTheDocument();
+      if (boundary !== "revision") expect(screen.queryByText("Obsolete detail")).not.toBeInTheDocument();
       await act(async () => replacement.resolve(page({ value: [reportUser(4, { displayName: "Current" })] })));
       await screen.findByRole("button", { name: "Current" });
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+      expect(screen.queryByRole("dialog") !== null).toBe(boundary === "revision");
+      if (boundary === "revision") expect(screen.getByRole("button", { name: "Preparing export..." })).toBeDisabled();
+      else expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
     });
   it.each(["success", "invalidation"] as const)(
     "discards a cancelled search's late %s without changing the replacement's loading or results", async outcome => {

@@ -16,6 +16,34 @@ Each collected source records:
 Package, Power Platform, directory, activity, official-report, Purview, and
 Defender data remain separate source authorities.
 
+### Agent definition size limits
+
+Inventory metadata and ordinary child payloads remain limited to 256 KiB per
+JSONB value. Graph package element payloads (including their complete definition)
+have a separate 4 MiB limit, measured using PostgreSQL's JSONB text representation.
+Definitions are never truncated or silently dropped to fit a limit.
+
+Normal database batches and list responses retain their 1 MiB budget. A larger
+element uses a single-row write or copy and a paged detail read with a 5 MiB
+transfer budget, including envelope overhead. Ordinary detail pages still target
+512 KiB; an oversized element is returned alone. Internal single-record restoration
+and reconciliation components have a 16 MiB aggregate work budget; multi-record
+restoration batches retain 1 MiB. Generation and tenant storage quotas are unchanged.
+Graph package-detail JSON responses and complete package observations are bounded at
+16 MiB as well; a large definition must not pass storage checks only to fail an
+older, smaller response-reader limit.
+
+Collection retains its normal 1 MiB slice budget, except that one large element
+can be deleted within a dedicated 5 MiB slice. Oversized definitions fail the
+refresh explicitly with `data_detail_bytes` (HTTP 413), leaving the last successful
+publication intact. Diagnostics include byte counts and correlation IDs, not the
+definition contents.
+
+The PostgreSQL check constraint enforces the same per-kind limits. Deploying this
+schema change requires the existing explicit database reset and initialization
+workflow, followed by synchronization. There is no in-place migration or
+backward-compatibility path.
+
 ## Publication
 
 A refresh validates and stores a complete source result before making it

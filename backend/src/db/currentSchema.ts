@@ -3243,7 +3243,8 @@ CREATE TABLE inventory_facts (
                                          OR octet_length(value) <= 256)
   , CONSTRAINT inventory_facts_kind_check CHECK (length(kind) <= 64)
   , CONSTRAINT inventory_facts_ordinal_check CHECK (ordinal >= 0 AND ordinal <= 9999)
-  , CONSTRAINT inventory_facts_payload_check CHECK (octet_length(CAST(payload AS text)) <= 262144)
+  , CONSTRAINT inventory_facts_payload_check CHECK (octet_length(CAST(payload AS text)) <=
+      CASE WHEN kind = 'element' THEN 4194304 ELSE 262144 END)
   , CONSTRAINT inventory_facts_schema_version_check CHECK (schema_version = 1)
   , CONSTRAINT inventory_facts_text_value_check CHECK (octet_length(text_value) <= 262144)
   , CONSTRAINT inventory_facts_value_check CHECK (length(value) <= 4096)

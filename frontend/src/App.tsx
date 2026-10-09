@@ -100,6 +100,7 @@ import { CapabilityHealth, PermissionCenter } from "./components/PermissionCente
 import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
 import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
+import { WorkbenchDialog } from "./components/WorkbenchDialog";
 import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress, type BulkJobCommand } from "./components/BulkActions";
 import { AgentInventoryOverview, AgentInventoryScopes } from "./components/AgentInventoryOverview";
@@ -369,6 +370,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }>();
   const [agentDetailTab, setAgentDetailTab] = useState(initialAgentRoute.detailTab ?? "identities");
   const [requestedAgentDetailId, setRequestedAgentDetailId] = useState(initialAgentRoute.detailId);
+  const [agentOpenedFromUser, setAgentOpenedFromUser] = useState<string>();
+  const agentDetailReturnFocus = useRef<HTMLElement | null>(null);
+  const userAgentOverlayRef = useRef(false);
   const [requestedPackageRefreshJobId, setRequestedPackageRefreshJobId] = useState(initialAgentRoute.refreshJobId);
   const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
@@ -407,17 +411,38 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [inventoryReportRevision, setInventoryReportRevision] = useState(0);
   const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
   const [activeView, setActiveView] = useState<WorkbenchViewId>(() => parseWorkbenchView(window.location.pathname));
+  const userAgentOverlay = activeView === "users" && agentOpenedFromUser !== undefined;
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
   const [packageSnapshotExpiresAt, setPackageSnapshotExpiresAt] = useState<Date>();
   const [refreshingAgents, setRefreshingAgents] = useState(false);
   const normalizedQuery = parseBulkRefSearch(query) ?? query.trim();
   const deferredQuery = useDeferredValue(normalizedQuery);
+  const currentUnifiedAgentQuery = useCallback((): UnifiedAgentInventoryQuery => {
+    const operationIdPrefix = parseBulkRefSearch(deferredQuery);
+    return {
+      ...(packageType !== undefined ? { type: packageType } : {}),
+      ...(endUserAccess !== "all" ? { endUserAccess } : {}),
+      ...(reportedUsage !== "all" ? { reportedUsage } : {}),
+      ...(agentManagement !== "all" ? { management: agentManagement } : {}),
+      ...(agentRelevance !== "all" ? { relevance: agentRelevance } : {}),
+      ...(operationIdPrefix ? { operationIdPrefix } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+      ...(agentEnvironmentFilter !== undefined ? { environmentId: agentEnvironmentFilter } : {}),
+      ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+      ...(publisherFilter === undefined ? {} : { publisher: publisherFilter }),
+      ...(availableToFilter === undefined ? {} : { availableTo: availableToFilter }),
+      ...(hostFilter === undefined ? {} : { host: hostFilter }),
+      ...(platformFilter === undefined ? {} : { platform: platformFilter }),
+      ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+      inventoryScope: agentInventoryScope, sortBy: agentSortBy, sortDirection: agentSortDirection,
+    };
+  }, [agentEnvironmentFilter, agentInventoryScope, agentManagement, agentRelevance, agentSortBy, agentSortDirection,
+    availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, packageType, platformFilter, publisherFilter, reportedUsage, statusFilter]);
   const agentSearchPending = deferredQuery !== normalizedQuery;
   const agentDetailRequestId = useRef(0);
   const agentDetailAbortController = useRef<AbortController | undefined>(undefined);
   const pendingSavedDetail = useRef<{ key: string; requestId: number } | undefined>(undefined);
   const pendingAccessPreparation = useRef<{ key: string; requestId: number } | undefined>(undefined);
-  const pendingBlockPreview = useRef<number | undefined>(undefined);
+  const pendingSinglePreview = useRef<number | undefined>(undefined);
   const pendingBulkPreview = useRef<{ key: string; requestId: number } | undefined>(undefined);
   const pendingBulkSubmission = useRef<BulkConfirmation | undefined>(undefined);
   const [unifiedAgentDetailPage, setUnifiedAgentDetailPage] = useState<{
@@ -477,7 +502,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const handleSyncSetupStatusChange = useCallback((status: WorkspaceSetupStatus) => {
     setSyncSetup({ owner: principalKey, status });
   }, [principalKey]);
-  const agentDetail = savedAgentDetail?.owner === principalKey ? savedAgentDetail.detail : undefined;
+  const latestDetailPackage = selectedUnifiedAgent?.packages.find(item => item.id === savedAgentDetail?.detail.id);
+  const agentDetail = savedAgentDetail?.owner === principalKey
+    ? { ...savedAgentDetail.detail, ...latestDetailPackage } : undefined;
   useEffect(() => () => savedQueries.clear(), [principalKey, savedQueries]);
   useEffect(() => () => { bulkJobRequestAbort.current?.abort(); }, [principalKey]);
   const sessionOwnerRef = useRef<string | undefined>(principalKey);
@@ -562,7 +589,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   useEffect(() => {
     sessionOwnerRef.current = principalKey;
     activeViewRef.current = activeView;
-  }, [activeView, principalKey]);
+    userAgentOverlayRef.current = userAgentOverlay;
+  }, [activeView, principalKey, userAgentOverlay]);
 
   useEffect(() => {
     const unsubscribe = subscribeSessionRevalidationRequired(() => revalidateCurrentSession());
@@ -618,6 +646,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setAgents([]);
       setUnifiedAgentPage(undefined);
       setSelectedUnifiedAgent(undefined);
+      setAgentOpenedFromUser(undefined);
       setUnifiedAgentDetailPage(undefined);
       setAgentPackageSelection(undefined);
       setPackageAccessRevisions(new Map());
@@ -664,6 +693,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         && !busyAgentId && !preparingBulkAction && !bulkConfirmation && !singleAccessAgentDetail && !bulkAccessAgentIds;
       if (!retainDetail) {
         cancelAgentDetailRequest();
+        setAgentOpenedFromUser(undefined);
         setAgentDetail(undefined);
         setSelectedUnifiedAgent(undefined);
         setUnifiedAgentDetailPage(undefined);
@@ -774,7 +804,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     return () => {
       active = false;
     };
-  }, [agentSearchPending, pendingStoredAgentSelectionCount, principalKey, user]);
+  }, [agentSearchPending, currentUnifiedAgentQuery, pendingStoredAgentSelectionCount, principalKey, user]);
 
   useEffect(() => {
     if (!user || activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
@@ -843,7 +873,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           : `The selection remains active, but could not be preserved in browser session storage. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, replaceRoute, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user, groupPackageSelection, groupTargetCount, principalKey, serverPackageSelection, unifiedAgentPage]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, currentUnifiedAgentQuery, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, replaceRoute, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user, groupPackageSelection, groupTargetCount, principalKey, serverPackageSelection, unifiedAgentPage]);
 
   useEffect(() => {
     if (!user || activeView !== "sync") return;
@@ -872,7 +902,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   });
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
+    if (!user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && !userAgentOverlay) || !requestedAgentDetailId
       || !unifiedAgentPage?.selection?.id
       || busyAgentId || busyBulkAction
       || (selectedUnifiedAgent?.id === requestedAgentDetailId && unifiedAgentDetailPage?.listPage === unifiedAgentPage)
@@ -984,7 +1014,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       controller.abort();
       setLoadingUnifiedAgentDetail(false);
     };
-  }, [activeView, agentDetail?.id, agentEnvironmentFilter, agentPackageSelection, agentReloadRevision, busyAgentId, busyBulkAction, loadingAgentDetailId, principalKey, requestedAgentDetailId, savedQueries, selectedUnifiedAgent, unifiedAgentDetailPage, unifiedAgentPage, user]);
+  }, [activeView, agentDetail?.id, agentEnvironmentFilter, agentPackageSelection, agentReloadRevision, busyAgentId, busyBulkAction, loadingAgentDetailId, principalKey, requestedAgentDetailId, savedQueries, selectedUnifiedAgent, unifiedAgentDetailPage, unifiedAgentPage, user, userAgentOverlay]);
 
   const waitingForLinkedPackageStatus = Boolean(requestedPackageRefreshJobId && refreshingAgents);
   const visibleLinkedPackageRefreshJob = !requestedPackageRefreshJobId
@@ -1218,7 +1248,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       });
       return;
     }
-    if (activeView !== "agents" && activeView !== "sync" && activeView !== "audit"
+    if (activeView !== "agents" && activeView !== "sync" && activeView !== "audit" && !userAgentOverlay
       || waitingForInitialInventory || pendingStoredAgentSelectionCount !== undefined || agentSearchPending) {
       agentListAbortController.current?.abort();
       return;
@@ -1226,16 +1256,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const forceCurrentSnapshot = forceCurrentAgentReload.current;
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
-  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, waitingForInitialInventory]);
+  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, userAgentOverlay, waitingForInitialInventory]);
 
   useEffect(() => {
     if (!inventoryUnavailable || loadingAgents || !hasRole(user, "AgentControl.Viewer")
-      || !["agents", "sync", "audit"].includes(activeView) || waitingForInitialInventory) return;
+      || !["agents", "sync", "audit"].includes(activeView) && !userAgentOverlay || waitingForInitialInventory) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible" && navigator.onLine) loadSavedAgents(true);
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [activeView, inventoryUnavailable, loadingAgents, user, waitingForInitialInventory]);
+  }, [activeView, inventoryUnavailable, loadingAgents, user, userAgentOverlay, waitingForInitialInventory]);
 
 
   useEffect(() => {
@@ -1337,7 +1367,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ? [[record.environmentId.toLowerCase(), record.environment.displayName]] : []));
 
   const canReadSensitiveUsage = hasRole(user, "AgentControl.Viewer");
-  const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
   const authorizedViews = allowedViews(user);
   const visibleViews: WorkbenchViewId[] = workbenchMetadata
     ? workbenchMetadata.views.flatMap(view => {
@@ -1381,6 +1410,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       && !serverPackageSelection && !groupPackageSelection && !inventoryExport && !requestedAgentDetailId
       && unifiedAgentPage && !selectedReadRemaining(unifiedAgentPage.selection)) inventoryNavigation.current = { key: "" };
     cancelAgentDetailRequest();
+    setAgentOpenedFromUser(undefined);
     savedViewSearches.current.set(activeView, window.location.search);
     setAgentDetail(undefined);
     setSelectedUnifiedAgent(undefined);
@@ -1440,6 +1470,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleOfficialUsageChanged() {
+    automaticRefresh.checkNow();
     requestCurrentAgentReload();
     setOfficialUsageDashboardRevision(revision => revision + 1);
     setCopilotUsersDataRevision(revision => revision + 1);
@@ -1475,13 +1506,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     });
     if (!publicationOnly && changed.has("users")) setCopilotUsersDataRevision(revision => revision + 1);
     if (changed.has("graph_packages") || changed.has("power_platform")) {
-      if (inventoryNavigation.current.selectionId && (agentPageIndex > 0 || selectedAgentIds.size > 0
-        || groupPackageSelection?.owner === principalKey || serverPackageSelection?.owner === principalKey
-        || selectedPowerPlatformTargets.size > 0 || pendingPowerPlatformIds.size > 0
-        || inventoryExport || exportChoiceOpen || bulkConfirmation || singleAccessAgentDetail || bulkAccessAgentIds
-        || selectedUnifiedAgent || requestedAgentDetailId || requestedInventorySnapshotId)) {
-        if (selectedReadRemaining(unifiedAgentPage?.selection)) scheduleAgentReload();
-      } else requestCurrentAgentReload();
+      requestCurrentAgentReload();
     }
     if (changed.has("usage_reports")) {
       handleOfficialUsageChanged();
@@ -1527,6 +1552,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const agentReadLeaseActive = useSelectedReadLease(visibleUnifiedAgentPage?.selection);
   const agentLeaseEnded = Boolean(visibleUnifiedAgentPage && (!agentReadLeaseActive
     || expiredAgentSelection === visibleUnifiedAgentPage.selection.id));
+  const renewedInventorySelection = useRef<string | undefined>(undefined);
+  const liveInventorySelection = useRef<string | undefined>(undefined);
+  const renewInventory = useEffectEvent(() => {
+    if (agentReadLeaseActive && !agentLeaseEnded && visibleUnifiedAgentPage) liveInventorySelection.current = visibleUnifiedAgentPage.selection.id;
+    if (!agentLeaseEnded || loadingAgents || unifiedAgentReadError || !visibleUnifiedAgentPage
+      || activeView !== "agents" && !userAgentOverlay || !isCurrentAgentScope() || document.visibilityState !== "visible" || !navigator.onLine
+      || liveInventorySelection.current !== visibleUnifiedAgentPage.selection.id
+      || renewedInventorySelection.current === visibleUnifiedAgentPage.selection.id) return;
+    renewedInventorySelection.current = visibleUnifiedAgentPage.selection.id;
+    requestCurrentAgentReload();
+  });
+  useEffect(() => { renewInventory(); });
   const matchingPackageSelection = serverPackageSelection?.owner === principalKey
     && serverPackageSelection.id === visibleUnifiedAgentPage?.selection?.id ? serverPackageSelection : undefined;
   const matchingPackageCount = matchingPackageSelection ? visibleUnifiedAgentPage?.counts?.packageTargets ?? 0 : 0;
@@ -1656,6 +1693,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function clearAgentState() {
+    setAgentOpenedFromUser(undefined);
     setInventoryUnavailable(undefined);
     setInventoryExport(undefined);
     setServerPackageSelection(undefined);
@@ -1813,27 +1851,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       if (isCurrent()) setLoadingSession(false);
       if (sessionAbortController.current === controller) sessionAbortController.current = undefined;
     }
-  }
-
-  function currentUnifiedAgentQuery(): UnifiedAgentInventoryQuery {
-    return {
-      ...(packageType !== undefined ? { type: packageType } : {}),
-      ...(endUserAccess !== "all" ? { endUserAccess } : {}),
-      ...(reportedUsage !== "all" ? { reportedUsage } : {}),
-      ...(agentManagement !== "all" ? { management: agentManagement } : {}),
-      ...(agentRelevance !== "all" ? { relevance: agentRelevance } : {}),
-      ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-      ...(agentEnvironmentFilter !== undefined ? { environmentId: agentEnvironmentFilter } : {}),
-      ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-      ...(publisherFilter === undefined ? {} : { publisher: publisherFilter }),
-      ...(availableToFilter === undefined ? {} : { availableTo: availableToFilter }),
-      ...(hostFilter === undefined ? {} : { host: hostFilter }),
-      ...(effectivePlatformFilter === undefined ? {} : { platform: effectivePlatformFilter }),
-      ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-      inventoryScope: agentInventoryScope,
-      sortBy: agentSortBy,
-      sortDirection: agentSortDirection,
-    };
   }
 
   async function loadAgents(forceCurrentSnapshot = false) {
@@ -2213,10 +2230,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     targetBlockedState: boolean,
   ) {
     if (!isCurrentAgentScope() || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)
-      || bulkJobStatusUnrecognized || pendingBlockPreview.current === agentDetailRequestId.current) return;
+      || bulkJobStatusUnrecognized || pendingSinglePreview.current === agentDetailRequestId.current) return;
     const returnFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     const requestId = cancelAgentDetailRequest();
-    pendingBlockPreview.current = requestId;
+    pendingSinglePreview.current = requestId;
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
     const owner = principalKey;
@@ -2239,7 +2256,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setPackageControlError({ packageId: agent.id, message });
       }
     } finally {
-      if (pendingBlockPreview.current === requestId) pendingBlockPreview.current = undefined;
+      if (pendingSinglePreview.current === requestId) pendingSinglePreview.current = undefined;
       if (ownsAgentFlowRequest(requestId, owner)) setBusyAgentId(undefined);
     }
   }
@@ -2285,11 +2302,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     agentDetailAbortController.current?.abort();
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
-    const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update }, { signal: controller.signal });
-    if (!ownsAgentFlowRequest(requestId, owner) || forceCurrentAgentReload.current
-      || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return false;
-    setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
-    return true;
+    if (mutationScope === "single") pendingSinglePreview.current = requestId;
+    try {
+      const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update }, { signal: controller.signal });
+      if (!ownsAgentFlowRequest(requestId, owner) || forceCurrentAgentReload.current
+        || !selectedReadRemaining(visibleUnifiedAgentPage?.selection)) return false;
+      setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
+      return true;
+    } finally {
+      if (pendingSinglePreview.current === requestId) pendingSinglePreview.current = undefined;
+    }
   }
 
   function requestExportCsv() {
@@ -2491,9 +2513,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     clearTrackedJob();
     setBusyBulkAction(label);
+    const currentAgentName = preview.summary.targetCount === 1 ? preview.summary.targets[0]?.displayName : undefined;
     setBulkProgress(accessUpdate ? {
       action: label as "update-availability" | "update-installation",
       accessUpdate,
+      currentAgentName,
       total: preview.summary.targetCount,
       completed: 0,
       succeeded: 0,
@@ -2502,6 +2526,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     } : {
       action: label as "block" | "unblock",
       targetBlockedState: label === "block",
+      currentAgentName,
       total: preview.summary.targetCount,
       completed: 0,
       succeeded: 0,
@@ -2787,9 +2812,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           .map((result) => result.id),
       ) : current,
     );
-    if (result.total > result.results.length) {
-      setSelectionRouteNotice({ tone: "success", text: "Task results are paged. Review the result pages before selecting new work." });
-    }
   }
 
   async function handleBulkJobCommand(operation: BulkJobCommand) {
@@ -2881,6 +2903,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   function clearActiveBulkJobId() {
     const storageError = user ? clearStoredActiveBulkJobId(user) : undefined;
     if (storageError) setBulkJobStorageError(storageError);
+  }
+
+  function dismissBulkJobSummary() {
+    if (!isCurrentAgentScope() || busyBulkAction || bulkJobCommand || bulkJobStatusUnrecognized
+      || trackedJob && (isJobPolling(trackedJob.status) || trackedJob.canResume
+        || trackedJob.status === "waiting_authorization" || trackedJob.reconciliationRequired > 0 && !trackedJob.cancelRequested)) return;
+    clearTrackedJob();
+    clearActiveBulkJobId();
+    setBulkProgress(undefined);
+    setBulkResult(undefined);
+    setRequestedPackageControlJobId(undefined);
+    setLinkedJobError(undefined);
   }
 
   function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
@@ -3080,7 +3114,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   function ownsAgentFlowRequest(requestId: number, owner: string) {
     return agentDetailRequestId.current === requestId
       && ownsAgentScope(owner)
-      && activeViewRef.current === "agents";
+      && (activeViewRef.current === "agents" || activeViewRef.current === "users" && userAgentOverlayRef.current);
+  }
+
+  function closeUnifiedAgentDetails() {
+    cancelAgentDetailRequest();
+    setAgentDetail(undefined);
+    setSelectedUnifiedAgent(undefined);
+    setAgentPackageSelection(undefined);
+    setRequestedAgentDetailId(undefined);
+    setAgentDetailError(undefined);
+    setAgentOpenedFromUser(undefined);
+    if (inlinePackageConfirmation) setBulkConfirmation(undefined);
   }
 
   function isCurrentAgentScope() {
@@ -3116,6 +3161,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function requestCurrentAgentReload() {
     if (!isCurrentAgentScope()) return;
+    setServerPackageSelection(undefined);
+    setGroupPackageSelection(undefined);
+    setGroupTargetCount(undefined);
+    if (!busyBulkAction && (pendingSinglePreview.current || pendingBulkPreview.current
+      || bulkConfirmation || bulkAccessAgentIds || singleAccessAgentDetail)) {
+      cancelAgentDetailRequest();
+      setPreparingBulkAction(undefined);
+      setBulkConfirmation(undefined);
+      setBulkAccessAgentIds(undefined);
+      setBulkAccessSelection(undefined);
+      setSingleAccessAgentDetail(undefined);
+    }
     forceCurrentAgentReload.current = true;
     scheduleAgentReload();
   }
@@ -3124,11 +3181,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!isCurrentAgentScope()) return;
     // Replacement may change membership. Retire targets and unsent previews first,
     // but keep the route, query and detail identity for the replacement read.
-    if (pendingBulkPreview.current || bulkConfirmation || bulkAccessAgentIds || singleAccessAgentDetail) {
-      cancelAgentDetailRequest();
-      setPreparingBulkAction(undefined);
-      setBusyAgentId(undefined);
-    }
     setSelectedAgentIds(new Set());
     setSelectedPowerPlatformTargets(new Map());
     setSelectedPowerPlatformSnapshot(null);
@@ -3241,7 +3293,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   return (
     <CapabilityContext key={principalKey} value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
-    <PublicationContext value={{ admit: automaticRefresh.admitPublication, revisions: automaticRefresh.publicationRevisions }}>
+    <PublicationContext value={{ admit: automaticRefresh.admitPublication, revisions: automaticRefresh.publicationRevisions,
+      usersRefresh: {
+        checking: automaticRefresh.enabled && !automaticRefresh.paused && automaticRefresh.online && automaticRefresh.visible
+          && automaticRefresh.sourceStates === undefined && automaticRefresh.phase === "checking",
+        status: automaticRefresh.sourceStates?.users,
+      } }}>
     <WorkbenchActionProvider value={workbenchMetadata?.actions}>
     <main className="app-shell">
       <BackgroundRefreshIndicator active={automaticRefresh.checking || loadingAgents} />
@@ -3495,11 +3552,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               : "A saved agent inventory revision is unavailable. Reload the saved inventory before exporting.")}</span>
             {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={replaceCurrentAgentSelection}>Reload saved agent inventory</button> : null}
           </div> : null}
-          {agentLeaseEnded ? <div className="copilot-users-notice" role="status">
-            Showing previously loaded saved inventory, evaluated {formatRefreshTime(new Date(visibleUnifiedAgentPage!.selection.evaluatedAt))}.
-            {" "}Load a new selection before paging, exporting or acting. Sync progress does not remove this saved data.
-            {" "}<button type="button" className="secondary" disabled={loadingAgents} onClick={replaceCurrentAgentSelection}>Reload saved agent inventory</button>
-          </div> : null}
+          {agentLeaseEnded && !unifiedAgentReadError ? <p className="sr-only" role="status">Refreshing saved inventory...</p> : null}
           {matchingPackageSelection ? <p className="selection-summary">Server selection · no target list downloaded · maximum 5,000 targets per job</p> : null}
           {groupTargetKey && groupCount?.error ? <div role="alert">
             <p>{groupCount.error}</p>
@@ -3511,10 +3564,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             }}>Retry selected package count</button>
           </div>
             : groupCountPending ? <p role="status">Counting selected package targets...</p> : null}
-          {canOperate && !groupCountPending && (matchingPackageCount > 0 || selectedPackageCount > 0 || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobCommand || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
-              owner={principalKey}
+          {canOperate && ((!groupCountPending && (matchingPackageCount > 0 || selectedPackageCount > 0)) || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobCommand || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
             disabled={
-              agentLeaseEnded || Boolean(matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) || Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
+              groupCountPending || agentLeaseEnded || Boolean(matchingPackageSelection && (loadingAgents || agentSearchPending || unifiedAgentReadError)) || Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
             }
             busyAction={busyBulkAction}
             preparingAction={preparingBulkAction}
@@ -3525,11 +3577,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             jobCommand={bulkJobCommand}
             jobError={bulkJobError ?? (requestedPackageControlJobId ? linkedJobError : undefined)}
             statusUnrecognized={bulkJobStatusUnrecognized}
-            selectedCount={matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
+            selectedCount={groupCountPending ? 0 : matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
             onBlockAll={() => void requestBulkAction(true)}
             onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => void requestBulkAction(false)}
             onJobCommand={operation => void handleBulkJobCommand(operation)}
+            onDismiss={dismissBulkJobSummary}
           /> : null}
           {selectionRouteNotice ? (
             <div className={selectionRouteNotice.tone === "error" ? "error-banner" : "report-status"} role="status">
@@ -3664,7 +3717,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
           onOpenAgent={id => {
             if (!ownsAgentScope(principalKey)) return;
-            navigateToView("agents");
+            agentDetailReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+            cancelAgentDetailRequest();
+            setAgentOpenedFromUser(id);
+            setAgentDetail(undefined);
+            setAgentDetailError(undefined);
+            setSelectedUnifiedAgent(undefined);
+            setAgentPackageSelection(undefined);
             setUnifiedAgentPage(undefined);
             setUnifiedAgentDetailPage(undefined);
             requestCurrentAgentReload();
@@ -3676,13 +3735,26 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <AuditLogView key={principalKey} agents={agents} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
-      {loadingAgentDetailId || loadingUnifiedAgentDetail ? (
+      {userAgentOverlay && !selectedUnifiedAgent ? <WorkbenchDialog open title="Agent details"
+        fallbackFocusRef={agentDetailReturnFocus} onClose={closeUnifiedAgentDetails}>
+        {agentDetailError || unifiedAgentReadError ? <div role="alert">
+          <p>{agentDetailError ?? unifiedAgentReadError}</p>
+          <button type="button" onClick={() => {
+            setAgentDetailError(undefined);
+            setRequestedAgentDetailId(agentOpenedFromUser);
+            replaceCurrentAgentSelection();
+          }}>Retry agent details</button>
+        </div> : inventoryUnavailable ? <p role="status">{inventoryUnavailable.message}</p>
+          : <p role="status">Loading agent details...</p>}
+      </WorkbenchDialog> : null}
+
+      {!userAgentOverlay && (loadingAgentDetailId || loadingUnifiedAgentDetail) ? (
         <div className="detail-loading" role="status" aria-live="polite">
           Loading agent details...
         </div>
       ) : null}
 
-      {agentDetailError && !agentDetail && !selectedUnifiedAgent ? (
+      {!userAgentOverlay && agentDetailError && !agentDetail && !selectedUnifiedAgent ? (
         <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
@@ -3690,6 +3762,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <UnifiedAgentDetailModal
           selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}
+          returnFocusTo={userAgentOverlay ? agentDetailReturnFocus : undefined}
           record={selectedUnifiedAgent}
           onOpenPerson={personId => {
             if (!ownsAgentScope(principalKey)) return;
@@ -3717,14 +3790,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             setAgentDetailTab(tab);
           }}
           roles={user?.roles ?? []}
-          onClose={() => {
-            cancelAgentDetailRequest();
-            setAgentDetail(undefined);
-            setSelectedUnifiedAgent(undefined);
-            setAgentPackageSelection(undefined);
-            setRequestedAgentDetailId(undefined);
-            if (inlinePackageConfirmation) setBulkConfirmation(undefined);
-          }}
+          onClose={closeUnifiedAgentDetails}
           onInspectPackage={item => {
             if (!isCurrentAgentScope()) return;
             setAgentPackageSelection({ owner: principalKey, recordId: selectedUnifiedAgent.id, packageId: item.id });
@@ -3738,7 +3804,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           packageDetailLoading={Boolean(loadingAgentDetailId)}
           packageDetailError={agentDetailError}
           packageActionsBusy={Boolean(busyAgentId || busyBulkAction || refreshingAgents)}
-          packageActionsBlockedReason={agentLeaseEnded ? "Load a new saved selection before acting." : bulkJobStatusUnrecognized ? jobStatusMessage(undefined) : undefined}
+          packageActionsBlockedReason={agentLeaseEnded ? "Refreshing saved inventory..." : bulkJobStatusUnrecognized ? jobStatusMessage(undefined) : undefined}
           onUpdatePackageAccess={handleInlineAccessUpdate}
           packageAccessRevisions={packageAccessRevisions}
           packageControlError={packageControlError}

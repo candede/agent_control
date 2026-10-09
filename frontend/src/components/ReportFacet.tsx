@@ -79,6 +79,13 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
   useEffect(() => {
     if (invalidated) onSelectionInvalidated?.();
   }, [invalidated, onSelectionInvalidated]);
+  const expiredSelection = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!selectionId || invalidated || !leaseEnded && !isExpiredSelection(read.error)
+      || expiredSelection.current === selectionId || document.visibilityState !== "visible" || !navigator.onLine) return;
+    expiredSelection.current = selectionId;
+    onRestartSelection();
+  });
   function invalidatedAtAction() {
     if (current.selection && !selectedReadRemaining(current.selection) || isExpiredSelection(read.error)) return true;
     const failure = client.getQueryState(queryKey)?.error;
@@ -108,7 +115,7 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
     if (retryCursor !== cursor) setPage({ key });
     else void read.refetch({ cancelRefetch: false });
   }
-  const status = leaseEnded || isExpiredSelection(read.error) ? <p role="status">Showing saved options. <button type="button" onClick={onRestartSelection}>Restart selection</button> before loading more.</p>
+  const status = leaseEnded || isExpiredSelection(read.error) ? <p className="sr-only" role="status">Refreshing saved options...</p>
     : selectionId && !invalidated && read.isFetching ? <p role="status">Loading {label.toLowerCase()} options...</p>
     : (read.error || invalidated) && !(invalidated && onSelectionInvalidated) ? <p role="alert">{invalidated ? "This selection changed or expired." : read.error?.message}{" "}
       <button ref={retryRef} type="button" onClick={invalidated ? onRestartSelection : retry}>

@@ -336,7 +336,7 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
     if (paging) expect(signal?.aborted).toBe(false);
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "true");
     expect(screen.queryByRole("option", { name: /^Contoso/ }) !== null).toBe(!paging);
-    expect(screen.getByRole("status")).toHaveTextContent("Showing saved options");
+    expect(screen.getByRole("status")).toHaveTextContent("Refreshing saved options");
     await act(async () => { pending.resolve({ ...initial, value: [{ value: "Late", count: 10 }] }); await vi.advanceTimersByTimeAsync(1); });
     expect(screen.queryByRole("option", { name: /^Late/ }) !== null).toBe(paging);
     expect(invalidated).not.toHaveBeenCalled();
@@ -359,7 +359,7 @@ describe.each([false, true])("report facet boundaries (compact=%s)", compact => 
     expect(api.readReportFacet).toHaveBeenCalledOnce();
     fireEvent.focus(window);
     expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByRole("button", { name: "Restart selection" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
   });
 
   it("keeps selection rejection terminal across option search edits and cache invalidation", async () => {

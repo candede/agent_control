@@ -1,4 +1,4 @@
-import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { RefreshCw, X } from "lucide-react";
 import {
   type AppRole,
@@ -39,6 +39,7 @@ type Props = {
   roles: AppRole[];
   onTabChange: (tab: string) => void;
   onClose: () => void;
+  returnFocusTo?: RefObject<HTMLElement | null>;
   onInspectPackage: (item: Pick<CopilotPackage, "id">) => void;
   selectedPackageId?: string;
   packageDetail?: CopilotPackageDetail;
@@ -74,6 +75,7 @@ export function UnifiedAgentDetailModal({
   roles,
   onTabChange,
   onClose,
+  returnFocusTo,
   onInspectPackage,
   selectedPackageId,
   packageDetail,
@@ -194,6 +196,10 @@ export function UnifiedAgentDetailModal({
     if (panel.current) panel.current.scrollTop = 0;
   }, [selectedTab, record.id, hasPackageConfirmation]);
 
+  const restoreFocus = useEffectEvent(() => {
+    if (returnFocusTo?.current?.isConnected) returnFocusTo.current.focus();
+  });
+
   useEffect(() => {
     const element = dialog.current;
     dialogMounted.current = true;
@@ -203,6 +209,7 @@ export function UnifiedAgentDetailModal({
     return () => {
       dialogMounted.current = false;
       if (element?.open && typeof element.close === "function") element.close();
+      restoreFocus();
     };
   }, []);
 

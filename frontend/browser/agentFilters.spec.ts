@@ -14,6 +14,125 @@ const environments = [
   ];
 const inventoryWithEnvironments = { ...unifiedAgents };
 
+test("clear search remains visible when unfocused and preserves filters, URL state and keyboard focus", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.route("**/api/agent-inventory?*", route => {
+    const query = inventoryFixtureQuery(route);
+    const candidates = query.get("reportedUsage") === "used" ? unifiedAgents.value.slice(0, 2) : unifiedAgents.value;
+    const value = candidates.filter(record => !query.get("search") || record.displayName.includes(query.get("search")!));
+    return fulfillInventoryPage(route, { ...unifiedAgents, value, counts: { ...unifiedAgents.counts, filtered: value.length } });
+  });
+  await page.goto("/agents?usage=used&q=Service");
+  const toolbar = page.locator(".agent-grid-toolbar");
+  const search = toolbar.getByRole("searchbox", { name: "Search", exact: true });
+  const clear = toolbar.getByRole("button", { name: "Clear search", exact: true });
+  const count = toolbar.getByRole("status", { name: "Matching agents", exact: true });
+  const usage = toolbar.getByRole("button", { name: "Remove reported usage filter" });
+  await expect(count).toHaveText("1 matching agent");
+  await page.getByRole("heading", { name: /^Agents/ }).click();
+  await expect(search).not.toBeFocused();
+  await expect(clear).toBeVisible();
+  await expect(clear).toHaveAttribute("title", "Clear search");
+  const size = info.project.name === "mobile" ? 44 : 36;
+  const target = (await clear.boundingBox())!;
+  expect(target.width).toBeGreaterThanOrEqual(size);
+  expect(target.height).toBeGreaterThanOrEqual(size);
+  const field = (await toolbar.locator(".agent-search-field").boundingBox())!;
+  expect(Math.abs(field.x + field.width - target.x - target.width)).toBeLessThanOrEqual(2);
+  const height = (await toolbar.boundingBox())!.height;
+  await page.screenshot({ path: info.outputPath("clear-search.png"), fullPage: true });
+  expect((await new AxeBuilder({ page }).include(".agent-grid-toolbar").analyze()).violations).toEqual([]);
+  await clear.click({ position: { x: 3, y: 3 } });
+  await expect(search).toHaveValue("");
+  await expect(search).toBeFocused();
+  await expect(clear).toHaveCount(0);
+  await expect(usage).toBeVisible();
+  await expect(count).toHaveText("2 matching agents");
+  await expect(page.locator(".unified-agent-table tbody tr")).toHaveCount(2);
+  await expect(page).toHaveURL(/usage=used/);
+  expect(new URL(page.url()).searchParams.has("q")).toBe(false);
+  expect((await toolbar.boundingBox())!.height).toBeCloseTo(height, 1);
+  await search.fill("Finance");
+  await expect(count).toHaveText("1 matching agent");
+  await search.fill("Finance".repeat(50));
+  await expect(count).toHaveText("0 matching agents");
+  const longTextTarget = (await clear.boundingBox())!;
+  const longTextField = (await toolbar.locator(".agent-search-field").boundingBox())!;
+  expect(longTextTarget.width).toBeGreaterThanOrEqual(size);
+  expect(Math.abs(longTextField.x + longTextField.width - longTextTarget.x - longTextTarget.width)).toBeLessThanOrEqual(2);
+  await page.keyboard.press("Tab");
+  await expect(clear).toBeFocused();
+  expect(await clear.evaluate(button => getComputedStyle(button).outlineStyle)).toBe("solid");
+  await page.keyboard.press("Enter");
+  await expect(search).toBeFocused();
+  await expect(count).toHaveText("2 matching agents");
+  await expect(usage).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect(unexpected).toEqual([]);
+});
+
+test("clearing a pending search ignores its late result and keeps the reported usage filter", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  let finishRead!: () => void;
+  let markStarted!: () => void;
+  let markFinished!: () => void;
+  const pendingRead = new Promise<void>(resolve => { finishRead = resolve; });
+  const readStarted = new Promise<void>(resolve => { markStarted = resolve; });
+  const readFinished = new Promise<void>(resolve => { markFinished = resolve; });
+  await page.route("**/api/agent-inventory?*", async route => {
+    const query = inventoryFixtureQuery(route);
+    if (query.get("search") === "pending") {
+      markStarted();
+      await pendingRead;
+      await fulfillInventoryPage(route, { ...unifiedAgents, value: [], counts: { ...unifiedAgents.counts, filtered: 0 } });
+      markFinished();
+      return;
+    }
+    expect(query.get("reportedUsage")).toBe("used");
+    return fulfillInventoryPage(route, unifiedAgents);
+  });
+  await page.goto("/agents?usage=used");
+  const toolbar = page.locator(".agent-grid-toolbar");
+  const search = toolbar.getByRole("searchbox", { name: "Search", exact: true });
+  const count = toolbar.getByRole("status", { name: "Matching agents", exact: true });
+  await expect(count).toHaveText("3 matching agents");
+  try {
+    await search.fill("pending");
+    await readStarted;
+    await expect(count).toHaveText("Updating... matching agents");
+    await toolbar.getByRole("button", { name: "Clear search", exact: true }).click();
+    await expect(search).toHaveValue("");
+    await expect(count).toHaveText("3 matching agents");
+  } finally {
+    finishRead();
+  }
+  await readFinished;
+  await expect(count).toHaveText("3 matching agents");
+  await expect(toolbar.getByRole("button", { name: "Remove reported usage filter" })).toBeVisible();
+  expect(new URL(page.url()).searchParams.has("q")).toBe(false);
+  expect(unexpected).toEqual([]);
+});
+
+test.describe("touch search clearing", () => {
+  test.use({ hasTouch: true });
+
+  test("provides a 44px clear target on touch devices at every viewport", async ({ page }) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.goto("/agents?q=Service");
+    const clear = page.getByRole("button", { name: "Clear search", exact: true });
+    await expect(clear).toBeVisible();
+    expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
+    const target = (await clear.boundingBox())!;
+    expect(target.width).toBeGreaterThanOrEqual(44);
+    expect(target.height).toBeGreaterThanOrEqual(44);
+    await clear.tap();
+    await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
+    await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toBeFocused();
+    await expect(clear).toHaveCount(0);
+    expect(unexpected).toEqual([]);
+  });
+});
+
 test("filtered results keep Clear filters inline and show the matching total without a duplicate report row", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.route("**/api/agent-inventory?*", route => {

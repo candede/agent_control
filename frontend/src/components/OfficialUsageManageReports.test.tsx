@@ -56,7 +56,7 @@ describe("record-backed report management", () => {
     expect(screen.getByRole("table")).toBeVisible();
     expect(screen.getByRole("button", { name: "Delete report set" })).toBeDisabled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
   it("shows one bounded history list and exact inspection without querying any whole-report administration endpoint", async () => {
     const storage = vi.spyOn(Storage.prototype, "getItem");

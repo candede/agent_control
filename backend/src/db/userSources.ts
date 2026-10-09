@@ -97,7 +97,7 @@ export class UserSourcesRepository {
   }
 
   async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity) {
-    if (root.kind !== "user_sources") throw new Error("user_source_root_kind");
+    if (root.kind !== "user_sources") throw new AppError(400, "invalid_cursor", "Selection endpoint mismatch.");
     const row = (await client.query(`SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
       AND source='user_sources' AND selector='complete' AND scope_kind='principal' AND epoch=$4
       AND $5::timestamptz>clock_timestamp()`, [root.scopeId, identity.tenantId, identity.principalId, root.revision, root.expiresAt])).rows[0];

@@ -1,6 +1,7 @@
 import type pg from "pg";
 import { observeDataWork } from "../services/dataMetrics.js";
 import { inventoryReferenceColumns } from "./inventoryCollectionRewindSchema.js";
+import { dataLimits } from "./dataBounds.js";
 
 export const lifecycleLimits = { rows: 1000, bytes: 1_048_576, milliseconds: 5000 } as const;
 
@@ -33,8 +34,10 @@ export class LifecycleSlice {
     return true;
   }
   async change(name: string, table: string, where: string, values?: string, parameters: unknown[] = [],
-    orderBy: "ctid" | "ordinal" | "worker_id" | "revision" | "sequence" = "ctid", scopeCharge?: "reservation" | "collection") {
+    orderBy: "ctid" | "ordinal" | "worker_id" | "revision" | "sequence" = "ctid", scopeCharge?: "reservation" | "collection",
+    allowAgentDefinition = false) {
     if (scopeCharge && (table !== "data_generations" || !values)) throw new Error("lifecycle_scope_charge");
+    if (allowAgentDefinition && (table !== "inventory_facts" || values)) throw new Error("lifecycle_detail_table");
     const step = this.step++;
     if (step < this.resume || this.stopped) return 0;
     const time = lifecycleLimits.milliseconds - Math.ceil(performance.now() - this.startedAt);
@@ -59,6 +62,7 @@ export class LifecycleSlice {
     ),` : "";
     const candidate = `SELECT target.ctid,octet_length(row_to_json(target)::text)${scopeCharge ? `+CASE WHEN ${charge} THEN scopes.bytes ELSE 0 END` : ""} AS data_bytes,
         ${scopeCharge ? `CASE WHEN ${charge} THEN 2 ELSE 1 END` : "1"} AS base_row_cost
+        ${allowAgentDefinition ? ",target.kind='element' AS agent_definition" : ""}
         ${cursorWrites ? `,reference_scope.scope_id AS cursor_scope,
           CASE WHEN reference_scope.scope_id IS NULL THEN 0 ELSE octet_length(jsonb_build_object(
             'scope_id',reference_scope.scope_id,'tenant_id',reference_scope.tenant_id,
@@ -70,7 +74,7 @@ export class LifecycleSlice {
             WHERE k.generation_id=target.id AND k.scope_id=target.scope_id ORDER BY k.identity COLLATE "C" LIMIT 1) reference_scope ON true` : ""}
       WHERE ${where} ORDER BY target.${orderBy} LIMIT $1 ${values ? "FOR UPDATE OF target SKIP LOCKED" : ""}`;
     const candidates = cursorWrites ? `raw_candidates AS MATERIALIZED (${candidate}), candidates AS MATERIALIZED (
-      SELECT ctid,data_bytes,base_row_cost,data_bytes+CASE WHEN cursor_scope IS NOT NULL
+      SELECT ctid,data_bytes,base_row_cost,${allowAgentDefinition ? "agent_definition," : ""}data_bytes+CASE WHEN cursor_scope IS NOT NULL
         AND row_number() OVER(PARTITION BY cursor_scope ORDER BY ctid)=1
         THEN max(cursor_bytes) OVER(PARTITION BY cursor_scope) ELSE 0 END AS bytes,
         base_row_cost+CASE WHEN cursor_scope IS NOT NULL
@@ -79,14 +83,18 @@ export class LifecycleSlice {
     )` : `candidates AS MATERIALIZED (
       SELECT target.ctid,octet_length(row_to_json(target)::text)${scopeCharge ? `+CASE WHEN ${charge} THEN scopes.bytes ELSE 0 END` : ""} AS bytes,
         ${scopeCharge ? `CASE WHEN ${charge} THEN 2 ELSE 1 END` : "1"} AS row_cost
+        ${allowAgentDefinition ? ",target.kind='element' AS agent_definition" : ""}
       FROM ${table} target ${scopeCharge ? "JOIN selected ON selected.ctid=target.ctid JOIN scopes ON scopes.id=target.scope_id" : ""}
       WHERE ${where} ORDER BY target.${orderBy} LIMIT $1 ${values ? "FOR UPDATE OF target SKIP LOCKED" : ""}
     )`;
     const result = (await this.client.query(`WITH ${scopes} ${candidates}, bounded AS (
-      SELECT *,sum(bytes) OVER(ORDER BY ctid) AS total,sum(row_cost) OVER(ORDER BY ctid) AS total_rows FROM candidates
+      SELECT *,sum(bytes) OVER(ORDER BY ctid) AS total,sum(row_cost) OVER(ORDER BY ctid) AS total_rows,
+        row_number() OVER(ORDER BY ctid) AS position FROM candidates
     ), changed AS (
       ${values ? `UPDATE ${table} target SET ${values} FROM bounded` : `DELETE FROM ${table} target USING bounded`}
-      WHERE target.ctid=bounded.ctid AND bounded.total<=$2 AND bounded.total_rows<=${lifecycleLimits.rows - this.rows}
+      WHERE target.ctid=bounded.ctid AND (bounded.total<=$2${allowAgentDefinition
+        ? ` OR bounded.position=1 AND bounded.agent_definition AND bounded.total<=${dataLimits.agentDefinitionTransferBytes - this.bytes}` : ""})
+        AND bounded.total_rows<=${lifecycleLimits.rows - this.rows}
       RETURNING bounded.${cursorWrites ? "data_bytes" : "bytes"} AS data_bytes,bounded.bytes,bounded.row_cost,
         bounded.${cursorWrites ? "base_row_cost" : "row_cost"} AS base_rows
     ) SELECT count(*)::int AS rows,coalesce(sum(data_bytes),0)::int AS bytes,coalesce(sum(bytes),0)::int AS reserved_bytes,
@@ -103,7 +111,8 @@ export class LifecycleSlice {
     }
     if (!result || ![result.rows, result.charged_rows, result.bytes].every(value => Number.isSafeInteger(value) && value >= 0)
       || result.charged_rows < result.rows || this.rows + result.charged_rows > lifecycleLimits.rows
-      || this.bytes + result.bytes > lifecycleLimits.bytes) throw new Error("lifecycle_budget_counters");
+      || this.bytes + result.bytes > lifecycleLimits.bytes && !(allowAgentDefinition && result.rows === 1
+        && this.bytes + result.bytes <= dataLimits.agentDefinitionTransferBytes)) throw new Error("lifecycle_budget_counters");
     this.rows += result.charged_rows;
     this.bytes += result.bytes;
     // Move to the next relation when this slice is full; a busy earlier table cannot starve later children.

@@ -45,11 +45,20 @@ export function useSelectedReadLease(selection: SelectedRead | undefined) {
   const [, update] = useState(0);
   const remaining = selectedReadRemaining(selection);
   useEffect(() => {
-    if (!selection || !remaining) return;
+    if (!selection) return;
     const check = () => update(value => value + 1);
-    const timer = window.setTimeout(check, Math.min(remaining, 2_147_483_647));
+    const timer = remaining ? window.setTimeout(check, Math.min(remaining, 2_147_483_647)) : undefined;
     window.addEventListener("focus", check);
-    return () => { window.clearTimeout(timer); window.removeEventListener("focus", check); };
+    window.addEventListener("online", check);
+    window.addEventListener("offline", check);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", check);
+      window.removeEventListener("online", check);
+      window.removeEventListener("offline", check);
+      document.removeEventListener("visibilitychange", check);
+    };
   }, [selection, remaining]);
   return Boolean(selection && remaining > 0);
 }

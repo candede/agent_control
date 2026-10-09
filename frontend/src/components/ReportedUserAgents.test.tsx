@@ -27,6 +27,52 @@ beforeEach(() => { vi.resetAllMocks(); vi.mocked(readReportPage).mockResolvedVal
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("reported user's selected agent pages", () => {
+  it.each(["T_exact-package", "helpdesk/report:2", "agent:report-only"])(
+    "opens exact package details for %s while retaining the separate cohort action", async agentId => {
+      vi.mocked(readReportPage).mockResolvedValue(reportPage([relationship(1, { agentId })]));
+      const onOpenAgent = vi.fn(), onFocusAgent = vi.fn();
+      render(<UserAgents path={path} selectionId={selectionId} onOpenAgent={onOpenAgent} onFocusAgent={onFocusAgent} />);
+      const details = await screen.findByRole("button", { name: "Open agent Agent 1" });
+      details.focus();
+      await userEvent.keyboard("{Enter}");
+      expect(onOpenAgent).toHaveBeenCalledExactlyOnceWith(`graph_packages:${encodeURIComponent(agentId)}`);
+      expect(onFocusAgent).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: "Agent 1: active users without paid Copilot" }));
+      expect(onFocusAgent).toHaveBeenCalledExactlyOnceWith(agentId, reports.setId);
+      expect(onOpenAgent).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["failure", "expiry", "revalidation", "replacement"] as const)(
+    "does not open agent details from superseded usage evidence during %s", async boundary => {
+      const client = createSavedQueryClient(), pending = deferred<ReportPage<ReportRelationship>>();
+      const initial = reportPage([relationship(1)]), onOpenAgent = vi.fn();
+      initial.selection.expiresAt = new Date(Date.now() + 20_000).toISOString();
+      vi.mocked(readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise);
+      const view = render(<SavedQueryProvider client={client}>
+        <UserAgents path={path} selectionId={selectionId} onOpenAgent={onOpenAgent} />
+      </SavedQueryProvider>);
+      const button = await screen.findByRole("button", { name: "Open agent Agent 1" });
+      const cached = client.getQueryCache().find({ queryKey: ["saved", "record-page"], exact: false })!;
+      act(() => {
+        if (boundary === "failure") cached.setState({ status: "error", error: new Error("Relationships unavailable.") });
+        else if (boundary === "expiry") vi.spyOn(performance, "now").mockReturnValue(performance.now()
+          + Date.parse(initial.selection.expiresAt) - Date.parse(initial.selection.validatedAt) + 1);
+        else if (boundary === "replacement") client.setQueryData(cached.queryKey, reportPage([relationship(2)]));
+        else void client.invalidateQueries({ queryKey: cached.queryKey, exact: true });
+        fireEvent.click(button);
+      });
+      expect(onOpenAgent).not.toHaveBeenCalled();
+      if (boundary === "revalidation") {
+        await act(async () => pending.resolve(reportPage([relationship(2)])));
+        await userEvent.click(await screen.findByRole("button", { name: "Open agent Agent 2" }));
+        expect(onOpenAgent).toHaveBeenCalledExactlyOnceWith("graph_packages:agent-2");
+      }
+      view.unmount();
+      client.clear();
+    },
+  );
+
   it("describes an empty relationship page without denying the server's known matches", async () => {
     vi.mocked(readReportPage).mockResolvedValue(reportPage([], {
       counts: { total: 100, filtered: 20 }, page: { limit: 50, nextCursor: "next", previousCursor: "previous" },
@@ -303,7 +349,7 @@ describe("reported user's selected agent pages", () => {
     expect(onSelectionInvalidated).not.toHaveBeenCalled();
   });
 
-  it("admits an in-flight frozen relationship page through lease end without replay or automatic replacement", async () => {
+  it("keeps an admitted relationship read while requesting one automatic parent renewal", async () => {
     const initial = reportPage([relationship(1)], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
     initial.selection.expiresAt = new Date(Date.now() + 20_000).toISOString();
     const pending = deferred<ReportPage<ReportRelationship>>(), onRestartSelection = vi.fn();
@@ -315,13 +361,13 @@ describe("reported user's selected agent pages", () => {
     vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(initial.selection.expiresAt) - Date.parse(initial.selection.validatedAt) + 1);
     fireEvent.focus(window);
     expect(signal?.aborted).toBe(false);
-    expect(screen.getByText("Loading saved data...")).toBeVisible();
+    expect(screen.queryByText("Loading saved data...")).not.toBeInTheDocument();
+    expect(onRestartSelection).toHaveBeenCalledOnce();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry saved data" })).not.toBeInTheDocument();
     await act(async () => pending.resolve(reportPage([relationship(99)], { selection: initial.selection })));
     expect(await screen.findByText("Agent 99")).toBeVisible();
-    const restart = screen.getByRole("button", { name: "Restart selection" });
-    act(() => { fireEvent.click(restart); fireEvent.click(restart); });
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
     expect(onRestartSelection).toHaveBeenCalledOnce();
     expect(readReportPage).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Agent 99")).toBeVisible();

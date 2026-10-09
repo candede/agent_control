@@ -22,3 +22,21 @@ export class OfficialReportStatusRepository {
     });
   }
 }
+
+export async function directoryNeedsReportRefresh(database: Pick<pg.PoolClient, "query">,
+  scope: { tenantId: string; principalId: string }): Promise<boolean> {
+  // Compare collection start, not completion: a report can change while Users sync is running.
+  const result = await database.query(`SELECT 1 FROM official_usage_state report
+    JOIN official_usage_sets current ON current.id=report.active_set_id AND current.tenant_id=report.tenant_id
+    WHERE report.tenant_id=$1 AND current.complete AND current.deleted_at IS NULL
+      AND (current.expires_at IS NULL OR current.expires_at>clock_timestamp())
+      AND NOT EXISTS (
+        SELECT 1 FROM data_scope_epochs scope
+        JOIN data_generation_heads head ON head.scope_id=scope.id
+        JOIN data_generations generation ON generation.id=head.generation_id AND generation.state='published'
+          AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
+        WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.token_mode='delegated'
+          AND scope.source='directory' AND scope.selector='complete' AND generation.created_at>=report.updated_at
+      )`, [scope.tenantId, scope.principalId]);
+  return result.rowCount === 1;
+}

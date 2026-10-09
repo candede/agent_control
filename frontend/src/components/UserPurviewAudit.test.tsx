@@ -74,7 +74,7 @@ describe("user audit entry point", () => {
     expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
   });
 
-  it("retains lazy tabs and user-agent filters within a selection, but retires them on a data revision", async () => {
+  it("retains lazy tabs and user-agent filters across live data revisions", async () => {
     const view = render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const element = await screen.findByRole("dialog", { name: "Ada" });
@@ -105,14 +105,13 @@ describe("user audit entry point", () => {
 
     const detailReads = vi.mocked(readReportDetail).mock.calls.length;
     view.rerender(<CapabilityContext value={capability}><CopilotUsersView dataRevision={1} /></CapabilityContext>);
-    expect(element).not.toBeInTheDocument();
+    expect(element).toBeInTheDocument();
     expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
-    expect(readReportDetail).toHaveBeenCalledTimes(detailReads);
-    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(detailReads + 1));
     const replacement = within(await screen.findByRole("dialog", { name: "Ada" }));
     expect(replacement.getByRole("tabpanel")).toHaveAccessibleName("Overview");
     await userEvent.click(replacement.getByRole("tab", { name: "Usage & agents" }));
-    expect(await replacement.findByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("");
+    expect(await replacement.findByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
     await userEvent.click(replacement.getByRole("tab", { name: "Logs" }));
     expect(replacement.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
   });

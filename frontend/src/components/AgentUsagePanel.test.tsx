@@ -81,16 +81,26 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("restored agent usage and users", () => {
-  it("opens user Logs against the saved inventory agent, not a CSV agent ID, and closes when hidden", async () => {
+  it("opens user details (Overview first) with Logs scoped to the saved inventory agent, not a CSV agent ID, and closes when hidden", async () => {
     const view = renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "View logs for person0@example.invalid on Excel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "View details for person0@example.invalid on Excel" }));
     expect(UserDetailModal).toHaveBeenLastCalledWith(expect.objectContaining({
-      identity: "person0@example.invalid", kind: "report", initialTab: "purview",
-      investigationAgent: { recordId: record.id, name: "Excel" }, selectionId: context.selectionId,
+      identity: "person0@example.invalid", kind: "report",
+      investigationAgent: { recordId: record.id, name: "Excel" },
     }), undefined);
+    expect(vi.mocked(UserDetailModal).mock.lastCall?.[0]).not.toHaveProperty("selectionId");
+    expect(vi.mocked(UserDetailModal).mock.lastCall?.[0]).not.toHaveProperty("initialTab");
     expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
     view.rerender(view.content({ view: "usage" }));
     expect(screen.queryByLabelText("Scoped user logs")).not.toBeInTheDocument();
+  });
+  it("keeps the user modal open when an automatic refresh changes the inventory revision", async () => {
+    const view = renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "View details for person0@example.invalid on Excel" }));
+    expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
+    view.rerender(view.content({ inventoryRevision: "b".repeat(64) }));
+    await screen.findByText("person0@example.invalid");
+    expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
   });
   it.each(["page", "revision", "disabled", "account", "unmount"] as const)(
     "retires report-link callbacks across %s changes", async boundary => {

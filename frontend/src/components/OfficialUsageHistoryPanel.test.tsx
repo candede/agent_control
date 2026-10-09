@@ -216,9 +216,8 @@ describe("saved report history", () => {
     let finish!: (value: HistoryPage) => void;
     api.history.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     view.rerender(<OfficialUsageHistoryPanel revision={1} onSelect={vi.fn()} admin={admin} />);
-    expect(screen.getByText("Loading saved data...")).toHaveAttribute("role", "status");
-    expect(screen.queryByRole("button", { name: /View report|Delete report set/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+    for (const button of screen.getAllByRole("button", { name: /View report|Delete report set/ })) expect(button).toBeDisabled();
+    expect(screen.getByRole("navigation")).toBeInTheDocument();
     await act(async () => finish(history()));
     await waitFor(() => {
       for (const button of screen.getAllByRole("button", { name: /View report|Delete report set/ })) expect(button).toBeEnabled();

@@ -176,7 +176,7 @@ describe("exact selected snapshot inspection", () => {
     expect(api.createReportExport).toHaveBeenCalledOnce();
   });
   it.each(["revision", "report", "account", "roles", "session", "search", "dates", "failure", "invalidation", "expiry"] as const)(
-    "preserves lease-end work but retires it on a %s boundary during pagination", async boundary => {
+    "keeps exports independent while handling a %s boundary during pagination", async boundary => {
       vi.useFakeTimers();
       const initial = page(), next = deferred<ReportPage<ReportAgent>>(), replacement = deferred<ReportPage<ReportAgent>>();
       if (boundary === "expiry") initial.selection = { ...initial.selection, validatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 1000).toISOString() };
@@ -222,14 +222,34 @@ describe("exact selected snapshot inspection", () => {
         expect(exportSignal?.aborted).toBe(false);
         expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
         expect(screen.getByRole("button", { name: "Cancel export" })).toBeVisible();
+        const fresh = page();
+        fresh.selection = { ...fresh.selection, id: "20000000-0000-4000-8000-000000000009",
+          validatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString() };
+        vi.mocked(api.readReportDetail).mockImplementation(async (_path, selected) => ({
+          value: reportAgent(1), reports, sources: fresh.sources, selection: selected === fresh.selection.id ? fresh.selection : initial.selection,
+        }));
+        vi.mocked(api.readReportPage).mockImplementation(async (_path, request) => reportPage([], {
+          selection: request?.selectionId === initial.selection.id ? initial.selection : fresh.selection,
+        }));
         await act(async () => {
           next.resolve(initial);
           exact.resolve({ value: reportAgent(1), reports, sources: initial.sources, selection: initial.selection });
+          replacement.resolve(fresh);
           await vi.advanceTimersByTimeAsync(1);
         });
         expect(screen.getByRole("button", { name: "Researcher" })).toBeVisible();
         expect(screen.getByRole("region", { name: "Exact reported agent details" })).toBeVisible();
-        expect(api.readReportPage).toHaveBeenCalledTimes(3);
+        expect(vi.mocked(api.readReportPage).mock.calls.filter(call => call[0] === "official-usage/aggregate")).toHaveLength(3);
+        expect(api.createReportExport).toHaveBeenCalledOnce();
+        return;
+      }
+      if (boundary === "revision") {
+        expect(pageSignal?.aborted).toBe(true);
+        expect(facetSignal?.aborted).toBe(false);
+        expect(detailSignal?.aborted).toBe(true);
+        expect(exportSignal?.aborted).toBe(false);
+        expect(screen.getByRole("region", { name: "Exact reported agent details" })).toBeVisible();
+        expect(screen.getByRole("button", { name: "Cancel export" })).toBeVisible();
         expect(api.createReportExport).toHaveBeenCalledOnce();
         return;
       }

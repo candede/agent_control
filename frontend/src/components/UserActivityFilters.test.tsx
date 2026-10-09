@@ -22,16 +22,18 @@ function facetPage(nextCursor: string | null = "facet-next", previousCursor: str
     page: { limit: 50, nextCursor, previousCursor },
   };
 }
-function Filters({ selection }: { selection?: string }) {
-  const [values, setValues] = useState<Values>(defaults);
-  const [search, setSearch] = useState("");
+function Filters({ selection, loading = false, initialSearch = "", initialValues = defaults }: {
+  selection?: string; loading?: boolean; initialSearch?: string; initialValues?: Values;
+}) {
+  const [values, setValues] = useState<Values>(initialValues);
+  const [search, setSearch] = useState(initialSearch);
   const [sort, setSort] = useState("responses:desc");
   const searchRef = useRef<HTMLInputElement>(null);
   return <UserActivityFilters values={values} path="official-usage/users" selectionId={selection}
     cohorts={[{ value: "all", label: "All responses" }, { value: "low", label: "Low responses" }]} defaultCohort="all"
     search={search} searchRef={searchRef} sort={sort}
     sorts={[{ value: "responses:desc", label: "Most responses" }, { value: "name:asc", label: "Name ascending" }]}
-    loading={false} validThreshold matchingCount={10} onChange={setValues} onSearch={setSearch} onSort={setSort}
+    loading={loading} validThreshold matchingCount={10} onChange={setValues} onSearch={setSearch} onSort={setSort}
     onClear={() => { setValues(defaults); setSearch(""); }} onRestartSelection={vi.fn()} />;
 }
 async function openFilters() {
@@ -46,6 +48,56 @@ beforeEach(() => { vi.mocked(api.readReportFacet).mockResolvedValue(facetPage())
 afterEach(() => { vi.resetAllMocks(); });
 
 describe("user activity filter controls", () => {
+  it.each([false, true])("clears an unfocused search without changing filters while loading=%s", async loading => {
+    const user = userEvent.setup();
+    render(<><Filters selection={selectionId} loading={loading} initialSearch="Ada"
+      initialValues={{ company: "Contoso", cohort: "low", lowResponseThreshold: "10" }} /><button type="button">Outside</button></>);
+    const search = screen.getByRole("searchbox", { name: "Search reported users or agents" });
+    await user.click(screen.getByRole("button", { name: "Outside" }));
+    expect(search).not.toHaveFocus();
+    const clear = screen.getByRole("button", { name: "Clear search" });
+    expect(clear).toBeVisible();
+    expect(clear).toBeEnabled();
+    expect(clear).toHaveAttribute("title", "Clear search");
+    expect(clear).toHaveClass("agent-search-clear");
+    expect(search.parentElement).toHaveClass("agent-search-field-clearable");
+    await user.click(clear);
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove company filter" })).toHaveTextContent("Contoso");
+    expect(screen.getByRole("button", { name: "Remove agent responses filter" })).toHaveTextContent("Low responses");
+    expect(screen.getByRole("button", { name: "Remove low-response threshold filter" })).toHaveTextContent("10");
+  });
+
+  it.each(["{Enter}", " "])("clears search from the keyboard (%s) and restores input focus", async key => {
+    const user = userEvent.setup();
+    render(<Filters initialSearch="Ada" />);
+    const search = screen.getByRole("searchbox", { name: "Search reported users or agents" });
+    search.focus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Clear search" })).toHaveFocus();
+    await user.keyboard(key);
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+  });
+
+  it("shows Clear search for any entered text, including whitespace, but not when empty", async () => {
+    const user = userEvent.setup();
+    render(<Filters />);
+    const search = screen.getByRole("searchbox", { name: "Search reported users or agents" });
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+    await user.type(search, " ");
+    expect(screen.getByRole("button", { name: "Clear search" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(search).toHaveValue("");
+    await user.type(search, "Ada");
+    expect(screen.getByRole("button", { name: "Clear search" })).toBeVisible();
+    await user.clear(search);
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+  });
+
   it("keeps exact null facets, chip removal, sort and reset behavior", async () => {
     render(<Filters selection={selectionId} />);
     const { user, controls } = await openFilters();

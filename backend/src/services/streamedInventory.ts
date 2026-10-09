@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { InventoryGenerations, inventoryAsOf, type InventoryIntent } from "../db/inventoryGenerations.js";
 import type { BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
-import { dataLimitError, encodeBatch } from "../db/dataBounds.js";
+import { dataLimitError, dataLimits, encodeBatch } from "../db/dataBounds.js";
 import { GraphPackagesClient, packageInventoryReadPolicy, type PackageReadOptions } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient, type ResourceQueryOptions } from "./powerPlatformResourceQuery.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryFact, type InventoryRecord } from "./inventoryRecordProjection.js";
@@ -35,6 +35,7 @@ export async function storedInventoryRecords(client: pg.PoolClient, requested: r
     SELECT * FROM sized WHERE page_bytes<=524288 OR position=0 ORDER BY position`, [parameters])).rows;
   if (!rows.length) return [];
   const result = rows.map(row => ({ ...row, facts: [] as InventoryFact[], bytes: Buffer.byteLength(JSON.stringify(row)) }));
+  const workBudget = result.length === 1 ? dataLimits.agentDefinitionWorkBytes : dataLimits.batchBytes;
   let bytes = result.reduce((sum, row) => sum + row.bytes, 0);
   if (bytes > 1_048_576) throw dataLimitError("inventory_record_work_bytes", 1_048_576, bytes);
   const byIdentity = new Map(result.map(row => [`${row.generation_id}:${row.identity}`, row]));
@@ -52,14 +53,15 @@ export async function storedInventoryRecords(client: pg.PoolClient, requested: r
          'acquireUsersAndGroups','elementGroup','element','identifier','connectorOperation') OR f.kind LIKE 'detail:%'`})
          AND ($2::uuid IS NULL OR (f.generation_id,f.identity COLLATE "C",f.ordinal)>($2::uuid,$3::text COLLATE "C",$4::integer))
        ORDER BY f.generation_id,f.identity COLLATE "C",f.ordinal LIMIT 250
-      ), sized AS (SELECT *,sum(octet_length(row_to_json(c)::text))
+      ), sized AS (SELECT *,row_number() OVER(ORDER BY generation_id,identity COLLATE "C",ordinal) AS position,
+       sum(octet_length(row_to_json(c)::text))
        OVER(ORDER BY generation_id,identity COLLATE "C",ordinal) AS bytes FROM candidates c)
-      SELECT generation_id,identity,ordinal,kind,value,payload FROM sized WHERE bytes<=524288
+      SELECT generation_id,identity,ordinal,kind,value,payload FROM sized WHERE bytes<=524288 OR position=1
        ORDER BY generation_id,identity COLLATE "C",ordinal`,
     [selected, boundary?.generation_id ?? null, boundary?.identity ?? null, boundary?.ordinal ?? null])).rows;
     if (!part.length) break;
     bytes += Buffer.byteLength(JSON.stringify(part));
-    if (bytes > 1_048_576) throw dataLimitError("inventory_record_work_bytes", 1_048_576, bytes);
+    if (bytes > workBudget) throw dataLimitError("inventory_record_work_bytes", workBudget, bytes);
     for (const fact of part) {
       const row = byIdentity.get(`${fact.generation_id}:${fact.identity}`)!;
       row.facts.push(fact);

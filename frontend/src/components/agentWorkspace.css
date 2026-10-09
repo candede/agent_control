@@ -498,6 +498,48 @@
   outline: none;
 }
 
+.agent-search-field-clearable {
+  --search-clear-size: 36px;
+  min-height: calc(var(--search-clear-size) + 2px);
+}
+
+.agent-search-field-clearable input {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--search-clear-size);
+}
+
+.agent-search-field-clearable input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  display: none;
+}
+
+.agent-search-clear {
+  flex: 0 0 var(--search-clear-size);
+  width: var(--search-clear-size);
+  height: var(--search-clear-size);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.agent-search-clear:hover {
+  background: #ece9fa;
+  color: var(--ink);
+}
+
+.agent-search-clear:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -4px;
+}
+
+@media (max-width: 760px), (pointer: coarse) {
+  .agent-search-field-clearable {
+    --search-clear-size: 44px;
+  }
+}
+
 .agent-filter-picker {
   position: relative;
 }
@@ -762,6 +804,10 @@
 }
 
 @media (min-width: 761px) and (max-width: 900px) {
+  .agent-grid-tools > .catalog-controls {
+    flex-basis: 0;
+  }
+
   .app-shell .top-bar {
     gap: 8px;
   }
@@ -955,6 +1001,10 @@
   .agent-grid-tools {
     position: relative;
     padding-top: 44px;
+  }
+
+  .agent-grid-tools:has(.agent-search-field-clearable) {
+    padding-top: 54px;
   }
 
   .agent-search-field {

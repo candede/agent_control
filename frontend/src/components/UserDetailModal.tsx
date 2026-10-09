@@ -15,6 +15,7 @@ import type { UserDetailTab } from "../workbenchRouting";
 import { usageCount, usageDate } from "../usageInsights";
 import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import { lockBodyScroll } from "../bodyScrollLock";
+import { PublicationContext } from "../publicationContext";
 import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { CopilotServiceDetails } from "./CopilotServiceDetails";
 import { ReportedUserAgents, type UserRelationshipFilters, type UserRelationshipQuery } from "./ReportedUserAgents";
@@ -47,6 +48,8 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
   const [openedAt] = useState(Date.now);
   const now = useContext(CapabilityContext)?.now ?? openedAt;
   const principal = useReportPrincipalScope(), client = useSavedQueryClient();
+  const publication = useContext(PublicationContext);
+  const [readRevision, setReadRevision] = useState(0);
   const interactionScope = JSON.stringify([principal, kind, identity]);
   const [interactionOwner, setInteractionOwner] = useState(interactionScope);
   if (interactionOwner !== interactionScope) {
@@ -65,13 +68,15 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     onTabChange?.(next);
   }
   const path = `${kind === "directory" ? "copilot-usage" : "official-usage"}/users/${encodeURIComponent(identity)}`;
-  const queryKey = useMemo(() => ["saved", "report-detail", principal, kind, identity, selectionId, dataRevision],
-    [principal, kind, identity, selectionId, dataRevision]);
+  const queryKey = useMemo(() => ["saved", "report-detail", principal, kind, identity, selectionId, dataRevision, readRevision],
+    [principal, kind, identity, selectionId, dataRevision, readRevision]);
   const read = useQuery<OfficialReportDetail<CombinedUser | ReportUser>>({
     queryKey, enabled: cached => validIdentity && rejected?.owner !== owner
       && (!cached.state.data || selectedReadRemaining(cached.state.data.selection) > 0)
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
     gcTime: 0, staleTime: Infinity, structuralSharing: false,
+    placeholderData: (previous, query) => query?.queryKey[2] === principal && query.queryKey[3] === kind
+      && query.queryKey[4] === identity ? previous : undefined,
     queryFn: async ({ signal }) => {
       const startedAt = performance.now();
       const result = await readReportDetail<CombinedUser | ReportUser>(path, selectionId, signal);
@@ -85,10 +90,30 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
   }, client);
   const leaseActive = useSelectedReadLease(read.data?.selection);
   const leaseEnded = Boolean(read.data && !leaseActive) || isExpiredSelection(read.error);
+  const cachedRead = client.getQueryState(queryKey);
+  const incompleteRead = !read.isFetching && !read.isError && (read.isPending || cachedRead?.status === "pending" || cachedRead?.isInvalidated);
   const readError = (rejected?.owner === owner ? rejected.error : null)
-    ?? read.error ?? (!read.isFetching && (read.isPending || read.isStale)
-      ? new Error(read.isPending ? "The user detail read was cancelled. Retry user details." : "User details need reloading. Retry user details.") : null);
+    ?? read.error ?? (incompleteRead
+      ? new Error(read.isPending || cachedRead?.status === "pending" ? "The user detail read was cancelled. Retry user details." : "User details need reloading. Retry user details.") : null);
   const selectionInvalidated = readError instanceof ApiError && readError.code === "selection_invalidated" && !isExpiredSelection(readError);
+  const observedRead = useRef<{ selection?: string; liveSelection?: string; publication?: string }>({});
+  const publishedUsers = publication?.revisions?.users;
+  const available = document.visibilityState === "visible" && navigator.onLine;
+  const renewDetail = useEffectEvent(() => {
+    if (directUser) setReadRevision(value => value + 1);
+    else onRestartSelection?.();
+  });
+  useEffect(() => {
+    if (!validIdentity || !available || read.isFetching || read.isError && !isExpiredSelection(read.error)) return;
+    const previous = observedRead.current;
+    if (read.data && leaseActive) previous.liveSelection = read.data.selection.id;
+    const changed = directUser && publishedUsers && read.data
+      && (previous.publication ?? read.data.selection.publicationRevisions.users) !== publishedUsers;
+    observedRead.current.publication = publishedUsers;
+    if (!changed && (!leaseEnded || !read.data || previous.liveSelection !== read.data.selection.id || previous.selection === read.data.selection.id)) return;
+    observedRead.current.selection = read.data?.selection.id;
+    renewDetail();
+  }, [available, directUser, leaseActive, leaseEnded, onRestartSelection, publishedUsers, read.data, read.error, read.isError, read.isFetching, validIdentity]);
   useEffect(() => {
     if (selectionInvalidated) onSelectionInvalidated?.();
   }, [selectionInvalidated, onSelectionInvalidated]);
@@ -101,15 +126,18 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     setRejected(undefined);
     void read.refetch({ cancelRefetch: false });
   } : undefined);
-  function rejectSelection(error: Error) { setRejected({ owner, error }); }
-  const detail = readError && !isExpiredSelection(readError) || read.isFetching ? undefined : read.data;
+  function rejectSelection(error: Error) {
+    if (!read.isPlaceholderData) setRejected({ owner, error });
+  }
+  const detail = readError && !isExpiredSelection(readError) || cachedRead?.isInvalidated && read.isFetching ? undefined : read.data;
   const reported = detail && "username" in detail.value ? detail.value : undefined;
-  const directoryEnabled = kind === "report" && Boolean(reported?.objectId);
+  const directoryEnabled = kind === "report" && Boolean(reported?.objectId) && !read.isPlaceholderData;
   const directoryRead = useQuery<OfficialReportDetail<CombinedUser>>({
     queryKey: ["saved", "report-directory-detail", principal, identity, detail?.selection.id.toLowerCase(), dataRevision, reported?.objectId],
     enabled: cached => directoryEnabled
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
     gcTime: 0, staleTime: Infinity, structuralSharing: false,
+    placeholderData: (previous, query) => query?.queryKey[2] === principal && query.queryKey[3] === identity ? previous : undefined,
     queryFn: async ({ signal }) => {
       const startedAt = performance.now();
       const result = await readReportDetail<CombinedUser>(`${path}/directory`, detail?.selection.id, signal);
@@ -129,13 +157,15 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
       return acceptSelectedRead(result, startedAt);
     },
   }, client);
-  if (!readError && directoryRead.error instanceof ApiError && directoryRead.error.code === "selection_invalidated" && !isExpiredSelection(directoryRead.error)) {
+  if (!readError && directoryEnabled && directoryRead.error instanceof ApiError && directoryRead.error.code === "selection_invalidated" && !isExpiredSelection(directoryRead.error)) {
     setRejected({ owner, error: directoryRead.error });
   }
   const directoryError = directoryEnabled ? directoryRead.error ?? (!directoryRead.isFetching && (directoryRead.isPending || directoryRead.isStale)
     ? new Error(directoryRead.isPending ? "The directory detail read was cancelled. Retry directory details." : "Directory details need reloading. Retry directory details.") : null) : null;
   const directory = kind === "directory" ? detail && "directory" in detail.value ? detail.value : undefined
-    : directoryError || directoryRead.isFetching || !reported ? undefined : directoryRead.data?.value;
+    : directoryError || directoryRead.isFetching || !reported?.objectId
+      || directoryRead.data?.value.directory.objectId.toLowerCase() !== reported.objectId.toLowerCase()
+      || directoryRead.data.selection.id.toLowerCase() !== detail?.selection.id.toLowerCase() ? undefined : directoryRead.data.value;
   const directoryLoading = directoryEnabled && directoryRead.isFetching;
   const current = detail?.sources.directory.state === "available";
   const reportCurrent = detail?.reports.availability === "active";
@@ -205,10 +235,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
       }}>{label}</button>)}</div>
     {tabs.map(([panel]) => <section key={panel} hidden={tab !== panel} role="tabpanel" id={`${id}-panel-${panel}`} aria-labelledby={`${id}-${panel}`} className="user-detail-panel" tabIndex={0}>
       {tab === panel ? <>
-        {leaseEnded ? <p role="status" className="copilot-users-notice">
-          Showing previously loaded user details{detail ? ` evaluated ${usageDate(detail.selection.evaluatedAt)}` : ""}.
-          {restartSelection ? <>{" "}<button type="button" onClick={restartSelection}>Restart selection</button> before reading more details.</> : " Restart the parent selection before reading more details."}
-        </p> : null}
+        {leaseEnded && restartSelection ? <p className="sr-only" role="status">Refreshing saved user details...</p> : null}
         {!validIdentity ? <p role="alert">User details unavailable: an exact directory object ID is required.</p>
           : read.isFetching ? <p role="status">Loading exact user details...</p>
           : missingProfile ? <p className="copilot-users-notice" role="status">This user is not in the saved Users directory. Responsibility is shown from agent inventory; profile, license and usage details are unavailable. Run Users sync to refresh user data.</p>
@@ -249,7 +276,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
             {reportMismatch ? <p className="copilot-users-notice">Report totals differ. Users total: {usageCount(counts?.reportedResponses)}; agent breakdown: {usageCount(counts?.bridgeResponses)}.</p> : null}
             {hasReport ? <><p>Responses across reported agents: <strong>{counts?.relationshipCount ? usageCount(counts.bridgeResponses) : "Not reported"}</strong></p>
               <ReportedUserAgents path={`${path}/agents`} selectionId={detail.selection.id} filters={filters} query={relationshipQuery} onQueryChange={setRelationshipQuery}
-                onFocusAgent={onFocusAgent} onRestartSelection={restartSelection} onSelectionInvalidated={rejectSelection} />
+                onFocusAgent={onFocusAgent} onOpenAgent={onOpenAgent} onRestartSelection={restartSelection} onSelectionInvalidated={rejectSelection} />
             </> : <p>{noReportedActivity ? "No agent activity in the selected reports." : "No agent usage report is linked to this user."}</p>}
           </section>
           <section className="user-detail-card" aria-label="User Office app activity"><h3>Copilot in Office apps</h3>{directory?.appActivity ? <>

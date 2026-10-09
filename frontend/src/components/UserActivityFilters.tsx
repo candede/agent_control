@@ -1,4 +1,4 @@
-import { useRef, type ReactNode, type RefObject } from "react";
+import { useId, useRef, type ReactNode, type RefObject } from "react";
 import { Search, X } from "lucide-react";
 import type { ReportQuery } from "../../../backend/src/types/officialReportData";
 import { FilterPopover } from "./FilterPopover";
@@ -38,6 +38,7 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
   onSelectionInvalidated?: () => void;
   exportButton?: ReactNode;
 }) {
+  const searchId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const fields = [
     { key: "company", label: "Company" },
@@ -60,11 +61,16 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
 
   return <section className="catalog-controls user-activity-controls agent-grid-toolbar" aria-label="User filters">
     <div className="agent-query-bar">
-      <label className="agent-search-field">
-        <Search size={17} aria-hidden="true" /><span className="sr-only">{searchLabel}</span>
-        <input ref={searchRef} type="search" maxLength={256} placeholder="Search users or agents" value={search}
+      <div className="agent-search-field agent-search-field-clearable">
+        <Search size={17} aria-hidden="true" /><label className="sr-only" htmlFor={searchId}>{searchLabel}</label>
+        <input ref={searchRef} id={searchId} type="search" maxLength={256} placeholder="Search users or agents" value={search}
           onChange={event => onSearch(event.target.value)} />
-      </label>
+        {search.length > 0 ? <button type="button" className="agent-search-clear"
+          aria-label="Clear search" title="Clear search" onClick={() => {
+            onSearch("");
+            searchRef.current?.focus();
+          }}><X size={20} aria-hidden="true" /></button> : null}
+      </div>
       <div className="agent-query-summary">
         <span className="agent-match-count" role="status" aria-label="Matching users" aria-atomic="true">
           <strong>{loading ? "Updating..." : matchingCount === undefined ? "Unavailable" : matchingCount.toLocaleString()}</strong>{" "}

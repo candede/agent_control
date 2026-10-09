@@ -13,6 +13,7 @@ import { deferred } from "../test/deferred";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { responsibilityFixture, responsibilityOwnerId } from "../test/agentResponsibilityFixture";
+import { PublicationContext } from "../publicationContext";
 
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getAgentResponsibility: vi.fn(),
@@ -69,6 +70,82 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe("record-backed paid M365 Copilot license dashboard", () => {
+  it.each(["queued", "running"] as const)("shows incomplete counts as updating during %s Users sync and retains known counts", async status => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.sources.app_activity.state = "stale";
+    saved.summary.licensedUsers = saved.summary.noAgentActivityUsers = null;
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status } }}><CopilotUsersView /></PublicationContext>);
+    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    expect(summary).toHaveAttribute("aria-busy", "true");
+    expect(within(summary).getAllByText("Updating...")).toHaveLength(2);
+    expect(within(summary).getByRole("button", { name: "Using agents" }).querySelector("strong")).toHaveTextContent("2");
+    expect(screen.getByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toHaveClass("reported-users-note");
+    expect(screen.queryByText(/Run Users sync|Review the connection/)).not.toBeInTheDocument();
+  });
+
+  it("describes the first check accurately before sync admission, then restores idle recovery guidance", async () => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.summary.licensedUsers = null;
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    const content = (checking: boolean) => <PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking } }}><CopilotUsersView /></PublicationContext>;
+    const view = render(content(true));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByText("Checking user data and automatic sync status. Please wait a moment.")).toBeVisible();
+    expect(screen.queryByText(/Users sync is in progress|Run Users sync/)).not.toBeInTheDocument();
+    view.rerender(content(false));
+    expect(screen.getByText("License data partial. Run Users sync in Sync or review Permissions.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("Unknown");
+  });
+
+  it("uses a captured running directory attempt even before the automatic check responds", async () => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.sources.directory.attemptStatus = "running";
+    saved.summary.licensedUsers = null;
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toBeVisible();
+    expect(screen.queryByText(/Run Users sync/)).not.toBeInTheDocument();
+  });
+
+  it("keeps independent app permission failures visible during directory collection", async () => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.sources.app_activity.state = "unavailable";
+    saved.sources.app_activity.attemptStatus = "permission_required";
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status: "running" } }}><CopilotUsersView /></PublicationContext>);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toBeVisible();
+    expect(screen.getByText("Office app activity unavailable. Review the connection in Permissions.")).toBeVisible();
+  });
+
+  it("does not mark already-current user data as pending just because a refresh is running", async () => {
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status: "running" } }}><CopilotUsersView /></PublicationContext>);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByText(/Users sync is in progress|Updating\.\.\./)).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "M365 Copilot license summary" })).toHaveAttribute("aria-busy", "false");
+  });
+
+  it.each(["failed", "cancelled", "waiting_authorization", "permission_required"] as const)(
+    "does not hide a %s directory attempt behind another active Users subsource", async attemptStatus => {
+      const saved = page();
+      saved.sources.directory.state = "partial";
+      saved.sources.directory.attemptStatus = attemptStatus;
+      saved.summary.licensedUsers = null;
+      vi.mocked(api.readReportPage).mockResolvedValue(saved);
+      render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status: "running" } }}><CopilotUsersView /></PublicationContext>);
+      await screen.findByRole("button", { name: "Ada" });
+      expect(screen.getByText("License data partial. Run Users sync in Sync or review Permissions.")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("Unknown");
+    },
+  );
+
   it("keeps saved counts and rows quiet while license and app-activity sources refresh", async () => {
     const saved = page();
     saved.sources.directory.attemptStatus = "running";
@@ -183,7 +260,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       : state === "lookup_failed" ? /Directory lookup failed/ : /Saved directory identity is out of date/)).toBeVisible();
     expect(modal.queryByText("Identity from saved agent inventory.")).not.toBeInTheDocument();
   });
-  it("retains a responsibility-only user's historical name and rows when the lease ends", async () => {
+  it("keeps a responsibility-only user's name and rows during automatic renewal", async () => {
     vi.mocked(api.readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Record is not in the selected cohort."));
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selection.expiresAt = new Date(Date.now() + 60_000).toISOString();
@@ -193,11 +270,12 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(data.selection.expiresAt) - Date.parse(data.selection.validatedAt) + 1);
     try {
       fireEvent(window, new Event("focus"));
-      expect(await modal.findByText(/Showing previously loaded saved responsibility/)).toBeVisible();
+      await waitFor(() => expect(getAgentResponsibility).toHaveBeenCalledTimes(2));
+      expect(modal.queryByText(/Showing previously loaded saved responsibility/)).not.toBeInTheDocument();
       expect(screen.getByRole("dialog")).toHaveAccessibleName("Responsible only");
       expect(modal.getByText("Responsible only")).toBeVisible();
       expect(modal.getByText("Responsible agent")).toBeVisible();
-      expect(getAgentResponsibility).toHaveBeenCalledOnce();
+      expect(getAgentResponsibility).toHaveBeenCalledTimes(2);
     } finally {
       clock.mockRestore();
     }
@@ -697,7 +775,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
   });
-  it("does not reopen unresolved identities inside collapsed coverage after a data revision", async () => {
+  it("keeps coverage expanded but retires unresolved identity evidence after a data revision", async () => {
     const current = page([ben], { selection: { ...page().selection, id: "new-selection" } });
     vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")
       ? new Promise(() => {}) : Promise.resolve(page()));
@@ -710,17 +788,16 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       ? new Promise(() => {}) : Promise.resolve(current));
     view.rerender(<CopilotUsersView dataRevision={1} />);
     await screen.findByRole("button", { name: "Ben" });
-    expect(signal?.aborted).toBe(true);
+    await waitFor(() => expect(signal?.aborted).toBe(true));
     const summary = screen.getByText("Data sources and coverage");
-    expect(summary.closest("details")).not.toHaveAttribute("open");
+    expect(summary.closest("details")).toHaveAttribute("open");
     expect(screen.queryByRole("region", { name: "Unresolved report identities", hidden: true })).not.toBeInTheDocument();
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
-    await userEvent.click(summary);
     await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users/unresolved-identities",
       expect.objectContaining({ selectionId: current.selection.id, limit: 50 }), expect.any(AbortSignal)));
   });
-  it.each(["licenses", "activity"] as const)("retires %s row details before reading a replacement revision", async viewName => {
+  it.each(["licenses", "activity"] as const)("keeps %s row details open while adopting a replacement revision", async viewName => {
     const row = viewName === "licenses" ? ada : reportUser(1, { displayName: "Ada", objectId: null });
     const saved = reportPage([row]);
     const replacement = deferred<typeof saved>();
@@ -734,19 +811,19 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledOnce());
     const signal = vi.mocked(api.readReportDetail).mock.calls[0][2]!;
     view.rerender(<SavedQueryProvider><CopilotUsersView route={route} dataRevision={1} /></SavedQueryProvider>);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeVisible();
     expect(signal.aborted).toBe(true);
-    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    expect(api.readReportDetail).toHaveBeenCalledTimes(2);
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
     await act(async () => {
       pendingDetail.resolve({ value: row, reports: saved.reports, sources: saved.sources, selection: saved.selection });
       replacement.resolve(saved);
     });
     await screen.findByRole("button", { name: "Ada" });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
+    expect(api.readReportDetail).toHaveBeenCalledTimes(2);
   });
   it.each(["paid facet", "activity facet", "unresolved identities"] as const)(
     "withdraws parent evidence and cancels exports when %s reject its selection", async source => {

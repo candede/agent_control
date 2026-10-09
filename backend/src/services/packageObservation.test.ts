@@ -4,11 +4,25 @@ import { GraphPackagesClient, verifyPackageMutationConverged } from "./graphPack
 import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
 import { normalizePackageStatus } from "../types/copilotPackage.js";
+import { dataLimits } from "../db/dataBounds.js";
 
 const base = { id: "package", displayName: "Package", isBlocked: false };
 const access = { ...base, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] };
 
 describe("complete package observations", () => {
+  it("reads and preserves a large definition through the Graph response and observation boundaries", async () => {
+    const definition = JSON.stringify({ instructions: "x".repeat(3 * 1024 ** 2) });
+    const value = { ...base, elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "one", definition }] }] };
+    const client = new GraphPackagesClient(async () => Response.json(value));
+    expect((await client.getPackageDetails("fixture-token", base.id)).elementDetails?.[0].elements[0].definition).toBe(definition);
+  });
+
+  it("retains an aggregate observation bound even when individual definitions use the larger budget", () => {
+    const definition = "x".repeat(dataLimits.agentDefinitionBytes - 1024);
+    expect(() => allowlistedPackage({ ...base,
+      elementDetails: [{ elementType: "Custom", elements: Array.from({ length: 5 }, (_, i) => ({ id: String(i), definition })) }],
+    })).toThrow(expect.objectContaining({ code: "provider_result_limit" }));
+  });
   it.each(["availableTo", "deployedTo"] as const)("does not truncate %s into a recognized access scope", async field => {
     const status = "all".padEnd(4096, "-") + "future";
     expect(normalizePackageStatus(status)).toBeUndefined();

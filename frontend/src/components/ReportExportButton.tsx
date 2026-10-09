@@ -3,11 +3,11 @@ import { cancelReportExport, createReportExport, reportExportDownload, reportExp
 import type { OfficialReportExportRequest, OfficialReportExportStatus } from "../../../backend/src/types/officialReportApi";
 import { ApiError } from "../api/client";
 
-export function ReportExportButton({ selectionId, kind, ids, label, disabled = false, autoStart = false, onPendingChange, onSelectionInvalidated, admissionAllowed, onOwnSelection }: {
+export function ReportExportButton({ selectionId, kind, ids, label, disabled = false, autoStart = false, onPendingChange, onSelectionInvalidated, admissionAllowed, preserveOnRefresh = false }: {
   selectionId?: string; kind: OfficialReportExportRequest["kind"]; ids?: readonly string[]; label: string; disabled?: boolean;
   autoStart?: boolean; onPendingChange?: (pending: boolean) => void; onSelectionInvalidated?: (error?: ApiError) => void;
   admissionAllowed?: () => boolean;
-  onOwnSelection?: () => void;
+  preserveOnRefresh?: boolean;
 }) {
   const [status, setStatus] = useState<OfficialReportExportStatus>();
   const [error, setError] = useState<string>();
@@ -16,28 +16,30 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   const [cancellation, setCancellation] = useState<"pending" | "failed">();
   const [retry, setRetry] = useState<"admission" | "status">();
   const [owner, setOwner] = useState<string>();
-  const context = JSON.stringify([selectionId, kind, ids]);
-  const visibleStatus = !disabled && owner === context ? status : undefined, preparing = !disabled && owner === context && pending;
-  const cancelling = !disabled && owner === context && cancellation === "pending";
-  const cancellationFailed = !disabled && owner === context && cancellation === "failed";
-  const retrying = !disabled && owner === context ? retry : undefined;
+  const context = JSON.stringify([preserveOnRefresh ? null : selectionId, kind, ids]);
+  const withdrawn = disabled && !preserveOnRefresh;
+  const visibleStatus = !withdrawn && owner === context ? status : undefined, preparing = !withdrawn && owner === context && pending;
+  const cancelling = !withdrawn && owner === context && cancellation === "pending";
+  const cancellationFailed = !withdrawn && owner === context && cancellation === "failed";
+  const retrying = !withdrawn && owner === context ? retry : undefined;
   const controller = useRef<AbortController | undefined>(undefined);
   const operation = useRef<"preparing" | "checking" | "cancelling" | undefined>(undefined);
   const attempt = useRef<{ input: OfficialReportExportRequest; id?: string; settled: boolean } | undefined>(undefined);
   const admission = useRef(admissionAllowed);
-  const ownSelection = useRef(onOwnSelection);
   useLayoutEffect(() => { admission.current = admissionAllowed; }, [admissionAllowed]);
-  useLayoutEffect(() => { ownSelection.current = onOwnSelection; }, [onOwnSelection]);
+  const currentSelection = useRef(selectionId);
+  useLayoutEffect(() => { currentSelection.current = selectionId; }, [selectionId]);
   const nativeDownload = useRef<string | undefined>(undefined);
   const invalidationHandler = useRef(onSelectionInvalidated);
   useEffect(() => { invalidationHandler.current = onSelectionInvalidated; }, [onSelectionInvalidated]);
   const invalidated = useCallback((error?: ApiError) => {
+    const rejectedSelection = attempt.current?.input.selectionId;
     attempt.current = undefined;
     setStatus(undefined);
     setRetry(undefined);
     setError("Export selection changed or expired. Restart the selection before exporting.");
-    invalidationHandler.current?.(error);
-  }, []);
+    if (!preserveOnRefresh || rejectedSelection === currentSelection.current) invalidationHandler.current?.(error);
+  }, [preserveOnRefresh]);
   useEffect(() => {
     return () => {
       controller.current?.abort();
@@ -48,7 +50,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
       setStatus(undefined); setPending(false); setChecking(false); setCancellation(undefined);
       setOwner(undefined); setError(undefined); setRetry(undefined);
     };
-  }, [context, disabled]);
+  }, [context, withdrawn]);
   useEffect(() => { onPendingChange?.(preparing || cancelling); }, [preparing, cancelling, onPendingChange]);
   useEffect(() => () => { onPendingChange?.(false); }, [onPendingChange]);
   useEffect(() => {
@@ -58,14 +60,14 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     return () => clearTimeout(timer);
   }, [status]);
   const start = useCallback(async () => {
-    const [selectionId, kind, ids] = JSON.parse(context) as [string | null, OfficialReportExportRequest["kind"], string[] | null];
-    if (!selectionId || disabled || operation.current || !attempt.current?.id && admission.current && !admission.current()) return;
-    ownSelection.current?.();
+    const retryAttempt = attempt.current && !attempt.current.settled ? attempt.current : undefined;
+    const requestedSelection = retryAttempt?.input.selectionId ?? selectionId;
+    if (!requestedSelection || operation.current || withdrawn || !retryAttempt && (disabled || admission.current && !admission.current())) return;
     operation.current = "preparing";
     controller.current?.abort();
     const abort = new AbortController(); controller.current = abort;
-    const request = attempt.current && !attempt.current.settled ? attempt.current : {
-      input: { selectionId, kind, ids: ids ?? undefined, idempotencyKey: crypto.randomUUID() }, settled: false,
+    const request = retryAttempt ?? {
+      input: { selectionId: requestedSelection, kind, ids: ids?.slice(), idempotencyKey: crypto.randomUUID() }, settled: false,
     };
     attempt.current = request;
     nativeDownload.current = undefined; setOwner(context); setChecking(false);
@@ -101,14 +103,14 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     } finally {
       if (controller.current === abort) { operation.current = undefined; setPending(false); }
     }
-  }, [context, disabled, invalidated]);
+  }, [context, disabled, withdrawn, selectionId, kind, ids, invalidated]);
   useEffect(() => {
     let abandoned = false;
     if (autoStart && !disabled) void Promise.resolve().then(() => { if (!abandoned) void start(); });
     return () => { abandoned = true; };
   }, [start, autoStart, disabled]);
   async function cancel() {
-    if (disabled || operation.current === "cancelling") return;
+    if (withdrawn || operation.current === "cancelling") return;
     operation.current = "cancelling";
     const id = attempt.current?.id;
     controller.current?.abort();
@@ -125,7 +127,6 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     } catch (cause) {
       if (controller.current === cancelled && !cancelled.signal.aborted) {
         if (cause instanceof ApiError && cause.code === "selection_invalidated") {
-          attempt.current = undefined;
           setStatus(undefined); setCancellation(undefined);
           invalidated(cause);
         } else if (exportUnavailable(cause)) {
@@ -174,8 +175,8 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     } finally { if (controller.current === abort) { operation.current = undefined; setChecking(false); } }
   }
   return <div className="report-export">
-    <button type="button" className="secondary" disabled={disabled || !selectionId || preparing || checking || cancelling
-      || retrying !== "status" && Boolean(admissionAllowed && !admissionAllowed())} onClick={() => void start()}>{preparing && !cancelling ? "Preparing export..." : retrying === "status" ? "Retry export status" : retrying === "admission" ? "Retry export request" : label}</button>
+    <button type="button" className="secondary" disabled={withdrawn || preparing || checking || cancelling
+      || !retrying && (disabled || !selectionId || Boolean(admissionAllowed && !admissionAllowed()))} onClick={() => void start()}>{preparing && !cancelling ? "Preparing export..." : retrying === "status" ? "Retry export status" : retrying === "admission" ? "Retry export request" : label}</button>
     {preparing || cancelling || cancellationFailed || retrying || visibleStatus?.status === "ready" ? <button type="button" className="secondary"
       disabled={cancelling} onClick={() => void cancel()}>{cancelling ? "Cancelling export..." : "Cancel export"}</button> : null}
     {visibleStatus ? <p role="status">{visibleStatus.status}: {visibleStatus.rows.toLocaleString()} rows, {visibleStatus.bytes.toLocaleString()} bytes.
@@ -184,7 +185,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
       {visibleStatus.status === "failed" ? ` ${visibleStatus.error ?? "Export failed; no partial file is available."}` : null}
       {visibleStatus.status === "expired" ? " Create a new export from a current selection." : null}
     </p> : null}
-    {!disabled && owner === context && error ? <p role="alert">{error}</p> : null}
+    {!withdrawn && owner === context && error ? <p role="alert">{error}</p> : null}
   </div>;
 }
 

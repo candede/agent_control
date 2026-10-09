@@ -18,6 +18,9 @@ import { AgentPeopleRepository } from "./agentPeople.js";
 import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord } from "../services/inventoryRecordProjection.js";
+import { seedReportSet } from "../../scripts/officialReportFixtures.js";
+import { OfficialReportImports } from "./officialReportImports.js";
+import { OfficialReportHistory } from "./officialReportHistory.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-automatic-source-revision-secret"; });
 
@@ -82,6 +85,33 @@ describe("session-driven automatic sync admission", () => {
       return page;
     };
   }
+
+  it.each(["failed", "permission_required", "waiting_authorization"] as const)(
+    "refreshes licenses after selecting a saved report but retains the %s retry cooldown", async status => {
+      const scope = owner(), principal = identity(scope), imports = new OfficialReportImports(fixture.runtime);
+      const saved = await seedReportSet(fixture.runtime, scope.tenantId, 1);
+      const other = await seedReportSet(fixture.runtime, scope.tenantId, 2);
+      const history = new OfficialReportHistory(fixture.runtime);
+      await history.ensure(scope.tenantId);
+      for (const report of [saved, other]) {
+        await history.connections.run(client => history.accepted(client, scope.tenantId, report.id));
+      }
+      const first = await repository.submitDue(scope);
+      await publishFixtureDirectory(fixture.runtime, principal, []);
+      await complete(scope, first.run!);
+      expect((await repository.submitDue(scope)).created).toBe(false);
+      await imports.confirm(principal, await imports.confirmPreview(principal, saved.id, "select"));
+      await publishFixtureDirectory(fixture.runtime, { ...principal, principalId: randomUUID() }, []);
+      const refresh = await repository.submitDue(scope);
+      expect(refresh).toMatchObject({ created: true, run: { automatic: true, sources: [{ source: "users" }] } });
+      await repository.updateSource(scope, refresh.run!.id, "users", {
+        status, count: null, message: "Fixture directory collection did not finish.", canRetry: true,
+      });
+      await repository.finishAutomatic(scope, refresh.run!.id);
+      await imports.confirm(principal, await imports.confirmPreview(principal, other.id, "select"));
+      expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: refresh.run!.id } });
+    },
+  );
 
   describe("persisted automatic revision boundaries", () => {
     it("separates persisted inventory and people publications from freshness and the Users response", async () => {

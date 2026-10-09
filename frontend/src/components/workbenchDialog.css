@@ -18,6 +18,8 @@
 .workbench-dialog-header { display: flex; justify-content: space-between; align-items: start; gap: 16px; flex-shrink: 0; padding: 22px 24px; border-bottom: 1px solid var(--border); }
 .workbench-dialog-header > div { flex: 1; min-width: 0; }
 .workbench-dialog-header h2 { margin: 0; font-size: 21px; }
+/* The heading is only a programmatic focus target (tabIndex -1), not an interactive control. */
+.workbench-dialog-header h2:focus-visible { outline: none; }
 .workbench-dialog-header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .workbench-dialog .workbench-dialog-close { flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; display: grid; place-items: center; padding: 8px; }
 .workbench-dialog-body { display: grid; align-content: start; gap: 20px; padding: 24px; overflow: auto; min-height: min(10rem, 50dvh); overscroll-behavior: contain; }

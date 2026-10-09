@@ -96,6 +96,85 @@ test("package controls stay enabled through diagnostic expiry and background inv
 });
 
 for (const action of ["block", "unblock"] as const) {
+  test(`${action} progress stays compact and mounted through polling and inventory refresh, then dismisses`, async ({ page }, info) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.clock.install({ time: new Date(layoutTime) });
+    let current: BulkActionJob = { ...job, action, targetBlockedState: action === "block",
+      currentAgentName: "Service desk assistant with a very long published version name ".repeat(8) };
+    let resultReads = 0;
+    let finishInventory: (() => Promise<void>) | undefined;
+    await page.addInitScript(jobId => {
+      localStorage.setItem("agent-control:active-bulk-job:v2:layout-tenant:layout-principal", jobId);
+    }, job.id);
+    await page.route(`**/api/agents/bulk-jobs/${job.id}**`, route => {
+      if (new URL(route.request().url()).pathname.endsWith("/items")) {
+        resultReads += 1;
+        return route.fulfill({ json: resultPage(current) });
+      }
+      return route.fulfill({ json: current });
+    });
+    await page.route(url => url.pathname === "/api/agent-inventory" && !url.searchParams.has("recordId"), route => {
+      if (current.status !== "succeeded") return route.fallback();
+      finishInventory = () => fulfillInventoryPage(route, unifiedAgents);
+    });
+    await page.goto("/agents");
+    const panel = page.getByRole("region", { name: "Exact package bulk actions" });
+    await expect(page.getByRole("checkbox", { name: "Select Service desk assistant", exact: true })).toBeDisabled();
+    await expect(panel.getByRole("status")).toHaveText("Running");
+    await expect(panel.getByRole("button", { name: "Close job summary" })).toHaveCount(0);
+    await expect(panel.getByText(/Current agent:/)).toHaveAttribute("title", current.currentAgentName!);
+    await panel.evaluate(element => {
+      element.setAttribute("data-removals", "0");
+      const observer = new MutationObserver(records => {
+        for (const record of records) {
+          for (const removed of record.removedNodes) {
+            if (removed.contains(element)) element.setAttribute("data-removals", String(Number(element.getAttribute("data-removals")) + 1));
+          }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+    const runningHeight = (await panel.boundingBox())!.height;
+    expect(runningHeight).toBeLessThanOrEqual(info.project.name === "mobile" ? 310 : 200);
+    expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(await panel.locator(".bulk-job-current").evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
+    await expect(panel.getByRole("button", { name: "Cancel unprocessed tasks" })).toBeInViewport();
+    for (const completed of [2, 3]) {
+      current = { ...current, completed, succeeded: completed, resultRevision: String(completed) };
+      await page.clock.runFor(1_100);
+      await expect(panel.getByRole("progressbar")).toHaveAttribute("value", String(completed));
+      await expect(panel).toHaveAttribute("data-removals", "0");
+      expect((await panel.boundingBox())!.height).toBe(runningHeight);
+    }
+    expect(resultReads).toBe(0);
+    await panel.screenshot({ path: info.outputPath(`${action}-compact-running.png`) });
+    current = { ...current, status: "succeeded", completed: 4, succeeded: 4, queued: 0,
+      currentAgentName: undefined, resultRevision: "4" };
+    await page.clock.runFor(1_100);
+    await expect(panel.getByRole("status")).toHaveText("Completed");
+    await expect.poll(() => Boolean(finishInventory)).toBe(true);
+    await expect(panel.getByRole("button", { name: "Close job summary" })).toBeEnabled();
+    await expect(panel.getByRole("progressbar")).toHaveCount(0);
+    await expect(panel.getByRole("group", { name: "Package job results" })).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: /Previous results|Next results/ })).toHaveCount(0);
+    await expect(panel.locator(".bulk-job > :last-child")).toHaveClass("bulk-progress-meta");
+    expect((await panel.boundingBox())!.height).toBeLessThanOrEqual(info.project.name === "mobile" ? 200 : 140);
+    await expect(panel).toHaveAttribute("data-removals", "0");
+    await finishInventory!();
+    await expect(page.getByRole("status", { name: "Updating agent results" })).toHaveCount(0);
+    await expect(panel).toHaveAttribute("data-removals", "0");
+    expect(resultReads).toBe(1);
+    expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect((await new AxeBuilder({ page }).include(".bulk-panel").analyze()).violations).toEqual([]);
+    await panel.screenshot({ path: info.outputPath(`${action}-compact-completed.png`) });
+    await panel.getByRole("button", { name: "Close job summary" }).click();
+    await expect(panel).toHaveCount(0);
+    await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Permissions", exact: true }).click();
+    await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(panel).toHaveCount(0);
+    expect(unexpected).toEqual([]);
+  });
+
   test(`interrupted ${action} is rediscovered after sign-in and resumes inline after reload`, async ({ page }, info) => {
     const unexpected = await mockLayoutApi(page);
     let current: BulkActionJob = {
@@ -125,7 +204,8 @@ for (const action of ["block", "unblock"] as const) {
     page.once("dialog", dialog => dialog.accept());
     await panel.getByRole("button", { name: "Resume unprocessed tasks" }).click();
     await expect(panel.getByRole("status")).toHaveText("Completed");
-    await expect(panel.getByText("10 of 10 processed", { exact: true })).toBeVisible();
+    await expect(panel.getByText("10 succeeded", { exact: true })).toBeVisible();
+    await expect(panel.getByRole("progressbar")).toHaveCount(0);
     expect(commands).toEqual([`/api/agents/bulk-jobs/${job.id}/resume`]);
     await expect(page).toHaveURL("/agents");
     await expect(page.getByRole("button", { name: "Jobs", exact: true })).toHaveCount(0);
@@ -211,6 +291,77 @@ for (const [status, label] of [
     expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
     expect((await new AxeBuilder({ page }).include(".bulk-panel").analyze()).violations).toEqual([]);
     await panel.screenshot({ path: info.outputPath(`${status}-job.png`) });
+    expect(unexpected).toEqual([]);
+  });
+}
+
+for (const status of ["partial", "succeeded"] as const) {
+  test(`${status} feedback and five selected packages keep action labels and selection counts separated`, async ({ page }, info) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.clock.setFixedTime(new Date(layoutTime));
+    await page.route(url => ["/api/capabilities", "/api/capabilities/check"].includes(url.pathname), route => route.fulfill({ json: {
+      value: capabilityViews.map(view => ["graph.package.block.manage", "graph.package.access.manage"].includes(view.definition.id) ? {
+        ...view,
+        decision: { capabilityId: view.definition.id, status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [] },
+      } : view),
+    } }));
+    const inventory = {
+      ...unifiedAgents,
+      counts: { ...unifiedAgents.counts, total: 5, scoped: 5, filtered: 5, packageTargets: 5 },
+      value: Array.from({ length: 5 }, (_, index) => ({
+        ...unifiedAgents.value[0], id: `graph_packages:panel-package-${index}`, displayName: `Panel agent ${index + 1}`,
+        packages: [{ ...unifiedAgents.value[0].packages[0], id: `panel-package-${index}`, displayName: `Panel agent ${index + 1}` }],
+      })),
+    };
+    const current: BulkActionJob = { ...job, status, canResume: false, total: 5, completed: 5,
+      succeeded: status === "partial" ? 4 : 5, queued: 0, inconclusive: status === "partial" ? 1 : 0,
+      reconciliationRequired: status === "partial" ? 1 : 0 };
+    await page.route(url => url.pathname === "/api/agent-inventory" && !url.searchParams.has("recordId"),
+      route => fulfillInventoryPage(route, inventory));
+    await page.route(`**/api/agents/bulk-jobs/${job.id}/items?*`, route => route.fulfill({ json: resultPage(current) }));
+    await page.route(`**/api/agents/bulk-jobs/${job.id}`, route => route.fulfill({ json: current }));
+    await page.goto(`/agents?controlJob=${job.id}`);
+    const panel = page.getByRole("region", { name: "Exact package bulk actions" });
+    await expect(panel.getByRole("status")).toHaveText(status === "partial" ? "Needs review" : "Completed");
+    await page.getByRole("button", { name: "Select all 5 matching published versions", exact: true }).click();
+    await expect(panel.getByText("5 selected", { exact: true })).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Check uncertain results" })).toHaveCount(status === "partial" ? 1 : 0);
+    const actions = panel.locator(".bulk-buttons");
+    const labels = ["Block selected packages", "Unblock selected packages", "Manage access"];
+    for (const width of info.project.name === "desktop" ? [1920, 1440, 1024, 800] : [360, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+      const bounds = [];
+      for (const label of labels) {
+        const button = actions.getByRole("button", { name: label, exact: true });
+        await expect(button).toBeEnabled();
+        bounds.push((await button.boundingBox())!);
+        expect(await button.evaluate(element => {
+          const text = document.createRange();
+          text.selectNodeContents(element);
+          return text.getClientRects().length;
+        }), `${label} should fit on one line at ${width}px`).toBe(1);
+      }
+      expect(new Set(bounds.map(bounds => bounds.height)).size).toBe(1);
+      const counts = page.locator(".selection-summary").filter({ hasText: "5 agents selected on this page" });
+      const countBounds = await counts.locator("span").evaluateAll(elements => elements.map(element => {
+        const bounds = element.getBoundingClientRect();
+        return { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom };
+      }));
+      expect(countBounds).toHaveLength(2);
+      expect(countBounds[1].top >= countBounds[0].bottom + 4
+        || countBounds[1].left >= countBounds[0].right + 8).toBe(true);
+      expect(await counts.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    }
+    await page.setViewportSize({ width: info.project.name === "desktop" ? 1920 : 360, height: 1000 });
+    expect((await new AxeBuilder({ page }).include(".bulk-panel").analyze()).violations).toEqual([]);
+    await panel.screenshot({ path: info.outputPath(`${status}-with-selection.png`) });
+    if (status === "succeeded") {
+      await panel.getByRole("button", { name: "Close job summary" }).click();
+      await expect(panel.getByRole("group", { name: "Package job progress" })).toHaveCount(0);
+      await expect(panel.getByText("5 selected", { exact: true })).toBeVisible();
+    }
     expect(unexpected).toEqual([]);
   });
 }

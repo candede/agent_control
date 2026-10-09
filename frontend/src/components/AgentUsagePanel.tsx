@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type MutableRefObject } from "react";
 import { skipToken, useMutationState, useQuery, type QueryClient } from "@tanstack/react-query";
 import type { CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageMutation, CandidateAgentUsageUsers, AgentUsageUser } from "../../../backend/src/types/officialReportApi";
 import type { InventoryReportContext, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
@@ -32,6 +32,10 @@ export function AgentUsagePanel(props: Props) {
   const capability = useContext(CapabilityContext), user = capability?.user;
   const principalScope = JSON.stringify([user?.tenantId, user?.homeAccountId, [...(user?.roles ?? [])].sort()]);
   const client = useSavedQueryClient();
+  // Owned here because AgentUsageSession remounts whenever the inventory or report revision changes.
+  const [investigatedUser, setInvestigatedUser] = useState<string>();
+  const investigationTrigger = useRef<HTMLButtonElement | null>(null);
+  if (props.view !== "users" && investigatedUser) setInvestigatedUser(undefined);
   const [mutationOwner, setMutationOwner] = useState({ client, principalScope });
   if (mutationOwner.client !== client || mutationOwner.principalScope !== principalScope) setMutationOwner({ client, principalScope });
   const committedOwner = useRef(mutationOwner);
@@ -99,14 +103,21 @@ export function AgentUsagePanel(props: Props) {
   }, []);
   if (capability && !hasRole(user, "AgentControl.Viewer")) return <p role="alert">Current Viewer access is required to read agent usage.</p>;
   const readScope = JSON.stringify([principalScope, props.record.id, context?.revision, context?.reports.setId, props.inventoryRevision, inventorySelectionId, removalRevision.data?.revision ?? 0]);
-  return <AgentUsageSession key={readScope} principalScope={readScope} recoverInventory={recoverInventory} usageReady={usageReady} {...props}
+  return <><AgentUsageSession key={readScope} principalScope={readScope} recoverInventory={recoverInventory} usageReady={usageReady} {...props}
+    investigationTrigger={investigationTrigger} onInvestigateUser={setInvestigatedUser}
     client={client} busy={busy} submitRemoval={submitRemoval} removalUncertain={removalRevision.data?.uncertain ?? false}
     context={context} inventorySelectionId={inventorySelectionId}
-    canRemoveReviewedAssociations={props.canRemoveReviewedAssociations && (!capability || hasRole(user, "AgentControl.Admin"))} />;
+    canRemoveReviewedAssociations={props.canRemoveReviewedAssociations && (!capability || hasRole(user, "AgentControl.Admin"))} />
+    {investigatedUser ? <UserDetailModal key={investigatedUser} identity={investigatedUser} kind="report"
+      investigationAgent={{ recordId: props.record.id, name: props.record.displayName }}
+      returnFocusTo={investigationTrigger} closeLabel="Close user details" onClose={() => setInvestigatedUser(undefined)} /> : null}
+  </>;
 }
 
 function AgentUsageSession({ record, view, context: inventoryContext, dataRevision = 0, canRemoveReviewedAssociations: canManage,
-  disabled, principalScope, inventorySelectionId, onReloadInventory, recoverInventory, usageReady, client, busy, submitRemoval, removalUncertain }: Props & {
+  disabled, principalScope, inventorySelectionId, onReloadInventory, recoverInventory, usageReady, client, busy, submitRemoval, removalUncertain,
+  investigationTrigger, onInvestigateUser }: Props & {
+    investigationTrigger: MutableRefObject<HTMLButtonElement | null>; onInvestigateUser: (username: string) => void;
     principalScope: string; recoverInventory: (source?: RecoverySource) => void; usageReady: (source?: RecoverySource) => void;
     client: QueryClient; busy: boolean; removalUncertain: boolean; submitRemoval: (input: CandidateAgentUsageMutation, uiSignal: AbortSignal) => Promise<void>;
   }) {
@@ -360,7 +371,8 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
       {usersRequested && !usersInvalidated && !mismatched && summary.data?.status === "linked" && context
         && context.reportSetId === requestedSetId && usersContextKey === validatedUsersContext
         ? <AgentUsers key={usersContextKey}
-        recordId={record.id} agentName={record.displayName} context={context} revision={dataRevision} inventorySelectionId={inventorySelectionId}
+        recordId={record.id} agentName={record.displayName} context={context} revision={dataRevision}
+        investigationTrigger={investigationTrigger} onInvestigateUser={onInvestigateUser} inventorySelectionId={inventorySelectionId}
         setId={reportOverride} revalidating={revalidating} active={view === "users" && Boolean(usage)}
         onReady={usageReady} onInvalidated={recoverInventory} onRestartSelection={restartUsage} /> : null}
       {view === "users" && canManageViewedReport && !usersInvalidated && !changed
@@ -420,14 +432,13 @@ function targetLabel(target: CandidateAgentUsageAssociations["value"][number]["t
 function UsageMetric({ label, value }: { label: string; value: string }) {
   return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong></dd></div>;
 }
-function AgentUsers({ recordId, agentName, context, revision, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active }: {
+function AgentUsers({ recordId, agentName, context, revision, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active,
+  investigationTrigger, onInvestigateUser }: {
+  investigationTrigger: MutableRefObject<HTMLButtonElement | null>; onInvestigateUser: (username: string) => void;
   recordId: string; agentName: string; context: CandidateAgentUsageSummary["context"]; revision: number; onRestartSelection: () => void;
   inventorySelectionId?: string; setId?: string; onInvalidated: () => void; onReady: () => void; revalidating: boolean; active: boolean;
 }) {
   const [search, setSearch] = useState("");
-  const [investigatedUser, setInvestigatedUser] = useState<string>();
-  const investigationTrigger = useRef<HTMLButtonElement | null>(null);
-  if (!active && investigatedUser) setInvestigatedUser(undefined);
   const [requested, setRequested] = useState(active);
   const [readRevision, setReadRevision] = useState(revision);
   if (active && !requested) setRequested(true);
@@ -454,18 +465,14 @@ function AgentUsers({ recordId, agentName, context, revision, onRestartSelection
       <thead><tr><th scope="col">User</th><th scope="col">Responses</th></tr></thead>
       <tbody>{data.value.map(user => <tr key={user.username}><th scope="row">
         <button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" disabled={read.loading || revalidating || Boolean(changed)}
-          aria-label={`View logs for ${user.displayName} on ${agentName}`} onClick={event => {
+          aria-label={`View details for ${user.displayName} on ${agentName}`} onClick={event => {
             investigationTrigger.current = event.currentTarget;
-            setInvestigatedUser(user.username);
+            onInvestigateUser(user.username);
           }}>{user.displayName !== user.username
             ? <><span>{user.displayName}</span><small>{user.username}</small></> : user.username}</button>
         </th><td>{usageCount(user.responses)}</td></tr>)}</tbody>
     </table></div> : data ? <p>{data.counts.filtered > 0 ? "No users on this page. Use the page controls to continue."
       : normalizedSearch ? "No users match your search." : "No users listed in this report."}</p> : null}
     <ReportPageControls {...read} data={data} loading={read.loading || revalidating} disabled={Boolean(changed)} label="users" />
-    {investigatedUser && !changed ? <UserDetailModal key={investigatedUser} identity={investigatedUser} kind="report"
-      selectionId={context.selectionId} initialTab="purview" investigationAgent={{ recordId, name: agentName }}
-      returnFocusTo={investigationTrigger} closeLabel="Close user logs" onClose={() => setInvestigatedUser(undefined)}
-      onRestartSelection={onRestartSelection} onSelectionInvalidated={onInvalidated} /> : null}
   </section>;
 }

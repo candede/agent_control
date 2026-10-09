@@ -171,6 +171,11 @@ async function verifyInventoryGenerationSchema(database: Pick<pg.Pool, "query">)
     "inventory_compaction_refs", "inventory_canonical_ids", "inventory_read_contexts", "inventory_revisions", "inventory_exact_heads"];
   const rows = (await database.query(`SELECT name,to_regclass('public.'||name) AS relation FROM unnest($1::text[]) name`, [tables])).rows;
   if (rows.length !== tables.length || rows.some(row => !row.relation)) throw new Error("inventory_schema_missing");
+  const payloadBound = (await database.query(`SELECT convalidated
+    AND regexp_replace(pg_get_expr(conbin,conrelid),'[[:space:]]+',' ','g')=$1 AS valid
+    FROM pg_constraint WHERE conrelid='inventory_facts'::regclass AND conname='inventory_facts_payload_check' AND contype='c'`,
+  ["(octet_length((payload)::text) <= CASE WHEN (kind = 'element'::text) THEN 4194304 ELSE 262144 END)"])).rows[0];
+  if (payloadBound?.valid !== true) throw new Error("inventory_payload_schema");
   const triggers = (await database.query(`SELECT count(*)::int AS count FROM pg_trigger
     WHERE NOT tgisinternal AND tgenabled<>'D' AND tgname IN ('inventory_immutable','inventory_interval_fence','inventory_reachability',
       'inventory_audit_insert','inventory_audit_delete','inventory_control_fence','inventory_revision_fence','inventory_exact_fence')`)).rows[0].count;

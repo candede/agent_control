@@ -6,7 +6,7 @@ import { packageControlIdentityChanged, type SavedPackageControl } from "../serv
 import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "../services/packageMutationState.js";
 import { restoreInventoryRecord, type InventoryFact } from "../services/inventoryRecordProjection.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import { dataLimitError, encodeBatch } from "./dataBounds.js";
+import { dataLimitError, dataLimits, encodeBatch, encodeInventoryFactBatch } from "./dataBounds.js";
 
 type Scope = { tenantId: string; principalId: string };
 
@@ -111,11 +111,13 @@ async function readControlIdentity(client: pg.PoolClient, scope: Scope, incoming
     const rows = (await client.query(`SELECT ordinal,kind,value,payload FROM inventory_facts WHERE generation_id=$1 AND identity=$2
       AND ordinal>$3 AND (kind='elementTypes' OR $4 AND (kind='elementGroup'
         OR kind='element' AND lower(payload->>'elementType') IN ('agentmetadatas','declarativecopilots','bots','customenginecopilots')))
-      ORDER BY ordinal LIMIT 2`, [saved.generation_id, saved.identity, after, incoming.elementDetails !== undefined])).rows;
+      ORDER BY ordinal LIMIT 1`, [saved.generation_id, saved.identity, after, incoming.elementDetails !== undefined])).rows;
     if (!rows.length) break;
-    encodeBatch(rows);
+    encodeInventoryFactBatch(rows);
     bytes += Buffer.byteLength(JSON.stringify(rows));
-    if (bytes > 1_048_576) throw dataLimitError("package_control_identity_bytes", 1_048_576, bytes);
+    if (bytes > dataLimits.agentDefinitionWorkBytes) {
+      throw dataLimitError("package_control_identity_bytes", dataLimits.agentDefinitionWorkBytes, bytes);
+    }
     facts.push(...rows); after = rows.at(-1)!.ordinal;
   }
   return restoreInventoryRecord(saved.residual, facts, "packages") as CopilotPackageDetail;

@@ -1,4 +1,4 @@
-import { useContext, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useContext, useEffect, useEffectEvent, useId, useLayoutEffect, useRef, useState } from "react";
 import { hashKey, useQuery, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { CapabilityContext } from "./capabilityContext";
 import { ApiError } from "./api/client";
@@ -68,10 +68,11 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const scope = useReportPrincipalScope();
   const client = useSavedQueryClient();
   const owner = useId();
+  const liveKey = hashKey([scope, path, query]);
   const key = hashKey([scope, path, query, query.selectionId ? undefined : revision]);
   const [highestRevision, setHighestRevision] = useState(revision);
-  const [navigation, setNavigation] = useState<{ key: string; cursor?: string; selectionId?: string; restart: number; shared?: boolean; publication?: string }>({ key, restart: 0, shared: !freshCaptureOnMount });
-  const [captured, setCaptured] = useState<{ key: string; restart: number; id: string; data: Page }>();
+  const [navigation, setNavigation] = useState<{ key: string; cursor?: string; selectionId?: string; restart: number; shared?: boolean; publication?: string; renewal?: string }>({ key, restart: 0, shared: !freshCaptureOnMount });
+  const [captured, setCaptured] = useState<{ key: string; restart: number; id: string; data: Page; live: boolean }>();
   const [rejected, setRejected] = useState<{ key: string; restart: number }>();
   const [manualRetry, setManualRetry] = useState<{ key: string; token: object }>();
   const reusablePage = retainedPagePaths.has(path) && !query.selectionId;
@@ -95,7 +96,8 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const retiredShared = !query.selectionId && sharedQuery && retiredCaptures.has(sharedQuery.queryKey)
     && !(captured?.key === key && captured.restart === current.restart);
   if (retiredShared && current.shared) setNavigation({ ...current, shared: false });
-  const restartKey = current.publication ? `publication:${current.publication}` : current.shared && !retiredShared ? 0 : `${owner}:${current.restart}`;
+  const restartKey = current.renewal ? `renewal:${current.renewal}`
+    : current.publication ? `publication:${current.publication}` : current.shared && !retiredShared ? 0 : `${owner}:${current.restart}`;
   const retain = enabled && restartKey === 0 && reusablePage && !current.cursor;
   const queryKey = ["saved", "record-page", key, revision, restartKey, current.selectionId ?? query.selectionId, current.cursor, enabled];
   const retryKey = JSON.stringify(queryKey);
@@ -103,7 +105,6 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const actionKey = JSON.stringify([key, revision, current.restart, enabled]);
   const [actionOwner, setActionOwner] = useState({ client, key: actionKey });
   if (actionOwner.client !== client || actionOwner.key !== actionKey) setActionOwner({ client, key: actionKey });
-  const publicationOwned = useRef<{ owner: typeof actionOwner } | undefined>(undefined);
   const actions = useRef<{ owner: typeof actionOwner; page: string; moved: boolean; restarted: boolean } | undefined>(undefined);
   useLayoutEffect(() => {
     actions.current = { owner: actionOwner, page: retryKey, moved: false, restarted: false };
@@ -125,15 +126,16 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       && (!request.selectionId || !captured || captured.key !== key || captured.restart !== current.restart
         || selectedReadRemaining(captured.data.selection) > 0)
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
-    placeholderData: (previous, previousQuery) => previousQuery?.queryKey[2] === key
-      && previousQuery.queryKey[4] === restartKey && previousQuery.queryKey[6] === current.cursor
+    placeholderData: (previous, previousQuery) => previousQuery?.meta?.liveReportKey === liveKey
+      && (previousQuery.queryKey[3] !== revision && current.shared || current.renewal !== undefined || current.publication !== undefined
+        || previousQuery.queryKey[4] === restartKey && previousQuery.queryKey[6] === current.cursor)
       && previousQuery.queryKey[7] === enabled ? previous : undefined,
     staleTime: Infinity,
     refetchOnMount: cached => retain && (retiredCaptures.has(cached.queryKey)
       || !cached.state.data || !canReuseSelectedRead(cached.state.data.selection)) ? "always" : false,
     structuralSharing: false,
     gcTime: retain ? cohortCacheMs : 0,
-    meta: { retainReportPage: retain },
+    meta: { retainReportPage: retain, liveReportKey: liveKey },
   }, client);
   const refetch = read.refetch;
   const awaitingCapture = captured?.key !== key || captured.restart !== current.restart;
@@ -152,6 +154,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   useEffect(() => {
     if (!enabled || externallyInvalidated) return;
     const revalidate = () => {
+      if (document.visibilityState !== "visible" || !navigator.onLine) return;
       const cached = cachedKey ? client.getQueryState(cachedKey) : undefined;
       const failure = cached?.error;
       const needsRecovery = cached?.fetchStatus === "idle" && !failure
@@ -165,7 +168,9 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   }, [cachedKey, client, enabled, selected, externallyInvalidated, refetch, revalidateOnFocus]);
   const retiredCapture = awaitingCapture && Boolean(retirement);
   if (read.data && !read.isError && !read.isFetching && !retiredCapture && (awaitingCapture || captured?.data !== read.data)) {
-    setCaptured({ key, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data });
+    setCaptured({ key, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data,
+      live: leaseActive || captured?.key === key && captured.restart === current.restart
+        && captured.id === read.data.selection.id.toLowerCase() && captured.live });
   }
   const expired = Boolean(selected && !leaseActive) || isExpiredSelection(read.error);
   const error = externallyInvalidated ? new ApiError(409, "selection_invalidated", "The report selection changed or expired. Load a new selection.")
@@ -173,32 +178,64 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     ? new ApiError(409, "selection_invalidated", "The report selection changed or expired. Load a new selection.") : read.error
       ?? (incompleteRead && !expired ? new Error(pendingRead ? "The saved-data read was cancelled. Retry saved data." : "Saved data needs reloading. Retry saved data.") : null);
   const invalidated = error instanceof ApiError && error.code === "selection_invalidated" && !isExpiredSelection(error);
-  const revalidatingCache = retain && awaitingCapture && read.isFetching;
+  const revalidatingCache = retain && awaitingCapture && read.isFetching && !read.isPlaceholderData;
   const historical = isExpiredSelection(error) && !awaitingCapture ? captured?.data : undefined;
   const data = read.isError && !isExpiredSelection(read.error) || withdrawsSelectedRead(read.error) || !enabled || externallyInvalidated || retiredCapture || revalidatingCache || incompleteRead && !expired || manualRetry?.key === retryKey ? undefined : historical ?? read.data;
-  const frozenData = enabled && !externallyInvalidated && !retiredCapture && (!error || isExpiredSelection(error))
+  const selectedData = enabled && !externallyInvalidated && !retiredCapture && (!error || isExpiredSelection(error))
     && manualRetry?.key !== retryKey ? data ?? (!awaitingCapture ? captured?.data : undefined) : undefined;
   const publication = useContext(PublicationContext);
   const admitPublication = publication?.admit;
+  const observedPublication = useRef<{ key: string; revision: string } | undefined>(undefined);
+  const publicationRevision = publication?.revisions?.users;
+  const renewalDue = Boolean(enabled && !query.selectionId && data && expired && !externallyInvalidated && !invalidated
+    && (!error || isExpiredSelection(error)) && !incompleteRead && !read.isPlaceholderData
+    && !query.inventorySelectionId
+    && captured?.key === key && captured.live && captured.id === data.selection.id.toLowerCase()
+    && current.renewal !== data.selection.id.toLowerCase());
+  const available = document.visibilityState === "visible" && navigator.onLine;
+  const renewing = enabled && !invalidated && !externallyInvalidated && (!error || isExpiredSelection(error))
+    && (renewalDue || Boolean(query.selectionId && restartParent && expired)
+      || Boolean(current.renewal && read.isFetching && read.isPlaceholderData));
+  useEffect(() => {
+    if (!renewalDue || !available || read.isFetching || !data || !actions.current || actions.current.restarted) return;
+    actions.current.restarted = true;
+    if (publicationRevision) observedPublication.current = { key, revision: publicationRevision };
+    // Independent operation inputs remain valid while the view captures fresh data.
+    invalidateReportPages(client, key, revision, { excludeRestartKey: `renewal:${data.selection.id.toLowerCase()}` });
+    setNavigation({ key, restart: current.restart + 1, renewal: data.selection.id.toLowerCase() });
+  }, [available, client, current.restart, data, key, publicationRevision, read.isFetching, renewalDue, revision]);
+  const expiredChild = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!enabled || !available || !expired || !query.selectionId || !restartParent
+      || invalidated || read.error && !isExpiredSelection(read.error) || expiredChild.current === query.selectionId) return;
+    expiredChild.current = query.selectionId;
+    restartParent();
+  }, [available, enabled, read.error, expired, invalidated, query.selectionId, restartParent]);
   useEffect(() => {
     if (data) admitPublication?.(data.selection.publicationRevisions);
   }, [admitPublication, data]);
-  const observedPublication = useRef<{ key: string; revision: string } | undefined>(undefined);
-  const publicationRevision = publication?.revisions?.users;
+  const capturePublication = useEffectEvent((publicationRevision: string) => {
+    observedPublication.current = { key, revision: publicationRevision };
+    invalidateReportPages(client, key, revision);
+    setNavigation({ key, restart: current.restart + 1, publication: publicationRevision });
+  });
   useEffect(() => {
     if (!data || !publicationRevision || read.isFetching || read.isError) return;
     const previous = observedPublication.current?.key === key ? observedPublication.current.revision : undefined;
     if (previous === publicationRevision) return;
-    observedPublication.current = { key, revision: publicationRevision };
-    if (!previous && data.selection.publicationRevisions.users === publicationRevision) return;
-    if (!selectedReadRemaining(data.selection)) return;
-    if (query.selectionId || query.inventorySelectionId || query.setId || current.cursor
-      || publicationOwned.current?.owner === actionOwner) {
-      // A publication can revalidate frozen evidence, never replace its identity.
+    if (!previous && data.selection.publicationRevisions.users === publicationRevision) {
+      observedPublication.current = { key, revision: publicationRevision };
+      return;
+    }
+    if (query.selectionId || query.inventorySelectionId) {
+      // Children follow their parent's replacement rather than changing identity here.
+      if (!selectedReadRemaining(data.selection)) return;
+      observedPublication.current = { key, revision: publicationRevision };
       void refetch({ cancelRefetch: false });
     } else {
-      invalidateReportPages(client, key, revision);
-      setNavigation({ key, restart: current.restart + 1, publication: publicationRevision });
+      let active = true;
+      queueMicrotask(() => { if (active) capturePublication(publicationRevision); });
+      return () => { active = false; };
     }
   }, [actionOwner, client, current.cursor, current.restart, data, key, publicationRevision,
     query.inventorySelectionId, query.selectionId, query.setId, read.isError, read.isFetching, refetch, revision]);
@@ -221,14 +258,13 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     setNavigation({ ...current, key, cursor, selectionId: data.selection.id.toLowerCase() });
   }
   return {
-    data, frozenData, loading: enabled && !externallyInvalidated && !invalidated && read.isFetching,
+    data, selectedData, renewing, loading: enabled && !externallyInvalidated && !invalidated && (read.isFetching || renewalDue && available),
     // A page transition does not replace the validated selection used by facets and exports.
     selectionId: enabled && !error && !expired && !retiredCapture && manualRetry?.key !== retryKey
       ? data?.selection.id.toLowerCase() ?? (!awaitingCapture ? captured?.id : undefined) : undefined,
     error, invalidated, leaseEnded: expired, selectionRevision: current.restart,
     publicationRevisions: data?.selection.publicationRevisions,
     isCurrentData,
-    ownPublication: () => { if (ownsSelection()) publicationOwned.current = { owner: actionOwner }; },
     invalidateSelection: (error?: Error) => {
       if (!ownsSelection()) return;
       const rejectedId = data?.selection.id ?? selectionId;
@@ -239,11 +275,13 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
         return;
       }
       invalidateReportPages(client, key, revision, { selectionId: rejectedId });
+      if (read.isPlaceholderData && read.isFetching) return;
       setRejected({ key, restart: current.restart });
     },
     next: () => move(data?.page.nextCursor), previous: () => move(data?.page.previousCursor),
     restartable: !query.selectionId || Boolean(restartParent),
     restart: () => {
+      if (renewing) return;
       if (!ownsSelection() || !actions.current || actions.current.restarted) return;
       const action = actions.current;
       action.restarted = true;

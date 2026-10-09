@@ -6,6 +6,8 @@ import type pg from "pg";
 
 export const dataLimits = Object.freeze({
   batchRows: 250, batchBytes: 1_048_576, residualBytes: 262_144,
+  agentDefinitionBytes: 4 * 1024 ** 2, agentDefinitionTransferBytes: 5 * 1024 ** 2,
+  agentDefinitionWorkBytes: 16 * 1024 ** 2,
   generationBytes: 8 * 1024 ** 3, tenantBytes: 64 * 1024 ** 3,
   sourceRows: 100_000, derivedRows: 200_000, plansPerUser: 1000, pages: 10_000, wireRows: 5_000_000,
   pageRows: 100, roots: 16, queue: 32, acquireMs: 5_000,
@@ -54,6 +56,15 @@ export class BatchResidency {
 }
 
 export function encodeBatch(rows: readonly unknown[], parameters: readonly unknown[] = []) {
+  return encodeBoundedBatch(rows, parameters, dataLimits.batchBytes);
+}
+
+export function encodeInventoryFactBatch(rows: readonly { kind: string }[], parameters: readonly unknown[] = []) {
+  return encodeBoundedBatch(rows, parameters, rows.length === 1 && rows[0].kind === "element"
+    ? dataLimits.agentDefinitionTransferBytes : dataLimits.batchBytes);
+}
+
+function encodeBoundedBatch(rows: readonly unknown[], parameters: readonly unknown[], maximumBytes: number) {
   if (rows.length > dataLimits.batchRows) throw dataLimitError("data_batch_rows", dataLimits.batchRows, rows.length);
   peakCheckpoint("batch.stringify");
   const json = JSON.stringify(rows);
@@ -62,8 +73,27 @@ export function encodeBatch(rows: readonly unknown[], parameters: readonly unkno
   // content, not a JSON-escaped copy of the complete parameter array.
   const bytes = [ ...parameters, json ].reduce<number>((total, value) => total + 4 + (value === null || value === undefined
     ? 0 : Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value))), 0);
-  if (bytes > dataLimits.batchBytes) throw dataLimitError("data_batch_bytes", dataLimits.batchBytes, bytes);
+  if (bytes > maximumBytes) throw dataLimitError("data_batch_bytes", maximumBytes, bytes);
   return { json, bytes, hash: digest(json) };
+}
+
+export function assertAgentDefinitionBytes(bytes: number) {
+  if (bytes <= dataLimits.agentDefinitionBytes) return;
+  operationalLog("warn", "data_detail_limit_exceeded", {
+    errorCode: "data_detail_bytes", stage: "database", field: "payload", bytes, maximumLength: dataLimits.agentDefinitionBytes,
+  });
+  throw dataLimitError("data_detail_bytes", dataLimits.agentDefinitionBytes, bytes);
+}
+
+export async function assertInventoryFactDatabaseBounds(client: pg.PoolClient, json: string,
+  rows: readonly { kind: string; payload: unknown }[]) {
+  if (rows.every(row => Buffer.byteLength(JSON.stringify(row.payload)) <= 512)) return;
+  const result = await client.query(`SELECT
+    max(octet_length(payload::text)) FILTER(WHERE kind='element')::text AS detail,
+    max(octet_length(payload::text)) FILTER(WHERE kind<>'element')::text AS residual
+    FROM jsonb_to_recordset($1::jsonb) AS record(kind text,payload jsonb)`, [json]);
+  assertResidualBytes(Number(result.rows[0].residual ?? 0), "database", "payload");
+  assertAgentDefinitionBytes(Number(result.rows[0].detail ?? 0));
 }
 
 export async function assertResidualDatabaseBounds(client: pg.PoolClient, json: string, field: "residual" | "payload" = "residual",

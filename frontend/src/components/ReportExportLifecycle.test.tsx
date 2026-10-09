@@ -5,7 +5,7 @@ import * as api from "../api/reportData";
 import { ApiError } from "../api/client";
 import { createSavedQueryClient } from "../savedQueries";
 import { deferred } from "../test/deferred";
-import { combinedUser, reportAgent, reportPage, reportUser } from "../test/reportDataFixture";
+import { combinedUser, reportAgent, reportPage, reportSelection, reportUser } from "../test/reportDataFixture";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportingView } from "./ReportingView";
@@ -37,6 +37,34 @@ afterEach(() => {
 });
 
 describe.each(views)("$name export and page lifetimes", ({ element, page, row, exportLabel }) => {
+  if (exportLabel === "Export users CSV") it("does not freeze a Users table at lease expiry while its export is building", async () => {
+    const selected = page();
+    selected.selection = reportSelection(2, Date.now());
+    selected.selection.expiresAt = new Date(Date.now() + 3000).toISOString();
+    const replacement = page();
+    replacement.selection = reportSelection(3, Date.now());
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(selected).mockResolvedValue(replacement);
+    vi.mocked(api.createReportExport).mockResolvedValue({ id: "artifact" });
+    const ready = { id: "artifact", status: "ready" as const, rows: 117, bytes: 100,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
+    vi.mocked(api.reportExportStatus).mockResolvedValue({ ...ready, status: "building" });
+    render(element);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: exportLabel })));
+    const signal = vi.mocked(api.createReportExport).mock.calls[0][1]!;
+    await act(() => vi.advanceTimersByTimeAsync(3001));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByRole("button", { name: row })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
+    vi.mocked(api.reportExportStatus).mockResolvedValue(ready);
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(screen.getByRole("link", { name: "Download CSV" })).toBeVisible();
+    expect(api.createReportExport).toHaveBeenCalledOnce();
+  });
+
   it("does not revive export-rejected cached evidence on an immediate view revisit", async () => {
     const client = createSavedQueryClient();
     clients.push(client);
@@ -68,7 +96,7 @@ describe.each(views)("$name export and page lifetimes", ({ element, page, row, e
     { phase: "building", age: 0 }, { phase: "ready", age: 0 },
     { phase: "building", age: 31_000 }, { phase: "ready", age: 31_000 },
   ] as const).flatMap(value => (["focus", "publication"] as const).map(trigger => ({ ...value, trigger }))))(
-    "preserves a $phase export during pinned $trigger revalidation at cache age $age", async ({ phase, age, trigger }) => {
+    "preserves a $phase export during table $trigger refresh at cache age $age", async ({ phase, age, trigger }) => {
     const selected = page();
     vi.mocked(api.readReportPage).mockResolvedValue(selected);
     vi.mocked(api.createReportExport).mockResolvedValue({ id: "artifact" });
@@ -93,12 +121,13 @@ describe.each(views)("$name export and page lifetimes", ({ element, page, row, e
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe(selected.selection.id);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe(trigger === "focus" ? selected.selection.id : undefined);
     expect(signal.aborted).toBe(false);
     expect(screen.getByRole("button", { name: "Cancel export" })).toBeEnabled();
     if (phase === "ready") expect(screen.getByRole("link", { name: "Download CSV" })).toBeVisible();
     else expect(screen.getByRole("button", { name: "Preparing export..." })).toBeDisabled();
-    await act(async () => { pending.resolve(selected); await vi.advanceTimersByTimeAsync(1); });
+    const replacement = { ...selected, selection: { ...selected.selection, id: "new-table-selection" } };
+    await act(async () => { pending.resolve(trigger === "focus" ? selected : replacement); await vi.advanceTimersByTimeAsync(1); });
     vi.mocked(api.reportExportStatus).mockResolvedValue(ready);
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
     expect(screen.getByRole("link", { name: "Download CSV" })).toBeVisible();

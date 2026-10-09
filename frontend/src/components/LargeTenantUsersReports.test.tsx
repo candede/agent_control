@@ -178,7 +178,7 @@ describe("selected users and reports client boundary", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("withdraws stale historical rows and cursors while a known revision is recaptured", async () => {
+  it("retains historical rows but fences old cursors while a known revision is recaptured", async () => {
     const page = reportPage([combinedUser()], { page: { limit: 50, nextCursor: "next", previousCursor: null } });
     const replacement = deferred<ReturnType<typeof reportPage>>();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(page).mockReturnValueOnce(replacement.promise);
@@ -187,8 +187,8 @@ describe("selected users and reports client boundary", () => {
     await screen.findByRole("button", { name: "User 1" });
     view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
-    expect(screen.getByText("Loading saved data...")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "User 1" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading saved data...")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "User 1" })).toBeVisible();
     const next = screen.getByRole("button", { name: "Next users" });
     expect(next).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(next);
@@ -492,7 +492,7 @@ describe("selected users and reports client boundary", () => {
     act(() => result.current.next());
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     rerender({ revision: 1 });
-    expect(result.current.data).toBeUndefined();
+    expect(result.current.data).toEqual(first);
     expect(result.current.loading).toBe(true);
     expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users", { ...query, limit: 50 }, expect.any(AbortSignal));
     const latest = reportPage([combinedUser(2)], { selection: { ...first.selection, id: "new-selection" } });

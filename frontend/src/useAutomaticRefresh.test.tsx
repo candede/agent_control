@@ -73,6 +73,25 @@ afterEach(() => {
 });
 
 describe("automatic saved-data refresh", () => {
+  it.each([true, false])("exposes source-specific progress for automatic=%s without conflating other-source failures", async automatic => {
+    const run = sourceRun("users", "running", automatic);
+    run.sources.push({ ...run.sources[0], source: "graph_packages", status: "failed" });
+    check.mockResolvedValueOnce(response({ run }));
+    const props = options();
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    await settle();
+    expect(hook.result.current.sourceStates).toEqual({ users: "running", graph_packages: "failed" });
+    const pending = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(pending.promise);
+    act(() => hook.result.current.checkNow());
+    expect(hook.result.current.sourceStates?.users).toBe("running");
+    await act(async () => pending.resolve(response({ run: sourceRun("users", "succeeded", automatic) })));
+    expect(hook.result.current.sourceStates).toEqual({ users: "succeeded" });
+    check.mockReturnValueOnce(deferred<AutomaticRefreshResult>().promise);
+    hook.rerender({ ...props, principalKey: "another-principal" });
+    expect(hook.result.current.sourceStates).toBeUndefined();
+  });
+
   it.each(["active", "idle"] as const)("bounds a 45-minute %s session without manufacturing a publication", async mode => {
     const props = options();
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });

@@ -3,7 +3,7 @@ import { DataSelections, CursorCodec, SelectionError, type SelectionIdentity, ty
 import { LargeTenantUsersReports, type ReportCurrentData } from "../services/largeTenantUsersReports.js";
 import { officialAgentsSql } from "./officialReportQueries.js";
 import { userSourcePeopleInRead } from "./userSources.js";
-import { dataLimitError, digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { inventoryAsOf } from "./inventoryGenerations.js";
 import { parseUnifiedAgentRecordId, unifiedAgentSortKeys, type UnifiedAgentInventoryQuery,
   type SavedAgentEnvironment, type SavedAgentPerson } from "../types/unifiedAgents.js";
@@ -166,7 +166,8 @@ export class InventoryQueries {
     });
   }
 
-  private read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: Context, selection: Record<string, unknown>) => Promise<T>) {
+  private read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: Context, selection: Record<string, unknown>) => Promise<T>,
+    maximumBytes: number = dataLimits.batchBytes) {
     return this.selections.read(id, identity, async (client, selected) => {
       await client.query("SELECT set_config('jit','off',true)");
       const context = await this.contextFromSelected(client, id, identity, selected);
@@ -174,7 +175,7 @@ export class InventoryQueries {
       peakCheckpoint("response.serialize");
       const serialized = JSON.stringify(result);
       peakCheckpoint("response.serialize");
-      if (Buffer.byteLength(serialized) > 1_048_576) throw dataLimitError("data_response_bytes", 1_048_576, Buffer.byteLength(serialized));
+      if (Buffer.byteLength(serialized) > maximumBytes) throw dataLimitError("data_response_bytes", maximumBytes, Buffer.byteLength(serialized));
       return result;
     });
   }
@@ -1031,6 +1032,7 @@ export class InventoryQueries {
     kind: string; cursor?: string; limit?: number; sourceScopeId?: string; sourceIdentity?: string; value?: string;
   }) {
     const limit = pageLimit(options.limit);
+    const singleRecordBudget = options.kind === "element" ? dataLimits.agentDefinitionTransferBytes - 65_536 : 524_288;
     return this.read(id, identity, async (client, context, selection) => {
       if (Boolean(options.sourceScopeId) !== Boolean(options.sourceIdentity)) throw new SelectionError("invalid_cursor");
       const cursor = this.continuation(id, identity, selection, "children", [recordId, options.kind,
@@ -1048,16 +1050,19 @@ export class InventoryQueries {
       const rows = (await client.query(`WITH selected AS (${selected}), candidates AS (SELECT f.ordinal,f.kind,f.value,f.payload FROM selected s
         JOIN inventory_facts f ON f.generation_id=s.generation_id AND f.identity=s.identity
         WHERE f.kind=$4 AND f.ordinal>$5 AND ($8::text IS NULL OR f.value=$8) ORDER BY f.ordinal LIMIT ${limit + 1}),
-        sized AS (SELECT *,count(*) OVER() AS candidate_count,
+        sized AS (SELECT *,count(*) OVER() AS candidate_count,row_number() OVER(ORDER BY ordinal) AS position,
           sum(octet_length(row_to_json(c)::text)+1) OVER(ORDER BY ordinal) AS bytes FROM candidates c)
-        SELECT ordinal,kind,value,CASE WHEN bytes<=524288 THEN payload END AS payload,candidate_count,bytes
-          FROM sized WHERE bytes<=524288 OR ordinal=(SELECT min(ordinal) FROM candidates) ORDER BY ordinal`,
+        SELECT ordinal,kind,value,CASE WHEN bytes<=524288 OR position=1 AND bytes<=${singleRecordBudget}
+          THEN payload END AS payload,candidate_count,bytes
+          FROM sized WHERE bytes<=524288 OR position=1 ORDER BY ordinal`,
       parameters)).rows;
-      if (rows.length && exactCount(rows[0].bytes) > 524288) throw dataLimitError("inventory_child_record_bytes", 524288, exactCount(rows[0].bytes));
+      if (rows.length && exactCount(rows[0].bytes) > singleRecordBudget) {
+        throw dataLimitError("inventory_child_record_bytes", singleRecordBudget, exactCount(rows[0].bytes));
+      }
       const page = rows.slice(0, limit);
       return { value: page.map(({ ordinal, kind, value, payload }) => ({ ordinal, kind, value, payload })), total,
         nextCursor: cursor.next(rows.length && exactCount(rows[0].candidate_count) > page.length ? page.at(-1)!.ordinal : undefined) };
-    });
+    }, options.kind === "element" ? dataLimits.agentDefinitionTransferBytes : dataLimits.batchBytes);
   }
 
   people(id: string, identity: SelectionIdentity, objectIds: readonly string[]) {

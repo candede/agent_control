@@ -24,6 +24,7 @@ import { checkpointQueries, observePeakMemory, observeQueryWork } from "../servi
 import { verifyInventoryCollectionRewindSchema } from "./inventoryCollectionRewindSchema.js";
 import { AuditLog } from "../services/auditLog.js";
 import { withTelemetryContext } from "../services/telemetry.js";
+import { dataLimits } from "./dataBounds.js";
 
 describe("immutable inventory record storage", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -699,7 +700,7 @@ describe("immutable inventory record storage", () => {
   });
   it("rejects the oversized child at actual staging and pages every legal multibyte child within the encoded budget", async () => {
     const oversized = packageInventoryRecord({ id: "oversized", displayName: "Oversized", isBlocked: false,
-      elementDetails: [{ elementType: "Custom", elements: [{ id: "one", definition: "x".repeat(600_000) }] }] });
+      elementDetails: [{ elementType: "Custom", elements: [{ id: "one", definition: "x".repeat(dataLimits.agentDefinitionBytes) }] }] });
     const payload = oversized.facts.find(fact => fact.kind === "element")!.payload;
     const bytes = (await fixture.operator.query("SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify(payload)])).rows[0].bytes;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -707,12 +708,12 @@ describe("immutable inventory record storage", () => {
       await expect(withTelemetryContext({ requestId: "request-oversized", jobId: "job-oversized" }, () =>
         store.execute(inventoryInput(), { domain: "packages", mode: "delta", channel: "exact", targets: ["oversized"] },
           lease => store.append(lease, [oversized]).then(() => {}), { authorize: async () => {} })))
-        .rejects.toMatchObject({ code: "data_residual_bytes", details: { limit: 262_144, observed: bytes } });
+        .rejects.toMatchObject({ code: "data_detail_bytes", details: { limit: dataLimits.agentDefinitionBytes, observed: bytes } });
       expect(warn).toHaveBeenCalledOnce();
       expect(JSON.parse(warn.mock.calls[0][0])).toEqual({
-        timestamp: expect.any(String), level: "warn", event: "data_residual_limit_exceeded",
-        requestId: "request-oversized", jobId: "job-oversized", errorCode: "data_residual_bytes",
-        stage: "database", field: "payload", bytes, maximumLength: 262_144,
+        timestamp: expect.any(String), level: "warn", event: "data_detail_limit_exceeded",
+        requestId: "request-oversized", jobId: "job-oversized", errorCode: "data_detail_bytes",
+        stage: "database", field: "payload", bytes, maximumLength: dataLimits.agentDefinitionBytes,
       });
     } finally { warn.mockRestore(); }
     const input = inventoryInput(), record = packageRecord(0);
@@ -754,8 +755,76 @@ describe("immutable inventory record storage", () => {
     }
     expect(collected).toBeGreaterThanOrEqual(80);
     expect(partial).toBe(true);
-    process.stdout.write("INVENTORY_CHILD_REPAIR_PROOF " + JSON.stringify({ rejectedPayloadBytes: payloadBytes, payloadLimit: 262144,
+    process.stdout.write("INVENTORY_CHILD_REPAIR_PROOF " + JSON.stringify({ rejectedPayloadBytes: payloadBytes, payloadLimit: dataLimits.agentDefinitionBytes,
       legalMultibyteValues: facts.length, returned: seen.length, gcRows: collected }) + "\n");
+  });
+  it("round-trips large definitions, copies them without truncation and collects them within the dedicated budget", async () => {
+    const input = inventoryInput(), queries = new InventoryQueries(fixture.runtime, "synthetic-large-definition-cursor-secret");
+    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const empty = { elementType: "AgentMetadatas", id: "0", definition: JSON.stringify({ padding: "" }) };
+    const overhead = (await fixture.operator.query("SELECT octet_length($1::jsonb::text)::int AS bytes",
+      [JSON.stringify(empty)])).rows[0].bytes;
+    const definitions = [335_303, 600_000, 2 * 1024 ** 2, dataLimits.agentDefinitionBytes]
+      .map(size => JSON.stringify({ padding: "x".repeat(size - overhead) }));
+    const value = { id: "large-definition", displayName: "Large definition", isBlocked: false,
+      elementDetails: [{ elementType: "AgentMetadatas", elements: definitions.map((definition, index) => ({ id: String(index), definition })) }] };
+    const record = packageInventoryRecord(value);
+    const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: [value.id] },
+      lease => store.append(lease, [record]).then(() => {}), { authorize: async () => {} });
+    const selection = await queries.capture(identity, root.scopeId);
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await queries.children(selection.id, identity, value.id, { kind: "element", cursor });
+      expect(page.value.length).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(dataLimits.agentDefinitionTransferBytes);
+      collected.push(...page.value.map(fact => fact.payload.definition as string));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    expect(collected).toEqual(definitions);
+    expect(Buffer.byteLength(JSON.stringify(await queries.page(selection.id, identity)))).toBeLessThanOrEqual(dataLimits.batchBytes);
+    const client = await fixture.runtime.connect();
+    try {
+      const saved = await storedInventoryRecord(client, root.baselineId, value.id, "canonical");
+      expect(saved!.value.elementDetails).toEqual(value.elementDetails);
+    } finally { client.release(); }
+    const copied = await store.execute(inventoryInput(identity.principalId),
+      { domain: "packages", mode: "delta", channel: "exact", targets: [value.id] }, lease =>
+        store.append(lease, [{ ...record, facts: [], factSource: {
+          generationId: root.baselineId, identity: value.id, kinds: ["*"],
+        } }]).then(() => {}), { authorize: async () => {} });
+    const current = await queries.capture(identity, copied.scopeId);
+    const largest = await queries.children(current.id, identity, value.id, { kind: "element", value: "AgentMetadatas:3" });
+    expect(largest.value[0].payload.definition).toBe(definitions[3]);
+    expect((await fixture.runtime.query(`SELECT max(octet_length(payload::text))::int AS bytes FROM inventory_facts
+      WHERE generation_id=(SELECT generation_id FROM inventory_memberships m WHERE ${inventoryAsOf()} AND identity=$3) AND kind='element'`,
+    [copied.baselineId, copied.revision, value.id])).rows[0].bytes).toBe(dataLimits.agentDefinitionBytes);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(store.execute(inventoryInput(identity.principalId),
+        { domain: "packages", mode: "delta", channel: "exact", targets: [value.id] }, lease =>
+          store.append(lease, [packageInventoryRecord({ ...value, elementDetails: [{ elementType: "AgentMetadatas",
+            elements: [{ id: "3", definition: definitions[3] + " " }] }] })]).then(() => {}), { authorize: async () => {} }))
+        .rejects.toMatchObject({ code: "data_detail_bytes", details: { limit: dataLimits.agentDefinitionBytes, observed: dataLimits.agentDefinitionBytes + 1 } });
+      expect((await queries.children(current.id, identity, value.id, { kind: "element", value: "AgentMetadatas:3" })).value[0].payload.definition)
+        .toBe(definitions[3]);
+    } finally { warn.mockRestore(); }
+    await queries.selections.invalidate(selection.id, identity);
+    await queries.selections.invalidate(current.id, identity);
+    await store.generations.connections.run(client => retainRecordData(client));
+    await inventoryBaseline(store, identity.principalId, 1);
+    await store.gcMetadata(root.scopeId, root.tenantId);
+    await store.gc(root);
+    let largeSlice = false;
+    for (let pass = 0; pass < 40; pass++) {
+      const work = await store.gcContent(root.scopeId, root.tenantId);
+      expect(work.rows).toBeLessThanOrEqual(1000);
+      expect(work.bytes).toBeLessThanOrEqual(dataLimits.agentDefinitionTransferBytes);
+      largeSlice ||= work.bytes > dataLimits.batchBytes;
+      if (!(await fixture.runtime.query("SELECT 1 FROM inventory_facts WHERE generation_id=$1 LIMIT 1", [root.baselineId])).rowCount) break;
+    }
+    expect(largeSlice).toBe(true);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_facts WHERE generation_id=$1", [root.baselineId])).rows[0].count).toBe(0);
   });
   it.each(["asc", "desc"].flatMap(sortDirection => (["publisher", "builtWith", "versions"] as const)
     .map(sortBy => ({ sortDirection: sortDirection as "asc" | "desc", sortBy }))))

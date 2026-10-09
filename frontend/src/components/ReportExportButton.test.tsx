@@ -36,6 +36,54 @@ it("checks export admission against the monotonic lease before the timer renders
   expect(createReportExport).not.toHaveBeenCalled();
 });
 
+it.each(["admission", "building", "ready", "retry"] as const)("keeps a %s export independent of the current table selection", async phase => {
+  vi.useFakeTimers();
+  let admit!: (value: { id: string }) => void;
+  vi.mocked(createReportExport).mockReturnValueOnce(new Promise(resolve => { admit = resolve; }))
+    .mockResolvedValue({ id: "new-artifact" });
+  const ready = { id: "artifact", status: "ready" as const, rows: 117, bytes: 100,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
+  if (phase === "retry") vi.mocked(reportExportStatus).mockRejectedValueOnce(new Error("Status unavailable."));
+  vi.mocked(reportExportStatus).mockResolvedValue(phase === "building" ? { ...ready, status: "building" } : ready);
+  const props = { kind: "official_users" as const, label: "Export", preserveOnRefresh: true };
+  const view = render(<ReportExportButton {...props} selectionId="original" />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
+  if (phase !== "admission") await act(async () => { admit({ id: "artifact" }); await vi.advanceTimersByTimeAsync(2000); });
+  const signal = vi.mocked(createReportExport).mock.calls[0][1]!;
+  view.rerender(<ReportExportButton {...props} disabled />);
+  expect(signal.aborted).toBe(false);
+  view.rerender(<ReportExportButton {...props} selectionId="replacement" />);
+  if (phase === "retry") {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry export status" }));
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+  } else {
+    vi.mocked(reportExportStatus).mockResolvedValue(ready);
+    await act(async () => { if (phase === "admission") admit({ id: "artifact" }); await vi.advanceTimersByTimeAsync(3000); });
+  }
+  expect(screen.getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/data-exports/artifact/download");
+  expect(createReportExport).toHaveBeenCalledOnce();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
+  expect(vi.mocked(createReportExport).mock.lastCall?.[0].selectionId).toBe("replacement");
+  expect(createReportExport).toHaveBeenCalledTimes(2);
+});
+
+it("does not invalidate a refreshed table when an older export selection is rejected", async () => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+  vi.mocked(reportExportStatus).mockRejectedValue(new ApiError(409, "selection_invalidated", "Old selection retired."));
+  const onSelectionInvalidated = vi.fn();
+  const props = { kind: "official_users" as const, label: "Export", preserveOnRefresh: true, onSelectionInvalidated };
+  const view = render(<ReportExportButton {...props} selectionId="original" />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
+  view.rerender(<ReportExportButton {...props} selectionId="replacement" />);
+  await act(() => vi.advanceTimersByTimeAsync(2000));
+  expect(screen.getByRole("alert")).toHaveTextContent("Export selection changed or expired.");
+  expect(onSelectionInvalidated).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
+});
+
 it("aborts and clears a disabled owner's pending state, then permits a new explicit request", async () => {
   vi.useFakeTimers();
   vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });

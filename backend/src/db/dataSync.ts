@@ -13,6 +13,7 @@ import {
 } from "../types/dataSync.js";
 import { pool, transaction } from "./pool.js";
 import { readAutomaticInventoryRevisions } from "./inventoryAutomaticRevisions.js";
+import { directoryNeedsReportRefresh } from "./officialReportStatus.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
 export type UserSourcePublication = { runId: string; jobId: string };
@@ -72,6 +73,7 @@ export class DataSyncRepository {
           AND expires_at>clock_timestamp()
         ORDER BY started_at DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
       if (active.rows[0]) return { id: active.rows[0].id, created: false };
+      const reportChanged = await directoryNeedsReportRefresh(client, scope);
       const due = await client.query<{ source_id: DataSyncSourceId }>(`
         SELECT requested.source_id FROM unnest($3::text[]) requested(source_id)
         LEFT JOIN data_sync_success_markers marker
@@ -82,13 +84,15 @@ export class DataSyncRepository {
           WHERE source.tenant_id=$1 AND source.principal_id=$2 AND source.source_id=requested.source_id
           ORDER BY source.updated_at DESC LIMIT 1
         ) attempt ON true
-        WHERE ((marker.last_success_at IS NULL OR marker.last_success_at<=clock_timestamp()-interval '15 minutes')
-          AND (attempt.updated_at IS NULL OR attempt.updated_at<=clock_timestamp()-
+        WHERE ((marker.last_success_at IS NULL OR marker.last_success_at<=clock_timestamp()-interval '15 minutes'
+            OR requested.source_id='users' AND $5::boolean)
+          AND (attempt.updated_at IS NULL OR requested.source_id='users' AND $5::boolean AND attempt.status='succeeded'
+            OR attempt.updated_at<=clock_timestamp()-
             CASE WHEN attempt.status IN ('permission_required','waiting_authorization') THEN interval '1 hour'
               ELSE interval '15 minutes' END))
           OR (attempt.status='waiting_authorization' AND attempt.started_at<$4::timestamptz)
         ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, automaticDataSyncSourceIds,
-        signedInAt === undefined ? null : new Date(signedInAt)]);
+        signedInAt === undefined ? null : new Date(signedInAt), reportChanged]);
       if (!due.rows.length) return { id: null, created: false };
       const recent = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND started_at>clock_timestamp()-interval '1 hour'`,

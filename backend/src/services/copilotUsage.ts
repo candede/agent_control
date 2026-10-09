@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { requireUserPublication, type UserSourcePublication } from "../db/dataSync.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
 import { UserSourcesRepository } from "../db/userSources.js";
+import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -50,11 +51,13 @@ export class CopilotUsageService {
     const fence = () => { signal?.throwIfAborted(); assertAccountSessionValidation(validation); this.dependencies.admissions(); };
     fence();
     const before = await this.sources.refreshStatus(identity, "delegated");
+    const reportChanged = options.automatic && await directoryNeedsReportRefresh(this.database, scope);
     const due = (source: UserSourceMetadata) => {
       if (!options.automatic) return !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
       if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
       if (source.attemptedAt && source.attemptStatus !== "available" && Date.now() - Date.parse(source.attemptedAt) < 900000) return false;
+      if (source.source === "directory" && reportChanged) return true;
       return !source.generationId || !source.observedAt || Date.now() - Date.parse(source.observedAt) >= (source.source === "directory" ? 900000 : 21600000);
     };
     const requested = (["directory", "app_activity"] as const).filter(source => due(before.sources[source]));

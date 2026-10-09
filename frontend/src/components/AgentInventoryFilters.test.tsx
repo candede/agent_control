@@ -40,13 +40,13 @@ beforeEach(() => {
   });
 });
 
-function setup(initial: Partial<AgentFilterValues> = {}) {
+function setup(initial: Partial<AgentFilterValues> = {}, loading = false) {
   const changed = vi.fn();
   const error = vi.fn();
   function Filters() {
     const [values, setValues] = useState({ ...defaults, ...initial });
     return <>
-      <AgentInventoryFilters selectionId="selected-fixture" values={values} options={options} loading={false}
+      <AgentInventoryFilters selectionId="selected-fixture" values={values} options={options} loading={loading}
         onChange={patch => { changed(patch); setValues(current => ({ ...current, ...patch })); }}
         onClear={() => setValues(current => ({ ...defaults, sortBy: current.sortBy, sortDirection: current.sortDirection }))}
         onError={error} />
@@ -58,6 +58,50 @@ function setup(initial: Partial<AgentFilterValues> = {}) {
 }
 
 describe("inventory filter toolbar", () => {
+  it.each([false, true])("clears an unfocused search without clearing filters, including while loading=%s", async loading => {
+    const { user, changed } = setup({ search: "rain", reportedUsage: "used", host: "Teams" }, loading);
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    await user.click(screen.getByRole("button", { name: "Outside" }));
+    expect(search).not.toHaveFocus();
+    const clear = screen.getByRole("button", { name: "Clear search" });
+    expect(clear).toBeVisible();
+    expect(clear).toBeEnabled();
+    expect(clear).toHaveAttribute("title", "Clear search");
+    await user.click(clear);
+    expect(changed).toHaveBeenCalledExactlyOnceWith({ search: "" });
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove reported usage filter" })).toHaveTextContent("Used in selected report");
+    expect(screen.getByRole("button", { name: "Remove host filter" })).toHaveTextContent("Teams");
+  });
+
+  it.each(["{Enter}", " "])("clears search using the keyboard (%s) and returns focus to the input", async key => {
+    const { user, changed } = setup({ search: "rain" });
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    search.focus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Clear search" })).toHaveFocus();
+    await user.keyboard(key);
+    expect(changed).toHaveBeenCalledExactlyOnceWith({ search: "" });
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+  });
+
+  it("shows the clear button for any entered text, including whitespace, and hides it when empty", async () => {
+    const { user } = setup();
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+    await user.type(search, " ");
+    await user.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(search).toHaveValue("");
+    await user.type(search, "rain");
+    expect(screen.getByRole("button", { name: "Clear search" })).toBeVisible();
+    await user.clear(search);
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+  });
+
   it.each([
     { matchingCount: 0, loading: false, text: "0 matching agents" },
     { matchingCount: 1, loading: false, text: "1 matching agent" },

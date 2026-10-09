@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions } from "../agentColumns";
 import type { AgentRouteState } from "../workbenchRouting";
@@ -44,6 +44,8 @@ const statusOptions = [
 ] as const;
 
 export function AgentInventoryFilters({ values, options, loading, matchingCount, selectionId, readOwnerKey, onChange, onClear, onError, onInvalidated }: Props) {
+  const searchId = useId();
+  const searchInput = useRef<HTMLInputElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const firstField = useRef<HTMLSelectElement>(null);
   const firstEnabledFieldIndex = selectionId ? 0 : 1;
@@ -130,12 +132,17 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
 
   return <section className="catalog-controls" aria-label="Filters">
     <div className="agent-query-bar">
-      <label className="agent-search-field">
+      <div className="agent-search-field agent-search-field-clearable">
         <Search size={17} aria-hidden="true" />
-        <span className="sr-only">Search</span>
-        <input type="search" value={values.search} placeholder="Search agents by name, publisher or ID"
+        <label className="sr-only" htmlFor={searchId}>Search</label>
+        <input ref={searchInput} id={searchId} type="search" value={values.search} placeholder="Search agents by name, publisher or ID"
           onChange={event => onChange({ search: event.target.value })} />
-      </label>
+        {values.search.length > 0 ? <button type="button" className="agent-search-clear"
+          aria-label="Clear search" title="Clear search" onClick={() => {
+            onChange({ search: "" });
+            searchInput.current?.focus();
+          }}><X size={20} aria-hidden="true" /></button> : null}
+      </div>
       {selectionId ? <InventoryFacetSelect key="type" selectionId={selectionId} scopeKey={readOwnerKey} compact field="type" loading={loading} onInvalidated={onInvalidated} onError={onError}
         label="Show agents" allLabel="All agents" value={values.packageType}
         onChange={type => changeLiteral("packageType", type)} /> : <label className="agent-view-control">

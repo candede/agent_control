@@ -267,8 +267,8 @@ describe("inventory dashboard exact report context", () => {
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
     remount.rerender(content(1));
     const button = screen.getByRole("button", { name: "Show reported used agents" });
-    expect(button).toBeDisabled();
-    expect(button).not.toHaveTextContent("50,000");
+    expect(button).toBeEnabled();
+    expect(button).toHaveTextContent("50,000");
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
     const replacement = overviewPage();

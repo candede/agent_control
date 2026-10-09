@@ -8,7 +8,7 @@ import type { ReportMetadata } from "../../../backend/src/types/officialReportDa
 import { ApiError } from "../api/client";
 import * as api from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
-import { historySet, reportPage, reports, selectionId } from "../test/reportDataFixture";
+import { historySet, reportPage, reportSelection, reports, selectionId } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
 import { createSavedQueryClient } from "../savedQueries";
 import { useReportPage } from "../useReportPage";
@@ -46,7 +46,7 @@ beforeEach(() => {
     return { activeSetId: metadata.activeSetId, activeRevision: metadata.activeRevision };
   });
 });
-afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks(); vi.restoreAllMocks(); });
 
 describe("compact shared report-set selection", () => {
   it("uses metadata-only options without requiring analytics or user sources", async () => {
@@ -269,10 +269,80 @@ describe("compact shared report-set selection", () => {
     if (phase === "admission") fireEvent.change(select, { target: { value: second.id } });
     else await act(async () => pending.resolve(confirmation()));
     fireEvent.focus(window);
-    expect(await screen.findByText(/Showing saved report sets/)).toBeVisible();
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await ready();
+    expect(screen.queryByText(/Showing saved report sets/)).not.toBeInTheDocument();
     expect(api.previewReportOperation).toHaveBeenCalledTimes(phase === "admission" ? 0 : 1);
     expect(api.confirmReportOperation).not.toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
+  });
+  it("quietly renews idle report options without removing their labels or changing the shared report", async () => {
+    vi.useFakeTimers();
+    const initial = page(), pending = deferred<ReturnType<typeof page>>(), onChanged = vi.fn();
+    initial.selection = reportSelection(2, Date.now());
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise);
+    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    const select = screen.getByRole("combobox", { name: "Report set" });
+    expect(select).toHaveValue(first.id);
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(select).toHaveValue(first.id);
+    expect(select).toBeDisabled();
+    expect(within(select).getByRole("option", { name: /Observed activity: 2026-01-01 to 2026-01-31/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Showing saved report sets/)).not.toBeInTheDocument();
+    await act(async () => {
+      pending.resolve({ ...page(), selection: reportSelection(9, Date.now()) });
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(select).toBeEnabled();
+    expect(select).toHaveValue(first.id);
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+  it.each(["preview", "confirm"] as const)("renews expired options without replaying an in-flight %s", async phase => {
+    vi.useFakeTimers();
+    const initial = page(), preview = deferred<OfficialReportConfirmation>(), commit = deferred<OfficialReportConfirmed>(), onChanged = vi.fn();
+    initial.selection = reportSelection(2, Date.now());
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    let capture = 2;
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockImplementation(async () => ({
+      ...page(), selection: reportSelection(++capture, Date.now()),
+    }));
+    if (phase === "preview") vi.mocked(api.previewReportOperation).mockReturnValueOnce(preview.promise);
+    else vi.mocked(api.confirmReportOperation).mockReturnValueOnce(commit.promise);
+    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    const select = screen.getByRole("combobox", { name: "Report set" });
+    await act(async () => fireEvent.change(select, { target: { value: second.id } }));
+    expect(api.previewReportOperation).toHaveBeenCalledOnce();
+    expect(api.confirmReportOperation).toHaveBeenCalledTimes(phase === "confirm" ? 1 : 0);
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Showing saved report sets/)).not.toBeInTheDocument();
+    expect(onChanged).not.toHaveBeenCalled();
+    if (phase === "preview") {
+      expect(vi.mocked(api.previewReportOperation).mock.lastCall?.[2]?.aborted).toBe(true);
+      await act(async () => preview.resolve(confirmation()));
+      expect(api.confirmReportOperation).not.toHaveBeenCalled();
+      expect(onChanged).not.toHaveBeenCalled();
+      expect(select).toHaveValue(first.id);
+    } else {
+      expect(vi.mocked(api.confirmReportOperation).mock.lastCall?.[1]?.aborted).toBe(false);
+      metadata = { ...metadata, activeSetId: second.id, activeRevision: "5" };
+      await act(async () => {
+        commit.resolve({ activeSetId: second.id, activeRevision: "5" });
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(api.confirmReportOperation).toHaveBeenCalledOnce();
+      expect(onChanged).toHaveBeenCalledExactlyOnceWith(true);
+      expect(select).toHaveValue(second.id);
+    }
+    expect(select).toBeEnabled();
   });
   it("accepts case-equivalent UUIDs without duplicating the active option or altering signed confirmation data", async () => {
     const current = historySet(1, { id: "aaaaaaaa-0000-4000-8000-000000000001" });

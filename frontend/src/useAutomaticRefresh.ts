@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
-import { ApiError, automaticDataSyncSourceIds, checkAutomaticRefresh, dataSyncFailureStatus, type AutomaticRefreshResult, type DataSyncSourceId } from "./api/client";
+import { ApiError, automaticDataSyncSourceIds, checkAutomaticRefresh, dataSyncFailureStatus, type AutomaticRefreshResult, type DataSyncSourceId, type DataSyncSourceState } from "./api/client";
 import { isPublicationRevisions, type PublicationRevisions } from "../../backend/src/types/dataSelection";
 
 const checkIntervalMs = 60_000;
 const maximumBackoffMs = 5 * 60_000;
 const requestTimeoutMs = 30_000;
 type Phase = "ready" | "checking" | "refreshing" | "backoff" | "sign_in_required" | "permission_required" | "failed";
-type Observation = { phase: Phase; message?: string; checkedAt?: string };
+type Observation = { phase: Phase; message?: string; checkedAt?: string; sourceStates?: Partial<Record<DataSyncSourceId, DataSyncSourceState>> };
 type SourceIssue = "sign_in_required" | "permission_required" | "failed";
 type Options = {
   principalKey: string;
@@ -140,7 +140,10 @@ export function useAutomaticRefresh({
     let requestTimeout: number | undefined;
     const admitted = () => active && enabled && !current.paused && !current.interaction && !current.denied
       && document.visibilityState === "visible" && navigator.onLine;
-    const publish = (value: Observation) => setObservation({ ...value, owner: principalKey, authorization: authorizationKey });
+    const publish = (value: Observation) => setObservation(previous => ({
+      sourceStates: previous?.owner === principalKey && previous.authorization === authorizationKey ? previous.sourceStates : undefined,
+      ...value, owner: principalKey, authorization: authorizationKey,
+    }));
     if (current.interaction) publish({ phase: "sign_in_required", message: "Sign in again to continue automatic refresh." });
 
     const backoff = () => {
@@ -193,7 +196,8 @@ export function useAutomaticRefresh({
         // A successful due-check is cheap; backend cadence decides when real collection is due.
         const suggested = Date.parse(result.nextCheckAt);
         current.dueAt = Date.now() + Math.max(checkIntervalMs, Math.min(maximumBackoffMs, Number.isFinite(suggested) ? suggested - Date.now() : checkIntervalMs));
-        publish({ ...next, checkedAt: new Date().toISOString() });
+        publish({ ...next, sourceStates: Object.fromEntries((result.run?.sources ?? []).map(source => [source.source, source.status])),
+          checkedAt: new Date().toISOString() });
       } catch (cause) {
         if (!active || controller.signal.aborted) return;
         if (cause instanceof ApiError && (cause.status === 401 || ["interaction_required", "authorization_expired"].includes(cause.code))) {
@@ -256,6 +260,7 @@ export function useAutomaticRefresh({
       && checkingRequest?.owner === principalKey && checkingRequest.authorization === authorizationKey,
     message: status?.message,
     checkedAt: status?.checkedAt,
+    sourceStates: status?.sourceStates,
     paused,
     enabled,
     ...availability,
@@ -269,4 +274,4 @@ export function useAutomaticRefresh({
   };
 }
 
-export type AutomaticRefreshStatus = Omit<ReturnType<typeof useAutomaticRefresh>, "admitPublication" | "publicationRevisions" | "checkNow">;
+export type AutomaticRefreshStatus = Omit<ReturnType<typeof useAutomaticRefresh>, "admitPublication" | "publicationRevisions" | "checkNow" | "sourceStates">;

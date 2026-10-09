@@ -1,6 +1,7 @@
 import type pg from "pg";
 import { LifecycleSlice } from "./lifecycleSlice.js";
-import { assertResidualDatabaseBounds, dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { assertResidualDatabaseBounds, assertInventoryFactDatabaseBounds, dataLimitError, dataLimits, digest, encodeBatch,
+  encodeInventoryFactBatch, exactCount } from "./dataBounds.js";
 import { DataGenerations, type BeginGeneration, type GenerationLease } from "./dataGenerations.js";
 import { inventoryLimits, type InventoryDomain, type InventoryPage, type InventoryRoot } from "../types/inventoryRecords.js";
 import type { InventoryRecord } from "../services/inventoryRecordProjection.js";
@@ -229,9 +230,9 @@ export class InventoryGenerations {
       let pendingFactBytes = emptyFactBytes;
       const flushFacts = async () => {
         if (!pendingFacts.length) return;
-        const facts = encodeBatch(pendingFacts, factParameters);
+        const facts = encodeInventoryFactBatch(pendingFacts, factParameters);
         this.maximumParameterBytes = Math.max(this.maximumParameterBytes, facts.bytes);
-        await assertResidualDatabaseBounds(client, facts.json, "payload", pendingFacts);
+        await assertInventoryFactDatabaseBounds(client, facts.json, pendingFacts);
         await client.query(`INSERT INTO inventory_facts(generation_id,scope_id,tenant_id,identity,schema_version,ordinal,kind,value,payload,text_value,number_value,boolean_value)
           SELECT $1,$2,$3,identity,1,ordinal,kind,value,payload,text_value,number_value,boolean_value FROM jsonb_to_recordset($4::jsonb)
           r(identity text,ordinal integer,kind text,value text,payload jsonb,text_value text,number_value numeric,boolean_value boolean)`,
@@ -250,7 +251,12 @@ export class InventoryGenerations {
             || pendingFactBytes + factBytes + Number(pendingFacts.length > 0) > dataLimits.batchBytes) {
             await flushFacts();
           }
-          if (emptyFactBytes + factBytes > dataLimits.batchBytes) encodeBatch([fact], factParameters);
+          if (emptyFactBytes + factBytes > dataLimits.batchBytes) {
+            encodeInventoryFactBatch([fact], factParameters);
+            pendingFacts.push(fact);
+            await flushFacts();
+            continue;
+          }
           pendingFactBytes += factBytes + Number(pendingFacts.length > 0);
           pendingFacts.push(fact);
         }
@@ -279,11 +285,15 @@ export class InventoryGenerations {
             inserted AS (INSERT INTO inventory_facts(generation_id,scope_id,tenant_id,identity,schema_version,ordinal,kind,value,payload,text_value,number_value,boolean_value)
               SELECT $1,$2,$3,$4,1,$10::int+position-1,kind,value,payload,text_value,number_value,boolean_value FROM chosen RETURNING ordinal)
             SELECT (SELECT count(*)::int FROM inserted) AS count,max(source_ordinal)::int AS last,
-              coalesce(sum(row_bytes),0)::text AS bytes FROM chosen`,
+              coalesce(sum(row_bytes),0)::text AS bytes,
+              CASE WHEN count(*)=1 AND bool_and(kind='element') THEN $12::int ELSE 1048576 END AS maximum_bytes FROM chosen`,
             [lease.id, lease.scopeId, lease.tenantId, row.identity, source.generationId, source.identity, after, source.kinds,
-              source.excludeCollections ?? [], row.facts.length + copied, source.includeCollections ?? null])).rows[0];
+              source.excludeCollections ?? [], row.facts.length + copied, source.includeCollections ?? null,
+              dataLimits.agentDefinitionTransferBytes])).rows[0];
             const copiedBytes = exactCount(result.bytes);
-            if (copiedBytes > 1_048_576) throw dataLimitError("inventory_fact_batch_bytes", 1_048_576, copiedBytes);
+            if (copiedBytes > result.maximum_bytes) {
+              throw dataLimitError("inventory_fact_batch_bytes", result.maximum_bytes, copiedBytes);
+            }
             if (!result.count) break;
             after = result.last; copied += result.count; bytes += copiedBytes; children += result.count;
             if (row.facts.length + copied > inventoryLimits.factsPerRecord) {
@@ -619,7 +629,7 @@ export class InventoryGenerations {
           SELECT generation,identity FROM jsonb_to_recordset($3::jsonb) k(generation uuid,identity text))`;
         const noFacts = `NOT EXISTS(SELECT 1 FROM inventory_facts f WHERE f.generation_id=target.generation_id AND f.identity=target.identity COLLATE "default")`;
         const noMembers = `NOT EXISTS(SELECT 1 FROM unified_agent_memberships m WHERE m.generation_id=target.generation_id AND m.identity=target.identity COLLATE "default")`;
-        while (slice.rows<900 && await slice.change("facts","inventory_facts",where,undefined,values)) { /* Shared row/byte/time budget. */ }
+        while (slice.rows<900 && await slice.change("facts","inventory_facts",where,undefined,values,"ctid",undefined,true)) { /* Shared row/byte/time budget. */ }
         await slice.change("members","unified_agent_memberships",`${where} AND ${noFacts}`,undefined,values);
         for (const domain of new Set(selected.map(row => row.domain as InventoryDomain))) {
           await slice.change("content",inventoryTables[domain],`${where} AND ${noFacts} AND ${noMembers}`,undefined,values);

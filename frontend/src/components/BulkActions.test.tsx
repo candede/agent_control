@@ -1,9 +1,9 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
-import { ApiError, getBulkActionJobItems, type BulkActionJob, type BulkJobItemPage, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
+import { getBulkActionJobItems, type BulkActionJob, type BulkJobItemPage, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { BulkActions } from "./BulkActions";
@@ -30,10 +30,10 @@ const running: BulkActionJob = {
 function mount(overrides: Partial<Parameters<typeof BulkActions>[0]> = {}, roles = user.roles, metadata = true) {
   const props = {
     disabled: false, selectedCount: 0,
-    onBlockAll: vi.fn(), onUnblockAll: vi.fn(), onManageAccess: vi.fn(), onJobCommand: vi.fn(),
+    onBlockAll: vi.fn(), onUnblockAll: vi.fn(), onManageAccess: vi.fn(), onJobCommand: vi.fn(), onDismiss: vi.fn(),
     ...overrides,
   };
-  const view = render(<CapabilityContext value={{
+  const renderPanel = (currentProps: typeof props) => <CapabilityContext value={{
     user: { ...user, roles }, views: [{
       definition: capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!,
       decision: { capabilityId: "graph.package.block.manage", status: "available", authorized: true, fresh: true,
@@ -42,10 +42,12 @@ function mount(overrides: Partial<Parameters<typeof BulkActions>[0]> = {}, roles
     reload: vi.fn(), openPermissions: vi.fn(),
   }}>
     <WorkbenchActionProvider value={metadata ? workbenchActions : undefined}>
-      <BulkActions {...props} />
+      <BulkActions {...currentProps} />
     </WorkbenchActionProvider>
-  </CapabilityContext>);
-  return { ...view, props, panel: within(screen.getByRole("region", { name: "Exact package bulk actions" })) };
+  </CapabilityContext>;
+  const view = render(renderPanel(props));
+  return { ...view, props, panel: within(screen.getByRole("region", { name: "Exact package bulk actions" })),
+    rerenderPanel: (overrides: Partial<typeof props>) => view.rerender(renderPanel({ ...props, ...overrides })) };
 }
 
 describe("unified access job panel", () => {
@@ -94,11 +96,13 @@ describe("unified access job panel", () => {
   it("shows starting progress without controls for a job not accepted yet", () => {
     const { panel } = mount({
       busyAction: "unblock", selectedCount: 1,
-      progress: { action: "unblock", targetBlockedState: false, total: 1, completed: 0, succeeded: 0, failed: 0, skipped: 0 },
+      progress: { action: "unblock", targetBlockedState: false, total: 1, completed: 0, succeeded: 0, failed: 0, skipped: 0,
+        currentAgentName: "Support agent" },
     });
     expect(panel.getByRole("status")).toHaveTextContent("Starting");
     expect(panel.getByText("1 published version in this job")).toBeVisible();
     expect(panel.getByRole("progressbar", { name: "Unblock packages progress" })).toHaveAttribute("value", "0");
+    expect(panel.getByText(/Current agent:/)).toHaveTextContent("Support agent");
     expect(panel.queryAllByRole("button")).toHaveLength(0);
   });
 
@@ -124,7 +128,8 @@ describe("unified access job panel", () => {
     expect(props.onJobCommand).toHaveBeenNthCalledWith(1, "resume");
     expect(props.onJobCommand).toHaveBeenNthCalledWith(2, "reconcile");
     expect(panel.getByText("1 uncertain")).toBeVisible();
-    expect(await panel.findByText("Provider response lost.")).toBeVisible();
+    expect(panel.queryByRole("group", { name: "Package job results" })).not.toBeInTheDocument();
+    expect(getBulkActionJobItems).not.toHaveBeenCalled();
   });
 
   it.each(["cancel", "resume", "reconcile"] as const)("disables recovery controls while %s is pending", async operation => {
@@ -135,7 +140,7 @@ describe("unified access job panel", () => {
     const { panel } = mount({ jobCommand: operation, job: {
       ...running, status: "partial", canResume: true, inconclusive: 1, reconciliationRequired: 1,
     } });
-    await panel.findByText("Saved result");
+    expect(panel.queryByText("Saved result")).not.toBeInTheDocument();
     for (const button of panel.getAllByRole("button")) expect(button).toBeDisabled();
     expect(panel.getByRole("status")).toHaveTextContent(operation === "cancel" ? "Cancelling" : operation === "resume" ? "Resuming" : "Checking results");
   });
@@ -167,7 +172,7 @@ describe("unified access job panel", () => {
     expect(panel.queryByRole("button", { name: /Check uncertain results|Cancel unprocessed tasks|Resume unprocessed tasks/ })).not.toBeInTheDocument();
     expect(panel.getByText(/cancelled jobs cannot be reconciled or resumed/)).toBeVisible();
     expect(panel.getByText("1 uncertain")).toBeVisible();
-    expect(await panel.findByText("Uncertain agent")).toBeVisible();
+    expect(panel.queryByText("Uncertain agent")).not.toBeInTheDocument();
   });
 
   it("uses the right operation for access jobs and keeps request errors in the panel", () => {
@@ -207,30 +212,64 @@ describe("unified access job panel", () => {
     expect(container.querySelector(".agent-refresh-spinner")).toBeInTheDocument();
   });
 
-  it("retries a failed result page once without refreshing the job or replaying a mutation", async () => {
-    let resolve!: (page: BulkJobItemPage) => void;
-    vi.mocked(getBulkActionJobItems).mockRejectedValueOnce(new Error("Result read unavailable."))
-      .mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-    const { panel, props } = mount({ job: running });
-    expect(await panel.findByRole("alert")).toHaveTextContent("Result read unavailable.");
-    const retry = panel.getByRole("button", { name: "Retry results" });
-    act(() => { fireEvent.click(retry); fireEvent.click(retry); });
-    await waitFor(() => expect(getBulkActionJobItems).toHaveBeenCalledTimes(2));
-    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
-    expect(panel.getByText("Loading job results…")).toBeVisible();
-    await act(async () => resolve({ value: [], revision: "1", counts: { total: 4, filtered: 4 },
-      page: { limit: 50, nextCursor: null, previousCursor: null } }));
-    expect(panel.getByText("No results.")).toBeVisible();
-    expect(props.onJobCommand).not.toHaveBeenCalled();
+  it("updates progress in place without reading or displaying result pages", () => {
+    const { panel, rerenderPanel } = mount({ job: running });
+    const progress = panel.getByRole("progressbar");
+    const group = panel.getByRole("group", { name: "Package job progress" });
+    for (let completed = 2; completed <= 3; completed += 1) {
+      rerenderPanel({ job: { ...running, completed, resultRevision: String(completed),
+        currentAgentName: `Agent ${completed}` } });
+      expect(panel.getByRole("progressbar")).toBe(progress);
+      expect(panel.getByRole("group", { name: "Package job progress" })).toBe(group);
+      expect(progress).toHaveAttribute("value", String(completed));
+      expect(panel.getByText(/Current agent:/)).toHaveTextContent(`Agent ${completed}`);
+    }
+    expect(panel.queryByRole("group", { name: "Package job results" })).not.toBeInTheDocument();
+    expect(panel.queryByRole("navigation", { name: "Job result pages" })).not.toBeInTheDocument();
+    expect(getBulkActionJobItems).not.toHaveBeenCalled();
   });
 
-  it("offers status recovery when only the result-page revision has expired", async () => {
-    vi.mocked(getBulkActionJobItems).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "changed"));
-    const { panel, props } = mount({ job: { ...running, status: "partial" } });
-    expect(await panel.findByRole("alert")).toHaveTextContent("Job results changed");
-    await userEvent.click(panel.getByRole("button", { name: "Refresh status" }));
-    expect(props.onJobCommand).toHaveBeenCalledExactlyOnceWith("refresh");
-    expect(getBulkActionJobItems).toHaveBeenCalledOnce();
+  it.each(["succeeded", "failed", "cancelled", "partial"] as const)("ends a settled %s job at the counts and offers dismissal", async status => {
+    const { panel, props } = mount({ job: { ...running, status, completed: 4, queued: 0 } });
+    expect(panel.queryByRole("progressbar")).not.toBeInTheDocument();
+    const group = panel.getByRole("group", { name: "Package job progress" });
+    expect(group.lastElementChild).toHaveClass("bulk-progress-meta");
+    expect(panel.queryByRole("button", { name: /Previous results|Next results/ })).not.toBeInTheDocument();
+    await userEvent.click(panel.getByRole("button", { name: "Close job summary" }));
+    expect(props.onDismiss).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { job: running },
+    { job: { ...running, status: "queued" as const } },
+    { job: { ...running, status: "waiting_authorization" as const, canResume: true } },
+    { job: { ...running, status: "partial" as const, reconciliationRequired: 1 } },
+    { job: { ...running, status: "partial" as const, canResume: true } },
+    { job: { ...running, status: "succeeded" as const }, jobCommand: "refresh" as const },
+    { job: { ...running, status: "succeeded" as const }, statusUnrecognized: true },
+  ])("keeps unfinished work and recovery available rather than dismissing it: %j", overrides => {
+    const { panel } = mount(overrides);
+    expect(panel.queryByRole("button", { name: "Close job summary" })).not.toBeInTheDocument();
+  });
+
+  it("allows dismissal after cancellation settles even when uncertainty cannot be reconciled", async () => {
+    const { panel, props } = mount({ job: { ...running, status: "partial", cancelRequested: true,
+      inconclusive: 1, reconciliationRequired: 1 } });
+    expect(panel.getByText("1 uncertain")).toBeVisible();
+    expect(panel.queryByRole("button", { name: "Check uncertain results" })).not.toBeInTheDocument();
+    await userEvent.click(panel.getByRole("button", { name: "Close job summary" }));
+    expect(props.onDismiss).toHaveBeenCalledOnce();
+  });
+
+  it("does not expand legacy result feedback below the counts", () => {
+    const { panel } = mount({ result: {
+      targetBlockedState: true, total: 2, succeeded: 1, failed: 1, skipped: 0,
+      results: [{ id: "failed", displayName: "Failed agent", status: "failed", message: "Provider failed." }],
+    } });
+    expect(panel.queryByText("Failed agent")).not.toBeInTheDocument();
+    expect(panel.queryByText("Provider failed.")).not.toBeInTheDocument();
+    expect(panel.getByText("1 failed")).toBeVisible();
+    expect(panel.getByRole("group", { name: "Package job progress" }).lastElementChild).toHaveClass("bulk-progress-meta");
   });
 
   it.each(["owner", "job", "revision"] as const)("cancels obsolete result reads across a changed %s and ignores late results", async boundary => {

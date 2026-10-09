@@ -105,13 +105,13 @@ describe("report provenance request ownership", () => {
     const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
     view.rerender(panel(true));
     expect(signal?.aborted).toBe(true);
-    expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
-    expect(screen.getByText("Loading saved data...")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Report provenance" }) !== null).toBe(boundary === "revision");
+    if (boundary !== "revision") expect(screen.getByText("Loading saved data...")).toBeVisible();
     view.rerender(panel(true));
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
     await act(async () => pending.resolve(evidence({ ...reports, historyRevision: "obsolete-revision" })));
     expect(screen.queryByText(/obsolete-revision/)).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Report provenance" }) !== null).toBe(boundary === "revision");
     await act(async () => replacement.resolve(evidence({ ...reports, setId: boundary === "report" ? nextSetId : reportSetId,
       historyRevision: "current-revision" })));
     fireEvent.click(await screen.findByText("Report sources"));

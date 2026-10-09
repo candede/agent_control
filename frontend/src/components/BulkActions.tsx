@@ -7,11 +7,10 @@ import type {
   BulkJobStatus,
   PackageAccessUpdate,
 } from "../api/client";
-import { CircleStop, LoaderCircle, Play, RefreshCw } from "lucide-react";
+import { CircleStop, LoaderCircle, Play, RefreshCw, X } from "lucide-react";
 import { isJobPolling } from "../jobStatus";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { PreviewBadge } from "./PermissionCenter";
-import { BulkJobItems } from "./BulkJobItems";
 
 export type BulkJobCommand = "resume" | "cancel" | "reconcile" | "refresh";
 
@@ -49,12 +48,12 @@ type BulkActionsProps = {
   jobCommand?: BulkJobCommand;
   jobError?: string;
   statusUnrecognized?: boolean;
-  owner?: string;
   selectedCount: number;
   onBlockAll: () => void;
   onManageAccess: () => void;
   onUnblockAll: () => void;
   onJobCommand: (operation: BulkJobCommand) => void;
+  onDismiss: () => void;
 };
 
 export function BulkActions({
@@ -68,12 +67,12 @@ export function BulkActions({
   jobCommand,
   jobError,
   statusUnrecognized = false,
-  owner,
   selectedCount,
   onBlockAll,
   onManageAccess,
   onUnblockAll,
   onJobCommand,
+  onDismiss,
 }: BulkActionsProps) {
   const active = Boolean(busyAction || jobCommand || statusUnrecognized || (job && (isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization")));
   const summary = job ?? progress ?? result;
@@ -86,28 +85,30 @@ export function BulkActions({
   const percent = completed === undefined ? undefined : total === 0 ? 100 : Math.round(completed / total * 100);
   const canCancel = job && !job.cancelRequested && (isJobPolling(job.status) || job.canResume);
   const statusUnavailable = statusUnrecognized || Boolean(job && isJobPolling(job.status) && jobError && !busyAction && !jobCommand);
+  const canDismiss = Boolean(summary && !active && (!needsReconciliation || job?.cancelRequested));
+  const showProgress = completed !== undefined && active;
+  const currentAgentName = job?.status === "running" ? job.currentAgentName : !job ? progress?.currentAgentName : undefined;
   const message = job?.cancelRequested ? `Cancellation was requested. Changes already in progress may still finish.${needsReconciliation ? " Uncertain results remain recorded, but cancelled jobs cannot be reconciled or resumed." : ""}`
     : job?.status === "waiting_authorization" ? "Sign in again, then resume unprocessed tasks."
     : job?.status === "cancelled" ? "Unprocessed tasks were cancelled. Changes already in progress may still finish."
     : needsReconciliation ? "Check uncertain results before starting another change. This only reads the current provider state."
     : undefined;
-  const failedResults =
-    outcomes.filter((item) => item.status === "failed" || item.status === "inconclusive");
-  const visibleFailures = failedResults.slice(0, 12);
-  const hiddenFailureCount = Math.max(
-    0,
-    failedResults.length - visibleFailures.length,
-  );
   const sideEffectErrors = job ? [] : result?.sideEffectErrors ?? [];
 
   return (
-    <section className="bulk-panel" aria-label="Exact package bulk actions">
-      <div>
-        <h2>Access and availability</h2>
-        <PreviewBadge />
-        <span className="selected-count">{summary && (active || selectedCount === 0)
-          ? `${total.toLocaleString()} published version${total === 1 ? "" : "s"} in this job`
-          : <><span>{selectedCount} selected</span> · published versions</>}</span>
+    <section className={`bulk-panel${summary ? " bulk-panel-has-job" : ""}`} aria-label="Exact package bulk actions">
+      <div className="bulk-panel-heading">
+        <div className="bulk-panel-title">
+          <h2>Access and availability</h2>
+          <PreviewBadge />
+          <span className="selected-count">{summary && (active || selectedCount === 0)
+            ? `${total.toLocaleString()} published version${total === 1 ? "" : "s"} in this job`
+            : <><span>{selectedCount} selected</span> · published versions</>}</span>
+        </div>
+        {canDismiss ? <button type="button" className="secondary icon-button bulk-job-dismiss"
+          aria-label="Close job summary" title="Close job summary" onClick={onDismiss}>
+          <X size={18} aria-hidden="true" />
+        </button> : null}
       </div>
       {!active && selectedCount > 0 ? <div className="bulk-buttons">
         <WorkbenchActionGate actionId="packages.block">
@@ -182,13 +183,17 @@ export function BulkActions({
             </WorkbenchActionGate> : null}
           </div> : null}
         </div>
-        {completed !== undefined ? <div className="bulk-progress">
+        {showProgress ? <div className="bulk-progress">
           <div className="bulk-progress-header">
-            <span>{completed.toLocaleString()} of {total.toLocaleString()} processed</span>
-            <span>{percent}%</span>
+            {currentAgentName ? <span className="bulk-job-current" title={currentAgentName}>
+              {statusUnavailable ? "Last reported agent" : "Current agent"}: <strong>{currentAgentName}</strong>
+            </span> : null}
+            <span className="bulk-progress-count"><span>{completed.toLocaleString()} of {total.toLocaleString()} processed</span><span>{percent}%</span></span>
           </div>
           <progress value={completed} max={total || 1} aria-label={`${bulkActionLabel(summary)} progress`} />
         </div> : null}
+        {message ? <p className="bulk-job-message">{message}</p> : null}
+        {jobError || job?.error ? <p className="bulk-job-error" role="alert">{jobError ?? job?.error}</p> : null}
         <div className="bulk-progress-meta">
           <span>{summary.succeeded} succeeded</span>
           <span>{summary.failed} failed</span>
@@ -199,34 +204,8 @@ export function BulkActions({
             <span>{sideEffectErrors.length} audit/progress errors</span>
           ) : null}
         </div>
-        {job?.status === "running" && job.currentAgentName ? <p className="bulk-job-current">{statusUnavailable ? "Last reported agent" : "Current agent"}: <strong>{job.currentAgentName}</strong></p> : null}
-        {message ? <p className="bulk-job-message">{message}</p> : null}
-        {job ? <BulkJobItems key={`${owner ?? ""}:${job.id}`} job={job} owner={owner}
-          refreshing={jobCommand === "refresh"} disabled={Boolean(jobCommand)}
-          statusRecoveryAvailable={Boolean(jobError)}
-          onRefreshStatus={jobError ? undefined : () => onJobCommand("refresh")} /> : null}
-        {failedResults.length > 0 ? (
-          <details className="bulk-failures">
-            <summary>Review {failedResults.length} {inconclusive ? "failed or uncertain changes" : "failed changes"}</summary>
-            <ul>
-              {visibleFailures.map((item) => (
-                <li key={item.id}>
-                  <span>{item.displayName}</span>
-                  <small>{item.message}</small>
-                  {item.reconciliationStatus && item.reconciliationStatus !== "not_required" ? <small>Reconciliation: {item.reconciliationStatus.replaceAll("_", " ")}{item.retryEligible ? ". Eligible only for a new explicit preview and confirmation." : ""}</small> : null}
-                </li>
-              ))}
-            </ul>
-            {hiddenFailureCount > 0 ? (
-              <p>
-                {hiddenFailureCount} more failures hidden to keep the page
-                readable.
-              </p>
-            ) : null}
-          </details>
-        ) : null}
       </div> : null}
-      {jobError || job?.error ? <p className="bulk-job-error" role="alert">{jobError ?? job?.error}</p> : null}
+      {!summary && jobError ? <p className="bulk-job-error" role="alert">{jobError}</p> : null}
     </section>
   );
 }

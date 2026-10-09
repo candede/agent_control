@@ -8,7 +8,7 @@ import { ApiError } from "../api/client";
 import { readReportDetail, readReportPage } from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { createSavedQueryClient } from "../savedQueries";
-import { combinedUser, reportPage, reportUser } from "../test/reportDataFixture";
+import { combinedUser, reportPage, reportSelection, reportUser } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
 import { mockNativeDialogs } from "../test/dialog";
 import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
@@ -98,7 +98,7 @@ describe("license evidence read ownership", () => {
     vi.mocked(readReportPage).mockResolvedValue(reportPage([]));
   });
 
-  it("withdraws license evidence and cancels feature reads when the saved source revision changes", async () => {
+  it("retains license evidence during refresh and retires old feature reads when replacement evidence arrives", async () => {
     const plans = deferred<ReturnType<typeof reportPage>>();
     vi.mocked(readReportPage).mockReturnValue(plans.promise);
     const props = modalProps();
@@ -111,11 +111,11 @@ describe("license evidence read ownership", () => {
     vi.mocked(readReportDetail).mockReturnValue(refreshed.promise);
     view.rerender(<UserDetailModal {...props} dataRevision={1} />);
     expect(screen.getByText("Loading exact user details...")).toBeVisible();
-    expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
-    expect(signal?.aborted).toBe(true);
+    expect(screen.getByText("M365 Copilot licensed", { exact: true })).toBeInTheDocument();
+    expect(signal?.aborted).toBe(false);
     fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
     const inactive = { ...combinedUser(), copilotServiceState: "disabled" as const, entitlement: "no_paid" as const };
-    await act(async () => refreshed.resolve(evidence(inactive)));
+    await act(async () => refreshed.resolve({ ...evidence(inactive), selection: reportSelection(9) }));
     expect(await screen.findByText("No active M365 Copilot license", { exact: true })).toBeVisible();
     await act(async () => plans.resolve(reportPage([])));
     expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
@@ -234,9 +234,12 @@ describe("license evidence read ownership", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Licenses" }));
     await waitFor(() => expect(readReportPage).toHaveBeenCalledOnce());
     const signal = vi.mocked(readReportPage).mock.calls[0][2];
+    const refreshed = { ...evidence(combinedUser()), selection: reportSelection(9) };
+    vi.mocked(readReportDetail).mockResolvedValue(refreshed);
+    vi.mocked(readReportPage).mockResolvedValue(reportPage([], { selection: refreshed.selection }));
     view.rerender(<UserDetailModal {...props} dataRevision={1} />);
-    expect(signal?.aborted).toBe(true);
     await waitFor(() => expect(readReportPage).toHaveBeenCalledTimes(2));
+    expect(signal?.aborted).toBe(true);
     await act(async () => oldPlans.reject(new ApiError(409, "selection_invalidated", "Obsolete selection.")));
     fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
     expect(await screen.findByText("M365 Copilot licensed", { exact: true })).toBeVisible();
@@ -275,7 +278,7 @@ describe("license evidence read ownership", () => {
     expect(screen.getByRole("button", { name: "Retry user details" })).toBeVisible();
   });
 
-  it("retains a direct-user selection at lease end and only explicitly captures fresh evidence", async () => {
+  it("automatically renews a direct user and retains visible license evidence while pending", async () => {
     vi.useFakeTimers();
     const saved = evidence(combinedUser());
     saved.selection.validatedAt = new Date().toISOString();
@@ -284,13 +287,15 @@ describe("license evidence read ownership", () => {
     await act(async () => { render(<UserDetailModal {...modalProps()} />); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
+    const replacement = deferred<OfficialReportDetail<CombinedUser>>();
+    vi.mocked(readReportDetail).mockReturnValue(replacement.promise);
     await act(async () => { await vi.advanceTimersByTimeAsync(5001); });
     expect(screen.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
-    expect(screen.getByText(/Showing previously loaded user details/)).toBeVisible();
+    expect(screen.queryByText(/Showing previously loaded user details/)).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(readReportDetail).toHaveBeenCalledOnce();
-    vi.mocked(readReportDetail).mockResolvedValue(evidence({ ...combinedUser(), copilotServiceState: "disabled", entitlement: "no_paid" }));
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Restart selection" })); });
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+    await act(async () => replacement.resolve({ ...evidence({ ...combinedUser(), copilotServiceState: "disabled", entitlement: "no_paid" }),
+      selection: reportSelection(9, Date.now()) }));
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
     expect(readReportDetail).toHaveBeenLastCalledWith(expect.any(String), undefined, expect.any(AbortSignal));
@@ -336,7 +341,7 @@ describe("license evidence read ownership", () => {
     expect(screen.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
     vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(report.selection.expiresAt) - Date.parse(report.selection.validatedAt) + 1);
     fireEvent.focus(window);
-    expect(screen.getByText(/Showing previously loaded user details/)).toBeVisible();
+    expect(screen.queryByText(/Showing previously loaded user details/)).not.toBeInTheDocument();
     expect(signal?.aborted).toBe(false);
     await act(async () => pending.resolve(evidence(combinedUser())));
     expect(await screen.findByText("Contoso")).toBeVisible();

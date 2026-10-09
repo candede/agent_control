@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { InventoryGenerations, inventoryAsOf } from "../db/inventoryGenerations.js";
 import { lockDataScope, type BeginGeneration, type GenerationLease } from "../db/dataGenerations.js";
-import { dataAdmissionError, dataLimitError, digest, encodeBatch } from "../db/dataBounds.js";
+import { dataAdmissionError, dataLimitError, dataLimits, digest, encodeBatch } from "../db/dataBounds.js";
 import { assignSurvivors, sourceKey } from "./inventorySurvivors.js";
 import { inventoryLimits, type InventoryRoot } from "../types/inventoryRecords.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
@@ -16,6 +16,7 @@ import { inventoryNativeRootChoicesSql } from "../db/inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "../db/inventoryIdentityExpiry.js";
 import { projectPackageDetailAge } from "./packageDetailProjection.js";
 import { inventoryReconciliationAdmissionSql } from "../db/inventoryReconciliationAdmissionSchema.js";
+import { AppError } from "../errors.js";
 
 type CapturedRoot = InventoryRoot & { domain: string; expiresAt: string };
 type PreviousRoot = { baseline_id: string; revision: string; nativeScopes: string[] };
@@ -280,7 +281,9 @@ export class InventoryReconciliation {
         const row = await storedInventoryRecord(client, vertex.generation_id, vertex.identity, "canonical");
         if (!row) throw new Error("inventory_component_incomplete");
         bytes += row.bytes;
-        if (bytes > 1_048_576) throw dataLimitError("inventory_component_bytes", 1_048_576, bytes);
+        if (bytes > dataLimits.agentDefinitionWorkBytes) {
+          throw dataLimitError("inventory_component_bytes", dataLimits.agentDefinitionWorkBytes, bytes);
+        }
         rows.push(row);
       }
       const previous = claim.old ? (await client.query(`SELECT DISTINCT s.identity AS agent_id,s.source_scope_id,s.source_identity,
@@ -341,9 +344,19 @@ export class InventoryReconciliation {
         SELECT source_scope_id,identity,generation_id,agent_id FROM ordered WHERE ordinal=included ORDER BY ordinal`,
       [claim.job, JSON.stringify(claim.roots), claim.old?.baseline_id ?? null, claim.old?.revision ?? null, claim.old?.nativeScopes ?? []])).rows;
       if (!candidates.length) return [];
-      const rows = await storedInventoryRecords(client, candidates.map(candidate => ({
-        generationId: candidate.generation_id, identity: candidate.identity,
-      })), "canonical");
+      let batch = candidates;
+      let rows: Awaited<ReturnType<typeof storedInventoryRecords>>;
+      for (;;) {
+        try {
+          rows = await storedInventoryRecords(client, batch.map(candidate => ({
+            generationId: candidate.generation_id, identity: candidate.identity,
+          })), "canonical");
+          break;
+        } catch (error) {
+          if (!(error instanceof AppError) || error.code !== "inventory_record_work_bytes" || batch.length < 2) throw error;
+          batch = batch.slice(0, Math.ceil(batch.length / 2));
+        }
+      }
       if (!rows.length) throw new Error("inventory_component_incomplete");
       const result: Component[] = [];
       for (let index = 0; index < rows.length; index++) {

@@ -3,7 +3,8 @@ import type { useReportPage } from "../useReportPage";
 import { usageCount } from "../usageInsights";
 import { isExpiredSelection } from "../selectedRead";
 
-export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<ReturnType<typeof useReportPage>, "loading" | "error" | "invalidated" | "retry" | "restart" | "restartable"> & { data?: unknown; leaseEnded?: boolean }; quietLoading?: boolean }) {
+export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<ReturnType<typeof useReportPage>, "loading" | "error" | "invalidated" | "retry" | "restart" | "restartable"> & { data?: unknown; leaseEnded?: boolean; renewing?: boolean }; quietLoading?: boolean }) {
+  if (read.renewing) return null;
   if (read.invalidated) return <div role="alert" className="error-banner">This selection changed or expired. Restart to load a new consistent selection.
     {read.restartable ? <>{" "}<button type="button" onClick={read.restart}>Restart selection</button></>
       : " Close this detail and restart its parent selection."}</div>;

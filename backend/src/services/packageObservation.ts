@@ -2,6 +2,7 @@ import { AppError } from "../errors.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import { isPackageElementType, validatePackageAgentMetadata } from "./packageAgentMetadata.js";
 import { operationalLog } from "./telemetry.js";
+import { dataLimits } from "../db/dataBounds.js";
 
 export function allowlistedPackage(input: unknown): CopilotPackageDetail {
   if (!isRecord(input)) throw new AppError(502, "provider_schema", "Invalid package observation.");
@@ -93,7 +94,7 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
       };
     });
   }
-  if (Buffer.byteLength(JSON.stringify(result), "utf8") > 2_048_000) {
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > dataLimits.agentDefinitionWorkBytes) {
     throw new AppError(502, "provider_result_limit", "Package details exceed the saved observation limit; no truncated identity was saved.");
   }
   const omittedCount = Object.keys(row).filter(key => !(key in result) && !key.startsWith("@odata.")).length;

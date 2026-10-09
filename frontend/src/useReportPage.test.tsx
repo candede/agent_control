@@ -33,6 +33,27 @@ beforeEach(() => { vi.mocked(api.readReportPage).mockResolvedValue(page("initial
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
 describe("report page selection lifetimes", () => {
+  it("does not reject a pending fresh capture when an old detail or export rejects the displayed placeholder", async () => {
+    const initial = page("initial"), fresh = { ...page("fresh"), selection: reportSelection(9) };
+    const replacement = deferred<typeof initial>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
+    const hook = renderHook(({ revision }) => useReportPage("copilot-usage/users", {}, revision), {
+      initialProps: { revision: 0 }, wrapper: sharedQueries(),
+    });
+    await waitFor(() => expect(hook.result.current.data).toEqual(initial));
+    hook.rerender({ revision: 1 });
+    await waitFor(() => expect(hook.result.current.loading).toBe(true));
+    expect(hook.result.current.data).toEqual(initial);
+    const signal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    act(() => hook.result.current.invalidateSelection(new ApiError(409, "selection_invalidated", "Old evidence changed.")));
+    expect(signal?.aborted).toBe(false);
+    expect(hook.result.current.invalidated).toBe(false);
+    await act(async () => replacement.resolve(fresh));
+    await waitFor(() => expect(hook.result.current.data).toEqual(fresh));
+    expect(hook.result.current.invalidated).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["page-first", "observer-first"] as const)("compares the admitted report vector %s without a startup reread", async order => {
     const initial = page("initial"), published = initial.selection.publicationRevisions;
     const pending = deferred<typeof initial>();
@@ -49,8 +70,8 @@ describe("report page selection lifetimes", () => {
     expect(admit).toHaveBeenCalledWith(published);
   });
 
-  it.each(["fresh", "page", "detail", "export", "report", "lease-end"] as const)(
-    "scopes publication synchronization to %s ownership without replaying a frozen capture", async ownership => {
+  it.each(["fresh", "page", "report", "lease-end"] as const)(
+    "captures a live %s view on publication without replaying an old capture", async ownership => {
       const initial = page("initial");
       vi.mocked(api.readReportPage).mockImplementation(async (_path, request) =>
         request?.selectionId ? { ...initial, selection: { ...initial.selection, validatedAt: new Date().toISOString() } } : initial);
@@ -63,23 +84,18 @@ describe("report page selection lifetimes", () => {
         act(() => hook.result.current.next());
         await waitFor(() => expect(hook.result.current.loading).toBe(false));
       }
-      if (ownership === "detail" || ownership === "export") act(() => hook.result.current.ownPublication());
       if (ownership === "lease-end") {
         vi.spyOn(performance, "now").mockReturnValue(performance.now() + 20 * 60_000);
       }
       const before = vi.mocked(api.readReportPage).mock.calls.length;
+      vi.mocked(api.readReportPage).mockResolvedValue({ ...initial, selection: reportSelection(9, Date.now()) });
       context.revisions = { ...context.revisions, users: "4".repeat(64) };
       hook.rerender();
-      if (ownership === "lease-end") {
-        expect(api.readReportPage).toHaveBeenCalledTimes(before);
-        expect(hook.result.current.data?.selection.id).toBe("initial");
-      } else {
-        await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(before + 1));
-        await waitFor(() => expect(hook.result.current.loading).toBe(false));
-        expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBe(ownership === "fresh" ? undefined : "initial");
-      }
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(before + 1));
+      await waitFor(() => expect(hook.result.current.loading).toBe(false));
+      expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]?.selectionId).toBeUndefined();
       hook.rerender();
-      expect(api.readReportPage).toHaveBeenCalledTimes(before + (ownership === "lease-end" ? 0 : 1));
+      expect(api.readReportPage).toHaveBeenCalledTimes(before + 1);
     });
 
   it("shares concurrent base report synchronization while unrelated source publications do not reread Users", async () => {
@@ -613,24 +629,137 @@ describe("report page selection lifetimes", () => {
     expect(result.current.leaseEnded).toBe(true);
   });
 
-  it("retains an expired displayed selection until explicit replacement", async () => {
+  it.each(["copilot-usage/users", "official-usage/users", "official-usage/overview", "official-usage/history/options"])(
+    "quietly renews an idle %s selection while retaining its displayed data", async path => {
     vi.useFakeTimers();
     const initial = page("initial"), replacement = deferred<ReturnType<typeof page>>();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
-    const { result } = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper: sharedQueries() });
+    const { result } = renderHook(() => useReportPage<string>(path), { wrapper: sharedQueries() });
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("initial");
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(result.current.data).toBe(initial);
     expect(result.current.leaseEnded).toBe(true);
-    expect(result.current.loading).toBe(false);
+    expect(result.current.renewing).toBe(true);
+    expect(result.current.loading).toBe(true);
     expect(result.current.error).toBeNull();
-    act(() => result.current.restart());
+    expect(result.current.isCurrentData()).toBe(false);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
+    act(() => window.dispatchEvent(new Event("focus")));
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("replacement");
+    expect(result.current.leaseEnded).toBe(false);
+    expect(result.current.renewing).toBe(false);
+    expect(result.current.isCurrentData()).toBe(true);
+  });
+  it.each(["selectionId", "inventorySelectionId"] as const)("does not independently renew an explicitly pinned %s when its lease ends", async field => {
+    vi.useFakeTimers();
+    const initial = page("initial");
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial);
+    const { result } = renderHook(() => useReportPage("official-usage/users", {
+      [field]: field === "selectionId" ? "initial" : initial.reports.setId!,
+    }), { wrapper: sharedQueries() });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(result.current.data).toBe(initial);
+    expect(result.current.leaseEnded).toBe(true);
+    expect(result.current.renewing).toBe(false);
+  });
+  it("shares idle renewal between table readers", async () => {
+    vi.useFakeTimers();
+    const initial = page("initial"), replacement = deferred<ReturnType<typeof page>>();
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
+    const { result } = renderHook(() => ({
+      idle: useReportPage("official-usage/users"), owned: useReportPage("official-usage/users"),
+    }), { wrapper: sharedQueries() });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(result.current.owned.renewing).toBe(true);
+    await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.idle.data?.selection.id).toBe("replacement");
+    expect(result.current.owned.data).toBe(result.current.idle.data);
+    expect(result.current.owned.leaseEnded).toBe(false);
+  });
+  it("shares successive renewals between idle peers", async () => {
+    vi.useFakeTimers();
+    let capture = 0;
+    vi.mocked(api.readReportPage).mockImplementation(async () => {
+      const next = page(`capture-${++capture}`);
+      next.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+      return next;
+    });
+    const { result } = renderHook(() => ({
+      first: useReportPage("official-usage/users"), second: useReportPage("official-usage/users"), owned: useReportPage("official-usage/users"),
+    }), { wrapper: sharedQueries() });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    for (const expected of [2, 3]) {
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(api.readReportPage).toHaveBeenCalledTimes(expected);
+      expect(result.current.first.data?.selection.id).toBe(`capture-${expected}`);
+      expect(result.current.second.data).toBe(result.current.first.data);
+      expect(result.current.owned.data?.selection.id).toBe(`capture-${expected}`);
+      expect(result.current.owned.renewing).toBe(false);
+      expect(result.current.first.isCurrentData()).toBe(true);
+    }
+  });
+  it.each(["hidden", "offline"] as const)("waits while %s and renews the idle selection when available again", async state => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    const initial = page("initial");
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockImplementation(async () => page("replacement"));
+    const { result } = renderHook(() => useReportPage("official-usage/users"), { wrapper: sharedQueries() });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    if (state === "hidden") visibility.mockReturnValue("hidden");
+    else online.mockReturnValue(false);
+    act(() => state === "hidden" ? document.dispatchEvent(new Event("visibilitychange")) : window.dispatchEvent(new Event("offline")));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    expect(result.current.data).toBe(initial);
+    visibility.mockReturnValue("visible"); online.mockReturnValue(true);
+    act(() => state === "hidden" ? document.dispatchEvent(new Event("visibilitychange")) : window.dispatchEvent(new Event("online")));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(result.current.data?.selection.id).toBe("replacement");
+  });
+  it.each([401, 403, 503])("surfaces a %i renewal failure without a request loop", async status => {
+    vi.useFakeTimers();
+    const initial = page("initial");
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockRejectedValue(new ApiError(status, "read_failed", "Renewal failed."));
+    const { result } = renderHook(() => useReportPage("official-usage/users"), { wrapper: sharedQueries() });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.error).toMatchObject({ status });
+    expect(result.current.renewing).toBe(false);
+    expect(result.current.data).toBeUndefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it("does not repeatedly renew a replacement that arrives already expired", async () => {
+    vi.useFakeTimers();
+    const initial = page("initial"), late = page("late"), replacement = deferred<ReturnType<typeof page>>();
+    initial.selection.expiresAt = late.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
+    const { result } = renderHook(() => useReportPage("official-usage/users"), { wrapper: sharedQueries() });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1001); });
+    await act(async () => { replacement.resolve(late); await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.leaseEnded).toBe(true);
+    expect(result.current.renewing).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
   it("does not cancel or repin already-admitted pagination when its local lease ends", async () => {
     vi.useFakeTimers();
@@ -648,11 +777,10 @@ describe("report page selection lifetimes", () => {
     await act(async () => { next.resolve(initial); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data).toBe(initial);
     expect(result.current.leaseEnded).toBe(true);
-    act(() => result.current.restart());
     await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
     expect(result.current.data?.selection.id).toBe("replacement");
   });
-  it("keeps an admitted pinned page through lease end and delegates explicit replacement to its parent", async () => {
+  it("keeps an admitted pinned page through lease end and automatically asks its parent to refresh once", async () => {
     vi.useFakeTimers();
     const initial = page("initial"), next = deferred<ReturnType<typeof page>>(), restart = vi.fn();
     initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
@@ -668,7 +796,7 @@ describe("report page selection lifetimes", () => {
     expect(result.current.selectionId).toBeUndefined();
     expect(result.current.loading).toBe(true);
     expect(result.current.leaseEnded).toBe(true);
-    act(() => { window.dispatchEvent(new Event("focus")); result.current.restart(); });
+    act(() => { window.dispatchEvent(new Event("focus")); });
     expect(restart).toHaveBeenCalledOnce();
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     await act(async () => { next.resolve(initial); await vi.advanceTimersByTimeAsync(1); });
