@@ -8,12 +8,13 @@ import { useReportPrincipalScope } from "../useReportPage";
 import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "../selectedRead";
 import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
 
-export function ReportFacet({ path, selectionId: requestedSelectionId, field, value, onChange, onRestartSelection, onSelectionInvalidated, compact = false }: {
+export function ReportFacet({ path, selectionId: requestedSelectionId, field, value, onChange, onRestartSelection, onSelectionInvalidated, compact = false, alwaysShowSearch = false }: {
   path: string; selectionId?: string; field: "company" | "department" | "creatorType"; value?: string | null;
   onChange: (value: string | null | undefined) => void;
   onRestartSelection: () => void;
   onSelectionInvalidated?: () => void;
   compact?: boolean;
+  alwaysShowSearch?: boolean;
 }) {
   const principal = useReportPrincipalScope();
   const scope = JSON.stringify([principal, path, field]);
@@ -116,11 +117,11 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
     else void read.refetch({ cancelRefetch: false });
   }
   const status = leaseEnded || isExpiredSelection(read.error) ? <p className="sr-only" role="status">Refreshing saved options...</p>
-    : selectionId && !invalidated && read.isFetching ? <p role="status">Loading {label.toLowerCase()} options...</p>
+    : selectionId && !invalidated && read.isFetching ? <p className={alwaysShowSearch ? "sr-only" : undefined} role="status">Loading {label.toLowerCase()} options...</p>
     : (read.error || invalidated) && !(invalidated && onSelectionInvalidated) ? <p role="alert">{invalidated ? "This selection changed or expired." : read.error?.message}{" "}
       <button ref={retryRef} type="button" onClick={invalidated ? onRestartSelection : retry}>
         {invalidated ? "Restart selection" : "Retry options"}</button></p>
-      : data && !data.value.length ? <p role="status">{data.counts.filtered > 0
+      : data && !data.value.length ? <p className={alwaysShowSearch ? "sr-only" : undefined} role="status">{data.counts.filtered > 0
         ? `No ${label.toLowerCase()} options on this page.` : searchQuery
           ? `No ${label.toLowerCase()} options match this search.` : `No ${label.toLowerCase()} options available.`}</p> : null;
   const control = <select ref={controlRef} aria-label={label} aria-disabled={leaseEnded || !selectionId || !data || read.isFetching} value={value === undefined ? "" : encodeReportFacetValue(value)}
@@ -141,7 +142,7 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
   </select>;
   if (compact) return <div className="inventory-facet" role="group" aria-label={`${label} options`}>
     <label><span>{label}</span>{control}</label>
-    {searchOpened || search || cursor || data?.page.nextCursor ? <label><span className="sr-only">Search {label.toLowerCase()} options</span>
+    {alwaysShowSearch || searchOpened || search || cursor || data?.page.nextCursor ? <label><span className="sr-only">Search {label.toLowerCase()} options</span>
       <input type="search" placeholder="Search options" value={search} maxLength={256}
         onFocus={() => changeSearch(search)} onChange={event => changeSearch(event.target.value)} /></label> : null}
     {status}

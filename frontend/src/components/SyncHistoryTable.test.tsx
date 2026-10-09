@@ -35,6 +35,32 @@ function detailHandler(node: ReactNode): ((event: MouseEvent<HTMLAnchorElement>)
 }
 
 describe("SyncHistoryTable", () => {
+  it("keeps the outcome filter beside refresh and indicates reads without moving loaded rows", () => {
+    const state = projection([job(1)]);
+    const props = { state, error: "", onRefresh: vi.fn() };
+    const view = render(<SyncHistoryTable {...props} />);
+    const filter = screen.getByRole("combobox", { name: "Outcome" });
+    const refresh = screen.getByRole("button", { name: "Refresh history" });
+    const controls = refresh.parentElement!;
+    expect(controls).toContainElement(filter);
+    expect(controls.parentElement).toHaveClass("section-heading");
+    expect(filter.closest("label")?.nextElementSibling).toBe(refresh);
+    const table = screen.getByRole("table", { name: "Sync history" });
+    const row = within(table).getAllByRole("row")[1];
+    for (const refreshing of [false, true]) {
+      view.rerender(<SyncHistoryTable {...props} loading refreshing={refreshing} />);
+      expect(refresh.querySelector("svg")).toHaveClass("data-sync-spinning");
+      expect(refresh).toHaveAttribute("aria-disabled", String(refreshing));
+      expect(screen.getByRole("status")).toHaveClass("sr-only");
+      expect(screen.getByRole("status")).toHaveTextContent("Updating sync history");
+      expect(screen.getByRole("table", { name: "Sync history" })).toBe(table);
+      expect(within(table).getAllByRole("row")[1]).toBe(row);
+    }
+    view.rerender(<SyncHistoryTable {...props} />);
+    expect(refresh.querySelector("svg")).not.toHaveClass("data-sync-spinning");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it.each(["data-sync", "package-refresh", "power-platform"] as const)(
     "retires ordinary and modified %s detail navigation on replacement, withdrawal and unmount", source => {
       const onOpenSyncRun = vi.fn();

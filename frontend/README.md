@@ -39,9 +39,47 @@ No host Node.js installation is required.
   and review activity.
 - **Users**: review licenses, activity, and agent relationships.
 - **Sync**: refresh provider data and import Microsoft 365 usage reports.
+
 - **Audit**: review administrative actions made through Agent Control.
 - **Permissions**: check app roles, Microsoft roles, API permissions, consent,
   licensing, and provider access.
+
+Sync history keeps its Outcome filter beside Refresh history. During automatic
+or manual history reads, the refresh icon animates without adding a visible
+loading message or shifting the table. Loading status remains available to
+screen readers; reduced-motion preferences disable the animation.
+
+Users opens the unchanged **Users** view by default. **Adoption** shows
+always-visible Company / Department sections with independent people and agent
+lists; search matches company and department keywords. Group pages show five
+groups at a time, without collapsed sections.
+
+Users and Adoption share the Agents header layout, with the view selectors next
+to the title and summary cards starting at the same height. Adoption uses the
+same search bar and Filters popover. Company and Department options are read
+from all matching saved groups, not just the visible page; missing values can
+also be selected. Copilot Champs and Group agents filters each offer all groups,
+groups with evidence, or groups without evidence. Filters combine before group
+paging and survive reloads in the URL. Summary counts reflect all matching
+groups, and the agent count deduplicates agents shared across groups.
+Company and Department option searches stay visible while filters change;
+dropdowns keep their normal height instead of stretching to match adjacent fields.
+
+The compact `agents/responses` counts mean distinct organization-built agents
+created or used, and reported agent responses in the selected report (not
+lifetime usage). Up to three colleagues with creation or usage evidence are marked **Copilot Champ**,
+ordered by verified agents created, then reported responses. This is a suggestion,
+not a competition or an assigned role. Missing usage is shown as unavailable.
+
+Group agents are the deduplicated union of verified creations and reported use by
+group members, excluding identified first- and third-party agents. Agent entries
+show name, the saved About text (long description preferred, short description
+only as a fallback), and authoring type; clicking opens existing details.
+Rich About text uses the same HTML sanitization as the agent details modal.
+Membership uses the saved directory, not a complete workforce census or
+historical department membership. Agents use current authorized saved inventory;
+appearing in a group does not imply access for every group member. No groups,
+champion assignments, or additional synchronization state are persisted.
 
 Opening an agent from a user's **Responsibility** or **Usage & agents** tab keeps the Users URL and
 opens agent details above the user details. Closing the agent returns to the

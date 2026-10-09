@@ -186,7 +186,12 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const publication = useContext(PublicationContext);
   const admitPublication = publication?.admit;
   const observedPublication = useRef<{ key: string; revision: string } | undefined>(undefined);
-  const publicationRevision = publication?.revisions?.users;
+  const publicationRevision = path === "copilot-usage/adoption" && publication?.revisions
+    ? JSON.stringify([publication.revisions.users, publication.revisions.graph_packages, publication.revisions.power_platform])
+    : publication?.revisions?.users;
+  const capturedPublicationRevision = path === "copilot-usage/adoption" && data
+    ? JSON.stringify([data.selection.publicationRevisions.users, data.selection.publicationRevisions.graph_packages,
+      data.selection.publicationRevisions.power_platform]) : data?.selection.publicationRevisions.users;
   const renewalDue = Boolean(enabled && !query.selectionId && data && expired && !externallyInvalidated && !invalidated
     && (!error || isExpiredSelection(error)) && !incompleteRead && !read.isPlaceholderData
     && !query.inventorySelectionId
@@ -223,7 +228,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     if (!data || !publicationRevision || read.isFetching || read.isError) return;
     const previous = observedPublication.current?.key === key ? observedPublication.current.revision : undefined;
     if (previous === publicationRevision) return;
-    if (!previous && data.selection.publicationRevisions.users === publicationRevision) {
+    if (!previous && capturedPublicationRevision === publicationRevision) {
       observedPublication.current = { key, revision: publicationRevision };
       return;
     }
@@ -237,7 +242,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       queueMicrotask(() => { if (active) capturePublication(publicationRevision); });
       return () => { active = false; };
     }
-  }, [actionOwner, client, current.cursor, current.restart, data, key, publicationRevision,
+  }, [actionOwner, capturedPublicationRevision, client, current.cursor, current.restart, data, key, publicationRevision,
     query.inventorySelectionId, query.selectionId, query.setId, read.isError, read.isFetching, refetch, revision]);
   function ownsSelection() { return enabled && actions.current?.owner === actionOwner; }
   function ownsPage() { return ownsSelection() && actions.current?.page === retryKey && !actions.current.moved && !actions.current.restarted; }

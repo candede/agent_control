@@ -1,6 +1,6 @@
 import "./workspaceSkeleton.css";
 
-const titles = { agents: "Agents", users: "Users & adoption", audit: "Local control audit" };
+const titles = { agents: "Agents", users: "Users", audit: "Local control audit" };
 
 export function WorkspaceSkeleton({ view, contentOnly = false, showSummary = true }: {
   view: keyof typeof titles;

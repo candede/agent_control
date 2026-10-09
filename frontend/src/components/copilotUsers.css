@@ -4,7 +4,6 @@
   min-width: 0;
 }
 
-.copilot-users-header,
 .copilot-users-header-actions,
 .copilot-users-toolbar,
 .copilot-users-pagination,
@@ -129,6 +128,8 @@
 .copilot-user-dialog footer p { flex: 1 1 240px; }
 
 @media (max-width: 760px) {
+  .copilot-users-cohort { grid-template-columns: minmax(0, 1fr); max-width: 230px; }
+  .copilot-users-cohort > span { display: none; }
   .copilot-app-activity { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .copilot-users { gap: 12px; }
   .copilot-user-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }

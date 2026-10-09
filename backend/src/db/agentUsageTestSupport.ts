@@ -30,7 +30,7 @@ export const usageAudit = (scope: AgentUsageScope) => ({
   actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "fixture@example.invalid", displayName: "Fixture" },
   requestPath: "/fixture/usage-associations",
 });
-export type UsageGroup = { packages: string[]; native?: { nativeId: string; environmentId: string | null };
+export type UsageGroup = { packages: string[]; native?: { nativeId: string; environmentId: string | null; createdBy?: string };
   packageFields?: Partial<Omit<CopilotPackageDetail, "id">> };
 const agentType = "microsoft.copilotstudio/agents" as const;
 
@@ -46,7 +46,7 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
   const resources = native.map(value => ({
     sourceSystem: "power_platform" as const, nativeId: value.nativeId, environmentId: value.environmentId, tenantId: scope.tenantId,
     type: agentType, displayName: "Inventory native agent", creatorType: "unknown" as const, agentKind: "agent",
-    location: null, createdAt: null, createdBy: null, lastPublishedAt: null, authoringTool: null,
+    location: null, createdAt: null, createdBy: value.createdBy ?? null, lastPublishedAt: null, authoringTool: null,
     lifecycle: "published" as const, identityConfidence: "exact_native" as const, identifiers: [], provenance: {}, details: {}, unknownFieldCount: 0,
   } satisfies PowerPlatformResource));
   const stages = new InventoryGenerations(database);

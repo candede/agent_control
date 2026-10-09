@@ -1,0 +1,26 @@
+.adoption-view { display: grid; gap: 14px; min-width: 0; }
+.adoption-group { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; min-width: 0; }
+.adoption-group > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 16px; padding: 16px 20px; background: #f2f6f4; border-bottom: 1px solid var(--border); }
+.adoption-group h3 { margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.adoption-group h3 > span { color: var(--muted); margin-inline: 6px; }
+.adoption-group-columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+.adoption-group-columns > div { min-width: 0; padding: 16px 20px; }
+.adoption-people { border-right: 1px solid var(--border); }
+.adoption-group h4 { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 12px; font-size: 13px; }
+.adoption-group h4 small { font-weight: 400; }
+.adoption-group ul { list-style: none; margin: 0; padding: 0; }
+.adoption-group li { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.adoption-group li:last-child { border-bottom: 0; }
+.adoption-people li { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.adoption-people li > div { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.adoption-group .adoption-name { justify-content: flex-start; width: auto; padding: 0; border: 0; background: none; color: var(--ink); text-align: left; min-height: 32px; font-size: 14px; overflow-wrap: anywhere; }
+.adoption-name:hover { text-decoration: underline; }
+.adoption-count { flex-shrink: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+.adoption-agent-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; }
+.adoption-agent-heading small { font-size: 12px; }
+.adoption-agents li p, .adoption-agent-description, .adoption-empty { margin: 3px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .adoption-view { gap: 12px; }
+  .adoption-group-columns { grid-template-columns: minmax(0, 1fr); }
+  .adoption-people { border-right: 0; border-bottom: 1px solid var(--border); }
+}

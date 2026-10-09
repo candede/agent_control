@@ -158,7 +158,7 @@ test("users reuse the Agents summary strip and integrated table design at every 
     if (width > 760) {
       const userBounds = {
         heading: await verticalBounds(users.locator(".copilot-users-header")),
-        title: await verticalBounds(users.getByRole("heading", { name: "Users & adoption", exact: true })),
+        title: await verticalBounds(users.getByRole("heading", { name: "Users", exact: true })),
         summary: await verticalBounds(summary),
         card: await verticalBounds(summary.locator(".metric").first()),
         tableSurface: await verticalBounds(surface),

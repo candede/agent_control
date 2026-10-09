@@ -65,6 +65,11 @@ export type UserDetailTab = typeof userDetailTabs[number];
 
 export type UsersRouteState = {
   view: "licenses" | "activity";
+  section?: "adoption";
+  company?: string | null;
+  department?: string | null;
+  adoptionChamps?: "with" | "without";
+  adoptionAgents?: "with" | "without";
   detailId?: string;
   detailTab?: UserDetailTab;
   search: string;
@@ -344,6 +349,12 @@ export function parseUsersRoute(search: string): UsersRouteState {
   const legacyResponsibility = params.get("view") === "responsibility";
   const detailId = params.get("detail") ?? (legacyResponsibility ? params.get("person") : null);
   return {
+    ...(params.get("section") === "adoption" ? { section: "adoption" as const } : {}),
+    ...(params.get("section") === "adoption" ? {
+      company: routeFacet(params, "company", 256), department: routeFacet(params, "department", 256),
+      adoptionChamps: params.get("champs") === "with" ? "with" as const : params.get("champs") === "without" ? "without" as const : undefined,
+      adoptionAgents: params.get("groupAgents") === "with" ? "with" as const : params.get("groupAgents") === "without" ? "without" as const : undefined,
+    } : {}),
     view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
     ...(detailId !== null ? {
       detailId: isDirectoryObjectId(detailId) ? detailId.toLowerCase() : "invalid",
@@ -359,6 +370,13 @@ export function parseUsersRoute(search: string): UsersRouteState {
 
 export function usersRouteSearch(state: UsersRouteState) {
   const params = new URLSearchParams();
+  if (state.section === "adoption") {
+    params.set("section", "adoption");
+    if (state.company !== undefined) params.set("company", encodeInventoryFacet(state.company));
+    if (state.department !== undefined) params.set("department", encodeInventoryFacet(state.department));
+    if (state.adoptionChamps) params.set("champs", state.adoptionChamps);
+    if (state.adoptionAgents) params.set("groupAgents", state.adoptionAgents);
+  }
   if (state.view === "activity") params.set("view", state.view);
   if (state.detailId) {
     params.set("detail", isDirectoryObjectId(state.detailId) ? state.detailId.toLowerCase() : "invalid");

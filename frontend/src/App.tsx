@@ -3469,7 +3469,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       </div> : null}
       {blockingWorkspace ? syncSetupStatus === "checking"
         && (visibleActiveView === "agents" || visibleActiveView === "users" || visibleActiveView === "audit")
-        ? <WorkspaceSkeleton view={visibleActiveView} showSummary={visibleActiveView === "users" ? usersRoute.view !== "activity"
+        ? <WorkspaceSkeleton view={visibleActiveView} showSummary={visibleActiveView === "users" ? usersRoute.section !== "adoption" && usersRoute.view !== "activity"
           : visibleActiveView === "audit" || canReadSensitiveUsage} /> : null
         : visibleActiveView === "agents" && hasRole(user, "AgentControl.Viewer")
           && initialAgentReadOwner !== principalKey

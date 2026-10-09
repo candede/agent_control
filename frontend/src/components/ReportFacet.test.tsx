@@ -33,6 +33,26 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
+it("keeps compact option search visible across loading, short pages and empty results", async () => {
+  const pending = deferred<FacetPage>();
+  vi.mocked(api.readReportFacet).mockReturnValueOnce(pending.promise).mockResolvedValue({
+    ...facetPage([]), counts: { total: 1, filtered: 0 },
+  });
+  render(<ReportFacet compact alwaysShowSearch path="copilot-usage/adoption" selectionId={selectionId}
+    field="company" onChange={vi.fn()} onRestartSelection={vi.fn()} />);
+  const search = screen.getByRole("searchbox", { name: "Search company options" });
+  expect(search).toBeVisible();
+  expect(screen.getByText("Loading company options...")).toHaveClass("sr-only");
+  await act(async () => pending.resolve(facetPage(["Contoso"])));
+  await waitFor(() => expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false"));
+  expect(screen.getByRole("searchbox")).toBe(search);
+  fireEvent.change(search, { target: { value: "missing" } });
+  await screen.findByText("No company options match this search.");
+  expect(screen.getByText("No company options match this search.")).toHaveClass("sr-only");
+  expect(screen.getByRole("searchbox")).toBe(search);
+  expect(search).toBeVisible();
+});
+
 describe.each([false, true])("report facet boundaries (compact=%s)", compact => {
   function facet(onChange = vi.fn(), onRestartSelection = vi.fn(), value?: string | null) {
     return <ReportFacet compact={compact} path="copilot-usage/users" selectionId={selectionId}

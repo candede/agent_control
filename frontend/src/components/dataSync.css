@@ -396,8 +396,10 @@
 .sync-history .section-heading { align-items: center; }
 .sync-history .jobs-note { margin: 0; }
 .sync-history button[aria-disabled="true"] { cursor: not-allowed; opacity: 0.58; }
-.sync-history-controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
-.sync-history-filter { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.sync-history-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; }
+.sync-history-controls > button { flex-shrink: 0; white-space: nowrap; }
+.sync-history-filter { display: flex; align-items: center; gap: 8px; font-size: 13px; white-space: nowrap; }
+.sync-history-filter select { width: auto; }
 .sync-table-scroll { overflow-x: auto; min-width: 0; border: 1px solid var(--border); border-radius: 8px; }
 .sync-history-table { border-collapse: collapse; width: 100%; min-width: 760px; text-align: left; }
 .sync-history-table th { padding: 12px 14px; background: #f6f8f7; color: var(--muted); font-size: 12px; font-weight: 650; white-space: nowrap; }

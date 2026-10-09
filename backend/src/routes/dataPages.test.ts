@@ -112,6 +112,8 @@ describe("users/report route-to-client boundary", () => {
   });
   it.each([
     ["/copilot-usage/users", "licensed_copilot_usage"],
+    ["/copilot-usage/adoption", "licensed_copilot_usage"],
+    ["/copilot-usage/adoption/facets?field=company", "licensed_copilot_usage"],
     ["/official-usage/history", "official_usage_history"],
     ["/official-usage/history/options", "official_usage_history"],
     ["/official-usage/overview", "official_usage_overview"],
@@ -119,7 +121,7 @@ describe("users/report route-to-client boundary", () => {
     ["/official-usage/users", "official_usage_user"],
     ["/official-usage/agents/Report-A", "official_usage_user"],
   ])("preserves real Viewer/Admin policy and read-only navigation for %s", async (path, dataClass) => {
-    expect(declaredRoutePolicies.get(`GET ${path === "/official-usage/agents/Report-A" ? "/official-usage/agents/:agentId" : path}`)).toEqual({
+    expect(declaredRoutePolicies.get(`GET ${path === "/official-usage/agents/Report-A" ? "/official-usage/agents/:agentId" : path.split("?")[0]}`)).toEqual({
       access: "authenticated", dataClass, roles: ["AgentControl.Viewer"],
     });
     expect(declaredRoutePolicies.has(`POST ${path}`)).toBe(false);
@@ -142,8 +144,9 @@ describe("users/report route-to-client boundary", () => {
         expect(result.status, await result.clone().text()).toBe(200);
         expect(result.headers.get("cache-control")).toBe("private, no-store");
       }
-      expect((await api(`${path}?search=${path.endsWith("/Report-A") ? "Same" : "typing"}`)).status).toBe(200);
-      expect((await api(`${path}?offset=1`)).status).toBe(400);
+      const separator = path.includes("?") ? "&" : "?";
+      expect((await api(`${path}${separator}search=${path.endsWith("/Report-A") ? "Same" : "typing"}`)).status).toBe(200);
+      expect((await api(`${path}${separator}offset=1`)).status).toBe(400);
       expect((await api(path, { method: "POST", body: "{}" })).status).toBe(404);
       expect(inventory).not.toHaveBeenCalled();
     } finally { inventory.mockRestore(); provider.mockRestore(); }

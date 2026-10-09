@@ -17,11 +17,13 @@ import { readableReportVersionSql } from "../db/reportCapacitySchema.js";
 import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisions.js";
 import type { PublicationRevisions, PublishedSelectedRead } from "../types/dataSelection.js";
 import { isPublicationRevisions } from "../types/dataSelection.js";
+import { adoptionDataset } from "./adoptionGroups.js";
 
 export const reportQueryFields = ["setId", "scope", "search", "company", "department", "entitlement", "serviceState", "appActivity",
   "reportActivity", "cohort", "licenseCohort", "creatorType", "agentId", "username", "responsesOnly", "startDate", "endDate",
-  "lowResponseThreshold", "inactiveDays", "activityWindowDays", "sort", "order"] as const;
+  "lowResponseThreshold", "inactiveDays", "activityWindowDays", "adoptionChamps", "adoptionAgents", "sort", "order"] as const;
 const sorts = {
+  adoption: ["name"],
   copilot_users: ["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity"],
   official_users: ["name", "responses", "agentsUsed", "lastActivity"],
   official_agents: ["name", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"],
@@ -30,6 +32,11 @@ const sorts = {
 } as const;
 export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportQuery {
   if (!(endpoint in sorts) || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
+  if (endpoint === "adoption" && Object.keys(input).some(key => !["setId", "search", "company", "department", "adoptionChamps", "adoptionAgents", "sort", "order",
+    "lowResponseThreshold", "inactiveDays", "activityWindowDays"].includes(key))) throw new SelectionError("invalid_cursor");
+  for (const key of ["adoptionChamps", "adoptionAgents"] as const) {
+    if (input[key] !== undefined && (endpoint !== "adoption" || !["with", "without"].includes(input[key]))) throw new SelectionError("invalid_cursor");
+  }
   const query = { ...input };
   for (const key of ["company", "department", "creatorType", "agentId", "username"] as const) {
     const value = query[key];
@@ -63,7 +70,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
   if (query.search !== undefined) query.search = reportSearch(query.search);
   // A accepted filter must be meaningful on the chosen endpoint, never ignored.
   const organization = ["company", "department", "entitlement", "serviceState", "appActivity", "cohort", "licenseCohort"];
-  if (!["copilot_users", "official_users"].includes(endpoint) && organization.some(key => key in input)
+  if (!["copilot_users", "official_users", "adoption"].includes(endpoint) && organization.some(key => key in input)
     || endpoint === "official_users" && ("appActivity" in input || ["licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"].includes(input.cohort ?? ""))
     || endpoint !== "overview" && "scope" in input
     || ["history", "overview", "unresolved", "plans", "observations"].includes(endpoint) && ["creatorType", "agentId", "username", "responsesOnly", "reportActivity"].some(key => key in input)) throw new SelectionError("invalid_cursor");
@@ -260,6 +267,7 @@ export class LargeTenantUsersReports {
   }
 
   dataset(context: ReportReadContext, endpoint = context.endpoint, child?: string): { sql: string; values: unknown[] } {
+    if (endpoint === "adoption") return adoptionDataset(this, context);
     const values = this.parameters(context);
     const relation = (table: string, extra = "") => `${reportRelationsSql} SELECT * FROM ${table} ${extra}`;
     if (endpoint === "copilot_users") {
@@ -333,6 +341,7 @@ export class LargeTenantUsersReports {
   }
 
   filter(context: ReportReadContext, endpoint: ReportEndpoint, values: unknown[], omit?: "company" | "department") {
+    if (endpoint === "adoption") return "true";
     const q = context.query, clauses = ["true"], add = (value: unknown) => { values.push(value); return `$${values.length}`; };
     if (endpoint === "overview") clauses.push("query_match");
     if (q.search) clauses.push(`(strpos(${reportSearchSql("COALESCE(name,'')")},${add(q.search)})>0 OR strpos(${reportSearchSql("identity")},${add(q.search)})>0
@@ -602,7 +611,7 @@ export class LargeTenantUsersReports {
     const limit = options.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new SelectionError("invalid_cursor");
     return this.read(id, identity, async (client, context) => {
-      if (options.field === "creatorType" ? context.endpoint !== "official_agents" : !["copilot_users", "official_users"].includes(context.endpoint)) throw new SelectionError("invalid_cursor");
+      if (options.field === "creatorType" ? context.endpoint !== "official_agents" : !["copilot_users", "official_users", "adoption"].includes(context.endpoint)) throw new SelectionError("invalid_cursor");
       const field = options.field === "creatorType" ? "creator_type" : options.field;
       const query = { ...context.query };
       delete query[options.field];
@@ -610,11 +619,13 @@ export class LargeTenantUsersReports {
       const { sql, values } = this.dataset(copy);
       const where = this.filter(copy, copy.endpoint, values, options.field === "creatorType" ? undefined : options.field);
       values.push(search);
-      const base = `WITH dataset AS (${sql}), options AS (SELECT ${field} AS value,count(*)::text AS count FROM dataset
-        WHERE ${where} AND strpos(${reportSearchSql(`COALESCE(${field},'')`)},$${values.length})>0 GROUP BY ${field}),
+      const facetKey = context.endpoint === "adoption" ? `lower(normalize(${field},NFKC))` : field;
+      const facetLabel = context.endpoint === "adoption" ? `min(${field} COLLATE "C")` : field;
+      const base = `WITH dataset AS (${sql}), options AS (SELECT ${facetLabel} AS value,count(*)::text AS count FROM dataset
+        WHERE ${where} AND strpos(${reportSearchSql(`COALESCE(${field},'')`)},$${values.length})>0 GROUP BY ${facetKey}),
         ordered AS (SELECT *,lower(normalize(value,NFKC) COLLATE "default") AS page_key,COALESCE(value,chr(1)) AS identity FROM options)`;
       const counts = (await client.query(`${base} SELECT count(*)::text AS filtered,
-        (SELECT count(*) FROM (SELECT ${field} FROM dataset GROUP BY ${field}) all_options)::text AS total FROM ordered`, values)).rows[0];
+        (SELECT count(*) FROM (SELECT ${facetKey} FROM dataset GROUP BY ${facetKey}) all_options)::text AS total FROM ordered`, values)).rows[0];
       const expected = { identity, endpoint: `facets:${options.field}`, selectionId: id, revision: context.selection.revision,
         queryHash: digest(`${context.queryHash}:${options.field}:${options.search ?? ""}`) };
       const cursor = options.cursor ? this.codec.decode(options.cursor, expected) : undefined, previous = cursor?.direction === "previous";

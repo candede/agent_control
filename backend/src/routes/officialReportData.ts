@@ -14,6 +14,7 @@ import type { ReportUser, ReportEndpoint, ReportQuery } from "../types/officialR
 import { officialReportMultipart } from "./officialReportMultipart.js";
 import { InventoryQueries } from "../db/inventoryQueries.js";
 import { config } from "../config.js";
+import { readAdoptionGroups } from "../services/adoptionGroups.js";
 
 export type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
 export type ReportHandlerOptions = {
@@ -135,10 +136,16 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     const context = await selected(request, "history");
     response.json(await reports.historyOptions(context.id, context.identity, pageOptions(request.query)));
   }));
+  route("get", "/copilot-usage/adoption", "read", failSafe(async (request, response) => {
+    const context = await selected(request, "adoption");
+    response.json(await reports.read(context.id, context.identity, (client, read) =>
+      readAdoptionGroups(client, reports, read, pageOptions(request.query))));
+  }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));
   }));
-  for (const [path, endpoint] of lists.filter(([, endpoint]) => ["copilot_users", "official_users", "official_agents"].includes(endpoint))) {
+  for (const [path, endpoint] of [...lists.filter(([, endpoint]) => ["copilot_users", "official_users", "official_agents"].includes(endpoint)),
+    ["/copilot-usage/adoption", "adoption"] as const]) {
     route("get", `${path}/facets`, "read", failSafe(async (request, response) => {
       const context = await selected(request, endpoint, true);
       response.json(await reports.facets(context.id, context.identity, { ...pageOptions(request.query),

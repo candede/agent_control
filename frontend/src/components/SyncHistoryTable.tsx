@@ -93,28 +93,28 @@ export function SyncHistoryTable({ state, error, loading = false, refreshing = f
           <h2 id="jobs-heading">Sync history</h2>
           <p className="jobs-note">Previous collection attempts, separate from your workspace's last successful data.</p>
         </div>
-        <button type="button" className="secondary" aria-disabled={refreshing}
-          onClick={() => { if (!refreshing && actionIsCurrent()) onRefresh(); }}>
-          <RefreshCw size={15} aria-hidden="true" />Refresh history
-        </button>
-      </div>
-      <div className="sync-history-controls">
-        <label className="sync-history-filter">
-          Outcome
-          <select value={outcome} onChange={event => {
-            if (event.target.value === outcome || !admitAction()) return;
-            setOutcome(event.target.value);
-            setPage(0);
-          }}>
-            <option value="all">All outcomes</option>
-            <option value="complete">Complete</option>
-            <option value="active">In progress</option>
-            <option value="incomplete">Incomplete or stopped</option>
-          </select>
-        </label>
+        <div className="sync-history-controls">
+          <label className="sync-history-filter">
+            <span>Outcome</span>
+            <select value={outcome} onChange={event => {
+              if (event.target.value === outcome || !admitAction()) return;
+              setOutcome(event.target.value);
+              setPage(0);
+            }}>
+              <option value="all">All outcomes</option>
+              <option value="complete">Complete</option>
+              <option value="active">In progress</option>
+              <option value="incomplete">Incomplete or stopped</option>
+            </select>
+          </label>
+          <button type="button" className="secondary" aria-disabled={refreshing}
+            onClick={() => { if (!refreshing && actionIsCurrent()) onRefresh(); }}>
+            <RefreshCw size={15} className={loading ? "data-sync-spinning" : undefined} aria-hidden="true" />Refresh history
+          </button>
+        </div>
       </div>
       {error && !loading ? <div className="error-banner" role="alert">{error}</div> : null}
-      {loading ? <p role="status">{state ? "Updating sync history..." : "Loading sync history..."}</p> : null}
+      <span className="sr-only" role={loading ? "status" : undefined}>{loading ? state ? "Updating sync history..." : "Loading sync history..." : ""}</span>
       {unavailable.length ? <p className="notice" role="status">History is temporarily unavailable for {unavailable.map(source => source.source === "data-sync" ? "sync runs" : source.source === "package-refresh" ? "Graph packages" : "Power Platform").join(" and ")}. Displayed rows may be incomplete.</p> : null}
       {state && !loading && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"
         ? "No recent records match this outcome."

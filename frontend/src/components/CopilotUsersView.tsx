@@ -16,6 +16,7 @@ import { UserDetailModal } from "./UserDetailModal";
 import { UsageReportContext } from "./UsageReportContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { useUserSourceProgress } from "../publicationContext";
+import { AdoptionView } from "./AdoptionView";
 import "./copilotUsers.css";
 import "./reportedUsers.css";
 
@@ -43,6 +44,7 @@ export function CopilotUsersView(props: Props) {
 function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, reportSelector }: Props) {
   const cohortDescriptionId = useId();
   const cohort = useRef<HTMLSelectElement>(null);
+  const adoptionTrigger = useRef<HTMLButtonElement>(null);
   const [internal, setInternal] = useState<UsersRouteState>({ view: "licenses", search: "", page: 0 });
   const current = route ?? internal;
   const change = (next: UsersRouteState) => { setInternal(next); onRouteChange?.(next, false); };
@@ -53,19 +55,31 @@ function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInve
       <button type="button" className="secondary" onClick={() => change({ ...current, reportSetId: undefined, page: 0 })}>Use current reports</button></p> : null}
   </div>;
   return <section className="copilot-users" aria-label="Users and adoption" aria-busy={false}>
-    <header className="copilot-users-header"><div><h2>Users &amp; adoption</h2><p className="sr-only" id={cohortDescriptionId}>{current.view === "licenses"
+    <header className="copilot-users-header"><div><h2>Users</h2><p className="sr-only" id={cohortDescriptionId}>{current.section === "adoption"
+      ? "People and organization-built agents grouped by company and department."
+      : current.view === "licenses"
       ? "Effective paid M365 Copilot licenses and adoption."
       : "Agent activity by users without paid Copilot."}</p></div>
-      <div className="copilot-users-header-actions"><label className="copilot-users-cohort"><span>User cohort</span><select ref={cohort} aria-describedby={cohortDescriptionId} value={current.view} onChange={event => {
+      <div className="agent-inventory-scopes" role="group" aria-label="Users view">
+      <button type="button" className="agent-inventory-scope" aria-label="Users view" aria-pressed={current.section !== "adoption"}
+        onClick={() => change({ ...current, section: undefined, search: "", page: 0 })}><span>Users</span></button>
+      <button ref={adoptionTrigger} type="button" className="agent-inventory-scope" aria-pressed={current.section === "adoption"}
+        onClick={() => change({ ...current, section: "adoption", search: "", page: 0 })}><span>Adoption</span></button>
+      </div>
+      {current.section !== "adoption" ? <div className="copilot-users-header-actions"><label className="copilot-users-cohort"><span>User cohort</span><select ref={cohort} aria-label="User cohort" aria-describedby={cohortDescriptionId} value={current.view} onChange={event => {
         const view = event.target.value;
         if (view === "licenses" || view === "activity") change({ ...current, view, page: 0 });
-      }}><option value="licenses">Paid M365 Copilot users</option><option value="activity">Active users without paid Copilot</option></select></label></div></header>
-    {current.view === "activity" ? reportContext : null}
+      }}><option value="licenses">Paid M365 Copilot users</option><option value="activity">Active users without paid Copilot</option></select></label></div> : null}</header>
+    {current.section === "adoption" ? <AdoptionView route={current} change={change} revision={dataRevision + agentInventoryRevision}
+      reportContext={reportContext} onOpenAgent={onOpenAgent}
+      onOpenPerson={detailId => change({ ...current, detailId, detailTab: undefined })} />
+      : <>{current.view === "activity" ? reportContext : null}
     {current.view === "activity" ? <ReportedUserActivity route={current} onRouteChange={change} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
         : <LicensedUsers route={current} change={change} revision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} reportContext={reportContext} />}
+    </>}
     {current.detailId ? <UserDetailModal key={current.detailId} identity={current.detailId} kind="directory"
       activeTab={current.detailTab} onTabChange={detailTab => change({ ...current, detailTab })}
-      returnFocusTo={cohort} closeLabel="Close user details" onClose={() => change({ ...current, detailId: undefined, detailTab: undefined })}
+      returnFocusTo={current.section === "adoption" ? adoptionTrigger : cohort} closeLabel="Close user details" onClose={() => change({ ...current, detailId: undefined, detailTab: undefined })}
       dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} /> : null}
   </section>;
 }

@@ -48,7 +48,7 @@ test("bounded export setup is idempotent under backpressure and polling stops wh
   await expect(page.getByRole("link", { name: "Download CSV" })).toHaveCount(0);
   const prior = polls;
   await page.goto("/users");
-  await expect(page.getByRole("heading", { name: "Users & adoption", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Users", exact: true })).toBeVisible();
   await page.waitForTimeout(3300);
   expect(polls).toBe(prior);
   expect(pages).toBeLessThanOrEqual(3);
