@@ -15,7 +15,7 @@ import { ReportedUserActivity } from "./ReportedUserActivity";
 import { UserDetailModal } from "./UserDetailModal";
 import { UsageReportContext } from "./UsageReportContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
-import { useUserSourceProgress } from "../publicationContext";
+import { useUserSourceFailure, useUserSourceProgress } from "../publicationContext";
 import { AdoptionView } from "./AdoptionView";
 import "./copilotUsers.css";
 import "./reportedUsers.css";
@@ -101,6 +101,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   const queryKey = JSON.stringify(query);
   const data = read.data;
   const directoryProgress = useUserSourceProgress(data?.sources.directory);
+  const directoryFailure = useUserSourceFailure(data?.sources.directory);
   const appProgress = useUserSourceProgress(data?.sources.app_activity);
   const [initialReadComplete, setInitialReadComplete] = useState(false);
   if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
@@ -129,7 +130,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
             : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating..." : usageCount(data?.summary[metric])}</strong>
           <small title={description}>{description}</small></button>)}{reportContext}</div>
     {directoryProgress ? <p className="reported-users-note" role="status">{directoryProgress}</p>
-      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data {data.sources.directory.state}. Run Users sync in Sync or review Permissions.</p> : null}
+      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">{directoryFailure ?? `License data ${data.sources.directory.state}. Run Users sync in Sync or review Permissions.`}</p> : null}
     {data && !read.loading && data.reports.availability !== "active" ? <p className="copilot-users-notice" role="status">
       {data.reports.availability === "stale" ? "Reports are out of date." : "Agent reports unavailable."}{" "}
       <a href="/sync?reports=manage">Manage reports in Sync</a>.</p> : null}

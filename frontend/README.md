@@ -75,7 +75,10 @@ Group agents are the deduplicated union of verified creations and reported use b
 group members, excluding identified first- and third-party agents. Agent entries
 show name, the saved About text (long description preferred, short description
 only as a fallback), and authoring type; clicking opens existing details.
-Rich About text uses the same HTML sanitization as the agent details modal.
+About previews strip HTML using the agent modal's sanitizer and show at most
+300 plain-text characters, including a trailing ellipsis when truncated.
+Previews end at a word boundary where possible. Clicking the agent name opens
+the existing details modal with the full About text; no expansion control is added.
 Membership uses the saved directory, not a complete workforce census or
 historical department membership. Agents use current authorized saved inventory;
 appearing in a group does not imply access for every group member. No groups,
@@ -124,6 +127,11 @@ counts, rather than asking for manual sync. Known counts and rows remain visible
 The first automatic check is described as a check, not as confirmed sync work.
 Failed, cancelled, and permission-blocked reads retain their recovery guidance;
 unrelated inventory refreshes do not hide user-data problems.
+Incomplete automatic Users syncs explicitly show that the latest attempt failed
+and that saved data remains available. Automatic checks settle finished runs even
+when the saved aggregate state is stale; collection failures retry after the
+existing 15-minute cooldown (authorization failures retain their one-hour
+cooldown or require a fresh sign-in).
 
 Tables, report dropdowns and open details adopt new saved-data publications.
 Short-lived selections renew automatically while the page is visible and online.

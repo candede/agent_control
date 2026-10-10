@@ -18,7 +18,7 @@
 .adoption-count { flex-shrink: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
 .adoption-agent-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; }
 .adoption-agent-heading small { font-size: 12px; }
-.adoption-agents li p, .adoption-agent-description, .adoption-empty { margin: 3px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.adoption-agents li p, .adoption-empty { margin: 3px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 @media (max-width: 760px) {
   .adoption-view { gap: 12px; }
   .adoption-group-columns { grid-template-columns: minmax(0, 1fr); }

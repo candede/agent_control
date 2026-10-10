@@ -2,7 +2,7 @@ import { useId, useRef, type ReactNode } from "react";
 import { Search, X } from "lucide-react";
 import type { AdoptionGroup, AdoptionPage } from "../../../backend/src/types/adoption";
 import { normalizeReportSearch } from "../api/reportData";
-import { getSanitizedDescriptionHtml } from "../agentDetails";
+import { getAdoptionDescriptionPreview } from "../agentDetails";
 import { useReportPage } from "../useReportPage";
 import { usageCount } from "../usageInsights";
 import type { UsersRouteState } from "../workbenchRouting";
@@ -126,7 +126,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
               if (read.isCurrentData(true)) onOpenAgent(agent.id);
             }}>{agent.name}</button> : <strong>{agent.name}</strong>}
               {agent.type ? <small>{agent.type.replace("Microsoft 365 Copilot Agent Builder", "Agent Builder")}</small> : null}</div>
-            <AdoptionAgentDescription description={agent.description} />
+            <p>{getAdoptionDescriptionPreview(agent.description) || "Description unavailable"}</p>
           </li>)}</ul>
           {!group.agents.length ? <p className="adoption-empty">No organization-built agents found.</p> : null}
         </div>
@@ -136,10 +136,4 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
       ? "No groups match your search and filters." : "No saved users to group. Refresh Users in Sync."}</p> : null}
     <ReportPageControls {...read} label="groups" />
   </div>;
-}
-
-function AdoptionAgentDescription({ description }: { description: string | null }) {
-  const html = getSanitizedDescriptionHtml(description ?? "");
-  return html ? <div className="adoption-agent-description rich-description" dangerouslySetInnerHTML={{ __html: html }} />
-    : <p>{description || "Description unavailable"}</p>;
 }

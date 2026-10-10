@@ -4,6 +4,7 @@ import type pg from "pg";
 import { observeDataWork } from "./dataMetrics.js";
 import { revalidateAuthenticatedUser } from "../auth/msal.js";
 import { DataGenerations, type BeginGeneration } from "../db/dataGenerations.js";
+import { finalizeRun } from "../db/dataSync.js";
 import { InventoryGenerations, inventorySelector, type InventoryIntent } from "../db/inventoryGenerations.js";
 import { pool } from "../db/pool.js";
 import { AppError, errorTelemetry } from "../errors.js";
@@ -50,6 +51,7 @@ export function completeInventoryJob(input: BeginGeneration, domain: Domain) {
     [result.jobId, input.scope.tenantId, input.scope.principalId, result.rows]);
     if (changed.rowCount !== 1) throw new AppError(409, "inventory_job_fenced", "The inventory refresh stopped before publication.");
     if (!input.runId) return;
+    if (!input.scope.principalId) throw new AppError(409, "inventory_run_fenced", "The source run requires a principal-scoped inventory refresh.");
     const source = domain === "packages" ? "graph_packages" : "power_platform";
     const published = await client.query(`UPDATE data_sync_run_sources s SET status='succeeded',count=$5,
       last_success_at=clock_timestamp(),updated_at=clock_timestamp(),message='Complete source published.',can_retry=false
@@ -61,8 +63,7 @@ export function completeInventoryJob(input: BeginGeneration, domain: Domain) {
       VALUES($1,$2,$3,$4,clock_timestamp(),clock_timestamp()) ON CONFLICT(tenant_id,principal_id,source_id)
       DO UPDATE SET count=EXCLUDED.count,last_success_at=EXCLUDED.last_success_at,updated_at=EXCLUDED.updated_at`,
     [input.scope.tenantId, input.scope.principalId, source, result.rows]);
-    await client.query(`UPDATE data_sync_runs r SET status='completed',completed_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM data_sync_run_sources s WHERE s.run_id=r.id AND s.status<>'succeeded')`, [input.runId]);
+    await finalizeRun(client, { tenantId: input.scope.tenantId, principalId: input.scope.principalId }, input.runId);
   };
 }
 

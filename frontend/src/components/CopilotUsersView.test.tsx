@@ -70,6 +70,32 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe("record-backed paid M365 Copilot license dashboard", () => {
+  it.each(["failed", "partial"] as const)("shows a %s Users sync as incomplete rather than updating", async status => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.sources.directory.attemptStatus = "failed";
+    saved.summary.licensedUsers = null;
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status } }}><CopilotUsersView /></PublicationContext>);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByText("The latest Users sync did not complete. Saved data remains available; automatic refresh will retry when eligible. Review Sync for details.")).toBeVisible();
+    expect(screen.getByRole("group", { name: "M365 Copilot license summary" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByText("Updating...")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("Unknown");
+  });
+
+  it("stops showing progress when live Users sync has finished but a captured attempt still says running", async () => {
+    const saved = page();
+    saved.sources.directory.state = "partial";
+    saved.sources.directory.attemptStatus = "running";
+    saved.summary.licensedUsers = null;
+    vi.mocked(api.readReportPage).mockResolvedValue(saved);
+    render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status: "partial" } }}><CopilotUsersView /></PublicationContext>);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByText(/The latest Users sync did not complete/)).toBeVisible();
+    expect(screen.queryByText(/Users sync is in progress|Updating\.\.\./)).not.toBeInTheDocument();
+  });
+
   it.each(["queued", "running"] as const)("shows incomplete counts as updating during %s Users sync and retains known counts", async status => {
     const saved = page();
     saved.sources.directory.state = "partial";

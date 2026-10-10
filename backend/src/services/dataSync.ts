@@ -80,7 +80,13 @@ export class DataSyncService {
     const scope = dataScope(user);
     let run = await this.dependencies.repository.getLatestRun(scope);
     const published = await this.dependencies.officialUsage.read(scope.tenantId);
-    if (run) run = await this.reconcileRun(user, scope, run, published);
+    if (run) {
+      run = await this.reconcileRun(user, scope, run, published);
+      if (run.automatic && run.sources.every(source => ["succeeded", "partial", "failed", "cancelled"].includes(source.status))) {
+        await this.dependencies.repository.finishAutomatic(scope, run.id);
+        run = (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
+      }
+    }
     if (hasAcceptedUsage(published)) {
       await this.dependencies.repository.recordSuccessMarker(scope, "usage_reports", usageRowCount(published), usageAcceptedAt(published));
     }

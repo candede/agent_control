@@ -68,6 +68,7 @@ export class DataSyncRepository {
     validateScope(scope);
     const result = await transaction(this.database, async client => {
       await lockScope(client, scope);
+      await settleAutomaticRuns(client, scope);
       const active = await client.query<{ id: string }>(`SELECT id FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting')
           AND expires_at>clock_timestamp()
@@ -115,10 +116,10 @@ export class DataSyncRepository {
 
   async finishAutomatic(scope: DataSyncScope, runId: string) {
     validateScope(scope);
-    await this.database.query(`UPDATE data_sync_runs run SET status='partial',completed_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND automatic AND status='waiting'
-        AND NOT EXISTS (SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status IN ('queued','running'))`,
-    [runId, scope.tenantId, scope.principalId]);
+    await transaction(this.database, async client => {
+      await lockScope(client, scope);
+      await settleAutomaticRuns(client, scope, runId);
+    });
   }
 
   async submit(scope: DataSyncScope, input: StartDataSyncInput): Promise<{ run: DataSyncRun; created: boolean }> {
@@ -468,7 +469,23 @@ function projectSource(row: SourceRow): DataSyncSourceStatus {
   };
 }
 
-async function finalizeRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {
+async function settleAutomaticRuns(client: pg.PoolClient, scope: DataSyncScope, runId?: string) {
+  await client.query(`UPDATE data_sync_runs run SET
+    status=CASE
+      WHEN NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status<>'succeeded') THEN 'completed'
+      WHEN NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status<>'cancelled') THEN 'cancelled'
+      ELSE 'partial' END,
+    completed_at=COALESCE(completed_at,clock_timestamp()),updated_at=clock_timestamp()
+    WHERE tenant_id=$1 AND principal_id=$2 AND automatic AND status IN ('running','waiting')
+      AND ($3::uuid IS NULL OR id=$3)
+      AND EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id)
+      AND NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND
+        (source.status IN ('queued','running')
+          OR $3::uuid IS NULL AND source.status IN ('waiting_authorization','permission_required','awaiting_upload')))`,
+  [scope.tenantId, scope.principalId, runId ?? null]);
+}
+
+export async function finalizeRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {
   const result = await client.query<{ status: DataSyncSourceState }>(`SELECT status FROM data_sync_run_sources
     WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3`, [runId, scope.tenantId, scope.principalId]);
   const statuses = result.rows.map(row => row.status);

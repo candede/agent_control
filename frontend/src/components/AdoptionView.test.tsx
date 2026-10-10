@@ -110,16 +110,30 @@ describe("Adoption", () => {
     expect(await screen.findByText("No organization-built agents found.")).toBeVisible();
     expect(screen.getByText("Robin")).toBeVisible();
   });
-  it("renders rich About descriptions using the agent modal sanitizer", async () => {
+  it("shows About markup as sanitized plain text", async () => {
     vi.mocked(api.readReportPage).mockResolvedValue(page([{ ...group, agents: [{
       ...group.agents[0], description: '<p>Finds <strong>HR policies</strong> and onboarding guidance.</p><img src="x" onerror="alert(1)"><script>alert(1)</script>',
     }] }]));
     mount();
-    const text = await screen.findByText("HR policies");
-    expect(text.tagName).toBe("STRONG");
-    expect(text.closest(".adoption-agent-description")).toHaveTextContent("Finds HR policies and onboarding guidance.");
-    expect(document.querySelector(".adoption-agent-description script")).toBeNull();
-    expect(document.querySelector(".adoption-agent-description img")).not.toHaveAttribute("onerror");
+    const text = await screen.findByText("Finds HR policies and onboarding guidance.");
+    expect(text.tagName).toBe("P");
+    expect(text.children).toHaveLength(0);
+    expect(text).not.toHaveTextContent("alert(1)");
+  });
+  it("limits long About previews without changing agent detail navigation", async () => {
+    const description = "Useful guidance ".repeat(40);
+    const result = page([{ ...group, agents: [{ ...group.agents[0], description }] }]);
+    vi.mocked(api.readReportPage).mockResolvedValue(result);
+    mount();
+    const agent = await screen.findByRole("button", { name: "Policy Assistant" });
+    const preview = agent.closest("li")!.querySelector("p")!.textContent!;
+    expect(Array.from(preview).length).toBeLessThanOrEqual(300);
+    expect(preview).toMatch(/…$/);
+    expect(screen.queryByText(description.trim())).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Show more/ })).not.toBeInTheDocument();
+    fireEvent.click(agent);
+    expect(onOpenAgent).toHaveBeenCalledWith(group.agents[0].id);
+    expect(result.value[0].agents[0].description).toBe(description);
   });
   it("surfaces unavailable sources", async () => {
     const missing = page([]);

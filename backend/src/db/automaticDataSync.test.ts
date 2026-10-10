@@ -46,6 +46,59 @@ async function complete(scope: DataSyncScope, run: DataSyncRun) {
 }
 
 describe("session-driven automatic sync admission", () => {
+  it("finishes a mixed automatic run when inventory is the last source to publish and retries after cooldown", async () => {
+    const scope = owner();
+    const { run } = await repository.submitDue(scope);
+    const packages = new PackageRefreshJobs(fixture.runtime);
+    const job = await packages.submit(scope, {
+      idempotencyKey: "mixed-run-final-publication", tokenMode: "delegated",
+      authorizationPrincipalId: scope.principalId, requestedIds: [],
+    });
+    await repository.attachJob(scope, run!.id, "graph_packages", job.id);
+    await repository.updateSource(scope, run!.id, "graph_packages", {
+      status: "running", jobId: job.id, message: "Collecting inventory.", canRetry: false,
+    });
+    await packages.markRunning(scope, job.id);
+    for (const source of ["users", "power_platform"] as const) {
+      await repository.updateSource(scope, run!.id, source, {
+        status: source === "users" ? "partial" : "failed", count: 500,
+        message: "Latest collection did not complete.", canRetry: true,
+      });
+    }
+    await refreshInventoryFixture(fixture.runtime, scope, job.id, "packages", []);
+    expect(await repository.getRun(scope, run!.id)).toMatchObject({
+      status: "partial", completedAt: expect.any(String),
+      sources: expect.arrayContaining([expect.objectContaining({ source: "graph_packages", status: "succeeded" })]),
+    });
+    expect((await repository.submitDue(scope)).created).toBe(false);
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+      WHERE run_id=$1 AND source_id IN ('users','power_platform')`, [run!.id]);
+    const next = await repository.submitDue(scope);
+    expect(next.created).toBe(true);
+    expect(next.run!.id).not.toBe(run!.id);
+    expect(next.run!.sources.map(source => source.source)).toEqual(["power_platform", "users"]);
+  });
+
+  it.each(["running", "waiting"] as const)("repairs a stale %s automatic aggregate without restarting fresh sources", async status => {
+    const scope = owner();
+    const { run } = await repository.submitDue(scope);
+    await complete(scope, run!);
+    await fixture.operator.query(`UPDATE data_sync_runs SET status=$2,completed_at=NULL WHERE id=$1`, [run!.id, status]);
+    const checked = await repository.submitDue(scope);
+    expect(checked).toMatchObject({ created: false, run: { id: run!.id, status: "completed", completedAt: expect.any(String) } });
+  });
+
+  it("finishes a stale mixed automatic run even if its aggregate still says running", async () => {
+    const scope = owner();
+    const { run } = await repository.submitDue(scope);
+    for (const source of run!.sources) await repository.updateSource(scope, run!.id, source.source, {
+      status: "failed", message: "Collection failed.", canRetry: true,
+    });
+    await fixture.operator.query(`UPDATE data_sync_runs SET status='running',completed_at=NULL WHERE id=$1`, [run!.id]);
+    await repository.finishAutomatic(scope, run!.id);
+    expect(await repository.getRun(scope, run!.id)).toMatchObject({ status: "partial", completedAt: expect.any(String) });
+  });
+
   it("atomically deduplicates across independent callers and does not request manual reports", async () => {
     const scope = owner();
     const publication = await repository.automaticRevisions(scope);
