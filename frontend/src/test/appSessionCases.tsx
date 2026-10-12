@@ -552,6 +552,22 @@ export function sessionAndNavigationCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(duplicate ? 0 : 1);
   });
 
+  it("fails malformed workbench authorization metadata closed before routing actions or automatic refresh", async () => {
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const metadata = { views: workbenchViews, actions: workbenchActions.map(action => ({ ...action })) };
+    for (const action of metadata.actions) Reflect.deleteProperty(action, "roles");
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
+      ? Promise.resolve(Response.json(metadata)) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText("The server returned invalid workbench metadata.")).toBeVisible();
+    const button = await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAccessibleDescription(/Action metadata is unavailable/);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(0);
+  });
+
   it("does not claim workbench action metadata is still loading after a failed read", async () => {
     const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -3924,7 +3940,7 @@ export function sessionAndNavigationCases() {
     expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
   });
 
-  it("preserves one selected quarantine target when equivalent native GUID casing changes", async () => {
+  it("does not merge a case-changed opaque resource GUID into the saved quarantine selection", async () => {
     const nativeId = "abcdefab-2222-4222-8222-222222222222";
     const native = powerPlatformRecord(nativeId, "Case-stable target");
     const replacement = powerPlatformRecord(nativeId.toUpperCase(), native.displayName);
@@ -3942,11 +3958,13 @@ export function sessionAndNavigationCases() {
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
     await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) =>
       new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(2));
-    expect(screen.getByRole("checkbox", { name: "Select Case-stable target" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select Case-stable target" })).not.toBeChecked();
     expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeVisible();
     await userEvent.click(screen.getByRole("checkbox", { name: "Select Case-stable target" }));
-    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
-    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([]);
+    expect(screen.getByText("2 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual(expect.arrayContaining([
+      expect.stringContaining(nativeId), expect.stringContaining(nativeId.toUpperCase()),
+    ]));
   });
 
   it("retains mixed package selection when adding its quarantine target would mix snapshots", async () => {
@@ -4224,7 +4242,8 @@ export function sessionAndNavigationCases() {
   });
 
   it("reuses one inventory selection for equivalent environment bookmarks", async () => {
-    window.history.replaceState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("ENV-A"))}`);
+    const environmentId = "default-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    window.history.replaceState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet(environmentId.toUpperCase()))}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
@@ -4237,11 +4256,33 @@ export function sessionAndNavigationCases() {
     await screen.findByText(agent.displayName);
     const before = agentListRequests(transport.fetchMock).length;
     act(() => {
-      window.history.pushState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("env-a"))}`);
+      window.history.pushState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet(environmentId))}`);
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     await act(async () => {});
     expect(agentListRequests(transport.fetchMock)).toHaveLength(before);
+    expect(inventorySelections.size).toBe(1);
+    expect(new URLSearchParams(window.location.search).get("environment")).toBe(encodeInventoryFacet(environmentId));
+  });
+
+  it("does not reuse an inventory selection for case-distinct opaque environment bookmarks", async () => {
+    unifiedPage.value[0].environmentId = "ENV-A";
+    window.history.replaceState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("ENV-A"))}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const selectionId = currentInventorySelection(transport.fetchMock);
+    act(() => {
+      window.history.pushState({}, "", `/agents?environment=${encodeURIComponent(encodeInventoryFacet("env-a"))}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("heading", { name: "No matching agents" })).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(agentListRequests(transport.fetchMock).map(([input]) =>
+      selectedInventoryUrl(input).searchParams.get("environmentId"))).toEqual(["ENV-A", "env-a"]);
+    expect(inventorySelections.size).toBe(2);
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(selectionId);
     expect(new URLSearchParams(window.location.search).get("environment")).toBe(encodeInventoryFacet("env-a"));
   });
 
@@ -8606,6 +8647,32 @@ export function commandsAndExportsCases() {
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
   });
 
+  it.each([
+    { code: "maintenance", detail: "Maintenance is active; provider work is not accepted.", guidance: "Retry after maintenance ends." },
+    { code: "provider_requalification_required", detail: "Provider work remains disabled until restored access is reviewed and explicitly requalified.",
+      guidance: "Contact the deployment administrator to review and requalify provider access." },
+  ])("explains $code without treating it as a missing user permission or losing saved inventory", async ({ code, detail, guidance }) => {
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => input === "/api/agents/refresh-jobs"
+      ? Response.json({ code, detail }, { status: 503 }) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("View diagnostics"));
+    await userEvent.click(await screen.findByRole("button", { name: "Refresh agents" }));
+    const alert = await within(screen.getByRole("dialog", { name: "Inventory diagnostics" })).findByRole("alert");
+    expect(alert).toHaveTextContent(detail);
+    expect(alert).toHaveTextContent(guidance);
+    expect(alert).not.toHaveTextContent("Check Permissions");
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/me")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
+  });
+
   it("keeps package refresh explicit and allows an explicit retry after failure", async () => {
     const transport = initialCatalogTransport();
     transport.failRefresh = true;
@@ -10407,6 +10474,36 @@ export function commandsAndExportsCases() {
       await screen.findByText(agent.displayName);
     }
     expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agent-inventory/selections")).toHaveLength(before);
+  });
+
+  it.each(["broad", "exact"] as const)("labels %s-scope progress without treating checked absences as returned packages or publication", async scopeKind => {
+    window.history.replaceState({}, "", "/sync?refreshJob=checked-targets&mode=application");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agents/refresh-jobs/checked-targets") {
+        return Promise.resolve(Response.json({ ...completedRefreshJob(), id: "checked-targets", scopeKind,
+          tokenMode: "application", status: "failed", errorCode: "graph_http_400",
+          observedCount: 2, totalRecords: 2, targetCount: scopeKind === "exact" ? 2 : 0, snapshotId: null,
+          message: "Collection finished, but publication failed. Saved inventory is unchanged." }));
+      }
+      if (url.pathname === "/api/agents/refresh-jobs/checked-targets/targets") {
+        return Promise.resolve(Response.json({ value: [], revision: "fixture",
+          counts: { total: 2, filtered: 2 }, page: { limit: 50, nextCursor: null, previousCursor: null } }));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const panel = await screen.findByRole("region", { name: "Selected package refresh job" });
+    expect(panel).toHaveTextContent(`2 of 2 ${scopeKind === "exact" ? "targets checked" : "packages observed"}`);
+    expect(panel).toHaveTextContent("Package refresh · failed");
+    expect(panel).toHaveTextContent("Saved inventory is unchanged");
+    expect(panel).not.toHaveTextContent("succeeded");
+    if (scopeKind === "exact") expect(panel).not.toHaveTextContent("packages observed");
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(selectedRefreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("recovers invalidated refresh target pages with one status read and no repeated inventory invalidation or provider admission", async () => {

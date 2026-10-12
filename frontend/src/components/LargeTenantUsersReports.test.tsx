@@ -35,12 +35,7 @@ describe("selected users and reports client boundary", () => {
     data.sources.app_activity = { ...data.sources.app_activity, state: "stale", attemptStatus: "running" };
     vi.mocked(api.readReportPage).mockResolvedValueOnce(data);
     render(<CopilotUsersView route={{ view, search: "", page: 0 }} />);
-    if (view === "licenses") {
-      expect(await screen.findByText("License data unavailable. Run Users sync in Sync or review Permissions.")).toBeVisible();
-      expect(screen.getByText("Office app activity is out of date. Run Users sync in Sync.")).toBeVisible();
-    } else {
-      expect(await screen.findByText("License data unavailable. Current directory verification is required. Run Users sync to verify licensing.")).toBeVisible();
-    }
+    expect(await screen.findByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toBeVisible();
     expect(screen.queryByText(/Refreshing license data|Refreshing Office app activity|Showing the last saved data/)).not.toBeInTheDocument();
   });
   it.each(["available", "stale"] as const)("withholds old Office freshness notices during a read and reports the settled %s state", async state => {

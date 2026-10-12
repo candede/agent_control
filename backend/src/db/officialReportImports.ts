@@ -371,13 +371,20 @@ export class OfficialReportImports {
     });
   }
 
-  acceptBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
+  acceptBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     bundleId = reportUuid(bundleId);
-    const supplied = ownIntent(input, ["bundleHash", "expectedActiveRevision"]);
-    input = { bundleHash: confirmationHash(supplied.bundleHash), expectedActiveRevision: revision(supplied.expectedActiveRevision) };
+    const supplied = ownIntent(input, ["bundleHash", "expectedActiveRevision"], ["preserveSelection"]);
+    if (supplied.preserveSelection !== undefined && typeof supplied.preserveSelection !== "boolean") {
+      throw new AppError(400, "invalid_import_intent", "Preserving the report selection must be a boolean.");
+    }
+    input = {
+      bundleHash: confirmationHash(supplied.bundleHash),
+      expectedActiveRevision: revision(supplied.expectedActiveRevision),
+      ...(supplied.preserveSelection === undefined ? {} : { preserveSelection: supplied.preserveSelection }),
+    };
     return settleAcceptance(() => this.acceptReviewedBundle(identity, bundleId, input, signal), signal);
   }
-  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
+  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     const receipt = await this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
       return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at FROM official_usage_bundle_receipts r

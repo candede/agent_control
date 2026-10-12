@@ -335,6 +335,7 @@ export class ApiError extends Error {
     this.kind = options.kind ?? "problem";
     this.retryAfterSeconds = typeof options.retryAfterSeconds === "number"
       && Number.isSafeInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 ? options.retryAfterSeconds : undefined;
+    this.details = options.details;
   }
 
   get authenticationExpired() {
@@ -1243,6 +1244,7 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
     "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
     {
+      details: reason === "expired" || reason === "unavailable" || reason === "changed" ? { reason } : undefined,
       requestId: safeRequestId("requestId" in problem ? problem.requestId : undefined)
         ?? safeRequestId(response.headers.get("X-Request-ID")),
       type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,

@@ -74,6 +74,7 @@ export class DataSyncRepository {
           AND expires_at>clock_timestamp()
         ORDER BY started_at DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
       if (active.rows[0]) return readAdmittedRun(client, scope, active.rows[0].id, false);
+      const reportChanged = await directoryNeedsReportRefresh(client, scope);
       const due = await client.query<{ source_id: DataSyncSourceId }>(`
         SELECT requested.source_id FROM unnest($3::text[]) requested(source_id)
         LEFT JOIN data_sync_success_markers marker
@@ -92,7 +93,7 @@ export class DataSyncRepository {
               ELSE interval '15 minutes' END))
           OR (attempt.status='waiting_authorization' AND attempt.attempt_started_at<$4::timestamptz)
         ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, automaticDataSyncSourceIds,
-        signedInAt === undefined ? null : new Date(signedInAt)]);
+        signedInAt === undefined ? null : new Date(signedInAt), reportChanged]);
       if (!due.rows.length) return { run: (await readLatestRun(client, scope)) ?? null, created: false };
       const recent = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND started_at>clock_timestamp()-interval '1 hour'`,
@@ -112,10 +113,10 @@ export class DataSyncRepository {
 
   async finishAutomatic(scope: DataSyncScope, runId: string) {
     validateScope(scope);
-    await transaction(this.database, async client => {
-      await lockScope(client, scope);
-      await settleAutomaticRuns(client, scope, runId);
-    });
+    await this.database.query(`UPDATE data_sync_runs run SET status='partial',completed_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND automatic AND status='waiting'
+        AND NOT EXISTS (SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status IN ('queued','running'))`,
+    [runId, scope.tenantId, scope.principalId]);
   }
 
   async submit(scope: DataSyncScope, input: StartDataSyncInput, beforeCommit?: () => void): Promise<{ run: DataSyncRun; created: boolean }> {

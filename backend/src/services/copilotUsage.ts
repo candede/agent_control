@@ -4,7 +4,6 @@ import { config } from "../config.js";
 import { requireUserPublication, type UserSourcePublication } from "../db/dataSync.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
 import { UserSourcesRepository } from "../db/userSources.js";
-import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";

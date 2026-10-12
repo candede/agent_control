@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { InventoryGenerations, inventoryAsOf, type InventoryIntent } from "../db/inventoryGenerations.js";
 import type { BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
-import { dataLimitError, encodeBatch } from "../db/dataBounds.js";
+import { dataLimitError, dataLimits, encodeBatch } from "../db/dataBounds.js";
 import { GraphPackagesClient, graphResponseDiagnostics, packageInventoryReadPolicy, packageReadTimeoutMs, type PackageReadOptions } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient, type ResourceQueryOptions } from "./powerPlatformResourceQuery.js";
 import { inventoryQuarantineIdentity, packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryFact, type InventoryRecord } from "./inventoryRecordProjection.js";
@@ -37,7 +37,7 @@ export async function storedInventoryRecords(client: pg.PoolClient, requested: r
     SELECT * FROM sized WHERE page_bytes<=524288 OR position=0 ORDER BY position`, [parameters])).rows;
   if (!rows.length) return [];
   const result = rows.map(row => ({ ...row, facts: [] as InventoryFact[], bytes: Buffer.byteLength(JSON.stringify(row)) }));
-  const workBudget = result.length === 1 ? dataLimits.agentDefinitionWorkBytes : dataLimits.batchBytes;
+  const workBudget = dataLimits.batchBytes;
   let bytes = result.reduce((sum, row) => sum + row.bytes, 0);
   if (bytes > 1_048_576) throw dataLimitError("inventory_record_work_bytes", 1_048_576, bytes);
   const byIdentity = new Map(result.map(row => [`${row.generation_id}:${row.identity}`, row]));

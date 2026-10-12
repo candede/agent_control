@@ -532,13 +532,20 @@ describe("AgentInventoryQueries", () => {
     await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
     expect(queries.getCached("owner", {})).toBe(result);
     vi.advanceTimersByTime(1);
-    expect(queries.getCached("owner", {})).toBeUndefined();
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    if (boundary === "selection") {
+      expect(queries.getCached("owner", {})).toBeUndefined();
+      await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+      expect(read).toHaveBeenCalledTimes(2);
+    } else {
+      expect(queries.getCached("owner", {})).toBe(result);
+      await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+      expect(read).toHaveBeenCalledOnce();
+    }
   });
 
   it("rejects invalid calendar expiry even when Date.parse normalizes it", async () => {
     read.mockResolvedValue(page("2026-09-31T12:00:00Z"));
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_selected_read" });
   });
 
   it("keeps browser-safe fractional detail expiry independent of raw Date.parse support", async () => {
@@ -556,7 +563,8 @@ describe("AgentInventoryQueries", () => {
     await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
     expect(queries.getCached("owner", {})).toBe(result);
     vi.advanceTimersByTime(1);
-    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+    expect(read).toHaveBeenCalledOnce();
   });
 
   it("retains only the current and directly adjacent pinned pages, including reverse-cursor aliases", async () => {

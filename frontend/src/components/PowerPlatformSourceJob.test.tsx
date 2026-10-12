@@ -4,8 +4,6 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api/client";
 import { PowerPlatformSourceJob } from "./PowerPlatformSourceJob";
-import { SavedQueryProvider } from "./SavedQueryProvider";
-import { createSavedQueryClient } from "../savedQueries";
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof api>(),

@@ -16,18 +16,20 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   const [cancellation, setCancellation] = useState<"pending" | "failed">();
   const [retry, setRetry] = useState<"admission" | "status">();
   const [owner, setOwner] = useState<string>();
-  const context = JSON.stringify([selectionId?.toLowerCase(), kind, ids]);
-  const visibleStatus = !disabled && owner === context ? status : undefined, preparing = !disabled && owner === context && pending;
-  const cancelling = !disabled && owner === context && cancellation === "pending";
-  const cancellationFailed = !disabled && owner === context && cancellation === "failed";
-  const retrying = !disabled && owner === context ? retry : undefined;
+  const normalizedSelectionId = selectionId?.toLowerCase();
+  const context = JSON.stringify([preserveOnRefresh ? null : normalizedSelectionId, kind, ids]);
+  const withdrawn = disabled && !preserveOnRefresh;
+  const visibleStatus = !withdrawn && owner === context ? status : undefined, preparing = !withdrawn && owner === context && pending;
+  const cancelling = !withdrawn && owner === context && cancellation === "pending";
+  const cancellationFailed = !withdrawn && owner === context && cancellation === "failed";
+  const retrying = !withdrawn && owner === context ? retry : undefined;
   const controller = useRef<AbortController | undefined>(undefined);
   const operation = useRef<"preparing" | "checking" | "cancelling" | undefined>(undefined);
   const attempt = useRef<{ input: OfficialReportExportRequest; id?: string; settled: boolean } | undefined>(undefined);
   const admission = useRef(admissionAllowed);
   useLayoutEffect(() => { admission.current = admissionAllowed; }, [admissionAllowed]);
-  const currentSelection = useRef(selectionId);
-  useLayoutEffect(() => { currentSelection.current = selectionId; }, [selectionId]);
+  const currentSelection = useRef(normalizedSelectionId);
+  useLayoutEffect(() => { currentSelection.current = normalizedSelectionId; }, [normalizedSelectionId]);
   const nativeDownload = useRef<string | undefined>(undefined);
   const invalidationHandler = useRef(onSelectionInvalidated);
   useEffect(() => { invalidationHandler.current = onSelectionInvalidated; }, [onSelectionInvalidated]);
@@ -60,7 +62,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   }, [status]);
   const start = useCallback(async () => {
     const retryAttempt = attempt.current && !attempt.current.settled ? attempt.current : undefined;
-    const requestedSelection = retryAttempt?.input.selectionId ?? selectionId;
+    const requestedSelection = retryAttempt?.input.selectionId ?? normalizedSelectionId;
     if (!requestedSelection || operation.current || withdrawn || !retryAttempt && (disabled || admission.current && !admission.current())) return;
     operation.current = "preparing";
     controller.current?.abort();
@@ -102,7 +104,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     } finally {
       if (controller.current === abort) { operation.current = undefined; setPending(false); }
     }
-  }, [context, disabled, withdrawn, selectionId, kind, ids, invalidated]);
+  }, [context, disabled, withdrawn, normalizedSelectionId, kind, ids, invalidated]);
   useEffect(() => {
     let abandoned = false;
     if (autoStart && !disabled) void Promise.resolve().then(() => { if (!abandoned) void start(); });
@@ -126,7 +128,6 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     } catch (cause) {
       if (controller.current === cancelled && !cancelled.signal.aborted) {
         if (cause instanceof ApiError && ["selection_invalidated", "export_selection_changed"].includes(cause.code)) {
-          attempt.current = undefined;
           setStatus(undefined); setCancellation(undefined);
           invalidated(cause);
         } else if (exportUnavailable(cause)) {

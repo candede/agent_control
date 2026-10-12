@@ -248,8 +248,6 @@ export async function runBulkJob(
         if (isAdmissionFailure(error) || externalSignal?.aborted) return;
         continue;
       }
-      // The verified outcome is durable; a publication failure must not overwrite it as inconclusive.
-      await repository.settleInventoryControls(scope, signal, async () => { await authorizeJob(scope, job.capability); });
     }
   } finally { await releaseIfOwned(repository, lease); }
 }

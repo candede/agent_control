@@ -43,12 +43,16 @@ function fixture() {
       events.push(`scope:${values?.[0]}:${statement.endsWith("FOR SHARE") ? "share" : "update"}`);
       return result([{ principal_id: identity.principalId, epoch: "1", session_epoch: "0" }]);
     }
-    if (statement.startsWith("SELECT * FROM data_generation_pins")) return result(roots.map((root, ordinal) => ({
+    if (statement.startsWith("SELECT *,expires_at<=clock_timestamp()")) return result(roots.map((root, ordinal) => ({
       scope_id: root.scopeId, root_kind: root.kind, revision: root.revision, expires_at: root.expiresAt,
-      scope_epoch: "1", session_epoch: "0", ordinal,
+      scope_epoch: "1", session_epoch: "0", ordinal, expired: false,
     })));
-    if (statement.startsWith("SELECT * FROM data_read_selections")) return result([{
-      id: selection.id, root_count: roots.length, expires_at: expiresAt,
+    if (statement.startsWith("SELECT invalidated_at,expires_at<=clock_timestamp()")) {
+      return result([{ invalidated_at: null, expired: false }]);
+    }
+    if (statement.startsWith("SELECT *,clock_timestamp() AS validated_at")) return result([{
+      id: selection.id, root_count: roots.length, expires_at: expiresAt, validated_at: at,
+      expired: false, dependencies_expired: false,
     }]);
     if (statement.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "0" }]);
     if (statement === "SELECT clock_timestamp() AS now") return result([{ now: at }]);
@@ -87,9 +91,9 @@ describe("selection scope-before-domain lock order", () => {
     const { database, query } = fixture();
     const original = query.getMockImplementation()!;
     query.mockImplementation(async (statement, values) => {
-      if (typeof statement === "string" && statement.startsWith("SELECT * FROM data_generation_pins")) {
+      if (typeof statement === "string" && statement.startsWith("SELECT *,expires_at<=clock_timestamp()")) {
         return result(roots.map((root, ordinal) => ({ scope_id: root.scopeId, root_kind: "generation", generation_id: root.scopeId,
-          revision: root.revision, expires_at: root.expiresAt, scope_epoch: "1", session_epoch: "0", ordinal })));
+          revision: root.revision, expires_at: root.expiresAt, scope_epoch: "1", session_epoch: "0", ordinal, expired: false })));
       }
       if (typeof statement === "string" && statement.startsWith("SELECT g.id")) return result([{ id: values?.[0] }]);
       return original(statement, values);

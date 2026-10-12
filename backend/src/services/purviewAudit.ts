@@ -84,7 +84,8 @@ export class PurviewAuditService {
     requireProviderAdmissions();
     const authority = this.initiatingAuthority(user, [input.tokenMode]);
     const assertCurrent = () => { authority.assertCurrent(); requireProviderAdmissions(); };
-    const filters = validatePurviewAuditFilters(input.filters);
+    const filters = await this.bindFilters(user, input.filters, input.agentRecordId);
+    assertCurrent();
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
@@ -102,7 +103,8 @@ export class PurviewAuditService {
     requireProviderAdmissions();
     const authority = this.initiatingAuthority(user, [input.tokenMode]);
     const assertCurrent = () => { authority.assertCurrent(); requireProviderAdmissions(); requireQualificationRole(user, input.tokenMode); };
-    const filters = validatePurviewAuditFilters(input.filters, { qualification: true });
+    const filters = await this.bindFilters(user, input.filters, input.agentRecordId, true);
+    assertCurrent();
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
@@ -364,7 +366,7 @@ export class PurviewAuditService {
         signal = AbortSignal.any([signal, qualificationDeadline]);
         authorizationSignal = signal;
       }
-      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal);
+      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal, current.filters);
       const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
         : this.dependencies.applicationToken(actor.tenantId, capabilityId), signal), { signal, clearOnSuccess: false });
@@ -446,7 +448,7 @@ export class PurviewAuditService {
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000), ...(qualificationDeadline ? [qualificationDeadline] : [])]);
       authorizationSignal = publicationSignal;
       const publicationValidation = authority.validation;
-      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal);
+      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal, current.filters);
       const job = await commitAccountSessionValidation(publicationValidation, async () => {
         publicationSignal.throwIfAborted();
         assertCurrent();

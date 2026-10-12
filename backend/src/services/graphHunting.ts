@@ -235,7 +235,7 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
   }
   const actorObjectIds = stringList(value.actorObjectIds, "actorObjectIds", isDirectoryObjectId, 128);
   if (templateId === "agents_inventory" && actorObjectIds.length) throw new AppError(400, "invalid_hunting_filters", "Actor filters are not available for the inventory template.");
-  if (value.userObjectId !== undefined && (typeof value.userObjectId !== "string" || !uuid(value.userObjectId)
+  if (value.userObjectId !== undefined && (typeof value.userObjectId !== "string" || !isDirectoryObjectId(value.userObjectId)
     || templateId !== "agent_activity" || operations.length !== 1 || operations[0] !== "InvokeAgent")) {
     throw new AppError(400, "invalid_hunting_filters", "User investigations require an exact directory user and the human-attributed agent invocation operation.");
   }

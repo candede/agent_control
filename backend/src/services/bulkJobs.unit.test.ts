@@ -571,17 +571,16 @@ describe("bulk job execution boundaries", () => {
   it("waits for verified control publication before releasing the completed job", async () => {
     const repository = fakeRepository();
     let publish!: () => void;
-    repository.settleInventoryControls.mockResolvedValueOnce(undefined).mockImplementationOnce(
-      () => new Promise<void>(resolve => { publish = resolve; }),
-    );
+    repository.finishItem.mockImplementationOnce(() => new Promise<void>(resolve => { publish = resolve; }));
     let blocked = false;
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
       if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
       return Response.json({ id: "package", displayName: "Package", isBlocked: blocked });
     });
     const execution = runBulkJob("job", scope, false, repository, provider(fetcher), async () => "token");
-    await vi.waitFor(() => expect(repository.settleInventoryControls).toHaveBeenCalledTimes(2));
-    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), "item", "succeeded", expect.anything());
+    await vi.waitFor(() => expect(repository.finishItem).toHaveBeenCalledOnce());
+    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), "item", "succeeded",
+      expect.anything(), expect.any(AbortSignal), expect.any(Function));
     expect(repository.release).not.toHaveBeenCalled();
     publish();
     await execution;
@@ -589,17 +588,21 @@ describe("bulk job execution boundaries", () => {
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
-  it("surfaces publication failure without overwriting verified evidence or replaying the write", async () => {
+  it("records an inconclusive outcome when verified publication fails without replaying the write", async () => {
     const repository = fakeRepository();
     const failure = new Error("Saved inventory publication failed.");
-    repository.settleInventoryControls.mockResolvedValueOnce(undefined).mockRejectedValueOnce(failure);
+    repository.finishItem.mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined);
     let blocked = false;
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
       if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
       return Response.json({ id: "package", displayName: "Package", isBlocked: blocked });
     });
-    await expect(runBulkJob("job", scope, false, repository, provider(fetcher), async () => "token")).rejects.toBe(failure);
-    expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), "item", "succeeded", expect.anything());
+    await expect(runBulkJob("job", scope, false, repository, provider(fetcher), async () => "token")).resolves.toBeUndefined();
+    expect(repository.finishItem).toHaveBeenCalledTimes(2);
+    expect(repository.finishItem).toHaveBeenNthCalledWith(1, expect.anything(), "item", "succeeded",
+      expect.anything(), expect.any(AbortSignal), expect.any(Function));
+    expect(repository.finishItem).toHaveBeenNthCalledWith(2, expect.anything(), "item", "inconclusive",
+      expect.objectContaining({ errorCode: "provider_error" }));
     expect(repository.release).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });

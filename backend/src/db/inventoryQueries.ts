@@ -3,7 +3,7 @@ import { DataSelections, CursorCodec, SelectionError, type SelectionIdentity, ty
 import { LargeTenantUsersReports, type ReportCurrentData } from "../services/largeTenantUsersReports.js";
 import { officialAgentsSql } from "./officialReportQueries.js";
 import { userSourceObjectIds, userSourcePeopleInRead, userSourceSearch, userSourceSearchSql } from "./userSources.js";
-import { dataLimitError, digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { inventoryAsOf } from "./inventoryGenerations.js";
 import { parseUnifiedAgentRecordId, unifiedAgentSortKeys, type UnifiedAgentInventoryQuery,
   type SavedAgentEnvironment, type SavedAgentPerson } from "../types/unifiedAgents.js";
@@ -19,6 +19,7 @@ import { projectPackageDetailAge } from "../services/packageDetailProjection.js"
 import { peakCheckpoint } from "../services/peakMemory.js";
 import { normalizeEnvironmentIdentity } from "../services/inventoryIdentity.js";
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
+import { isPublicationRevisions } from "../types/dataSelection.js";
 
 export type InventoryQuery = Omit<UnifiedAgentInventoryQuery, "limit" | "selectionId" | "cursor">;
 const queryFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
@@ -168,6 +169,7 @@ export class InventoryQueries {
       if (!root) throw new SelectionError("selection_invalidated");
       const data = await this.reports.currentInventoryData(client, identity, at);
       const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
+      const pinUntil = new Date(at.getTime() + 30 * 60_000);
       const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: root.expires_at },
         await this.reports.history.root(client, identity.tenantId, at),
         { kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) }];

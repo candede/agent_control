@@ -63,6 +63,11 @@ function InvestigationSession({ recordId, agentName, identity, revision, user }:
   const source = selectedSource ?? ((user ? data?.defender.templates?.agent_activity.status : data?.defender.status) === "available" ? "defender" : "purview");
   const defenderActive = source === "defender" && !resolving;
   const purviewActive = source === "purview" && data?.purview.status === "available";
+  function canUseContext() {
+    const cached = client.getQueryState(contextQueryKey);
+    return current && cached?.status === "success" && cached.fetchStatus === "idle"
+      && !cached.isInvalidated && cached.data === data;
+  }
   function refreshAccess() {
     if (context.isFetching || resolutionRequest.current || accessRefreshRequest.current) return;
     setRefreshVersion(value => value + 1);

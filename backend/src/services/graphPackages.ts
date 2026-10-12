@@ -10,7 +10,6 @@ import { types } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { isPackageAccessEntity, isPackageId, normalizePackageStatus, packageAccessCollectionLimit } from "../types/copilotPackage.js";
 import { inventoryLimits, type InventoryPage } from "../types/inventoryRecords.js";
-import { dataLimits } from "../db/dataBounds.js";
 import type {
   CopilotPackage,
   CopilotPackageDetail,

@@ -23,7 +23,10 @@ function fixture() {
   const repository = new UserSourcesRepository(database, "synthetic-source-unit-cursor-secret");
   const context: UserSourceReadContext = {
     evaluatedAt: at, scope: { ...identity, tokenMode: "delegated" }, query: { sort: "name", order: "asc" }, queryHash: digest("source-query"),
-    selection: { id: "selected", revision: "revision", evaluatedAt: at.toISOString(), expiresAt: new Date(at.getTime() + 600_000).toISOString() },
+    selection: {
+      id: "selected", revision: "revision", evaluatedAt: at.toISOString(), validatedAt: at.toISOString(),
+      expiresAt: new Date(at.getTime() + 600_000).toISOString(),
+    },
     metadata: {
       directory: { source: "directory", generationId: "generation", scopeId: "scope", revision: "1", expiresAt: "2030-01-02T00:00:00Z",
         observedAt: at.toISOString(), attemptedAt: at.toISOString(), attemptStatus: "available", attemptObservedCount: 3,
@@ -106,7 +109,8 @@ describe("source selection search canonicalization", () => {
       query.mockResolvedValue(result([{ token_mode: "delegated", metadata: context.metadata }]));
       const restored = await repository.contextInRead(client, identity, {
         selection: { id: context.selection.id, query_json: filters, query_hash: hash,
-          evaluated_at: at, expires_at: new Date(context.selection.expiresAt), revision: context.selection.revision },
+          evaluated_at: at, validated_at: at, expires_at: new Date(context.selection.expiresAt),
+          revision: context.selection.revision },
         pins: [{ root_kind: "user_sources" }, { generation_id: "generation", scope_id: "scope" }],
       });
       expect(restored.query).toEqual(filters);
@@ -176,7 +180,7 @@ describe("selected people input snapshots", () => {
     });
     await repository.people("selected", identity, ids);
     expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [identity.tenantId, identity.principalId, "generation", [objectId], at, "delegated"]);
+      [identity.tenantId, identity.principalId, "generation", [objectId], at, "delegated", true]);
   });
 
   it("projects the captured inventory and selection identity rather than post-await caller mutations", async () => {

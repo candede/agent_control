@@ -18,7 +18,15 @@ export type DependencyRoot =
   | { kind: "user_sources"; scopeId: string; revision: string; expiresAt: Date }
   | { kind: "inventory_delta"; scopeId: string; generationId: string; revision: string; expiresAt: Date };
 export type DomainRootValidator = (client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) => Promise<void>;
-export type Selection = { id: string; revision: string; expiresAt: Date; evaluatedAt: Date; endpoint: string; queryHash: string };
+export type Selection = {
+  id: string;
+  revision: string;
+  expiresAt: Date;
+  evaluatedAt: Date;
+  validatedAt: Date;
+  endpoint: string;
+  queryHash: string;
+};
 export type CursorBoundary = { key: string | null; id: string; nullRank: 0 | 1 };
 type CursorPayload = {
   version: 1; identity: SelectionIdentity; endpoint: string; selectionId: string; revision: string;
@@ -142,7 +150,15 @@ export class DataSelections {
       }
       // Domain revision locks come after every scope fence, not between scopes.
       for (const root of ordered) await this.validateRoot(client, root, identity);
-      const selection: Selection = { id: randomUUID(), revision: randomUUID(), expiresAt, evaluatedAt: now, endpoint, queryHash };
+      const selection: Selection = {
+        id: randomUUID(),
+        revision: randomUUID(),
+        expiresAt,
+        evaluatedAt: now,
+        validatedAt: now,
+        endpoint,
+        queryHash,
+      };
       await client.query(`INSERT INTO data_read_selections(id,tenant_id,principal_id,authorization_hash,endpoint,query_hash,evaluated_at,expires_at,revision,session_epoch,query_json,root_count)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)`,
       [selection.id, identity.tenantId, identity.principalId, identity.authorizationHash, endpoint, queryHash, now, expiresAt, selection.revision, identity.sessionEpoch, JSON.stringify(filters), roots.length]);

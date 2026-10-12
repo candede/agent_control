@@ -586,9 +586,12 @@ function inventoryLifecycle() {
     if (typeof statement !== "string") throw new Error("Unexpected inventory query shape.");
     if (statement.startsWith("INSERT INTO data_principal_epochs")) return result();
     if (statement.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: fixture.identity.sessionEpoch }]);
-    if (statement.startsWith("SELECT * FROM data_generation_pins")) return result([{
+    if (statement.startsWith("SELECT invalidated_at,expires_at<=clock_timestamp()")) {
+      return result([{ invalidated_at: null, expired: false }]);
+    }
+    if (statement.startsWith("SELECT *,expires_at<=clock_timestamp()")) return result([{
       scope_id: "inventory-root", scope_epoch: "1", session_epoch: "1", root_kind: "inventory_delta",
-      generation_id: "inventory-baseline", revision: "1", expires_at: fixture.metadata.expires_at,
+      generation_id: "inventory-baseline", revision: "1", expires_at: fixture.metadata.expires_at, expired: false,
     }]);
     if (statement.startsWith("SELECT * FROM data_scope_epochs")) return result([{
       tenant_id: fixture.identity.tenantId, principal_id: fixture.identity.principalId, epoch: "1", session_epoch: "1",
@@ -600,8 +603,9 @@ function inventoryLifecycle() {
       expect(values).toEqual(["selection", fixture.identity.tenantId, "inventory-root"]);
       return result(association.revision === "1" ? [] : [{}]);
     }
-    if (statement.startsWith("SELECT * FROM data_read_selections")) return result([{
+    if (statement.startsWith("SELECT *,clock_timestamp() AS validated_at")) return result([{
       root_count: 1, query_json: {}, query_hash: "a".repeat(64), endpoint: "inventory",
+      validated_at: new Date(), expired: false, dependencies_expired: false,
     }]);
     return original(statement, values);
   });

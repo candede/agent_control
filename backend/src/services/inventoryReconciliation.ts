@@ -16,7 +16,6 @@ import { inventoryNativeRootChoicesSql } from "../db/inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "../db/inventoryIdentityExpiry.js";
 import { projectPackageDetailAge } from "./packageDetailProjection.js";
 import { inventoryReconciliationAdmissionSql } from "../db/inventoryReconciliationAdmissionSchema.js";
-import { AppError } from "../errors.js";
 
 type CapturedRoot = InventoryRoot & { domain: string; expiresAt: string };
 type PreviousRoot = { baseline_id: string; revision: string; nativeScopes: string[] };

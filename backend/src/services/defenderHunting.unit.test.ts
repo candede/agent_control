@@ -326,7 +326,7 @@ describe("Hunting authority and committed outcomes without services", () => {
       return [];
     });
     const retained = vi.spyOn(f.repository, "listRetainedScopes").mockResolvedValueOnce([]);
-    await expect(f.service.catalog(user, "agent:selected")).rejects.toMatchObject({ code: "not_found" });
+    await expect(f.service.catalog(user, { agentRecordId: "agent:selected" })).rejects.toMatchObject({ code: "not_found" });
     expect(evidence).toHaveBeenCalledOnce();
     expect(retained).toHaveBeenCalledOnce();
     expect(evidence.mock.calls[0][0]).toBe(retained.mock.calls[0][0]);
@@ -369,7 +369,7 @@ describe("Hunting authority and committed outcomes without services", () => {
       }));
       return f.current();
     });
-    await expect(f.service.get(user, f.current().id, "agent:selected")).rejects.toMatchObject({ code: "not_found" });
+    await expect(f.service.get(user, f.current().id, { agentRecordId: "agent:selected" })).rejects.toMatchObject({ code: "not_found" });
   });
 
   it.each(["delegated", "application"] as const)("fences %s capability invalidation during physical request admission", async mode => {

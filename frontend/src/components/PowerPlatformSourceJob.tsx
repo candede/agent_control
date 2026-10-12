@@ -4,6 +4,7 @@ import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { inventoryRequestScope, inventoryRoleHint } from "../inventoryVerification";
 import { dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
+import { useBrowserAvailability } from "../useBrowserAvailability";
 
 export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved, onCancelRequested, paused = false }: {
   jobId: string;

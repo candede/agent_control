@@ -424,6 +424,16 @@ function parseDirectQuery(value: unknown, operation: "create" | "get" | "list"):
   const status = boundedString(value.status, "status", 64) as PurviewProviderQueryStatus;
   if (!queryStatuses.has(status)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search query status.");
   if (!validProviderQueryId(value.id)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search query ID.");
+  if (value.isRecordCountLimitExceeded !== undefined && typeof value.isRecordCountLimitExceeded !== "boolean") {
+    throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search completeness flag.");
+  }
+  const services = value.serviceFilters === undefined ? undefined : responseStringList(value.serviceFilters, "serviceFilters");
+  const service = value.serviceFilter === undefined && services?.length === 1
+    ? services[0] : boundedString(value.serviceFilter, "serviceFilter", 128);
+  if (services && (services.length !== 1 || services[0] !== service)) {
+    throw new AppError(502, "provider_schema", "Microsoft Graph returned inconsistent Audit Search service filters.");
+  }
+  const keywordFilter = optionalString(value.keywordFilter, 512);
   return {
     id: value.id,
     displayName: boundedString(value.displayName, "displayName", 256),

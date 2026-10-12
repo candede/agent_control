@@ -29,7 +29,9 @@ function fixture() {
     state: "unavailable" as const, reportRefreshDate: null, period: null, reportVersion: null,
   };
   const data: Parameters<typeof readInventoryResponsibility>[2] = {
-    identity, evaluatedAt: at, query: {}, metadata: {
+    identity, evaluatedAt: at, query: {},
+    publicationRevisions: { graph_packages: "a".repeat(64), power_platform: "b".repeat(64), users: "c".repeat(64) },
+    metadata: {
       directory: { ...source, source: "directory", generationId: "directory", observedAt: at.toISOString() },
       app_activity: { ...source, source: "app_activity" },
     }, report: {
@@ -38,7 +40,10 @@ function fixture() {
       reportingPeriod: null, acceptedAt: null, expiresAt: null, lineages: [],
     },
   };
-  const selection = { revision: "1", query_hash: "query", evaluated_at: at, expires_at: new Date(at.getTime() + 60_000) };
+  const selection = {
+    revision: "1", query_hash: "query", evaluated_at: at, validated_at: at,
+    expires_at: new Date(at.getTime() + 60_000),
+  };
   const cursors = new CursorCodec("synthetic-responsibility-cursor-secret");
   const read = (search: string, cursor?: string) => readInventoryResponsibility(client, { sql: "WITH people AS (SELECT NULL)", values: [] },
     data, selection, "selection", identity, cursors, { search, cursor, limit: 1 });
@@ -90,5 +95,5 @@ it("captures inventory exact-person requests before selected acquisition yields"
   });
   expect((await inventory.people("selection", identity, ids))[0].objectId).toBe(objectId);
   expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-    [identity.tenantId, identity.principalId, "directory", [objectId], at, "delegated"]);
+    [identity.tenantId, identity.principalId, "directory", [objectId], at, "delegated", true]);
 });

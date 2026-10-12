@@ -328,6 +328,10 @@ export class PurviewAuditRepository {
     }
     await transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution, ["running"]);
+      if (result.records.some(record => matchesPurviewAgent(record, job.filters) !== true)) {
+        throw new AppError(409, "invalid_audit_publication", "Audit Search results do not match the selected agent.");
+      }
+      if (job.deadline_at <= new Date()) throw new AppError(409, "audit_job_expired", "Audit Search results arrived after its deadline.");
       if (job.expires_at <= new Date()) throw new AppError(409, "audit_job_expired", "The local Audit Search cache expired before publication.");
       if (result.records.length) {
         const rows = result.records.map(record => ({

@@ -3,6 +3,7 @@ import { ApiError, getInventoryFacets, type InventoryFacetField } from "../api/c
 import { decodeInventoryFacet, encodeInventoryFacet, inventoryFacetLabel, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import { formatPackageFacetLabel, formatPackageType } from "../../../backend/src/types/copilotPackage";
 import { normalizeEnvironmentIdentity } from "../../../backend/src/services/inventoryIdentity";
+import { isExpiredSelection } from "../selectedRead";
 
 export function InventoryFacetSelect({ selectionId, scopeKey = selectionId, field, value, label, allLabel, loading, onChange, onInvalidated, onError, selectRef, compact, onOptionLabel }: {
   selectionId: string; field: InventoryFacetField; value?: InventoryFacetValue; label: string; allLabel: string;

@@ -702,7 +702,7 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
       <section className="hunting-history" aria-labelledby="hunting-history-title"><header><div><h3 id="hunting-history-title">Hunting history</h3></div><span>{historyCount === undefined ? "Unknown" : historyCount.toLocaleString()} jobs</span></header>
         {historyLoading && !retainedPresentation ? <div className="compact-empty-state" role="status">Loading hunting history...</div>
           : historyCount === undefined ? <div className="compact-empty-state"><strong>Hunting history unavailable</strong><span>Refresh hunting history to try again.</span></div>
-          : jobs.length === 0 ? <div className="compact-empty-state"><strong>No hunting history</strong><span>Run a hunt to collect results for this agent.</span></div>
+          : jobs.length === 0 ? <div className="compact-empty-state"><strong>No hunting history</strong><span>Run a hunt to collect results for this selection.</span></div>
           : <HistoryTable jobs={jobs} selectedId={selected?.id} busy={actionsDisabled} currentPrincipalId={capability.user?.homeAccountId}
             applicationQualificationAllowed={hasRole(capability.user, "AgentControl.Admin")}
             onView={handleView} onResume={handleResume} onCancel={handleCancel} onDelete={handleDelete} onExport={handleExport} />}

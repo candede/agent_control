@@ -11,7 +11,7 @@ import { createSavedQueryClient } from "../savedQueries";
 import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 import { deferred } from "../test/deferred";
 import { mockNativeDialogs } from "../test/dialog";
-import { combinedUser, reportPage, reportSelection, reportUser } from "../test/reportDataFixture";
+import { combinedUser, reportPage, reportUser } from "../test/reportDataFixture";
 import { UserDetailModal } from "./UserDetailModal";
 import { WorkbenchDialog } from "./WorkbenchDialog";
 

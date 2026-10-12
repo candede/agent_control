@@ -7,7 +7,7 @@ import type {
   BulkJobStatus,
   PackageAccessUpdate,
 } from "../api/client";
-import { CircleStop, LoaderCircle, Play, RefreshCw } from "lucide-react";
+import { CircleStop, LoaderCircle, Play, RefreshCw, X } from "lucide-react";
 import { isJobPolling, jobStatusMessage } from "../jobStatus";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { PreviewBadge } from "./PermissionCenter";

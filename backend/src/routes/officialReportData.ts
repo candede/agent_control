@@ -16,6 +16,7 @@ import { InventoryQueries } from "../db/inventoryQueries.js";
 import { config } from "../config.js";
 import { abortableRead, createExportPublicationValidator } from "../services/csvExport.js";
 import { operationalLog } from "../services/telemetry.js";
+import { readAdoptionGroups } from "../services/adoptionGroups.js";
 
 export type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
 export type ReportHandlerOptions = {
