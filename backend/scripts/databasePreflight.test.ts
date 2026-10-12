@@ -11,9 +11,9 @@ let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(false); });
 afterAll(async () => { await fixture?.close(); });
 
-function preflightCommand() {
-  return execute(process.execPath, ["--import", "tsx", fileURLToPath(new URL("./database.ts", import.meta.url)), "preflight"], {
-    env: { ...process.env, PGDATABASE: fixture.name }, timeout: 15_000,
+function databaseCommand(command: "preflight" | "initialize" = "preflight", database = fixture.name) {
+  return execute(process.execPath, ["--import", "tsx", fileURLToPath(new URL("./database.ts", import.meta.url)), command], {
+    env: { ...process.env, PGDATABASE: database }, timeout: 15_000,
   });
 }
 
@@ -21,7 +21,7 @@ describe.sequential("read-only database deployment preflight", () => {
   it("accepts a fresh database without creating schema or bootstrapping runtime access", async () => {
     const expected = { state: "fresh", currentFingerprint: null, targetFingerprint: schemaFingerprint };
     expect(await preflightSchema(fixture.operator)).toEqual(expected);
-    const result = await preflightCommand();
+    const result = await databaseCommand();
     expect(JSON.parse(result.stdout)).toEqual({
       event: "database_operator_command", command: "preflight", outcome: "succeeded", ...expected,
     });
@@ -71,7 +71,7 @@ describe.sequential("read-only database deployment preflight", () => {
         code: "database_schema_reset_required",
         message: expect.stringContaining("Explicitly reset"),
       });
-      await expect(preflightCommand()).rejects.toMatchObject({
+      await expect(databaseCommand()).rejects.toMatchObject({
         code: 1, stdout: "",
         stderr: expect.stringContaining('"code":"database_schema_reset_required"'),
       });
@@ -93,6 +93,23 @@ describe.sequential("read-only database deployment preflight", () => {
         [before.fingerprint, before.initialized_at]);
     }
   });
+});
+
+it("initializes through the operator CLI and safely retries without resetting the schema", async () => {
+  const isolated = await testDatabase(false);
+  try {
+    const expected = {
+      event: "database_operator_command", command: "initialize", outcome: "succeeded", schemaFingerprint,
+    };
+    const initialized = await databaseCommand("initialize", isolated.name);
+    expect(JSON.parse(initialized.stdout)).toEqual(expected);
+    expect(initialized.stderr).toBe("");
+    const marker = (await isolated.operator.query("SELECT * FROM app_schema")).rows;
+    const repeated = await databaseCommand("initialize", isolated.name);
+    expect(JSON.parse(repeated.stdout)).toEqual(expected);
+    expect(repeated.stderr).toBe("");
+    expect((await isolated.operator.query("SELECT * FROM app_schema")).rows).toEqual(marker);
+  } finally { await isolated.close(); }
 });
 
 describe("database operator diagnostics", () => {

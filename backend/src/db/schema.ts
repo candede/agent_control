@@ -531,8 +531,7 @@ async function verifyOfficialReportSchema(database: Pick<pg.Pool, "query">) {
     AND EXISTS(SELECT 1 FROM pg_index i WHERE i.indexrelid=to_regclass('public.official_usage_fact_directory_identity')
       AND i.indisvalid AND i.indisready AND i.indnatts=4 AND i.indrelid='official_usage_row_facts'::regclass
       AND i.indcollation[2]='pg_catalog."C"'::regcollation
-      AND replace(pg_get_expr(i.indexprs,i.indrelid),'"','') ILIKE '%left(lower(btrim(username)%default%128)%'
-      AND pg_get_expr(i.indexprs,i.indrelid) NOT ILIKE '%normalize%')
+      AND replace(pg_get_expr(i.indexprs,i.indrelid),'"','') = 'left(lower((btrim(username) COLLATE default)), 128)')
     AND (SELECT count(*)=4 FROM pg_trigger WHERE tgname IN ('official_history_membership_guard','official_history_state_guard','official_upload_row_guard','official_upload_intent_guard') AND tgenabled IN ('O','A'))
     AND (SELECT count(*)=5 FROM information_schema.tables WHERE table_schema='public' AND table_name IN(
       'official_usage_history_state','official_usage_history_memberships','official_usage_ingestions','official_usage_ingestion_rows','official_usage_read_contexts'))

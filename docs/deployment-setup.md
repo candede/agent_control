@@ -151,6 +151,24 @@ pwsh ./deploy-local.ps1 start -Project contoso
 
 Project state is stored under `.local/<project>/`.
 
+### Recover from failed database initialization
+
+An initialization failure leaves the application in maintenance. If an explicit
+`-DbReset` already succeeded, the old application data has already been deleted;
+initialization may still have created the current schema before verification
+failed.
+
+After correcting the reported failure, retry without another reset:
+
+```powershell
+pwsh ./deploy-local.ps1 start -Project contoso
+```
+
+Initialization accepts either a fresh database or this build's current schema.
+A retry preserves the current schema and existing secrets. Use `-DbReset` only
+when an incompatible schema requires an intentional, destructive reset; do not
+repeat it merely because initialization failed.
+
 ## Configure multiple tenants
 
 Add each tenant through the configuration wizard:

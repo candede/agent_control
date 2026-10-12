@@ -58,10 +58,37 @@ describe.sequential("PostgreSQL initialization and role boundary", () => {
     await expect(verifySchema(database)).rejects.toThrow("schema");
     await initializeSchema(database);
     await grantRuntime(database);
+    expect((await database.query<{ expression: string }>(`SELECT pg_get_expr(indexprs,indrelid) AS expression
+      FROM pg_index WHERE indexrelid='official_usage_fact_directory_identity'::regclass`)).rows[0].expression)
+      .toBe('"left"(lower((btrim(username) COLLATE "default")), 128)');
+    await verifySchema(database);
     await verifySchema(runtime);
     expect(await preflightSchema(database)).toEqual({
       state: "current", currentFingerprint: schemaFingerprint, targetFingerprint: schemaFingerprint,
     });
+  });
+
+  it.each([
+    '("left"(lower(btrim(username) COLLATE "default"), 64) COLLATE "C")',
+    '("left"(lower(btrim(username) COLLATE "default"), 1280) COLLATE "C")',
+    '("left"(lower(username COLLATE "default"), 128) COLLATE "C")',
+    '("left"(lower(normalize(btrim(username), NFKC) COLLATE "default"), 128) COLLATE "C")',
+    '("left"(lower(btrim(username) COLLATE "C"), 128) COLLATE "C")',
+  ])("rejects a changed report-directory identity expression: %s", async expression => {
+    const definition = (await database.query<{ definition: string }>(
+      "SELECT pg_get_indexdef('official_usage_fact_directory_identity'::regclass) AS definition",
+    )).rows[0].definition;
+    try {
+      await database.query("DROP INDEX official_usage_fact_directory_identity");
+      await database.query(`CREATE INDEX official_usage_fact_directory_identity ON official_usage_row_facts
+        (tenant_id,kind,${expression},payload_hash) WHERE kind IN ('users','userAgents')`);
+      await expect(verifySchema(database)).rejects.toThrow("Official report schema is invalid.");
+      await expect(verifySchema(runtime)).rejects.toThrow("Official report schema is invalid.");
+    } finally {
+      await database.query("DROP INDEX IF EXISTS official_usage_fact_directory_identity");
+      await database.query(definition);
+    }
+    await verifySchema(runtime);
   });
 
   it("serializes concurrent fresh initialization and preserves the singleton on repetition", async () => {
