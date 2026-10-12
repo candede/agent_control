@@ -70,9 +70,9 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
         loading={loadingInventory && !inventory}
         hint={inventory?.partial ? "Includes unavailable agents · Partial data" : "Includes unavailable agents"}
         selected={allSelected} onClick={onClearFilters} />
-      <Metric label="Available to end users" value={hasInventory ? scopedInventory?.inventoryOverview?.availableToUsers ?? null : null}
+      <Metric label="Admin-permitted agents" value={hasInventory ? scopedInventory?.inventoryOverview?.availableToUsers ?? null : null}
         loading={loadingInventory && !scopedInventory}
-        hint={inventory?.partial ? "In this view · Partial data" : "All or selected users"}
+        hint={inventory?.partial ? "Admin settings · Partial data" : "Admin settings, not maker chat sharing"}
         selected={endUserAccess === "available"} onClick={onAccessChange ? () => onAccessChange(endUserAccess === "available" ? "all" : "available") : undefined} />
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
         loading={loadingReports}

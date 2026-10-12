@@ -106,6 +106,172 @@ bytes; exceeding that bound explicitly disables access editing rather than
 presenting missing assignments as an empty scope. Neither a historical detail
 selection nor its displayed control values authorize a mutation.
 
+Graph sharing recipients use `inventory_facts.kind='sharedWithUsersAndGroups'`,
+with a `collection` presence marker whose value is `sharedWithUsersAndGroups`.
+Recipient payloads contain the reported `resourceId` and `resourceType`; the
+fresh-schema constraint validates their identity/type shape. They are not
+embedded in inventory list residuals or the access-control editor response.
+Selected source sections and the exact package-detail `principalCounts` expose
+collection counts without embedding sharing identities, and paged children expose
+the complete ordered evidence without the control editor's assignment limits.
+An absent presence marker is unknown/not supplied, not an empty recipient list.
+Compatible catalog refreshes and control-only publications preserve sharing
+evidence; a new exact detail observation replaces it, including explicit
+emptiness or omission. Recipient assignments and their presence markers remain
+excluded from inventory exports, as with other principal collections.
+
+After resetting and initializing the database, collect package inventory and
+follow Graph package details in Sync until its fresh/total coverage is complete.
+Catalog-only rows can still lack sharing evidence if Microsoft returns it only
+from exact detail GETs. Compare each agent's recipient facts together with
+`availableTo`, `deployedTo`, raw package type/platform, and detail observation
+freshness. Graph's admin availability/installation settings are not the maker's
+chat-sharing toggle.
+
+### Maker-controlled sharing and captured agent configuration
+
+The documented [agent inventory schema](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-agent-inventory)
+defines the Preview `properties.sharedWithViewers` and
+`properties.sharedWithEditors` objects. In particular,
+`sharedWithViewers.entireTenant` reports maker-controlled whole-tenant sharing,
+including when it has not received admin approval. The two targeted October 13
+captures distinguish BRD Review Analyst (`true`) from Enterprise Visual Architect
+(`false`) even though their Graph `availableTo` values are identical.
+
+Normal Power Platform inventory sync now retains this evidence; the temporary
+diagnostic is not required to collect or update it:
+
+| Provider field | Saved native field | Contract |
+| --- | --- | --- |
+| `sharedWithViewers` | `details.makerSharing.viewers` | Preview; `entireTenant`, `userCount`, `groupCount` |
+| `sharedWithEditors` | `details.makerSharing.editors` | Preview; `userCount`, `groupCount` |
+| `isWebSearchEnabledForKnowledge` | `details.isWebSearchEnabledForKnowledge` | Correct lowercase-initial provider spelling; no legacy alias |
+| `harness`, `titleId`, `instructionsCharactersCount` | Same names under `details` | Observed bounded metadata; no instruction text retained |
+| `componentsCounts` | `details.componentsCounts` | Observed connected-agent, knowledge, topic and tool counts, plus a bounded knowledge-type/count dictionary |
+| `capabilitiesCounts.distinctFlows` | `details.distinctFlows` | Observed nonnegative integer count |
+| `flows`, `triggers` | `details.flowReferenceCount`, `details.triggerCount` | Array lengths only; nonempty item schemas were not established by the empty-array captures |
+| ResourceItem `id` | `providerResourceId` | Provider resource path, separate from the existing native `name` identity |
+
+Maker sharing is stored in `power_platform_record_rows.residual.details`, not in
+the Graph package access fields/facts. Its fresh-table constraint rejects
+malformed sharing objects, non-Boolean tenant flags and invalid recipient counts.
+The generated nullable Boolean `power_platform_record_rows.maker_org_wide_chat`
+supports direct database inspection: `true`/`false` mean reported on/off, and SQL
+NULL means the tenant flag was not reported or was explicitly null. The residual
+preserves the finer missing/object/empty/null distinctions. Zero counts and false
+flags are never discarded or inferred from admin settings. A new native
+observation replaces the prior values, including omission; native content changes
+are published even when Graph package IDs and versions are unchanged.
+
+Field provenance distinguishes documented GA/Preview fields from newly
+`observed` metadata whose broader provider contract has not been established.
+Malformed new sharing/configuration evidence fails the provider read explicitly;
+unknown future object members are counted as omissions, not saved as raw JSON.
+Generic ResourceItem null/empty scaffolding remains excluded. `titleId` and the
+resource path are descriptive metadata, not new authoritative matching or
+quarantine-control identities.
+
+The Graph package object additionally retains observed `ownerId`,
+`agentIdentityId`, and a separate `providerUsage` object containing
+`activeUsers`, `totalSessions`, `totalRunTimeInHours`, `exceptionRate`, and
+`lastUsedDateTime`. These counters preserve zero/null/absence, do not define a
+reporting period, and do not replace imported report usage, report associations,
+Usage/Users tabs, usage filters or CSV report metrics. Exception-rate units are
+unverified; the UI displays the raw value, not an invented percentage. Newer
+catalog observations take precedence over reused older detail telemetry, and
+omitted newer values are not replaced with old counters. Null untyped Graph
+`governanceMetadata`/request fields are not promoted into invented object schemas.
+Existing export columns and sharing-recipient privacy exclusions remain unchanged.
+
+Overview displays read-only maker sharing, source observation time and
+current/expired warnings separately from Graph admin settings. Maker sharing and
+core configuration stay visible. Additional configuration counts/metadata are
+grouped under Components and authoring; identifiers and separately labeled Graph
+telemetry are grouped under Technical details. All retained UI sections are
+always visible, without expand/collapse controls. Sharing API field paths remain
+in the provider documentation rather than the Overview. Manage keeps the admin
+controls and visible read-only raw Graph values/assignment counts under Package
+details, without a duplicate admin-settings panel in Overview. Brief field hints
+replace repetitive explanatory notices; full provider limitations remain
+documented here.
+Manage uses separate padded header, editor and package-detail areas. Unavailable
+quarantine controls show their reason directly rather than behind an expander.
+Manage only edits admin-controlled availability/installation/blocking; there is
+no maker-sharing write API or chat-link construction. Inventory availability
+labels/filters explicitly refer to admin settings, not effective personal chat
+permissions. Maker-wide sharing is intent, not proof that licensing,
+authentication, quarantine or other admin restrictions permit a particular user
+to chat. Recipient counts do not include implicit ownership.
+
+This is a reset-only schema change: no migration, backfill or compatibility
+reader. After deploying with the user-requested database reset, run the normal
+full sync (including **Power Platform inventory**) and reopen the two agents'
+Overview tabs. After each maker toggle in Agent Builder, run **Sync Power
+Platform inventory** again, wait for success, refresh the saved inventory and
+reopen the modal. Compare the new **Sharing observed** time and reported
+enabled/disabled state. Graph package-details collection alone does not refresh
+maker sharing. Provider propagation may delay a changed observation; do not
+report a UI change as captured until a newer provider observation proves it.
+
+### Sync completion and workspace health
+
+Users, the Graph package catalog, and Power Platform inventory are the three
+base sources. Their successful publication is **Source sync complete**, not proof
+that all exact package details have been read. Sync advertises **Sync complete**
+only when those sources succeeded and exact-detail coverage is also complete.
+Browsing does not wait for all detail batches.
+
+Workspace data presents these as four consistent sync rows using the same
+count/time columns, status badges and row controls. Its completed-step count
+includes exact details, not just the three base sources. The top-level Sync all
+sources command collects the catalogs and starts their detail enrichment;
+Check status rechecks all four rows. Exact details retain their own cancellation
+control because their server-owned batches can continue after the source run ends.
+When the saved Graph catalog marker changes, its detail coverage is unknown until
+rechecked; completion from the previous catalog cannot complete the new detail step.
+
+Successful Graph catalog publication starts a server-owned detail collector.
+It uses the existing at-most-20-target jobs, provider pacing, authorization
+checks and per-revision retry backoff, continuing without browser polling.
+Hiding the page does not stop admitted collection. Failure, explicit cancellation,
+account authorization changes or application shutdown stop the collector.
+Persisted cancellation is respected by later automatic checks; an explicit
+start or a newly admitted catalog collection can resume it. A catalog run
+admitted before cancellation cannot undo that cancellation.
+
+Viewer-private, no-store endpoints expose the separate lane:
+
+- `GET /api/data-sync/package-details`: current catalog total, fresh, pending,
+  eligible-for-retry counts, collection state and latest bounded job status.
+- `POST /api/data-sync/package-details/start`: start/resume paced collection.
+- `POST /api/data-sync/package-details/cancel`: request cancellation.
+
+Controls require CSRF and accept no options or query parameters. Pending work
+under backoff is not reported as complete. Complete details mean an exact
+observation was collected, not that Microsoft supplied every optional field;
+an omitted sharing collection remains unknown.
+
+The detail-sync start control collects only missing or stale details; it is not
+a force-refresh operation. With zero pending packages, the UI retains the fresh
+count and Complete status, hides the coverage progress meter, and explains the
+disabled control. An incomplete meter describes coverage, not necessarily active
+collection.
+
+`GET /api/agent-inventory/health` captures the latest authorized, unfiltered
+canonical receipt and returns only health, verification and coverage aggregates.
+It rejects browsing selections/filters and invalidates its temporary selection
+before responding; ordinary retention subsequently cleans its pins. It never
+reconciles or mutates source authority on GET. Sync health is independent of the
+agent table's frozen browsing selection. Saved-only verification does not replace
+that selection, its filters, page or selected targets.
+
+CSV report acceptance and source publications trigger new health receipts.
+Report-selection invalidation is retried within bounded limits, and canonical
+convergence is shown as Checking rather than an instruction to resync an already
+current source. Read failures withdraw the previous verified claim; authorization
+denial fences protected cached data. Identity-detail observation currency cannot
+outlive its enclosing package catalog observation, even after a control readback.
+
 The browser captures inventory criteria with the CSRF-protected metadata-only
 `POST /api/agent-inventory/selections` resource, then reads
 `GET /api/agent-inventory?selectionId=...&limit=...&cursor=...`.

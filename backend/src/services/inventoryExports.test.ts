@@ -181,13 +181,14 @@ describe("durable selected inventory exports", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_export_chunks WHERE export_id=$1", [id])).rows[0].count).toBe(0);
   });
 
-  it.each(["graph_packages", "unified_agents"] as const)("keeps private access assignments out of %s CSV child rows", async kind => {
+  it.each(["graph_packages", "unified_agents"] as const)("keeps private access and sharing assignments out of %s CSV child rows", async kind => {
     const identity = { ...selectionIdentity, principalId: randomUUID() };
     const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
     let root = await streamedPackageFixture(fixture.runtime, scope, [allowlistedPackage({
       id: "exported-package", displayName: "Exported package", isBlocked: false, publisher: "=formula",
       allowedUsersAndGroups: [{ resourceId: "private-access-principal", resourceType: "user" }],
       acquireUsersAndGroups: [{ resourceId: "private-installation-principal", resourceType: "group" }],
+      sharedWithUsersAndGroups: [{ resourceId: "private-sharing-principal", resourceType: "User" }],
     })]);
     if (kind === "unified_agents") root = (await reconcileInventoryFixture(fixture.runtime, scope))!;
     const selection = await inventory.capture(identity, root.scopeId);
@@ -201,7 +202,7 @@ describe("durable selected inventory exports", () => {
     }
     expect(csv).toContain("Exported package");
     expect(csv).toContain("'=formula");
-    expect(csv).not.toMatch(/private-access-principal|private-installation-principal|allowedUsersAndGroups|acquireUsersAndGroups/);
+    expect(csv).not.toMatch(/private-access-principal|private-installation-principal|private-sharing-principal|allowedUsersAndGroups|acquireUsersAndGroups|sharedWithUsersAndGroups/);
   });
 
   it.each(["power_platform_agents", "unified_agents"] as const)(

@@ -31,6 +31,88 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("purposeful saved agent context", () => {
+  it.each([true, false])("separates maker org-wide chat %s from unchanged Graph admin availability", entireTenant => {
+    const observation = { ...environment.observation, roleScope: "full" as const, environmentScope: null,
+      coverage: "covered" as const, coveredCount: 1, observedCount: 1, totalRecords: 1, pageCount: 1,
+      verification: createInventoryVerification(1) };
+    const selectedPackage: CopilotPackage = { id: "package", displayName: "Agent", type: "shared", isBlocked: false,
+      sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
+      lifecycle: "unknown", identityConfidence: "exact_native", provenance: {}, availableTo: "allowedForAll", deployedTo: "acquiredForNone" };
+    render(<AgentOverview record={{ ...record, packages: [selectedPackage],
+      powerPlatformResource: { ...resource, details: {
+        makerSharing: { viewers: { entireTenant, userCount: 0, groupCount: 0 },
+          editors: { userCount: entireTenant ? 1 : 0, groupCount: 0 } },
+        harness: "Copilot Chat", instructionsCharactersCount: entireTenant ? 5508 : 5909,
+        componentsCounts: { connectedAgents: 0, knowledge: 0, tools: 0, topics: 1, knowledgeByType: {} },
+        distinctFlows: 0, flowReferenceCount: 0, triggerCount: 0, isWebSearchEnabledForKnowledge: !entireTenant,
+      } }, observations: { ...record.observations, powerPlatform: observation } }}
+      selectedPackage={selectedPackage} packageDetail={{ ...selectedPackage,
+        principalCounts: { sharedWithUsersAndGroups: 0, allowedUsersAndGroups: 0, acquireUsersAndGroups: 0 } }}
+      peopleState={peopleState} />);
+    expect(field("Org-wide sharing for chat access")).toHaveTextContent(entireTenant ? "Enabled" : "Disabled");
+    expect(field("Viewer users")).toHaveTextContent(/^0$/);
+    expect(field("Editor users")).toHaveTextContent(entireTenant ? /^1$/ : /^0$/);
+    expect(screen.queryByText("Graph availableTo", { selector: "dt" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Graph shared assignments", { selector: "dt" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Admin-controlled package availability" })).not.toBeInTheDocument();
+    expect(field("Sharing observed")?.querySelector("time")).toHaveAttribute("dateTime", observation.observedAt);
+    expect(field("Sharing observed")).toHaveTextContent(/\d{1,2}:\d{2}/);
+    const sharing = screen.getByRole("region", { name: "Maker-controlled sharing" });
+    expect(within(sharing).getByText("Preview")).toHaveAttribute("title", "Read-only Power Platform preview");
+    expect(sharing.querySelector("p")).toBeNull();
+    expect(screen.queryByText("Sharing source", { selector: "dt" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Components and authoring" })).toBeVisible();
+    expect(field("Harness")).toBeVisible();
+    expect(field("Harness")).toHaveTextContent("Copilot Chat");
+    expect(field("Topics")).toHaveTextContent(/^1$/);
+    expect(field("Knowledge by type")).toHaveTextContent("None reported");
+    expect(field("Flow references")).toHaveTextContent(/^0$/);
+    expect(field("Web search for knowledge")).toHaveTextContent(entireTenant ? "No" : "Yes");
+    expect(within(screen.getByRole("region", { name: "Maker-controlled sharing" })).queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, { viewers: null }, { viewers: {} }, { viewers: { entireTenant: null } }])("never treats unreported maker sharing as disabled: %j", makerSharing => {
+    render(<AgentOverview record={{ ...record, powerPlatformResource: { ...resource, details: { makerSharing } } }}
+      peopleState={peopleState} />);
+    expect(field("Org-wide sharing for chat access")).toHaveTextContent("Not reported");
+    expect(field("Viewer users")).toHaveTextContent("Not reported");
+    expect(screen.getByText("Sharing details are unavailable. Sync Power Platform inventory.")).toBeVisible();
+  });
+
+  it("marks saved maker sharing out of date when its native observation expires while the modal stays open", async () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    render(<AgentOverview record={{ ...record, powerPlatformResource: { ...resource,
+      details: { makerSharing: { viewers: { entireTenant: true } } } }, observations: { ...record.observations,
+      powerPlatform: { ...environment.observation, observedAt: new Date(now - 1_000).toISOString(),
+        expiresAt: new Date(now + 1_000).toISOString(), roleScope: "full", environmentScope: null, coverage: "covered",
+        coveredCount: 1, observedCount: 1, totalRecords: 1, pageCount: 1, verification: createInventoryVerification(1) } } }}
+      peopleState={peopleState} />);
+    expect(screen.queryByText(/Sharing details are unverified or out of date/)).not.toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTime(1_001));
+    expect(screen.getByText("Sharing details are unverified or out of date. Sync Power Platform inventory.")).toBeVisible();
+    expect(field("Org-wide sharing for chat access")).toHaveTextContent("Enabled");
+  });
+
+  it("labels observed Graph counters separately and preserves nullable metadata", () => {
+    const selectedPackage: CopilotPackage = { id: "package", displayName: "Agent", isBlocked: false,
+      sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
+      lifecycle: "unknown", identityConfidence: "exact_native", provenance: {}, ownerId: "graph-owner", agentIdentityId: null,
+      providerUsage: { activeUsers: 3, totalSessions: 5, totalRunTimeInHours: 0.1, exceptionRate: 0, lastUsedDateTime: null } };
+    render(<AgentOverview record={{ ...record, packages: [selectedPackage] }} selectedPackage={selectedPackage} peopleState={peopleState} />);
+    const technical = screen.getByRole("region", { name: "Technical details" });
+    expect(technical).toBeVisible();
+    expect(field("Graph owner ID")).toBeVisible();
+    expect(field("Provider active users")).toBeVisible();
+    expect(field("Provider active users")).toHaveTextContent(/^3$/);
+    expect(field("Provider exception rate (raw)")).toHaveTextContent(/^0$/);
+    expect(field("Provider last used")).toHaveTextContent("Not reported");
+    expect(field("Graph reported agent identity ID")).toHaveTextContent("Not reported");
+    expect(screen.getByRole("region", { name: "Graph provider telemetry" })).toHaveTextContent("Graph counters; reporting window not provided.");
+    expect(screen.getByText("Provider exception rate (raw)", { selector: "dt" })).toHaveAttribute("title", "Provider units are not verified.");
+    expect(technical.querySelector("details, summary")).toBeNull();
+  });
+
   it("labels superseded environment and native configuration evidence even before timestamps expire", () => {
     const observed = { ...environment.observation, current: false };
     render(<AgentOverview record={{ ...record, environment: { ...environment, observation: observed },
@@ -65,7 +147,7 @@ describe("purposeful saved agent context", () => {
       peopleState={peopleState} />);
     expect(field("Connectors")).toHaveTextContent("401");
     expect(field("Operations")).toHaveTextContent("9999");
-    expect(screen.getByText("Status and access summarize all 6,000 published versions.")).toBeVisible();
+    expect(screen.getByText("Status and admin availability summarize all 6,000 published versions.")).toBeVisible();
     expect(screen.queryByText(/source members/)).not.toBeInTheDocument();
     expect(screen.queryByRole("list", { name: "Configured connector details" })).not.toBeInTheDocument();
     expect(screen.getByText("Configured connector details are unavailable. Refresh inventory in Sync.")).toBeVisible();
@@ -338,7 +420,7 @@ describe("purposeful saved agent context", () => {
     else expect(field("Bot ID")).toHaveTextContent(botId);
   });
 
-  it("organizes meaningful configuration, dates and identifiers without duplication or disclosures", () => {
+  it("organizes all retained fields into visible groups without duplication or disclosures", () => {
     const selectedPackage: CopilotPackage = {
       id: "package", appId: "package-app", displayName: "Agent", isBlocked: false, publisher: "Microsoft",
       type: "firstParty", version: "2.1", supportedHosts: ["Teams"], sourceSystem: "graph_packages",
@@ -360,14 +442,18 @@ describe("purposeful saved agent context", () => {
     expect(field("Agent ID")).toHaveTextContent("native");
     expect(field("Schema name")).toHaveTextContent("agent_schema");
     expect(field("Package app ID")).toHaveTextContent("package-app");
+    expect(field("Package app ID")).toBeVisible();
     expect(screen.queryByText("Bot ID", { selector: "dt" })).not.toBeInTheDocument();
     expect(screen.queryByText("Agent region", { selector: "dt" })).not.toBeInTheDocument();
     expect(container.querySelectorAll("details, summary")).toHaveLength(0);
     const labels = [...container.querySelectorAll("dt")].map(element => element.textContent);
     expect(new Set(labels).size).toBe(labels.length);
     expect(screen.getAllByRole("heading").map(element => element.textContent)).toEqual([
-      "About", "Environment", "Configuration", "Configured connectors and operations", "Identifiers",
+      "About", "Environment", "Maker-controlled sharing Preview", "Configuration",
+      "Configured connectors and operations", "Technical details", "Identifiers",
     ]);
+    for (const heading of screen.getAllByRole("heading")) expect(heading).toBeVisible();
+    expect(screen.getByRole("region", { name: "Identifiers" })).toBeVisible();
   });
 
   it("keeps long connector lists paged while displaying provider totals and visible operation properties", () => {

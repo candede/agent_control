@@ -294,7 +294,7 @@ async function childBatch(client: pg.PoolClient, members: Member[], after: strin
         AND fact.ordinal>CASE WHEN requested.index=$2 THEN $3::integer ELSE -1 END
         AND (fact.kind LIKE 'detail:%' OR fact.kind IN
           ('collection','element','elementGroup','identifier','connectorOperation','supportedHosts','elementTypes','categories'))
-        AND NOT (fact.kind='collection' AND fact.value IN ('allowedUsersAndGroups','acquireUsersAndGroups'))
+        AND NOT (fact.kind='collection' AND fact.value IN ('allowedUsersAndGroups','acquireUsersAndGroups','sharedWithUsersAndGroups'))
       ORDER BY fact.ordinal LIMIT 251 OFFSET 0) f
     ORDER BY (${key}) COLLATE "C" LIMIT 251)${boundedResult}`, [batch.json,memberIndex,ordinal]);
   return boundedPage<{ key: string; member_index: number; ordinal: number; kind: string; value: string; payload: unknown }>(result.rows[0]);

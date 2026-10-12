@@ -133,6 +133,75 @@ After signing in:
 2. Resolve any missing role, permission, consent, or license.
 3. Open **Sync** and refresh the sources you want to use.
 
+### Temporary two-agent sharing investigation
+
+For the current BRD Review Analyst / Enterprise Visual Architect comparison,
+enable the removable backend-only diagnostic explicitly:
+
+```powershell
+pwsh ./deploy-local.ps1 start -Project seha -AgentSharingDiagnostics
+```
+
+Use your existing project name. No database reset or new API consent is needed
+solely for this diagnostic. Sign in as an Agent Control Admin and manually run
+**Sync all** or sync **Graph packages**. After successful Graph catalog
+publication, the separate function requests only these two agents in tenant
+`5dc17551-d2fb-4e89-93da-178b52154818`:
+
+- Exact Graph package details from both `v1.0` and `beta`, without `$select`.
+- Power Platform ResourceQuery responses, server-filtered by native agent ID,
+  tenant, environment and resource type, then independently scope-validated.
+  The POST is a read-only resource query, not a settings change.
+
+Six response artifacts retain unprojected **parsed JSON**, including unknown
+properties and missing/null/empty distinctions. They are not byte-for-byte wire
+captures. Credential-named fields and the active access token are redacted.
+Request headers, cookies and authentication responses are never captured.
+Responses that fail identity/scope validation are rejected rather than saved.
+Denied or missing targets are recorded explicitly in the manifest.
+
+Files persist privately on the host under
+`.local/<project>/agent-sharing-diagnostics/<capture-id>/`, mounted at
+`/run/agent-sharing-diagnostics/<capture-id>/` in the app container. Directory
+permissions are `0700`, file permissions `0600`. Captures may contain agent
+instructions and confidential authoring content: do not commit, publish or
+attach them to issues. There is no raw-data HTTP endpoint, CSV export or database
+schema change.
+
+Ordinary container logs contain only safe operational metadata. Look for
+`agent_sharing_diagnostic_started`, `agent_sharing_diagnostic_response_saved`,
+`agent_sharing_diagnostic_response_failed`, and
+`agent_sharing_diagnostic_finished`. The `jobId` is the private capture directory
+name; `runId` links it to the manual sync. `manifest.json` lists endpoints,
+timestamps, filenames and explicit success/failure outcomes. A started-only
+manifest means collection was interrupted before finalization.
+
+The regular sync's success is **not** diagnostic success. This optional
+investigation does not change normal inventory publication or its status.
+Check the diagnostic's own finish event and final manifest. Dataverse is
+explicitly recorded as not attempted because there is no authenticated
+Dataverse discovery/read client; `bot.accesscontrolpolicy` is not a verified
+mapping to owner-controlled org-wide chat access.
+
+Automatic sign-in refresh, polling, detail-only sync and capability checks do
+not trigger capture. Manual Graph retries can trigger another capture. The
+normal **Sync complete** banner may describe an automatic run and is not a
+diagnostic trigger. When diagnostics are enabled but no capture exists, click
+**Sync Graph packages** after the current run finishes; do not wait for another
+automatic refresh or use **Sync package details** to trigger the investigation.
+The function allows one capture at a time, a three-minute deadline, two-million-byte
+responses/files and **three capture directories total** (about 36 MB of response
+data maximum). It never silently overwrites or deletes earlier evidence.
+Sign-out, cancellation, shutdown and revoked authorization fence collection.
+Quota, permission and disk errors are explicit diagnostic failures.
+
+Redeploy without `-AgentSharingDiagnostics` to disable it. This does not delete
+existing evidence. After analysis, stop the app and delete only the specific
+owned capture directories under the path above; do not remove the project
+state, secrets or database directories. The existing `ENABLE_RAW_PROVIDER_DATA`
+runtime prohibition remains in force; Azure does not support this temporary
+local diagnostic.
+
 ## Change local settings
 
 ```powershell

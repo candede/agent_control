@@ -10,7 +10,7 @@ export class ProviderResponseLimitError extends AppError {
 }
 
 type ProviderJsonContext = {
-  fields: readonly string[];
+  fields: readonly string[] | "*";
   objects?: Readonly<Record<string, string | ((parent: unknown) => string | undefined)>>;
   arrays?: Readonly<Record<string, string>>;
 };
@@ -48,7 +48,8 @@ export function parseProviderContractJson(text: string, contexts: Readonly<Recor
       if (text.charAt(next) !== ":") continue;
       const key: string = JSON.parse(token);
       frame.property = key;
-      if (!frame.context || !Object.hasOwn(contexts, frame.context) || !contexts[frame.context].fields.includes(key)) continue;
+      if (!frame.context || !Object.hasOwn(contexts, frame.context)
+        || contexts[frame.context].fields !== "*" && !contexts[frame.context].fields.includes(key)) continue;
       if (frame.keys.has(key)) throw new SyntaxError("Provider response contains duplicate contract properties.");
       frame.keys.add(key);
     }

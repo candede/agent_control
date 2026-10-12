@@ -2,6 +2,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import {
   derivePowerPlatformAuthoringTool,
+  agentComponentCountFields,
+  isAgentComponentCounts,
+  isMakerSharing,
+  isNullableInventoryCount,
   powerPlatformResourceTypes,
   type InventoryConnector,
   type InventoryConnectorOperation,
@@ -54,7 +58,7 @@ type ResourceQueryPage = {
   data?: unknown;
 };
 
-type QueryLogContext = { provider: "power_platform"; source: "inventory_refresh" | "capability_check"; page: number };
+type QueryLogContext = { provider: "power_platform"; source: "inventory_refresh" | "capability_check" | "agent_sharing_diagnostic"; page: number };
 type SchemaDiagnostics = {
   reason: string;
   field?: string;
@@ -223,7 +227,35 @@ export class PowerPlatformResourceQueryClient {
     }
   }
 
-  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId: string | undefined, pageSize: number, logContext: QueryLogContext, retryAfterLimit = this.retryPolicy.maximumDelayMs, assertCurrent?: () => void, getAccessToken?: () => Promise<string>, beforeRequest?: () => Promise<void>): Promise<ResourceQueryPage> {
+  async getDiagnosticAgentDetail(accessToken: string, nativeId: string, options: ResourceQueryOptions & {
+    expectedTenantId: string; environmentId: string;
+  }): Promise<unknown> {
+    if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(nativeId)) {
+      throw new AppError(400, "invalid_diagnostic_identity", "Agent diagnostics require an exact native GUID.");
+    }
+    if (options.cloud && options.cloud !== "global") throw new AppError(501, "unsupported_cloud", "Agent diagnostics support only the global-cloud endpoint.");
+    const tenantId = validateExpectedTenantId(options.expectedTenantId);
+    const environmentId = validateEnvironmentId(options.environmentId);
+    if (!tenantId || !environmentId) throw new AppError(400, "invalid_diagnostic_scope", "Agent diagnostics require a tenant and environment.");
+    const signal = options.signal ?? AbortSignal.timeout(60_000);
+    signal.throwIfAborted();
+    options.assertCurrent?.();
+    const types = ["microsoft.copilotstudio/agents"] as const;
+    const page = await this.requestPage(accessToken, types, undefined, signal, environmentId, 1,
+      { provider: "power_platform", source: "agent_sharing_diagnostic", page: 1 },
+      this.retryPolicy.maximumDelayMs, options.assertCurrent, options.getAccessToken, options.beforeRequest, { nativeId, tenantId });
+    signal.throwIfAborted();
+    options.assertCurrent?.();
+    const parsed = parsePage(page, types, environmentId, tenantId, 0);
+    if (parsed.totalRecords === 0) throw new AppError(404, "diagnostic_target_missing", "The targeted agent was not returned.");
+    if (parsed.totalRecords !== 1 || parsed.resources.length !== 1 || parsed.skipToken
+      || normalizeNativeIdentity(parsed.resources[0].nativeId) !== normalizeNativeIdentity(nativeId)) {
+      throw new AppError(502, "diagnostic_scope_mismatch", "Agent diagnostic response did not contain only the requested agent.");
+    }
+    return page;
+  }
+
+  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId: string | undefined, pageSize: number, logContext: QueryLogContext, retryAfterLimit = this.retryPolicy.maximumDelayMs, assertCurrent?: () => void, getAccessToken?: () => Promise<string>, beforeRequest?: () => Promise<void>, exactIdentity?: { nativeId: string; tenantId: string }): Promise<ResourceQueryPage> {
     const body = {
       TableName: "PowerPlatformResources",
       Clauses: [{
@@ -231,7 +263,11 @@ export class PowerPlatformResourceQueryClient {
         FieldName: "type",
         Operator: "in~",
         Values: types.map(type => `'${type.replaceAll("'", "''")}'`),
-      }, ...(environmentId ? [{ $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] }] : []), {
+      }, ...(environmentId ? [{ $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] }] : []),
+      ...(exactIdentity ? [
+        { $type: "where", FieldName: "tenantId", Operator: "==", Values: [JSON.stringify(exactIdentity.tenantId)] },
+        { $type: "where", FieldName: "name", Operator: "==", Values: [JSON.stringify(exactIdentity.nativeId)] },
+      ] : []), {
         $type: "orderby",
         FieldNamesAscDesc: { tenantId: "asc", type: "asc", "tostring(properties.environmentId)": "asc", name: "asc" },
       }],
@@ -504,7 +540,13 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     throw new InventorySchemaError("Power Platform inventory returned an invalid resource location.", { reason: "invalid_location", field: "location", actualType: valueType(value.location), resourceType: type });
   }
   const context = projectionContext(value.properties, type);
-  context.omittedCount += Object.keys(value).filter(key => !["tenantId", "name", "type", "location", "properties"].includes(key)).length;
+  context.omittedCount += Object.keys(value).filter(key => !["id", "tenantId", "name", "type", "location", "properties"].includes(key)).length;
+  let providerResourceId: string | null | undefined;
+  if (Object.hasOwn(value, "id")) {
+    if (value.id !== null && !validText(value.id, 2048)) invalidObservation("id", value.id);
+    providerResourceId = value.id;
+    context.provenance.providerResourceId = { sourceSystem: "power_platform", path: "id", maturity: "ga" };
+  }
   const displayName = optionalString(context, "displayName", "properties.displayName", "ga", 512);
   const environmentId = optionalString(context, "environmentId", "properties.environmentId", "ga", 512);
   const createdAt = optionalDate(context, "createdAt", "properties.createdAt", "ga");
@@ -538,6 +580,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
   return {
     tenantId,
     nativeId: value.name,
+    ...(providerResourceId !== undefined ? { providerResourceId } : {}),
     type,
     location: typeof value.location === "string" ? value.location.slice(0, 256).replace(/[\uD800-\uDBFF]$/, "") : null,
     displayName,
@@ -562,7 +605,7 @@ const sharedProperties = fields("ga", "displayName", "createdAt", "createdBy");
 const ownedResourceProperties = fields("ga", "ownerId", "environmentId", "lastModifiedAt", "lastModifiedBy");
 const connectorUsageProperties = fields("preview", "powerPlatformConnectors");
 const resourcePropertySchemas: Record<PowerPlatformResourceType, ReadonlyMap<string, InventoryFieldMaturity>> = {
-  "microsoft.copilotstudio/agents": schema(sharedProperties, ownedResourceProperties, fields("ga", "lastPublishedAt", "createdIn", "schemaName", "name", "botId", "entraAppId", "entraAgentId", "entraAgentBlueprintId"), fields("preview", "isQuarantined", "quarantinedAt", "isManaged", "orchestration", "model", "authentication", "channels", "capabilitiesCounts", "IsWebSearchEnabledForKnowledge"), connectorUsageProperties),
+  "microsoft.copilotstudio/agents": schema(sharedProperties, ownedResourceProperties, fields("ga", "lastPublishedAt", "createdIn", "schemaName", "name", "botId", "entraAppId", "entraAgentId", "entraAgentBlueprintId"), fields("preview", "isQuarantined", "quarantinedAt", "isManaged", "orchestration", "model", "authentication", "channels", "capabilitiesCounts", "isWebSearchEnabledForKnowledge", "sharedWithViewers", "sharedWithEditors"), fields("observed", "harness", "titleId", "instructionsCharactersCount", "componentsCounts", "flows", "triggers"), connectorUsageProperties),
   "microsoft.powerplatform/environments": schema(sharedProperties, fields("ga", "environmentType", "isManaged", "environmentGroup", "environmentGroupId", "lastModifiedAt")),
 };
 
@@ -570,17 +613,22 @@ function parseResourceQueryJson(text: string): unknown {
   return parseProviderContractJson(text, {
     root: { fields: ["totalRecords", "count", "resultTruncated", "skipToken", "data"], arrays: { data: "resource" } },
     resource: {
-      fields: ["tenantId", "name", "type", "location", "properties"],
+      fields: ["id", "tenantId", "name", "type", "location", "properties"],
       objects: { properties: value => !isRecord(value) ? undefined
         : value.type === "microsoft.copilotstudio/agents" ? "agentProperties"
           : value.type === "microsoft.powerplatform/environments" ? "environmentProperties" : undefined },
     },
     agentProperties: {
       fields: [...resourcePropertySchemas["microsoft.copilotstudio/agents"].keys()],
-      objects: { capabilitiesCounts: "counts" }, arrays: { powerPlatformConnectors: "connector" },
+      objects: { capabilitiesCounts: "counts", sharedWithViewers: "viewers", sharedWithEditors: "editors",
+        componentsCounts: "components" }, arrays: { powerPlatformConnectors: "connector" },
     },
     environmentProperties: { fields: [...resourcePropertySchemas["microsoft.powerplatform/environments"].keys()] },
-    counts: { fields: ["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations"] },
+    counts: { fields: ["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations", "distinctFlows"] },
+    viewers: { fields: ["entireTenant", "userCount", "groupCount"] },
+    editors: { fields: ["userCount", "groupCount"] },
+    components: { fields: [...agentComponentCountFields, "knowledgeByType"], objects: { knowledgeByType: "knowledgeTypes" } },
+    knowledgeTypes: { fields: "*" },
     connector: { fields: ["connectorId", "operations"], arrays: { operations: "operation" } },
     operation: { fields: ["operationId", "createdBy", "usedAs", "isEnabled", "requiresEndUserConsent", "whenCanBeUsed", "connectionProvider"] },
   }, 8);
@@ -620,7 +668,8 @@ function projectDetails(context: ProjectionContext): PowerPlatformResourceDetail
   for (const key of ["schemaName", "createdIn", "environmentType", "environmentGroup", "environmentGroupId", "orchestration", "model", "authentication"] as const) {
     assign(details, key, optionalString(context, key, `properties.${key}`, maturity(context, key), 512));
   }
-  assign(details, "isWebSearchEnabledForKnowledge", optionalBoolean(context, "IsWebSearchEnabledForKnowledge", "properties.IsWebSearchEnabledForKnowledge", "preview"));
+  assign(details, "isWebSearchEnabledForKnowledge", optionalBoolean(context, "isWebSearchEnabledForKnowledge", "properties.isWebSearchEnabledForKnowledge", "preview"));
+  projectAgentObservations(context, details);
   const channels = optionalStringArray(context, "channels", "properties.channels", "preview", 50);
   if (channels) details.channels = channels;
   const connectorKey = "powerPlatformConnectors";
@@ -639,17 +688,86 @@ function projectDetails(context: ProjectionContext): PowerPlatformResourceDetail
     }
     if (connectorCount !== undefined) details.distinctPowerPlatformConnectors = connectorCount;
     if (operationCount !== undefined) details.distinctPowerPlatformConnectorsOperations = operationCount;
+    const flowCount = observedCount(counts, "distinctFlows");
+    if (flowCount !== undefined) {
+      details.distinctFlows = flowCount;
+      context.provenance.distinctFlows = { sourceSystem: "power_platform", path: "properties.capabilitiesCounts.distinctFlows", maturity: "observed" };
+    }
     context.provenance.capabilityCounts = { sourceSystem: "power_platform", path: "properties.capabilitiesCounts", maturity: "preview" };
     const retainedConnectors = details.connectors?.length ?? 0;
     const retainedOperations = details.connectors?.reduce((sum, connector) => sum + (connector.operations?.length ?? 0), 0) ?? 0;
     if (connectorCount !== undefined && connectorCount !== retainedConnectors || operationCount !== undefined && operationCount !== retainedOperations) details.capabilityDetailsTruncated = true;
-    context.omittedCount += Object.keys(counts).filter(key => !["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations"].includes(key)).length;
+    context.omittedCount += Object.keys(counts).filter(key => !["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations", "distinctFlows"].includes(key)).length;
   }
   if (context.capabilityDetailsTruncated) details.capabilityDetailsTruncated = true;
   if (connectors?.length === maximumConnectors && details.distinctPowerPlatformConnectors === undefined
     || context.retainedOperations === maximumOperations && details.distinctPowerPlatformConnectorsOperations === undefined) details.capabilityDetailsTruncated = true;
   if (supportsConnectorDetails) details.connectorDetailsStatus = !connectorDetailsSupplied ? "not_supplied" : details.capabilityDetailsTruncated ? "partial" : "complete";
   return details;
+}
+
+function projectAgentObservations(context: ProjectionContext, details: PowerPlatformResourceDetails) {
+  if (!context.schema.has("sharedWithViewers")) return;
+  const sharing: Record<string, unknown> = {};
+  for (const [property, role, fields] of [
+    ["sharedWithViewers", "viewers", ["entireTenant", "userCount", "groupCount"]],
+    ["sharedWithEditors", "editors", ["userCount", "groupCount"]],
+  ] as const) {
+    if (!Object.hasOwn(context.properties, property)) continue;
+    sharing[role] = observedObject(context, property, fields);
+    context.provenance[`makerSharing.${role}`] = { sourceSystem: "power_platform", path: `properties.${property}`, maturity: "preview" };
+    if (isRecord(sharing[role])) for (const field of Object.keys(sharing[role])) {
+      context.provenance[`makerSharing.${role}.${field}`] = { sourceSystem: "power_platform", path: `properties.${property}.${field}`, maturity: "preview" };
+    }
+  }
+  if (!isMakerSharing(sharing)) invalidObservation("makerSharing", sharing);
+  if (Object.keys(sharing).length) details.makerSharing = sharing;
+  for (const property of ["harness", "titleId"] as const) {
+    if (!Object.hasOwn(context.properties, property)) continue;
+    const value = context.properties[property];
+    if (value !== null && !validText(value, 512)) invalidObservation(property, value);
+    details[property] = value;
+    context.provenance[property] = { sourceSystem: "power_platform", path: `properties.${property}`, maturity: "observed" };
+  }
+  const instructions = observedCount(context.properties, "instructionsCharactersCount");
+  if (instructions !== undefined) {
+    details.instructionsCharactersCount = instructions;
+    context.provenance.instructionsCharactersCount = { sourceSystem: "power_platform", path: "properties.instructionsCharactersCount", maturity: "observed" };
+  }
+  if (Object.hasOwn(context.properties, "componentsCounts")) {
+    const components = observedObject(context, "componentsCounts", [...agentComponentCountFields, "knowledgeByType"]);
+    if (!isAgentComponentCounts(components)) invalidObservation("componentsCounts", components);
+    details.componentsCounts = components;
+    context.provenance.componentsCounts = { sourceSystem: "power_platform", path: "properties.componentsCounts", maturity: "observed" };
+  }
+  for (const [property, field] of [["flows", "flowReferenceCount"], ["triggers", "triggerCount"]] as const) {
+    if (!Object.hasOwn(context.properties, property)) continue;
+    const value = context.properties[property];
+    if (value !== null && !Array.isArray(value)) invalidObservation(property, value);
+    details[field] = value === null ? null : value.length;
+    context.provenance[field] = { sourceSystem: "power_platform", path: `properties.${property}.length`, maturity: "observed" };
+  }
+}
+
+function observedObject(context: ProjectionContext, property: string, fields: readonly string[]) {
+  const value = context.properties[property];
+  if (value === null) return null;
+  if (!isRecord(value)) invalidObservation(property, value);
+  context.omittedCount += Object.keys(value).filter(key => !fields.includes(key)).length;
+  return Object.fromEntries(fields.filter(field => Object.hasOwn(value, field)).map(field => [field, structuredClone(value[field])]));
+}
+
+function observedCount(value: Record<string, unknown>, field: string) {
+  if (!Object.hasOwn(value, field)) return undefined;
+  const count = value[field];
+  if (!isNullableInventoryCount(count)) invalidObservation(field, count);
+  return count;
+}
+
+function invalidObservation(field: string, value: unknown): never {
+  throw new InventorySchemaError("Power Platform inventory returned invalid agent observation metadata.", {
+    reason: "invalid_resource", field, actualType: valueType(value),
+  });
 }
 
 function resourceConnectors(context: ProjectionContext): InventoryConnector[] | undefined {

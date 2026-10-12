@@ -19,6 +19,28 @@ import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 vi.mock("node:timers/promises", { spy: true });
 
 describe("GraphPackagesClient", () => {
+  it.each(["v1.0", "beta"] as const)("retains unprojected exact diagnostic fields from %s without adding a select", async version => {
+    const id = "T_01d12748-6737-d92a-636a-74afd2e69389";
+    const body = { id, futureChatAccess: { enabled: false, recipients: [], optional: null }, unknownAuthoring: "private" };
+    const fetcher = vi.fn<FetchLike>(async () => Response.json(body));
+    await expect(new GraphPackagesClient(fetcher).getDiagnosticPackageDetails("opaque-token", id, version)).resolves.toEqual(body);
+    const url = new URL(String(fetcher.mock.calls[0][0]));
+    expect(url.pathname).toBe(`/${version}/copilot/admin/catalog/packages/${id}`);
+    expect(url.search).toBe("");
+    expect(fetcher.mock.calls[0][1]?.method ?? "GET").toBe("GET");
+  });
+
+  it.each([null, {}, { id: "other-agent" }, { id: 12 }])("refuses an out-of-scope diagnostic Graph response %j", async body => {
+    const client = new GraphPackagesClient(async () => Response.json(body));
+    await expect(client.getDiagnosticPackageDetails("token", "T_01d12748-6737-d92a-636a-74afd2e69389", "beta"))
+      .rejects.toMatchObject({ code: "diagnostic_scope_mismatch" });
+  });
+
+  it.each(["v1.0", "beta"] as const)("keeps bounded body reading for %s diagnostic responses", async version => {
+    const client = new GraphPackagesClient(async () => Response.json({ id: "P_1", unknown: "a".repeat(2_000_000) }));
+    await expect(client.getDiagnosticPackageDetails("token", "P_1", version)).rejects.toMatchObject({ code: "provider_result_limit" });
+  });
+
   it("builds the Copilot agents list URL with the required filter", () => {
     const url = new URL(buildCopilotAgentsListUrl());
 

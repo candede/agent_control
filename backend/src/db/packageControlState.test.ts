@@ -70,6 +70,23 @@ beforeAll(async () => { fixture = await testDatabase(); jobs = new PackageRefres
 afterAll(async () => { await fixture?.close(); });
 
 describe("persisted package control observations", () => {
+  it("preserves separately paged sharing recipients through block and access control publications", async () => {
+    const scope = newScope();
+    const recipients = [{ resourceId: "sharing-user", resourceType: "User" }, { resourceId: "sharing-group", resourceType: "group" }];
+    await refresh(scope, [{ ...original(), sharedWithUsersAndGroups: recipients }], ["rain"]);
+    await control(scope, sparse(true));
+    await control(scope, sparse(true, {
+      availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+    }), "update-availability");
+    const selected = await read(scope);
+    expect(selected.detail).not.toHaveProperty("sharedWithUsersAndGroups");
+    const sharing = await selected.queries.children(selected.selection.id, selected.identity, "rain", {
+      kind: "sharedWithUsersAndGroups", limit: 50,
+    });
+    expect(sharing.total).toBe(2);
+    expect(sharing.value.map(row => row.payload)).toEqual(recipients);
+  });
+
   it("preserves independent block/access receipts without relabeling provider or identity observations", async () => {
     const scope = newScope();
     const identityRoot = await refresh(scope, [original()], ["rain"]);

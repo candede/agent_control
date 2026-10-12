@@ -54,6 +54,129 @@ describe("PowerPlatformResourceQueryClient", () => {
   });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
+  it("retains opposite maker-sharing observations and captured configuration independently of Graph availability", async () => {
+    const data = [true, false].map((entireTenant, index) => ({ ...resource, id: `/resources/agent-${index}`,
+      name: `agent-${index}`, properties: {
+        sharedWithViewers: { entireTenant, userCount: 0, groupCount: 0 },
+        sharedWithEditors: { userCount: entireTenant ? 1 : 0, groupCount: 0 },
+        harness: "Copilot Chat", titleId: `T_package-${index}`,
+        instructionsCharactersCount: entireTenant ? 5508 : 5909,
+        componentsCounts: { knowledgeByType: {}, connectedAgents: 0, knowledge: 0, topics: 1, tools: 0 },
+        capabilitiesCounts: { distinctFlows: 0, distinctPowerPlatformConnectors: 0, distinctPowerPlatformConnectorsOperations: 0 },
+        isWebSearchEnabledForKnowledge: !entireTenant, flows: [], triggers: [],
+      } }));
+    const client = new PowerPlatformResourceQueryClient(async () => Response.json({
+      totalRecords: 2, count: 2, resultTruncated: false, data,
+    }));
+    const result = await tinyNativePages(client, "token");
+    expect(result.resources.map(value => value.details.makerSharing)).toEqual([
+      { viewers: { entireTenant: true, userCount: 0, groupCount: 0 }, editors: { userCount: 1, groupCount: 0 } },
+      { viewers: { entireTenant: false, userCount: 0, groupCount: 0 }, editors: { userCount: 0, groupCount: 0 } },
+    ]);
+    for (const [index, value] of result.resources.entries()) {
+      expect(value).toMatchObject({ providerResourceId: `/resources/agent-${index}`, unknownFieldCount: 0,
+        details: { harness: "Copilot Chat", titleId: `T_package-${index}`, distinctFlows: 0, flowReferenceCount: 0, triggerCount: 0,
+          isWebSearchEnabledForKnowledge: index === 1, componentsCounts: data[index].properties.componentsCounts } });
+      expect(value.provenance["makerSharing.viewers.entireTenant"]).toEqual({
+        sourceSystem: "power_platform", path: "properties.sharedWithViewers.entireTenant", maturity: "preview",
+      });
+      expect(value.provenance.instructionsCharactersCount.maturity).toBe("observed");
+      const record = powerPlatformInventoryRecord(value);
+      expect(restoreInventoryRecord(record.residual, record.facts, "power_platform")).toEqual(value);
+      expect(record.facts.some(fact => fact.kind === "match:package_id")).toBe(false);
+    }
+  });
+
+  it.each([
+    { properties: {}, expected: {} },
+    { properties: { sharedWithViewers: null, sharedWithEditors: null }, expected: { makerSharing: { viewers: null, editors: null } } },
+    { properties: { sharedWithViewers: {}, sharedWithEditors: {} }, expected: { makerSharing: { viewers: {}, editors: {} } } },
+    { properties: { sharedWithViewers: { entireTenant: null, userCount: null, groupCount: null },
+      componentsCounts: null, instructionsCharactersCount: null, flows: null, triggers: null, harness: null, titleId: null,
+      capabilitiesCounts: { distinctFlows: null } },
+    expected: { makerSharing: { viewers: { entireTenant: null, userCount: null, groupCount: null } },
+      componentsCounts: null, instructionsCharactersCount: null, flowReferenceCount: null, triggerCount: null,
+      distinctFlows: null, harness: null, titleId: null } },
+    { properties: { componentsCounts: { knowledgeByType: { Files: 2, Websites: 0, Unknown: null } },
+      flows: [{ unverifiedDefinition: "must-not-be-retained" }], triggers: [{}] },
+    expected: { componentsCounts: { knowledgeByType: { Files: 2, Websites: 0, Unknown: null } }, flowReferenceCount: 1, triggerCount: 1 } },
+  ])("preserves missing, null, empty and zero native observations: %j", async ({ properties, expected }) => {
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false, data: [{ ...resource, properties }],
+    })), "token");
+    expect(result.resources[0].details).toMatchObject(expected);
+    if (!Object.hasOwn(properties, "sharedWithViewers")) expect(result.resources[0].details).not.toHaveProperty("makerSharing");
+    expect(JSON.stringify(result.resources[0])).not.toContain("must-not-be-retained");
+  });
+
+  it.each([
+    { sharedWithViewers: [] }, { sharedWithViewers: false }, { sharedWithViewers: { entireTenant: "false" } },
+    { sharedWithEditors: { userCount: -1 } }, { sharedWithEditors: { groupCount: 1.5 } },
+    { sharedWithViewers: { userCount: Number.MAX_SAFE_INTEGER + 1 } },
+    { componentsCounts: { tools: [] } }, { componentsCounts: { knowledgeByType: { Files: -1 } } },
+    { componentsCounts: { knowledgeByType: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [String(index), 0])) } },
+    { instructionsCharactersCount: false }, { instructionsCharactersCount: -1 },
+    { harness: "x".repeat(513) }, { titleId: {} }, { flows: {} }, { triggers: false },
+    { capabilitiesCounts: { distinctFlows: 0.5 } },
+  ])("rejects invalid new native evidence rather than publishing a false sharing default: %j", async properties => {
+    const client = new PowerPlatformResourceQueryClient(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false, data: [{ ...resource, properties }],
+    }));
+    await expect(tinyNativePages(client, "token")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    '"sharedWithViewers":{"entireTenant":true,"entire\\u0054enant":false}',
+    '"sharedWithEditors":{"userCount":1,"userCount":0}',
+    '"componentsCounts":{"tools":1,"tools":0}',
+    '"componentsCounts":{"knowledgeByType":{"Files":1,"Files":0}}',
+    '"capabilitiesCounts":{"distinctFlows":1,"distinctFlows":0}',
+    '"harness":"Copilot Chat","harness":"Other"',
+  ])("rejects duplicate new contract members: %s", async properties => {
+    const text = `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[${JSON.stringify(resource).replace(
+      /"properties":\{[^}]*\}/, `"properties":{${properties}}`)}]}`;
+    const client = new PowerPlatformResourceQueryClient(async () => new Response(text));
+    await expect(tinyNativePages(client, "token")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it("server-filters an exact diagnostic agent and preserves all unprojected fields", async () => {
+    const nativeId = "3deaf785-6ba7-44e6-b67d-e255791c432c", environmentId = `default-${resource.tenantId}`;
+    const data = [{ ...resource, name: nativeId, properties: { environmentId, accesscontrolpolicy: 4, futureSharing: null } }];
+    const page = { totalRecords: 1, count: 1, resultTruncated: false, data, futureMetadata: { values: [] } };
+    const fetcher = vi.fn(async () => Response.json(page));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token", nativeId,
+      { environmentId, expectedTenantId: resource.tenantId })).resolves.toEqual(page);
+    const body = JSON.parse(String(fetcher.mock.calls[0][1]?.body));
+    expect(body.Options).toEqual({ Top: 1, Skip: 0 });
+    expect(body.Clauses).toEqual(expect.arrayContaining([
+      { $type: "where", FieldName: "name", Operator: "==", Values: [JSON.stringify(nativeId)] },
+      { $type: "where", FieldName: "tenantId", Operator: "==", Values: [JSON.stringify(resource.tenantId)] },
+      { $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] },
+    ]));
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["name", "tenant", "environment", "type", "extra", "missing"] as const)("refuses diagnostic data outside exact scope: %s", async mismatch => {
+    const nativeId = "3deaf785-6ba7-44e6-b67d-e255791c432c", environmentId = `default-${resource.tenantId}`;
+    const row = { ...resource, name: mismatch === "name" ? "other-agent" : nativeId,
+      tenantId: mismatch === "tenant" ? "22222222-2222-2222-2222-222222222222" : resource.tenantId,
+      type: mismatch === "type" ? "microsoft.powerplatform/environments" : resource.type,
+      properties: { environmentId: mismatch === "environment" ? "other-environment" : environmentId } };
+    const data = mismatch === "missing" ? [] : mismatch === "extra" ? [row, { ...row, name: "other-agent" }] : [row];
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: data.length, count: data.length, resultTruncated: false, data }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token", nativeId,
+      { environmentId, expectedTenantId: resource.tenantId })).rejects.toBeInstanceOf(AppError);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("does not dispatch diagnostic queries with an unsafe native identity", async () => {
+    const fetcher = vi.fn();
+    await expect(new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token", "' or true",
+      { environmentId: "default-environment", expectedTenantId: resource.tenantId }))
+      .rejects.toMatchObject({ code: "invalid_diagnostic_identity" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it.each([
     '{"totalRecords":100001,"total\\u0052ecords":0,"count":0,"resultTruncated":false,"data":[]}',
     '{"totalRecords":0,"count":1,"count":0,"resultTruncated":false,"data":[]}',
@@ -1067,7 +1190,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     });
     expect(JSON.stringify(result)).not.toContain("secret");
     expect(JSON.stringify(result)).not.toContain("private");
-    expect(JSON.stringify(result)).not.toContain("sharedWithViewers");
+    expect(result.resources[0].details.makerSharing).toEqual({ viewers: { entireTenant: true } });
     expect(result.resources[0].details.isQuarantined).toBeUndefined();
     expect(result.resources[0].provenance.authoringTool).toMatchObject({ path: "properties.createdIn", maturity: "ga" });
     expect(result.unknownFieldCount).toBeGreaterThan(0);

@@ -209,6 +209,25 @@ export class GraphPackagesClient {
     } finally { budget.dispose(); }
   }
 
+  async getDiagnosticPackageDetails(accessToken: string, id: string, version: "v1.0" | "beta", options: PackageReadOptions = {}): Promise<unknown> {
+    const budget = this.readBudget(options, 60_000);
+    try {
+      budget.assertCurrent();
+      requirePackageId(id);
+      if (version !== "v1.0" && version !== "beta") throw new AppError(400, "invalid_api_version", "Unsupported package diagnostic API version.");
+      const observation = await this.requestReadWithRetry<unknown>(
+        `${version === "v1.0" ? graphV1 : graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
+        accessToken, budget, "identity",
+      );
+      budget.assertCurrent();
+      if (!observation || typeof observation !== "object" || Array.isArray(observation)
+        || !("id" in observation) || typeof observation.id !== "string" || observation.id.toLowerCase() !== id.toLowerCase()) {
+        throw new AppError(502, "diagnostic_scope_mismatch", "Package diagnostic response did not identify the requested package.");
+      }
+      return observation;
+    } finally { budget.dispose(); }
+  }
+
   private readBudget(options: PackageReadOptions, maximumDurationMs = Infinity) {
     if ((options.executionDeadlineAt !== undefined && !Number.isSafeInteger(options.executionDeadlineAt))
       || (options.retryThrottlingUntilAborted && (!options.signal || options.executionDeadlineAt === undefined))) {

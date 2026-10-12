@@ -25,6 +25,39 @@ const observation = {
 };
 
 describe("separate package detail projection", () => {
+  it("uses the newer observed telemetry and does not carry omitted observations across refreshes", () => {
+    const saved = { ...observation, package: { ...detailed, ownerId: null,
+      providerUsage: { activeUsers: 3, totalSessions: 5 }, provenance: { ...detailed.provenance,
+        "providerUsage.activeUsers": { sourceSystem: "graph_packages" as const, path: "activeUsers", maturity: "observed" as const } } } };
+    expect(projectPackageDetails(summary, saved, true, now)).toMatchObject({ ownerId: null, providerUsage: { activeUsers: 3 } });
+    expect(projectPackageDetails({ ...summary, providerUsage: { activeUsers: 1 } }, saved, true, now, now))
+      .toMatchObject({ providerUsage: { activeUsers: 1 } });
+    expect(projectPackageDetails(summary, saved, true, now, now)).not.toHaveProperty("providerUsage");
+    const cleared = projectPackageDetails({ ...summary, providerUsage: { activeUsers: 3 } }, observation, true, now);
+    expect(cleared).not.toHaveProperty("providerUsage");
+    expect(cleared.provenance).not.toHaveProperty("providerUsage.activeUsers");
+  });
+
+  it("projects sharing independently of availability and installation without replacing a newer catalog observation", () => {
+    const sharedWithUsersAndGroups = [{ resourceId: "shared-recipient", resourceType: "user" }];
+    const saved = { ...observation, package: { ...detailed, sharedWithUsersAndGroups } };
+    const result = projectPackageDetails({ ...summary, availableTo: "allowedForAll" }, saved, false, now);
+    expect(result.sharedWithUsersAndGroups).toEqual(sharedWithUsersAndGroups);
+    expect(result.allowedUsersAndGroups).toBeUndefined();
+    expect(result.availableTo).toBe("allowedForAll");
+    expect(result.deployedTo).toBe(summary.deployedTo);
+    expect(projectPackageDetails({ ...summary, sharedWithUsersAndGroups: [] }, saved, false, now, now)
+      .sharedWithUsersAndGroups).toEqual([]);
+    expect(projectPackageDetails(summary, { ...saved, package: { ...detailed, sharedWithUsersAndGroups: [] } }, false, now)
+      .sharedWithUsersAndGroups).toEqual([]);
+    expect(projectPackageDetails({ ...summary, sharedWithUsersAndGroups }, observation, true, now))
+      .not.toHaveProperty("sharedWithUsersAndGroups");
+    expect(projectPackageDetails({ ...summary, version: "2" }, saved, false, now))
+      .not.toHaveProperty("sharedWithUsersAndGroups");
+    expect(projectPackageDetails(summary, { ...saved, expiresAt: "2026-09-24T09:59:59Z" }, false, now))
+      .toMatchObject({ sharedWithUsersAndGroups, detailFreshness: { state: "stale" } });
+  });
+
   it("ages identity evidence at exact sub-millisecond instants for number, Date and string evaluations", () => {
     const value = { ...detailed, detailFreshness: {
       state: "fresh" as const, observedAt: "2026-09-24T09:59:59.999999999Z", expiresAt: "2026-09-24T10:00:00.000000002Z",

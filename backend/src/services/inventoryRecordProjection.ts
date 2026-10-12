@@ -1,6 +1,6 @@
 import { assertResidualBytes, digest, dataLimitError } from "../db/dataBounds.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import { formatAgentAuthoringTool, isDirectoryObjectId, normalizePackageAuthoringTool } from "../types/copilotPackage.js";
+import { formatAgentAuthoringTool, isDirectoryObjectId, isPackageProviderUsage, normalizePackageAuthoringTool, packagePrincipalCollections } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { powerPlatformAuthoringTool } from "../types/powerPlatformInventory.js";
 import { inventoryLimits, type InventoryClassification } from "../types/inventoryRecords.js";
@@ -38,12 +38,15 @@ function bounded(record: InventoryRecord) {
 }
 
 export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRecord {
-  const retainedFields = ["identityDetailsCollected", "identityRevalidationRequired", "detailFreshness", "controlObservations"] as const;
+  const retainedFields = ["identityDetailsCollected", "identityRevalidationRequired", "detailFreshness", "controlObservations", "providerUsage", "provenance"] as const;
   const properties = Object.getOwnPropertyDescriptors(input);
   if (Object.values(properties).some(property => !Object.hasOwn(property, "value"))) {
     throw new AppError(502, "provider_schema", "Package observations must contain own data properties.");
   }
   const observation = Object.fromEntries(Object.entries(properties).map(([key, property]) => [key, property.value]));
+  if (Object.hasOwn(input, "providerUsage") && !isPackageProviderUsage(input.providerUsage)) {
+    throw new AppError(502, "provider_schema", "Package provider telemetry is invalid.");
+  }
   // Local freshness/control annotations are not omitted provider fields.
   for (const key of retainedFields) delete observation[key];
   const value = { ...allowlistedPackage(observation), ...structuredClone(Object.fromEntries(
@@ -54,7 +57,7 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
     if (value[kind] !== undefined) fact("collection", kind);
     for (const item of value[kind] ?? []) fact(kind, item);
   }
-  for (const kind of ["allowedUsersAndGroups", "acquireUsersAndGroups"] as const) {
+  for (const kind of packagePrincipalCollections) {
     if (value[kind] !== undefined) fact("collection", kind);
     for (const item of value[kind] ?? []) fact(kind, item.resourceId, item);
   }
@@ -90,7 +93,7 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   }
   // Source-native identity evidence stays bounded; child collections are not list payloads.
   const residual: Record<string, unknown> = { ...value };
-  for (const key of ["supportedHosts", "elementTypes", "categories", "allowedUsersAndGroups", "acquireUsersAndGroups", "elementDetails"]) delete residual[key];
+  for (const key of ["supportedHosts", "elementTypes", "categories", ...packagePrincipalCollections, "elementDetails"]) delete residual[key];
   const projection = canonicalRecord(value.id, buildRecords([value], [], resolvePackageAgentLinks("", [value], []), null, null)[0]);
   facts.push(...projection.facts);
   return bounded({ identity: value.id, native_id: value.id, environment_id: identity?.environmentId ?? null,
@@ -150,7 +153,7 @@ export function restoreInventoryRecord(residual: Record<string, unknown>, inputF
     throw new AppError(500, "saved_source_invalid", "Saved inventory child facts are invalid.");
   }
   if (domain === "packages") {
-    for (const kind of ["supportedHosts", "elementTypes", "categories", "allowedUsersAndGroups", "acquireUsersAndGroups"]) {
+    for (const kind of ["supportedHosts", "elementTypes", "categories", ...packagePrincipalCollections]) {
       const selected = facts.filter(fact => fact.kind === kind);
       if (selected.length || facts.some(fact => fact.kind === "collection" && fact.value === kind)) value[kind] = selected.map(fact => kind.endsWith("UsersAndGroups") ? fact.payload : fact.value);
     }

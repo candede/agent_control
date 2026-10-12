@@ -56,11 +56,13 @@ describe("package access scope consistency", () => {
         id: "package", displayName: "Package", isBlocked: false,
         availableTo: "some", deployedTo: "some",
         allowedUsersAndGroups: [preserved], acquireUsersAndGroups: [preserved],
+        sharedWithUsersAndGroups: [{ resourceType: "user", resourceId: "unrelated-sharing-recipient" }],
         [scopeProperty]: status,
         [property]: [{ resourceType: "user", resourceId: "inactive-user" }],
       });
       const update: PackageAccessUpdate = { target, mode: "add", scope: "specific", principals: [requested] };
       const before = capturePackageMutationState(details, action);
+      expect(before).not.toHaveProperty("sharedWithUsersAndGroups");
       const expected = { ...before, [scopeProperty]: "some", [property]: [requested] };
       expect.soft(expectedPackageMutationState(before, action, update)).toEqual(expected);
 

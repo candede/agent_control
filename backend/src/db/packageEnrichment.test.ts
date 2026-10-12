@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { inventorySelectionFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryInput, inventorySelectionFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRuntime.js";
 import { inventoryPresentation } from "../services/inventoryPresentation.js";
-import { StreamedInventory } from "../services/streamedInventory.js";
+import { storedInventoryRecord, StreamedInventory } from "../services/streamedInventory.js";
+import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import { PackageRefreshJobs, type PackageDataScope } from "./packageRefreshJobs.js";
 import { verifySchema } from "./schema.js";
@@ -74,6 +75,97 @@ async function targetIds(owner: PackageDataScope, job: Job) {
 }
 
 describe("streamed catalog and bounded automatic detail enrichment", () => {
+  it("collects and pages sharing evidence through automatic detail sync, compatible catalog refresh and canonical sections", async () => {
+    const owner = scope();
+    const recipients = [
+      { resourceId: " Exact_User ", resourceType: "USER" },
+      { resourceId: "shared-group", resourceType: "group" },
+    ];
+    await publish(owner, [summary("populated"), summary("empty"), summary("omitted")]);
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 0, eligible: 3 });
+    expect(await jobs.detailCoverage({ ...owner, principalId: randomUUID() }))
+      .toEqual({ catalog_available: false, total: 0, fresh: 0, eligible: 0 });
+    await collect(owner, await claim(owner), [
+      { ...detail("populated"), sharedWithUsersAndGroups: recipients },
+      { ...detail("empty"), sharedWithUsersAndGroups: [] },
+      detail("omitted"),
+    ]);
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 3, eligible: 0 });
+    await publish(owner, [summary("populated"), summary("empty"), summary("omitted")]);
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 3, eligible: 0 });
+    for (const [id, expected] of [["populated", recipients], ["empty", []], ["omitted", undefined]] as const) {
+      const result = await read(owner, id);
+      const children = await result.queries.children(result.selection.id, result.identity, id, {
+        kind: "sharedWithUsersAndGroups", limit: 1,
+      });
+      expect(children.total).toBe(expected?.length ?? 0);
+      if (expected?.length) {
+        expect(children.value.map(row => row.payload)).toEqual([expected[0]]);
+        expect(children.nextCursor).toEqual(expect.any(String));
+        const next = await result.queries.children(result.selection.id, result.identity, id, {
+          kind: "sharedWithUsersAndGroups", limit: 1, cursor: children.nextCursor!,
+        });
+        expect(next.value.map(row => row.payload)).toEqual([expected[1]]);
+        expect(next.nextCursor).toBeNull();
+      }
+      const stream = new StreamedInventory(fixture.runtime);
+      const stored = await stream.stages.generations.connections.run(client =>
+        storedInventoryRecord(client, result.detail.selectedSource.generationId, id));
+      expect(stored.value.sharedWithUsersAndGroups).toEqual(expected);
+      expect(stored.residual).not.toHaveProperty("sharedWithUsersAndGroups");
+      expect(stored.facts.filter(fact => fact.kind === "collection" && fact.value === "sharedWithUsersAndGroups"))
+        .toHaveLength(expected === undefined ? 0 : 1);
+    }
+    await reconcileInventoryFixture(fixture.runtime, owner);
+    const unified = await inventorySelectionFixture(fixture.runtime, owner);
+    selections.push(unified);
+    const references = await unified.queries.sourceReferences(unified.selection.id, unified.identity, [
+      { domain: "packages", nativeId: "populated", environmentId: null },
+    ]);
+    expect(references).toHaveLength(1);
+    const recordId = references[0].canonical_id;
+    const members = await unified.queries.members(unified.selection.id, unified.identity, recordId);
+    const member = members.value.find(item => item.domain === "packages" && item.native_id === "populated")!;
+    const sections = await unified.queries.sections(unified.selection.id, unified.identity, recordId, {
+      sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity,
+    });
+    expect(sections.value).toContainEqual({ kind: "sharedWithUsersAndGroups", total: 2 });
+  });
+
+  it("replaces saved sharing with a newer explicit catalog value and withdraws it on exact omission", async () => {
+    const owner = scope();
+    const recipients = [{ resourceId: "recipient", resourceType: "user" }];
+    await publish(owner, [{ ...detail(), sharedWithUsersAndGroups: recipients }], ["one"]);
+    await publish(owner, [{ ...summary(), sharedWithUsersAndGroups: [] }]);
+    const empty = await read(owner);
+    const countPresence = async (generationId: string) => (await fixture.runtime.query(`SELECT count(*)::int AS total
+      FROM inventory_facts WHERE generation_id=$1 AND identity='one'
+        AND kind='collection' AND value='sharedWithUsersAndGroups'`, [generationId])).rows[0].total;
+    expect(await countPresence(empty.detail.selectedSource.generationId)).toBe(1);
+    expect((await empty.queries.children(empty.selection.id, empty.identity, "one", { kind: "sharedWithUsersAndGroups" })).total).toBe(0);
+    await publish(owner, [summary()], ["one"]);
+    await publish(owner, [summary()]);
+    const omitted = await read(owner);
+    expect(await countPresence(omitted.detail.selectedSource.generationId)).toBe(0);
+    expect((await omitted.queries.children(omitted.selection.id, omitted.identity, "one", { kind: "sharedWithUsersAndGroups" })).total).toBe(0);
+  });
+
+  it.each(["resourceId", "resourceType"] as const)("rejects invalid sharing %s facts in the fresh database schema", async field => {
+    const stream = new StreamedInventory(fixture.runtime);
+    const record = packageInventoryRecord({ ...detail(),
+      sharedWithUsersAndGroups: [{ resourceId: "recipient", resourceType: "user" }] });
+    const fact = record.facts.find(item => item.kind === "sharedWithUsersAndGroups")!;
+    fact.payload[field] = field === "resourceId" ? "different-recipient" : "tenant";
+    await expect(stream.stages.execute(inventoryInput(randomUUID()), {
+      domain: "packages", mode: "baseline", channel: "catalog",
+    }, async lease => {
+      await stream.stages.visit(lease, "sharing-schema-probe");
+      await stream.stages.appendBounded(lease, [record]);
+    }, { authorize: async () => {} })).rejects.toMatchObject({
+      code: "23514", constraint: "inventory_facts_shared_principal_check",
+    });
+  });
+
   it.each(["interaction_required", "missing_permission"])("backs off %s across the detail lane rather than trying another twenty targets", async code => {
     const owner = scope();
     await publish(owner, Array.from({ length: 25 }, (_, index) => summary(`auth-${index}`)));
@@ -156,8 +248,10 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     await jobs.markFailed(owner, automatic.id, "provider_error", "Unavailable.");
     await publish(owner, [{ ...summary("changed", "2"), displayName: "Only a name changed",
       manifestId: summary().manifestId!.toUpperCase() }, summary("old"), summary("new")]);
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 0, eligible: 0 });
     expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
     await publish(owner, [summary("changed", "3"), summary("old"), summary("new")]);
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 0, eligible: 1 });
     const changed = (await jobs.claimDueDetails(owner, owner.principalId))!;
     expect(await targetIds(owner, changed)).toEqual(["changed"]);
   });

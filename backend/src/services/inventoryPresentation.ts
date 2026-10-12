@@ -1,6 +1,8 @@
 import type { InventoryQueries } from "../db/inventoryQueries.js";
 import type { CopilotPackage } from "../types/copilotPackage.js";
+import { isPackageProviderUsage } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { isAgentComponentCounts, isMakerSharing, isNullableInventoryCount } from "../types/powerPlatformInventory.js";
 import { packageSummary } from "./inventoryComponent.js";
 import { AppError } from "../errors.js";
 import { dataLimitError, dataLimits } from "../db/dataBounds.js";
@@ -184,12 +186,13 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
             throw new AppError(500, "saved_source_invalid", "Saved package catalog observation provenance is unavailable.");
           }
           const detail = member.residual.detailFreshness;
+          const catalogObservation = inventoryObservation(providerGeneration, catalogObservedAt, catalogExpiresAt, current, evaluatedAt);
           return [member.native_id, {
-            ...inventoryObservation(providerGeneration, catalogObservedAt, catalogExpiresAt, current, evaluatedAt),
+            ...catalogObservation,
             scopeKind: member.source_channel === "catalog" ? "broad" as const : "exact" as const,
             identityDetails: member.detail_generation && detail?.observedAt && detail.expiresAt
               && ["fresh", "stale"].includes(detail.state) ? {
-                ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, current && detail.state === "fresh", evaluatedAt),
+                ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, catalogObservation.current && detail.state === "fresh", evaluatedAt),
               } : null,
           }];
         })),
@@ -304,7 +307,7 @@ function assertSavedJson(value: unknown, ancestors = new Set<object>(), depth = 
 function validateProvenance(value: unknown, sourceSystem: "graph_packages" | "power_platform") {
   if (!isSavedRecord(value) || Object.values(value).some(provenance => !isSavedRecord(provenance)
     || provenance.sourceSystem !== sourceSystem || typeof provenance.path !== "string"
-    || typeof provenance.maturity !== "string" || !["ga", "preview"].includes(provenance.maturity))) {
+    || typeof provenance.maturity !== "string" || !["ga", "preview", "observed"].includes(provenance.maturity))) {
     return invalid("Saved inventory field provenance is invalid.");
   }
 }
@@ -393,6 +396,10 @@ function validatePackage(value: Record<string, unknown>, detailGeneration: unkno
   }
   validateStringFields(value, ["type", "shortDescription", "publisher", "availableTo", "deployedTo", "platform",
     "version", "manifestVersion", "manifestId", "appId", "assetId", "createdDateTime", "lastModifiedDateTime"]);
+  for (const field of ["ownerId", "agentIdentityId"]) {
+    if (value[field] !== undefined && value[field] !== null && !savedIdentityText(value[field])) return invalid("Saved package observed identity metadata is invalid.");
+  }
+  if (value.providerUsage !== undefined && !isPackageProviderUsage(value.providerUsage)) return invalid("Saved package provider telemetry is invalid.");
   for (const field of ["supportedHosts", "elementTypes"]) if (value[field] !== undefined) validateStringArray(value[field]);
   for (const field of ["createdDateTime", "lastModifiedDateTime"]) {
     if (typeof value[field] === "string") inventoryTimestamp(value[field]);
@@ -442,6 +449,19 @@ function validateNativeResource(value: Record<string, unknown>, environmentId: s
   savedCount(value.unknownFieldCount);
   for (const field of ["createdAt", "lastPublishedAt"]) if (typeof value[field] === "string") inventoryTimestamp(value[field]);
   const details = value.details;
+  if (value.providerResourceId !== undefined && value.providerResourceId !== null
+    && (typeof value.providerResourceId !== "string" || !value.providerResourceId.length || value.providerResourceId.length > 2048)) {
+    return invalid("Saved native provider resource path is invalid.");
+  }
+  if (details.makerSharing !== undefined && !isMakerSharing(details.makerSharing)) return invalid("Saved maker-controlled sharing is invalid.");
+  if (details.componentsCounts !== undefined && !isAgentComponentCounts(details.componentsCounts)) return invalid("Saved native component counts are invalid.");
+  for (const field of ["instructionsCharactersCount", "distinctFlows", "flowReferenceCount", "triggerCount"]) {
+    if (details[field] !== undefined && !isNullableInventoryCount(details[field])) return invalid("Saved native configuration counts are invalid.");
+  }
+  for (const field of ["harness", "titleId"]) {
+    if (details[field] !== undefined && details[field] !== null
+      && (typeof details[field] !== "string" || !details[field].length || details[field].length > 512)) return invalid("Saved native observed configuration is invalid.");
+  }
   validateStringFields(details, ["ownerId", "lastModifiedAt", "lastModifiedBy", "quarantinedAt", "schemaName", "createdIn",
     "environmentType", "environmentGroup", "environmentGroupId", "orchestration", "model", "authentication"]);
   validateBooleanFields(details, ["isQuarantined", "isManaged", "isWebSearchEnabledForKnowledge", "capabilityDetailsTruncated"]);

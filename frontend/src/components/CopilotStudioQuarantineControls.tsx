@@ -426,10 +426,10 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
   if (variant === "detail") {
     const resource = targets[0];
     const disabledReason = quarantineTargetReason(resource, snapshot, eligibilityNow);
-    if (disabledReason && !job && !preview) return <details className="agent-insight-provenance">
-      <summary>Additional control availability</summary>
+    if (disabledReason && !job && !preview) return <section className="agent-management-card" aria-label="Additional control availability">
+      <div className="management-card-heading"><h4>Additional control availability</h4></div>
       <p>Quarantine is unavailable: {disabledReason}</p><a href="/sync">Review inventory coverage</a>
-    </details>;
+    </section>;
     return <article className="agent-management-card">
       <div className="management-card-heading"><h4>Quarantine and restore</h4></div>
       <section className="inventory-detail-section quarantine-control" aria-labelledby="quarantine-control-title">

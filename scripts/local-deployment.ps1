@@ -8,7 +8,7 @@ function Invoke-DockerCommand {
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS')) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
@@ -442,7 +442,7 @@ function Save-LocalConfiguration {
         Write-LocalText (Join-Path $controlDirectory 'maintenance') 'maintenance'
         Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
     }
-    foreach ($directory in @($state,$secretDirectory,(Join-Path $state 'control'),(Join-Path $state 'backups'))) {
+    foreach ($directory in @($state,$secretDirectory,(Join-Path $state 'control'),(Join-Path $state 'backups'),(Join-Path $state 'agent-sharing-diagnostics'))) {
         [IO.Directory]::CreateDirectory($directory) | Out-Null
         Protect-LocalPath $directory -Directory
     }
@@ -487,8 +487,9 @@ function Write-LocalComposeEnvironment {
     $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
     $trustProxy = if ($Context.PublicUrl -cne $Context.Url) { '1' } else { '0' }
     $image = if ($Context.RuntimeImageId) { $Context.RuntimeImageId } else { $Context.Image }
+    $diagnostics = if ($Context.AgentSharingDiagnostics) { '1' } else { '0' }
     $lines = @("LOCAL_STATE_DIR='$($Context.State)'","APP_PORT=$($Context.Port)","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$image",
-        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy")
+        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy","AGENT_SHARING_DIAGNOSTICS=$diagnostics")
     Write-LocalText (Join-Path $Context.State 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 

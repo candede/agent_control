@@ -128,6 +128,27 @@ describe("inventory HTTP selected-read boundary", () => {
     if (server) await new Promise<void>(resolve => server.close(() => resolve()));
     await fixture?.close();
   });
+  it("returns a fresh unfiltered workspace receipt without exposing or retaining an active browsing selection", async () => {
+    const before = (await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_read_selections
+      WHERE principal_id=$1 AND invalidated_at IS NULL`, [principalId])).rows[0].count;
+    const guard = forbidAuthorityWrites(fixture.runtime);
+    const response = await fetch(`${base}/agent-inventory/health`, { headers: { cookie } });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const health = await response.json();
+    expect(health).toMatchObject({ summary: { total: 101 }, verification: { graphPackageCount: 101 } });
+    for (const field of ["selection", "value", "page", "counts", "usageContext"]) expect(health).not.toHaveProperty(field);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_read_selections
+      WHERE principal_id=$1 AND invalidated_at IS NULL`, [principalId])).rows[0].count).toBe(before);
+    expect(guard.count()).toBeGreaterThan(0);
+    guard.restore();
+  });
+  it.each(["selectionId=frozen-selection", "search=Agent", "inventoryScope=organization_created"])(
+    "rejects browsing coordinates in workspace health: %s", async query => {
+      const response = await fetch(`${base}/agent-inventory/health?${query}`, { headers: { cookie } });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ code: "invalid_inventory_query" });
+    });
   it("keeps unavailable responsibility explicit when only the Graph catalog is available", async () => {
     const objectId = randomUUID();
     await fixture.runtime.query(`INSERT INTO agent_people_cache(tenant_id,principal_id,object_id,revision,status,
@@ -621,11 +642,12 @@ describe("inventory HTTP selected-read boundary", () => {
       ].map((value, index) => powerPlatformInventoryRecord({
         sourceSystem: "power_platform", nativeId: `responsibility-${index}`, type, environmentId: "owner-environment",
         tenantId: input.scope.tenantId, displayName: value.name, location: null, createdAt: null, createdBy: value.creator,
-        creatorType: "user", agentKind: index === 3 ? "copilot_studio_agent" : "agent", lifecycle: "published", lastPublishedAt: null, authoringTool: null,
+        creatorType: "unknown", agentKind: index === 3 ? "copilot_studio_agent" : "agent", lifecycle: "published", lastPublishedAt: null, authoringTool: null,
         identityConfidence: "exact_native", identifiers: index === 3 ? [{ kind: "entra_agent_id", value: c }] : [],
         provenance: index === 3 ? { entraAgentId: { sourceSystem: "power_platform", path: "properties.entraAgentId", maturity: "ga" } } : {},
         unknownFieldCount: 0,
-        details: { ownerId: value.owner, lastModifiedBy: value.modifier },
+        details: { ...(value.owner === null ? {} : { ownerId: value.owner }),
+          ...(value.modifier === null ? {} : { lastModifiedBy: value.modifier }) },
       } satisfies PowerPlatformResource));
       records.push(powerPlatformInventoryRecord({
         sourceSystem: "power_platform", nativeId: "owner-environment", type: "microsoft.powerplatform/environments",

@@ -27,6 +27,7 @@ export const config = {
   frontendOrigin,
   redirectUri,
   officialUsageStaleDays,
+  agentSharingDiagnostics: process.env.AGENT_SHARING_DIAGNOSTICS === "1",
   sessionSecret: secretValue("SESSION_SECRET") ?? "",
   trustProxy: deploymentTarget === "azure" || process.env.TRUST_PROXY === "1",
 };
@@ -149,6 +150,12 @@ export function validateRuntimeConfig() {
     if (process.env[name]) throw new Error(`${name} is unsupported by the production runtime.`);
   }
   if (process.env.TRUST_PROXY && !["0", "1"].includes(process.env.TRUST_PROXY)) throw new Error("TRUST_PROXY must be 0 or 1.");
+  if (process.env.AGENT_SHARING_DIAGNOSTICS !== undefined && !["0", "1"].includes(process.env.AGENT_SHARING_DIAGNOSTICS)) {
+    throw new Error("AGENT_SHARING_DIAGNOSTICS must be 0 or 1.");
+  }
+  if (config.agentSharingDiagnostics && config.deploymentTarget !== "local") {
+    throw new Error("Temporary agent sharing diagnostics are supported only by local deployments.");
+  }
   const origin = canonicalUrl(config.frontendOrigin, "FRONTEND_ORIGIN");
   if (origin.origin !== config.frontendOrigin || origin.pathname !== "/") throw new Error("FRONTEND_ORIGIN must contain only a canonical origin.");
   const callback = canonicalUrl(config.redirectUri, "REDIRECT_URI");

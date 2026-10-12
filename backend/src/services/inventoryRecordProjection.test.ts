@@ -18,6 +18,37 @@ const retiredKinds = ["presence", "linkState", "availability", "management"];
 afterEach(() => vi.restoreAllMocks());
 
 describe("inventory record projections", () => {
+  it("round-trips namespaced maker sharing and observed Graph telemetry without changing identity or admin availability", () => {
+    const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, availableTo: "allowedForAll",
+      activeUsers: 3, totalSessions: 5, totalRunTimeInHours: 0.1, exceptionRate: 0, ownerId: null });
+    const packaged = packageInventoryRecord(value);
+    expect(restoreInventoryRecord(packaged.residual, packaged.facts, "packages")).toEqual(value);
+    expect(packaged.availability).toBe("available");
+    const details = { makerSharing: { viewers: { entireTenant: false, userCount: 0, groupCount: 0 },
+      editors: { userCount: 0, groupCount: 0 } }, componentsCounts: { knowledgeByType: {} }, triggerCount: 0 };
+    const nativeRecord = powerPlatformInventoryRecord({ ...native, details });
+    expect(restoreInventoryRecord(nativeRecord.residual, nativeRecord.facts, "power_platform")).toMatchObject({ details });
+    expect(nativeRecord.facts.filter(fact => fact.kind.startsWith("match:"))).toEqual(
+      powerPlatformInventoryRecord(native).facts.filter(fact => fact.kind.startsWith("match:")));
+    expect(nativeRecord.availability).toBe(powerPlatformInventoryRecord(native).availability);
+  });
+
+  it.each([undefined, [], [
+    { resourceId: " Exact_User ", resourceType: "USER" },
+    { resourceId: "group", resourceType: "group" },
+    { resourceId: " Exact_User ", resourceType: "USER" },
+  ]])("round-trips sharing collection presence and ordered recipients: %j", sharedWithUsersAndGroups => {
+    const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false,
+      ...(sharedWithUsersAndGroups === undefined ? {} : { sharedWithUsersAndGroups }) });
+    const record = packageInventoryRecord(value);
+    expect(record.residual).not.toHaveProperty("sharedWithUsersAndGroups");
+    expect(record.facts.filter(fact => fact.kind === "collection" && fact.value === "sharedWithUsersAndGroups"))
+      .toHaveLength(sharedWithUsersAndGroups === undefined ? 0 : 1);
+    expect(record.facts.filter(fact => fact.kind === "sharedWithUsersAndGroups").map(fact => fact.payload))
+      .toEqual(sharedWithUsersAndGroups ?? []);
+    expect(restoreInventoryRecord(record.residual, record.facts, "packages")).toEqual(value);
+  });
+
   it("diagnoses an oversized projected residual without logging its contents", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const displayName = "private-display-name-" + "x".repeat(262_144);

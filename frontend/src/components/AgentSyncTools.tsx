@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { CircleAlert, Download, RefreshCw, ShieldCheck } from "lucide-react";
-import type { InventoryRefreshJob, UnifiedAgentInventoryPage, UnifiedAgentInventoryUnavailable } from "../api/client";
+import type { InventoryRefreshJob, UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { inventoryAttentionReasons, inventoryDetailsPending } from "../inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 import { SyncDialog } from "./SyncDialog";
 
 type Props = {
-  inventory?: UnifiedAgentInventoryPage;
+  inventory?: UnifiedAgentInventoryHealth;
   inventoryUnavailable?: UnifiedAgentInventoryUnavailable;
   verifyingInventory: boolean;
   inventoryError?: string;
@@ -61,19 +61,19 @@ export function AgentSyncTools({
   const health = verifyingInventory ? "Checking"
     : needsAttention ? "Needs attention" : inventoryUnavailable ? inventoryUnavailable.state === "preparing" ? "Preparing"
       : inventoryUnavailable.state === "unavailable" ? "Unavailable" : "Not collected"
-      : currentInventory ? detailsPending ? "Sources checked" : "Verified" : "Not checked";
+      : currentInventory ? detailsPending ? "Details pending" : "Verified" : "Not checked";
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">
       <div className="sync-inventory-summary">
         {needsAttention ? <CircleAlert size={22} aria-hidden="true" /> : <ShieldCheck size={22} aria-hidden="true" />}
         <div>
-          <div className="sync-health-heading"><h2 id="sync-inventory-heading">Inventory health</h2><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory ? "success" : "progress"}`}>{health}</span></div>
+          <div className="sync-health-heading"><h2 id="sync-inventory-heading">Inventory health</h2><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory && !detailsPending ? "success" : "progress"}`}>{health}</span></div>
           <p role={needsAttention ? undefined : "status"}>{verifyingInventory
             ? "Checking saved inventory. Previous results are not the result of this check."
             : needsAttention ? "Catalog sync and inventory health are separate. The issues below explain what still needs attention."
               : inventoryUnavailable ? inventoryUnavailable.message
                 : !currentInventory ? "No saved inventory receipt is available. Open diagnostics to read saved inventory."
-                  : detailsPending ? "Saved source counts are checked. Package detail freshness is shown in diagnostics; no administrator action is needed for scheduled refreshes."
+                  : detailsPending ? "Saved source counts are checked. Exact package details are still pending; start collection and follow its progress in Graph package details below."
                     : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
         </div>
         <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setDiagnosticsOpen(true)}>View diagnostics</button>

@@ -11,7 +11,7 @@ const names = [
   "TENANTS_JSON", "TENANTS_JSON_FILE",
   "TRUST_PROXY", "BOOTSTRAP_ADMIN", "BOOTSTRAP_ROLES", "AGENT_CONTROL_ADMIN", "AGENT_CONTROL_FIXTURE_MODE", "OFFICIAL_USAGE_STALE_AFTER_DAYS",
   "AGENT_CONTROL_AUTH_BYPASS", "AUTH_BYPASS", "ALLOW_ANY_ORIGIN", "SQLITE_PATH", "DATABASE_URL",
-  "ENABLE_RAW_PROVIDER_DATA", "ENABLE_ARBITRARY_KQL", "DISABLE_RETENTION",
+  "ENABLE_RAW_PROVIDER_DATA", "ENABLE_ARBITRARY_KQL", "DISABLE_RETENTION", "AGENT_SHARING_DIAGNOSTICS",
 ];
 const originalValues = new Map(names.map(name => [name, process.env[name]]));
 
@@ -32,6 +32,26 @@ afterEach(() => {
 });
 
 describe("runtime configuration", () => {
+  it("defaults temporary sharing diagnostics off and accepts explicit local opt-in", async () => {
+    const disabled = await loadConfig({ SESSION_SECRET: "x".repeat(32) });
+    expect(disabled.config.agentSharingDiagnostics).toBe(false);
+    const enabled = await loadConfig({ SESSION_SECRET: "x".repeat(32), AGENT_SHARING_DIAGNOSTICS: "1" });
+    enabled.validateRuntimeConfig();
+    expect(enabled.config.agentSharingDiagnostics).toBe(true);
+    const forbidden = await loadConfig({ SESSION_SECRET: "x".repeat(32), AGENT_SHARING_DIAGNOSTICS: "1", ENABLE_RAW_PROVIDER_DATA: "1" });
+    expect(() => forbidden.validateRuntimeConfig()).toThrow("ENABLE_RAW_PROVIDER_DATA is unsupported");
+  });
+
+  it.each(["", "true", "2"])("rejects ambiguous sharing diagnostic opt-in %j", async value => {
+    const loaded = await loadConfig({ AGENT_SHARING_DIAGNOSTICS: value });
+    expect(() => loaded.validateRuntimeConfig()).toThrow("AGENT_SHARING_DIAGNOSTICS must be 0 or 1");
+  });
+
+  it("rejects sharing diagnostics on Azure", async () => {
+    const loaded = await loadConfig({ WEBSITE_SITE_NAME: "agent-control", AGENT_SHARING_DIAGNOSTICS: "1" });
+    expect(() => loaded.validateRuntimeConfig()).toThrow("only by local deployments");
+  });
+
   it("rejects fixture authentication in every runtime environment", async () => {
     for (const nodeEnv of ["production", "development", "test"]) {
       const loaded = await loadConfig({ NODE_ENV: nodeEnv, SESSION_SECRET: "x".repeat(32), AGENT_CONTROL_FIXTURE_MODE: "browser" });

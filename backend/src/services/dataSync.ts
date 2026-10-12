@@ -16,6 +16,8 @@ import { powerPlatformInventory, type PowerPlatformInventoryService } from "./po
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { operationalLog } from "./telemetry.js";
 import { AgentPeopleService } from "./agentPeople.js";
+import { config } from "../config.js";
+import { temporaryAgentSharingDiagnostic, type AgentSharingDiagnosticContext } from "./temporaryAgentSharingDiagnostic.js";
 
 type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
 type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>>;
@@ -25,11 +27,12 @@ type DataSyncDependencies = {
     "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listMarkers" | "attachJob" | "updateSource"
     | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted" | "submitDue" | "automaticRevisions" | "finishAutomatic">;
   officialUsage: Pick<OfficialReportStatusRepository, "read">;
-  packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization" | "refreshDueDetails">;
+  packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization" | "refreshDueDetails" | "startDetailSync">;
   powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
   copilotUsage: Pick<CopilotUsageService, "refreshUsers">;
   agentPeople: Pick<AgentPeopleService, "refreshReferences">;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>;
 };
 
 type SyncAuthorization = {
@@ -430,7 +433,7 @@ export class DataSyncService {
       ? this.runPowerPlatform(user, scope, runId, activeRun, incompleteOnly) : undefined;
     const results = await Promise.allSettled(sources.map(source => {
       if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, activeRun, inventoryReady, automatic && !incompleteOnly, signedInAt);
-      if (source === "graph_packages") return this.runPackages(user, scope, runId, activeRun, incompleteOnly);
+      if (source === "graph_packages") return this.runPackages(user, scope, runId, activeRun, incompleteOnly, automatic);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
@@ -511,7 +514,8 @@ export class DataSyncService {
     }
   }
 
-  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, activeRun: ActiveRun, retryFailed: boolean) {
+  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, activeRun: ActiveRun, retryFailed: boolean, automatic: boolean) {
+    const requestedAt = Date.now();
     let jobId: string | null = null;
     try {
       assertCurrentSync(activeRun);
@@ -540,7 +544,26 @@ export class DataSyncService {
         ? await this.dependencies.packages.start(user, job.id, "delegated", { retryFailed })
         : job;
       assertCurrentSync(activeRun);
-      await this.trackPackageJob(user, scope, runId, started, activeRun);
+      const catalogPublished = await this.trackPackageJob(user, scope, runId, started, activeRun);
+      if (catalogPublished) {
+        try {
+          assertCurrentSync(activeRun);
+          await this.dependencies.packages.startDetailSync(user, undefined, requestedAt);
+          assertCurrentSync(activeRun);
+        } catch (error) {
+          operationalLog("warn", "package_detail_start_failed", { ...errorTelemetry(error), jobId });
+        }
+        if (!automatic && this.dependencies.sharingDiagnostic) {
+          try {
+            assertCurrentSync(activeRun);
+            await this.dependencies.sharingDiagnostic(user, {
+              runId, signal: activeRun.controller.signal, assertCurrent: () => assertCurrentSync(activeRun),
+            });
+          } catch (error) {
+            operationalLog("error", "agent_sharing_diagnostic_failed", { runId, ...errorTelemetry(error) });
+          }
+        }
+      }
     } catch (error) {
       if (jobId) await this.cleanupTrackedChildren(activeRun, new Set([childKey("graph_packages", jobId)]));
       await this.handleSourceFailure(scope, runId, "graph_packages", jobId, activeRun.controller.signal.aborted ? activeRun.controller.signal.reason : error);
@@ -594,13 +617,14 @@ export class DataSyncService {
     while (job.status === "running") {
       const current = await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job, () => assertCurrentSync(authorization)));
       assertCurrentSync(authorization);
-      if (current?.sources.some(source => source.source === "graph_packages" && source.jobId === job.id && source.status === "succeeded")) return;
+      if (current?.sources.some(source => source.source === "graph_packages" && source.jobId === job.id && source.status === "succeeded")) return true;
       requireRunningSource(current, "graph_packages", job.id);
       await this.dependencies.wait(childPollIntervalMs, signal);
       assertCurrentSync(authorization);
       job = await this.dependencies.packages.get(user, job.id, "delegated");
     }
     await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job, () => assertCurrentSync(authorization)));
+    return job.status === "succeeded";
   }
 
   private async trackPowerPlatformJob(
@@ -808,6 +832,8 @@ function defaultDependencies(database: pg.Pool): DataSyncDependencies {
     copilotUsage: new CopilotUsageService(database),
     agentPeople: new AgentPeopleService(database),
     wait: waitFor,
+    ...(config.agentSharingDiagnostics
+      ? { sharingDiagnostic: temporaryAgentSharingDiagnostic.run.bind(temporaryAgentSharingDiagnostic) } : {}),
   };
 }
 

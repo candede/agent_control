@@ -102,6 +102,35 @@ function savedPerson(): SavedAgentPerson {
     userPrincipalName: null, observedAt };
 }
 
+describe("saved maker-sharing and observed metadata", () => {
+  it("presents explicit false and zero native sharing without replacing admin availability or report usage", () => {
+    const raw = memberPage(true);
+    const native = raw.value[0].members[1];
+    native.residual.details = { makerSharing: { viewers: { entireTenant: false, userCount: 0, groupCount: 0 },
+      editors: { userCount: 1, groupCount: 0 } }, componentsCounts: { knowledgeByType: {}, topics: 1 },
+      flowReferenceCount: 0, triggerCount: 0, instructionsCharactersCount: 5508 };
+    native.residual.provenance = { makerSharing: { sourceSystem: "power_platform", path: "properties.sharedWithViewers", maturity: "preview" },
+      componentsCounts: { sourceSystem: "power_platform", path: "properties.componentsCounts", maturity: "observed" } };
+    raw.value[0].members[0].residual.providerUsage = { activeUsers: 3, totalSessions: 5, exceptionRate: 0 };
+    const result = inventoryPresentation(raw).value[0];
+    expect(result.powerPlatformResource?.details).toEqual(native.residual.details);
+    expect(result.packages[0].providerUsage).toEqual({ activeUsers: 3, totalSessions: 5, exceptionRate: 0 });
+    expect(result.usage?.activeUsers).toBeNull();
+  });
+
+  it.each([
+    { makerSharing: { viewers: { entireTenant: "false" } } },
+    { makerSharing: { editors: { userCount: -1 } } },
+    { makerSharing: { editors: { entireTenant: true } } },
+    { makerSharing: null }, { componentsCounts: [] }, { instructionsCharactersCount: 1.5 },
+    { flowReferenceCount: "0" }, { triggerCount: -1 }, { distinctFlows: Number.MAX_SAFE_INTEGER + 1 },
+  ])("rejects malformed saved native evidence: %j", details => {
+    const raw = memberPage(true);
+    raw.value[0].members[1].residual.details = details;
+    expect(() => inventoryPresentation(raw)).toThrow(expect.objectContaining({ code: "saved_source_invalid" }));
+  });
+});
+
 function environmentPage(): ReturnType<typeof memberPage> {
   const raw = memberPage(true);
   const environment: SavedAgentEnvironment = {
@@ -866,7 +895,7 @@ describe("saved inventory metadata verification", () => {
       expect(presented.observations.powerPlatform?.snapshotId).toBe(rows[2].generation_id);
       expect(presented.observations.packageSnapshots.a).toMatchObject({
         snapshotId: rows[0].catalog_generation, observedAt: catalogObservedAt, expiresAt: expiredCatalogAt, current: false,
-        identityDetails: { snapshotId: rows[0].detail_generation, observedAt, expiresAt, current: true },
+        identityDetails: { snapshotId: rows[0].detail_generation, observedAt, expiresAt, current: false },
       });
       const catalogTime = raw.value[0].members[0].catalog_observed_at;
       raw.value[0].members[0].catalog_observed_at = null;

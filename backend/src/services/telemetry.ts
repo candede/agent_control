@@ -19,7 +19,7 @@ const packageDiagnosticNumberFields = new Set([
 const integerFields = new Set([
   ...packageDiagnosticNumberFields, "attempt", "count", "schemaVersion", "page", "pages", "observedCount",
   "totalRecords", "returnedCount", "dataCount", "omittedFieldCount", "requestedTypeCount", "queriedTypeCount",
-  "pageSize", "pageLimit", "rowLimit", "length", "maximumLength", "resourceIndex", "firstSeenPage", "catalogScopedCount",
+  "pageSize", "pageLimit", "rowLimit", "length", "maximumLength", "resourceIndex", "firstSeenPage", "catalogScopedCount", "targetIndex",
 ]);
 const durationFields = new Set(["durationMs", "ageMs", "deadlineMs", "retryDelayMs"]);
 const booleanFields = new Set(["hasContinuation", "resultTruncated", "environmentScoped"]);
@@ -31,7 +31,8 @@ const labels: Record<string, ReadonlySet<string>> = {
   status: new Set(["queued", "running", "waiting_authorization", "succeeded", "failed", "cancelled", "partial"]),
   mode: new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE", "broad", "exact", "delegated", "application", "local"]),
   source: new Set([...dataSyncSourceIds, "directory", "app_activity", "official_usage", "inventory_refresh", "capability_check",
-    "local_administrative_audit", "microsoft_defender_hunting", "microsoft_purview_audit"]),
+    "local_administrative_audit", "microsoft_defender_hunting", "microsoft_purview_audit", "agent_sharing_diagnostic"]),
+  apiVersion: new Set(["v1.0", "beta", "2024-10-01"]),
   errorKind: new Set(["timeout", "aborted", "application", "unexpected"]),
   stage: new Set(["record_gc", "inventory_gc", "generation", "selection", "export", "admission",
     "catalog", "identity", "pagination", "load_job", "revalidate_user", "authorization", "delegated_token", "mark_running",
@@ -41,8 +42,9 @@ const labels: Record<string, ReadonlySet<string>> = {
     "inventory_projection", "generation_batch", "database"]),
   resourceType: new Set(powerPlatformResourceTypes),
   field: new Set(["name", "tenantId", "type", "location", "environmentId", "totalRecords", "count", "data", "skipToken",
-    "resultTruncated", "elementDetails", "allowedUsersAndGroups", "acquireUsersAndGroups", "longDescription", "categories",
-    "sensitivity", "retained_observation", "residual", "payload"]),
+    "resultTruncated", "elementDetails", "allowedUsersAndGroups", "acquireUsersAndGroups", "sharedWithUsersAndGroups", "longDescription", "categories",
+    "sensitivity", "retained_observation", "residual", "payload", "id", "makerSharing", "sharedWithViewers", "sharedWithEditors",
+    "harness", "titleId", "instructionsCharactersCount", "componentsCounts", "distinctFlows", "flows", "triggers"]),
   actualType: new Set(["undefined", "null", "array", "object", "string", "number", "boolean", "bigint", "symbol", "function",
     "missing", "detail", "summary", "other"]),
   reason: new Set(["changed_total", "incomplete_enumeration", "oversized_access_check", "invalid_page", "invalid_total",

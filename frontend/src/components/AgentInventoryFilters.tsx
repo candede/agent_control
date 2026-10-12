@@ -93,7 +93,7 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
   const fields = [
     { key: "platform", dynamic: true, label: "Built with", all: "All platforms", value: values.platform, options: options.platforms,
       change: (value: InventoryFacetValue | undefined) => changeLiteral("platform", value) },
-    { key: "endUserAccess", label: "End-user access", all: agentAccessOptions[0].label, value: values.endUserAccess, options: agentAccessOptions.slice(1),
+    { key: "endUserAccess", label: "Admin availability", all: agentAccessOptions[0].label, value: values.endUserAccess, options: agentAccessOptions.slice(1),
       change: (value: InventoryFacetValue | undefined) => changeChoice(value, agentAccessOptions, endUserAccess => onChange({ endUserAccess })) },
     { key: "reportedUsage", label: "Reported usage", all: agentUsageOptions[0].label, value: values.reportedUsage, options: agentUsageOptions.slice(1),
       change: (value: InventoryFacetValue | undefined) => changeChoice(value, agentUsageOptions, reportedUsage => onChange({ reportedUsage })) },

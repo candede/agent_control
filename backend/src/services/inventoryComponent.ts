@@ -115,7 +115,7 @@ export function packageSummary(value: CopilotPackage): CopilotPackage {
   const fields = [
     "type", "shortDescription", "supportedHosts", "createdDateTime",
     "lastModifiedDateTime", "publisher", "availableTo", "deployedTo", "elementTypes", "platform",
-    "version", "manifestVersion", "manifestId", "appId", "assetId", "controlObservations", "detailFreshness",
+    "version", "manifestVersion", "manifestId", "appId", "assetId", "ownerId", "agentIdentityId", "providerUsage", "controlObservations", "detailFreshness",
   ] as const satisfies readonly (keyof CopilotPackage)[];
   for (const key of fields) if (Object.hasOwn(value, key)) Object.assign(summary, { [key]: value[key] });
   return structuredClone(summary);

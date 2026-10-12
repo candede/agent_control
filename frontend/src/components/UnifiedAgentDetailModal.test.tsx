@@ -669,7 +669,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onClose).toHaveBeenCalledTimes(shouldClose ? 1 : 0);
   });
 
-  it("defaults to Overview with visible admin facts and identifiers, without technical disclosures", () => {
+  it("defaults to Overview with visible status facts and technical identifiers without disclosures", () => {
     const { props } = renderDetail({ roles: ["AgentControl.Viewer"] });
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
@@ -681,8 +681,8 @@ describe("UnifiedAgentDetailModal", () => {
     expect(within(dialog).getByText("Quarantine status unknown")).toBeVisible();
     expect(within(dialog).queryByText("Linked by source metadata")).not.toBeInTheDocument();
     expect(within(dialog).queryByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).not.toBeInTheDocument();
-    expect(within(dialog).getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details")).toHaveLength(0);
-    expect(within(dialog).queryByText("Technical details")).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details, .agent-overview summary")).toHaveLength(0);
+    expect(within(dialog).getByRole("region", { name: "Technical details" })).toBeVisible();
     expect(within(dialog).getByText("Package ID").nextElementSibling).toHaveTextContent("package-1");
     expect(within(dialog).queryByText("element-1")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("elementDetails.AgentMetadatas.definition.AgentIdentityId")).not.toBeInTheDocument();
@@ -746,9 +746,39 @@ describe("UnifiedAgentDetailModal", () => {
     for (const value of ["Example vendor", "Team owner", "Tenant maker", "Tenant model", "Organization sign-in", "Configured connector"]) {
       expect(screen.getByText(value)).toBeVisible();
     }
-    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details")).toHaveLength(0);
+    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details, .agent-overview summary")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: /Details & services|Viewing details|Package details for/ })).not.toBeInTheDocument();
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps raw admin package values and authoritative assignment counts in Manage rather than Overview", async () => {
+    const selectedPackage = { ...record.packages[0], availableTo: "allowedForAll", deployedTo: "acquiredForNone" };
+    const packageDetail: CopilotPackageDetail = { ...selectedPackage,
+      sharedWithUsersAndGroups: [], allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+      principalCounts: { sharedWithUsersAndGroups: 3, allowedUsersAndGroups: 0, acquireUsersAndGroups: 0 } };
+    const { update } = renderDetail({ record: { ...record, packages: [selectedPackage] }, packageDetail });
+    const overview = screen.getByRole("tabpanel", { name: "Overview" });
+    expect(overview.querySelector(".agent-overview")).not.toHaveTextContent("Graph availableTo");
+    expect(overview.querySelector(".agent-overview")).not.toHaveTextContent("Graph shared assignments");
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    const manage = screen.getByRole("tabpanel", { name: "Manage" });
+    const packageProperties = within(manage).getByRole("region", { name: "Package details" });
+    const value = (label: string) => within(manage).getByText(label, { selector: "dt" }).nextElementSibling;
+    expect(packageProperties).toBeVisible();
+    expect(packageProperties).toHaveClass("agent-access-package-details");
+    expect(within(manage).getByRole("heading", { name: "Admin-controlled availability and installation" }))
+      .toHaveProperty("parentElement", manage.querySelector(".agent-access-heading > div:first-child"));
+    expect(packageProperties.querySelector("details, summary")).toBeNull();
+    expect(value("Graph availableTo")).toBeVisible();
+    expect(value("Graph availableTo")).toHaveTextContent("allowedForAll");
+    expect(value("Graph deployedTo")).toHaveTextContent("acquiredForNone");
+    expect(value("Graph shared assignments")).toHaveTextContent(/^3$/);
+    expect(value("Graph availability assignments")).toHaveTextContent(/^0$/);
+    expect(value("Graph installation assignments")).toHaveTextContent(/^0$/);
+    update({ packageDetail: { ...selectedPackage } });
+    expect(value("Graph shared assignments")).toHaveTextContent("Not reported");
+    expect(value("Graph availability assignments")).toHaveTextContent("Not reported");
+    expect(value("Graph installation assignments")).toHaveTextContent("Not reported");
   });
 
   it.each(["identities", "reports", "controls", "audit-security"])("does not duplicate the tab navigation with buttons in %s", activeTab => {
@@ -1396,7 +1426,7 @@ describe("UnifiedAgentDetailModal", () => {
   ])("keeps detail end-user access consistent with the repository list ($availableTo, blocked=$isBlocked)", ({ availableTo, isBlocked, expected }) => {
     const item = { ...record.packages[0], availableTo, isBlocked };
     renderDetail({ record: { ...record, packages: [item] }, packageDetail: item });
-    expect(screen.getByText("End-user access", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
+    expect(screen.getByText("Admin availability", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
   });
 
   it.each([
@@ -1408,7 +1438,7 @@ describe("UnifiedAgentDetailModal", () => {
     const first = { ...record.packages[0], deployedTo: "none" };
     const second = { ...first, id: "second-package", deployedTo };
     renderDetail({ record: { ...record, packages: [first, second] } });
-    expect(screen.getByText("Installed for", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
+    expect(screen.getByText("Admin installation", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
   });
 
   it("keeps reported connector totals separate from retained details and discards arbitrary references", () => {
@@ -1982,7 +2012,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onTabChange).toHaveBeenCalledExactlyOnceWith("identities");
   });
 
-  it("keeps exact useful IDs visible without duplicating corroborated source proof", async () => {
+  it("keeps exact useful IDs accessible in technical details without duplicating corroborated source proof", async () => {
     const corroborated = corroboratedRecord(true);
     renderDetail({ record: corroborated, activeTab: "identities" });
     expect(screen.getByRole("region", { name: "Identifiers" })).toBeVisible();
@@ -1992,7 +2022,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByText(/Control access is checked separately/)).not.toBeInTheDocument();
     expect(screen.queryByText(corroborated.identity.evidence[0].packagePath)).not.toBeInTheDocument();
     expect(screen.queryByText(corroborated.identity.evidence[0].resourcePath)).not.toBeInTheDocument();
-    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelector(".agent-overview details")).toBeNull();
+    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelector(".agent-overview details, .agent-overview summary")).toBeNull();
   });
 
   it("omits informational source-identity disagreements without changing native control eligibility", async () => {
@@ -2346,7 +2376,9 @@ describe("UnifiedAgentDetailModal", () => {
       if (scenario === "duplicate-bot") resource.identifiers.push({ kind: "cds_bot_id", value: "33333333-3333-4333-8333-333333333333" });
       if (scenario === "missing-bot" || scenario === "duplicate-bot") resource.quarantineIdentity = null;
       renderDetail({ record: observed, activeTab: "controls" });
-      await userEvent.click(screen.getByText("Additional control availability"));
+      const availability = screen.getByRole("region", { name: "Additional control availability" });
+      expect(availability).toBeVisible();
+      expect(availability.querySelector("details, summary")).toBeNull();
       expect(screen.getByText(/Quarantine is unavailable/)).toBeVisible();
       if (scenario === "missing-bot") expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();

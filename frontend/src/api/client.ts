@@ -12,7 +12,9 @@ import type { InventoryRefreshJob, InventoryRefreshJobList, PowerPlatformResourc
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
-import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, PackageDetailSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+import type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
+export type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineReconciliationResult } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import { parseWorkbenchMetadataJson, workbenchMetadataMaximumBytes } from "../../../backend/src/types/workbench";
@@ -38,7 +40,7 @@ export type { CopilotServicePlan, CopilotServiceSummaryState } from "../../../ba
 export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
-export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, PackageDetailSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 export { automaticDataSyncSourceIds, dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
 export type { QuarantineAction, QuarantineJob, QuarantineReconciliationResult } from "../../../backend/src/types/copilotStudioQuarantine";
 
@@ -536,6 +538,10 @@ export async function getUnifiedAgents(
   );
 }
 
+export function getInventoryHealth(options: { signal?: AbortSignal } = {}) {
+  return request<UnifiedAgentInventoryHealth | UnifiedAgentInventoryUnavailable>("/api/agent-inventory/health", { signal: options.signal });
+}
+
 export type InventoryFacetField = "type" | "publisher" | "host" | "platform" | "environmentId" | "source" | "linkState" | "blocked" | "availableTo";
 export function getUnifiedAgentDetail(selectionId: string, recordId: string, options: { signal?: AbortSignal } = {}) {
   return request<UnifiedAgentRecord>(`/api/agent-inventory/${encodeURIComponent(recordId)}/detail?${new URLSearchParams({ selectionId })}`,
@@ -722,6 +728,38 @@ export function reconcileQuarantineJob(id: string, options: { signal?: AbortSign
 
 export function getDataSyncState(options: { signal?: AbortSignal } = {}) {
   return request<DataSyncState>("/api/data-sync/state", { signal: options.signal });
+}
+
+export function getPackageDetailSyncState(options: { signal?: AbortSignal } = {}) {
+  return request<PackageDetailSyncState>("/api/data-sync/package-details", { signal: options.signal }).then(validatePackageDetailSyncState);
+}
+
+export function startPackageDetailSync(options: { signal?: AbortSignal } = {}) {
+  return request<PackageDetailSyncState>("/api/data-sync/package-details/start", {
+    method: "POST", signal: options.signal,
+  }).then(validatePackageDetailSyncState);
+}
+
+export function cancelPackageDetailSync(options: { signal?: AbortSignal } = {}) {
+  return request<PackageDetailSyncState>("/api/data-sync/package-details/cancel", {
+    method: "POST", signal: options.signal,
+  }).then(validatePackageDetailSyncState);
+}
+
+function validatePackageDetailSyncState(value: PackageDetailSyncState) {
+  if (!value || !["not_collected", "ready", "running", "complete", "waiting_authorization", "permission_required", "failed", "paused"].includes(value.status)
+    || [value.total, value.fresh, value.pending, value.eligible].some(count => !Number.isSafeInteger(count) || count < 0)
+    || value.fresh > value.total || value.pending !== value.total - value.fresh || value.eligible > value.pending
+    || typeof value.message !== "string" || !value.message
+    || value.status === "complete" && value.pending !== 0
+    || value.job !== null && (!value.job || typeof value.job.id !== "string"
+      || !["waiting_authorization", "running", "succeeded", "failed", "cancelled"].includes(value.job.status)
+      || !Number.isSafeInteger(value.job.observedCount) || !Number.isSafeInteger(value.job.targetCount)
+      || value.job.observedCount < 0 || value.job.targetCount < 0 || value.job.targetCount > 20
+      || value.job.observedCount > value.job.targetCount || !Number.isFinite(Date.parse(value.job.updatedAt)))) {
+    throw new ApiError(500, "invalid_package_detail_sync_state", "The server returned invalid package detail coverage.");
+  }
+  return value;
 }
 
 export function checkAutomaticRefresh(options: { signal?: AbortSignal } = {}) {

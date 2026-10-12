@@ -4,9 +4,33 @@ import { requestScope } from "../middleware/auth.js";
 import { dataSync, type DataSyncService } from "../services/dataSync.js";
 import { dataSyncSourceIds, type DataSyncSourceId, type StartDataSyncInput } from "../types/dataSync.js";
 import { policyRoute } from "./policy.js";
+import { packageInventory, type PackageInventoryService } from "../services/packageInventory.js";
 
-export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "getRun" | "start" | "retry" | "cancel" | "automaticRefresh"> = dataSync) {
+export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "getRun" | "start" | "retry" | "cancel" | "automaticRefresh"> = dataSync,
+  details: Pick<PackageInventoryService, "detailSyncState" | "startDetailSync" | "cancelDetailSync"> = packageInventory) {
   const router = Router();
+
+  policyRoute(router, "get", "/data-sync/package-details", {
+    access: "authenticated", dataClass: "private_data_sync", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    requestScope(request);
+    if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Package detail status does not accept query parameters.");
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await details.detailSyncState(request.session.user!));
+  });
+  for (const action of ["start", "cancel"] as const) {
+    policyRoute(router, "post", `/data-sync/package-details/${action}`, {
+      access: "authenticated", dataClass: "private_data_sync_job", roles: ["AgentControl.Viewer"], csrf: true,
+    }, async (request, response) => {
+      requestScope(request);
+      requireEmptyBody(request.body, "Package detail controls do not accept options.");
+      if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Package detail controls do not accept query parameters.");
+      response.setHeader("Cache-Control", "no-store");
+      response.status(action === "start" ? 202 : 200).json(action === "start"
+        ? await details.startDetailSync(request.session.user!, request.session.signedInAt)
+        : await details.cancelDetailSync(request.session.user!));
+    });
+  }
 
   policyRoute(router, "post", "/data-sync/auto-refresh", {
     access: "authenticated",

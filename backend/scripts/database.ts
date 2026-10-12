@@ -143,6 +143,7 @@ export async function grantRuntime(database: pg.Pool) {
     GRANT SELECT,INSERT,DELETE ON official_usage_version_rows,official_usage_set_versions TO agentcontrol_app;
     GRANT SELECT,INSERT ON official_usage_bundle_receipts,official_usage_audit,official_usage_row_facts TO agentcontrol_app;
     GRANT EXECUTE ON FUNCTION official_usage_payload_hash(jsonb) TO agentcontrol_app;
+    GRANT EXECUTE ON FUNCTION inventory_maker_sharing_valid(jsonb) TO agentcontrol_app;
     GRANT SELECT,INSERT,DELETE ON agent_usage_associations TO agentcontrol_app;
     GRANT SELECT ON agent_usage_state TO agentcontrol_app;
   `);

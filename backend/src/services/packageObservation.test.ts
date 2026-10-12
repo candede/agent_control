@@ -1,15 +1,69 @@
 import { describe, expect, it, vi } from "vitest";
 import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 import { GraphPackagesClient, verifyPackageMutationConverged } from "./graphPackages.js";
-import { allowlistedPackage } from "./packageObservation.js";
+import { allowlistedPackage, parsePackageObservationJson } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
-import { normalizePackageStatus } from "../types/copilotPackage.js";
+import { normalizePackageStatus, packageAccessCollectionLimit } from "../types/copilotPackage.js";
 import { dataLimits } from "../db/dataBounds.js";
 
 const base = { id: "package", displayName: "Package", isBlocked: false };
 const access = { ...base, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] };
 
 describe("complete package observations", () => {
+  it("retains observed Graph counters separately from admin settings and imported usage", () => {
+    const value = allowlistedPackage({ ...access, availableTo: "allowedForAll", ownerId: "owner", agentIdentityId: null,
+      activeUsers: 3, totalSessions: 5, totalRunTimeInHours: 0.1, exceptionRate: 0, lastUsedDateTime: "2026-10-05T00:00:00Z" });
+    expect(value.providerUsage).toEqual({ activeUsers: 3, totalSessions: 5, totalRunTimeInHours: 0.1, exceptionRate: 0,
+      lastUsedDateTime: "2026-10-05T00:00:00Z" });
+    expect(value).toMatchObject({ ownerId: "owner", agentIdentityId: null, availableTo: "allowedForAll" });
+    expect(value.provenance["providerUsage.activeUsers"]).toEqual({ sourceSystem: "graph_packages", path: "activeUsers", maturity: "observed" });
+    expect(value).not.toHaveProperty("makerSharing");
+    expect(allowlistedPackage(base)).not.toHaveProperty("providerUsage");
+    expect(allowlistedPackage({ ...base, activeUsers: null, totalSessions: 0 }).providerUsage).toEqual({ activeUsers: null, totalSessions: 0 });
+  });
+
+  it.each([{ activeUsers: -1 }, { totalSessions: 1.5 }, { totalRunTimeInHours: -0.1 }, { exceptionRate: Infinity },
+    { lastUsedDateTime: "yesterday" }, { ownerId: [] }, { agentIdentityId: "x".repeat(513) }])("rejects invalid observed Graph metadata: %j", values => {
+    expect(() => allowlistedPackage({ ...base, ...values })).toThrow(expect.objectContaining({ code: "provider_schema" }));
+  });
+
+  it("rejects repeated telemetry members in provider JSON", () => {
+    expect(() => parsePackageObservationJson('{"id":"package","displayName":"Package","isBlocked":false,"activeUsers":3,"activeUsers":0}'))
+      .toThrow(/duplicate contract properties/);
+  });
+
+  it("retains bounded sharing recipients as read-only evidence without inferring org-wide sharing", () => {
+    const recipients = [
+      { resourceId: " Exact_User ", resourceType: "USER" },
+      { resourceId: "opaque-group", resourceType: "group" },
+    ];
+    const observed = allowlistedPackage({ ...access, availableTo: "allowedForAll",
+      sharedWithUsersAndGroups: recipients });
+    expect(observed.sharedWithUsersAndGroups).toEqual(recipients);
+    expect(observed).not.toHaveProperty("orgWideSharing");
+    expect(allowlistedPackage(base)).not.toHaveProperty("sharedWithUsersAndGroups");
+    expect(allowlistedPackage({ ...base, sharedWithUsersAndGroups: [] }).sharedWithUsersAndGroups).toEqual([]);
+    const bounded = Array.from({ length: packageAccessCollectionLimit }, (_, index) => ({
+      resourceId: `recipient-${index}`, resourceType: "user",
+    }));
+    expect(allowlistedPackage({ ...base, sharedWithUsersAndGroups: bounded }).sharedWithUsersAndGroups)
+      .toHaveLength(packageAccessCollectionLimit);
+    for (const invalid of [null, {}, "everyone", [...bounded, recipients[0]], Array(1)]) {
+      expect(() => allowlistedPackage({ ...base, sharedWithUsersAndGroups: invalid }))
+        .toThrow(expect.objectContaining({ code: "provider_schema" }));
+    }
+  });
+
+  it.each(["catalog", "inventory", "detail"])("retains reported sharing recipients at the Graph %s boundary", async operation => {
+    const sharedWithUsersAndGroups = [{ resourceId: "recipient", resourceType: "group" }];
+    const value = { ...base, sharedWithUsersAndGroups };
+    const client = new GraphPackagesClient(async () => Response.json(operation === "detail" ? value : { value: [value] }));
+    if (operation === "catalog") await expect(client.checkCatalogAccess("fixture-token")).resolves.toBeUndefined();
+    else if (operation === "inventory") {
+      expect((await tinyGraphCatalog(client, "fixture-token"))[0].sharedWithUsersAndGroups).toEqual(sharedWithUsersAndGroups);
+    } else await expect(client.getPackageDetails("fixture-token", base.id)).resolves.toMatchObject({ sharedWithUsersAndGroups });
+  });
+
   it("retains non-enumerable own evidence without turning a supplied unknown scope into inferred access", () => {
     const observation = { ...access, allowedUsersAndGroups: [{ resourceId: "Opaque_User", resourceType: "USER" }] };
     Object.defineProperty(observation, "availableTo", { value: "FutureScope", enumerable: false });
@@ -150,6 +204,9 @@ describe("unambiguous package response JSON", () => {
     `${jsonMembers},"allowedUsersAndGroups":[],"allowedUsersAndGroups":[{"resourceId":"user","resourceType":"user"}]`,
     `${jsonMembers},"allowedUsersAndGroups":[{"resourceId":"other","resourceId":"user","resourceType":"user"}]`,
     `${jsonMembers},"acquireUsersAndGroups":[{"resourceId":"user","resourceType":"group","resourceType":"user"}]`,
+    `${jsonMembers},"sharedWithUsersAndGroups":[],"sharedWithUsersAndGroups":[{"resourceId":"user","resourceType":"user"}]`,
+    `${jsonMembers},"sharedWithUsersAndGroups":[{"resourceId":"other","resource\\u0049d":"user","resourceType":"user"}]`,
+    `${jsonMembers},"sharedWithUsersAndGroups":[{"resourceId":"user","resourceType":"group","resourceType":"user"}]`,
     `${jsonMembers},"elementDetails":[{"elementType":"Bots","elementType":"AgentMetadatas","elements":[]}]`,
     `${jsonMembers},"elementDetails":[{"elementType":"Bots","elements":[],"elements":[{"id":"bot","definition":"{}"}]}]`,
     `${jsonMembers},"elementDetails":[{"elementType":"Bots","elements":[{"id":"other","id":"bot","definition":"{}"}]}]`,
@@ -210,7 +267,7 @@ describe("unambiguous package response JSON", () => {
 });
 
 describe("persistable package text", () => {
-  it.each(["allowedUsersAndGroups", "acquireUsersAndGroups"] as const)(
+  it.each(["allowedUsersAndGroups", "acquireUsersAndGroups", "sharedWithUsersAndGroups"] as const)(
     "rejects controls and unsupported principal types in %s before observation or mutation hashing", field => {
       for (const control of ["\0", "\t", "\n", "\u001b", "\u001f", "\u007f", "\u0085", "\u009f"]) {
         for (const principal of [

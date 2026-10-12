@@ -8,16 +8,13 @@ import {
   useState,
 } from "react";
 import {
-  Check,
   CircleCheck,
   CircleAlert,
   CircleStop,
-  Clock3,
   Database,
   LoaderCircle,
   RefreshCw,
   RotateCcw,
-  Upload,
 } from "lucide-react";
 import {
   ApiError,
@@ -28,9 +25,9 @@ import {
   type DataSyncMode,
   type DataSyncRun,
   type DataSyncSourceId,
-  type DataSyncSourceState,
   type DataSyncSourceStatus,
   type DataSyncState,
+  type PackageDetailSyncState,
 } from "../api/client";
 import { useSavedRead } from "../savedQueries";
 import { useBrowserAvailability } from "../useBrowserAvailability";
@@ -48,6 +45,8 @@ import {
   syncStatusLabel as statusLabel,
 } from "./syncPresentation";
 import "./dataSync.css";
+import { PackageDetailsSyncPanel, type PackageDetailsSyncPanelHandle } from "./PackageDetailsSyncPanel";
+import { SyncSourceRow, SyncSourceBadge as SourceBadge } from "./SyncSourceRow";
 
 const pollIntervalMs = 1_000;
 
@@ -72,6 +71,7 @@ type DataSyncPanelProps = {
   onSourcesChanged: (sources: DataSyncSourceId[]) => void;
   onCheckPublication?: (sources: DataSyncSourceId[]) => void;
   onCancelRequested?: () => void;
+  onDetailsStartRequested?: () => void;
 };
 
 export const DataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProps>(function DataSyncPanel(props, ref) {
@@ -92,10 +92,13 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   onSourcesChanged,
   onCheckPublication,
   onCancelRequested,
+  onDetailsStartRequested,
 }, ref) {
   const { openPermissions } = useCapabilityContext();
   const available = useBrowserAvailability();
   const [state, setState] = useState<DataSyncState>();
+  const [packageDetails, setPackageDetails] = useState<PackageDetailSyncState>();
+  const packageDetailsRef = useRef<PackageDetailsSyncPanelHandle>(null);
   const [requestedRunResult, setRequestedRunResult] = useState<{ principalKey: string; run: DataSyncRun }>();
   const requestedRun = requestedRunResult?.principalKey === principalKey && requestedRunResult.run.id === requestedRunId
     ? requestedRunResult.run : undefined;
@@ -460,6 +463,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
     if (!mounted.current) return;
     if (!explicit && (actionController.current || accessDenied.current || loadController.current || timer.current !== undefined
       || requestedRunController.current || requestedRunTimer.current !== undefined)) return;
+    if (explicit) packageDetailsRef.current?.refresh();
     accessDenied.current = false;
     actionRevision.current += 1;
     requestedRunGeneration.current += 1;
@@ -483,6 +487,9 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   const cannotStart = !state || isProgressing(currentRun) || isProgressing(requestedRun) || Boolean(busy);
   const savedSources = state?.sources.filter(source => source.source !== "usage_reports") ?? [];
   const savedSourceCount = savedSources.filter(source => source.status === "succeeded").length;
+  const completedSteps = savedSourceCount + (packageDetails?.status === "complete"
+    && savedSources.some(source => source.source === "graph_packages" && (source.status === "succeeded" || source.lastSuccessAt !== null)) ? 1 : 0);
+  const totalSteps = automaticSyncSources.length + 1;
 
   useEffect(() => {
     if (active && !wasActive.current) void refresh(false);
@@ -591,7 +598,8 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
                 <div className="data-sync-last-run" role="status">
                   {isComplete(currentRun) ? <CircleCheck size={19} aria-hidden="true" /> : <CircleAlert size={19} aria-hidden="true" />}
                   <div>
-                    <strong>{isComplete(currentRun) ? "Sync complete" : "Sync cancelled"}</strong>
+                    <strong>{isComplete(currentRun) ? savedSourceCount === automaticSyncSources.length && packageDetails?.status === "complete"
+                      ? "Sync complete" : "Source sync complete" : "Sync cancelled"}</strong>
                     <span>{currentRun.sources.map(source => sourceDetails[source.source].label).join(", ")}
                       {" · "}{formatInstant(currentRun.completedAt ?? currentRun.updatedAt)}</span>
                   </div>
@@ -603,10 +611,11 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
               <div className="section-heading">
                 <div>
                   <h3 id="sync-workspace-heading">Workspace data</h3>
-                  <p>Last successful collection across all sources, not just the latest run.</p>
+                  <p>Users, source catalogs, and exact package details are steps of the same app sync. Counts retain previous successful data until replaced.</p>
                 </div>
-                <span className={`data-sync-state state-${savedSourceCount === automaticSyncSources.length ? "success" : "attention"}`}>
-                  {savedSourceCount} of {automaticSyncSources.length} sources synced
+                <span className={`data-sync-state state-${completedSteps === totalSteps ? "success"
+                  : packageDetails?.status === "running" || isProgressing(currentRun) ? "progress" : "attention"}`}>
+                  {completedSteps} of {totalSteps} sync steps complete
                 </span>
               </div>
               {savedSourceCount === 0 ? <p className="data-sync-empty">Start a sync to collect users and inventory. Upload usage reports in the separate CSV usage reports section above.</p> : null}
@@ -621,6 +630,12 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
                     onSync={() => void start("incremental", [source.source])}
                   />
                 ))}
+                <PackageDetailsSyncPanel ref={packageDetailsRef} principalKey={principalKey}
+                  revision={JSON.stringify(state.sources.find(source => source.source === "graph_packages"))}
+                  onStateChanged={setPackageDetails}
+                  onPublicationChanged={() => onCheckPublicationRef.current?.(["graph_packages"])}
+                  onStartRequested={() => onDetailsStartRequested?.()}
+                  onCancelRequested={() => onCancelRequested?.()} />
               </div>
               <div className="data-sync-workspace-footer">
                 <p>Sync keeps previous successful data until a replacement is ready.
@@ -774,12 +789,10 @@ function SavedSourceRow({ source, attempt, stale, disabled, onSync }: {
   const details = sourceDetails[source.source];
   const saved = source.status === "succeeded" || source.lastSuccessAt !== null;
   return (
-    <article className="data-sync-source" aria-label={details.label}>
-      <div className="data-sync-source-name">
-        <strong>{details.label}</strong>
-        <p>{details.description}</p>
-      </div>
-      <dl>
+    <SyncSourceRow label={details.label} description={details.description}
+      status={attempt?.status ?? source.status} stale={stale}
+      statusCaption={attempt ? stale ? "Last reported attempt" : "Latest attempt" : "Last collection"}
+      statistics={<>
         <div>
           <dt>Last saved count</dt>
           <dd>{saved ? source.count === null ? "Not reported" : source.count.toLocaleString() : "Not synced"}</dd>
@@ -789,30 +802,13 @@ function SavedSourceRow({ source, attempt, stale, disabled, onSync }: {
           <dt>Last successful sync</dt>
           <dd>{source.lastSuccessAt ? formatInstant(source.lastSuccessAt) : saved ? "Not recorded" : "Never"}</dd>
         </div>
-      </dl>
-      <div className="data-sync-source-actions">
-        <div className="data-sync-source-attempt">
-          <span>{attempt ? stale ? "Last reported attempt" : "Latest attempt" : "Last collection"}</span>
-          <SourceBadge status={attempt?.status ?? source.status} stale={stale} />
-        </div>
+      </>}
+      actions={
         <WorkbenchActionGate actionId="data-sync.start" compact>
           <button type="button" className="secondary" disabled={disabled} onClick={onSync}>Sync {details.label.toLowerCase()}</button>
         </WorkbenchActionGate>
-      </div>
-    </article>
+      } />
   );
-}
-
-function SourceBadge({ status, stale = false }: { status: DataSyncSourceState; stale?: boolean }) {
-  return <span className={`status-badge status-${status.replaceAll("_", "-")}`}>
-    {status === "succeeded" ? <Check size={14} aria-hidden="true" />
-      : status === "running" ? stale ? <Clock3 size={14} aria-hidden="true" />
-        : <LoaderCircle size={14} className="data-sync-spinning" aria-hidden="true" />
-        : status === "queued" || status === "not_started" ? <Clock3 size={14} aria-hidden="true" />
-          : status === "awaiting_upload" ? <Upload size={14} aria-hidden="true" />
-            : <CircleAlert size={14} aria-hidden="true" />}
-    {statusLabel(status)}
-  </span>;
 }
 
 function isProgressing(run: DataSyncRun | null | undefined) {

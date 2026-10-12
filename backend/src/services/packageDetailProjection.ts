@@ -96,6 +96,23 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
   }
   const newerCatalog = currentReadStartedAt !== undefined
     && compareInventoryTimestamps(new Date(currentReadStartedAt), saved.observedAt) > 0;
+  if (!newerCatalog) {
+    for (const field of ["ownerId", "agentIdentityId", "providerUsage"] as const) {
+      delete result[field];
+      if (saved.package![field] !== undefined) Object.assign(result, { [field]: saved.package![field] });
+    }
+    result.provenance = { ...result.provenance };
+    for (const field of Object.keys(result.provenance)) {
+      if (field === "ownerId" || field === "agentIdentityId" || field.startsWith("providerUsage.")) delete result.provenance[field];
+    }
+    for (const [field, provenance] of Object.entries(saved.package!.provenance)) {
+      if (field === "ownerId" || field === "agentIdentityId" || field.startsWith("providerUsage.")) result.provenance[field] = provenance;
+    }
+  }
+  if (!(newerCatalog && current.sharedWithUsersAndGroups !== undefined)) {
+    delete result.sharedWithUsersAndGroups;
+    if (saved.package!.sharedWithUsersAndGroups !== undefined) result.sharedWithUsersAndGroups = saved.package!.sharedWithUsersAndGroups;
+  }
   if (packageDetailAccessScopesMatch(current.availableTo, saved.package!.availableTo)
     && !(newerCatalog && current.allowedUsersAndGroups !== undefined)) {
     delete result.allowedUsersAndGroups;

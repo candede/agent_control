@@ -33,6 +33,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "official reports", rows: [{ valid: true }] },
     { name: "users/reports cutover", rows: [cutoverContract] },
     { name: "inventory tables", rows: Array.from({ length: 21 }, () => ({ relation: "inventory_roots" })) },
+    { name: "inventory payload", rows: [{ valid: true }] },
     { name: "inventory guards", rows: [{ count: 14 }] },
     { name: "inventory indexes", rows: [{ count: 11 }] },
     { name: "inventory grants", rows: [inventoryGrants] },
@@ -98,6 +99,15 @@ function resultsBefore(name: string) {
 
 describe("current schema source contracts", () => {
   const topLevel = schemaSql.replace(/\$\$[\s\S]*?\$\$/g, "");
+  it("validates read-only sharing recipient facts in the current schema without a migration chain", () => {
+    expect(topLevel).toContain("CONSTRAINT inventory_facts_shared_principal_check");
+    expect(topLevel).toContain("kind <> 'sharedWithUsersAndGroups'");
+    expect(topLevel).toContain("payload->>'resourceId' = value");
+    expect(topLevel).toContain("lower(payload->>'resourceType') IN ('user','group')");
+    expect(topLevel).toContain("maker_org_wide_chat boolean GENERATED ALWAYS AS");
+    expect(topLevel).toContain("CONSTRAINT power_platform_record_rows_maker_sharing_check");
+    expect(schemaSql).toContain("CREATE FUNCTION inventory_maker_sharing_valid(sharing jsonb)");
+  });
 
   it("exports only the current schema, its exact SHA-256 fingerprint and verification", () => {
     expect(Object.keys(schema).sort()).toEqual(["schemaFingerprint", "schemaSql", "verifySchema"]);
@@ -107,7 +117,7 @@ describe("current schema source contracts", () => {
   });
 
   it("constructs the final objects once without upgrades, backfills or preservation branches", () => {
-    for (const [kind, count] of [["TABLE", 106], ["VIEW", 3], ["FUNCTION", 75], ["TRIGGER", 99], ["COLLATION", 2]] as const) {
+    for (const [kind, count] of [["TABLE", 106], ["VIEW", 3], ["FUNCTION", 76], ["TRIGGER", 99], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
@@ -346,6 +356,7 @@ describe("schema verification without a database", () => {
 
   it.each([
     ["inventory tables", [{ relation: null }], "inventory_schema_missing"],
+    ["inventory payload", [{ valid: false }], "inventory_payload_schema"],
     ["inventory guards", [{ count: 13 }], "inventory_schema_guards"],
     ["inventory indexes", [{ count: 10 }], "inventory_schema_indexes"],
   ] as const)("rejects incomplete active inventory structures at %s", async (stage, rows, message) => {

@@ -159,7 +159,7 @@ describe("inventory filter toolbar", () => {
     const dialog = within(screen.getByRole("dialog", { name: "Filter agents" }));
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(dialog.getByRole("combobox", { name: "Built with" })).toHaveFocus();
-    for (const name of ["Built with", "End-user access", "Reported usage", "Management", "Assigned access", "Host", "Publisher", "Package status", "Environment", "Sort"]) {
+    for (const name of ["Built with", "Admin availability", "Reported usage", "Management", "Assigned access", "Host", "Publisher", "Package status", "Environment", "Sort"]) {
       expect(dialog.getByRole("combobox", { name })).toBeVisible();
     }
     expect(dialog.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
@@ -372,7 +372,7 @@ describe("inventory filter toolbar", () => {
     await screen.findByRole("option", { name: "3rd party agents" });
     await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), encodeInventoryFacet("thirdParty"));
     await user.click(screen.getByRole("button", { name: "Filters" }));
-    await user.selectOptions(screen.getByRole("combobox", { name: "End-user access" }), "available");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Admin availability" }), "available");
     await user.selectOptions(screen.getByRole("combobox", { name: "Reported usage" }), "used");
     await user.selectOptions(screen.getByRole("combobox", { name: "Management" }), "organization_managed");
     await user.keyboard("{Escape}");
@@ -380,7 +380,7 @@ describe("inventory filter toolbar", () => {
     expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Remove reported usage filter" }));
     expect(changed).toHaveBeenLastCalledWith({ reportedUsage: "all" });
-    expect(screen.getByRole("button", { name: "Remove end-user access filter" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Remove admin availability filter" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Remove management filter" })).toBeVisible();
     expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue(encodeInventoryFacet("thirdParty"));
     await user.click(screen.getByRole("button", { name: "Clear filters" }));
@@ -413,7 +413,7 @@ describe("inventory filter toolbar", () => {
     await user.click(screen.getByRole("button", { name: "Filters, 1 active" }));
     expect(screen.getByRole("combobox", { name: "Built with" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Reset filters" }));
-    expect(screen.getByRole("combobox", { name: "End-user access" })).toHaveFocus();
+    expect(screen.getByRole("combobox", { name: "Admin availability" })).toHaveFocus();
     expect(screen.getByRole("button", { name: "Reset filters" })).toBeDisabled();
   });
 

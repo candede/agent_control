@@ -75,3 +75,21 @@ export type AutomaticRefreshResult = {
   revisions: Record<(typeof automaticDataSyncSourceIds)[number], string>;
   nextCheckAt: string;
 };
+
+export type PackageDetailSyncState = {
+  status: "not_collected" | "ready" | "running" | "complete" | "waiting_authorization" | "permission_required" | "failed" | "paused";
+  total: number;
+  fresh: number;
+  pending: number;
+  eligible: number;
+  message: string;
+  job: {
+    id: string;
+    status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
+    observedCount: number;
+    targetCount: number;
+    updatedAt: string;
+    errorCode?: string;
+    message?: string;
+  } | null;
+};

@@ -36,10 +36,23 @@ export function AgentAccessManagement({ agent, detail, detailUnavailable = false
   const [target, setTarget] = useState<PackageAccessTarget>("availability");
   const [reset, setReset] = useState({ availability: 0, installation: 0 });
   const isBlocked = detail?.isBlocked ?? agent.isBlocked;
+  const observed = detail ?? agent;
+  const packageProperties = [
+    { label: "Graph availableTo", value: observed.availableTo ?? "Not reported" },
+    { label: "Graph deployedTo", value: observed.deployedTo ?? "Not reported" },
+    { label: "Graph shared assignments", value: detail?.principalCounts?.sharedWithUsersAndGroups
+      ?? detail?.sharedWithUsersAndGroups?.length ?? "Not reported" },
+    { label: "Graph availability assignments", value: detail?.principalCounts?.allowedUsersAndGroups
+      ?? detail?.allowedUsersAndGroups?.length ?? "Not reported" },
+    { label: "Graph installation assignments", value: detail?.principalCounts?.acquireUsersAndGroups
+      ?? detail?.acquireUsersAndGroups?.length ?? "Not reported" },
+  ];
 
   return <section className="agent-access-management" aria-label={`Manage ${agent.displayName} (${agent.id})`}>
     <div className="agent-access-heading">
       <div>
+        <h3>Admin-controlled availability and installation</h3>
+        <p>Maker-controlled chat sharing is shown in Overview.</p>
         {showName ? <h4>{agent.displayName}</h4> : null}
         <p>{agent.version ? `Version ${agent.version}` : "Published version"}{agent.publisher ? ` / ${agent.publisher}` : ""}</p>
         <p>Package ID: <code className="agent-control-target">{agent.id}</code></p>
@@ -53,7 +66,7 @@ export function AgentAccessManagement({ agent, detail, detailUnavailable = false
         </WorkbenchActionGate> : null}
       </div>
     </div>
-    {accessReadError ? <p role="status">{accessReadError} Access assignment editing is unavailable.</p> : null}
+    {accessReadError ? <p className="agent-access-status" role="status">{accessReadError} Access assignment editing is unavailable.</p> : null}
     {(["availability", "installation"] as const).map(setting => {
       const observed = detail ?? initial;
       const preservedStatus = setting === "availability" ? observed?.deployedTo : observed?.availableTo;
@@ -65,7 +78,7 @@ export function AgentAccessManagement({ agent, detail, detailUnavailable = false
         ? `${setting === "availability" ? "Availability" : "Installation"} editing is unavailable because Microsoft Graph's collection-only PATCH cannot preserve the saved ${setting === "availability" ? "installation" : "availability"} scope and assignments. Review both access settings.`
         : undefined;
       return <div key={setting} hidden={target !== setting}>
-        {!readOnly && unavailableReason ? <p role="status">{unavailableReason}</p> : null}
+        {!readOnly && unavailableReason ? <p className="agent-access-status" role="status">{unavailableReason}</p> : null}
         <AccessAssignmentEditor
           key={`${revision}:${initial ? "detail" : "summary"}:${readOnlyKey}:${reset[setting]}`}
           initialTarget={setting}
@@ -84,5 +97,11 @@ export function AgentAccessManagement({ agent, detail, detailUnavailable = false
         />
       </div>;
     })}
+    <section className="agent-access-package-details" aria-label="Package details">
+      <h4>Package details</h4>
+      <dl className="agent-property-grid">{packageProperties.map(property => <div key={property.label}>
+        <dt>{property.label}</dt><dd>{property.value}</dd>
+      </div>)}</dl>
+    </section>
   </section>;
 }

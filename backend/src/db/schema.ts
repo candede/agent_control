@@ -191,7 +191,17 @@ async function verifyInventoryGenerationSchema(database: Pick<pg.Pool, "query">)
   if (rows.length !== tables.length || rows.some(row => !row.relation)) throw new Error("inventory_schema_missing");
   const payloadBound = (await database.query(`SELECT convalidated
     AND regexp_replace(pg_get_expr(conbin,conrelid),'[[:space:]]+',' ','g')=$1 AS valid
-    FROM pg_constraint WHERE conrelid='inventory_facts'::regclass AND conname='inventory_facts_payload_check' AND contype='c'`,
+    FROM pg_constraint WHERE conrelid='inventory_facts'::regclass AND conname='inventory_facts_payload_check' AND contype='c'
+      AND EXISTS(SELECT 1 FROM pg_constraint sharing WHERE sharing.conrelid='inventory_facts'::regclass
+        AND sharing.conname='inventory_facts_shared_principal_check' AND sharing.contype='c' AND sharing.convalidated)
+      AND EXISTS(SELECT 1 FROM pg_constraint maker WHERE maker.conrelid='power_platform_record_rows'::regclass
+        AND maker.conname='power_platform_record_rows_maker_sharing_check' AND maker.contype='c' AND maker.convalidated
+        AND pg_get_expr(maker.conbin,maker.conrelid) LIKE '%inventory_maker_sharing_valid%')
+      AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public'
+        AND table_name='power_platform_record_rows' AND column_name='maker_org_wide_chat'
+        AND data_type='boolean' AND is_generated='ALWAYS'
+        AND generation_expression LIKE '%makerSharing%viewers%entireTenant%')
+      AND has_function_privilege('agentcontrol_app','inventory_maker_sharing_valid(jsonb)','EXECUTE')`,
   ["(octet_length((payload)::text) <= CASE WHEN (kind = 'element'::text) THEN 4194304 ELSE 262144 END)"])).rows[0];
   if (payloadBound?.valid !== true) throw new Error("inventory_payload_schema");
   const triggers = (await database.query(`SELECT count(*)::int AS count FROM pg_trigger

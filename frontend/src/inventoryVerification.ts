@@ -1,8 +1,8 @@
-import type { InventoryCoverageStatus, InventorySnapshot, UnifiedAgentInventoryPage } from "./api/client";
+import type { InventoryCoverageStatus, InventorySnapshot, UnifiedAgentInventoryHealth } from "./api/client";
 
 export const powerPlatformInventoryCaveat = "Microsoft Power Platform inventory excludes classic/V1 bots. Recent changes may take about 20 minutes to appear.";
 
-export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage, error?: string): string[] {
+export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryHealth, error?: string): string[] {
   if (error) return [error];
   if (!inventory) return [];
   const reasons = new Set([
@@ -35,7 +35,7 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage,
   return [...reasons];
 }
 
-export function inventoryDetailsPending(inventory?: UnifiedAgentInventoryPage) {
+export function inventoryDetailsPending(inventory?: UnifiedAgentInventoryHealth) {
   return Boolean(inventory?.identityCollection?.pendingPackages) || inventory?.verification.status === "details_pending";
 }
 

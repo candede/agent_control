@@ -13,6 +13,7 @@ import type {
   DataSyncSourceState,
   DataSyncSourceStatus,
   DataSyncState,
+  PackageDetailSyncState,
 } from "../api/client";
 import { ApiError } from "../api/client";
 import { DataSyncPanel } from "./DataSyncPanel";
@@ -27,6 +28,9 @@ const api = vi.hoisted(() => ({
   cancel: vi.fn(),
   getRun: vi.fn(),
   getState: vi.fn(),
+  getDetails: vi.fn(),
+  startDetails: vi.fn(),
+  cancelDetails: vi.fn(),
   start: vi.fn(),
   openPermissions: vi.fn(),
 }));
@@ -41,6 +45,9 @@ vi.mock("../api/client", async importOriginal => ({
   getDataSyncRun: api.getRun,
   getDataSyncState: api.getState,
   startDataSync: api.start,
+  getPackageDetailSyncState: api.getDetails,
+  startPackageDetailSync: api.startDetails,
+  cancelPackageDetailSync: api.cancelDetails,
 }));
 
 vi.mock("../workbenchActionContext", () => ({
@@ -95,6 +102,23 @@ function syncState(overrides: Partial<DataSyncState> = {}): DataSyncState {
   };
 }
 
+function automaticSources(): DataSyncSourceStatus[] {
+  return sourceIds.filter(id => id !== "usage_reports").map(id => source(id, "succeeded", {
+    count: id === "users" ? 3_988 : id === "graph_packages" ? 1_216 : 1_549,
+    lastSuccessAt: "2026-10-12T17:10:00Z",
+  }));
+}
+
+function pendingDetails(status: PackageDetailSyncState["status"] = "ready"): PackageDetailSyncState {
+  return {
+    status, total: 1_216, fresh: 520, pending: 696, eligible: status === "running" ? 676 : 696,
+    message: status === "running" ? "Collecting exact package details." : "Exact package details are pending.",
+    job: status === "running"
+      ? { id: "detail-batch", status: "running", observedCount: 1, targetCount: 20, updatedAt: "2026-10-12T17:10:00Z" }
+      : null,
+  };
+}
+
 function renderPanel(options: {
   active?: boolean;
   canUploadUsage?: boolean;
@@ -139,6 +163,10 @@ describe("DataSyncPanel", () => {
     api.cancel.mockReset();
     api.getRun.mockReset();
     api.getState.mockReset();
+    api.getDetails.mockReset().mockResolvedValue({ status: "complete", total: 0, fresh: 0, pending: 0, eligible: 0,
+      message: "Fresh details for the current empty catalog.", job: null });
+    api.startDetails.mockReset();
+    api.cancelDetails.mockReset();
     api.start.mockReset();
     api.openPermissions.mockReset();
   });
@@ -966,7 +994,7 @@ describe("DataSyncPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Start initial sync" }));
     expect(api.start).toHaveBeenCalledWith({ mode: "initial" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     await waitFor(() => expect(onChanged).toHaveBeenCalledWith(sourceIds));
-    expect(screen.getAllByText("3 of 3 sources synced")).not.toHaveLength(0);
+    expect(screen.getAllByText("4 of 4 sync steps complete")).not.toHaveLength(0);
     const users = screen.getByText("Users", { selector: "strong" }).closest("article");
     expect(users).not.toBeNull();
     expect(within(users!).getByText("0")).toBeVisible();
@@ -1126,7 +1154,7 @@ describe("DataSyncPanel", () => {
     await act(async () => resolveCancellation(cancelled));
     expect(await screen.findByText("Sync cancelled")).toBeVisible();
     expect(screen.queryByRole("group", { name: "Current sync actions" })).not.toBeInTheDocument();
-    expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
+    expect(screen.getByText("4 of 4 sync steps complete")).toBeVisible();
   });
 
   it("marks exact-run progress as last reported throughout cancellation and recovers after a rejected command", async () => {
@@ -1254,8 +1282,8 @@ describe("DataSyncPanel", () => {
 
     const page = within(screen.getByRole("region", { name: "Data sync" }));
     expect(page.getAllByText("Sync complete")).toHaveLength(1);
-    expect(page.getByText("3 of 3 sources synced")).toBeVisible();
-    expect(page.getByText(/Last successful collection across all sources/)).toBeVisible();
+    expect(page.getByText("4 of 4 sync steps complete")).toBeVisible();
+    expect(page.getByText(/Users, source catalogs, and exact package details/)).toBeVisible();
     expect(page.queryByText(/Verify saved inventory below/)).not.toBeInTheDocument();
     expect(page.queryByRole("progressbar")).not.toBeInTheDocument();
     expect(page.queryByText("Keep your saved data up to date")).not.toBeInTheDocument();
@@ -1813,7 +1841,7 @@ describe("DataSyncPanel", () => {
     api.start.mockResolvedValue(current);
     const panelRef = createRef<DataSyncPanelHandle>();
     renderPanel({ ref: panelRef });
-    await screen.findByText("3 of 3 sources synced");
+    await screen.findByText("4 of 4 sync steps complete");
     let resolveStatus!: (value: DataSyncState) => void;
     api.getState.mockReturnValueOnce(new Promise<DataSyncState>(resolve => { resolveStatus = resolve; }));
 
@@ -1825,7 +1853,7 @@ describe("DataSyncPanel", () => {
     expect(within(screen.getByRole("article", { name: "Users" })).getByText("42")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).getByText("1,005")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Power Platform" })).getByText("4,178")).toBeVisible();
-    expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
+    expect(screen.getByText("4 of 4 sync steps complete")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("max", "1");
 
     const completedUsers = source("users", "succeeded", { count: 43, lastSuccessAt: "2026-09-16T10:00:00.000Z" });
@@ -1836,7 +1864,7 @@ describe("DataSyncPanel", () => {
     });
     await act(async () => resolveStatus(completed));
     expect(screen.getByText("Sync complete")).toBeVisible();
-    expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
+    expect(screen.getByText("4 of 4 sync steps complete")).toBeVisible();
     expect(screen.queryByText(/1 of 1/)).not.toBeInTheDocument();
     expect(within(screen.getByRole("article", { name: "Users" })).getByText("43")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).getByText("1,005")).toBeVisible();
@@ -1849,13 +1877,114 @@ describe("DataSyncPanel", () => {
     api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: automatic }));
     const onOpenUsageImport = vi.fn();
     renderPanel({ onOpenUsageImport });
-    await screen.findByText("3 of 3 sources synced");
+    await screen.findByText("4 of 4 sync steps complete");
     expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Check status" }));
     expect(api.getState).toHaveBeenCalledTimes(2);
+    expect(api.getDetails).toHaveBeenCalledTimes(2);
     expect(onOpenUsageImport).not.toHaveBeenCalled();
     expect(api.start).not.toHaveBeenCalled();
+    expect(api.startDetails).not.toHaveBeenCalled();
+  });
+
+  it("aligns all four sync rows in Workspace data without claiming pending details are complete", async () => {
+    const sources = automaticSources();
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources }));
+    api.getDetails.mockResolvedValue(pendingDetails("running"));
+    renderPanel();
+    await screen.findByText("520 / 1,216");
+
+    const workspace = screen.getByRole("heading", { name: "Workspace data" }).closest("section")!;
+    const rows = within(workspace).getAllByRole("article");
+    expect(rows).toHaveLength(4);
+    expect(rows.map(row => row.getAttribute("aria-label"))).toEqual(["Users", "Graph packages", "Power Platform", "Graph package details"]);
+    for (const row of rows) {
+      expect(row).toHaveClass("data-sync-source");
+      expect(row.parentElement).toHaveClass("data-sync-sources");
+      expect(row.querySelector(".data-sync-source-name")).not.toBeNull();
+      expect(row.querySelector("dl")).not.toBeNull();
+      expect(row.querySelector(".data-sync-source-actions .status-badge")).not.toBeNull();
+      expect(row.querySelector(".data-sync-source-controls button")).toHaveClass("secondary");
+    }
+    expect(new Set(rows.map(row => row.parentElement)).size).toBe(1);
+    expect(within(workspace).getByText("3 of 4 sync steps complete")).toHaveClass("state-progress");
+    expect(screen.queryByText("4 of 4 sync steps complete")).not.toBeInTheDocument();
+    const details = within(rows[3]!);
+    expect(details.getByText("Syncing", { exact: true })).toBeVisible();
+    expect(details.getByRole("button", { name: "Sync package details" })).toBeDisabled();
+    expect(details.getByRole("button", { name: "Cancel detail collection" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Check detail status" })).not.toBeInTheDocument();
+  });
+
+  it("rechecks detail coverage through both global Check status and imperative refresh", async () => {
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: automaticSources() }));
+    api.getDetails.mockResolvedValue(pendingDetails());
+    const ref = createRef<DataSyncPanelHandle>();
+    renderPanel({ ref });
+    await screen.findByText("520 / 1,216");
+
+    api.getDetails.mockResolvedValue({ ...pendingDetails(), status: "complete", fresh: 1_216, pending: 0, eligible: 0 });
+    await userEvent.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText("4 of 4 sync steps complete")).toHaveClass("state-success");
+    expect(screen.getByText("1,216 / 1,216")).toBeVisible();
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    expect(api.getDetails).toHaveBeenCalledTimes(2);
+    await act(async () => { await ref.current!.refresh(); });
+    await waitFor(() => expect(api.getDetails).toHaveBeenCalledTimes(3));
+    expect(api.getState).toHaveBeenCalledTimes(3);
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.startDetails).not.toHaveBeenCalled();
+  });
+
+  it("withdraws full completion on a failed detail recheck and recovers with global Check status", async () => {
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: automaticSources() }));
+    renderPanel();
+    await screen.findByText("4 of 4 sync steps complete");
+    api.getDetails.mockRejectedValue(new Error("Detail coverage read failed."));
+    await userEvent.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Detail coverage read failed.");
+    expect(screen.queryByText("4 of 4 sync steps complete")).not.toBeInTheDocument();
+    expect(screen.getByText("3 of 4 sync steps complete")).toHaveClass("state-attention");
+    expect(within(screen.getByRole("article", { name: "Graph package details" })).getByText("Not checked")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sync package details" })).toBeDisabled();
+    api.getDetails.mockResolvedValue(pendingDetails());
+    await userEvent.click(screen.getByRole("button", { name: "Check status" }));
+    expect(await screen.findByText("520 / 1,216")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("3 of 4 sync steps complete")).toHaveClass("state-attention");
+  });
+
+  it("does not count a previous catalog's detail completion while checking a newly saved catalog", async () => {
+    const sources = automaticSources();
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources }));
+    api.getDetails.mockResolvedValue({ ...pendingDetails(), status: "complete", fresh: 1_216, pending: 0, eligible: 0 });
+    renderPanel();
+    await screen.findByText("4 of 4 sync steps complete");
+    let resolveDetails!: (value: PackageDetailSyncState) => void;
+    api.getDetails.mockReturnValue(new Promise<PackageDetailSyncState>(resolve => { resolveDetails = resolve; }));
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: sources.map(saved => saved.source === "graph_packages"
+      ? { ...saved, count: 1_300, jobId: "new-catalog", lastSuccessAt: "2026-10-12T18:00:00Z" } : saved) }));
+    await userEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(within(screen.getByRole("article", { name: "Graph packages" })).getByText("1,300")).toBeVisible());
+    expect(screen.queryByText("4 of 4 sync steps complete")).not.toBeInTheDocument();
+    expect(screen.getByText("3 of 4 sync steps complete")).toBeVisible();
+    expect(within(screen.getByRole("article", { name: "Graph package details" })).getByText("Not checked")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sync package details" })).toBeDisabled();
+    await act(async () => resolveDetails({ ...pendingDetails(), total: 1_300, fresh: 1_216, pending: 84, eligible: 84 }));
+    expect(await screen.findByText("1,216 / 1,300")).toBeVisible();
+    expect(screen.getByText("3 of 4 sync steps complete")).toBeVisible();
+  });
+
+  it("keeps Sync all sources on the catalog pipeline without issuing a duplicate detail start", async () => {
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: automaticSources() }));
+    api.getDetails.mockResolvedValue(pendingDetails());
+    api.start.mockResolvedValue(run("running", automaticSources().map(saved => source(saved.source, "queued"))));
+    renderPanel();
+    await screen.findByText("520 / 1,216");
+    await userEvent.click(screen.getByRole("button", { name: "Sync all sources" }));
+    expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "incremental" }, expect.anything());
+    expect(api.startDetails).not.toHaveBeenCalled();
   });
 
   it("distinguishes successful unknown counts from never-synced sources and measured zeros", async () => {
@@ -1910,7 +2039,7 @@ describe("DataSyncPanel", () => {
     await userEvent.click(screen.getByRole("checkbox"));
     await userEvent.click(screen.getByRole("button", { name: "Clear and start full resync" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Status read failed.");
-    expect(screen.getByText("0 of 3 sources synced")).toBeVisible();
+    expect(screen.getByText("0 of 4 sync steps complete")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).queryByText("44")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
     expect(onSourcesChanged).toHaveBeenCalledExactlyOnceWith(["users", "graph_packages", "power_platform"]);
@@ -2184,7 +2313,7 @@ describe("DataSyncPanel", () => {
     renderPanel();
 
     expect((await screen.findAllByText("Import needed")).length).toBeGreaterThan(0);
-    expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
+    expect(await screen.findByText("4 of 4 sync steps complete")).toBeVisible();
     expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
   });
 
@@ -2233,7 +2362,7 @@ describe("DataSyncPanel", () => {
     });
     expect(api.getState).toHaveBeenCalledTimes(3);
     expect(onChanged).toHaveBeenCalledWith(sourceIds);
-    expect(screen.getAllByText("3 of 3 sources synced")).not.toHaveLength(0);
+    expect(screen.getAllByText("4 of 4 sync steps complete")).not.toHaveLength(0);
   });
 
   it("notifies a new successful observation even when the source stayed succeeded", async () => {
@@ -2264,7 +2393,7 @@ describe("DataSyncPanel", () => {
     const onChanged = vi.fn();
     const panelRef = createRef<DataSyncPanelHandle>();
     renderPanel({ ref: panelRef, onSourcesChanged: onChanged });
-    await screen.findAllByText("3 of 3 sources synced");
+    await screen.findAllByText("4 of 4 sync steps complete");
 
     await act(async () => {
       await panelRef.current?.refresh();
@@ -2567,7 +2696,7 @@ describe("DataSyncPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
     expect(api.cancel).toHaveBeenCalledExactlyOnceWith(exactRun.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
-    expect(screen.getByText("Sync complete", { exact: true })).toBeVisible();
+    expect(screen.getByText("Source sync complete", { exact: true })).toBeVisible();
     expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
     expect(api.start).not.toHaveBeenCalled();
   });

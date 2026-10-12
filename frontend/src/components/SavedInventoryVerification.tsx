@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { RefreshCw } from "lucide-react";
-import type { InventorySnapshot, UnifiedAgentInventoryPage, UnifiedAgentInventoryUnavailable, UnifiedAgentPowerPlatformObservation } from "../api/client";
+import type { InventorySnapshot, UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable, UnifiedAgentPowerPlatformObservation } from "../api/client";
 import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, powerPlatformInventoryCaveat, savedInventoryTime } from "../inventoryVerification";
 import "./savedInventoryVerification.css";
 
@@ -8,7 +8,7 @@ type ReadState = { loading?: boolean; error?: string };
 
 export function SavedAgentInventoryVerification({
   inventory, unavailable, loading = false, error, onVerify,
-}: ReadState & { inventory?: UnifiedAgentInventoryPage; unavailable?: UnifiedAgentInventoryUnavailable; onVerify?: () => void }) {
+}: ReadState & { inventory?: UnifiedAgentInventoryHealth; unavailable?: UnifiedAgentInventoryUnavailable; onVerify?: () => void }) {
   const receipt = inventory?.verification;
   const observation = inventory?.sources.powerPlatform.observation;
   const powerPlatform = observation && "roleScope" in observation ? observation : undefined;
@@ -32,7 +32,7 @@ export function SavedAgentInventoryVerification({
           : <>
             <p className={needsAttention ? "verification-attention" : "verification-success"} role="status">
               <strong>{needsAttention ? "Saved inventory needs attention" : detailsPending ? "Saved source accounting verified" : "Saved inventory verified"}</strong>
-              {" "}- {detailsPending && !needsAttention ? "detail freshness is separate from source coverage; no administrator action is needed for scheduled refreshes."
+              {" "}- {detailsPending && !needsAttention ? "source coverage is checked, but exact package detail collection is still pending. Review Graph package details in Sync."
                 : "authorized saved-source collection, accounting and identity consistency."}
             </p>
             <dl className="verification-counts" aria-label="Full saved agent accounting">

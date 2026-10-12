@@ -192,7 +192,7 @@ describe("UnifiedAgentTable", () => {
     expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("columnheader").map(header => header.textContent)).toEqual([
-      "Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions",
+      "Select agents", "Agent", "Publisher", "Built with", "Responses", "Admin availability", "Status", "Actions",
     ]);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Choose agent columns" })).not.toBeInTheDocument();
@@ -442,7 +442,7 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("region", { name: "Unified agents" })).toContainElement(screen.getByRole("table"));
     expect(screen.getAllByRole("row")).toHaveLength(2);
     expect(screen.getAllByRole("columnheader").map(header => header.textContent)).toEqual([
-      "Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions",
+      "Select agents", "Agent", "Publisher", "Built with", "Responses", "Admin availability", "Status", "Actions",
     ]);
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
     expect(screen.getByText("Synthetic publisher")).toBeInTheDocument();
@@ -750,7 +750,7 @@ describe("UnifiedAgentTable", () => {
       const projected = projectVerifiedAgentMutation(saved, new Set([saved.packages[0].id]), mutation);
       const { update } = renderTable({ records: [projected] });
       fireEvent.click(screen.getByRole("button", { name: "Columns" }));
-      fireEvent.click(screen.getByRole("checkbox", { name: "Installed for" }));
+      fireEvent.click(screen.getByRole("checkbox", { name: "Admin installation" }));
       fireEvent.keyDown(document, { key: "Escape" });
       const cells = () => within(screen.getAllByRole("row")[1]).getAllByRole("cell");
       const blockChange = "isBlocked" in mutation;

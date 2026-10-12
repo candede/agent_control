@@ -93,6 +93,7 @@ services:
       PGPASSWORD_FILE: /run/secrets/postgres-app
       PGSSLMODE: disable
       MAINTENANCE_FILE: /run/control/maintenance
+      AGENT_SHARING_DIAGNOSTICS: ${AGENT_SHARING_DIAGNOSTICS:-0}
     secrets:
       - postgres-app
       - session
@@ -100,6 +101,7 @@ services:
         target: tenants.json
     volumes:
       - ${LOCAL_STATE_DIR}/control:/run/control:ro
+      - ${LOCAL_STATE_DIR}/agent-sharing-diagnostics:/run/agent-sharing-diagnostics
     ports:
       - "127.0.0.1:${APP_PORT:-3001}:3001"
     depends_on:

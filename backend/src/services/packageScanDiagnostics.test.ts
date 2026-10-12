@@ -73,6 +73,7 @@ describe("package scan diagnostics", () => {
   it.each([
     ["elementDetails", [], elements(), "private-invalid"],
     ["longDescription", "", "private-description", { value: "private-invalid" }],
+    ["sharedWithUsersAndGroups", [], [{ resourceId: "private-recipient", resourceType: "user" }], "private-invalid"],
   ])("distinguishes missing, null, empty, populated and invalid raw %s fields", (field, empty, populated, invalid) => {
     const diagnostics = new PackageScanDiagnostics("broad");
     diagnostics.catalogPage([{}, { [field]: null }, { [field]: empty }, { [field]: populated }, { [field]: invalid }], 1, false, 50);
@@ -86,6 +87,17 @@ describe("package scan diagnostics", () => {
     const diagnostics = new PackageScanDiagnostics("broad");
     diagnostics.catalogPage([{ "@odata.type": "private-provider-type" }], 1, false, 0);
     expect(entries("package_catalog_response_type")).toMatchObject([{ actualType: "other", count: 1 }]);
+    expectPrivateValuesAbsent();
+  });
+
+  it("compares sharing field coverage without logging recipient identities", () => {
+    const diagnostics = new PackageScanDiagnostics("broad");
+    diagnostics.compareDetail(allowlistedPackage(rawPackage()), allowlistedPackage({
+      ...rawPackage(), sharedWithUsersAndGroups: [{ resourceId: "private-recipient", resourceType: "user" }],
+    }));
+    diagnostics.finish("collected");
+    expect(entries("package_detail_comparison").find(entry => entry.field === "sharedWithUsersAndGroups"))
+      .toMatchObject({ count: 1, detailOnlyCount: 1, bothMissingCount: 0 });
     expectPrivateValuesAbsent();
   });
 
@@ -477,7 +489,7 @@ describe("package scan diagnostics", () => {
         requestCount: 1, retryCount: 0, throttleCount: 0,
       }]);
       expect(entries("package_scan_summary")).toHaveLength(1);
-      expect(entries("package_detail_comparison")).toHaveLength(7);
+      expect(entries("package_detail_comparison")).toHaveLength(8);
       expect(entries("package_scan_progress")).toEqual([]);
       expectPrivateValuesAbsent();
     },

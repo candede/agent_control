@@ -1,5 +1,5 @@
 import { AppError } from "../errors.js";
-import { isPackageAccessEntity, isPackageId, packageAccessCollectionLimit, packageObservationLimits, type CopilotPackageDetail } from "../types/copilotPackage.js";
+import { isPackageAccessEntity, isPackageId, isPackageProviderUsage, packageAccessCollectionLimit, packageObservationLimits, packagePrincipalCollections, packageProviderUsageFields, type CopilotPackageDetail } from "../types/copilotPackage.js";
 import { isPackageElementType, validatePackageAgentMetadata } from "./packageAgentMetadata.js";
 import { operationalLog } from "./telemetry.js";
 import { isInventoryTimestamp } from "../types/inventoryTimestamp.js";
@@ -9,13 +9,15 @@ const descriptionFields = ["shortDescription", "longDescription"] as const;
 const facetFields = ["type", "publisher", "availableTo", "deployedTo", "platform", "version", "manifestVersion", "sensitivity"] as const;
 const timestampFields = ["createdDateTime", "lastModifiedDateTime"] as const;
 const identifierFields = ["manifestId", "appId", "assetId"] as const;
+const observedIdentifierFields = ["ownerId", "agentIdentityId"] as const;
 const facetCollections = ["supportedHosts", "elementTypes", "categories"] as const;
-const accessCollections = ["allowedUsersAndGroups", "acquireUsersAndGroups"] as const;
+const accessCollections = packagePrincipalCollections;
 
 export function parsePackageObservationJson(text: string): unknown {
   const packageFields = ["@odata.type", "id", "displayName", "isBlocked", ...descriptionFields, ...facetFields,
-    ...timestampFields, ...identifierFields, ...facetCollections, ...accessCollections, "elementDetails"];
-  const arrays = { elementDetails: "group", allowedUsersAndGroups: "principal", acquireUsersAndGroups: "principal" };
+    ...timestampFields, ...identifierFields, ...observedIdentifierFields, ...packageProviderUsageFields, ...facetCollections, ...accessCollections, "elementDetails"];
+  const arrays = { elementDetails: "group", allowedUsersAndGroups: "principal", acquireUsersAndGroups: "principal",
+    sharedWithUsersAndGroups: "principal" };
   return parseProviderContractJson(text, {
     root: { fields: ["value", "@odata.count", "@odata.nextLink", ...packageFields], arrays: { ...arrays, value: "package" } },
     package: { fields: packageFields, arrays },
@@ -74,6 +76,23 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
       throw new AppError(502, "provider_schema", "Package identifiers must be bounded, unmodified strings.");
     }
     result[key] = value;
+  }
+  for (const key of observedIdentifierFields) {
+    if (!Object.hasOwn(row, key)) continue;
+    const value = row[key];
+    if (value !== null && (!isPackageText(value) || !value.length || value.length > 512 || /[\r\n]/.test(value))) {
+      throw new AppError(502, "provider_schema", "Package observed identity metadata is invalid.");
+    }
+    result[key] = value;
+    result.provenance[key] = { sourceSystem: "graph_packages", path: key, maturity: "observed" };
+  }
+  const providerUsage = Object.fromEntries(packageProviderUsageFields.filter(field => Object.hasOwn(row, field)).map(field => [field, row[field]]));
+  if (!isPackageProviderUsage(providerUsage)) throw new AppError(502, "provider_schema", "Package provider telemetry is invalid.");
+  if (Object.keys(providerUsage).length) {
+    result.providerUsage = providerUsage;
+    for (const field of Object.keys(providerUsage)) {
+      result.provenance[`providerUsage.${field}`] = { sourceSystem: "graph_packages", path: field, maturity: "observed" };
+    }
   }
   for (const key of facetCollections) {
     const values = row[key];
@@ -135,7 +154,7 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
   }
   const knownFields = new Set([
     ...Object.keys(result), ...descriptionFields, ...facetFields, ...timestampFields, ...identifierFields,
-    ...facetCollections, ...accessCollections, "elementDetails",
+    ...observedIdentifierFields, ...packageProviderUsageFields, ...facetCollections, ...accessCollections, "elementDetails",
   ]);
   const omittedCount = Object.keys(row).filter(key => !knownFields.has(key) && !key.startsWith("@odata.")).length;
   if (omittedCount) operationalLog("warn", "provider_schema_omission", { provider: "graph_packages", count: omittedCount });

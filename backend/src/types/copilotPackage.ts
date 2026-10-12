@@ -1,4 +1,27 @@
 import { isGraphGuid } from "./copilotUsage.js";
+import { isInventoryTimestamp } from "./inventoryTimestamp.js";
+import { isInventoryCount, type InventoryFieldMaturity } from "./powerPlatformInventory.js";
+
+export const packageProviderUsageFields = ["activeUsers", "totalSessions", "totalRunTimeInHours", "exceptionRate", "lastUsedDateTime"] as const;
+export type PackageProviderUsage = {
+  activeUsers?: number | null;
+  totalSessions?: number | null;
+  totalRunTimeInHours?: number | null;
+  exceptionRate?: number | null;
+  lastUsedDateTime?: string | null;
+};
+
+export function isPackageProviderUsage(value: unknown): value is PackageProviderUsage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.entries(Object.getOwnPropertyDescriptors(value)).every(([field, descriptor]) => {
+    if (!Object.hasOwn(descriptor, "value")) return false;
+    const total: unknown = descriptor.value;
+    if (!packageProviderUsageFields.some(key => key === field)) return false;
+    return total === null || (field === "lastUsedDateTime" ? isInventoryTimestamp(total)
+      : field === "activeUsers" || field === "totalSessions" ? isInventoryCount(total)
+        : typeof total === "number" && Number.isFinite(total) && total >= 0 && total <= Number.MAX_SAFE_INTEGER);
+  });
+}
 
 export type PackageAccessEntity = {
   resourceId: string;
@@ -6,6 +29,7 @@ export type PackageAccessEntity = {
 };
 
 export const packageAccessCollectionLimit = 5000;
+export const packagePrincipalCollections = ["allowedUsersAndGroups", "acquireUsersAndGroups", "sharedWithUsersAndGroups"] as const;
 export const packageObservationLimits = { bytes: 2_048_000, elementGroups: 50, elementsPerGroup: 100 } as const;
 
 export function isPackageAccessEntity(value: unknown): value is PackageAccessEntity {
@@ -129,18 +153,22 @@ export type CopilotPackage = {
   manifestId?: string;
   appId?: string;
   assetId?: string;
+  ownerId?: string | null;
+  agentIdentityId?: string | null;
+  providerUsage?: PackageProviderUsage;
   sourceSystem: "graph_packages";
   authoringTool: string | null;
   creatorType: "unknown";
   agentKind: "copilot_package";
   lifecycle: "unknown";
   identityConfidence: "exact_native";
-  provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: "ga" | "preview" }>;
+  provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: InventoryFieldMaturity }>;
   controlObservations?: Partial<Record<"block" | "access", PackageControlObservation>>;
   detailFreshness?: PackageDetailFreshness;
 };
 
 export type CopilotPackageDetail = CopilotPackage & {
+  principalCounts?: Partial<Record<typeof packagePrincipalCollections[number], number>>;
   identityDetailsCollected?: true;
   identityRevalidationRequired?: true;
   longDescription?: string;
@@ -148,6 +176,7 @@ export type CopilotPackageDetail = CopilotPackage & {
   sensitivity?: string;
   allowedUsersAndGroups?: PackageAccessEntity[];
   acquireUsersAndGroups?: PackageAccessEntity[];
+  sharedWithUsersAndGroups?: PackageAccessEntity[];
   elementDetails?: PackageElementDetail[];
 };
 

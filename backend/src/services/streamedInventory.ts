@@ -52,7 +52,7 @@ export async function storedInventoryRecords(client: pg.PoolClient, requested: r
          OR f.kind='identifier' AND f.payload->>'kind' IN ('environment_id','cds_bot_id','entra_app_id','entra_agent_id')
          OR f.kind='element' AND lower(f.payload->>'elementType') IN ('agentmetadatas','declarativecopilots','bots','customenginecopilots')`
          : `f.kind IN ('collection','supportedHosts','elementTypes','categories','allowedUsersAndGroups',
-         'acquireUsersAndGroups','elementGroup','element','identifier','connectorOperation') OR f.kind LIKE 'detail:%'`})
+         'acquireUsersAndGroups','sharedWithUsersAndGroups','elementGroup','element','identifier','connectorOperation') OR f.kind LIKE 'detail:%'`})
          AND ($2::uuid IS NULL OR (f.generation_id,f.identity COLLATE "C",f.ordinal)>($2::uuid,$3::text COLLATE "C",$4::integer))
        ORDER BY f.generation_id,f.identity COLLATE "C",f.ordinal LIMIT 250
       ), sized AS (SELECT *,row_number() OVER(ORDER BY generation_id,identity COLLATE "C",ordinal) AS position,
@@ -76,7 +76,7 @@ export async function storedInventoryRecords(client: pg.PoolClient, requested: r
 
 function carryControlChildren(record: InventoryRecord, previous: { generation_id: string; identity: string }, ownedCollections: string[] = []) {
   const kinds = ["collection", "supportedHosts", "elementTypes", "categories", "allowedUsersAndGroups",
-    "acquireUsersAndGroups", "elementGroup", "element", "identifier", "connectorOperation", "detail:*", "search"]
+    "acquireUsersAndGroups", "sharedWithUsersAndGroups", "elementGroup", "element", "identifier", "connectorOperation", "detail:*", "search"]
     .filter(kind => !ownedCollections.includes(kind));
   record.factSource = { generationId: previous.generation_id, identity: previous.identity, kinds, excludeCollections: ownedCollections };
   record.facts = record.facts.filter(fact => fact.kind === "collection" ? ownedCollections.includes(fact.value)
@@ -350,6 +350,7 @@ export class StreamedInventory {
         if (detail && ["fresh", "stale"].includes(result.detailFreshness?.state ?? "")) {
           carriedCollections = ["categories", "elementDetails"];
           const newerCatalog = compareInventoryTimestamps(generation.observed_at, detail.detailFreshness!.observedAt!) > 0;
+          if (!(newerCatalog && value.sharedWithUsersAndGroups !== undefined)) carriedCollections.push("sharedWithUsersAndGroups");
           if (packageDetailAccessScopesMatch(value.availableTo, detail.availableTo)
             && !(newerCatalog && value.allowedUsersAndGroups !== undefined)) carriedCollections.push("allowedUsersAndGroups");
           if (packageDetailAccessScopesMatch(value.deployedTo, detail.deployedTo)

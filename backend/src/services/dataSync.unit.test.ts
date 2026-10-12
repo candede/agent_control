@@ -6,6 +6,7 @@ import { AppError } from "../errors.js";
 import type { DataSyncRun } from "../types/dataSync.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { DataSyncService } from "./dataSync.js";
+import type { AgentSharingDiagnosticContext } from "./temporaryAgentSharingDiagnostic.js";
 import type { CopilotUsageService } from "./copilotUsage.js";
 import type { AgentPeopleService } from "./agentPeople.js";
 import type { PackageInventoryService } from "./packageInventory.js";
@@ -140,7 +141,60 @@ describe("data sync admission ownership", () => {
   });
 });
 
-function fixture() {
+describe("temporary sharing diagnostic sync hook", () => {
+  it.each(["manual", "automatic", "failed", "diagnostic-failed"] as const)("preserves normal sync behavior for %s runs", async mode => {
+    const sharingDiagnostic = vi.fn<(user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>>(async () => {
+      if (mode === "diagnostic-failed") throw new AppError(507, "diagnostic_capture_limit", "Capture quota reached.");
+    });
+    const f = fixture(sharingDiagnostic);
+    const now = new Date().toISOString();
+    Object.assign(f.run, { status: "running", completedAt: null, automatic: mode === "automatic" });
+    Object.assign(f.run.sources[0], { source: "graph_packages", status: "queued", canRetry: false });
+    const job = {
+      id: randomUUID(), status: mode === "failed" ? "failed" as const : "succeeded" as const,
+      authorizationPrincipalId: f.user.homeAccountId, tokenMode: "delegated" as const,
+      scopeKind: "broad" as const, requestedIds: [], targetCount: 0, resultRevision: now, autoDetails: false,
+      pageCount: 1, observedCount: 2, totalRecords: 2, snapshotId: randomUUID(),
+      createdAt: now, attemptedAt: now, updatedAt: now, finishedAt: now,
+    };
+    f.packages.submit.mockResolvedValue(job);
+    f.packages.cancel.mockResolvedValue({ ...job, status: "cancelled" });
+    f.packages.startDetailSync.mockResolvedValue({ status: "complete", total: 2, fresh: 2, pending: 0, eligible: 0, message: "Complete", job: null });
+    f.packages.refreshDueDetails.mockResolvedValue(undefined);
+    vi.spyOn(f.repository, "submit").mockResolvedValue({ run: f.run, created: true });
+    vi.spyOn(f.repository, "submitDue").mockResolvedValue({ run: f.run, created: true });
+    vi.spyOn(f.repository, "automaticRevisions").mockResolvedValue({ users: "1", graph_packages: "1", power_platform: "1" });
+    vi.spyOn(f.repository, "finishAutomatic").mockResolvedValue(undefined);
+    vi.spyOn(f.repository, "getSourceAttempt").mockResolvedValue(1);
+    vi.spyOn(f.repository, "attachJob").mockResolvedValue(undefined);
+    vi.spyOn(f.repository, "updateSource").mockImplementation(async (_scope, _id, _source, update, beforeCommit) => {
+      beforeCommit?.();
+      Object.assign(f.run.sources[0], update);
+      return f.run;
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      if (mode === "automatic") await f.service.automaticRefresh(f.user);
+      else await f.service.start(f.user, { mode: "incremental", sources: ["graph_packages"] });
+      await vi.waitFor(() => {
+        expect(f.run.sources[0].status).toBe(mode === "failed" ? "failed" : "succeeded");
+        if (mode === "manual" || mode === "diagnostic-failed") expect(sharingDiagnostic).toHaveBeenCalledOnce();
+        if (mode === "automatic") expect(f.repository.finishAutomatic).toHaveBeenCalledOnce();
+      });
+      await f.service.drain();
+      expect(sharingDiagnostic).toHaveBeenCalledTimes(mode === "manual" || mode === "diagnostic-failed" ? 1 : 0);
+      expect(f.packages.startDetailSync).toHaveBeenCalledTimes(mode === "failed" ? 0 : 1);
+      expect(f.run.sources[0].status).toBe(mode === "failed" ? "failed" : "succeeded");
+      if (mode === "diagnostic-failed") expect(JSON.stringify(logged.mock.calls)).toContain("diagnostic_capture_limit");
+      if (mode === "manual") {
+        const context = sharingDiagnostic.mock.calls[0];
+        expect(context).toEqual([f.user, expect.objectContaining({ runId: f.run.id, signal: expect.any(AbortSignal), assertCurrent: expect.any(Function) })]);
+      }
+    } finally { await f.service.drain(); }
+  });
+});
+
+function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>) {
   const user: AuthenticatedUser = {
     tenantId: `synthetic-sync-${randomUUID()}`, homeAccountId: randomUUID(),
     username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"],
@@ -159,6 +213,7 @@ function fixture() {
   vi.spyOn(repository, "pausePrincipal").mockResolvedValue(0);
   const forbidden = new Error("This test must not dispatch child or provider work.");
   const packages = {
+    startDetailSync: vi.fn<PackageInventoryService["startDetailSync"]>().mockRejectedValue(forbidden),
     submit: vi.fn<PackageInventoryService["submit"]>().mockRejectedValue(forbidden),
     start: vi.fn<PackageInventoryService["start"]>().mockRejectedValue(forbidden),
     get: vi.fn<PackageInventoryService["get"]>().mockRejectedValue(forbidden),
@@ -179,6 +234,7 @@ function fixture() {
     repository, packages, powerPlatform, copilotUsage, agentPeople,
     officialUsage: { read: vi.fn(async () => ({ complete: false, count: 0, acceptedAt: null })) },
     wait: vi.fn(async () => undefined),
+    sharingDiagnostic,
   });
   return { service, repository, user, run, packages, powerPlatform, copilotUsage };
 }

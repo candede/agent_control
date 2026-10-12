@@ -266,6 +266,9 @@ export type UnifiedAgentInventoryPage = {
   errors: UnifiedAgentSourceError[];
 };
 
+export type UnifiedAgentInventoryHealth = Pick<UnifiedAgentInventoryPage,
+  "freshness" | "summary" | "verification" | "identityCollection" | "sources" | "partial" | "errors">;
+
 export type UnifiedAgentInventoryQuery = {
   /** Defaults to all for exact reads and other non-UI consumers. */
   inventoryScope?: UnifiedAgentInventoryScope;

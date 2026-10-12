@@ -202,6 +202,26 @@
 .data-sync-source-attempt { display: grid; gap: 5px; }
 .data-sync-source-attempt > span:first-child { color: var(--muted); font-size: 12px; }
 
+.data-sync-source-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.data-sync-source-note {
+  grid-column: 1 / -1;
+  margin-top: -12px;
+  font-size: 12px;
+}
+
+.data-sync-source-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  accent-color: #487cad;
+}
+
 .data-sync-source .status-badge,
 .data-sync-live-source .status-badge,
 .sync-history .status-badge {
@@ -304,13 +324,13 @@
 .data-sync-activity-footer > .data-sync-run-actions { justify-content: flex-end; margin-left: auto; min-width: 0; }
 .data-sync-activity-footer .sync-text-button { width: auto; }
 
-.data-sync-run-actions button.secondary.data-sync-cancel {
+:is(.data-sync-run-actions, .data-sync-source-controls) button.secondary.data-sync-cancel {
   color: var(--danger);
   border-color: var(--danger);
   background: transparent;
 }
 
-.data-sync-run-actions button.secondary.data-sync-cancel:hover:not(:disabled) {
+:is(.data-sync-run-actions, .data-sync-source-controls) button.secondary.data-sync-cancel:hover:not(:disabled) {
   background: #fbe9e7;
 }
 
@@ -436,6 +456,7 @@
   .data-sync-source { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
   .data-sync-source dl { grid-column: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .data-sync-source-actions { display: flex; flex-wrap: wrap; grid-column: 1 / -1; flex-direction: row; justify-content: space-between; align-items: center; }
+  .data-sync-source-controls { margin-left: auto; }
 }
 
 @media (max-width: 600px) {

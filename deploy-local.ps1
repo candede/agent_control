@@ -8,7 +8,8 @@ param(
     [string]$Project = 'agent-control',
     [Alias('db-reset')]
     [switch]$DbReset,
-    [switch]$ForceChecks
+    [switch]$ForceChecks,
+    [switch]$AgentSharingDiagnostics
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts/local-deployment.ps1')
@@ -16,7 +17,9 @@ $context = $null
 try {
     if ($DbReset -and $Command -ne 'start') { throw '-DbReset is supported only with start.' }
     if ($ForceChecks -and $Command -ne 'start') { throw '-ForceChecks is supported only with start.' }
+    if ($AgentSharingDiagnostics -and $Command -ne 'start') { throw '-AgentSharingDiagnostics is supported only with start.' }
     $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -in @('stop','check'))
+    $context.AgentSharingDiagnostics = [bool]$AgentSharingDiagnostics
     $operation = switch ($Command) {
         'start' { 'Deploy' }
         'stop' { 'Stop' }

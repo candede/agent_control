@@ -513,6 +513,7 @@ describe("DataSyncService", () => {
         await harness.service.start(user, { mode: "incremental", sources: [sourceId] });
         await vi.waitFor(() => expect(provider.cancel).toHaveBeenCalled());
         expect(provider.get).not.toHaveBeenCalled();
+        expect(harness.packages.startDetailSync).not.toHaveBeenCalled();
         expect(harness.run.sources[0].status).not.toBe("succeeded");
       } finally { await harness.service.drain(); }
     },
@@ -543,6 +544,9 @@ describe("DataSyncService", () => {
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(provider.get).not.toHaveBeenCalled();
       expect(provider.cancel).not.toHaveBeenCalled();
+      if (sourceId === "graph_packages") expect(harness.packages.startDetailSync)
+        .toHaveBeenCalledWith(user, undefined, expect.any(Number));
+      else expect(harness.packages.startDetailSync).not.toHaveBeenCalled();
       expect(harness.repository.updateSource.mock.calls.some(([, , , update]) => update.status === "failed")).toBe(false);
       await harness.service.drain();
     },
@@ -1539,6 +1543,7 @@ function serviceHarness() {
     recoverInterrupted: vi.fn(async () => 0),
   };
   const packages = {
+    startDetailSync: vi.fn(async () => ({ status: "complete" as const, total: 0, fresh: 0, pending: 0, eligible: 0, message: "Complete.", job: null })),
     refreshDueDetails: vi.fn(async () => null),
     submit: vi.fn<PackageInventoryService["submit"]>(async () => packageJob(randomUUID(), "waiting_authorization", 0)),
     start: vi.fn(async (_user, id) => packageJob(id, "succeeded", 0)),

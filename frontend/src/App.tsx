@@ -83,6 +83,7 @@ import { clearPackageSelection, restorePackageSelection, storePackageSelection }
 import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
+import { useInventoryHealth } from "./useInventoryHealth";
 import { PublicationContext } from "./publicationContext";
 import { useBrowserAvailability } from "./useBrowserAvailability";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
@@ -408,6 +409,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, []);
   const [inventoryHistoryError, setInventoryHistoryError] = useState<string>();
   const [agentReloadRevision, setAgentReloadRevision] = useState(0);
+  const [inventoryHistoryReloadRevision, setInventoryHistoryReloadRevision] = useState(0);
   const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
   const [inventoryReportRevision, setInventoryReportRevision] = useState(0);
   const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
@@ -533,7 +535,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   });
   const loadInventoryRefreshHistory = useEffectEvent((controller: AbortController) => {
     const previous = powerPlatformAgentRefreshJobRef.current;
-    void readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision],
+    void readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision, inventoryHistoryReloadRevision],
       signal => getInventoryRefreshJobs({ signal }), controller.signal).then(history => {
       if (controller.signal.aborted) return;
       setInventoryHistoryError(undefined);
@@ -1199,7 +1201,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     inventoryHistoryAbortController.current = controller;
     loadInventoryRefreshHistory(controller);
     return () => controller.abort();
-  }, [activeView, agentReloadRevision, principalKey, user, waitingForInitialInventory]);
+  }, [activeView, agentReloadRevision, inventoryHistoryReloadRevision, principalKey, user, waitingForInitialInventory]);
 
   useEffect(() => {
     if (!user) {
@@ -1401,6 +1403,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       void dataSyncPanelRef.current?.refresh(false);
     },
   });
+  const inventoryHealth = useInventoryHealth(principalKey,
+    Boolean(user && hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" && !loadingSession && !signingOut),
+    JSON.stringify([officialUsageDashboardRevision, automaticRefresh.publicationRevisions]), reason => {
+      if (!ownsAgentScope(principalKey)) return;
+      clearAgentState();
+      setInitialAgentReadOwner(principalKey);
+      setUnifiedAgentReadError(errorMessage(reason));
+    });
 
   useEffect(() => {
     if (!user || visibleActiveView === activeView) return;
@@ -2356,7 +2366,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleExportPowerPlatformAgentCsv() {
     if (!ownsAgentScope(principalKey)) return false;
-    if (!agentExportRevision || agentExportNeedsReload || exportingPowerPlatformCsv
+    if (inventoryHealth.isChecking() || !agentExportRevision || agentExportNeedsReload || exportingPowerPlatformCsv
       || loadingAgents || agentSearchPending || forceCurrentAgentReload.current) {
       return false;
     }
@@ -3222,11 +3232,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setAgentExportError({ message: "The saved inventory selection changed or expired. Reload inventory before exporting again.", reloadRequired: true });
   }
 
-  function verifySavedAgentInventory() {
-    setLoadingAgents(true);
-    replaceCurrentAgentSelection();
-  }
-
   if (loadingSession) {
     return <main className="screen-state">Checking sign-in...</main>;
   }
@@ -3374,13 +3379,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
       {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? (
         <AgentSyncTools
-          inventory={unifiedAgentPage}
-          inventoryUnavailable={inventoryUnavailable}
-          verifyingInventory={loadingAgents || agentSearchPending}
-          inventoryError={unifiedAgentReadError}
+          inventory={inventoryHealth.inventory}
+          inventoryUnavailable={inventoryHealth.unavailable}
+          verifyingInventory={inventoryHealth.loading}
+          inventoryError={inventoryHealth.error ?? unifiedAgentReadError}
           operationError={error === unifiedAgentReadError ? undefined : error}
           powerPlatformHistoryError={inventoryHistoryError}
-          onVerifyInventory={verifySavedAgentInventory}
+          onVerifyInventory={() => {
+            inventoryHealth.refresh();
+            setInventoryHistoryReloadRevision(value => value + 1);
+            if (unifiedAgentReadError) requestCurrentAgentReload();
+          }}
           selectedPackageCount={groupCountPending ? 0 : matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
           refreshingPackages={refreshingAgents}
           refreshingPowerPlatform={refreshingPowerPlatformAgents}
@@ -3434,6 +3443,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             automaticRefresh.checkNow();
           }}
           onCancelRequested={() => automaticRefresh.setPaused(true)}
+          onDetailsStartRequested={() => automaticRefresh.setPaused(false)}
         />
       ) : null}
       {visibleActiveView === "sync" ? (

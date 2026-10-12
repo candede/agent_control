@@ -20,6 +20,13 @@ export type PackageDataScope = { tenantId: string; principalId: string; tokenMod
 const catalogRevisionHashSql = `encode(sha256(convert_to(jsonb_build_array(
   r.residual->'lastModifiedDateTime',r.residual->'appId',${normalizeNativeIdentitySql("(r.residual->>'manifestId')")},
   r.residual->'assetId',r.residual->'version',r.residual->'manifestVersion')::text,'UTF8')),'hex')`;
+const detailPendingSql = `(r.detail_generation IS NULL OR coalesce(r.residual->'detailFreshness'->>'state','missing')<>'fresh'
+  OR coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz,'-infinity'::timestamptz)<=clock_timestamp())`;
+const detailUnattemptedSql = `NOT EXISTS(SELECT 1 FROM package_refresh_jobs attempted
+  WHERE attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details
+    AND EXISTS(SELECT 1 FROM inventory_refresh_targets t WHERE t.job_id=attempted.id AND t.target_id=r.native_id
+      AND t.catalog_revision_hash=${catalogRevisionHashSql})
+    AND attempted.updated_at>clock_timestamp()-interval '1 hour')`;
 export type PackageRefreshInput = {
   authorizationPrincipalId: string;
   tokenMode: "delegated" | "application";
@@ -202,13 +209,8 @@ export class PackageRefreshJobs {
         WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='inventory_packages'
           AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()
           AND r.expires_at>clock_timestamp()
-          AND (r.detail_generation IS NULL OR r.residual->'detailFreshness'->>'state'<>'fresh'
-            OR (r.residual->'detailFreshness'->>'expiresAt')::timestamptz<=clock_timestamp())
-          AND (r.native_id=ANY($3::text[]) OR NOT EXISTS(SELECT 1 FROM package_refresh_jobs attempted
-            WHERE attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details
-              AND EXISTS(SELECT 1 FROM inventory_refresh_targets t WHERE t.job_id=attempted.id AND t.target_id=r.native_id
-                AND t.catalog_revision_hash=${catalogRevisionHashSql})
-              AND attempted.updated_at>clock_timestamp()-interval '1 hour'))
+          AND ${detailPendingSql}
+          AND (r.native_id=ANY($3::text[]) OR ${detailUnattemptedSql})
         ORDER BY CASE WHEN r.detail_generation IS NULL OR r.residual->'detailFreshness'->>'state' IN ('missing','invalidated')
           THEN 0 ELSE 1 END,r.native_id COLLATE "C" LIMIT 20`,
       [scope.tenantId, scope.principalId, renewed ? previous.requested_ids : []]);
@@ -241,6 +243,29 @@ export class PackageRefreshJobs {
         AND job.token_mode='delegated' AND job.auto_details AND job.expires_at>clock_timestamp()
       ORDER BY job.created_at DESC,job.id DESC LIMIT 1`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
     return rows[0] ? projectJob(rows[0]) : null;
+  }
+
+  async detailCoverage(scope: PackageDataScope) {
+    validateScope(scope);
+    const { rows } = await this.database.query<{ catalog_available: boolean; total: number; fresh: number; eligible: number }>(`
+      WITH source AS (
+        SELECT root.* FROM data_scope_epochs s JOIN inventory_roots root ON root.scope_id=s.id AND root.current
+        JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
+        JOIN data_generations g ON g.id=revision.generation_id
+        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='inventory_packages'
+          AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.validated
+          AND g.state IN ('published','retired') AND g.expires_at>clock_timestamp()
+          AND root.catalog_complete AND root.catalog_expires_at>clock_timestamp()
+      ), records AS (
+        SELECT r.* FROM source root JOIN inventory_memberships m ON m.baseline_id=root.baseline_id
+          AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
+        JOIN package_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
+      ) SELECT EXISTS(SELECT 1 FROM source) AS catalog_available,count(*)::int AS total,
+        count(*) FILTER(WHERE NOT ${detailPendingSql})::int AS fresh,
+        count(*) FILTER(WHERE ${detailPendingSql} AND r.expires_at>clock_timestamp() AND ${detailUnattemptedSql})::int AS eligible
+      FROM records r`, [scope.tenantId, scope.principalId]);
+    if (!rows[0]) throw new Error("package_detail_coverage_missing");
+    return rows[0];
   }
 
   async listJobs(scope: PackageDataScope, authorizationPrincipalId: string, limit = 20) {

@@ -15,7 +15,7 @@ import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { requestScope } from "../middleware/auth.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
-import type { UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
+import type { UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
 
 function scalar(value: unknown, name: string, maximum = 4096) {
   if (typeof value !== "string" || !value || value.length > maximum || /[\0\r\n]/.test(value)) {
@@ -97,6 +97,24 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const query = capturedQuery(request);
     const result = await capture(await reportIdentity(database, request.session.user!), query);
     response.status("state" in result ? 200 : 201).json(result);
+  });
+  policyRoute(router, "get", "/agent-inventory/health", {
+    access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    if (Object.keys(request.query).length) throw new AppError(400, "invalid_inventory_query", "Workspace health does not accept selection IDs or filters.");
+    const identity = await reportIdentity(database, request.session.user!);
+    const selected = await capture(identity, {});
+    response.setHeader("Cache-Control", "no-store");
+    if ("state" in selected) { response.json(selected); return; }
+    let receipt: UnifiedAgentInventoryHealth;
+    try {
+      const { freshness, summary, verification, identityCollection, sources, partial, errors } =
+        inventoryPresentation(await inventory.page(selected.id, identity, { limit: 1 }));
+      receipt = { freshness, summary, verification, identityCollection, sources, partial, errors };
+    } finally {
+      await inventory.selections.invalidate(selected.id, identity);
+    }
+    response.json(receipt);
   });
   policyRoute(router, "post", "/agents/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,

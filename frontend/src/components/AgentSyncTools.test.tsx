@@ -119,7 +119,7 @@ describe("AgentSyncTools", () => {
     saved.identityCollection = { checkedPackages: 461, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } };
     saved.verification = { ...createUnifiedVerification(saved.verification, { packageMetadata: false }), status };
     render(<AgentSyncTools {...props({ inventory: saved })} />);
-    expect(screen.getByText("Sources checked")).toBeVisible();
+    expect(screen.getByText("Details pending", { exact: true })).toBeVisible();
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
     expect(screen.queryByText("What needs attention")).not.toBeInTheDocument();
     expect(screen.queryByText(/awaiting identity metadata/)).not.toBeInTheDocument();
@@ -167,7 +167,7 @@ describe("AgentSyncTools", () => {
     replacement.identityCollection = { checkedPackages: 1009, pendingPackages: 1, invalidPackages: 0 };
     replacement.verification = createUnifiedVerification(replacement.verification, {}, undefined, replacement.identityCollection);
     view.rerender(<AgentSyncTools {...actions} inventory={replacement} />);
-    expect(screen.getByText("Sources checked")).toBeVisible();
+    expect(screen.getByText("Details pending", { exact: true })).toBeVisible();
     expect(screen.getByText("Saved source accounting verified")).toBeVisible();
     expect(screen.queryByText(/invalid.*matching metadata/)).not.toBeInTheDocument();
     expect(actions.onVerifyInventory).toHaveBeenCalledOnce();

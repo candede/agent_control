@@ -72,7 +72,7 @@ function Invoke-TestDocker {
         $script:MarkerCalls.Add(@{command=$line;maintenance=(Test-Path -LiteralPath $script:MonitoredMarker)})
     }
     if ($script:CheckProjectEnvironment -and $Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
-        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS')) {
             if ($null -ne [Environment]::GetEnvironmentVariable($name)) { throw "Shell environment overrode project setting $name." }
         }
     }
@@ -341,7 +341,8 @@ try {
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
     Assert-True ($entry.Parameters['DbReset'].Aliases -contains 'db-reset') 'The db-reset spelling must select the same switch.'
     Assert-True ($entry.Parameters['ForceChecks'].ParameterType -eq [Management.Automation.SwitchParameter]) 'ForceChecks must be an opt-in switch.'
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 4) 'Entry point must expose only Command, Project, DbReset and ForceChecks.'
+    Assert-True ($entry.Parameters['AgentSharingDiagnostics'].ParameterType -eq [Management.Automation.SwitchParameter]) 'Temporary sharing diagnostics must be an opt-in switch.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 5) 'Entry point must expose only Command, Project, DbReset, ForceChecks and AgentSharingDiagnostics.'
     foreach ($contract in @(
         @{file='large-tenant-tests.ps1';call='Invoke-LocalSoftwareChecks @{Root=$root;Operator=$image} -ForceChecks'},
         @{file='persistence.tests.ps1';call="Invoke-LocalDeployment `$context 'Deploy' -ForceChecks"}
@@ -408,9 +409,20 @@ try {
     Assert-True (-not $compose.Contains('TENANT_ID=') -and -not $compose.Contains('TENANTS_JSON=')) 'Compose environment duplicated the tenant registry.'
     Assert-True (-not $compose.Contains($clientSecret)) 'Client secret leaked into compose.env.'
     Assert-True (-not [IO.File]::ReadAllText((Join-Path $context.State 'settings.json')).Contains($clientSecret)) 'Client secret leaked into settings.json.'
+    Assert-True ($compose.Contains('AGENT_SHARING_DIAGNOSTICS=0')) 'Temporary sharing diagnostics did not default off.'
+    Assert-True ($composeTemplate.Contains('${LOCAL_STATE_DIR}/agent-sharing-diagnostics:/run/agent-sharing-diagnostics')) 'Private diagnostic storage was not mounted.'
+    $diagnosticDirectory=Join-Path $context.State 'agent-sharing-diagnostics'
+    Assert-True (Test-Path -LiteralPath $diagnosticDirectory -PathType Container) 'Protected diagnostic storage was not initialized.'
+    $context.AgentSharingDiagnostics=$true
+    Write-LocalComposeEnvironment $context
+    Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'compose.env')).Contains('AGENT_SHARING_DIAGNOSTICS=1')) 'Explicit diagnostic opt-in was lost.'
+    $context.AgentSharingDiagnostics=$false
+    Write-LocalComposeEnvironment $context
+    Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'compose.env')).Contains('AGENT_SHARING_DIAGNOSTICS=0')) 'Redeploying without opt-in did not disable diagnostics.'
     if (-not $IsWindows) {
         Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State 'secrets/tenants.json')) -eq 384) 'Tenant registry permissions are not 0600.'
         Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State 'secrets')) -eq 448) 'Secret directory permissions are not 0700.'
+        Assert-True ([int][IO.File]::GetUnixFileMode($diagnosticDirectory) -eq 448) 'Diagnostic directory permissions are not 0700.'
     }
     $script:Failure=''
     Invoke-LocalDeployment $context 'Deploy' 6>$null
@@ -749,7 +761,7 @@ try {
 
     $shellValues=@{}
     try {
-        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS')) {
             $shellValues[$name]=[Environment]::GetEnvironmentVariable($name)
         }
         $script:CheckProjectEnvironment=$true

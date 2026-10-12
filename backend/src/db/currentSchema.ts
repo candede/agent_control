@@ -17,6 +17,38 @@ AS $$
   SELECT encode(sha256(convert_to(payload::text,'UTF8')),'hex')
 $$;
 
+CREATE FUNCTION inventory_maker_sharing_valid(sharing jsonb)
+RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+AS $$
+DECLARE
+  sharing_role text;
+  recipients jsonb;
+  allowed_fields text[];
+  recipient_count jsonb;
+  numeric_count numeric;
+BEGIN
+  IF sharing IS NULL THEN RETURN true; END IF;
+  IF jsonb_typeof(sharing)<>'object' OR sharing-ARRAY['viewers','editors']<>'{}'::jsonb THEN RETURN false; END IF;
+  FOREACH sharing_role IN ARRAY ARRAY['viewers','editors'] LOOP
+    recipients := sharing->sharing_role;
+    IF recipients IS NULL OR recipients='null'::jsonb THEN CONTINUE; END IF;
+    allowed_fields := CASE WHEN sharing_role='viewers' THEN ARRAY['userCount','groupCount','entireTenant']
+      ELSE ARRAY['userCount','groupCount'] END;
+    IF jsonb_typeof(recipients)<>'object' OR recipients-allowed_fields<>'{}'::jsonb THEN RETURN false; END IF;
+    IF sharing_role='viewers' AND recipients ? 'entireTenant'
+      AND jsonb_typeof(recipients->'entireTenant') NOT IN ('boolean','null') THEN RETURN false; END IF;
+    FOR recipient_count IN SELECT value FROM jsonb_each(recipients-'entireTenant') LOOP
+      IF recipient_count='null'::jsonb THEN CONTINUE; END IF;
+      IF jsonb_typeof(recipient_count)<>'number' THEN RETURN false; END IF;
+      numeric_count := (recipient_count#>>'{}')::numeric;
+      IF numeric_count<0 OR numeric_count>9007199254740991 OR numeric_count<>trunc(numeric_count) THEN RETURN false; END IF;
+    END LOOP;
+  END LOOP;
+  RETURN true;
+END
+$$;
+
 CREATE TABLE app_schema (
     singleton boolean CONSTRAINT app_schema_pkey PRIMARY KEY DEFAULT TRUE CONSTRAINT app_schema_singleton_check CHECK (singleton)
   , fingerprint text NOT NULL CONSTRAINT app_schema_fingerprint_check CHECK (fingerprint ~ '^[a-f0-9]{64}$')
@@ -3140,6 +3172,10 @@ CREATE TABLE power_platform_record_rows (
   , detail_generation uuid
   , control_generation uuid
   , residual jsonb NOT NULL
+  , maker_org_wide_chat boolean GENERATED ALWAYS AS (
+      CASE WHEN jsonb_typeof(residual->'details'->'makerSharing'->'viewers'->'entireTenant')='boolean'
+        THEN (residual->'details'->'makerSharing'->'viewers'->>'entireTenant')::boolean ELSE NULL END
+    ) STORED
   , identity_expires_at timestamp with time zone
   , presence text
   , link_state text
@@ -3164,6 +3200,10 @@ CREATE TABLE power_platform_record_rows (
   , CONSTRAINT power_platform_record_rows_native_id_check CHECK (length(native_id) <= 512)
   , CONSTRAINT power_platform_record_rows_residual_check CHECK (jsonb_typeof(residual) = CAST('object' AS text)
                                                             AND octet_length(CAST(residual AS text)) <= 262144)
+  , CONSTRAINT power_platform_record_rows_maker_sharing_check CHECK (
+      inventory_maker_sharing_valid(residual->'details'->'makerSharing')
+      AND (NOT (residual->'details' ? 'makerSharing') OR resource_type='microsoft.copilotstudio/agents')
+    )
   , CONSTRAINT power_platform_record_rows_schema_version_check CHECK (schema_version = 1)
   , CONSTRAINT power_platform_record_rows_pkey PRIMARY KEY (generation_id, identity)
 );
@@ -3248,6 +3288,11 @@ CREATE TABLE inventory_facts (
   , CONSTRAINT inventory_facts_payload_check CHECK (octet_length(CAST(payload AS text)) <=
       CASE WHEN kind = 'element' THEN 4194304 ELSE 262144 END)
   , CONSTRAINT inventory_facts_schema_version_check CHECK (schema_version = 1)
+  , CONSTRAINT inventory_facts_shared_principal_check CHECK (kind <> 'sharedWithUsersAndGroups'
+      OR coalesce(jsonb_typeof(payload->'resourceId') = 'string'
+        AND payload->>'resourceId' = value AND length(value) <= 512 AND btrim(value) <> ''
+        AND jsonb_typeof(payload->'resourceType') = 'string'
+        AND lower(payload->>'resourceType') IN ('user','group'),false))
   , CONSTRAINT inventory_facts_text_value_check CHECK (octet_length(text_value) <= 262144)
   , CONSTRAINT inventory_facts_value_check CHECK (length(value) <= 4096)
   , CONSTRAINT inventory_facts_pkey PRIMARY KEY (generation_id, identity, ordinal)
@@ -6829,6 +6874,9 @@ REVOKE ALL PRIVILEGES
 GRANT EXECUTE
   ON FUNCTION official_usage_payload_hash (jsonb)
   TO agentcontrol_app;
+
+REVOKE ALL PRIVILEGES ON FUNCTION inventory_maker_sharing_valid(jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION inventory_maker_sharing_valid(jsonb) TO agentcontrol_app;
 
 GRANT SELECT, INSERT
   ON TABLE official_usage_row_facts

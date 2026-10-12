@@ -7,7 +7,7 @@ import { dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./d
 import { inventoryAsOf } from "./inventoryGenerations.js";
 import { parseUnifiedAgentRecordId, unifiedAgentSortKeys, type UnifiedAgentInventoryQuery,
   type SavedAgentEnvironment, type SavedAgentPerson } from "../types/unifiedAgents.js";
-import { normalizePackageAuthoringTool, packageStatusAliases } from "../types/copilotPackage.js";
+import { normalizePackageAuthoringTool, packageStatusAliases, type CopilotPackageDetail } from "../types/copilotPackage.js";
 import { AppError } from "../errors.js";
 import { readInventoryResponsibility } from "./inventoryResponsibility.js";
 import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
@@ -967,21 +967,25 @@ export class InventoryQueries {
       if (rows.length !== 1) throw new AppError(409, "inventory_identity_ambiguous", "The exact package has multiple selected memberships.");
       const row = rows[0];
       const assignments: Record<string, unknown[]> = {};
+      const principalCounts: NonNullable<CopilotPackageDetail["principalCounts"]> = {};
       let assignmentBytes = 0;
       let accessReadError: string | undefined;
-      for (const kind of ["allowedUsersAndGroups", "acquireUsersAndGroups"]) {
+      for (const kind of ["allowedUsersAndGroups", "acquireUsersAndGroups", "sharedWithUsersAndGroups"] as const) {
         const count = (await client.query(`SELECT count(*)::int AS total,
           coalesce(sum(octet_length(payload::text)),0)::int AS bytes FROM inventory_facts
           WHERE generation_id=$1 AND identity=$2 AND kind=$3`, [row.generation_id, row.identity, kind])).rows[0];
+        const present = (await client.query(`SELECT 1 FROM inventory_facts
+          WHERE generation_id=$1 AND identity=$2 AND kind='collection' AND value=$3 LIMIT 1`,
+        [row.generation_id, row.identity, kind])).rowCount;
+        if (count.total > 0 && !present) throw new AppError(500, "saved_source_invalid", "Saved package principals have no collection observation.");
+        if (!present) continue;
+        principalCounts[kind] = count.total;
+        if (kind === "sharedWithUsersAndGroups") continue;
         assignmentBytes += count.bytes;
         if (count.total > 1000 || assignmentBytes > 60_000) {
           accessReadError = "The saved access assignment exceeds the supported 1,000-principal or 60,000-byte control limit.";
           continue;
         }
-        const present = (await client.query(`SELECT 1 FROM inventory_facts
-          WHERE generation_id=$1 AND identity=$2 AND kind='collection' AND value=$3 LIMIT 1`,
-        [row.generation_id, row.identity, kind])).rowCount;
-        if (!present) continue;
         assignments[kind] = [];
         for (let after = -1; ;) {
           const page = (await client.query(`SELECT ordinal,payload FROM inventory_facts
@@ -993,7 +997,7 @@ export class InventoryQueries {
           after = page[page.length - 1].ordinal;
         }
       }
-      const detail = { ...projectPackageDetailAge(row.residual, selection.evaluated_at as string | Date), ...assignments,
+      const detail = { ...projectPackageDetailAge(row.residual, selection.evaluated_at as string | Date), ...assignments, principalCounts,
         matchingEvidence: row.evidence, ...(accessReadError ? { accessReadError } : {}),
         observation: { id: row.generation_id, observedAt: row.observed_at, expiresAt: row.expires_at, current: row.current,
           scopeKind: "exact", source: "Microsoft Graph package catalog", apiMaturity: "v1.0 read; preview controls" },
@@ -1067,7 +1071,7 @@ export class InventoryQueries {
         JOIN inventory_facts f ON f.generation_id=s.source_generation_id AND f.identity=s.source_identity
         WHERE ${inventoryAsOf()} AND m.identity=$3 AND s.source_scope_id=$4 AND s.source_identity=$5
           AND (f.kind LIKE 'detail:%' OR f.kind IN ('collection','element','identifier','connectorOperation','supportedHosts',
-            'elementTypes','categories','allowedUsersAndGroups','acquireUsersAndGroups'))
+            'elementTypes','categories','allowedUsersAndGroups','acquireUsersAndGroups','sharedWithUsersAndGroups'))
         GROUP BY 1)
         SELECT kind,total,count(*) OVER()::int AS section_count FROM sections WHERE kind COLLATE "C">$6
         ORDER BY kind COLLATE "C" LIMIT ${limit + 1}`,

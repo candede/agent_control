@@ -6,6 +6,7 @@ const detailFields = [
   ["elementDetails", "array"],
   ["allowedUsersAndGroups", "array"],
   ["acquireUsersAndGroups", "array"],
+  ["sharedWithUsersAndGroups", "array"],
   ["longDescription", "string"],
   ["categories", "array"],
   ["sensitivity", "string"],

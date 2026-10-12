@@ -25,6 +25,42 @@ table below summarizes its required permissions, not a dated readiness result.
 
 The selected package read contract is GET on `https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages` with exactly `$filter=supportedHosts/any(h:h eq 'Copilot')`, or GET on that path plus one encoded, exact opaque package ID for detail. No caller-supplied origin, query, selection, expansion or headers are admitted; `$top` is not requested. Traversed continuation links may add only one nonempty `$skiptoken`, retaining the endpoint/filter, and redirects fail closed. Equivalent-link loops, duplicate exact identities, unsupported declared resource types and malformed security fields reject collection rather than publishing partial/empty success. Access principals must have a user/group type (case-insensitive validation, no aliases) and a nonblank, bounded identity without C0/C1 controls; observations preserve both strings exactly, without imposing a GUID/version format on provider IDs. Automatic due-detail refreshes retain their initiating session and delegated-read capability generation through claiming work, admission, collection and publication. Existing finite page/row/response-byte/execution limits remain enforced, and catalog refresh does not fan out detail requests. Package reads require `CopilotPackages.Read.All` or the accepted `CopilotPackages.ReadWrite.All` grant; delegated beta mutations remain one-shot with their existing permission and readback contract. These are code/mock guarantees, not live-provider qualification.
 
+The documented [package-detail `sharedWithUsersAndGroups` collection](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/resources/copilotpackagedetail)
+is retained as read-only sharing evidence, independently of availability and
+installation assignments. Missing means Microsoft did not return the field;
+an empty array means Microsoft explicitly returned no recipients. Each supplied
+collection has the existing 5,000-principal bound and preserves order and exact
+IDs/types. Diagnostics record only field coverage/counts, never recipient IDs.
+Neither the recipient list nor `availableTo` is interpreted as Agent Builder's
+**Org-wide sharing for chat access** toggle. This change does not request
+Dataverse permissions, infer an access-control policy, or add sharing mutations.
+
+Normal Power Platform inventory now retains the documented Preview
+[`properties.sharedWithViewers` and `properties.sharedWithEditors`](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-agent-inventory)
+as native `details.makerSharing.viewers/editors`, independently of Graph admin
+availability/installation. `viewers.entireTenant` reports maker-controlled
+whole-tenant chat sharing, including without admin approval. The targeted
+October 13 captures returned `true` for BRD Review Analyst and `false` for
+Enterprise Visual Architect. A nullable generated native table column exposes
+that reported flag without turning missing/null into false. New observations,
+including omitted sharing fields, replace earlier native evidence.
+
+Captured harness/title/instruction-length metadata, component/knowledge counts,
+distinct-flow count and flow/trigger array lengths are bounded and tagged
+`observed`, not promoted into unverified GA contracts. The actual lowercase
+`isWebSearchEnabledForKnowledge` field is retained. Flow/trigger item definitions
+are not retained from unverified schemas; no prompt text or raw generic resource
+scaffolding is added. Graph owner/agent identity metadata and provider counters
+are separately tagged `observed`; provider counters have no verified reporting
+window or exception-rate unit and never replace imported usage reports.
+Duplicate new contract members (including dynamic knowledge-type keys), malformed
+sharing objects, unsafe/noninteger counts and invalid typed metadata reject
+collection explicitly. Scope, identity matching, admin mutations and export
+privacy boundaries are unchanged. Maker sharing remains read-only; no documented
+write endpoint has been established. See the
+[storage/display contract](record-data-foundation.md#maker-controlled-sharing-and-captured-agent-configuration)
+for field mappings and the reset/resync comparison procedure.
+
 Package transport tracks settled responses before abort-race delivery. Undelivered bodies are disposed without waiting for cleanup or exposing cleanup failures. Caller cancellation and initiating authority remain authoritative; a local phase deadline retains already-observed Graph denial/throttle status, request ID and Retry-After metadata. One elapsed-time-checked logical budget includes preparation, admission, retries, response bodies and progress; extended throttling requires a cancellation signal and absolute caller execution deadline, fenced by the persisted generation deadline. An observed HTTP denial cannot be retried merely because its provider code resembles a local transport error. Valid but unrepresentable positive Retry-After delays fail closed. HTTP 429 headers establish shared cooldown/pacing independently of a stalled body or expiring caller; token-service throttling never changes that Graph-wide state.
 
 Paced admission remains held through token renewal, durable preparation, final authority checking and physical dispatch. The next interval starts at actual dispatch, not an earlier reservation, so an elapsed-clock stall cannot collapse adjacent dispatches into a burst. Response/body waits remain concurrent; cancellation releases admission without leaving unobserved request failures.

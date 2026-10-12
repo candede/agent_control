@@ -14,7 +14,7 @@ export const syncSourceDetails: Record<DataSyncSourceId, {
   },
   graph_packages: {
     label: "Graph packages",
-    description: "Published agents and their matching identities",
+    description: "Published package catalog and basic metadata; the Graph package details step collects exact matching and sharing evidence",
     unit: "packages",
   },
   power_platform: {

@@ -24,6 +24,8 @@ describe("Data sync route contract", () => {
       roles: ["AgentControl.Viewer"],
     });
     for (const path of [
+      "POST /data-sync/package-details/start",
+      "POST /data-sync/package-details/cancel",
       "POST /data-sync/auto-refresh",
       "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry",
@@ -36,6 +38,9 @@ describe("Data sync route contract", () => {
         csrf: true,
       });
     }
+    expect(declaredRoutePolicies.get("GET /data-sync/package-details")).toEqual({
+      access: "authenticated", dataClass: "private_data_sync", roles: ["AgentControl.Viewer"],
+    });
   });
 
   it("strictly parses start and retry bodies while forcing the shared source allowlist", () => {

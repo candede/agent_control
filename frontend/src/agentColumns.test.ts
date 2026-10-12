@@ -14,7 +14,7 @@ describe("agent column preferences", () => {
     expect(used.description).toContain("existing administrator-reviewed association");
     expect(used.description).toContain("not a live or all-channel activity measure");
     expect(agentColumns.find(column => column.id === "origin")!.label).toBe("Package type");
-    expect(agentAccessOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
+    expect(agentAccessOptions.find(option => option.value === "available")!.label).toBe("Admin permits availability");
   });
 
   it("orders the requested defaults by identity, usage and access while retaining every optional column", () => {
@@ -22,7 +22,7 @@ describe("agent column preferences", () => {
     expect(Object.entries(defaultAgentColumnVisibility).filter(([, visible]) => visible).map(([id]) => id))
       .toEqual(["displayName", "publisher", "builtWith", "responses", "availability", "status", "actions"]);
     expect(agentColumns.filter(column => defaultAgentColumnVisibility[column.id]).map(column => column.label))
-      .toEqual(["Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions"]);
+      .toEqual(["Agent", "Publisher", "Built with", "Responses", "Admin availability", "Status", "Actions"]);
     expect(loadAgentColumns("new-account").visibility).toEqual(defaultAgentColumnVisibility);
   });
 

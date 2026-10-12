@@ -41,6 +41,13 @@ describe("operational telemetry", () => {
     })).toEqual({ requestId: "request-1", status: 429, source: "official_usage", outcome: "failed" });
   });
 
+  it("retains the sharing field label without logging recipient identities or collections", () => {
+    expect(safeTelemetry({
+      field: "sharedWithUsersAndGroups", count: 2,
+      resourceId: "private-user-id", sharedWithUsersAndGroups: [{ resourceId: "private-group-id", resourceType: "group" }],
+    })).toEqual({ field: "sharedWithUsersAndGroups", count: 2 });
+  });
+
   it("enforces numeric, boolean and finite diagnostic-label contracts", () => {
     for (const field of ["count", "queriedTypeCount", "page", "attempt", "schemaVersion", "length"]) {
       for (const value of ["private-value", true, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {

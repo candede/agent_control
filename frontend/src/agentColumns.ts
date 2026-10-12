@@ -21,10 +21,10 @@ export function inventoryScopeAgentCount(summary: UnifiedAgentInventorySummary, 
 }
 
 export const agentAccessOptions = [
-  { value: "all", label: "Any end-user access", description: "Do not restrict end-user access." },
-  { value: "available", label: "Available to end users", description: "Unblocked agents available to all or selected users, excluding known quarantined agents. Access is based on saved settings, not proof of use or an individual user's permissions." },
-  { value: "unavailable", label: "Not available to end users", description: "Agents known to be blocked, quarantined, or available to no users." },
-  { value: "unknown", label: "End-user access unknown", description: "Agents without enough saved access information. Creation, publication, installation or past usage alone does not establish access." },
+  { value: "all", label: "Any admin availability", description: "Do not restrict saved admin availability." },
+  { value: "available", label: "Admin permits availability", description: "Graph permits all or selected users, excluding known blocking and quarantine. This does not establish maker chat sharing or an individual user's effective permissions." },
+  { value: "unavailable", label: "Admin restricts availability", description: "Agents known to be blocked, quarantined, or administratively available to no users." },
+  { value: "unknown", label: "Admin availability unknown", description: "Agents without enough saved admin settings. Creation, publication, installation or past usage alone does not establish access." },
 ] as const;
 
 export const agentUsageOptions = [
@@ -64,11 +64,11 @@ export const agentColumns: readonly AgentColumnDefinition[] = [
   { id: "responses", label: "Responses", group: "Usage", format: "number", description: "Total responses in the selected report; not lifetime usage." },
   { id: "activeUsers", label: "Active users", group: "Usage", format: "number", description: "Distinct response-producing user identities in the selected report." },
   { id: "lastActivity", label: "Last used", group: "Usage", format: "date", description: "Last reported activity by anyone; may fall outside the reporting period." },
-  { id: "availability", label: "End-user access", group: "Overview", description: "Saved access settings, accounting for blocking and known quarantine. Specific users or groups does not mean everyone has access." },
+  { id: "availability", label: "Admin availability", group: "Overview", description: "Saved admin package settings, blocking and quarantine; not the maker's chat-sharing toggle or effective personal access." },
   { id: "status", label: "Status", group: "Overview" },
   { id: "hosts", label: "Hosts", group: "Overview", description: "Supported hosts, not evidence of usage in each host." },
   { id: "origin", label: "Package type", group: "Overview", description: "The original type value returned by the Graph package catalog, without inferred classification." },
-  { id: "deployment", label: "Installed for", group: "Overview", description: "Deployment scope, not an installed-user count." },
+  { id: "deployment", label: "Admin installation", group: "Overview", description: "Admin deployment scope, not an installed-user count or maker chat sharing." },
   { id: "owner", label: "Owner", group: "Ownership", description: "Saved owner identifier when reported by Power Platform." },
   { id: "createdBy", label: "Created by", group: "Ownership" },
   { id: "createdAt", label: "Created", group: "Ownership", format: "date" },

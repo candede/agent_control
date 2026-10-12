@@ -7,6 +7,7 @@ import { AppError, isTimeoutError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus } from "../types/dataSync.js";
+import type { PackageDetailSyncState } from "../types/dataSync.js";
 import { capabilities } from "./capabilities.js";
 import { graphErrorTelemetry, graphResponseDiagnostics, packageReadTimeoutMs } from "./graphPackages.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
@@ -53,12 +54,16 @@ type StartingRefresh = Omit<ActiveRefresh, "operation" | "autoDetails"> & {
   autoDetails?: boolean;
   operation: Promise<NonNullable<Awaited<ReturnType<PackageRefreshJobs["getJob"]>>>>;
 };
+type DetailCollection = { actor: PackageDataScope; controller: AbortController; operation: Promise<void> };
 const maximumActiveRefreshes = 4;
 const maximumAutomaticRefreshes = 2;
 
 export class PackageInventoryService {
   private readonly active = new Map<string, ActiveRefresh>();
   private readonly starting = new Map<string, StartingRefresh>();
+  private readonly detailCollections = new Map<string, DetailCollection>();
+  private readonly detailFailures = new Map<string, { code: string; message: string }>();
+  private readonly detailCancelledAt = new Map<string, number>();
   private draining = false;
 
   constructor(
@@ -92,10 +97,22 @@ export class PackageInventoryService {
   async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number, signal?: AbortSignal) {
     requireRefreshRole(user);
     const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId(user.tenantId!));
+    const collectionKey = detailCollectionKey(scope);
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const validateCapability = this.dependencies.beginOperationValidation("graph.package.read.delegated", user);
+    if (this.detailCancelledAt.has(collectionKey)) {
+      signal?.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      validateCapability();
+      const latest = await this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+      signal?.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      validateCapability();
+      return latest;
+    }
     const assertCurrent = () => {
       signal?.throwIfAborted();
+      if (this.detailCancelledAt.has(collectionKey)) throw new AppError(409, "read_job_cancelled", "Package detail collection was cancelled.");
       assertAccountSessionValidation(validation);
       validateCapability();
       requireProviderAdmissions();
@@ -109,6 +126,8 @@ export class PackageInventoryService {
     if (this.draining || this.laneCount(true) >= maximumAutomaticRefreshes) {
       return latestCurrentJob();
     }
+    const history = await latestCurrentJob();
+    if (history?.status === "cancelled" && !this.detailCollections.has(collectionKey)) return history;
     const job = await commitAccountSessionValidation(validation, async () => {
       assertCurrent();
       return this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
@@ -125,6 +144,11 @@ export class PackageInventoryService {
       assertCurrent();
       return started;
     } catch (error) {
+      if (error instanceof AppError && error.code === "read_job_cancelled") {
+        const cancelled = await this.repository.cancel(scope, job.id, user.homeAccountId);
+        if (!cancelled) throw new AppError(409, "package_refresh_expired", "The cancelled detail batch expired before its status could be saved.");
+        throw error;
+      }
       operationalLog("warn", "package_detail_admission_failed", { jobId: job.id, ...graphErrorTelemetry(error) });
       const failed = await this.repository.markFailed(scope, job.id, syncFailureCode(error),
         isAuthorizationFailure(error) && !isAdmissionPause(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
@@ -135,6 +159,122 @@ export class PackageInventoryService {
     } finally {
       signal?.removeEventListener("abort", abort);
     }
+  }
+
+  async detailSyncState(user: AuthenticatedUser): Promise<PackageDetailSyncState> {
+    requireRefreshRole(user);
+    const scope = actorScope(user);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    assertAccountSessionValidation(validation);
+    const [coverage, latest] = await Promise.all([
+      this.repository.detailCoverage(scope),
+      this.repository.latestAutomaticDetailsJob(scope, scope.principalId),
+    ]);
+    assertAccountSessionValidation(validation);
+    const key = detailCollectionKey(scope);
+    const pending = coverage.total - coverage.fresh;
+    const failure = this.detailFailures.get(key);
+    let status: PackageDetailSyncState["status"];
+    let message: string;
+    if (!coverage.catalog_available) {
+      status = "not_collected";
+      message = "Sync the Graph package catalog before collecting package details.";
+    } else if (!pending) {
+      status = "complete";
+      message = "Exact package details are fresh for every package in the current saved catalog.";
+    } else if (this.detailCancelledAt.has(key)) {
+      const stopping = latest && ["running", "waiting_authorization"].includes(latest.status) && !latest.errorCode;
+      status = stopping ? "running" : "paused";
+      message = stopping ? "Cancellation was requested. Waiting for the current detail batch to confirm it has stopped."
+        : "Package detail collection was cancelled. Start it again to collect the remaining packages.";
+    } else if (this.detailCollections.has(key) || latest && ["running", "waiting_authorization"].includes(latest.status) && !latest.errorCode) {
+      status = "running";
+      message = "Collecting exact package details in paced batches of at most 20. This includes matching metadata and sharing recipients.";
+    } else if (failure || latest?.status === "failed" || latest?.status === "waiting_authorization") {
+      status = dataSyncFailureStatus(failure?.code ?? latest?.errorCode ?? "interaction_required");
+      message = failure?.message ?? latest?.message ?? "Package detail collection needs renewed Microsoft authorization.";
+    } else if (latest?.status === "cancelled") {
+      status = "paused";
+      message = "Package detail collection was cancelled. Previously collected details remain saved.";
+    } else {
+      status = "ready";
+      message = coverage.eligible ? "Package details still need collection; catalog sync alone does not collect them."
+        : "Some details are waiting for the existing retry backoff. New eligible packages can be collected on the next authorized check.";
+    }
+    return { status, total: coverage.total, fresh: coverage.fresh, pending, eligible: coverage.eligible, message,
+      job: latest ? { id: latest.id, status: latest.status, observedCount: latest.observedCount, targetCount: latest.targetCount,
+        updatedAt: latest.updatedAt, ...(latest.errorCode ? { errorCode: latest.errorCode } : {}),
+        ...(latest.message ? { message: latest.message } : {}) } : null };
+  }
+
+  async startDetailSync(user: AuthenticatedUser, signedInAt?: number, requestedAt?: number) {
+    requireRefreshRole(user);
+    requireProviderAdmissions();
+    if (this.draining) throw new AppError(503, "package_refresh_shutdown", "Package refreshes are stopping for application shutdown.");
+    const actor = actorScope(user), key = detailCollectionKey(actor);
+    // A catalog run admitted before cancellation must not restart detail collection.
+    if (requestedAt !== undefined && (this.detailCancelledAt.get(key) ?? -1) >= requestedAt) return this.detailSyncState(user);
+    this.detailCancelledAt.delete(key);
+    if (this.detailCollections.has(key)) return this.detailSyncState(user);
+    if (this.detailCollections.size >= maximumAutomaticRefreshes) throw refreshCapacityError();
+    const controller = new AbortController();
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      requireProviderAdmissions();
+    };
+    assertCurrent();
+    this.detailFailures.delete(key);
+    const admitted = Promise.resolve().then(() => this.refreshDueDetails(user, signedInAt, controller.signal));
+    const collection: DetailCollection = { actor, controller, operation: Promise.resolve() };
+    this.detailCollections.set(key, collection);
+    collection.operation = admitted.then(async first => {
+      let current = first, previousId: string | undefined;
+      while (current) {
+        assertCurrent();
+        if (current.id === previousId) return;
+        previousId = current.id;
+        let batch: NonNullable<Awaited<ReturnType<PackageRefreshJobs["getJob"]>>> = current;
+        while (["running", "waiting_authorization"].includes(batch.status) && !batch.errorCode) {
+          await this.dependencies.wait(250, controller.signal);
+          assertCurrent();
+          const jobId = batch.id;
+          const next = await currentPackageWork(() => this.repository.getJob(actor, jobId), controller.signal, assertCurrent);
+          assertCurrent();
+          if (!next) throw new AppError(409, "package_refresh_expired", "The package detail job expired. Recheck status before retrying.");
+          batch = next;
+        }
+        if (batch.status !== "succeeded") return;
+        assertCurrent();
+        current = await this.refreshDueDetails(user, signedInAt, controller.signal);
+      }
+    }).catch(error => {
+      if (controller.signal.aborted && controller.signal.reason instanceof AppError
+        && controller.signal.reason.code === "read_job_cancelled") return;
+      this.detailFailures.set(key, { code: syncFailureCode(error), message: safeFailureMessage(error) });
+      operationalLog("error", "package_detail_collection_failed", graphErrorTelemetry(error));
+    }).finally(() => {
+      if (this.detailCollections.get(key) === collection) this.detailCollections.delete(key);
+    });
+    await admitted;
+    return this.detailSyncState(user);
+  }
+
+  async cancelDetailSync(user: AuthenticatedUser) {
+    requireRefreshRole(user);
+    const actor = actorScope(user), key = detailCollectionKey(actor);
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    assertAccountSessionValidation(validation);
+    const collection = this.detailCollections.get(key);
+    this.detailCancelledAt.set(key, Date.now());
+    collection?.controller.abort(new AppError(409, "read_job_cancelled", "Package detail collection was cancelled."));
+    const latest = await this.repository.latestAutomaticDetailsJob(actor, actor.principalId);
+    assertAccountSessionValidation(validation);
+    if (latest && ["running", "waiting_authorization"].includes(latest.status)) await this.cancel(user, latest.id, "delegated");
+    if (collection) await collection.operation;
+    this.detailFailures.delete(key);
+    return this.detailSyncState(user);
   }
 
   async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
@@ -300,14 +440,22 @@ export class PackageInventoryService {
     this.draining = true;
     const refreshes = [...this.starting.values(), ...this.active.values()];
     const reason = new AppError(401, "interaction_required", "Application shutdown requires explicit package refresh authorization.");
+    const collections = [...this.detailCollections.values()];
+    for (const collection of collections) collection.controller.abort(reason);
     for (const refresh of refreshes) refresh.controller.abort(reason);
     const results = await Promise.allSettled(refreshes.map(refresh => refresh.operation));
+    await Promise.all(collections.map(collection => collection.operation));
     const failure = results.find((result, index) => result.status === "rejected"
       && result.reason !== refreshes[index].controller.signal.reason);
     if (failure?.status === "rejected") throw failure.reason;
   }
 
   async waitForPrincipalAuthorization(scope: PackageDataScope) {
+    for (const collection of this.detailCollections.values()) {
+      if (collection.actor.tenantId === scope.tenantId && collection.actor.principalId === scope.principalId) {
+        collection.controller.abort(new AppError(401, "interaction_required", "The signed-in account changed during package detail collection."));
+      }
+    }
     for (const refresh of [...this.starting.values(), ...this.active.values()]) {
       if (refresh.actor.tenantId === scope.tenantId && refresh.actor.principalId === scope.principalId) {
         refresh.controller.abort(new AppError(401, "interaction_required", "The signed-in account changed during package refresh."));
@@ -473,6 +621,10 @@ export class PackageInventoryService {
 }
 
 export const packageInventory = new PackageInventoryService();
+
+function detailCollectionKey(scope: PackageDataScope) {
+  return `${scope.tenantId}\0${scope.principalId}`;
+}
 
 async function currentPackageWork<T>(operation: (signal: AbortSignal) => Promise<T>, parent: AbortSignal, assertCurrent: () => void,
   timeoutMs = packageReadTimeoutMs): Promise<T> {

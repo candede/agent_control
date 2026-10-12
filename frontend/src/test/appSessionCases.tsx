@@ -695,13 +695,21 @@ export function sessionAndNavigationCases() {
 
   it("checks automatic Users refresh after a CSV import and invalidates saved views once, not again when acknowledging it", async () => {
     const roles: SessionUser["roles"] = ["AgentControl.Admin"];
-    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
+    const saved = verifiedSavedAgentPage();
+    const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles, unifiedResponse: saved });
     const original = transport.fetchMock.getMockImplementation()!;
     const stages: ReturnType<typeof reportStage>[] = [];
     let reviewed: ReturnType<typeof reportBundle> | undefined;
     const reports = selectedAgentsPage().reports;
+    let accepted = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
       const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory/health") {
+        const { freshness, summary, verification, identityCollection, sources, partial, errors } = saved;
+        return Response.json({ freshness: { ...freshness, capturedRevision: accepted ? "9" : "8" }, summary,
+          verification: { ...verification, checkedAt: accepted ? "2026-09-20T12:15:00Z" : verification.checkedAt },
+          identityCollection, sources, partial, errors });
+      }
       if (url.pathname === "/api/official-usage/staging" && init?.method === "POST") {
         if (!(init.body instanceof FormData)) throw new Error("Expected a streamed upload");
         const file = init.body.get("file");
@@ -723,6 +731,7 @@ export function sessionAndNavigationCases() {
         });
         expect(stages.every(stage => stage.status === "active")).toBe(true);
         stages.forEach((stage, index) => { stages[index] = { ...stage, status: "accepted" }; });
+        accepted = true;
         return Response.json({ setId: reports.setId, activeRevision: reports.activeRevision, complete: true });
       }
       return original(input, init);
@@ -731,6 +740,7 @@ export function sessionAndNavigationCases() {
     render(<App />);
     await screen.findByText(agent.displayName);
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await within(await screen.findByRole("region", { name: "Inventory health" })).findByText("Verified");
     await userEvent.click(await screen.findByRole("button", { name: "Add CSV reports" }));
     await userEvent.upload(screen.getByLabelText("CSV report files"), ["agents.csv", "user-agents.csv", "users.csv"].map(
       name => new File(["synthetic CSV"], name, { type: "text/csv" }),
@@ -739,10 +749,14 @@ export function sessionAndNavigationCases() {
     const automaticChecks = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh").length;
     const before = stateReads();
     const beforeChecks = automaticChecks();
+    const healthReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/health").length;
+    const beforeHealth = healthReads();
     await userEvent.click(await screen.findByRole("button", { name: "Import reports" }));
     await screen.findByRole("heading", { name: "Reports imported" });
     await waitFor(() => expect(stateReads()).toBe(before + 1));
     await waitFor(() => expect(automaticChecks()).toBe(beforeChecks + 1));
+    await waitFor(() => expect(healthReads()).toBeGreaterThan(beforeHealth));
+    await within(screen.getByRole("region", { name: "Inventory health" })).findByText("Verified");
     await userEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog", { name: "Add CSV reports" })).not.toBeInTheDocument();
     expect(window.location.pathname).toBe("/sync");
@@ -1374,7 +1388,7 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     let ready = false;
     const message = "Waiting for the first inventory publication.";
-    transport.fetchMock.mockImplementation((input, init) => input === "/api/agent-inventory/selections" && !ready
+    transport.fetchMock.mockImplementation((input, init) => ["/api/agent-inventory/selections", "/api/agent-inventory/health"].includes(input) && !ready
       ? Promise.resolve(Response.json({ state, message })) : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -1390,7 +1404,7 @@ export function sessionAndNavigationCases() {
     expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeDisabled();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     ready = true;
-    await act(() => vi.advanceTimersByTimeAsync(5000));
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
     expect(receipt.getByText("Saved inventory verified")).toBeVisible();
     expect(within(health).getByText("Verified")).toBeVisible();
     expect(screen.queryByText(message)).not.toBeInTheDocument();
@@ -2662,7 +2676,7 @@ export function sessionAndNavigationCases() {
   );
 
   it.each(["inventory", "package-detail"] as const)(
-    "uses a new selected %s request after verification without joining an independent historical reader", async resource => {
+    "preserves a selected %s request during independent health verification without joining a historical reader", async resource => {
       const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
@@ -2688,12 +2702,12 @@ export function sessionAndNavigationCases() {
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
       await userEvent.click(screen.getByText("View diagnostics"));
       await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
-      await waitFor(() => expect(currentInventorySelection(transport.fetchMock)).not.toBe(selectionId));
+      await waitFor(() => expect(screen.getByText("Saved inventory verified")).toBeVisible());
+      expect(currentInventorySelection(transport.fetchMock)).toBe(selectionId);
       await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
       if (resource === "package-detail") {
         await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
-        await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) =>
-          isPackageDetailRequest(input, agent.id) && input !== historicalUrl)).toBe(true));
+        expect(transport.fetchMock.mock.calls.filter(([input]) => input === historicalUrl)).toHaveLength(2);
       }
       expect(historicalSignal?.aborted).toBe(false);
       const historical = resource === "inventory" ? selectedInventoryPage(historicalUrl!, unifiedPage)
@@ -3119,7 +3133,7 @@ export function sessionAndNavigationCases() {
     const denied = deferredResponse();
     let deny = false;
     transport.fetchMock.mockImplementation((input, init) =>
-      deny && new URL(input, "http://localhost").pathname === "/api/agent-inventory" ? denied.promise : base(input, init));
+      deny && new URL(input, "http://localhost").pathname === "/api/agent-inventory/health" ? denied.promise : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await userEvent.click(await screen.findByText("View diagnostics"));
@@ -4619,7 +4633,7 @@ export function sessionAndNavigationCases() {
     expect(await screen.findByText(agent.displayName)).toBeVisible();
     expect(screen.queryByRole("button", { name: /Inventory needs attention/ })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
-    expect(await screen.findByText("Sources checked")).toBeVisible();
+    expect(await within(screen.getByRole("region", { name: "Inventory health" })).findByText("Details pending", { exact: true })).toBeVisible();
     expect(screen.queryByText("What needs attention")).not.toBeInTheDocument();
     expect(screen.queryByText(/awaiting identity metadata/)).not.toBeInTheDocument();
   });
@@ -4684,7 +4698,7 @@ export function sessionAndNavigationCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities") return permissionCatalog.promise;
       if (input === "/api/capabilities/check") return base("/api/capabilities", init);
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory/health") {
         return verificationRequested ? pending.promise : Response.json(page);
       }
       return base(input, init);
@@ -4728,14 +4742,14 @@ export function sessionAndNavigationCases() {
     expect(receipt.getByText("Saved data verified at").nextElementSibling?.querySelector("time")).toHaveAttribute("datetime", checkedAt);
     expect(receipt.getByText("Graph source collected at").nextElementSibling).toHaveTextContent(collectedTime!);
     const requests = transport.fetchMock.mock.calls.slice(before);
-    expect(requests.filter(([input]) => input === "/api/agent-inventory/selections")).toHaveLength(1);
-    expect(requests.filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(1);
+    expect(requests.filter(([input]) => input === "/api/agent-inventory/health")).toHaveLength(1);
+    expect(requests.filter(([input]) => input === "/api/agent-inventory/selections" || input.startsWith("/api/agent-inventory?"))).toHaveLength(0);
     expect(requests.filter(([path, init]) => path !== "/api/agent-inventory/selections" && init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method])).toEqual([]);
     expect(new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost").searchParams.has("snapshotId")).toBe(false);
     expect(receipt.queryByText(/partial inventory|coverage unknown/i)).not.toBeInTheDocument();
   });
 
-  it.each(["capture", "page"] as const)("keeps one pending verification %s while switching between inventory consumers", async phase => {
+  it("cancels only a pending health read on departure and captures a fresh receipt on return without thawing browsing", async () => {
     window.history.replaceState({}, "", "/sync");
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -4746,7 +4760,7 @@ export function sessionAndNavigationCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       const response = await base(input, init);
       const path = new URL(input, "http://localhost").pathname;
-      if (deferNextRead && path === (phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory")) {
+      if (deferNextRead && path === "/api/agent-inventory/health") {
         deferNextRead = false;
         pendingResponse = response;
         pendingSignal = init?.signal;
@@ -4763,27 +4777,26 @@ export function sessionAndNavigationCases() {
     await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
     await waitFor(() => expect(pendingResponse).toBeDefined());
     await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
-    expect(pendingSignal?.aborted).toBe(false);
-    expect(screen.getByRole("status", { name: "Updating agent results" })).toBeVisible();
+    expect(pendingSignal?.aborted).toBe(true);
+    expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
-    expect(screen.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
-    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    await screen.findByText("Saved inventory verified");
 
     await act(async () => pending.resolve(pendingResponse!));
     await screen.findByText("Saved inventory verified");
     const requests = transport.fetchMock.mock.calls.slice(before);
-    expect(requests.filter(([path]) => path === "/api/agent-inventory/selections")).toHaveLength(1);
-    expect(requests.filter(([path]) => new URL(path, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
-    expect(pendingSignal?.aborted).toBe(false);
+    expect(requests.filter(([path]) => path === "/api/agent-inventory/health")).toHaveLength(2);
+    expect(requests.filter(([path]) => path === "/api/agent-inventory/selections")).toHaveLength(0);
+    expect(requests.filter(([path]) => new URL(path, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(0);
+    expect(pendingSignal?.aborted).toBe(true);
   });
 
 }
 
 export function savedInventoryCases() {
-  it.each((["capture", "page"] as const).flatMap(phase =>
-    (["filter", "scope", "departure"] as const).map(boundary => ({ phase, boundary }))))(
-    "retires a pending verification $phase on $boundary and ignores its late denial", async ({ phase, boundary }) => {
+  it.each(["filter", "scope", "departure"] as const)(
+    "retires an independent pending health verification before %s and ignores its late denial", async boundary => {
       window.history.replaceState({}, "", "/sync");
       const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
       const base = transport.fetchMock.getMockImplementation()!;
@@ -4791,8 +4804,7 @@ export function savedInventoryCases() {
       let deferNextRead = false;
       let pendingSignal: AbortSignal | null | undefined;
       transport.fetchMock.mockImplementation(async (input, init) => {
-        if (deferNextRead && new URL(input, "http://localhost").pathname ===
-          (phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory")) {
+        if (deferNextRead && new URL(input, "http://localhost").pathname === "/api/agent-inventory/health") {
           deferNextRead = false;
           pendingSignal = init?.signal;
           return pending.promise;
@@ -4807,7 +4819,7 @@ export function savedInventoryCases() {
       await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
       await waitFor(() => expect(pendingSignal).toBeDefined());
       await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
-      expect(pendingSignal?.aborted).toBe(false);
+      expect(pendingSignal?.aborted).toBe(true);
       if (boundary === "filter") fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: agent.displayName } });
       else if (boundary === "scope") await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
       else {
@@ -4841,7 +4853,7 @@ export function savedInventoryCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities") return permissionCatalog.promise;
       if (input === "/api/capabilities/check") return base("/api/capabilities", init);
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory/health") {
         return verificationRequested ? verification.promise : Response.json(page);
       }
       return base(input, init);
@@ -4866,7 +4878,8 @@ export function savedInventoryCases() {
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     await act(async () => verification.resolve(Response.json({ ...page, revision: "b".repeat(64) })));
     await receipt.findByText("Saved inventory verified");
-    expect(transport.fetchMock.mock.calls.slice(beforeVerification).filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.slice(beforeVerification).filter(([input]) => input === "/api/agent-inventory/health")).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.slice(beforeVerification).filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(0);
     expect(nonGetRequests()).toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]]));
   });
 
@@ -4896,7 +4909,7 @@ export function savedInventoryCases() {
     })).toBe(true);
   });
 
-  it("captures inventory only once when verifying from a later result page", async () => {
+  it("verifies health without replacing the inventory captured on a later result page", async () => {
     const page = { ...unifiedPage, counts: { ...unifiedPage.counts, filtered: 51 },
       value: Array.from({ length: 51 }, (_, index) => ({ ...unifiedPage.value[0], id: `graph_packages:saved-${index}`,
         displayName: `Saved agent ${index}`, packages: [{ ...agent, id: `saved-${index}` }] })) };
@@ -4915,11 +4928,11 @@ export function savedInventoryCases() {
     await waitFor(() => expect(verify).toBeEnabled());
     const captures = transport.fetchMock.mock.calls.slice(before)
       .filter(([path]) => path === "/api/agent-inventory/selections");
-    expect(captures).toHaveLength(1);
-    expect(captures[0][1]?.signal?.aborted).toBe(false);
+    expect(captures).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.slice(before).filter(([path]) => path === "/api/agent-inventory/health")).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
-    expect(await screen.findByText("Saved agent 0")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Previous" })).toBeDisabled();
+    expect(await screen.findByText("Saved agent 50")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeEnabled();
   });
 
   it.each([false, true])("keeps pending metadata visible without launching automatic provider backfill after Verify saved inventory (page correction: %s)", async correctPage => {
@@ -4937,7 +4950,7 @@ export function savedInventoryCases() {
           previewQualification: "not_required", remediation: [],
         } }] });
       }
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(verificationRequested ? {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory/health") return Response.json(verificationRequested ? {
         ...page, revision: "b".repeat(64), identityCollection: { checkedPackages: 1008, pendingPackages: 2 },
         verification: createUnifiedVerification(page.verification, { packageMetadata: false }),
       } : correctPage ? { ...page, count: 51, offset: 50 } : page);
@@ -4956,7 +4969,7 @@ export function savedInventoryCases() {
     expect(transport.fetchMock.mock.calls.slice(before).filter(([path, init]) => path !== "/api/agent-inventory/selections" && init?.method === "POST")).toEqual([]);
     expect(transport.fetchMock.mock.calls.slice(before)
       .filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")
-      .map(([input]) => new URL(input, "http://localhost").searchParams.get("cursor"))).toEqual([null]);
+      .map(([input]) => new URL(input, "http://localhost").searchParams.get("cursor"))).toEqual([]);
   });
 
   it.each(["conflict", "expiry"] as const)("replaces a previous green receipt after %s and permits a saved-only retry", async failure => {
@@ -4969,7 +4982,7 @@ export function savedInventoryCases() {
       : "Saved normalized identities do not match provider total.";
     let fail = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return base(input, init);
+      if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory/health") return base(input, init);
       if (!fail) return Response.json(page);
       return failure === "expiry"
         ? Response.json({ code: "selection_invalidated", detail: message }, { status: 409 })
@@ -4987,10 +5000,9 @@ export function savedInventoryCases() {
     expect(receipt.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(receipt.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
-    const issue = await screen.findByRole("button", { name: /Inventory needs attention.*Open Sync/ });
-    expect(issue).toHaveAttribute("title", expect.stringContaining(message));
-    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
-    await userEvent.click(issue);
+    expect(screen.queryByRole("button", { name: /Inventory needs attention.*Open Sync/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(screen.getByText("View diagnostics"));
     const retryReceipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     await waitFor(() => expect(retryReceipt.getByRole("alert")).toHaveTextContent(message));
@@ -5010,7 +5022,7 @@ export function savedInventoryCases() {
     const pending = deferredResponse();
     let deferNextRead = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory/health") {
         if (deferNextRead) { deferNextRead = false; return pending.promise; }
         return Response.json(page);
       }
@@ -5047,7 +5059,7 @@ export function savedInventoryCases() {
       let replacementSession = false;
       let retiredSignal: AbortSignal | null | undefined;
       transport.fetchMock.mockImplementation(async (input, init) => {
-        if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory") return base(input, init);
+        if (new URL(input, "http://localhost").pathname !== "/api/agent-inventory/health") return base(input, init);
         if (deferNextRead) {
           deferNextRead = false;
           retiredSignal = init?.signal;
@@ -7037,7 +7049,7 @@ export function savedInventoryCases() {
     const pending = deferredResponse();
     let verifying = false;
     transport.fetchMock.mockImplementation((input, init) =>
-      verifying && input === "/api/agent-inventory/selections" ? pending.promise : base(input, init));
+      verifying && input === "/api/agent-inventory/health" ? pending.promise : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "View diagnostics" }));
@@ -9124,7 +9136,7 @@ export function commandsAndExportsCases() {
     render(<App />);
     await screen.findByRole("button", { name: `View details for ${agent.displayName}` });
     await userEvent.click(screen.getByRole("button", { name: "Columns" }));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Installed for" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Admin installation" }));
     await userEvent.keyboard("{Escape}");
     const row = within(screen.getByRole("table")).getAllByRole("row")[1];
     await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
@@ -9137,7 +9149,7 @@ export function commandsAndExportsCases() {
     await userEvent.click(within(confirmation).getByRole("button", { name: `Confirm update ${target}` }));
     await waitFor(() => expect(within(row).getByText(target === "availability" ? "Not available" : "No users")).toBeInTheDocument());
     await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
-    const summary = () => within(detail).getByText(target === "availability" ? "End-user access" : "Installed for",
+    const summary = () => within(detail).getByText(target === "availability" ? "Admin availability" : "Admin installation",
       { selector: ".agent-overview-facts span" }).nextElementSibling;
     expect(summary()).toHaveTextContent(target === "availability" ? /^Not available$/ : /^No users$/);
     expect(summary()).toBeVisible();
@@ -10008,7 +10020,7 @@ export function commandsAndExportsCases() {
     render(<App />);
     const overview = within(await screen.findByRole("region", { name: "Agent inventory overview" }));
     await waitFor(() => expect(overview.getByText("Agents in catalog").parentElement).toHaveTextContent("1"));
-    expect(overview.getByText("Available to end users").parentElement).toHaveTextContent("0");
+    expect(overview.getByText("Admin-permitted agents").parentElement).toHaveTextContent("0");
     expect(await overview.findByRole("alert")).toHaveTextContent("Retained reports unavailable.");
     expect(overview.getByText("Reported used agents").parentElement).toHaveTextContent("Unknown");
     expect(overview.getByText("Reported active · 30 days").parentElement).toHaveTextContent("Unknown");
@@ -10075,7 +10087,7 @@ export function commandsAndExportsCases() {
     const overview = within(await screen.findByRole("region", { name: "Agent inventory overview" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Additional Power Platform agents" })).toHaveTextContent("1"));
     expect(overview.getByText("Agents in catalog").parentElement).toHaveTextContent("Unknown");
-    expect(overview.getByText("Available to end users").parentElement).toHaveTextContent("Unknown");
+    expect(overview.getByText("Admin-permitted agents").parentElement).toHaveTextContent("Unknown");
     expect(screen.queryByText(native.displayName)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
     await screen.findByText(native.displayName);
@@ -12576,6 +12588,12 @@ function appTransport({
     }
     if (input === "/api/workbench/metadata") return Response.json({ views: workbenchViews, actions: workbenchActions });
     if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({ revisions: transport.publicationRevisions }));
+    if (input === "/api/data-sync/package-details") {
+      const total = unifiedResponse.verification.graphPackageCount;
+      const pending = unifiedResponse.identityCollection?.pendingPackages ?? 0;
+      return Response.json({ status: pending ? "ready" : "complete", total, fresh: total - pending,
+        pending, eligible: pending, message: pending ? "Exact package details need collection." : "All package details are fresh.", job: null });
+    }
     if (input === "/api/workbench/jobs") return Response.json({
       value: [], unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "sync-history",
     });
@@ -12602,6 +12620,10 @@ function appTransport({
         code: transport.protectedFailureCode ?? (transport.failProtectedReadsWith === 401 ? "unauthorized" : "forbidden"),
         detail: transport.failProtectedReadsWith === 401 ? "The current session has expired." : "The provider permission is insufficient.",
       }, { status: transport.failProtectedReadsWith });
+      if (input === "/api/agent-inventory/health") {
+        const { freshness, summary, verification, identityCollection, sources, partial, errors } = unifiedResponse;
+        return Response.json({ freshness, summary, verification, identityCollection, sources, partial, errors });
+      }
       if (input === "/api/agent-inventory/selections" && init?.method === "POST") {
         const { query } = JSON.parse(String(init.body)) as { query: Record<string, string> };
         const selection = { ...unifiedResponse.selection, id: crypto.randomUUID(), publicationRevisions: { ...transport.publicationRevisions } };

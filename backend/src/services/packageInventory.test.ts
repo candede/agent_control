@@ -45,6 +45,7 @@ function fixture(options: { autoDetails?: boolean; exact?: boolean; application?
     updatedAt: "2026-09-09T00:00:00.000Z", resultRevision: "2026-09-09 00:00:00+00", finishedAt: null,
   };
   const repository = {
+    detailCoverage: vi.fn(async () => ({ catalog_available: true, total: 40, fresh: 0, eligible: 40 })),
     submit: vi.fn(async () => job), getJob: vi.fn(async (_scope?: unknown, id = job.id): Promise<typeof job | undefined> => ({ ...job, id })),
     claimDueDetails: vi.fn(async () => null as typeof job | null), latestAutomaticDetailsJob: vi.fn(async () => null as typeof job | null),
     markRunning: vi.fn(async () => true), recordProgress: vi.fn(async () => undefined), complete: vi.fn(async () => undefined),
@@ -98,6 +99,103 @@ describe("streamed package refresh service", () => {
     await Promise.allSettled(services.splice(0).map(service => service.drain()));
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("exposes exact-detail completeness independently of catalog publication and distinguishes an empty catalog from no catalog", async () => {
+    const f = fixture();
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({
+      status: "ready", total: 40, fresh: 0, pending: 40, eligible: 40, job: null,
+    });
+    f.repository.detailCoverage.mockResolvedValue({ catalog_available: false, total: 0, fresh: 0, eligible: 0 });
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({ status: "not_collected", total: 0 });
+    f.repository.detailCoverage.mockResolvedValue({ catalog_available: true, total: 0, fresh: 0, eligible: 0 });
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({ status: "complete", pending: 0 });
+  });
+
+  it("continues paced detail batches to completion without another browser request", async () => {
+    const f = fixture({ autoDetails: true });
+    const first = { ...f.job, status: "succeeded" as const, observedCount: 20 };
+    const second = { ...first, id: randomUUID() };
+    const refresh = vi.spyOn(f.service, "refreshDueDetails").mockResolvedValueOnce(first)
+      .mockImplementationOnce(async () => {
+        f.repository.detailCoverage.mockResolvedValue({ catalog_available: true, total: 40, fresh: 40, eligible: 0 });
+        f.repository.latestAutomaticDetailsJob.mockResolvedValue(second);
+        return second;
+      }).mockResolvedValue(null);
+    await f.service.startDetailSync(f.owner);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({
+      status: "complete", total: 40, fresh: 40, pending: 0, job: { targetCount: 20 },
+    });
+  });
+
+  it("stops the detail collection on a failed batch and reports the actual permission failure", async () => {
+    const f = fixture({ autoDetails: true });
+    const failed = { ...f.job, status: "failed" as const, errorCode: "missing_permission", message: "Microsoft package read permission is required." };
+    f.repository.latestAutomaticDetailsJob.mockResolvedValue(failed);
+    const refresh = vi.spyOn(f.service, "refreshDueDetails").mockResolvedValue(failed);
+    await f.service.startDetailSync(f.owner);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({
+      status: "permission_required", pending: 40, message: failed.message,
+    });
+  });
+
+  it("deduplicates detail collection starts and aborts an outstanding job observation on cancellation", async () => {
+    const f = fixture({ autoDetails: true });
+    const running = { ...f.job, status: "running" as const };
+    const cancelled = { ...f.job, status: "cancelled" as const };
+    const held = deferred<typeof f.job | undefined>();
+    f.repository.getJob.mockReturnValueOnce(held.promise).mockResolvedValue(running);
+    f.repository.latestAutomaticDetailsJob.mockResolvedValue(running);
+    f.repository.cancel.mockImplementation(async () => {
+      f.repository.latestAutomaticDetailsJob.mockResolvedValue(cancelled);
+      return cancelled;
+    });
+    const refresh = vi.spyOn(f.service, "refreshDueDetails").mockResolvedValue(running);
+    await Promise.all([f.service.startDetailSync(f.owner), f.service.startDetailSync(f.owner)]);
+    await vi.waitFor(() => expect(f.repository.getJob).toHaveBeenCalledOnce());
+    await expect(f.service.cancelDetailSync(f.owner)).resolves.toMatchObject({ status: "paused", pending: 40 });
+    expect(refresh).toHaveBeenCalledOnce();
+    held.resolve(cancelled);
+  });
+
+  it("does not let a previously admitted catalog run restart cancelled details and permits an explicit resume", async () => {
+    const f = fixture({ autoDetails: true });
+    const requestedAt = Date.now() - 1;
+    await f.service.cancelDetailSync(f.owner);
+    const refresh = vi.spyOn(f.service, "refreshDueDetails").mockResolvedValue(null);
+    await expect(f.service.startDetailSync(f.owner, undefined, requestedAt)).resolves.toMatchObject({ status: "paused" });
+    expect(refresh).not.toHaveBeenCalled();
+    await f.service.startDetailSync(f.owner);
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+  it("honors persisted automatic detail cancellation after a process or browser restart", async () => {
+    const f = fixture({ autoDetails: true });
+    f.repository.latestAutomaticDetailsJob.mockResolvedValue({ ...f.job, status: "cancelled" });
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({ status: "paused", pending: 40 });
+    await expect(f.service.refreshDueDetails(f.owner)).resolves.toMatchObject({ status: "cancelled" });
+    expect(f.repository.claimDueDetails).not.toHaveBeenCalled();
+    expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+  it("persists cancellation even when its first batch claim finishes after the cancellation request", async () => {
+    const f = fixture({ autoDetails: true }), pending = deferred<typeof f.job>();
+    f.repository.claimDueDetails.mockReturnValueOnce(pending.promise);
+    f.repository.cancel.mockImplementation(async () => {
+      const cancelled = { ...f.job, status: "cancelled" };
+      f.repository.latestAutomaticDetailsJob.mockResolvedValue(cancelled);
+      return cancelled;
+    });
+    const starting = expect(f.service.startDetailSync(f.owner)).rejects.toMatchObject({ code: "read_job_cancelled" });
+    await vi.waitFor(() => expect(f.repository.claimDueDetails).toHaveBeenCalledOnce());
+    const cancelling = f.service.cancelDetailSync(f.owner);
+    await vi.waitFor(() => expect(f.repository.latestAutomaticDetailsJob).toHaveBeenCalledTimes(2));
+    pending.resolve(f.job);
+    await starting;
+    await expect(cancelling).resolves.toMatchObject({ status: "paused", job: { status: "cancelled" } });
+    expect(f.repository.cancel).toHaveBeenCalledWith(expect.any(Object), f.job.id, f.owner.homeAccountId);
+    expect(f.repository.markFailed).not.toHaveBeenCalled();
+    expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
   });
 
   it.each([{ exact: false }, { exact: true }, { autoDetails: true }])(
@@ -732,7 +830,7 @@ describe("streamed package refresh service", () => {
     await expect(f.service.refreshDueDetails(f.owner)).resolves.toBe(latest);
     await f.service.drain();
     await expect(f.service.refreshDueDetails(f.owner)).resolves.toBe(latest);
-    expect(f.repository.claimDueDetails).toHaveBeenCalledOnce();
+    expect(f.repository.claimDueDetails).toHaveBeenCalledTimes(status === "cancelled" ? 0 : 1);
     expect(f.dependencies.revalidateUser).not.toHaveBeenCalled();
     expect(f.collection).not.toHaveBeenCalled();
   });
@@ -765,7 +863,7 @@ describe("streamed package refresh service", () => {
       else await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
       pending.resolve(f.job);
       await stopped;
-      expect(f.repository.claimDueDetails).toHaveBeenCalledTimes(branch === "unclaimed" ? 1 : 0);
+      expect(f.repository.claimDueDetails).not.toHaveBeenCalled();
       expect(f.dependencies.revalidateUser).not.toHaveBeenCalled();
       expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
       expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();

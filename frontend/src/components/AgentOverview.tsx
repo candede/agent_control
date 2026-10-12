@@ -12,7 +12,7 @@ import { AgentConnectorOperations, SavedAgentChannels, SavedAgentConnectors } fr
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../../../backend/src/services/inventoryIdentity";
 
 const connectorPageSize = 10;
-type Property = { label: string; value: ReactNode; wide?: boolean };
+type Property = { label: string; value: ReactNode; wide?: boolean; hint?: string };
 
 export function AgentOverview({ record, selectionId, selectedPackage, packageDetail, peopleState, onOpenPerson, onInvalidated }: {
   record: UnifiedAgentRecord;
@@ -27,9 +27,15 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
   const [localNow, setLocalNow] = useState(Date.now);
   const now = Math.max(localNow, capabilities?.now ?? 0);
   const resource = record.powerPlatformResource;
+  const nativeObservation = record.observations.powerPlatform;
+  const nativeCurrent = nativeObservation?.current === true && Date.parse(nativeObservation.observedAt) <= now
+    && Date.parse(nativeObservation.expiresAt) > now;
+  const makerSharing = resource?.details.makerSharing;
+  const components = resource?.details.componentsCounts;
   const { people, loading: loadingPeople, error: peopleError, unavailable: peopleUnavailable, canRetry, retry: retryPeople } = peopleState;
   const missingName = resource && !resource.displayName?.trim() && record.displayName === resource.nativeId;
   const metadata = packageDetail ?? selectedPackage;
+  const showMakerSharing = resource?.type === "microsoft.copilotstudio/agents" || metadata?.type?.toLowerCase() === "shared";
   const observedRecord = packageDetail ? {
     ...record,
     packages: record.packages.map(item => item.id === packageDetail.id ? packageDetail : item),
@@ -101,6 +107,20 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
     { label: "Agent region", value: resource?.location?.toLowerCase() !== environment?.region?.toLowerCase() ? resource?.location : undefined },
     { label: "Authoring source", value: resource && !powerPlatformAuthoringTool(resource) ? resource.details.createdIn : undefined },
   ]);
+  const additionalConfiguration = properties([
+    { label: "Harness", value: resource?.details.harness },
+    { label: "Instruction characters", value: resource?.details.instructionsCharactersCount },
+    { label: "Connected agents", value: components?.connectedAgents },
+    { label: "Knowledge sources", value: components?.knowledge },
+    { label: "Topics", value: components?.topics },
+    { label: "Tools", value: components?.tools },
+    { label: "Knowledge by type", value: components && Object.hasOwn(components, "knowledgeByType")
+      ? components.knowledgeByType == null ? "Not reported"
+        : Object.entries(components.knowledgeByType).map(([kind, count]) => `${kind}: ${count ?? "Not reported"}`).join(", ") || "None reported" : undefined, wide: true },
+    { label: "Distinct flows", value: resource?.details.distinctFlows },
+    { label: "Flow references", value: resource?.details.flowReferenceCount, hint: "Reported flow-reference count, not flow definitions." },
+    { label: "Triggers", value: resource?.details.triggerCount, hint: "Reported trigger count, not trigger definitions." },
+  ]);
   const nativeBotId = resource?.identifiers.find(item => item.kind === "cds_bot_id")?.value;
   const identifiers = properties([
     { label: "Agent ID", value: resource?.nativeId },
@@ -110,15 +130,19 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
     { label: "Entra agent ID", value: resource?.identifiers.find(item => item.kind === "entra_agent_id")?.value },
     { label: "Package ID", value: metadata?.id },
     { label: "Package app ID", value: metadata?.appId },
+    { label: "Power Platform title ID", value: resource?.details.titleId, wide: true },
+    { label: "Provider resource path", value: resource?.providerResourceId, wide: true },
+    { label: "Graph owner ID", value: metadata && Object.hasOwn(metadata, "ownerId") ? metadata.ownerId ?? "Not reported" : undefined, wide: true },
+    { label: "Graph reported agent identity ID", value: metadata && Object.hasOwn(metadata, "agentIdentityId") ? metadata.agentIdentityId ?? "Not reported" : undefined, wide: true },
   ]);
 
   return <div className="agent-overview">
     <div className="inventory-detail-grid agent-overview-facts">
       <OverviewFact label="Status" value={<AgentStatus record={observedRecord} />} />
-      <OverviewFact label="End-user access" value={<AgentAvailability record={observedRecord} />} />
-      <OverviewFact label="Installed for" value={installationSummary ?? (observedRecord.packages.length ? "Unknown" : "Not reported")} />
+      <OverviewFact label="Admin availability" value={<AgentAvailability record={observedRecord} />} />
+      <OverviewFact label="Admin installation" value={installationSummary ?? (observedRecord.packages.length ? "Unknown" : "Not reported")} />
     </div>
-    {packageCount > 1 ? <p className="agent-insight-note">Status and access summarize all {packageCount.toLocaleString()} published versions.</p> : null}
+    {packageCount > 1 ? <p className="agent-insight-note">Status and admin availability summarize all {packageCount.toLocaleString()} published versions.</p> : null}
     {missingName ? <p className="agent-insight-note">Agent name not reported; showing its resource ID.</p> : null}
     <section className="agent-overview-information" aria-label="Agent information">
       {description || information.length || dates.length ? <section className="agent-overview-section" aria-label="About">
@@ -152,9 +176,29 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
             : <p>Environment details are unavailable. Check inventory coverage in Sync.</p>}
         </section> : null}
       </div>
-      {configuration.length ? <section className="agent-overview-section" aria-label="Configuration">
+      {showMakerSharing ? <section className="agent-overview-section" aria-label="Maker-controlled sharing">
+        <h3>Maker-controlled sharing <span className="agent-overview-preview" title="Read-only Power Platform preview">Preview</span></h3>
+        {!nativeCurrent ? <p className="notice">{nativeObservation ? "Sharing details are unverified or out of date." : "Sharing details are unavailable."} Sync Power Platform inventory.</p> : null}
+        <Properties values={[
+          { label: "Org-wide sharing for chat access", value: makerSharing?.viewers?.entireTenant === true ? "Enabled"
+            : makerSharing?.viewers?.entireTenant === false ? "Disabled" : "Not reported" },
+          { label: "Viewer users", value: makerSharing?.viewers?.userCount ?? "Not reported", hint: "Explicitly shared viewer users; excludes implicit ownership." },
+          { label: "Viewer groups", value: makerSharing?.viewers?.groupCount ?? "Not reported" },
+          { label: "Editor users", value: makerSharing?.editors?.userCount ?? "Not reported", hint: "Explicitly shared editor users; excludes implicit ownership." },
+          { label: "Editor groups", value: makerSharing?.editors?.groupCount ?? "Not reported" },
+          { label: "Sharing observed", value: nativeObservation
+            ? <time dateTime={nativeObservation.observedAt}>{new Date(nativeObservation.observedAt).toLocaleString(undefined, {
+              year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+            })}</time> : "Not reported" },
+        ]} />
+      </section> : null}
+      {configuration.length || additionalConfiguration.length ? <section className="agent-overview-section" aria-label="Configuration">
         <h3>Configuration</h3>
-        <Properties values={configuration} />
+        {configuration.length ? <Properties values={configuration} /> : null}
+        {additionalConfiguration.length ? <section className="agent-overview-subsection" aria-label="Components and authoring">
+          <h4>Components and authoring</h4>
+          <Properties values={additionalConfiguration} />
+        </section> : null}
       </section> : null}
     </section>
     {resource ? <section className="agent-overview-section" aria-label="Configured connectors and operations">
@@ -190,9 +234,25 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
           : "Configured connector details are unavailable. Refresh inventory in Sync."}</p>}
       {partialConnectors ? <p className="agent-insight-note">Some connector or operation details are unavailable.</p> : null}
     </section> : null}
-    {identifiers.length ? <section className="agent-overview-section agent-overview-identifiers" aria-label="Identifiers">
-      <h3>Identifiers</h3>
-      <Properties values={identifiers} />
+    {identifiers.length || metadata?.providerUsage ? <section className="agent-overview-section" aria-label="Technical details">
+      <h3>Technical details</h3>
+      <div className="agent-overview-technical">
+        {identifiers.length ? <section className="agent-overview-identifiers" aria-label="Identifiers">
+          <h4>Identifiers</h4>
+          <Properties values={identifiers} />
+        </section> : null}
+        {metadata?.providerUsage ? <section aria-label="Graph provider telemetry">
+          <h4>Graph provider telemetry</h4>
+          <Properties values={[
+            { label: "Provider active users", value: metadata.providerUsage.activeUsers ?? "Not reported" },
+            { label: "Provider sessions", value: metadata.providerUsage.totalSessions ?? "Not reported" },
+            { label: "Provider runtime (hours)", value: metadata.providerUsage.totalRunTimeInHours ?? "Not reported" },
+            { label: "Provider exception rate (raw)", value: metadata.providerUsage.exceptionRate ?? "Not reported", hint: "Provider units are not verified." },
+            { label: "Provider last used", value: dateValue(metadata.providerUsage.lastUsedDateTime) ?? "Not reported" },
+          ]} />
+          <p>Graph counters; reporting window not provided.</p>
+        </section> : null}
+      </div>
     </section> : null}
   </div>;
 }
@@ -204,7 +264,7 @@ function properties(values: Property[]) {
 
 function Properties({ values }: { values: Property[] }) {
   if (!values.length) return null;
-  return <dl className="agent-property-grid">{values.map(item => <div key={item.label} className={item.wide ? "agent-property-wide" : undefined}><dt>{item.label}</dt>
+  return <dl className="agent-property-grid">{values.map(item => <div key={item.label} className={item.wide ? "agent-property-wide" : undefined}><dt title={item.hint}>{item.label}</dt>
     <dd>{typeof item.value === "boolean" ? item.value ? "Yes" : "No" : item.value}</dd></div>)}</dl>;
 }
 
