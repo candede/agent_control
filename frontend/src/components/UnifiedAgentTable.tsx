@@ -11,6 +11,7 @@ import { usageAvailabilityLabel, usageCoverageLabel } from "../usageInsights";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { AgentColumnPicker } from "./AgentColumnPicker";
 import "./unifiedAgent.css";
+import { normalizeEnvironmentIdentity } from "../../../backend/src/services/inventoryIdentity";
 
 const features = tableFeatures({ columnVisibilityFeature, rowSortingFeature });
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" });
@@ -131,7 +132,7 @@ export function UnifiedAgentTable({
       : grouped ? selectedRecordIds?.has(record.id) ? packageCount : 0 : packageIds.filter(id => selectedPackageIds.has(id)).length)
       + Number(quarantineSelectable && record.powerPlatformResource !== null
         && selectedPowerPlatformKeys.has(quarantineTargetKey(record.powerPlatformResource)));
-    const environmentName = record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : null;
+    const environmentName = record.environmentId ? environmentNames[normalizeEnvironmentIdentity(record.environmentId)] || record.environmentId : null;
     const usageMatchesReport = Boolean(usageContext?.reports.setId
       && (usageContext.reports.availability === "active" || usageContext.reports.availability === "stale")
       && record.usage?.reportSetId === usageContext.reports.setId);

@@ -35,7 +35,7 @@ const permissionFeatureUses: Partial<Record<CapabilityId, Readonly<Record<string
     "LicenseAssignment.Read.All": "Users / Sync: read the tenant product and service-plan catalog.",
   },
   "reports.copilotUsage.read": {
-    "Reports.Read.All": "Users / Sync: refresh 30-day Microsoft 365 Copilot app activity.",
+    "Reports.Read.All": "Users / Sync: refresh 28-day Microsoft 365 Copilot app activity.",
   },
   "powerPlatform.inventory.read": {
     "ResourceQuery.Resources.Read": "Agents / Sync: refresh Power Platform agent and environment inventory.",

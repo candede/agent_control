@@ -3,9 +3,14 @@ import { GraphPackagesClient, buildCopilotAgentsListUrl } from "./graphPackages.
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import { generationHeartbeat } from "../db/dataGenerations.js";
 import { inventoryMatchKey } from "./inventoryRecordProjection.js";
+import { AppError } from "../errors.js";
 
-describe("dormant inventory pages", () => {
-  beforeEach(() => { vi.spyOn(console, "log").mockImplementation(() => {}); vi.spyOn(console, "warn").mockImplementation(() => {}); });
+describe("streamed inventory pages", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
   it("bounds indexed compound identities without truncating long schema-name evidence", () => {
     const common = "schema".repeat(500);
@@ -55,7 +60,7 @@ describe("dormant inventory pages", () => {
     }
     expect(observed).toBe(5001);
   });
-  it("enforces the 10000-page ceiling without a growing process seen-token set", async () => {
+  it("enforces the 10000-page ceiling before issuing another request", async () => {
     let page = 0;
     const client = new GraphPackagesClient(async () => Response.json({ value: [{ id: String(++page), displayName: "X", isBlocked: false }],
       "@odata.nextLink": `${buildCopilotAgentsListUrl()}&$skiptoken=${page}` }));
@@ -104,8 +109,71 @@ describe("dormant inventory pages", () => {
     const fetcher = vi.fn(async () => Response.json({ value: [{ id: "one", displayName: "X", isBlocked: false }],
       "@odata.nextLink": "https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?$filter=other" }));
     const pages = new GraphPackagesClient(fetcher).catalogPages("synthetic", { visit: async () => {} });
-    await pages.next();
     await expect(pages.next()).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["visit", "beforeRequest", "progress"] as const)("interrupts a non-cooperative native %s callback without advancing the source", async stage => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "read_job_cancelled", "Synthetic cancellation.");
+    const blocked = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const callback = vi.fn(() => { started.resolve(); return blocked.promise; });
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, data: [], resultTruncated: false }));
+    const pages = new PowerPlatformResourceQueryClient(fetcher).pages("synthetic", ["microsoft.copilotstudio/agents"], {
+      signal: controller.signal, visit: stage === "visit" ? callback : async () => {},
+      beforeRequest: stage === "beforeRequest" ? callback : undefined,
+      onProgress: stage === "progress" ? callback : undefined,
+    });
+    if (stage === "progress") expect((await pages.next()).value?.page).toBe(1);
+    const pending = pages.next();
+    const rejected = expect(pending).rejects.toBe(reason);
+    await started.promise;
+    controller.abort(reason);
+    await rejected;
+    expect(fetcher).toHaveBeenCalledTimes(stage === "progress" ? 1 : 0);
+    blocked.resolve();
+    expect((await pages.next()).done).toBe(true);
+    const events = vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry));
+    expect(events.filter(entry => entry.event === "inventory_query_failed")).toHaveLength(1);
+  });
+
+  it("bounds a non-cooperative native fetch and disposes its late response without waiting for cleanup", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("Synthetic deadline", "TimeoutError")), milliseconds);
+      return controller.signal;
+    });
+    const fetching = Promise.withResolvers<Response>();
+    const cleanup = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => cleanup.promise);
+    const fetcher = vi.fn(() => fetching.promise);
+    const pending = new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 })
+      .pages("synthetic", ["microsoft.copilotstudio/agents"], { visit: async () => {} }).next();
+    const rejected = expect(pending).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
+    fetching.resolve(new Response(new ReadableStream({ cancel })));
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+    cleanup.resolve();
+  });
+
+  it("terminates diagnostics when for-await closes a rejected durable page consumer", async () => {
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, data: [], resultTruncated: false }));
+    const failure = new Error("Synthetic durable page failure.");
+    const consume = async () => {
+      for await (const _page of new PowerPlatformResourceQueryClient(fetcher)
+        .pages("synthetic", ["microsoft.copilotstudio/agents"], { visit: async () => {} })) throw failure;
+    };
+    await expect(consume()).rejects.toBe(failure);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const events = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls]
+      .map(([entry]) => JSON.parse(entry));
+    expect(events.filter(entry => /inventory_query_(completed|failed|interrupted)/.test(entry.event))).toEqual([
+      expect.objectContaining({ event: "inventory_query_interrupted", stage: "save_page", pages: 0, observedCount: 0, outcome: "incomplete" }),
+    ]);
   });
 });

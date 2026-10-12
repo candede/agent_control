@@ -54,8 +54,8 @@ export type CandidateAgentUsageHistory = {
   latestReported: AgentUsageHistoryPoint | null;
   counts: { total: number; filtered: number }; page: OfficialReportFacetPage["page"];
 };
-export type CandidateAgentUsageMutation = Pick<CandidateAgentUsageContext, "selectionId" | "reportSetId" | "usageRevision" | "inventoryRevision">
-  & { reportAgentId: string; confirmed: true; target?: AgentUsageTarget };
+export type CandidateAgentUsageMutation = Pick<CandidateAgentUsageContext, "selectionId" | "usageRevision" | "inventoryRevision">
+  & { reportSetId: string; reportAgentId: string; confirmed: true; target?: AgentUsageTarget };
 export type CandidateAgentUsageCandidates = { value: Array<ReportAgent & { associated: boolean }>; context: CandidateAgentUsageContext;
   selection: PublishedSelectedRead; page: OfficialReportFacetPage["page"]; counts: OfficialReportFacetPage["counts"] };
 export type CandidateAgentUsageAssociations = { value: Array<{ reportAgentId: string; agentName: string; responses: number;

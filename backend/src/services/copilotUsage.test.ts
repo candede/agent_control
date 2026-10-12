@@ -80,7 +80,7 @@ describe("live Users orchestration and publication boundary", () => {
       .toMatchObject({ status: "succeeded", count: 1 });
     expect(await h.status()).toMatchObject({ sources: { directory: { state: "available", rowCount: 1 }, app_activity: { state: "available", rowCount: 1 } } });
     expect((await h.repository.getRun(h.identity, h.publication.runId))?.sources[0]).toMatchObject({ status: "running", count: 1, jobId: h.publication.jobId });
-    expect(progress).toHaveBeenCalledWith(1);
+    expect(progress).toHaveBeenCalledWith(1, expect.any(Function));
     expect(h.revalidateUser).toHaveBeenCalledTimes(4);
     expect(h.delegatedToken).toHaveBeenCalledTimes(4);
     const selected = await h.sources.capture(h.identity, "delegated");

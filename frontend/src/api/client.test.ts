@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
-import type { LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
+import type { AuditActor, LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
+import { getWorkbenchMetadata as backendWorkbenchMetadata } from "../../../backend/src/services/workbenchMetadata";
 import { createUnifiedVerification } from "../test/inventoryVerification";
 import { deferred } from "../test/deferred";
 import { createReportExport, reportExportStatus, reportExportDownload, reportPages, readReportDetail, readAgentReportSummary, readAgentReportCandidates, mutateAgentReportAssociation, stageReport } from "./reportData";
@@ -28,6 +29,7 @@ import {
   resolveAgentInvestigationIdentity,
   getAgentPurviewRecords,
   getCurrentUser,
+  getWorkbenchMetadata,
   getUnifiedAgents,
   getUnifiedAgentDetail,
   getInventoryMembers,
@@ -133,6 +135,109 @@ it("checks automatic refresh with an empty JSON body and the current session CSR
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("workbench metadata contract", () => {
+  it("accepts the backend contract without changing provider modes, roles or report workflows", async () => {
+    const metadata = backendWorkbenchMetadata();
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(metadata));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(getWorkbenchMetadata({ signal: controller.signal })).resolves.toEqual(metadata);
+    expect(fetchMock).toHaveBeenCalledWith("/api/workbench/metadata", expect.objectContaining({
+      credentials: "include", signal: controller.signal,
+    }));
+  });
+
+  it.each([
+    { name: "missing action roles", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { Reflect.deleteProperty(metadata.actions[0], "roles"); } },
+    { name: "empty action roles", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.actions[0].roles = []; } },
+    { name: "missing capability requirement", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { Reflect.deleteProperty(metadata.actions[0], "capabilityId"); } },
+    { name: "unknown capability", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { Reflect.set(metadata.actions[0], "capabilityId", "graph.unknown"); } },
+    { name: "ambiguous actions", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.actions.push({ ...metadata.actions[0], roles: ["AgentControl.Admin"] }); } },
+    { name: "ambiguous views", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.views[1] = { ...metadata.views[0] }; } },
+    { name: "unsafe view link", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { Reflect.set(metadata.views[0], "path", "//untrusted.invalid/agents"); } },
+    { name: "unsafe action link", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.actions[0].route = "/api/../auth/login"; } },
+    { name: "unknown method", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { Reflect.set(metadata.actions[0], "method", "PUT"); } },
+    { name: "unbounded label", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.actions[0].label = "x".repeat(129); } },
+    { name: "unsafe presentation", change: (metadata: ReturnType<typeof backendWorkbenchMetadata>) => { metadata.actions[0].label = "Action\u202e"; } },
+  ])("fails closed on $name in a successful response", async ({ change }) => {
+    const metadata = backendWorkbenchMetadata();
+    change(metadata);
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(metadata, { headers: { "X-Request-ID": "metadata-request" } })));
+    try {
+      await expect(getWorkbenchMetadata()).rejects.toMatchObject({
+        code: "invalid_response", status: 200, requestId: "metadata-request",
+      });
+      expect(listener).not.toHaveBeenCalled();
+    } finally { unsubscribe(); }
+  });
+
+  it("rejects duplicate contract properties rather than authorizing with the last value", async () => {
+    const metadata = backendWorkbenchMetadata();
+    const text = JSON.stringify(metadata).replace('"roles":["AgentControl.Viewer"]', '"roles":["AgentControl.Admin"],"roles":["AgentControl.Viewer"]');
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(text)));
+    await expect(getWorkbenchMetadata()).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("projects only own contract fields from otherwise valid JSON", async () => {
+    const metadata = backendWorkbenchMetadata();
+    Reflect.set(metadata, "diagnostics", { private: "not part of the metadata contract" });
+    Reflect.set(metadata.actions[0], "toJSON", "not a metadata field");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(metadata)));
+    const result = await getWorkbenchMetadata();
+    expect(result).not.toHaveProperty("diagnostics");
+    expect(result.actions[0]).not.toHaveProperty("toJSON");
+  });
+
+  it("cancels oversized metadata bodies without waiting for the stream to finish", async () => {
+    const cancel = vi.fn();
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(" ".repeat(65_537))); },
+      cancel,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream)));
+    await expect(getWorkbenchMetadata()).rejects.toMatchObject({ code: "invalid_response" });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("decodes multibyte labels across chunks and preserves their exact text", async () => {
+    const metadata = backendWorkbenchMetadata();
+    metadata.actions[0].label = "Refresh – source data";
+    const bytes = new TextEncoder().encode(JSON.stringify(metadata));
+    const split = bytes.indexOf(0xe2) + 1;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, split));
+        controller.enqueue(bytes.slice(split));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream)));
+    await expect(getWorkbenchMetadata()).resolves.toEqual(metadata);
+  });
+
+  it("rejects malformed UTF-8 rather than silently changing metadata labels", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new Uint8Array([0xff]))));
+    await expect(getWorkbenchMetadata()).rejects.toMatchObject({ code: "invalid_response", kind: "problem" });
+  });
+
+  it("aborts a pending metadata stream without revalidating the current session", async () => {
+    const cancel = vi.fn(), reading = deferred<void>(), controller = new AbortController(), listener = vi.fn();
+    const stream = new ReadableStream({ pull() { reading.resolve(); }, cancel });
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream)));
+    try {
+      const result = getWorkbenchMetadata({ signal: controller.signal });
+      await reading.promise;
+      controller.abort();
+      await expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(listener).not.toHaveBeenCalled();
+    } finally { unsubscribe(); }
+  });
 });
 
 describe("selected inventory detail page requests", () => {
@@ -396,7 +501,7 @@ describe("access API client", () => {
     const event: AuditEvent = {
       id: "audit-export-receipt", operationId: "export-operation", action: "export-administrative-audit",
       scope: "bulk", agentId: "audit-export", status: "succeeded",
-      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer", roles: ["AgentControl.Admin"] },
+      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer" },
       startedAt: "2026-09-15T12:00:00.000Z", completedAt: "2026-09-15T12:00:01.000Z",
       requestPath: "/api/audit/events/export.csv", metadata: { selectedCount: 2 },
     };
@@ -404,18 +509,20 @@ describe("access API client", () => {
     const result = await getAuditEvents({ action: "export-administrative-audit" });
     expect(result.value).toEqual([event]);
     expect(result.value[0]).not.toHaveProperty("targetBlockedState");
+    expect(result.value[0].actor).not.toHaveProperty("roles");
   });
 
   it("keeps audit receipt and query actions aligned with the backend contract", () => {
     expectTypeOf<AuditEvent["action"]>().toEqualTypeOf<BackendLocalAuditAction>();
     expectTypeOf<AuditEventsQuery["action"]>().toEqualTypeOf<BackendLocalAuditAction | undefined>();
+    expectTypeOf<AuditEvent["actor"]>().toEqualTypeOf<AuditActor>();
   });
 
   it("filters and retains hunting-scope revocation receipts without package blocked state", async () => {
     const event: AuditEvent = {
       id: "hunting-scope-revocation", operationId: "revoke-operation", action: "revoke-hunting-scope",
       scope: "single", agentId: "retained-scope-one", status: "succeeded",
-      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer", roles: ["AgentControl.Admin"] },
+      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer" },
       startedAt: "2026-09-15T12:00:00.000Z", completedAt: "2026-09-15T12:00:01.000Z",
       requestPath: "/api/hunting/retained-scopes/retained-scope-one/revoke",
     };
@@ -980,6 +1087,14 @@ describe("access API client", () => {
       id: "agent:11111111-1111-4111-8111-111111111111",
       packages: [{ id: "package/a" }, { id: "package:b" }],
       powerPlatformResource: { nativeId: "native/a", environmentId: "environment-a" },
+      observations: { graphPackages: null, powerPlatform: null, packageSnapshots: {
+        "package/a": {
+          id: "catalog-generation", snapshotId: "catalog-generation", current: false, scopeKind: "broad",
+          observedAt: "2026-09-19T12:00:00.000Z", expiresAt: "2026-09-20T11:00:00.000Z",
+          identityDetails: { id: "detail-generation", snapshotId: "detail-generation", current: true,
+            observedAt: "2026-09-20T12:00:00.000Z", expiresAt: "2030-01-01T00:00:00.000Z" },
+        },
+      } },
       identity: {
         state: "matched",
         evidence: [
@@ -1695,6 +1810,22 @@ describe("API response failures", () => {
       status: 200, code: "invalid_response", kind: "problem", requestId: "invalid-json-request",
       message: "The server returned an invalid JSON response.",
     });
+  });
+
+  it.each(["", "private@example.invalid", "a".repeat(129), "request-id ", "request\u2028id", "request\nid"])(
+    "falls back to the exact safe header when a problem request ID is invalid: %j", async requestId => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+        code: "provider_error", requestId,
+      }, { status: 502, headers: { "X-Request-ID": "Header-Request_1" } })));
+      await expect(getAgents()).rejects.toMatchObject({ requestId: "Header-Request_1", status: 502 });
+    },
+  );
+
+  it.each(["9".repeat(400), "9007199254740992"])("omits unsafe numeric retry diagnostics: %s", async retryAfter => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code: "provider_error" }, {
+      status: 429, headers: { "Retry-After": retryAfter, "X-Request-ID": "private@example.invalid" },
+    })));
+    await expect(getAgents()).rejects.toMatchObject({ status: 429, requestId: undefined, retryAfterSeconds: undefined });
   });
 
   it.each(["not JSON", "null", "[]", '{"code":23,"detail":{},"requestId":false,"type":[]}'])(

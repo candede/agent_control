@@ -63,7 +63,14 @@ describe("unified agent export references", () => {
     const nativeId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
     const observed = { ...record, powerPlatformResource: { environmentId: "ENVIRONMENT-A", nativeId } };
     expect(selectedAgentExportReferences([observed], [],
-      [`power_platform:environment-a:${nativeId.toLowerCase()}`])).toEqual([canonical]);
+      [`power_platform:ENVIRONMENT-A:${nativeId.toLowerCase()}`])).toEqual([canonical]);
+    expect(selectedAgentExportReferences([observed], [],
+      [`power_platform:environment-a:${nativeId.toLowerCase()}`])).toEqual([
+      `power_platform:environment-a:${nativeId.toLowerCase()}`,
+    ]);
+    const environmentId = `Default-${nativeId}`;
+    expect(selectedAgentExportReferences([{ ...observed, powerPlatformResource: { environmentId, nativeId } }], [],
+      [`power_platform:${environmentId.toUpperCase()}:${nativeId.toLowerCase()}`])).toEqual([canonical]);
     expect(selectedAgentExportReferences([{ ...observed, powerPlatformResource: {
       environmentId: "ENVIRONMENT-A", nativeId: "Opaque/Native",
     } }], [], ["power_platform:environment-a:opaque%2Fnative"])).toEqual(["power_platform:environment-a:opaque%2Fnative"]);

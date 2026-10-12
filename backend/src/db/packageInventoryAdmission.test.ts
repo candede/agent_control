@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { pool } from "./pool.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "./sessions.js";
+import { dataConnections } from "./dataConnections.js";
 
 vi.mock("./pool.js", () => ({
-  pool: { query: vi.fn() },
-  secretValue: vi.fn(),
-  transaction: vi.fn(async (database, operation) => operation(database)),
+  pool: { options: { max: 4 }, query: vi.fn(),
+    connect: vi.fn(async () => { throw new Error("Unit tests must not connect to a database."); }) },
+  secretValue: vi.fn((name: string) => name === "SESSION_SECRET" ? "synthetic-package-admission-session-secret" : undefined),
+  transaction: vi.fn(async (database, operation, _signal, beforeCommit) => {
+    const result = await operation(database);
+    beforeCommit?.();
+    return result;
+  }),
 }));
 vi.mock("../services/operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
 
@@ -42,9 +49,11 @@ const requestHash = createHash("sha256").update(JSON.stringify({
   authorizationPrincipalId: input.authorizationPrincipalId, queryHash,
 })).digest("hex");
 
-beforeEach(() => {
+beforeEach(async () => {
+  await activateAccountSession(scope.tenantId, scope.principalId, async () => {});
   query.mockReset().mockRejectedValue(new Error("Unexpected database query in package admission unit test."));
 });
+afterEach(() => vi.restoreAllMocks());
 
 describe("package refresh admission", () => {
   it("rejects an expired idempotent replay instead of returning an undefined job", async () => {
@@ -107,7 +116,68 @@ describe("package refresh admission", () => {
     expect(query.mock.calls[0][0]).toContain("deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')");
     expect(query.mock.calls[0][0]).toContain("deadline_at>clock_timestamp()");
     expect(query.mock.calls[0][0]).toContain("expires_at>clock_timestamp()");
+    expect(query.mock.calls[0][0]).toContain("page_count=0,observed_count=0,total_records=NULL");
     expect(query.mock.calls[0][1]).toEqual([job.id, scope.tenantId, scope.principalId, 4 * 60 * 60_000]);
+  });
+
+  it.each(["later", "same"] as const)("retains automatic authorization backoff when the latest attempt is %s relative to sign-in", async timing => {
+    const signedInAt = Date.parse("2026-09-22T00:01:00.000Z");
+    query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce({ ...emptyResult, rows: [{
+        created_at: job.created_at, attempted_at: new Date(signedInAt + (timing === "later" ? 1 : 0)),
+        cooling_down: true, error_code: "interaction_required", requested_ids: ["Exact-Package"],
+      }] });
+
+    await expect(new PackageRefreshJobs().claimDueDetails(scope, scope.principalId, signedInAt)).resolves.toBeNull();
+    expect(query).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([null, new Date("2026-09-22T00:00:30.000Z")])(
+    "allows renewed sign-in to retry older automatic authorization failures (attempt=%s)", async attemptedAt => {
+      query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+        .mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+        .mockResolvedValueOnce({ ...emptyResult, rows: [{
+          created_at: job.created_at, attempted_at: attemptedAt,
+          cooling_down: true, error_code: "interaction_required", requested_ids: ["Exact-Package"],
+        }] }).mockResolvedValueOnce(emptyResult);
+
+      await expect(new PackageRefreshJobs().claimDueDetails(scope, scope.principalId,
+        Date.parse("2026-09-22T00:01:00.000Z"))).resolves.toBeNull();
+      expect(query).toHaveBeenCalledTimes(6);
+      expect(query.mock.calls[5][1]).toEqual([scope.tenantId, scope.principalId, ["Exact-Package"]]);
+    },
+  );
+
+  it("cleans up only the unchanged automatic claim after stale admission", async () => {
+    const automatic = { ...job, auto_details: true, status: "failed", error_code: "authorization_expired" };
+    query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1 })
+      .mockResolvedValueOnce({ ...emptyResult, rows: [automatic] });
+
+    await expect(new PackageRefreshJobs().markFailed(scope, job.id, "authorization_expired", "Renew authorization.", job.result_revision))
+      .resolves.toMatchObject({ id: job.id, status: "failed", errorCode: "authorization_expired" });
+
+    const statement = String(query.mock.calls[0][0]);
+    expect(statement).toContain("id=$1 AND tenant_id=$2 AND principal_id=$3");
+    expect(statement).toContain("auto_details AND status='waiting_authorization' AND attempted_at IS NULL");
+    expect(statement).toContain("updated_at::text=$6");
+    expect(query.mock.calls[0][1]).toEqual([
+      job.id, scope.tenantId, scope.principalId, "authorization_expired", "Renew authorization.", job.result_revision,
+    ]);
+  });
+
+  it.each(["waiting_authorization", "running", "failed"])("does not overwrite saved %s work after automatic claim cleanup loses ownership", async status => {
+    const replacement = { ...job, auto_details: true, status, attempted_at: new Date("2026-09-22T00:01:00.000Z"),
+      result_revision: "2026-09-22 00:01:00+00" };
+    query.mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce({ ...emptyResult, rows: [replacement] });
+
+    await expect(new PackageRefreshJobs().markFailed(scope, job.id, "authorization_expired", "Renew authorization.", job.result_revision))
+      .resolves.toMatchObject({ id: job.id, status, resultRevision: replacement.result_revision });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(String(query.mock.calls[0][0])).toContain("auto_details AND status='waiting_authorization' AND attempted_at IS NULL");
+    expect(String(query.mock.calls[0][0])).toContain("updated_at::text=$6");
+    expect(String(query.mock.calls[1][0])).toMatch(/^SELECT /);
   });
 
   it("counts only retained jobs still within their dispatch deadline under the scope lock", async () => {
@@ -142,5 +212,60 @@ describe("package refresh admission", () => {
 
     await expect(repository.submit(scope, input)).rejects.toMatchObject({ code: "job_limit" });
     expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it("fences submission before commit when the initiating authority changes during the insert", async () => {
+    let current = true;
+    query.mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce({ ...emptyResult, rows: [{ count: 0 }] })
+      .mockImplementationOnce(async () => { current = false; return emptyResult; });
+    const assertCurrent = () => { if (!current) throw new Error("Submission authority changed."); };
+    await expect(new PackageRefreshJobs().submit(scope, input, assertCurrent))
+      .rejects.toThrow("Submission authority changed.");
+    expect(query).toHaveBeenCalledTimes(5);
+    expect(String(query.mock.calls.at(-1)?.[0])).toContain("INSERT INTO package_refresh_jobs");
+  });
+
+  it("rejects saved history after account revocation during its summary read", async () => {
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [job] })
+      .mockImplementationOnce(async () => {
+        await revokeAccountSessionMutations(scope.tenantId, scope.principalId, async () => {});
+        return { ...emptyResult, rows: [{ last_attempt_at: null, last_success_at: null }] };
+      });
+    await expect(new PackageRefreshJobs().listJobs(scope, scope.principalId)).rejects.toMatchObject({ code: "unauthorized" });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects target pages after account revocation during the selected read", async () => {
+    const read = vi.spyOn(dataConnections(pool), "selectedRead").mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(scope.tenantId, scope.principalId, async () => {});
+      return { value: [], revision: job.result_revision, counts: { total: 0, filtered: 0 },
+        page: { limit: 50, nextCursor: null, previousCursor: null } } as never;
+    });
+    await expect(new PackageRefreshJobs().targets(scope, {
+      ...scope, authorizationHash: "viewer", sessionEpoch: "0",
+    }, job.id, {})).rejects.toMatchObject({ code: "unauthorized" });
+    expect(read).toHaveBeenCalledOnce();
+  });
+
+  it("fences selected idempotent submission before commit when its initiating authority changes", async () => {
+    const selectionId = job.id;
+    const selectedQueryHash = createHash("sha256").update(JSON.stringify({ selectionId, ids: null, recordIds: null })).digest("hex");
+    const selectedRequestHash = createHash("sha256").update(JSON.stringify({
+      authorizationPrincipalId: scope.principalId, queryHash: selectedQueryHash, tokenMode: "delegated", scopeKind: "exact",
+    })).digest("hex");
+    let current = true;
+    query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult).mockImplementationOnce(async () => {
+      current = false;
+      return { ...emptyResult, rows: [{ id: job.id, request_hash: selectedRequestHash }] };
+    });
+    await expect(new PackageRefreshJobs().submitSelected(scope, {
+      ...scope, authorizationHash: "viewer", sessionEpoch: "0",
+    }, { selectionId, idempotencyKey: "selected-refresh" }, () => {
+      if (!current) throw new Error("Selected submission authority changed.");
+    })).rejects.toThrow("Selected submission authority changed.");
+    expect(query).toHaveBeenCalledTimes(3);
   });
 });

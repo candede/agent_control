@@ -73,9 +73,10 @@ export class OfficialReportHistory {
     if (root.kind !== "tenant_history") throw new SelectionError("selection_invalidated");
     const state = (await client.query(`SELECT h.revision FROM official_usage_history_state h JOIN data_scope_epochs s ON s.id=h.scope_id
       WHERE h.tenant_id=$1 AND h.scope_id=$2 AND h.revision>=$3::bigint AND h.invalidation_epoch=s.epoch
-        AND s.scope_kind='tenant' AND s.principal_id IS NULL AND s.source='official_history'`,
-    [identity.tenantId, root.scopeId, root.revision])).rows[0];
-    if (!state || root.expiresAt <= new Date()) throw new SelectionError("selection_invalidated");
+        AND s.scope_kind='tenant' AND s.principal_id IS NULL AND s.source='official_history'
+        AND $4::timestamptz>clock_timestamp()`,
+    [identity.tenantId, root.scopeId, root.revision, root.expiresAt])).rows[0];
+    if (!state) throw new SelectionError("selection_invalidated");
     await this.prepareRead(client, identity.tenantId);
     const expired = await client.query(`${historyIntegritySql} SELECT id FROM invalid_sets LIMIT 1`, [identity.tenantId, root.revision]);
     if (expired.rowCount) throw new SelectionError("selection_invalidated");

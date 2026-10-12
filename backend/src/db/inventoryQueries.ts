@@ -2,8 +2,8 @@ import type pg from "pg";
 import { DataSelections, CursorCodec, SelectionError, type SelectionIdentity, type DependencyRoot } from "../services/dataSelections.js";
 import { LargeTenantUsersReports, type ReportCurrentData } from "../services/largeTenantUsersReports.js";
 import { officialAgentsSql } from "./officialReportQueries.js";
-import { userSourcePeopleInRead } from "./userSources.js";
-import { dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { userSourceObjectIds, userSourcePeopleInRead, userSourceSearch, userSourceSearchSql } from "./userSources.js";
+import { dataLimitError, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { inventoryAsOf } from "./inventoryGenerations.js";
 import { parseUnifiedAgentRecordId, unifiedAgentSortKeys, type UnifiedAgentInventoryQuery,
   type SavedAgentEnvironment, type SavedAgentPerson } from "../types/unifiedAgents.js";
@@ -17,7 +17,8 @@ import { inventoryNativeRootChoicesSql } from "./inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "./inventoryIdentityExpiry.js";
 import { projectPackageDetailAge } from "../services/packageDetailProjection.js";
 import { peakCheckpoint } from "../services/peakMemory.js";
-import { isPublicationRevisions } from "../types/dataSelection.js";
+import { normalizeEnvironmentIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 
 export type InventoryQuery = Omit<UnifiedAgentInventoryQuery, "limit" | "selectionId" | "cursor">;
 const queryFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
@@ -39,6 +40,10 @@ function inventoryCriteria(input: Record<string, unknown>) {
     return [key, value] as const;
   });
   const values = Object.fromEntries(entries);
+  if (values.search !== undefined) {
+    if (typeof values.search !== "string") throw new SelectionError("invalid_cursor");
+    userSourceSearch(values.search);
+  }
   const bytes = Buffer.byteLength(JSON.stringify(values));
   if (bytes > 32768) throw dataLimitError("inventory_query_bytes", 32768, bytes);
   return values;
@@ -50,8 +55,22 @@ type Context = { data: ReportCurrentData; selectionId: string;expiresAt: number;
   tokenMode: "delegated" | "application"; query: InventoryQuery };
 type PageOptions = { limit?: number; cursor?: string; recordId?: string; expectedQuery?: InventoryQuery; explicitExportId?: string;
   exportKind?: "unified_agents" | "graph_packages" | "power_platform_agents" };
+
+export function inventoryPackageResidualSql(alias: "member" | "r") {
+  return `CASE WHEN ${alias}.domain='packages' THEN ${alias}.residual||coalesce((
+    SELECT jsonb_object_agg(collection.value,coalesce((
+      SELECT jsonb_agg(item.value ORDER BY item.ordinal) FROM inventory_facts item
+      WHERE item.generation_id=${alias}.generation_id AND item.identity=${alias}.identity AND item.kind=collection.value
+    ),'[]'::jsonb)) FROM inventory_facts collection
+    WHERE collection.generation_id=${alias}.generation_id AND collection.identity=${alias}.identity
+      AND collection.kind='collection' AND collection.value IN ('supportedHosts','elementTypes')
+  ),'{}'::jsonb) ELSE ${alias}.residual END`;
+}
+
 const primaryMembersSql = `SELECT f.identity,member.identity AS source_identity,member.domain,member.native_id,member.environment_id,member.scope_id,
-  member.residual,member.observed_at,member.expires_at,member.generation_id,member.catalog_generation,member.detail_generation,
+  ${inventoryPackageResidualSql("member")} AS residual,member.observed_at,member.expires_at,member.generation_id,member.catalog_generation,member.detail_generation,
+  (SELECT observed_at FROM data_generations WHERE id=coalesce(member.catalog_generation,member.generation_id)) AS catalog_observed_at,
+  (SELECT expires_at FROM data_generations WHERE id=coalesce(member.catalog_generation,member.generation_id)) AS catalog_expires_at,
   member.evidence,member.total,
   (SELECT channel FROM inventory_attempts attempt WHERE attempt.generation_id=coalesce(member.catalog_generation,member.generation_id)) AS source_channel,
   CASE WHEN member.domain='power_platform' THEN
@@ -93,8 +112,8 @@ export class InventoryQueries {
     this.summaryCache = summaryCaches.get(database) ?? new Map();
     summaryCaches.set(database,this.summaryCache);
     this.reports = new LargeTenantUsersReports(database, secret, reportStaleDays);
-    this.selections = new DataSelections(database, (client, root, identity) => root.kind === "inventory_delta"
-      ? this.validateRoot(client, root, identity)
+    this.selections = new DataSelections(database, (client, root, identity, exportSelectionId) => root.kind === "inventory_delta"
+      ? this.validateRoot(client, root, identity, exportSelectionId)
       : root.kind === "tenant_history" ? this.reports.history.validateRoot(client, root, identity)
         : this.reports.sources.validateRoot(client, root, identity),
     (scope, identity) => scope.tenant_id === identity.tenantId && scope.tenant_id === this.authorizedApplicationScope?.tenantId
@@ -102,7 +121,7 @@ export class InventoryQueries {
       && scope.source === "inventory_packages");
     this.cursors = new CursorCodec(secret);
   }
-  async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity) {
+  async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) {
     if (root.kind !== "inventory_delta") throw new SelectionError("selection_invalidated");
     const revision = (await client.query(`SELECT v.inputs FROM inventory_revisions v JOIN inventory_roots r ON r.baseline_id=v.baseline_id
       JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=v.scope_id
@@ -122,16 +141,24 @@ export class InventoryQueries {
       WHERE s.epoch IS DISTINCT FROM r.epoch OR s.tenant_id<>$2 OR NOT(s.principal_id=ANY($3::text[]))
         OR g.id IS NULL OR g.state NOT IN ('published','retired') LIMIT 1`, [JSON.stringify(revision.inputs), identity.tenantId, this.sourceOwners(identity)]);
     if (invalid.rowCount) throw new SelectionError("selection_invalidated");
+    if (exportSelectionId !== undefined) {
+      const changed = await client.query(`SELECT 1 FROM inventory_read_contexts c
+        WHERE c.selection_id=$1 AND c.tenant_id=$2 AND c.root_scope_id=$3
+          AND c.association_revision IS DISTINCT FROM coalesce(inventory_association_revision($2),0)`,
+      [exportSelectionId, identity.tenantId, root.scopeId]);
+      if (changed.rowCount) throw new SelectionError("selection_invalidated");
+    }
   }
 
   async capture(identity: SelectionIdentity, scopeId: string, query: InventoryQuery = {}, tokenMode: "delegated" | "application" = "delegated") {
+    identity = { ...identity };
     if (query.sortBy && !unifiedAgentSortKeys.includes(query.sortBy) || query.sortDirection && !["asc", "desc"].includes(query.sortDirection)
       || query.createdWithinDays !== undefined && (!Number.isInteger(query.createdWithinDays) || query.createdWithinDays < 0)) throw new SelectionError("invalid_cursor");
-    const sourceScope = needsPeopleCache(query) ? await this.reports.sources.ensureScope(identity, "delegated") : null;
-    await this.reports.history.ensure(identity.tenantId);
     const criteria = inventoryCriteria(query.availableTo === undefined ? query : { ...query, availableTo: encodeInventoryFacet(query.availableTo) });
     const metadata = { inventoryQuery: digest(JSON.stringify(criteria)),
-      ...query.operationIdPrefix === undefined ? {} : { operationIdPrefix: query.operationIdPrefix } };
+      ...criteria.operationIdPrefix === undefined ? {} : { operationIdPrefix: criteria.operationIdPrefix } };
+    const sourceScope = await this.reports.sources.ensureScope(identity, "delegated");
+    await this.reports.history.ensure(identity.tenantId);
     return this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
       const root = (await client.query(`SELECT r.*,g.expires_at,s.epoch FROM inventory_roots r
         JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
@@ -140,14 +167,10 @@ export class InventoryQueries {
       [scopeId, identity.tenantId, this.sourceOwners(identity), tokenMode])).rows[0];
       if (!root) throw new SelectionError("selection_invalidated");
       const data = await this.reports.currentInventoryData(client, identity, at);
-      const pinUntil = new Date(at.getTime() + 30 * 60_000);
-      const association = (await client.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
-      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: pinUntil },
-        await this.reports.history.root(client, identity.tenantId, at)];
-      if (sourceScope) {
-        const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
-        roots.push({ kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) });
-      }
+      const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
+      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: root.expires_at },
+        await this.reports.history.root(client, identity.tenantId, at),
+        { kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) }];
       const inputs = (await client.query("SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$2", [scopeId, root.revision])).rows[0]?.inputs ?? [];
       for (const input of inputs) roots.push({ kind: "inventory_delta", scopeId: input.scopeId, generationId: input.baselineId,
         revision: input.revision, expiresAt: pinUntil });
@@ -160,6 +183,7 @@ export class InventoryQueries {
         FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>$3`,
       [identity.tenantId, identity.principalId, at])).rows[0]?.expires_at : null;
       return { roots, nextTransition: transition ?? undefined, persist: async (connection, selection) => {
+        const association = (await connection.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
         await connection.query(`INSERT INTO inventory_read_contexts(selection_id,tenant_id,report_context,association_revision,root_scope_id,query_values)
           VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb)`, [selection.id, identity.tenantId, JSON.stringify(data), association, scopeId, JSON.stringify(criteria)]);
       } };
@@ -236,11 +260,11 @@ export class InventoryQueries {
         CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) r("baselineId" uuid,revision bigint) WHERE v.scope_id=(SELECT scope_id FROM inventory_roots WHERE baseline_id=$7) AND v.revision=$8
       UNION SELECT $7::uuid,$8::bigint
     ), native_roots AS (${inventoryNativeRootChoicesSql("input_roots")}), environments AS (
-      SELECT lower(r.native_id) AS environment_id,CASE WHEN count(DISTINCT r.display_name)=1 THEN min(r.display_name) ELSE min(r.native_id) END AS label
+      SELECT ${normalizeEnvironmentIdentitySql("r.native_id")} AS environment_id,CASE WHEN count(DISTINCT r.display_name)=1 THEN min(r.display_name) ELSE min(r.native_id) END AS label
       FROM native_roots root JOIN inventory_memberships m ON m.baseline_id=root.baseline_id
         AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
       JOIN power_platform_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
-      WHERE root.kind='microsoft.powerplatform/environments' AND r.resource_type=root.kind GROUP BY lower(r.native_id)
+      WHERE root.kind='microsoft.powerplatform/environments' AND r.resource_type=root.kind GROUP BY ${normalizeEnvironmentIdentitySql("r.native_id")}
     ), people_evidence AS (
       SELECT x.generation_id,x.identity,x.kind,x.value AS object_id,
         CASE WHEN c.checked_at IS NULL OR d.identity IS NOT NULL AND (g.observed_at>c.checked_at
@@ -277,9 +301,8 @@ export class InventoryQueries {
     ), source_links AS MATERIALIZED (
       SELECT s.canonical_id,reviewed.report_agent_id AS agent_id FROM sources s JOIN agent_usage_associations reviewed
         ON reviewed.tenant_id=$4 AND reviewed.report_set_id=$5 AND reviewed.source=s.source
-        AND reviewed.normalized_native_id=CASE WHEN s.source='power_platform' AND s.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
-          THEN lower(s.native_id) ELSE s.native_id END
-        AND reviewed.normalized_environment_id=CASE WHEN s.source='graph_packages' THEN '' ELSE coalesce(lower(s.environment_id),'') END
+        AND reviewed.normalized_native_id=CASE WHEN s.source='power_platform' THEN ${normalizeNativeIdentitySql("s.native_id")} ELSE s.native_id END
+        AND reviewed.normalized_environment_id=CASE WHEN s.source='graph_packages' THEN '' ELSE coalesce(${normalizeEnvironmentIdentitySql("s.environment_id")},'') END
       WHERE $5::uuid IS NOT NULL
       UNION
       SELECT s.canonical_id,s.native_id FROM sources s WHERE s.source='graph_packages' AND $5::uuid IS NOT NULL
@@ -321,7 +344,8 @@ export class InventoryQueries {
         extract(epoch FROM metrics.last_activity)*1000 AS last_activity,
         coalesce(environments.label,i.environment_id) AS environment_label,
         (SELECT text_value FROM inventory_facts f WHERE f.generation_id=i.generation_id AND f.identity=i.identity AND f.kind='column:createdAt' LIMIT 1) AS created_text
-      FROM inventory i LEFT JOIN metrics ON metrics.canonical_id=i.identity LEFT JOIN environments ON environments.environment_id=lower(i.environment_id)
+      FROM inventory i LEFT JOIN metrics ON metrics.canonical_id=i.identity
+        LEFT JOIN environments ON environments.environment_id=${normalizeEnvironmentIdentitySql("i.environment_id")}
     )`;
     return { sql, values };
   }
@@ -345,7 +369,7 @@ export class InventoryQueries {
     }
 
     if (query.environmentId !== undefined && omit !== "environmentId") clauses.push(query.environmentId === null
-      ? "coalesce(f.environment_id,'')=''" : `lower(f.environment_id)=lower(${add(query.environmentId)})`);
+      ? "coalesce(f.environment_id,'')=''" : `${normalizeEnvironmentIdentitySql("f.environment_id")}=${add(normalizeEnvironmentIdentity(query.environmentId))}`);
     if (query.linkState && omit !== "linkState") clauses.push(`f.link_state=${add(query.linkState)}`);
     if (query.source && query.source !== "all" && omit !== "source") clauses.push(query.source === "both" ? "f.presence='both'" : `f.presence IN ('both',${add(query.source)})`);
     if (query.endUserAccess && query.endUserAccess !== "all") clauses.push(`f.availability=${add(query.endUserAccess)}`);
@@ -361,11 +385,12 @@ export class InventoryQueries {
     } else if (query.view && !["all", "used", "organization", "unknown"].includes(query.view)) clauses.push(
       `EXISTS(SELECT 1 FROM inventory_facts x WHERE x.generation_id=f.generation_id AND x.identity=f.identity AND x.kind='view' AND x.value=${add(query.view)} AND x.boolean_value)`);
     if (query.search) {
-      const search = add(`%${query.search.normalize("NFKC").toLowerCase().replace(/[\\%_]/g, "\\$&")}%`);
-      clauses.push(`(f.sort_key LIKE ${search} OR lower(coalesce(f.environment_id,'')) LIKE ${search} OR lower(coalesce(f.environment_label,'')) LIKE ${search}
+      const search = add(`%${userSourceSearch(query.search).replace(/[\\%_]/g, "\\$&")}%`);
+      clauses.push(`(${userSourceSearchSql("f.sort_key")} LIKE ${search} OR ${userSourceSearchSql("coalesce(f.environment_id,'')")} LIKE ${search}
+        OR ${userSourceSearchSql("coalesce(f.environment_label,'')")} LIKE ${search}
         OR EXISTS(SELECT 1 FROM inventory_facts x WHERE x.generation_id=f.generation_id AND x.identity=f.identity
-          AND x.kind IN ('search','publisher','person:owner','person:createdBy','person:lastModifiedBy') AND lower(x.value) LIKE ${search})
-        OR EXISTS(SELECT 1 FROM people p WHERE p.generation_id=f.generation_id AND p.identity=f.identity AND lower(p.label) LIKE ${search}))`);
+          AND x.kind IN ('search','publisher','person:owner','person:createdBy','person:lastModifiedBy') AND ${userSourceSearchSql("x.value")} LIKE ${search})
+        OR EXISTS(SELECT 1 FROM people p WHERE p.generation_id=f.generation_id AND p.identity=f.identity AND ${userSourceSearchSql("p.label")} LIKE ${search}))`);
     }
     if (query.createdWithinDays !== undefined) clauses.push(`EXISTS(SELECT 1 FROM inventory_facts x WHERE x.generation_id=f.generation_id
       AND x.identity=f.identity AND x.kind='created' AND x.number_value>=extract(epoch FROM $9::timestamptz)*1000-${add(query.createdWithinDays)}::numeric*86400000)`);
@@ -377,9 +402,8 @@ export class InventoryQueries {
       else if (target.source === "graph_packages") clauses.push(`EXISTS(SELECT 1 FROM sources s
         WHERE s.canonical_id=f.identity AND s.source='graph_packages' AND s.native_id=${add(target.packageId)})`);
       else clauses.push(`EXISTS(SELECT 1 FROM sources s WHERE s.canonical_id=f.identity AND s.source='power_platform'
-        AND CASE WHEN s.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
-          THEN lower(s.native_id)=lower(${add(target.nativeId)}) ELSE s.native_id=${add(target.nativeId)} END
-        AND coalesce(lower(s.environment_id),'')=lower(${add(target.environmentId ?? "")}))`);
+        AND ${normalizeNativeIdentitySql("s.native_id")}=${normalizeNativeIdentitySql(add(target.nativeId))}
+        AND coalesce(${normalizeEnvironmentIdentitySql("s.environment_id")},'')=${add(normalizeEnvironmentIdentity(target.environmentId ?? ""))})`);
     }
     if (query.operationIdPrefix) clauses.push(`EXISTS(SELECT 1 FROM sources s JOIN audit_events a ON a.tenant_id=$4
       AND a.principal_id=$10 AND a.agent_id=s.native_id AND a.scope='bulk'
@@ -388,38 +412,51 @@ export class InventoryQueries {
     return clauses.join(" AND ");
   }
 
-  resolveExportReferences(id: string, identity: SelectionIdentity, references: readonly string[]) {
+  resolveExportReferences(id: string, identity: SelectionIdentity, references: readonly string[],
+    kind: NonNullable<PageOptions["exportKind"]> = "unified_agents") {
+    return this.read(id, identity, (client, context) => this.resolveExportReferencesInRead(client, context, references, kind));
+  }
+
+  async resolveExportReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[],
+    kind: NonNullable<PageOptions["exportKind"]>) {
     if (!references.length || references.length > 5000) throw new AppError(400, "invalid_export_selection", "Select 1–5000 exact references.");
-    return this.read(id, identity, async (client, context) => {
-      if (!(await client.query("SELECT 1 FROM data_scope_epochs WHERE id=$1 AND source='inventory_canonical' AND token_mode='delegated'",
-        [context.scopeId])).rowCount) throw new AppError(400, "export_selection_kind", "Unified exports require a canonical selection.");
-      const resolved = new Set<string>();
-      for (let offset = 0; offset < references.length; offset += 100) {
-        const requested = references.slice(offset, offset + 100).map((reference, ordinal) => {
-          let target;
-          try { target = parseUnifiedAgentRecordId(reference); } catch { /* Invalid references are rejected below. */ }
-          if (!target) throw new AppError(400, "invalid_export_selection", "Use exact canonical or source-qualified references.");
-          return { ordinal, source: target.source,
-            native: target.source === "canonical" ? target.agentId : target.source === "graph_packages" ? target.packageId : target.nativeId,
-            environment: target.source === "power_platform" ? target.environmentId ?? "" : "" };
-        });
-        const { sql, values } = this.relation(context);
-        values.push(encodeBatch(requested).json);
-        const result = await client.query(`${sql}
-          SELECT r.ordinal,min(s.canonical_id) AS id,count(DISTINCT s.canonical_id)::int AS count
+    if (kind === "unified_agents" ? context.source !== "inventory_canonical" || context.tokenMode !== "delegated"
+      : context.source !== "inventory_canonical" && context.source !== (kind === "graph_packages" ? "inventory_packages" : "inventory_power_platform")) {
+      throw new AppError(400, "export_selection_kind", "Export kind does not match the selected inventory source.");
+    }
+    const resolved = new Set<string>();
+    for (let offset = 0; offset < references.length; offset += 100) {
+      const requested = references.slice(offset, offset + 100).map((reference, ordinal) => {
+        if (kind !== "unified_agents") return {
+          ordinal, source: kind === "graph_packages" ? "graph_packages" : "power_platform", native: reference, environment: null,
+        };
+        let target;
+        try { target = parseUnifiedAgentRecordId(reference); } catch { /* Invalid references are rejected below. */ }
+        if (!target) throw new AppError(400, "invalid_export_selection", "Use exact canonical or source-qualified references.");
+        return { ordinal, source: target.source,
+          native: target.source === "canonical" ? target.agentId : target.source === "graph_packages" ? target.packageId : target.nativeId,
+          environment: target.source === "power_platform" ? target.environmentId ?? "" : "" };
+      });
+      const { sql, values } = this.relation(context);
+      values.push(encodeBatch(requested).json);
+      const result = await client.query(`${sql}
+          SELECT r.ordinal,min(s.canonical_id) AS id,count(DISTINCT s.canonical_id)::int AS count,
+            count(DISTINCT (s.generation_id,s.identity)) FILTER(WHERE s.identity IS NOT NULL)::int AS source_count
           FROM jsonb_to_recordset($${values.length}::jsonb) r(ordinal integer,source text,native text,environment text)
           LEFT JOIN sources s ON r.source='canonical' AND s.canonical_id=r.native OR r.source=s.source AND (
             r.source='graph_packages' AND s.native_id=r.native OR r.source='power_platform'
-            AND CASE WHEN s.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$' THEN lower(s.native_id)=lower(r.native) ELSE s.native_id=r.native END
-            AND coalesce(lower(s.environment_id),'')=lower(r.environment))
+            AND s.resource_type='microsoft.copilotstudio/agents'
+            AND CASE WHEN r.environment IS NULL THEN s.native_id=r.native
+              ELSE (${normalizeNativeIdentitySql("s.native_id")})=(${normalizeNativeIdentitySql("r.native")}) END
+            AND (r.environment IS NULL OR coalesce(${normalizeEnvironmentIdentitySql("s.environment_id")},'')=${normalizeEnvironmentIdentitySql("r.environment")}))
           GROUP BY r.ordinal ORDER BY r.ordinal`, values);
-        if (result.rows.length !== requested.length || result.rows.some(row => row.count !== 1)) {
-          throw new AppError(409, "export_selection_changed", "An exact selected source is missing or ambiguous. Reload the inventory and review the selection.");
-        }
-        for (const row of result.rows) resolved.add(`agent:${row.id}`);
+      if (result.rows.length !== requested.length || result.rows.some((row, index) => row.ordinal !== index || row.count !== 1
+        || requested[index].source !== "canonical" && row.source_count !== 1)) {
+        throw new AppError(409, "export_selection_changed", "An exact selected source is missing or ambiguous. Reload the inventory and review the selection.");
       }
-      return [...resolved];
-    });
+      for (const row of result.rows) resolved.add(kind === "unified_agents" ? `agent:${row.id}` : references[offset + row.ordinal]);
+    }
+    return [...resolved];
   }
 
   page(id: string, identity: SelectionIdentity, options: PageOptions = {}) {
@@ -550,6 +587,7 @@ export class InventoryQueries {
         ), candidates AS MATERIALIZED (
         SELECT f.identity,f.native_id,f.domain,f.resource_type,f.display_name,f.environment_id,f.presence,f.link_state,f.availability,f.management,
           jsonb_build_object('state',f.link_state,'reason',f.residual->'identity'->'reason',
+            'warnings',f.residual->'identity'->'warnings',
             'invalidMetadata',f.residual->'identity'->'invalidMetadata') AS identity_info,
           CASE WHEN f.domain<>'canonical' THEN f.residual END AS source_residual,
           coalesce((SELECT jsonb_agg(to_jsonb(member_row) ORDER BY member_row.domain)
@@ -559,7 +597,8 @@ export class InventoryQueries {
               AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
             JOIN power_platform_record_rows environment ON environment.generation_id=m.generation_id AND environment.identity=m.identity
             WHERE f.environment_id IS NOT NULL AND root.kind='microsoft.powerplatform/environments' AND environment.resource_type=root.kind
-              AND lower(environment.native_id)=lower(f.environment_id)),0)+
+              AND lower(environment.native_id)=lower(f.environment_id)
+              AND (${normalizeEnvironmentIdentitySql("environment.native_id")})=(${normalizeEnvironmentIdentitySql("f.environment_id")})),0)+
           coalesce((SELECT sum(coalesce(octet_length(to_jsonb(p.name)::text),0)+coalesce(octet_length(to_jsonb(p.upn)::text),0)
             +octet_length(to_jsonb(p.object_id)::text)+1536) FROM people p
             WHERE p.generation_id=f.generation_id AND p.identity=f.identity),0) AS member_bytes,
@@ -588,13 +627,11 @@ export class InventoryQueries {
       const enrichment = await this.pageEnrichment(client, context, page.map(row => row.identity));
       const sourceRows = page.flatMap(row => row.members as pg.QueryResultRow[]);
       for (const source of sourceRows) {
-        source.observed_at = new Date(source.observed_at);
-        source.expires_at = new Date(source.expires_at);
-        if (source.domain === "packages") source.residual = projectPackageDetailAge(source.residual, context.data.evaluatedAt.getTime());
+        if (source.domain === "packages") source.residual = projectPackageDetailAge(source.residual, selection.evaluated_at as string | Date);
       }
       encodeBatch(sourceRows);
       const projected = page.map(row => ({ id: row.identity, nativeId: row.native_id, domain: row.domain, resourceType: row.resource_type,
-        residual: row.domain === "packages" ? projectPackageDetailAge(row.source_residual, context.data.evaluatedAt.getTime()) : row.source_residual,
+        residual: row.domain === "packages" ? projectPackageDetailAge(row.source_residual, selection.evaluated_at as string | Date) : row.source_residual,
         displayName: row.display_name, environmentId: row.environment_id,
         presence: row.presence, linkState: row.link_state, identity: row.identity_info, availability: row.availability, management: row.management,
         responses: row.responses === null ? null : exactCount(row.responses), activeUsers: row.active_users === null ? null : exactCount(row.active_users),
@@ -643,8 +680,8 @@ export class InventoryQueries {
       FROM inventory_memberships m JOIN inventory_records r ON r.generation_id=m.generation_id AND r.identity=m.identity
       WHERE ${inventoryAsOf()} AND m.identity=ANY($3::text[]) LIMIT 100`, [context.baselineId, context.revision, ids])).rows;
     encodeBatch(references);
-    const objectIds = [...new Set(references.flatMap(row => Object.values(row.people) as string[]))]
-      .filter(id => /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id));
+    const objectIds = [...new Set(references.flatMap(row => Object.values(row.people) as string[])
+      .filter(id => /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)).map(id => id.toLowerCase()))];
     const evidence = new Map<string, SavedAgentPerson>();
     for (let offset = 0; offset < objectIds.length; offset += 100) {
       const batch = await userSourcePeopleInRead(client, { ...context.data.identity, tokenMode: "delegated" },
@@ -655,7 +692,7 @@ export class InventoryQueries {
     }
     for (const reference of references) people.set(reference.identity, Object.fromEntries(
       Object.entries(reference.people).flatMap(([role, objectId]) => {
-        const person = evidence.get(String(objectId));
+        const person = evidence.get(String(objectId).toLowerCase());
         return person ? [[role, person]] : [];
       })));
     const rows = (await client.query(`WITH inputs AS (
@@ -674,7 +711,7 @@ export class InventoryQueries {
         'groupName',r.residual->'details'->'environmentGroup','groupId',r.residual->'details'->'environmentGroupId',
         'provenance',coalesce((SELECT jsonb_object_agg(key,value) FROM jsonb_each(r.residual->'provenance')
           WHERE key IN ('sourceSystem','nativeId','displayName','location','environmentType','isManaged','environmentGroup','environmentGroupId')),'{}'::jsonb),
-        'observation',jsonb_build_object('id',g.id,'snapshotId',g.id,'observedAt',r.observed_at,'expiresAt',r.expires_at,
+        'observation',jsonb_build_object('id',r.generation_id,'snapshotId',r.generation_id,'observedAt',r.observed_at,'expiresAt',r.expires_at,
           'current',EXISTS(SELECT 1 FROM inventory_roots current WHERE current.scope_id=input.scope_id AND current.current
             AND current.baseline_id=input.baseline_id AND current.revision=input.revision))) AS value
       FROM native_roots input JOIN inventory_memberships m ON m.baseline_id=input.baseline_id
@@ -682,9 +719,11 @@ export class InventoryQueries {
       JOIN power_platform_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
       JOIN inventory_revisions revision ON revision.scope_id=input.scope_id AND revision.revision=input.revision
       JOIN data_generations g ON g.id=revision.generation_id
-      WHERE input.kind='microsoft.powerplatform/environments' AND r.resource_type=input.kind AND lower(r.native_id)=lower(selected.environment_id)
-        ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
-    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId])).rows;
+      WHERE input.kind='microsoft.powerplatform/environments' AND r.resource_type=input.kind
+        AND lower(r.native_id)=lower(selected.environment_id)
+        AND (${normalizeEnvironmentIdentitySql("r.native_id")})=(${normalizeEnvironmentIdentitySql("selected.environment_id")})
+        AND r.expires_at>$5 ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
+    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId, context.data.evaluatedAt])).rows;
     encodeBatch(rows);
     for (const row of rows) environments.set(row.identity, row.value);
     return { people, environments };
@@ -751,7 +790,8 @@ export class InventoryQueries {
         CROSS JOIN LATERAL jsonb_to_recordset(v.inputs) r("scopeId" uuid,"baselineId" uuid,revision bigint)
         WHERE v.scope_id=$1 AND v.revision=$2
       UNION SELECT $1::uuid,$3::uuid,$2::bigint), native_roots AS (${inventoryNativeRootChoicesSql("roots")})
-      SELECT s.id AS scope_id,s.source,s.selector,s.token_mode,v.row_count,g.id AS generation_id,g.observed_at,g.expires_at,a.channel,a.environment_id,a.resource_types,
+      SELECT s.id AS scope_id,s.source,s.selector,s.token_mode,v.row_count,g.id AS generation_id,
+        to_jsonb(g.observed_at)#>>'{}' AS observed_at,to_jsonb(g.expires_at)#>>'{}' AS expires_at,a.channel,a.environment_id,a.resource_types,
         root.baseline_id,a.role_scope,
         CASE WHEN a.domain='power_platform' THEN
         (SELECT count(*)::int FROM inventory_memberships m JOIN power_platform_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
@@ -760,8 +800,10 @@ export class InventoryQueries {
             AND r.resource_type='microsoft.copilotstudio/agents') ELSE 0 END AS agent_count,
         a.expected_count,CASE WHEN saved.catalog_complete THEN saved.catalog_page_count ELSE g.page_count END AS page_count,
         saved.catalog_omitted_fields AS unknown_field_count,g.wire_count,a.complete,
-        saved.catalog_complete,
-        saved.catalog_observed_at,saved.catalog_expires_at,
+        saved.catalog_complete AS catalog_scope_complete,
+        (saved.catalog_complete AND saved.catalog_expires_at>$4) AS catalog_complete,
+        to_jsonb(saved.catalog_observed_at)#>>'{}' AS catalog_observed_at,
+        to_jsonb(saved.catalog_expires_at)#>>'{}' AS catalog_expires_at,
         root.revision AS captured_revision,coalesce(current.baseline_id=root.baseline_id AND current.revision=root.revision,false) AS current
       FROM roots root JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision
       JOIN data_generations g ON g.id=v.generation_id JOIN inventory_attempts a ON a.generation_id=g.id
@@ -779,7 +821,8 @@ export class InventoryQueries {
     const verificationCounts = cached?.verificationCounts ?? (await client.query(`SELECT count(*) FILTER(WHERE r.domain='packages')::int AS packages,
       count(*) FILTER(WHERE r.domain='power_platform' AND r.resource_type='microsoft.copilotstudio/agents')::int AS native_agents,
       count(*)::int AS represented,
-      count(DISTINCT (r.domain,r.native_id,CASE WHEN r.domain='packages' THEN '' ELSE lower(coalesce(r.environment_id,'')) END))::int AS unique_sources,
+      count(DISTINCT (r.domain,CASE WHEN r.domain='packages' THEN r.native_id ELSE ${normalizeNativeIdentitySql("r.native_id")} END,
+        CASE WHEN r.domain='packages' THEN '' ELSE coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'') END))::int AS unique_sources,
       count(*) FILTER(WHERE r.domain='packages' AND r.residual->>'identityDetailsCollected'='true'
         AND (r.residual->'detailFreshness'->>'state' IS NULL OR r.residual->'detailFreshness'->>'state'='fresh'
           AND coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3
@@ -793,7 +836,7 @@ export class InventoryQueries {
       FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
       JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
       JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
-      WHERE ${inventoryAsOf()}`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
+      WHERE ${inventoryAsOf()} AND c.expires_at>$3`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
     if (cacheable && !cached) {
       peakCheckpoint("response.serialize");
       const serialized = JSON.stringify({ row,verificationCounts }); peakCheckpoint("response.serialize");
@@ -835,7 +878,7 @@ export class InventoryQueries {
       }
       let selectedValue = options.selected ? context.query[field] : undefined;
       if (options.selected && selectedValue === undefined) return { value: [], total: 0, nextCursor: null };
-      if (field === "environmentId" && typeof selectedValue === "string") selectedValue = selectedValue.toLowerCase();
+      if (field === "environmentId" && typeof selectedValue === "string") selectedValue = normalizeEnvironmentIdentity(selectedValue);
       if (field === "platform" && typeof selectedValue === "string") selectedValue = normalizePackageAuthoringTool(selectedValue);
       const cursor = this.continuation(id, identity, selection, "facets", [field, options.search ?? "", Boolean(options.selected)], options.cursor);
       const { sql, values } = this.relation(context);
@@ -844,7 +887,8 @@ export class InventoryQueries {
       const selectedWhere = `($${values.length}::text IS NULL OR value=$${values.length})`;
       values.push(field, cursor.after ?? null, options.search ?? "");
       const n = values.length;
-      const scalar = ({ environmentId: "f.environment_id", source: "f.presence", linkState: "f.link_state" } as Record<string, string>)[field];
+      const scalar = ({ environmentId: `(${normalizeEnvironmentIdentitySql("f.environment_id")})`,
+        source: "f.presence", linkState: "f.link_state" } as Record<string, string>)[field];
       const literal = scalar ?? "x.value";
       const expression = `CASE WHEN coalesce(${literal},'')='' THEN '~null' ELSE '~string:'||${literal} END`;
       const label = field === "environmentId" ? "coalesce(f.environment_label,'')" : field === "platform" ? "coalesce(x.text_value,x.value)"
@@ -891,7 +935,7 @@ export class InventoryQueries {
   }
 
   packageDetail(id: string, identity: SelectionIdentity, nativeId: string) {
-    return this.read(id, identity, async (client, context) => {
+    return this.read(id, identity, async (client, context, selection) => {
       const rows = (await client.query(`WITH selected AS (
         SELECT m.identity AS record_id,$4::uuid AS source_scope_id,'[]'::jsonb AS evidence,r.* FROM inventory_memberships m
         JOIN inventory_records r ON r.generation_id=m.generation_id AND r.identity=m.identity
@@ -944,7 +988,7 @@ export class InventoryQueries {
           after = page[page.length - 1].ordinal;
         }
       }
-      const detail = { ...projectPackageDetailAge(row.residual, context.data.evaluatedAt.getTime()), ...assignments,
+      const detail = { ...projectPackageDetailAge(row.residual, selection.evaluated_at as string | Date), ...assignments,
         matchingEvidence: row.evidence, ...(accessReadError ? { accessReadError } : {}),
         observation: { id: row.generation_id, observedAt: row.observed_at, expiresAt: row.expires_at, current: row.current,
           scopeKind: "exact", source: "Microsoft Graph package catalog", apiMaturity: "v1.0 read; preview controls" },
@@ -964,7 +1008,8 @@ export class InventoryQueries {
       source.domain,source.native_id,source.environment_id,source.generation_id FROM jsonb_to_recordset($3::jsonb)
         requested(domain text,"nativeId" text,"environmentId" text)
       JOIN inventory_records source ON source.domain=requested.domain AND source.native_id=requested."nativeId"
-        AND (requested.domain='packages' OR coalesce(lower(source.environment_id),'')=coalesce(lower(requested."environmentId"),''))
+        AND (requested.domain='packages' OR coalesce(${normalizeEnvironmentIdentitySql("source.environment_id")},'')
+          =coalesce(${normalizeEnvironmentIdentitySql('requested."environmentId"')},''))
       JOIN unified_agent_memberships member ON member.source_generation_id=source.generation_id AND member.source_identity=source.identity
       JOIN inventory_memberships m ON m.generation_id=member.generation_id AND m.identity=member.identity
       WHERE ${inventoryAsOf()} ORDER BY m.identity,source.domain,source.native_id LIMIT 101`, [context.baselineId, context.revision, batch.json])).rows;
@@ -1066,9 +1111,10 @@ export class InventoryQueries {
   }
 
   people(id: string, identity: SelectionIdentity, objectIds: readonly string[]) {
+    const requested = userSourceObjectIds(objectIds);
     return this.read(id, identity, (client, context) => userSourcePeopleInRead(client, { ...identity, tokenMode: "delegated" },
       context.data.metadata.directory.generationId ? { generationId: context.data.metadata.directory.generationId,
-        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, objectIds, context.data.evaluatedAt, needsPeopleCache(context.query)));
+        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, requested, context.data.evaluatedAt));
   }
 
   responsibility(id: string, identity: SelectionIdentity, options: AgentResponsibilityQuery = {}) {

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getTenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
 import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
 import { requestScope } from "../middleware/auth.js";
 import { capabilities } from "../services/capabilities.js";
@@ -90,6 +91,8 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
 }, async (request, response) => {
   const user = request.session.user!;
   const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  assertAccountSessionValidation(validation);
   const loaders: Array<{ source: WorkbenchJobSource; load: () => Promise<WorkbenchJobSummary[]> }> = [
     { source: "data-sync", load: async () => (await dataSync.listRuns(scope, 20)).map(dataSyncJobSummary) },
     { source: "package-refresh", load: async () => (await packageRepository.listJobs(scope, user.homeAccountId, 20)).value.map(packageRefreshJobSummary) },
@@ -110,6 +113,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
     } });
   }
   const settled = await Promise.allSettled(loaders.map(loader => loader.load()));
+  assertAccountSessionValidation(validation);
   const value = settled.flatMap(result => result.status === "fulfilled" ? result.value : [])
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id)).slice(0, 100);
   const unavailableSources = [...new Set(settled.flatMap((result, index) => result.status === "rejected"

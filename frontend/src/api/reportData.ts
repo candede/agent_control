@@ -106,7 +106,7 @@ export function stageReport(file: File, intent: OfficialReportImportIntent, meta
   if (intent.correctionOfSetId) query.set("correctionOfSetId", intent.correctionOfSetId);
   if (intent.rejectDuplicateKind) query.set("rejectDuplicateKind", "true");
   const body = new FormData();
-  for (const [key, value] of Object.entries(metadata)) if (value) body.append(key, value);
+  for (const [key, value] of Object.entries(metadata)) if (value !== undefined) body.append(key, value);
   body.append("file", file);
   return request<OfficialReportPreview>(`/api/official-usage/staging?${query}`, { method: "POST", body, signal });
 }

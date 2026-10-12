@@ -10,7 +10,7 @@ describe("Power Platform provider role scope", () => {
     expect(inventoryRoleScope({})).toBe("unknown");
   });
 
-  it("rejects malformed or excessive claims and narrows AI resource types", () => {
+  it("rejects malformed or excessive claims and preserves the supported AI request plan", () => {
     expect(normalizeInventoryProviderRoleIds([inventoryProviderRoleIds.aiReader, inventoryProviderRoleIds.aiReader, 1, "not-a-guid"])).toEqual([inventoryProviderRoleIds.aiReader]);
     expect(normalizeInventoryProviderRoleIds(Array.from({ length: 65 }, () => inventoryProviderRoleIds.globalReader))).toEqual([]);
     expect(resourceTypesForInventoryScope("ai")).toEqual([

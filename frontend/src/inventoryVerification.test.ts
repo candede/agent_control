@@ -52,6 +52,18 @@ describe("saved inventory evidence labels", () => {
 });
 
 describe("saved inventory attention and pending evidence", () => {
+  it("does not let pending details hide a failed membership check or a superseded source", () => {
+    const inventory = savedInventory();
+    inventory.identityCollection = { checkedPackages: 1, pendingPackages: 1 };
+    inventory.verification = createUnifiedVerification(inventory.verification, { sourceMemberships: false }, undefined, inventory.identityCollection);
+    expect(inventory.verification.status).toBe("needs_attention");
+    expect(inventoryAttentionReasons(inventory)).toContain(
+      "Saved source membership accounting is incomplete. Recheck the selected source counts and refresh inventory in Data sync.");
+    inventory.sources.graphPackages.observation!.current = false;
+    expect(inventoryAttentionReasons(inventory)).toContain(
+      "A selected saved source is stale or no longer authoritative. Refresh it in Data sync.");
+  });
+
   it("does not invent an error or pending details before a saved read exists", () => {
     expect(inventoryAttentionReasons()).toEqual([]);
     expect(inventoryDetailsPending()).toBe(false);

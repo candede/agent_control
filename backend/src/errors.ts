@@ -1,6 +1,7 @@
 import type { ErrorRequestHandler } from "express";
+import { types } from "node:util";
 import { config } from "./config.js";
-import { operationalLog, requestRouteTemplate } from "./services/telemetry.js";
+import { operationalLog, requestRouteTemplate, safeTelemetry } from "./services/telemetry.js";
 
 export class AppError extends Error {
   status: number;
@@ -36,19 +37,32 @@ export const errorHandler: ErrorRequestHandler = (
   _next,
 ) => {
   const appError = normalizeError(error);
-  if (Number.isSafeInteger(appError.retryAfterSeconds) && appError.retryAfterSeconds! > 0) {
-    response.setHeader("Retry-After", String(appError.retryAfterSeconds));
+  const retryAfter: unknown = Object.getOwnPropertyDescriptor(appError, "retryAfterSeconds")?.value;
+  const details: unknown = Object.getOwnPropertyDescriptor(appError, "details")?.value;
+  if (typeof retryAfter === "number" && Number.isSafeInteger(retryAfter) && retryAfter > 0) {
+    response.setHeader("Retry-After", String(retryAfter));
   }
-  response.locals.errorCode = appError.code;
+  const telemetry = errorTelemetry(error, appError.code);
+  const responseLocals: unknown = types.isProxy(response) ? undefined : Object.getOwnPropertyDescriptor(response, "locals")?.value;
+  if (responseLocals && typeof responseLocals === "object" && !types.isProxy(responseLocals)) {
+    try {
+      Object.defineProperty(responseLocals, "errorCode", {
+        value: telemetry.errorCode, writable: true, enumerable: true, configurable: true,
+      });
+    } catch {
+      // A frozen or nonwritable diagnostic local must not replace the problem response.
+    }
+  }
+  const locals = safeTelemetry(responseLocals);
   const event = appError.code === "provider_throttled" ? "provider_throttled"
     : appError.status >= 500 ? "request_error" : "request_rejected";
   operationalLog(appError.status >= 500 ? "error" : "warn", event, {
-    requestId: response.locals.requestId, jobId: response.locals.jobId,
-    route: requestRouteTemplate(request), ...errorTelemetry(error), errorCode: appError.code, status: appError.status,
+    requestId: locals.requestId, jobId: locals.jobId,
+    route: requestRouteTemplate(request), ...telemetry, status: appError.status,
   });
 
-  const requestId = typeof response.locals.requestId === "string"
-    ? response.locals.requestId
+  const requestId = typeof locals.requestId === "string"
+    ? locals.requestId
     : "unavailable";
   response
     .status(appError.status)
@@ -60,40 +74,102 @@ export const errorHandler: ErrorRequestHandler = (
       detail: appError.message,
       code: appError.code,
       requestId,
-      ...(appError.details === undefined ? {} : { details: appError.details }),
+      ...(details === undefined ? {} : { details }),
     });
 };
 
 export function errorTelemetry(error: unknown, fallbackCode = "internal_error") {
-  const errorKind = isTimeoutError(error) || error instanceof AppError && error.code === "provider_timeout" ? "timeout"
-    : error instanceof Error && error.name === "AbortError" ? "aborted"
-      : error instanceof AppError ? "application" : "unexpected";
+  const fallback = safeTelemetry({ errorCode: fallbackCode }).errorCode;
+  let errorCode = typeof fallback === "string" ? fallback : "internal_error";
+  let status: number | undefined;
+  const application = isApplicationError(error);
+  if (application) {
+    const code: unknown = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    const fields = safeTelemetry({
+      errorCode: code,
+      status: Object.getOwnPropertyDescriptor(error, "status")?.value,
+    });
+    if (typeof fields.errorCode === "string") errorCode = fields.errorCode;
+    if (typeof fields.status === "number") status = fields.status;
+    const details: unknown = Object.getOwnPropertyDescriptor(error, "details")?.value;
+    if (status !== undefined && details !== null && typeof details === "object" && !types.isProxy(details)
+      && Object.getOwnPropertyDescriptor(details, "httpStatus")?.value === status
+      && typeof code === "string" && Object.getOwnPropertyDescriptor(details, "providerErrorCode")?.value === code) {
+      errorCode = "provider_error";
+    }
+  }
+  const name = errorName(error);
+  const errorKind = name === "TimeoutError" || application && errorCode === "provider_timeout" ? "timeout"
+    : name === "AbortError" ? "aborted" : application ? "application" : "unexpected";
   return {
-    errorCode: error instanceof AppError ? error.code : fallbackCode,
+    errorCode,
     errorKind,
-    ...(error instanceof AppError ? { status: error.status } : {}),
+    ...(status === undefined ? {} : { status }),
   };
 }
 
+export function isApplicationError(error: unknown): error is AppError {
+  return hasNativeErrorPrototype(error, AppError.prototype);
+}
+
+export function hasNativeErrorPrototype(error: unknown, prototype: object): boolean {
+  if (!types.isNativeError(error)) return false;
+  let value: object | null = error;
+  for (let depth = 0; value && depth < 8 && !types.isProxy(value); depth++) {
+    if (value === prototype) return true;
+    value = Object.getPrototypeOf(value);
+  }
+  return false;
+}
+
+function errorProperty(error: unknown, key: string): unknown {
+  if (!error || typeof error !== "object") return undefined;
+  let value: object | null = error;
+  for (let depth = 0; value && depth < 8 && !types.isProxy(value); depth++) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (property) return Object.hasOwn(property, "value") ? property.value : undefined;
+    value = Object.getPrototypeOf(value);
+  }
+  return undefined;
+}
+
+export function errorName(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || types.isProxy(error)) return undefined;
+  try {
+    // Use the trusted DOMException brand getter, not a shadowing instance accessor.
+    const name: unknown = Object.getOwnPropertyDescriptor(DOMException.prototype, "name")?.get?.call(error);
+    if (typeof name === "string") return name;
+  } catch {
+    // Ordinary native errors do not carry the DOMException brand.
+  }
+  if (!types.isNativeError(error)) return undefined;
+  const name = errorProperty(error, "name");
+  return typeof name === "string" && name.length <= 128 ? name : undefined;
+}
+
 export function isTimeoutError(error: unknown): error is Error {
-  return error instanceof Error && error.name === "TimeoutError";
+  return errorName(error) === "TimeoutError";
 }
 
 export function normalizeError(error: unknown) {
-  if (error instanceof AppError) {
-    return error;
+  const status = errorProperty(error, "status");
+  const message = errorProperty(error, "message");
+  if (isApplicationError(error)) {
+    const code: unknown = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599
+      && typeof code === "string" && typeof message === "string") return error;
+    return new AppError(500, "internal_error", "An unexpected error occurred");
   }
 
-  const status = (error as { status?: unknown })?.status;
   if (typeof status === "number" && [400,403,404,413].includes(status)) return new AppError(status, "request_rejected", "The request could not be served.");
 
-  if (error instanceof Error) {
+  if (types.isNativeError(error)) {
     return new AppError(
       500,
       "internal_error",
-      config.nodeEnv === "production"
+      config.nodeEnv === "production" || typeof message !== "string"
         ? "An unexpected error occurred"
-        : error.message,
+        : message,
     );
   }
 

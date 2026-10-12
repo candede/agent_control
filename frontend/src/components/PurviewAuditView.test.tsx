@@ -692,6 +692,23 @@ describe("PurviewAuditView", () => {
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
   });
 
+  it("cancels a waiting search without resuming provider work or deleting its recovery history", async () => {
+    let job = { ...partialJob, status: "waiting_authorization" as PurviewAuditJob["status"], canResume: true };
+    vi.mocked(getPurviewAuditJobs).mockImplementation(async () => ({ value: [job], count: 1, limit: 20, offset: 0 }));
+    vi.mocked(cancelPurviewAuditSearch).mockImplementation(async () => {
+      job = { ...job, status: "cancelled", canResume: false, remoteWorkMayContinue: true };
+      return job;
+    });
+    render(<CapabilityContext value={context(viewer)}><PurviewAuditView /></CapabilityContext>);
+    await userEvent.click(await screen.findByRole("button", { name: /Cancel local polling/ }));
+    await waitFor(() => expect(cancelPurviewAuditSearch).toHaveBeenCalledExactlyOnceWith(job.id, expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    expect(await screen.findByText("Remote work may continue")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Resume search|Cancel local polling/ })).not.toBeInTheDocument();
+    expect(deletePurviewAuditSearch).not.toHaveBeenCalled();
+    expect(resumePurviewAuditSearch).not.toHaveBeenCalled();
+    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+  });
+
   it("downloads the explicit saved CSV export and releases the local object URL", async () => {
     const createUrl = vi.fn(() => "blob:saved-purview");
     const revokeUrl = vi.fn();
@@ -1774,6 +1791,47 @@ describe("PurviewAuditView", () => {
     await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(value.reload).toHaveBeenCalledOnce();
     expect(startPurviewAuditQualification).toHaveBeenCalledOnce();
+  });
+
+  it.each(["succeeded", "partial", "inconclusive"] as const)(
+    "refreshes delegated lifecycle readiness only for a complete explicit search: %s", async status => {
+      vi.useFakeTimers();
+      const value = context(viewer, true);
+      value.views[0].decision.verification = "token";
+      const running: PurviewAuditJob = { ...partialJob, status: "running", pageComplete: false };
+      const completed: PurviewAuditJob = { ...running, status, pageComplete: status === "succeeded" };
+      vi.mocked(submitPurviewAuditSearch).mockResolvedValue(running);
+      vi.mocked(getPurviewAuditJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
+        .mockResolvedValue({ value: [running], count: 1, limit: 20, offset: 0 });
+      vi.mocked(getPurviewAuditJob).mockResolvedValue(completed);
+      render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
+      await act(async () => {});
+      expect(value.reload).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+      await act(async () => {});
+      vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [completed], count: 1, limit: 20, offset: 0 });
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(value.reload).toHaveBeenCalledTimes(status === "succeeded" ? 1 : 0);
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(value.reload).toHaveBeenCalledTimes(status === "succeeded" ? 1 : 0);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh Audit Search history" }));
+      await act(async () => {});
+      expect(value.reload).toHaveBeenCalledTimes(status === "succeeded" ? 2 : 0);
+      expect(submitPurviewAuditSearch).toHaveBeenCalledOnce();
+      expect(startPurviewAuditQualification).not.toHaveBeenCalled();
+      expect(resumePurviewAuditSearch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("shows expired qualification remediation without offering stale resume or unpublished results", async () => {
+    const expired: PurviewAuditJob = { ...partialJob, status: "inconclusive", canResume: false, storedRowCount: 0, pageCount: 0,
+      errorCode: "qualification_expired", message: "Audit Search qualification approval expired. Approve a new bounded qualification." };
+    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [expired], count: 1, limit: 20, offset: 0 });
+    render(<CapabilityContext value={context(administrator, true)}><PurviewAuditView /></CapabilityContext>);
+    expect(await screen.findByText(/qualification_expired: Audit Search qualification approval expired/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Resume search|View results|Export results|Cancel local polling/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Delete local cache/ })).toBeEnabled();
+    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
   });
 
   it("never claims complete coverage for an empty partial result", async () => {

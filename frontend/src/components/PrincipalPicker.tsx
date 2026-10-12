@@ -25,12 +25,14 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
   const [settledQuery, setSettledQuery] = useState<string>();
   const normalizedQuery = query.trim();
   const queryTooLong = normalizedQuery.length > maxSearchQueryLength;
-  const displayedError = queryTooLong
-    ? `Directory searches cannot exceed ${maxSearchQueryLength} characters.`
-    : error;
+  const queryHasControls = /\p{Cc}/u.test(query);
+  const displayedError = queryHasControls
+    ? "Directory searches must be text without control characters."
+    : queryTooLong ? `Directory searches cannot exceed ${maxSearchQueryLength} characters.`
+      : error;
 
   useEffect(() => {
-    if (disabled || normalizedQuery.length < 2 || queryTooLong || settledQuery === normalizedQuery) {
+    if (disabled || normalizedQuery.length < 2 || queryTooLong || queryHasControls || settledQuery === normalizedQuery) {
       return;
     }
 
@@ -61,7 +63,7 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
       controller.abort();
       window.clearTimeout(timerId);
     };
-  }, [disabled, normalizedQuery, queryTooLong, settledQuery]);
+  }, [disabled, normalizedQuery, queryTooLong, queryHasControls, settledQuery]);
 
   const selectedKeys = new Set(selected.map(principalKey));
   const visibleResults = results.filter(
@@ -81,14 +83,15 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
               type="search"
               value={query}
               disabled={disabled}
-              aria-invalid={queryTooLong || undefined}
+              aria-invalid={queryTooLong || queryHasControls || undefined}
               placeholder="Name or email"
               onChange={(event) => {
                 const nextQuery = event.target.value;
                 const nextNormalizedQuery = nextQuery.trim();
-                const canSearch = nextNormalizedQuery.length >= 2 && nextNormalizedQuery.length <= maxSearchQueryLength;
+                const nextHasControls = /\p{Cc}/u.test(nextQuery);
+                const canSearch = !nextHasControls && nextNormalizedQuery.length >= 2 && nextNormalizedQuery.length <= maxSearchQueryLength;
                 setQuery(nextQuery);
-                if (nextNormalizedQuery === normalizedQuery) return;
+                if (nextNormalizedQuery === normalizedQuery && nextHasControls === queryHasControls) return;
                 setSettledQuery(undefined);
                 setResults([]);
                 setError(undefined);
@@ -211,9 +214,7 @@ function matchesFilter(principal: DirectoryPrincipal, filter: PrincipalFilter) {
 }
 
 function principalKey(principal: DirectoryPrincipal) {
-  return `${principal.resourceType.trim().toLowerCase()}:${principal.resourceId
-    .trim()
-    .toLowerCase()}`;
+  return `${principal.resourceType.toLowerCase()}:${principal.resourceId}`;
 }
 
 function principalKindLabel(principal: DirectoryPrincipal) {

@@ -16,6 +16,7 @@ import { StreamedInventory } from "../src/services/streamedInventory.js";
 import { InventoryQueries } from "../src/db/inventoryQueries.js";
 import { peakCheckpoint } from "../src/services/peakMemory.js";
 import { capacityInput, fixtureFetch } from "./capacityRuntime.js";
+import { capacityWithCleanup } from "./capacityBackground.js";
 export { capacityBudgets } from "./capacityRuntime.js";
 function percentiles(values: number[]) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -34,7 +35,7 @@ async function queryComparison(database: BoundedPool, telemetry: CapacityTelemet
     const query = { sortBy: "displayName", sortDirection: "asc", inventoryScope: "all", source: "all" } as const;
     const selected = await queries.capture(identity, root.scopeId, query);
     const timings: number[] = [];
-    const requestWindows = [];
+    const requestWindows: Array<{ index: number } & ReturnType<CapacityTelemetry["endRequestWindow"]>> = [];
     let cursor: string | undefined, rows = 0;
     const observed = createHash("sha256"), expected = createHash("sha256");
     for (let i = 0; i < count; i++) expected.update(`package-${key(i)}\n`);
@@ -44,11 +45,15 @@ async function queryComparison(database: BoundedPool, telemetry: CapacityTelemet
       const windowIndex = timings.length;
       writeSync(1,`CAPACITY_REQUEST_WINDOW ${JSON.stringify({ state: "begin",pid: process.pid,count,index: windowIndex })}\n`);
       telemetry.beginRequestWindow();
-      const page = await queries.page(selected.id, identity, { limit: 100, cursor });
-      timings.push(performance.now() - started);
-      const serialized = JSON.stringify(page); peakCheckpoint("response.serialize");
-      requestWindows.push({ index: windowIndex,...telemetry.endRequestWindow() });
-      writeSync(1,`CAPACITY_REQUEST_WINDOW ${JSON.stringify({ state: "end",pid: process.pid,count,index: windowIndex })}\n`);
+      const { page, serialized } = await capacityWithCleanup(async () => {
+        const page = await queries.page(selected.id, identity, { limit: 100, cursor });
+        timings.push(performance.now() - started);
+        const serialized = JSON.stringify(page); peakCheckpoint("response.serialize");
+        return { page, serialized };
+      }, async () => {
+        requestWindows.push({ index: windowIndex,...telemetry.endRequestWindow() });
+        writeSync(1,`CAPACITY_REQUEST_WINDOW ${JSON.stringify({ state: "end",pid: process.pid,count,index: windowIndex })}\n`);
+      });
       assert.ok(Buffer.byteLength(serialized) <= MiB);
       assert.equal(page.counts.total, count); assert.ok(page.value.length <= 100);
       for (const row of page.value) { observed.update(`${row.nativeId}\n`); rows++; }
@@ -184,14 +189,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     telemetry.start();
     onCapacityWorkerTermination(() => telemetry.stop());
     const { DataGenerations } = await import("../src/db/dataGenerations.js");
-    await new DataGenerations(database).execute(capacityInput("capacity-death"), async lease => {
+    await capacityWithCleanup(() => new DataGenerations(database).execute(capacityInput("capacity-death"), async lease => {
       process.send?.(lease);
       await delay(180_000);
+    }), async () => {
+      try { telemetry.stop(); }
+      finally { await database.end(); }
     });
   } else if (process.argv[2] === "--probe" && process.argv[3] === "transient-heap") {
     const telemetry = new CapacityTelemetry("/evidence/probe-memory.jsonl"); telemetry.start();
-    const probe = await transientHeapProbe();
-    writeFileSync("/evidence/probe-result.json", JSON.stringify({ ...probe, memory: telemetry.stop() }, null, 2));
+    let memory: ReturnType<CapacityTelemetry["stop"]> | undefined;
+    const probe = await capacityWithCleanup(transientHeapProbe, async () => { memory = telemetry.stop(); });
+    writeFileSync("/evidence/probe-result.json", JSON.stringify({ ...probe, memory }, null, 2));
     console.log("TRANSIENT_HEAP_PROBE", JSON.stringify(probe));
     if (probe.status !== "passed") process.exitCode = 2;
   } else await runCapacity(process.argv[2] ?? "full");

@@ -798,13 +798,78 @@ describe("live selected users and reports", () => {
       agents: ["agent,Agent,User,1,0,5,"], userAgents: [`agent,Agent,User,${username},5,${today}`] });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
     const selected = await reports.capture(identity, "delegated", "copilot_users");
-    const combined = await reports.page<CombinedUser>(selected.id, identity);
+    const combined = await reports.page(selected.id, identity);
     expect(combined.summary).toMatchObject({ licensedUsers: 3, usingAgentsUsers: 0, noAgentActivityUsers: 0, unresolvedIdentities: 1 });
-    expect(combined.value.every(row => row.reportedResponses === null && row.agentActivityState === "unknown")).toBe(true);
+    expect(combined.value.every(row => "directory" in row && row.reportedResponses === null && row.agentActivityState === "unknown")).toBe(true);
     const official = await reports.capture(identity, "delegated", "official_users");
-    expect((await reports.page<ReportUser>(official.id, identity)).value[0]).toMatchObject({ objectId: null, entitlement: null, reportedResponses: 5 });
+    expect((await reports.page(official.id, identity)).value[0]).toMatchObject({ objectId: null, entitlement: null, reportedResponses: 5 });
     const agents = await reports.capture(identity, "delegated", "official_agents");
     expect((await reports.page(agents.id, identity)).value[0]).toMatchObject({ lastActivityDateUtc: null, responses: 5 });
+  });
+
+  it("resolves genuine compatibility and decomposed aliases independently on full and warm pages", async () => {
+    const identity = { ...selectionIdentity, tenantId: `unicode-directory-aliases-${randomUUID()}` };
+    const aliases = ["ｐｅｒｓｏｎ@example.invalid", "person@example.invalid", "Cafe\u0301@example.invalid", "café@example.invalid"];
+    const users = aliases.map((upn, index) => {
+      const user = sourceUser(index + 1, index % 2 ? "disabled" : "enabled");
+      user.identity.userPrincipalName = upn;
+      return user;
+    });
+    await directory(fixture.runtime, identity, users);
+    const usernames = aliases.map(alias => alias.toUpperCase());
+    await publish(new OfficialReportImports(fixture.runtime), identity, {
+      users: usernames.map((username, index) => `${username},Report ${index},1,5,${today}`), agents: [], userAgents: [],
+    });
+    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
+    for (const endpoint of ["copilot_users", "official_users"] as const) {
+      const selected = await reports.capture(identity, "delegated", endpoint, { sort: "name" });
+      const rows: Array<CombinedUser | ReportUser> = [];
+      let cursor: string | undefined;
+      do {
+        const page = await reports.page(selected.id, identity, { limit: 1, cursor });
+        expect(page.counts).toEqual({ total: 4, filtered: 4 });
+        expect(page.summary).toMatchObject({ licensedUsers: 2, usingAgentsUsers: 2, activeWithoutPaidUsers: 2, unresolvedIdentities: 0 });
+        rows.push(...page.value as Array<CombinedUser | ReportUser>);
+        cursor = page.page.nextCursor ?? undefined;
+      } while (cursor);
+      expect(rows).toHaveLength(4);
+      for (const [index, user] of users.entries()) {
+        const row = rows.find(row => ("directory" in row ? row.directory.objectId : row.objectId) === user.identity.objectId);
+        expect(row).toMatchObject({ reportedResponses: 5, entitlement: index % 2 ? "no_paid" : "paid_active" });
+        expect(row).toMatchObject(endpoint === "copilot_users"
+          ? { reportedUsername: usernames[index], reportMatch: "matched" } : { username: usernames[index] });
+      }
+    }
+  });
+
+  it("does not turn compatibility-folded usernames into directory identities or conflicting aliases", async () => {
+    const identity = { ...selectionIdentity, tenantId: `exact-report-identities-${randomUUID()}` };
+    const users = [sourceUser(1), sourceUser(2, "disabled"), sourceUser(3, "disabled")];
+    users[0].identity.userPrincipalName = users[1].identity.objectId;
+    await directory(fixture.runtime, identity, users);
+    const fullWidth = (value: string) => value.replace(/[!-~]/g, character => String.fromCharCode(character.charCodeAt(0) + 0xfee0));
+    const concealedUpn = fullWidth(users[2].identity.userPrincipalName);
+    const concealedId = fullWidth(users[1].identity.objectId);
+    const exactUpn = users[1].identity.userPrincipalName.toUpperCase();
+    await publish(new OfficialReportImports(fixture.runtime), identity, {
+      users: [`${concealedUpn},A concealed UPN,1,5,${today}`, `${concealedId},B concealed ID,1,6,${today}`,
+        `${exactUpn},C exact UPN,1,7,${today}`], agents: [], userAgents: [],
+    });
+    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
+    const combined = await reports.capture(identity, "delegated", "copilot_users", { sort: "name" });
+    const first = await reports.page(combined.id, identity, { limit: 1 });
+    const next = await reports.page(combined.id, identity, { limit: 1, cursor: first.page.nextCursor! });
+    expect(first.summary.unresolvedIdentities).toBe(2);
+    expect(next.value).toMatchObject([{ directory: { objectId: users[1].identity.objectId }, reportedResponses: 7 }]);
+    expect((await reports.exact(combined.id, identity, users[2].identity.objectId)).value)
+      .toMatchObject({ reportedResponses: null, reportMatch: "missing" });
+    const official = await reports.capture(identity, "delegated", "official_users");
+    const hidden = await reports.page(official.id, identity, { limit: 1 });
+    const hiddenId = await reports.page(official.id, identity, { limit: 1, cursor: hidden.page.nextCursor! });
+    const exact = await reports.page(official.id, identity, { limit: 1, cursor: hiddenId.page.nextCursor! });
+    expect(hidden.value).toMatchObject([{ username: concealedUpn, objectId: null, entitlement: null }]);
+    expect(hiddenId.value).toMatchObject([{ username: concealedId, objectId: null, entitlement: null }]);
+    expect(exact.value).toMatchObject([{ username: exactUpn, objectId: users[1].identity.objectId, entitlement: "no_paid" }]);
   });
 
   it("keeps idle immutable selection aggregates bounded without losing ambiguity, known zero, fences or reverse cursors", async () => {
@@ -869,7 +934,7 @@ describe("live selected users and reports", () => {
     await publish(new OfficialReportImports(fixture.runtime), identity, { users: ["user1@example.invalid,User,1,5,2000-01-01"],
       agents: ["agent,Agent,User,1,0,5,2000-01-01"], userAgents: ["agent,Agent,User,user1@example.invalid,5,2000-01-01"] });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "delegated", "copilot_users");
-    const page = await reports.page<CombinedUser>(selected.id, identity);
+    const page = await reports.page(selected.id, identity);
     expect(page.reports.availability).toBe("stale");
     expect(page.reports.lineages.every(row => row.sourceFreshness === "unknown")).toBe(true);
     expect(page.summary).toMatchObject({ licensedUsers: 1, usingAgentsUsers: null, noAgentActivityUsers: null });

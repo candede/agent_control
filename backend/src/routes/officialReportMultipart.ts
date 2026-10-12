@@ -25,8 +25,8 @@ function metadata(fields: Record<string, unknown>): OfficialUsageMetadata {
   }
   const periodFields = [fields.reportingStart, fields.reportingEnd, fields.periodProvenance].filter(value => value !== undefined).length;
   if (periodFields !== 0 && periodFields !== 3 || periodFields && fields.periodProvenance !== "operator_asserted"
-    || Boolean(fields.sourceAsOf) !== Boolean(fields.sourceAsOfProvenance)
-    || fields.sourceAsOfProvenance && fields.sourceAsOfProvenance !== "operator_asserted") {
+    || (fields.sourceAsOf !== undefined) !== (fields.sourceAsOfProvenance !== undefined)
+    || fields.sourceAsOfProvenance !== undefined && fields.sourceAsOfProvenance !== "operator_asserted") {
     throw new AppError(400, "invalid_metadata", "Supply complete operator-asserted provenance.");
   }
   const text = (value: unknown, maximum: number) => {
@@ -37,8 +37,8 @@ function metadata(fields: Record<string, unknown>): OfficialUsageMetadata {
   };
   return {
     ...(periodFields ? { reportingPeriod: { startDate: text(fields.reportingStart, 10), endDate: text(fields.reportingEnd, 10), provenance: "operator_asserted" as const } } : {}),
-    ...(fields.sourceAsOf ? { sourceAsOf: { value: text(fields.sourceAsOf, 128), provenance: "operator_asserted" as const } } : {}),
-    ...(fields.downloadedAt ? { downloadedAt: text(fields.downloadedAt, 128) } : {}),
+    ...(fields.sourceAsOf !== undefined ? { sourceAsOf: { value: text(fields.sourceAsOf, 128), provenance: "operator_asserted" as const } } : {}),
+    ...(fields.downloadedAt !== undefined ? { downloadedAt: text(fields.downloadedAt, 128) } : {}),
   };
 }
 

@@ -4,12 +4,12 @@ import { JobRepository, type Lease } from "../db/jobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { DataScope } from "./auditLog.js";
-import { GraphPackagesClient, updatePackageAccess, verifyPackageMutationConverged } from "./graphPackages.js";
+import { GraphPackagesClient, packageReadTimeoutMs, updatePackageAccess, verifyPackageMutationConverged } from "./graphPackages.js";
 import { maintenanceActive } from "./maintenance.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
-import { capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
+import { capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, packageMutationStatesEqual, requirePersistablePackageMutationState, type PackageMutationState } from "./packageMutationState.js";
 import { operationalLog } from "./telemetry.js";
 
 export const bulkJobs = new JobRepository();
@@ -78,18 +78,23 @@ export async function runBulkJob(
 ) {
   requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const authorizeJob = async (owner: DataScope, capabilityId: CapabilityId) => {
-    externalSignal?.throwIfAborted();
-    assertAccountSessionValidation(validation);
-    const token = await authorize(owner, capabilityId);
-    externalSignal?.throwIfAborted();
-    assertAccountSessionValidation(validation);
-    return token;
-  };
   const jobSummary = await repository.get(id, scope);
+  assertAccountSessionValidation(validation);
   if (!jobSummary) throw new AppError(404, "not_found", "Job was not found.");
   if (jobSummary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "The delegated worker cannot execute an application-mode job.");
+  if (jobSummary.isCanary && (resume || authorize === authorizeDelegatedJob)) {
+    throw new AppError(409, "canary_cycle_authorization_required", "A package canary may run only inside its original approval-bound cycle; ordinary execution or resume is prohibited.");
+  }
   const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
+  const validateCapability = capabilities.beginOperationValidation(jobSummary.capabilityId, principal);
+  const assertCurrent = () => {
+    externalSignal?.throwIfAborted();
+    assertAccountSessionValidation(validation);
+    validateCapability();
+    requireProviderAdmissions();
+  };
+  const authorizeJob = (owner: DataScope, capabilityId: CapabilityId, signal = externalSignal) =>
+    currentPackageAuthorization(() => authorize(owner, capabilityId), assertCurrent, signal);
   let accessToken: string;
   try {
     requireProviderAdmissions();
@@ -114,32 +119,45 @@ export async function runBulkJob(
       const current = await repository.beginItem(lease);
       if (!current) break;
       const { item, job, inventoryGeneration } = current;
-      const signal = externalSignal
+      const executionDeadlineAt = Date.now() + itemExecutionDeadlineMs;
+      const executionExpiresAt = performance.now() + itemExecutionDeadlineMs;
+      const itemSignal = externalSignal
         ? AbortSignal.any([externalSignal, AbortSignal.timeout(itemExecutionDeadlineMs)])
         : AbortSignal.timeout(itemExecutionDeadlineMs);
+      let signal = itemSignal;
+      let sent = false, finished = false;
       const requireCurrentItem = () => {
         requireProviderAdmissions();
         signal.throwIfAborted();
         assertAccountSessionValidation(validation);
+        validateCapability();
+        requirePackageDeadline(executionDeadlineAt, executionExpiresAt);
       };
-      const getPackageDetails = async (...args: Parameters<GraphPackagesClient["getPackageDetails"]>) => {
-        requireCurrentItem();
-        const details = await provider.getPackageDetails(...args);
-        requireCurrentItem();
-        return details;
-      };
-      let sent = false;
       try {
-        await repository.settleInventoryControls(scope, signal, async () => { await authorizeJob(scope, job.capability); });
-        await capabilities.observeOperation(job.capability, principal, () => repository.withTargetLock(lease, item, async () => {
-          const readOptions = { correlationId: item.correlation_id!, signal };
+        requireCurrentItem();
+        await repository.settleInventoryControls(lease, item.id, itemSignal, async () => {
+          requireCurrentItem();
+          await authorizeJob(scope, job.capability, itemSignal);
+          requireCurrentItem();
+        }, requireCurrentItem);
+        requireCurrentItem();
+        await capabilities.observeOperation(job.capability, principal, () => repository.withTargetLock(lease, item, async lockSignal => {
+          signal = AbortSignal.any([itemSignal, lockSignal]);
+          requireCurrentItem();
+          const getPackageDetails = async (...args: Parameters<GraphPackagesClient["getPackageDetails"]>) => {
+            requireCurrentItem();
+            const details = await provider.getPackageDetails(...args);
+            requireCurrentItem();
+            return details;
+          };
+          const readOptions = { correlationId: item.correlation_id!, signal, executionDeadlineAt, assertCurrent: requireCurrentItem };
           const before = await getPackageDetails(accessToken, item.target_id, readOptions);
           if (before.id !== item.target_id) throw new AppError(502,"target_mismatch","Provider returned a different package identity.");
           const beforeState = capturePackageMutationState(before, job.action);
           requireFrozenPrestate(item.prestate_hash, beforeState);
           let readbackToken = accessToken;
           const dispatch = async () => {
-            const dispatchToken = await authorizeJob(scope, job.capability);
+            const dispatchToken = await authorizeJob(scope, job.capability, signal);
             const immediate = await getPackageDetails(dispatchToken, item.target_id, readOptions);
             if (immediate.id !== item.target_id) throw new AppError(502,"target_mismatch","Provider returned a different package identity.");
             const immediateState = capturePackageMutationState(immediate, job.action);
@@ -148,7 +166,7 @@ export async function runBulkJob(
             await commitAccountSessionValidation(validation, async () => {
               requireProviderAdmissions();
               signal.throwIfAborted();
-              await repository.markSent(lease, item.id, packageMutationStateHash(immediateState));
+              await repository.markSent(lease, item.id, packageMutationStateHash(immediateState), signal, requireCurrentItem);
             });
             sent = true;
             requireCurrentItem();
@@ -158,6 +176,9 @@ export async function runBulkJob(
           if (job.access_update) {
             const accessAction = job.action;
             if (accessAction !== "update-availability" && accessAction !== "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package access action does not match its payload.");
+            const expected = expectedPackageMutationState(beforeState, accessAction, job.access_update);
+            requirePersistablePackageMutationState(beforeState);
+            requirePersistablePackageMutationState(expected);
             const result = await updatePackageAccess({
               getPackageDetails,
               patchPackageAccess: (...args) => {
@@ -167,19 +188,24 @@ export async function runBulkJob(
             }, accessToken, item.target_id, job.access_update, before, dispatch, readOptions);
             requireProviderAdmissions();
             if (!result.changed) {
-              await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorizeJob, signal);
+              await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorizeJob, signal, validation, requireCurrentItem);
+              finished = true;
+              requireCurrentItem();
               return;
             }
-            const expected = expectedPackageMutationState(beforeState, accessAction, job.access_update);
             const verified = await verifyPackageMutationConverged({ getPackageDetails }, readbackToken, item.target_id, accessAction, expected, readOptions);
-            await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorizeJob, signal);
+            await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorizeJob, signal, validation, requireCurrentItem);
+            finished = true;
+            requireCurrentItem();
             return;
           }
           const blockAction = job.action;
           if (blockAction === "reassign" || blockAction === "update-availability" || blockAction === "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package action does not match its payload.");
           const expected = expectedPackageMutationState(beforeState, blockAction);
           if (packageMutationStateHash(beforeState) === packageMutationStateHash(expected)) {
-            await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorizeJob, signal);
+            await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorizeJob, signal, validation, requireCurrentItem);
+            finished = true;
+            requireCurrentItem();
             return;
           }
           const dispatchToken = await dispatch();
@@ -188,11 +214,21 @@ export async function runBulkJob(
           else await provider.unblockPackage(dispatchToken, item.target_id, readOptions);
           requireProviderAdmissions();
           const verified = await verifyPackageMutationConverged({ getPackageDetails }, dispatchToken, item.target_id, blockAction, expected, readOptions);
-          await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorizeJob, signal);
-        }), { signal, clearOnSuccess: () => sent });
+          await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorizeJob, signal, validation, requireCurrentItem);
+          finished = true;
+          requireCurrentItem();
+        }), { signal: itemSignal, clearOnSuccess: () => sent });
       } catch (caught) {
+        if (finished) throw caught;
         if (caught instanceof AppError && caught.code === "lease_lost") throw caught;
-        const error: unknown = signal.aborted ? signal.reason : caught;
+        let error: unknown = caught;
+        try {
+          signal.throwIfAborted();
+          assertAccountSessionValidation(validation);
+          validateCapability();
+          requireProviderAdmissions();
+          requirePackageDeadline(executionDeadlineAt, executionExpiresAt);
+        } catch (currentError) { error = currentError; }
         if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error) || error instanceof AppError && [401, 403].includes(error.status))) {
           await repository.pauseItemForAuthorization(lease, item.id);
           return;
@@ -227,12 +263,19 @@ export async function reconcileBulkJob(
 ) {
   requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const validateCapability = capabilities.beginOperationValidation("graph.package.read.delegated",
+    { tenantId: scope.tenantId, homeAccountId: scope.principalId });
+  const assertCurrent = () => {
+    assertAccountSessionValidation(validation);
+    validateCapability();
+    requireProviderAdmissions();
+  };
   const summary = await repository.get(id, scope);
-  assertAccountSessionValidation(validation);
+  assertCurrent();
   if (!summary) throw new AppError(404, "not_found", "Job was not found.");
   if (summary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "Package reconciliation requires the original delegated authorization mode.");
   let context = await repository.reconciliationContext(id, scope);
-  assertAccountSessionValidation(validation);
+  assertCurrent();
   if (!context) throw new AppError(404, "not_found", "Job was not found.");
   const errors: Array<{ id: string; message: string }> = [];
   let attempted = 0, failed = 0;
@@ -243,36 +286,53 @@ export async function reconcileBulkJob(
       attempted += 1;
       requireProviderAdmissions();
       assertAccountSessionValidation(validation);
+      validateCapability();
+      let published = false;
       try {
-        const token = await authorize(scope, "graph.package.read.delegated");
-        assertAccountSessionValidation(validation);
-        const signal = AbortSignal.timeout(reconciliationDeadlineMs);
-        await repository.withReconciliationLock(scope, item, async () => {
+        const executionDeadlineAt = Date.now() + reconciliationDeadlineMs;
+        const executionExpiresAt = performance.now() + reconciliationDeadlineMs;
+        const deadline = AbortSignal.timeout(reconciliationDeadlineMs);
+        const requireWithinDeadline = () => {
+          deadline.throwIfAborted();
+          assertCurrent();
+          requirePackageDeadline(executionDeadlineAt, executionExpiresAt);
+        };
+        const token = await currentPackageAuthorization(() => authorize(scope, "graph.package.read.delegated"), requireWithinDeadline, deadline);
+        requireWithinDeadline();
+        await repository.withReconciliationLock(scope, item, async lockSignal => {
+          const signal = AbortSignal.any([deadline, lockSignal]);
+          const requireCurrent = () => { signal.throwIfAborted(); requireWithinDeadline(); };
+          requireCurrent();
           if (action === "reassign") throw new AppError(409, "reassign_verification_unavailable", "Reassign owner cannot be reconciled because Microsoft Graph does not expose owner state.");
+          requireFrozenPrestate(item.prestate_hash, item.prestate);
           const inventoryGeneration = await repository.inventoryGeneration(scope);
-          requireProviderAdmissions();
-          assertAccountSessionValidation(validation);
-          const details = await provider.getPackageDetails(token, item.target_id, { correlationId: item.correlation_id ?? randomUUID(), signal });
+          requireCurrent();
+          const details = await provider.getPackageDetails(token, item.target_id, { correlationId: item.correlation_id ?? randomUUID(), signal, executionDeadlineAt, assertCurrent: requireCurrent });
+          requireCurrent();
           if (details.id !== item.target_id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
           const observed = capturePackageMutationState(details, action);
           const expected = expectedPackageMutationState(item.prestate, action, accessUpdate ?? undefined);
           requireProviderAdmissions();
           assertAccountSessionValidation(validation);
-          await authorize(scope, "graph.package.read.delegated");
-          signal.throwIfAborted();
+          requireCurrent();
+          await currentPackageAuthorization(() => authorize(scope, "graph.package.read.delegated"), requireCurrent, signal);
+          requireCurrent();
           await commitAccountSessionValidation(validation, async () => {
             signal.throwIfAborted();
             requireProviderAdmissions();
             if (packageMutationStatesEqual(observed, expected)) {
-              await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.", { details, inventoryGeneration });
+              await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.", { details, inventoryGeneration }, signal, requireCurrent);
             } else if (packageMutationStatesEqual(observed, item.prestate)) {
-              await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.", { details, inventoryGeneration });
+              await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.", { details, inventoryGeneration }, signal, requireCurrent);
             } else {
-              await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.", { details, inventoryGeneration });
+              await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.", { details, inventoryGeneration }, signal, requireCurrent);
             }
           });
+          published = true;
         });
-      } catch {
+      } catch (error) {
+        if (published) throw error;
+        assertCurrent();
         failed += 1;
         if (errors.length < 20) errors.push({ id: item.target_id, message: "Reconciliation could not be completed; no provider state was published." });
       }
@@ -281,20 +341,14 @@ export async function reconcileBulkJob(
     context = await repository.reconciliationContext(id, scope, after);
     if (!context) throw new AppError(404, "not_found", "Job was not found.");
   }
-  requireProviderAdmissions();
-  if (attempted > failed) {
-    await repository.settleInventoryControls(scope, AbortSignal.timeout(reconciliationDeadlineMs), async () => {
-      requireProviderAdmissions();
-      assertAccountSessionValidation(validation);
-      await authorize(scope, "graph.package.read.delegated");
-      assertAccountSessionValidation(validation);
-    });
-  }
-  await authorize(scope, "graph.package.read.delegated");
+  assertCurrent();
+  await currentPackageAuthorization(() => authorize(scope, "graph.package.read.delegated"), assertCurrent);
   assertAccountSessionValidation(validation);
+  validateCapability();
   const current = await repository.get(id, scope);
   requireProviderAdmissions();
   assertAccountSessionValidation(validation);
+  validateCapability();
   if (!current) throw new AppError(404, "not_found", "Job was not found.");
   return { ...current, reconciliation: { attempted, failed, errors } };
 }
@@ -327,18 +381,57 @@ async function finishAuthorized(
   evidence: Parameters<JobRepository["finishItem"]>[3],
   scope: DataScope,
   capabilityId: CapabilityId,
-  authorize: (scope: DataScope, capabilityId: CapabilityId) => Promise<string>,
+  authorize: (scope: DataScope, capabilityId: CapabilityId, signal?: AbortSignal) => Promise<string>,
   signal: AbortSignal,
+  validation: ReturnType<typeof beginAccountSessionValidation>,
+  assertCurrent: () => void,
 ) {
-  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  await authorize(scope, capabilityId);
+  assertCurrent();
+  await authorize(scope, capabilityId, signal);
   requireProviderAdmissions();
   signal.throwIfAborted();
+  assertCurrent();
   await commitAccountSessionValidation(validation, async () => {
     requireProviderAdmissions();
     signal.throwIfAborted();
-    await repository.finishItem(lease, itemId, outcome, evidence);
+    assertCurrent();
+    await repository.finishItem(lease, itemId, outcome, evidence, signal, assertCurrent);
   });
+}
+
+function requirePackageDeadline(executionDeadlineAt: number, executionExpiresAt: number) {
+  if (Date.now() >= executionDeadlineAt || performance.now() >= executionExpiresAt) {
+    throw new DOMException("Package execution deadline expired.", "TimeoutError");
+  }
+}
+
+async function currentPackageAuthorization(
+  operation: () => Promise<string>, assertCurrent: () => void, parent?: AbortSignal,
+) {
+  const expiresAt = performance.now() + packageReadTimeoutMs;
+  const timeout = AbortSignal.timeout(packageReadTimeoutMs);
+  const signal = parent ? AbortSignal.any([parent, timeout]) : timeout;
+  let removeAbort = () => {};
+  try {
+    assertCurrent();
+    signal.throwIfAborted();
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+      removeAbort = () => signal.removeEventListener("abort", onAbort);
+    });
+    const result = await Promise.race([operation(), aborted]);
+    assertCurrent();
+    if (performance.now() >= expiresAt) throw new AppError(504, "provider_timeout", "Microsoft package authorization did not complete within 30 seconds.");
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    assertCurrent();
+    parent?.throwIfAborted();
+    if (timeout.aborted || performance.now() >= expiresAt) throw new AppError(504, "provider_timeout", "Microsoft package authorization did not complete within 30 seconds.");
+    throw error;
+  } finally { removeAbort(); }
 }
 
 function isAuthorizationFailure(error: unknown) {
@@ -367,8 +460,16 @@ function requireFrozenPrestate(expectedHash: string, observed: PackageMutationSt
 
 function failureEvidence(error: unknown) {
   const details = error instanceof AppError && error.details && typeof error.details === "object" ? error.details as { lastState?: unknown; readbackCount?: unknown } : undefined;
+  let poststate: PackageMutationState | undefined;
+  if (isMutationState(details?.lastState)) {
+    try { poststate = requirePersistablePackageMutationState(details.lastState); }
+    catch (error) {
+      // Optional divergent-state diagnostics must not prevent a durable inconclusive outcome.
+      if (!(error instanceof AppError && error.code === "mutation_state_too_large")) throw error;
+    }
+  }
   return {
-    ...(isMutationState(details?.lastState) ? { poststate: details.lastState } : {}),
+    ...(poststate ? { poststate } : {}),
     ...(typeof details?.readbackCount === "number" ? { readbackCount: details.readbackCount } : {}),
   };
 }

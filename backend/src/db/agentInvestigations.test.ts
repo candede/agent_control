@@ -5,6 +5,9 @@ import { DefenderHuntingRepository, huntingTargetScopeHash, type DefenderHunting
 import { PurviewAuditRepository } from "./purviewAudit.js";
 import { LiveInventory } from "./liveInventory.js";
 import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
+import { AgentInvestigationsService } from "../services/agentInvestigations.js";
+import type { AgentIdentityCacheState } from "./agentIdentity.js";
+import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestigations.js";
 
 const entra = "11111111-1111-4111-8111-111111111111";
 const bot = "22222222-2222-4222-8222-222222222222";
@@ -39,6 +42,68 @@ describe("agent-scoped saved-query isolation", () => {
     });
     expect(query).toHaveBeenCalledOnce();
   });
+
+  it.each(["entra_app_id", "entra_agent_id"] as const)(
+    "withholds %s investigation scope when another environment changes during the identity read", async kind => {
+      const database = new pg.Pool({ max: 4 });
+      const client = Object.assign(new pg.Client(), { release: vi.fn() });
+      const connect = vi.spyOn(database, "connect").mockResolvedValue(client);
+      const now = new Date(), expiresAt = new Date(now.getTime() + 60_000);
+      let inventoryRevision = "1", changed = false;
+      const query = vi.spyOn(client, "query").mockImplementation(async (sql: string) => {
+        let rows: pg.QueryResultRow[] = [];
+        if (sql.includes("SELECT clock_timestamp() AS now")) rows = [{ now }];
+        else if (sql.includes("selected AS")) rows = [{
+          identity: entra, generation_id: "33333333-3333-4333-8333-333333333333",
+          inventory_baseline_id: "44444444-4444-4444-8444-444444444444", inventory_revision: inventoryRevision,
+          display_name: "Saved agent", environment_id: "environment-a", link_state: "unmatched",
+          residual: { identity: { evidence: [], packageEvidence: [], reason: null } },
+        }];
+        else if (sql.includes("SELECT r.generation_id,r.identity,r.residual")) rows = [{
+          generation_id: "55555555-5555-4555-8555-555555555555", identity: "native-a", observed_at: now, expires_at: expiresAt,
+          residual: { type: "microsoft.copilotstudio/agents", tenantId: "tenant-a", nativeId: "native-a",
+            environmentId: "environment-a", agentKind: "copilot_studio_agent", provenance: {
+              entraAppId: { sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga" },
+              entraAgentId: { sourceSystem: "power_platform", path: "properties.entraAgentId", maturity: "ga" },
+            } },
+        }];
+        else if (sql.includes("SELECT kinds.kind,identifier.value")) rows = [{ kind, value: entra }];
+        else if (sql.includes("SELECT DISTINCT c.normalized_native_id")) {
+          rows = [
+            { normalized_native_id: "native-a", normalized_environment_id: "environment-a", tenant_id: "tenant-a" },
+            ...(inventoryRevision === "2" ? [{
+              normalized_native_id: "native-b", normalized_environment_id: "environment-b", tenant_id: "tenant-a",
+            }] : []),
+          ];
+          // A cross-environment collision changes the root, not this agent's row or native snapshot.
+          if (changed) inventoryRevision = "2";
+        } else if (!["BEGIN ISOLATION LEVEL REPEATABLE READ", "COMMIT", "ROLLBACK"].includes(sql)
+          && !sql.includes("SELECT substr(kind,8) AS role")) throw new Error("Unexpected live investigation query.");
+        return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
+      });
+      const mappings = { readState: vi.fn(async (): Promise<AgentIdentityCacheState> => ({
+        status: "resolved", value: { objectId: entra, applicationId: entra, checkedAt: now.toISOString(), expiresAt: expiresAt.toISOString(),
+          runtimeStatus: "available", runtimeProvenance: verifiedAgentIdentityClientIdProvenance },
+      })) };
+      const inventory = new LiveInventory(database);
+      const service = new AgentInvestigationsService(inventory, inventory, mappings);
+      const actor = { tenantId: "tenant-a", principalId: "reader-a" };
+      try {
+        await expect(service.defenderScope(actor, `agent:${entra}`)).resolves.toMatchObject({
+          entraAgentApplicationIds: [entra], entraAgentIds: kind === "entra_agent_id" ? [entra] : [],
+        });
+        changed = true;
+        await expect(service.resolve(actor, `agent:${entra}`)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
+        const refreshed = await service.resolve(actor, `agent:${entra}`);
+        expect(refreshed.context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [] });
+        expect(refreshed.identitySource).toBeUndefined();
+      } finally {
+        query.mockRestore();
+        connect.mockRestore();
+        await database.end();
+      }
+    },
+  );
 
   it("separates object-ID inventory jobs from application-ID runtime jobs before pagination", async () => {
     const db = database();

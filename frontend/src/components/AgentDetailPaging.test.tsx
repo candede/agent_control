@@ -12,6 +12,7 @@ import { SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfigurat
 
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getInventoryChildren: vi.fn(), getInventoryMembers: vi.fn(),
+  getInventorySections: vi.fn(),
 }));
 const source = { scopeId: "source-scope", identity: "native-agent" };
 const props = { selectionId: "selected", recordId: "agent:canonical", source };
@@ -50,6 +51,9 @@ beforeEach(() => {
   vi.mocked(api.getInventoryMembers).mockImplementation(async (_selection, _record, cursor) => ({
     value: [member(cursor ? "later-package" : "first-package")], total: 2000, nextCursor: cursor ? null : "next-versions",
   }));
+  vi.mocked(api.getInventorySections).mockResolvedValue({
+    value: [{ kind: "detail:channels", total: 0 }], nextCursor: null,
+  });
 });
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.resetAllMocks(); });
 

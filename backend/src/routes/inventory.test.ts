@@ -1,6 +1,8 @@
 import type { Request, RequestHandler, Response, Router } from "express";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
+import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
+import { activateAccountSession } from "../db/sessions.js";
 import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import type { RoutePolicy } from "./policy.js";
 import { createInventoryReadRouter } from "./inventory.js";
@@ -45,6 +47,17 @@ async function invoke(method: string, path: string, input: Partial<Request> = {}
 }
 
 describe("Power Platform refresh admission and exact live reads", () => {
+  it.each(["resolves", "rejects"] as const)("fences history when a pending read %s after replacement sign-in", async settlement => {
+    const pending = Promise.withResolvers<{ value: []; lastAttemptAt: null; lastSuccessAt: null }>();
+    const list = vi.spyOn(PowerPlatformRefreshJobs.prototype, "listJobs").mockReturnValueOnce(pending.promise);
+    const request = invoke("get", "/inventory/refresh-jobs").catch(error => error);
+    await vi.waitFor(() => expect(list).toHaveBeenCalledOnce());
+    await activateAccountSession("tenant", "principal", async () => undefined);
+    if (settlement === "resolves") pending.resolve({ value: [], lastAttemptAt: null, lastSuccessAt: null });
+    else pending.reject(new Error("Late private history read failure."));
+    expect(await request).toMatchObject({ code: "unauthorized" });
+  });
+
   it.each(["/inventory/refresh-jobs", "/inventory/refresh-jobs/:id/resume"])(
     "returns the persisted permission failure from %s instead of an authorization wait", async path => {
       const job: InventoryRefreshJob = {
@@ -62,6 +75,17 @@ describe("Power Platform refresh admission and exact live reads", () => {
       expect(response.status).toHaveBeenCalledWith(202);
       expect(response.json).toHaveBeenCalledWith(job);
       expect(mocks.get).toHaveBeenCalledWith(user, job.id);
+      expect(mocks.start).toHaveBeenCalledWith(user, job.id, { retryFailed: true });
+    });
+
+  it.each(["/inventory/refresh-jobs", "/inventory/refresh-jobs/:id/resume"])(
+    "rechecks failed readiness for an explicit source command at %s", async path => {
+      const job = { id: snapshotId, status: "waiting_authorization" };
+      mocks.submit.mockResolvedValue(job);
+      mocks.start.mockResolvedValue({ ...job, status: "running" });
+      const response = await invoke("post", path, { params: { id: job.id } });
+      expect(mocks.start).toHaveBeenCalledExactlyOnceWith(user, job.id, { retryFailed: true });
+      expect(response.json).toHaveBeenCalledWith({ ...job, status: "running" });
     });
 
   it.each(["get", "post"])("has no %s synchronous CSV or full-set resource route", method => {

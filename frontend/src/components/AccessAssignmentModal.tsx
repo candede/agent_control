@@ -34,6 +34,7 @@ type AccessAssignmentModalProps = {
 type AccessAssignmentEditorProps = Omit<AccessAssignmentModalProps, "context" | "agentCount"> & {
   active?: boolean;
   readOnly?: boolean;
+  unavailableReason?: string;
   onTargetChange: (target: PackageAccessTarget) => void;
 };
 
@@ -57,11 +58,13 @@ function AccessAssignmentForm({
   inline = false,
   active = true,
   readOnly = false,
+  unavailableReason,
   onTargetChange,
 }: AccessAssignmentModalProps & {
   inline?: boolean;
   active?: boolean;
   readOnly?: boolean;
+  unavailableReason?: string;
   onTargetChange?: (target: PackageAccessTarget) => void;
 }) {
   const id = useId();
@@ -90,7 +93,7 @@ function AccessAssignmentForm({
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const submissionInFlight = useRef(false);
-  const locked = busy || submitting || readOnly || !active;
+  const locked = busy || submitting || readOnly || !active || Boolean(unavailableReason);
   const [resolutionError, setResolutionError] = useState<string>();
   const [error, setError] = useState<string>();
   const dialogRef = useRef<HTMLElement>(null);
@@ -126,7 +129,7 @@ function AccessAssignmentForm({
   }, [busy, inline, onCancel, submitting]);
 
   useEffect(() => {
-    if (!active || scope !== "specific" || readOnly || !directoryAllowed || !resolving) {
+    if (!active || scope !== "specific" || readOnly || unavailableReason || !directoryAllowed || !resolving) {
       return;
     }
 
@@ -150,7 +153,7 @@ function AccessAssignmentForm({
     return () => {
       controller.abort();
     };
-  }, [initialAccess, resolving, directoryAllowed, active, readOnly, scope]);
+  }, [initialAccess, resolving, directoryAllowed, active, readOnly, unavailableReason, scope]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
@@ -407,8 +410,8 @@ function AccessAssignmentForm({
                     ? initialAccess.principalsReported ? `${selected.length.toLocaleString()} saved` : "Not reported"
                     : `${selected.length.toLocaleString()} selected`}</span>
                 </div>
-                {readOnly || !directoryAllowed ? <>
-                  {!readOnly ? <p role="status">{directory ? capabilityExplanation(directory, capabilities.now) : "Directory capability is unavailable."}</p> : null}
+                {readOnly || unavailableReason || !directoryAllowed ? <>
+                  {!readOnly && !directoryAllowed ? <p role="status">{directory ? capabilityExplanation(directory, capabilities.now) : "Directory capability is unavailable."}</p> : null}
                   <AssignmentList values={readOnly && !initialAccess.principalsReported ? undefined : selected} saved={readOnly} />
                 </> : resolving ? (
                   <p className="access-resolving" role="status">
@@ -470,6 +473,7 @@ function AccessAssignmentForm({
             disabled={
               busy ||
               submitting ||
+              Boolean(unavailableReason) ||
               !scope ||
               scope === "all" ||
               (scope === "specific" && (!directoryAllowed || resolving || selected.length === 0))

@@ -732,6 +732,40 @@ describe("restored agent usage and users", () => {
     expect(api.readReportPage).not.toHaveBeenCalled();
   });
 
+  it("discovers the most recently accepted undated usage beyond the history page and binds all local reads to it", async () => {
+    const latestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", newestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const points: AgentUsageHistoryPoint[] = [
+      { setId: "ffffffff-ffff-4fff-8fff-ffffffffffff", reportingStart: null, reportingEnd: null, periodProvenance: "unknown",
+        acceptedAt: "2026-10-01T12:00:00Z", responses: 10, status: "linked", lastActivityDateUtc: null, associationCount: 1 },
+      { setId: latestId, reportingStart: null, reportingEnd: null, periodProvenance: "unknown",
+        acceptedAt: "2026-10-02T12:00:00Z", responses: 0, status: "linked", lastActivityDateUtc: null, associationCount: 1 },
+      { setId: newestId, reportingStart: null, reportingEnd: null, periodProvenance: "unknown",
+        acceptedAt: "2026-10-03T12:00:00Z", responses: null, status: "unlinked", lastActivityDateUtc: null, associationCount: 0 },
+    ];
+    const sharedContext = { ...context, reportSetId: newestId, reports: { ...reports, setId: newestId, reportingPeriod: null } };
+    const localContext = { ...sharedContext, reportSetId: latestId, reports: { ...sharedContext.reports, setId: latestId } };
+    vi.mocked(api.readAgentReportHistory).mockResolvedValue(agentUsageHistoryFixture(sharedContext, record.id, points, { limit: 1 }));
+    vi.mocked(api.readAgentReportSummary).mockImplementation(async (_id, query) => query.setId
+      ? summary({ responses: 0, activeUsers: 0, lastActivityDateUtc: null, context: localContext })
+      : summary({ status: "unlinked", responses: null, context: sharedContext }));
+    vi.mocked(api.readAgentReportAssociations).mockImplementation(async (_id, query) =>
+      links({ context: query.setId ? localContext : sharedContext, value: [] }));
+    const localUsers: CandidateAgentUsageUsers = { ...users(), context: localContext, reports: localContext.reports };
+    vi.mocked(api.readReportPage).mockResolvedValue(localUsers);
+    renderPanel({ inventorySelectionId: selectionId, context: { ...inventoryContext, reports: sharedContext.reports } });
+    await screen.findByRole("heading", { name: "Usage not reported" });
+    expect(screen.getByText(/Usage is reported in another saved report/)).toHaveTextContent("(0 responses)");
+    fireEvent.click(screen.getByRole("button", { name: "View this period" }));
+    await screen.findByText("person0@example.invalid");
+    expect(screen.getByLabelText("CSV report dates")).toHaveTextContent("Historical report datesDates not supplied");
+    expect(screen.getByLabelText("Selected agent report metrics")).toHaveTextContent("Responses0Active users0");
+    expect(api.readAgentReportSummary).toHaveBeenLastCalledWith(record.id,
+      { selectionId, inventorySelectionId: selectionId, setId: latestId }, expect.any(AbortSignal));
+    for (const reader of [api.readAgentReportAssociations, api.readReportPage]) expect(reader).toHaveBeenLastCalledWith(
+      expect.any(String), expect.objectContaining({ selectionId, inventorySelectionId: selectionId, setId: latestId }), expect.any(AbortSignal));
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
+  });
+
   it("keeps Usage read-only and confines historical discovery and report context to Users", async () => {
     const historicalId = "77777777-7777-4777-8777-777777777777";
     const historical: AgentUsageHistoryPoint = { setId: historicalId, reportingStart: "2026-09-01", reportingEnd: "2026-10-01",
@@ -918,6 +952,8 @@ describe("restored agent usage and users", () => {
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
     expect(onReloadInventory).not.toHaveBeenCalled();
     expect(api.readReportPage).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Remove association for/ })).not.toBeInTheDocument();
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
   });
   it.each([0, null])("keeps zero and unknown exact metrics distinct: %s", async value => {
     vi.mocked(api.readAgentReportSummary).mockResolvedValue(summary({ responses: value, activeUsers: value, lastActivityDateUtc: null }));
@@ -1295,6 +1331,24 @@ describe("restored agent usage and users", () => {
       reportAgentId: association.reportAgentId, confirmed: true,
     }, "remove", expect.any(AbortSignal));
   });
+  it("shows an absent Power Platform association environment explicitly in review and confirmation", async () => {
+    const nativeRecord: UnifiedAgentRecord = { ...record, presence: "both", powerPlatformResource: {
+      sourceSystem: "power_platform", nativeId: "Opaque/Native%2F-ID", environmentId: null, tenantId: "tenant",
+      type: "microsoft.copilotstudio/agents", displayName: "Excel native agent", creatorType: "unknown", agentKind: "agent",
+      location: null, createdAt: null, createdBy: null, lastPublishedAt: null, authoringTool: null,
+      lifecycle: "published", identityConfidence: "exact_native", identifiers: [], provenance: {}, details: {}, unknownFieldCount: 0,
+    } };
+    vi.mocked(api.readAgentReportAssociations).mockResolvedValue(links({ value: [{ ...association,
+      target: { source: "power_platform", nativeId: "Opaque/Native%2F-ID", environmentId: null, snapshotId: "exact-snapshot" },
+    }] }));
+    renderPanel({ record: nativeRecord });
+    const trigger = await removal();
+    const label = "Power Platform: Opaque/Native%2F-ID - Environment: not reported";
+    expect(screen.getByText(label)).toBeVisible();
+    fireEvent.click(trigger);
+    const confirmation = screen.getByRole("region", { name: "Confirm reviewed association removal" });
+    expect(within(confirmation).getByText(label)).toBeVisible();
+  });
   it("removes a reviewed link on its inventory pin and requests only one parent refresh", async () => {
     const onReloadInventory = vi.fn(), view = renderPanel({ inventorySelectionId: selectionId, onReloadInventory });
     fireEvent.click(await removal());
@@ -1396,7 +1450,7 @@ describe("restored agent usage and users", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agent users" }), { target: { value: "concealed" } });
     expect(await screen.findByText("7f7de4f6-censored")).toBeVisible();
   });
-  it("reuses equivalent normalized user searches without resetting the current page", async () => {
+  it.each([" Person ", " ＰＥＲＳＯＮ "])("reuses equivalent normalized user search %j without resetting the current page", async spelling => {
     renderPanel();
     await screen.findByText("person0@example.invalid");
     const search = screen.getByRole("searchbox");
@@ -1404,9 +1458,9 @@ describe("restored agent usage and users", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     fireEvent.click(await screen.findByRole("button", { name: "Next users" }));
     await screen.findByText("person25@example.invalid");
-    fireEvent.change(search, { target: { value: " Person " } });
+    fireEvent.change(search, { target: { value: spelling } });
     expect(screen.getByText("person25@example.invalid")).toBeVisible();
-    expect(search).toHaveValue(" Person ");
+    expect(search).toHaveValue(spelling);
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
   });
   it.each([new Error("Saved users failed"), new ApiError(403, "forbidden", "User access revoked")])("clears retained users on $message and retries", async failure => {

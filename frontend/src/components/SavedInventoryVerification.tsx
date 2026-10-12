@@ -82,7 +82,8 @@ function SavedPowerPlatformVerification({
     <h4>Power Platform saved request</h4>
     {loading ? <p role="status">Verifying the saved Power Platform request. Previous verification is not current for this read.</p>
       : error ? <p className="verification-attention" role="alert">Power Platform saved verification failed. The previous receipt has not been reverified. {error}</p>
-        : !snapshot || !verification ? <p role="status">No verified Power Platform snapshot is available. Collection counts and request coverage are not established.</p>
+        : !snapshot || !verification || "current" in snapshot && !snapshot.current
+          ? <p role="status">No current verified Power Platform snapshot is available. Collection counts and request coverage are not established.</p>
           : <>
             <p className="verification-success"><strong>Authorized Power Platform query verified</strong> - provider total agrees with stored, unique resource identities.</p>
             <dl className="verification-counts" aria-label="Verified Power Platform request counts">

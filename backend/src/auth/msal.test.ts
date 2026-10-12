@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfidentialClientApplication } from "@azure/msal-node";
+import { AuthError, ConfidentialClientApplication, InteractionRequiredAuthError, ServerError } from "@azure/msal-node";
 import { config, loginScopes, type TenantConfiguration } from "../config.js";
-import { acquireApplicationToken, acquireDelegatedToken, capabilityScopes, createAuthFlow, createAuthorizationUrl, evictAccount, getMsalClient, msalNetworkClient, msalNetworkTimeoutMs, redeemAuthorizationCode, replaceMsalClientForTest, revalidateAuthenticatedUser, toAuthenticatedUser, type MsalClient } from "./msal.js";
+import { acquireApplicationToken, acquireDelegatedToken, capabilityScopes, createAuthFlow, createAuthorizationUrl, evictAccount, getMsalClient, isRetryableIdentityProviderError, msalNetworkClient, msalNetworkTimeoutMs, redeemAuthorizationCode, replaceMsalClientForTest, revalidateAuthenticatedUser, toAuthenticatedUser, type MsalClient } from "./msal.js";
+import { AppError } from "../errors.js";
 import { inventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { capabilityDefinitions } from "../services/capabilityRegistry.js";
 
@@ -52,6 +53,153 @@ afterEach(() => {
   config.tenants = originalTenants;
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+it("reads identity-provider retry evidence without invoking accessors or proxy traps", () => {
+  expect(isRetryableIdentityProviderError(new AppError(503, "identity_provider_error", "private failure", {
+    retryable: true,
+  }))).toBe(true);
+  const getter = vi.fn(() => { throw new Error("private retry evidence"); });
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  for (const error of [
+    revoked.proxy,
+    Object.defineProperty(new AppError(503, "identity_provider_error", "private failure"), "code", { get: getter }),
+    Object.defineProperty(new AppError(503, "identity_provider_error", "private failure"), "status", { get: getter }),
+    new AppError(503, "identity_provider_error", "private failure", revoked.proxy),
+    new AppError(503, "identity_provider_error", "private failure", Object.defineProperty({}, "retryable", { get: getter })),
+  ]) {
+    expect(() => isRetryableIdentityProviderError(error)).not.toThrow();
+    expect(isRetryableIdentityProviderError(error)).toBe(false);
+  }
+  expect(getter).not.toHaveBeenCalled();
+});
+
+describe("token error normalization", () => {
+  function rejectToken(error: unknown, operation: "delegated" | "application" | "revalidation" = "delegated") {
+    const failure = vi.fn(async () => { throw error; });
+    const { client } = fakeClient({ acquireTokenSilent: failure, acquireTokenByClientCredential: failure });
+    replaceMsalClientForTest(tenantId, client);
+    return operation === "application" ? acquireApplicationToken(tenantId, "graph.package.read.application")
+      : operation === "revalidation" ? revalidateAuthenticatedUser(tenantId, account.homeAccountId)
+        : acquireDelegatedToken(tenantId, account.homeAccountId, "graph.package.read.delegated");
+  }
+
+  it("ignores every own and inherited accessor without replacing the provider failure", async () => {
+    const getter = vi.fn(() => { throw new Error("replacement accessor failure"); });
+    for (const field of ["errorCode", "subError", "errorNo", "errorMessage", "correlationId", "status"]) {
+      for (const inherited of [false, true]) {
+        const error = new Error("private provider failure");
+        const target = inherited ? Object.create(Error.prototype) : error;
+        Object.defineProperty(target, field, { get: getter });
+        if (inherited) Object.setPrototypeOf(error, target);
+        await expect(rejectToken(error)).rejects.toMatchObject({
+          status: 502, code: "identity_provider_error", details: {},
+        });
+      }
+    }
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("does not classify inherited fields or a non-native application-error prototype", async () => {
+    const fields = {
+      errorCode: "consent_required", subError: "consent_required", errorNo: "65001",
+      errorMessage: "AADSTS65001: private provider failure", correlationId: "inherited-id", status: 429,
+    };
+    for (const error of [
+      Object.create(fields),
+      Object.setPrototypeOf(new Error("private"), Object.assign(Object.create(Error.prototype), fields)),
+    ]) {
+      const normalized = await rejectToken(error).catch((failure: unknown) => failure);
+      expect(normalized).toMatchObject({ status: 502, code: "identity_provider_error", details: {} });
+      expect(JSON.stringify(normalized)).not.toMatch(/inherited-id|AADSTS65001/);
+    }
+    await expect(rejectToken(Object.assign(Object.create(AppError.prototype), { errorCode: "consent_required" })))
+      .rejects.toMatchObject({ status: 403, code: "missing_permission" });
+  });
+
+  it("ignores proxies, revoked proxies and proxy prototypes without running any trap", async () => {
+    const trap = vi.fn(() => { throw new Error("replacement proxy failure"); });
+    const handler = { get: trap, has: trap, getPrototypeOf: trap, getOwnPropertyDescriptor: trap, ownKeys: trap };
+    const revokedObject = Proxy.revocable({}, handler);
+    const revokedError = Proxy.revocable(new AppError(403, "missing_permission", "private"), handler);
+    revokedObject.revoke();
+    revokedError.revoke();
+    for (const error of [
+      new Proxy({ errorCode: "consent_required" }, handler),
+      new Proxy(new Error("private"), handler),
+      new Proxy(new AppError(403, "missing_permission", "private"), handler),
+      Object.setPrototypeOf(new Error("private"), new Proxy(Error.prototype, handler)),
+      revokedObject.proxy,
+      revokedError.proxy,
+    ]) {
+      await expect(rejectToken(error)).rejects.toMatchObject({
+        status: 502, code: "identity_provider_error", details: {},
+      });
+    }
+    expect(trap).not.toHaveBeenCalled();
+  });
+
+  it("keeps own data evidence while ignoring mutable classification accessors", async () => {
+    const getter = vi.fn()
+      .mockReturnValueOnce("consent_required")
+      .mockImplementation(() => { throw new Error("replacement mutable failure"); });
+    const error = Object.defineProperty({
+      errorCode: "server_error", status: 503, correlationId: "original-correlation",
+    }, "subError", { get: getter });
+    const normalized = await rejectToken(error).catch((failure: unknown) => failure);
+    expect(normalized).toMatchObject({
+      status: 502, code: "identity_provider_error",
+      details: { retryable: true, httpStatus: 503, correlationId: "original-correlation" },
+    });
+    expect(isRetryableIdentityProviderError(normalized)).toBe(true);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each(["delegated", "application", "revalidation"] as const)(
+    "preserves native application errors and safe normalization for %s", async operation => {
+      const original = new AppError(401, "authorization_expired", "Sign in again.", { correlationId: "original-id" });
+      const getter = vi.fn(() => { throw new Error("replacement provider metadata"); });
+      Object.defineProperty(original, "errorCode", { get: getter });
+      await expect(rejectToken(original, operation)).rejects.toBe(original);
+      await expect(rejectToken(Object.defineProperty(new Error("private"), "errorCode", { get: getter }), operation))
+        .rejects.toMatchObject({ status: 502, code: "identity_provider_error", details: {} });
+      expect(getter).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    {
+      error: new AuthError("REQUEST_TIMEOUT", "safe-correlation", "private provider failure"),
+      code: "identity_provider_error", status: 502, details: { correlationId: "safe-correlation", retryable: true }, retryable: true,
+    },
+    {
+      error: new ServerError("invalid_grant", "safe-correlation", "AADSTS65001: private provider failure"),
+      code: "missing_permission", status: 403, details: { correlationId: "safe-correlation", providerErrorCode: "AADSTS65001" }, retryable: false,
+    },
+    {
+      error: new InteractionRequiredAuthError("invalid_grant", "safe-correlation", "private provider failure", "ADDITIONAL_ACTION", undefined, undefined, "private claims", "50076"),
+      code: "interaction_required", status: 401, details: { correlationId: "safe-correlation", providerErrorCode: "AADSTS50076" }, retryable: false,
+    },
+    {
+      error: new ServerError("invalid_grant", "safe-correlation", "AADSTS65001: private provider failure", undefined, "700082", 400),
+      code: "authorization_expired", status: 401, details: { correlationId: "safe-correlation", providerErrorCode: "AADSTS700082", httpStatus: 400 }, retryable: false,
+    },
+    {
+      error: new ServerError("temporarily_unavailable", "safe-correlation", "private provider failure", undefined, undefined, 429),
+      code: "provider_throttled", status: 429, details: { correlationId: "safe-correlation", httpStatus: 429, retryable: true }, retryable: false,
+    },
+    {
+      error: new ServerError("invalid_client", "unsafe\ncorrelation", "private provider failure", undefined, undefined, 503),
+      code: "identity_provider_error", status: 502, details: { httpStatus: 503 }, retryable: false,
+    },
+  ])("preserves native MSAL $code semantics and sanitized details", async ({ error, code, status, details, retryable }) => {
+    const normalized = await rejectToken(error).catch((failure: unknown) => failure);
+    expect(normalized).toBeInstanceOf(AppError);
+    expect(normalized).toMatchObject({ code, status, details });
+    expect(isRetryableIdentityProviderError(normalized)).toBe(retryable);
+    expect(JSON.stringify(normalized)).not.toMatch(/private|unsafe|errorMessage|claims/);
+  });
 });
 
 describe("authentication scopes", () => {
@@ -599,6 +747,45 @@ describe("authentication scopes", () => {
     const pending = expect(msalNetworkClient.sendPostRequestAsync("https://login.microsoftonline.com/fixture", { body: "fixture" })).rejects.toThrow("timed out");
     await vi.advanceTimersByTimeAsync(msalNetworkTimeoutMs);
     await pending;
+  });
+
+  it("forwards hostile transport errors without inspection and safely normalizes them for token acquisition", async () => {
+    const trap = vi.fn(() => { throw new Error("replacement transport failure"); });
+    const revoked = Proxy.revocable(new Error("private"), {});
+    revoked.revoke();
+    for (const error of [
+      Object.defineProperty(new Error("private"), "errorCode", { get: trap }),
+      new Proxy(new Error("private"), { get: trap, getPrototypeOf: trap, getOwnPropertyDescriptor: trap }),
+      revoked.proxy,
+    ]) {
+      vi.stubGlobal("fetch", vi.fn(async () => { throw error; }));
+      const request = () => msalNetworkClient.sendPostRequestAsync("https://login.microsoftonline.com/fixture", { body: "fixture" });
+      await expect(request()).rejects.toBe(error);
+      const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => { await request(); return null; }) });
+      replaceMsalClientForTest(tenantId, client);
+      await expect(acquireApplicationToken(tenantId, "graph.package.read.application")).rejects.toMatchObject({
+        status: 502, code: "identity_provider_error", details: {},
+      });
+    }
+    expect(trap).not.toHaveBeenCalled();
+  });
+
+  it("preserves provider JSON responses and safely normalizes native JSON parse failures", async () => {
+    const body = { error: "temporarily_unavailable", error_description: "private provider failure" };
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(body, { status: 429, headers: { "x-ms-request-id": "safe-correlation" } })));
+    await expect(msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture")).resolves.toMatchObject({
+      body, status: 429, headers: { "x-ms-request-id": "safe-correlation" },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not JSON")));
+    await expect(msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture")).rejects.toBeInstanceOf(SyntaxError);
+    const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => {
+      await msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture");
+      return null;
+    }) });
+    replaceMsalClientForTest(tenantId, client);
+    await expect(acquireApplicationToken(tenantId, "graph.package.read.application")).rejects.toMatchObject({
+      status: 502, code: "identity_provider_error", details: {},
+    });
   });
 
   it("evicts only the selected account", async () => {

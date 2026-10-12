@@ -29,6 +29,8 @@ export function agentUsageHistoryFixture(context: CandidateAgentUsageContext, re
       || descending(left.reportingStart ?? "", right.reportingStart ?? "") || byImport(left, right);
   });
   const latest = points[0]?.reportingEnd ? points[0] : [...points].sort(byImport)[0];
+  const reported = points.filter(point => point.responses !== null);
+  const latestReported = reported[0]?.reportingEnd ? reported[0] : [...reported].sort(byImport)[0];
   const owner = JSON.stringify([recordId, context]);
   const cursor = (point: AgentUsageHistoryPoint, direction: "next" | "previous") => `${owner}:${direction}:${point.setId}`;
   let start = 0, end = limit;
@@ -43,7 +45,7 @@ export function agentUsageHistoryFixture(context: CandidateAgentUsageContext, re
   }
   const page = points.slice(start, end);
   return { recordId, context: structuredClone(context), value: page, latestReportSetId: latest?.setId ?? null,
-    latestReported: structuredClone(points.find(point => point.responses !== null) ?? null),
+    latestReported: structuredClone(latestReported ?? null),
     counts: { total: points.length, filtered: points.length }, page: { limit,
       nextCursor: page.length && end < points.length ? cursor(page.at(-1)!, "next") : null,
       previousCursor: page.length && start > 0 ? cursor(page[0], "previous") : null } };

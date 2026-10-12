@@ -99,7 +99,7 @@ export function AgentSyncTools({
           </dl> : null}
           <section className="sync-source-tools" aria-label="Source matching details">
             <h3>Agent identity matching</h3>
-            <p>Refresh agents collects the full list and exact identity details automatically. Records are combined only when the backend verifies exact, typed source identity evidence, never by display name alone.</p>
+            <p>Refresh agents collects the full catalog. Exact matching details refresh in separate scheduled batches; use Refresh matching details for selected packages. Records are combined only when the backend verifies exact, typed source identity evidence, never by display name alone.</p>
             {currentInventory?.identityCollection ? <>
               <p>{currentInventory.identityCollection.checkedPackages.toLocaleString()} package detail check{currentInventory.identityCollection.checkedPackages === 1 ? "" : "s"} current; {currentInventory.identityCollection.pendingPackages.toLocaleString()} not current.</p>
               {currentInventory.identityCollection.pendingDetails ? <dl className="sync-inventory-counts" aria-label="Package detail freshness">

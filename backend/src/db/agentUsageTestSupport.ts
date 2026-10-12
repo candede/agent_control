@@ -18,7 +18,7 @@ import { InventoryReconciliation } from "../services/inventoryReconciliation.js"
 import { canonicalRecord, nativeInventoryKey, packageInventoryRecord, powerPlatformInventoryRecord,
   type InventoryRecord } from "../services/inventoryRecordProjection.js";
 import { assignSurvivors, sourceKey } from "../services/inventorySurvivors.js";
-import { normalizeNativeIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 
 export type AgentUsageScope = { tenantId: string; principalId: string };
@@ -104,7 +104,7 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
     WHERE root.scope_id=$1 AND root.current ORDER BY known.created_at,known.id,r.identity LIMIT 251`, [queue.scopeId])).rows.map(row => ({
     source: row.domain === "packages" ? "graph_packages" as const : "power_platform" as const, agent_id: row.agent_id as string,
     normalized_native_id: row.domain === "packages" ? row.native_id as string : normalizeNativeIdentity(row.native_id),
-    normalized_environment_id: row.domain === "packages" ? "" : row.environment_id?.toLowerCase() ?? "",
+    normalized_environment_id: row.domain === "packages" ? "" : normalizeEnvironmentIdentity(row.environment_id ?? ""),
   }));
   if (previous.length > 250) throw new Error("Grouped usage fixture previous membership exceeds its synthetic bound.");
   const candidates = records.map((record, index) => ({ record, index, sortKey: String(index),
@@ -112,7 +112,7 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
       environment_id: "", normalized_environment_id: "", package_snapshot_id: packageRoot.baselineId, power_platform_snapshot_id: null, matching_evidence: [] })),
     ...record.powerPlatformResource ? [{ source: "power_platform" as const, native_id: record.powerPlatformResource.nativeId,
       normalized_native_id: normalizeNativeIdentity(record.powerPlatformResource.nativeId), environment_id: record.environmentId ?? "",
-      normalized_environment_id: record.environmentId?.toLowerCase() ?? "", package_snapshot_id: null,
+      normalized_environment_id: normalizeEnvironmentIdentity(record.environmentId ?? ""), package_snapshot_id: null,
       power_platform_snapshot_id: nativeRoot.baselineId, matching_evidence: [] }] : []] }));
   const survivors = assignSurvivors(candidates, previous, new Map(previous.map(value => [sourceKey(value), value.agent_id])));
   await database.query(`UPDATE inventory_reconciliation SET active_id=$2,active_inputs=pending_inputs,active_sequence=pending_sequence,
@@ -187,6 +187,7 @@ export async function usageIntent(database: pg.Pool, scope: AgentUsageScope,
   const selection = await reports.capture(identity, "delegated", "official_agents");
   const [summary] = await new OfficialAgentUsage(reports).summaries(selection.id, identity, [unifiedAgentRecordId(target)]);
   const { selectionId, reportSetId, usageRevision, inventoryRevision } = summary.context;
+  if (!reportSetId) throw new Error("Usage mutation fixtures require an available report set.");
   return { selectionId, reportSetId, usageRevision, inventoryRevision, reportAgentId, target, confirmed: true };
 }
 

@@ -46,6 +46,70 @@ class Directory:
 
 
 class CapacityContracts(unittest.TestCase):
+    def test_parent_heap_requires_owned_complete_samples_and_terminal_identity(self):
+        identity = {"event": "identity", "pid": 42, "isolate": 0, "node": "24.21.0", "v8": "13.6",
+                    "heap": {"heap_size_limit": 905969664}, "execArgv": ["--max-old-space-size=768"]}
+        sample = {"event": "sample", "pid": 42, "isolate": 0, "heapUsed": 100, "heapTotal": 200, "rss": 300,
+                  "external": 0, "arrayBuffers": 0, "eventLoopMaxMs": 0, "pool": None}
+        checkpoints = [{"event": "checkpoint", "pid": 42, "isolate": 0, "stage": stage, "heapUsed": 100}
+                       for stage in results.STAGES]
+        summary = {"event": "summary", "pid": 42, "isolate": 0, "dropped": 0}
+        def check(rows):
+            return results.summarize(Directory({"query-memory.jsonl": "\n".join(map(json.dumps, rows)),
+                "query-stdout.log": "[42:0x123:0] 20 ms: gc=mc start_object_size=100 end_object_size=50 allocated=10\n",
+                "probe-result.json": '{"status":"passed"}'}), "query")
+        self.assertEqual(check([identity, sample, *checkpoints, summary])["gates"]["heapObserved615MiB"], "passed")
+        for changed in (None, *[{**sample, "heapUsed": value} for value in (None, float("nan"), -1, True, 2**53)],
+                        {**sample, "pid": 43}, {**sample, "eventLoopMaxMs": float("inf")}):
+            with self.subTest(sample=changed):
+                rows = [identity, *([changed] if changed is not None else []), *checkpoints, summary]
+                self.assertEqual(check(rows)["gates"]["heapObserved615MiB"], "inconclusive")
+        for changed in ({**summary, "pid": 43}, {**identity, "heap": {}}, {**identity, "execArgv": []}):
+            with self.subTest(identity=changed):
+                rows = [changed if changed["event"] == "identity" else identity, sample, *checkpoints,
+                        changed if changed["event"] == "summary" else summary]
+                self.assertEqual(check(rows)["gates"]["heapObserved615MiB"], "inconclusive")
+        for changed in ({**point, "pid": 43} for point in checkpoints[:1]):
+            self.assertEqual(check([identity, sample, changed, *checkpoints[1:], summary])
+                             ["gates"]["heapObserved615MiB"], "inconclusive")
+
+    def test_gc_object_byte_counters_are_nonnegative_safe_integers(self):
+        for value in ("-1", "1.5", "1e999", "9007199254740992"):
+            with self.subTest(bytes=value):
+                directory = Directory({"query-stdout.log":
+                    f"[42:0x123:0] 20 ms: gc=mc start_object_size={value} end_object_size=0 allocated=0\n"})
+                observed = results.summarize(directory, "query")
+                self.assertIsNone(observed["gcPreHeapUsedMax"])
+                self.assertEqual(observed["coverage"]["malformedOrIncomplete"], 1)
+
+    def test_loader_isolate_heap_does_not_become_workload_peak(self):
+        directory = Directory({"query-memory.jsonl": json.dumps({"event": "identity", "pid": 42, "isolate": 0}),
+            "query-stdout.log":
+                "[42:0x123:0] 20 ms: gc=mc start_object_size=100 end_object_size=50 allocated=10\n"
+                "[42:0x456:1] 20 ms: gc=mc start_object_size=900000000 end_object_size=50 allocated=10\n"})
+        observed = results.summarize(directory, "query")
+        self.assertEqual(observed["gcPreHeapUsedMax"], 100)
+        self.assertEqual(observed["peakSensitiveHeapObservedMax"], 100)
+        self.assertEqual(len(observed["coverage"]["isolates"]), 2)
+        self.assertEqual(observed["gates"]["heapObserved615MiB"], "inconclusive")
+
+    def test_invalid_worker_checkpoint_cannot_fill_coverage_or_crash_interpretation(self):
+        identity = {"event": "identity", "pid": 43, "isolate": 0, "node": "24.21.0", "v8": "13.6",
+                    "heap": {"heap_size_limit": 905969664}, "execArgv": ["--max-old-space-size=768"]}
+        sample = {"event": "sample", "pid": 43, "isolate": 0, "heapUsed": 100, "heapTotal": 200, "rss": 300,
+                  "external": 0, "arrayBuffers": 0, "eventLoopMaxMs": 0,
+                  "pool": {"total": 1, "waiting": 0, "idle": 0, "maximum": 4, "foreground": 0, "queue": 0}}
+        summary = {"event": "summary", "pid": 43, "isolate": 0, "dropped": 0}
+        gc = {"worker": {"pid": 43, "isolate": "0x123:0", "records": 1, "incomplete": 0, "gcPreHeapUsedMax": 100}}
+        for value in (None, -1, True, float("nan"), 2**53):
+            with self.subTest(bytes=value):
+                point = {"event": "checkpoint", "pid": 43, "isolate": 0, "stage": "sql.result", "heapUsed": value}
+                rows = [identity, sample, point, summary]
+                observed = results.worker_memory(Directory({"lease-worker-43-memory.jsonl":
+                    "\n".join(map(json.dumps, rows))}), gc)[0]
+                self.assertFalse(observed["covered"])
+                self.assertEqual(observed["malformed"], 1)
+
     def test_whole_app_connection_budget_requires_binding_bootstrap_and_actual_counters(self):
         name = "agentcontrol_test_"+"a"*32
         functional = {"database": name,"functionalStatus": "passed","status": "inconclusive",
@@ -177,11 +241,25 @@ class CapacityContracts(unittest.TestCase):
                 raw.append("[43:0x456:0] 1 ms: gc=mc start_object_size=900000000 end_object_size=100 allocated=100")
                 raw.append("CAPACITY_REQUEST_WINDOW "+json.dumps({**marker,"state": "end"}))
             comparison.append({"count": count,"requestWindows": windows,"latency": {"p95": 1,"p99": 1}})
-        memory = [{"event": "identity","pid": 42,"isolate": 0},{"event": "summary","dropped": 0}]
+        memory = [{"event": "identity", "pid": 42, "isolate": 0, "node": "24.21.0", "v8": "13.6",
+                   "heap": {"heap_size_limit": 905969664}, "execArgv": ["--max-old-space-size=768"]},
+                  {"event": "sample", "pid": 42, "isolate": 0, "heapUsed": 100, "heapTotal": 200, "rss": 300,
+                   "external": 0, "arrayBuffers": 0, "eventLoopMaxMs": 0},
+                  {"event": "summary", "pid": 42, "isolate": 0, "dropped": 0}]
         result = results.summarize(Directory({"query-stdout.log": "\n".join(raw),"query-result.json": json.dumps({"comparison": comparison}),
             "query-memory.jsonl": "\n".join(map(json.dumps,memory)),"probe-result.json": '{"status":"passed"}'}),"query")
         self.assertEqual(result["requestWorkingSetDelta"],10*results.MIB)
         self.assertEqual(result["gates"]["requestWorkingSet64MiB"],"passed")
+        for field, value in (("sampledHeapUsedMax", None), ("stageCheckpointHeapUsedMax", float("nan")),
+                             ("finishedAt", -1), ("index", 2)):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(comparison))
+                changed[0]["requestWindows"][0][field] = value
+                observed = results.summarize(Directory({"query-stdout.log": "\n".join(raw),
+                    "query-result.json": json.dumps({"comparison": changed}),
+                    "query-memory.jsonl": "\n".join(map(json.dumps, memory)),
+                    "probe-result.json": '{"status":"passed"}'}), "query")
+                self.assertEqual(observed["gates"]["requestWorkingSet64MiB"], "inconclusive")
 
     def test_lease_worker_samples_cannot_be_replaced_by_parent_or_raw_gc_coverage(self):
         def worker(pid, terminal=True, pool=True, peak=100):
@@ -206,9 +284,12 @@ class CapacityContracts(unittest.TestCase):
         directory.values["lease-worker-44-memory.jsonl"] = worker(44, pool=False)
         self.assertFalse(results.worker_memory(directory, gc)[1]["covered"])
         directory.values["lease-worker-44-memory.jsonl"] = worker(44)
-        parent = [{"event": "identity", "pid": 42, "isolate": 0},
-                  *[{"event": "checkpoint", "stage": stage, "heapUsed": 100} for stage in results.STAGES],
-                  {"event": "summary", "dropped": 0}]
+        parent = [{"event": "identity", "pid": 42, "isolate": 0, "node": "24.21.0", "v8": "13.6",
+                   "heap": {"heap_size_limit": 905969664}, "execArgv": ["--max-old-space-size=768"]},
+                  {"event": "sample", "pid": 42, "isolate": 0, "heapUsed": 100, "heapTotal": 200, "rss": 300,
+                   "external": 0, "arrayBuffers": 0, "eventLoopMaxMs": 0},
+                  *[{"event": "checkpoint", "pid": 42, "isolate": 0, "stage": stage, "heapUsed": 100} for stage in results.STAGES],
+                  {"event": "summary", "pid": 42, "isolate": 0, "dropped": 0}]
         directory.values["full-memory.jsonl"] = "\n".join(map(json.dumps, parent))
         directory.values["full-stdout.log"] = "\n".join(
             f"[{pid}:0x123:0] 20 ms: gc=mc start_object_size=90 end_object_size=80 allocated=100" for pid in (42, 43, 44))

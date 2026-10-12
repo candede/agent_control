@@ -18,7 +18,10 @@ export function isJobPolling(status: unknown) {
   return status === "queued" || status === "running";
 }
 
-export function jobStatusMessage(status: unknown) {
+export function jobStatusMessage(status: unknown, isCanary = false) {
+  if (isCanary && (status === "waiting_authorization" || status === "partial")) {
+    return "This canary cannot be resumed. Cancel any unprocessed tasks and review uncertain results before obtaining new approvals.";
+  }
   return isKnownJobStatus(status) ? statusMessages[status]
     : "The server returned an unrecognized job status. Refresh status before starting another change.";
 }

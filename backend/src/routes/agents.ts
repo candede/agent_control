@@ -16,9 +16,9 @@ import { packageInventory } from "../services/packageInventory.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { operationalLog } from "../services/telemetry.js";
-import type { PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
+import { isDirectoryObjectId, isPackageId, type PackageAccessEntity, type PackageAccessUpdate } from "../types/copilotPackage.js";
 import type { AuditAction } from "../types/audit.js";
-import { hasAppRole } from "../types/capability.js";
+import { hasAppRole, packageMutationCapability } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 import { reportIdentity } from "../services/reportIdentity.js";
 import { SelectionError } from "../services/dataSelections.js";
@@ -60,9 +60,15 @@ policyRoute(agentsRouter, "post", "/agents/:id/refresh-jobs", { access: "authent
   response.status(202).json(job.status === "waiting_authorization" ? await startPackageRefreshOrWaiting(request, job.id, tokenMode) : job);
 });
 policyRoute(agentsRouter, "get", "/agents/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+  const owner = requestScope(request);
+  const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
+  assertAccountSessionValidation(validation);
   const mode = packageMode(firstQueryValue(request.query.mode));
   const scope = await savedPackageScope(request, mode);
-  response.json(await packageRepository.listJobs(scope, request.session.user!.homeAccountId, positiveInteger(firstQueryValue(request.query.limit), 20, 50)));
+  assertAccountSessionValidation(validation);
+  const result = await packageRepository.listJobs(scope, request.session.user!.homeAccountId, positiveInteger(firstQueryValue(request.query.limit), 20, 50));
+  assertAccountSessionValidation(validation);
+  response.json(result);
 });
 policyRoute(agentsRouter, "get", "/agents/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await packageInventory.get(request.session.user!, jobId(request), packageMode(firstQueryValue(request.query.mode))));
@@ -70,11 +76,16 @@ policyRoute(agentsRouter, "get", "/agents/refresh-jobs/:id", { access: "authenti
 export function createAgentRefreshTargetsRouter(database: pg.Pool) {
   const router = Router(), repository = new PackageRefreshJobs(database);
   policyRoute(router, "get", "/agents/refresh-jobs/:id/targets", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+    const owner = requestScope(request);
+    const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
+    assertAccountSessionValidation(validation);
     const mode = packageMode(firstQueryValue(request.query.mode));
     if (Object.keys(request.query).some(key => !["mode", "limit", "revision", "cursor"].includes(key))
       || request.query.limit !== undefined && (typeof request.query.limit !== "string" || !/^[1-9]\d{0,2}$/.test(request.query.limit))) throw new SelectionError("invalid_cursor");
-    response.json(await repository.targets(await savedPackageScope(request, mode), await reportIdentity(database, request.session.user!), jobId(request),
-      { limit: request.query.limit === undefined ? 50 : Number(request.query.limit), revision: firstQueryValue(request.query.revision), cursor: firstQueryValue(request.query.cursor) }));
+    const result = await repository.targets(await savedPackageScope(request, mode), await reportIdentity(database, request.session.user!), jobId(request),
+      { limit: request.query.limit === undefined ? 50 : Number(request.query.limit), revision: firstQueryValue(request.query.revision), cursor: firstQueryValue(request.query.cursor) });
+    assertAccountSessionValidation(validation);
+    response.json(result);
   });
   return router;
 }
@@ -122,6 +133,7 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
   let job = await bulkJobs.get(id, scope);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (job.tokenMode !== "delegated") throw new AppError(409,"invalid_token_mode","This route can resume delegated jobs only.");
+  if (job.isCanary) throw new AppError(409, "canary_cycle_authorization_required", "Package canary jobs cannot be resumed outside their original approved cycle.");
   await capabilities.requireAvailable(job.capabilityId, request.session.user!);
   await acquireDelegatedToken(scope.tenantId, scope.principalId, job.capabilityId);
   await bulkJobs.recover(scope.tenantId, true, id);
@@ -138,9 +150,14 @@ policyRoute(agentsRouter, "post", "/agents/mutation-canaries", { access: "authen
   const approval = parseCanaryApproval(request.body);
   const owner = requestScope(request);
   const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
+  const validateCapability = capabilities.beginOperationValidation(packageMutationCapability(approval.action), request.session.user!);
+  const assertCurrent = () => { assertAccountSessionValidation(validation); validateCapability(); };
   const administrator = await revalidateCanaryAdmin(owner);
+  assertCurrent();
   const identity = await capabilities.packageQualificationIdentity(approval.action, administrator);
-  const record = await commitAccountSessionValidation(validation, () => mutationQualifications.createApproved(administrator, { ...approval, ...identity }));
+  assertCurrent();
+  const record = await commitAccountSessionValidation(validation, () => mutationQualifications.createApproved(administrator, { ...approval, ...identity }, assertCurrent));
+  assertCurrent();
   response.status(201).json(canaryRecordView(record));
 });
 policyRoute(agentsRouter, "post", "/agents/mutation-canaries/:id/execute", { access: "authenticated", dataClass: "package_control_qualification", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
@@ -150,41 +167,59 @@ policyRoute(agentsRouter, "post", "/agents/mutation-canaries/:id/execute", { acc
   const originalApproved = await mutationQualifications.getApproved(request.session.user!, String(request.params.id));
   const restorationApproved = await mutationQualifications.getApproved(request.session.user!, executionRequest.restorationApprovalId);
   if (!originalApproved || !restorationApproved) throw new AppError(409, "canary_cycle_not_approved", "Both exact canary directions require current, unused approvals.");
-  assertAccountSessionValidation(validation);
+  const validateCapabilities = [originalApproved, restorationApproved].map(approval =>
+    capabilities.beginOperationValidation(packageMutationCapability(approval.action), request.session.user!));
+  const assertCurrent = () => {
+    assertAccountSessionValidation(validation);
+    for (const validate of validateCapabilities) validate();
+    requireProviderAdmissions();
+  };
+  assertCurrent();
   const operator = await revalidateCanaryAdmin(owner);
+  assertCurrent();
   const originalIdentity = await capabilities.packageQualificationIdentity(originalApproved.action, operator);
+  assertCurrent();
   const restorationIdentity = await capabilities.packageQualificationIdentity(restorationApproved.action, operator);
+  assertCurrent();
   let claimed!: Awaited<ReturnType<PackageMutationQualificationRepository["claimCycle"]>>;
   await commitAccountSessionValidation(validation, async () => {
-    claimed = await mutationQualifications.claimCycle(operator, originalApproved.id, restorationApproved.id, originalIdentity, restorationIdentity);
+    claimed = await mutationQualifications.claimCycle(operator, originalApproved.id, restorationApproved.id, originalIdentity, restorationIdentity, assertCurrent);
   });
   let originalJobId: string | undefined;
   let restorationJobId: string | undefined;
   try {
-    const originalJob = await commitAccountSessionValidation(validation, () => submitCanaryJob(operator, claimed.original, originalApproved.id, "original"));
+    assertCurrent();
+    const originalJob = await commitAccountSessionValidation(validation, () => submitCanaryJob(operator, claimed.original, originalApproved.id, "original", assertCurrent));
     originalJobId = originalJob.id;
     await mutationQualifications.recordCycleJob(operator, claimed.original.id, originalJob.id);
-    assertAccountSessionValidation(validation);
-    await runTrackedBulkJob(originalJob.id, owner, bulkJobs, graphPackages, canaryJobAuthorizer(operator, claimed.original, originalJob.id, validation));
+    assertCurrent();
+    await runTrackedBulkJob(originalJob.id, owner, bulkJobs, graphPackages, canaryJobAuthorizer(operator, claimed.original, originalJob.id, validation, assertCurrent));
+    assertCurrent();
     const originalResult = await bulkJobs.get(originalJob.id, owner);
+    assertCurrent();
     if (originalResult?.status !== "succeeded") throw new AppError(409, "canary_original_unverified", "The original canary direction was not durably verified; restoration was not dispatched automatically.");
 
-    const restorationJob = await commitAccountSessionValidation(validation, () => submitCanaryJob(operator, claimed.restoration, originalApproved.id, "restoration"));
+    const restorationJob = await commitAccountSessionValidation(validation, () => submitCanaryJob(operator, claimed.restoration, originalApproved.id, "restoration", assertCurrent));
     restorationJobId = restorationJob.id;
     await mutationQualifications.recordCycleJob(operator, claimed.restoration.id, restorationJob.id);
-    assertAccountSessionValidation(validation);
-    await runTrackedBulkJob(restorationJob.id, owner, bulkJobs, graphPackages, canaryJobAuthorizer(operator, claimed.restoration, restorationJob.id, validation));
+    assertCurrent();
+    await runTrackedBulkJob(restorationJob.id, owner, bulkJobs, graphPackages, canaryJobAuthorizer(operator, claimed.restoration, restorationJob.id, validation, assertCurrent));
+    assertCurrent();
     const restorationResult = await bulkJobs.get(restorationJob.id, owner);
+    assertCurrent();
     if (restorationResult?.status !== "succeeded") throw new AppError(409, "canary_restoration_unverified", "The restoration direction was not durably verified; no qualification was published.");
 
-    assertAccountSessionValidation(validation);
     const currentAdmin = await revalidateCanaryAdmin(owner);
+    assertCurrent();
     const currentOriginalIdentity = await capabilities.packageQualificationIdentity(claimed.original.action, currentAdmin);
+    assertCurrent();
     const currentRestorationIdentity = await capabilities.packageQualificationIdentity(claimed.restoration.action, currentAdmin);
+    assertCurrent();
     let completed!: Awaited<ReturnType<PackageMutationQualificationRepository["completeCycle"]>>;
     await commitAccountSessionValidation(validation, async () => {
-      completed = await mutationQualifications.completeCycle(currentAdmin, claimed.original.id, claimed.restoration.id, { status: "qualified" }, currentOriginalIdentity, currentRestorationIdentity);
+      completed = await mutationQualifications.completeCycle(currentAdmin, claimed.original.id, claimed.restoration.id, { status: "qualified" }, currentOriginalIdentity, currentRestorationIdentity, assertCurrent);
     });
+    assertCurrent();
     response.json({
       status: "qualified",
       original: canaryRecordView(completed.original),
@@ -227,11 +262,13 @@ async function withDirectoryRequest(
 ) {
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", request.session.user!);
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
   const assertCurrent = () => {
     signal.throwIfAborted();
     assertAccountSessionValidation(validation);
+    validateCapability();
     requireProviderAdmissions();
   };
   const disconnected = () => {
@@ -247,12 +284,17 @@ async function withDirectoryRequest(
   });
   try {
     const work = async () => {
-      assertCurrent();
-      await capabilities.requireAvailable("graph.directory.read", request.session.user!);
-      assertCurrent();
-      const token = await acquireDelegatedToken(scope.tenantId, scope.principalId, "graph.directory.read");
-      assertCurrent();
-      await operation(token, signal, assertCurrent);
+      try {
+        assertCurrent();
+        await capabilities.requireAvailable("graph.directory.read", request.session.user!);
+        assertCurrent();
+        const token = await acquireDelegatedToken(scope.tenantId, scope.principalId, "graph.directory.read");
+        assertCurrent();
+        await operation(token, signal, assertCurrent);
+      } catch (error) {
+        assertCurrent();
+        throw error;
+      }
     };
     await Promise.race([work(), aborted]);
   } catch (error) {
@@ -275,7 +317,7 @@ function jobId(request: Request) {
   return value;
 }
 export function exactId(value: string) {
-  if (!value.trim() || value.length > 512) throw new AppError(400,"invalid_request","Each id must be a non-empty string of at most 512 characters.");
+  if (!isPackageId(value)) throw new AppError(400,"invalid_request","Each id must be an exact non-empty string of at most 512 characters without controls or dot path segments.");
   return value;
 }
 function firstQueryValue(value: unknown) { return Array.isArray(value) ? typeof value[0] === "string" ? value[0] : undefined : typeof value === "string" ? value : undefined; }
@@ -305,10 +347,12 @@ function parsePackageAccessEntities(value: unknown, required = false): PackageAc
   if (!Array.isArray(value) || value.length > 500) throw new AppError(400,"invalid_principals","Expected at most 500 principals.");
   const unique = new Map<string, PackageAccessEntity>();
   for (const item of value) {
-    if (!["user","group"].includes(item?.resourceType) || typeof item?.resourceId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(item.resourceId.trim())) throw new AppError(400,"invalid_principal","Each principal requires a user or group resourceType and native Microsoft Entra object ID.");
+    if (!["user","group"].includes(item?.resourceType) || typeof item?.resourceId !== "string"
+      || item.resourceId.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(item.resourceId)
+      || !isDirectoryObjectId(item.resourceId.trim())) throw new AppError(400,"invalid_principal","Each principal requires a user or group resourceType and native Microsoft Entra object ID.");
     const key = `${item.resourceType}:${item.resourceId.trim().toLowerCase()}`;
     if (unique.has(key)) throw new AppError(400, "duplicate_principal", "Duplicate package access principals are not allowed.");
-    unique.set(key, { resourceType: item.resourceType, resourceId: item.resourceId.trim() });
+    unique.set(key, { resourceType: item.resourceType, resourceId: item.resourceId.trim().toLowerCase() });
   }
   if (required && !unique.size) throw new AppError(400,"invalid_principals","At least one principal is required.");
   return [...unique.values()];
@@ -358,7 +402,7 @@ function invalidPackageQuery(message: string): never {
 }
 
 export function packageMutationAction(value: unknown): AuditAction {
-  if (!["block", "unblock", "update-availability", "update-installation", "reassign"].includes(String(value))) throw new AppError(400, "invalid_mutation_action", "Package mutation action is invalid.");
+  if (typeof value !== "string" || !["block", "unblock", "update-availability", "update-installation", "reassign"].includes(value)) throw new AppError(400, "invalid_mutation_action", "Package mutation action is invalid.");
   return value as AuditAction;
 }
 
@@ -369,7 +413,8 @@ function parseCanaryApproval(value: unknown) {
   if (keys.length !== 4 || keys.some((key, index) => key !== ["action", "poststate", "prestate", "targetId"][index])) {
     throw new AppError(400, "invalid_qualification", "Canary approval accepts only action, targetId, prestate, and poststate.");
   }
-  return { action: packageMutationAction(record.action), targetId: exactId(String(record.targetId)), prestate: record.prestate, poststate: record.poststate };
+  if (typeof record.targetId !== "string") throw new AppError(400, "invalid_qualification", "Canary approval requires one exact string package target.");
+  return { action: packageMutationAction(record.action), targetId: exactId(record.targetId), prestate: record.prestate, poststate: record.poststate };
 }
 
 function parseCanaryExecution(value: unknown) {
@@ -407,6 +452,7 @@ export async function submitCanaryJob(
   approval: Pick<NonNullable<Awaited<ReturnType<PackageMutationQualificationRepository["getApproved"]>>>, "id" | "targetId" | "action" | "prestate" | "poststate">,
   cycleId: string,
   stage: "original" | "restoration",
+  assertCurrent?: () => void,
 ) {
   const intent: JobIntentInput = {
     action: approval.action,
@@ -420,7 +466,7 @@ export async function submitCanaryJob(
     ...intent,
     confirmationHash: createJobConfirmation(intent).confirmationHash,
     idempotencyKey: `canary-${approval.id}-${stage}`,
-  });
+  }, assertCurrent);
 }
 
 function canaryJobAuthorizer(
@@ -428,15 +474,19 @@ function canaryJobAuthorizer(
   approval: Awaited<ReturnType<PackageMutationQualificationRepository["getApproved"]>> & {},
   jobId: string,
   validation: ReturnType<typeof beginAccountSessionValidation>,
+  assertCycleCurrent: () => void,
 ) {
   return async (scope: ReturnType<typeof requestScope>, capabilityId: Parameters<typeof acquireDelegatedToken>[2]) => {
-    assertAccountSessionValidation(validation);
+    assertCycleCurrent();
     const current = await revalidateCanaryAdmin(scope);
+    assertCycleCurrent();
     const identity = await capabilities.packageQualificationIdentity(approval.action, current);
+    assertCycleCurrent();
     if (identity.capabilityId !== capabilityId || current.homeAccountId !== operator.homeAccountId) throw AppError.unauthorized("The canary job no longer matches its exact approval actor or capability.");
     const token = await acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
+    assertCycleCurrent();
     await commitAccountSessionValidation(validation, () => mutationQualifications.authorizeCycleJob(current, approval.id, jobId, identity));
-    assertAccountSessionValidation(validation);
+    assertCycleCurrent();
     return token;
   };
 }
@@ -460,8 +510,8 @@ export async function canaryFailureCompletion(scope: ReturnType<typeof requestSc
     });
     return { status: "inconclusive" as const, errorCode: "canary_result_unavailable" };
   }
-  if (originalJobId && (!original || original.status === "running")
-    || restorationJobId && (!restoration || restoration.status === "running")) {
+  if (originalJobId && (!original || ["queued", "running", "waiting_authorization"].includes(original.status) || original.completed < original.total)
+    || restorationJobId && (!restoration || ["queued", "running", "waiting_authorization"].includes(restoration.status) || restoration.completed < restoration.total)) {
     return { status: "inconclusive" as const, errorCode: "canary_result_unavailable" };
   }
   if (original?.status === "succeeded" && restoration?.status !== "succeeded") {
@@ -474,7 +524,7 @@ export async function canaryFailureCompletion(scope: ReturnType<typeof requestSc
 
 function canaryId(value: string) {
   if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_qualification_id", "Canary qualification ID is invalid.");
-  return value;
+  return value.toLowerCase();
 }
 
 async function startPackageRefreshOrWaiting(request: Request, id: string, tokenMode: "delegated" | "application") {

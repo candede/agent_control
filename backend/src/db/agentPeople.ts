@@ -39,7 +39,7 @@ export class AgentPeopleRepository {
       SELECT DISTINCT lower(person.value) COLLATE "C" AS id FROM native resource
       JOIN inventory_facts person ON person.generation_id=resource.generation_id AND person.identity=resource.identity
         AND person.kind IN ('person:owner','person:createdBy','person:lastModifiedBy')
-      WHERE person.value ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      WHERE person.value ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
         AND lower(person.value) COLLATE "C">$4::text COLLATE "C" ORDER BY id LIMIT 100`,
     [scope.tenantId, scope.principalId, ["microsoft.copilotstudio/agents"], after]));
     return result.rows.map(row => row.id);
@@ -50,6 +50,7 @@ export class AgentPeopleRepository {
       JOIN data_scope_epochs s ON s.id=d.scope_id AND s.tenant_id=d.tenant_id
       JOIN data_generation_heads h ON h.scope_id=s.id AND h.generation_id=d.generation_id
       JOIN data_generations g ON g.id=d.generation_id AND g.expires_at>clock_timestamp() AND g.state='published'
+        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
       WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='directory'
         AND d.identity=ANY($3::text[]) LIMIT 100`, [scope.tenantId, scope.principalId, requested]);
     return rows.rows.map(row => row.identity);

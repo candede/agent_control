@@ -93,7 +93,7 @@ export async function physicalWork(database: pg.Pool, telemetry: CapacityTelemet
     GRANT USAGE ON SCHEMA capacity_evidence TO agentcontrol_app;
     GRANT SELECT,DELETE ON capacity_evidence.work TO agentcontrol_app;`));
   const starts = new WeakMap<pg.PoolClient,{ wal: string;reads: ReadCounter[];measurementMs: number }>();
-  observeTransactionStart(async client => {
+  const stopStart = observeTransactionStart(async client => {
     const current = currentCapacityOperation();
     if (current) {
       const started = performance.now();
@@ -106,7 +106,7 @@ export async function physicalWork(database: pg.Pool, telemetry: CapacityTelemet
   telemetry.write({ event: "physical-counter-coverage",readMethod: "transaction-difference-v2",
     scope: "Same-backend public heap/index counter differences measured after BEGIN and before COMMIT, excluding rolled-back work. Each endpoint combines the bounded counter snapshot and operation/WAL metadata in one query. PostgreSQL pending scan counters can include prior unflushed transactions; their starting values are subtracted. WAL is a precommit cluster interval, includes concurrent/maintenance WAL and can overlap other operations; not attributable transaction WAL.",
     relationDetail: "All fixed-probe relations; otherwise the eight largest relations at each operation-class high water. Read totals are recorded for every tagged committed transaction. Write counters aggregate operation/relation/action within each bounded 250-counter flush." });
-  observeTransactionResult(async client => {
+  const stopResult = observeTransactionResult(async client => {
     const current = currentCapacityOperation();
     if (!current) return;
     const started = performance.now();
@@ -161,8 +161,8 @@ export async function physicalWork(database: pg.Pool, telemetry: CapacityTelemet
     telemetry.write({ event: "fixed-probe-checkpoint",milliseconds: performance.now()-started,
       scope: "Before the isolated identical-component WAL interval only; SQL/resource budgets are unchanged." });
   }, async close() {
-    observeTransactionStart();
-    observeTransactionResult();
+    stopStart();
+    stopResult();
     await flush();
     await administrative(operator => operator.query(`DO $$ DECLARE r record; BEGIN
       FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='public' LOOP

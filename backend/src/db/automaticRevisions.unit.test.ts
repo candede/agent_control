@@ -50,7 +50,8 @@ function fixture() {
   const response = (rows: object[]) => ({ rows: structuredClone(rows), rowCount: rows.length, command: "", oid: 0, fields: [] });
   const query = vi.fn(async (text: unknown, values?: readonly unknown[]) => {
     if (typeof text !== "string") throw new Error("Expected SQL.");
-    if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "COMMIT", "ROLLBACK"].includes(text)) return response([]);
+    if (text === "COMMIT") return { ...response([]), command: "COMMIT" };
+    if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK"].includes(text)) return response([]);
     if (text === "SELECT clock_timestamp() AS now") return response([{ now: vi.isFakeTimers() ? new Date() : observedAt }]);
     if (text.includes("WITH markers AS")) {
       const afterSource = String(values![2]), afterId = String(values![3]);

@@ -80,6 +80,7 @@ vi.mock("./auth/msal.js", async original => {
 }; });
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
   checkProgress: vi.fn(() => null),
+  beginOperationValidation: vi.fn(() => () => undefined),
   observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
   requireAvailable: vi.fn(async () => undefined), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: huntingCapabilityFixture.applicationRevision })), invalidatePrincipal: vi.fn(async () => undefined), list: vi.fn(async () => []), check: vi.fn(async () => []), refresh: vi.fn(), configureApplication: vi.fn(),
   packageQualificationIdentity: vi.fn(async (action: string) => ({ capabilityId: action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage", contractRevision: "a".repeat(64), configurationRevision: 1, authMode: "delegated" })),

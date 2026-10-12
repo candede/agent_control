@@ -170,7 +170,7 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     expect(provider.setQuarantine).toHaveBeenCalledWith("ephemeral-token", { environmentId, botId }, requestedState, expect.objectContaining({ correlationId: expect.any(String) }));
     expect(provider.getStatus).toHaveBeenCalledTimes(3);
     expect(await repository.get(value, job.id)).toMatchObject({ status: "succeeded", succeeded: 1 });
-    expect(authorized).toHaveBeenCalledWith(value);
+    expect(authorized).toHaveBeenCalledWith(value, expect.any(AbortSignal));
     expect(await repository.isQualified(value, authority, [{ environmentId, botId }])).toBe(false);
     const audit = (await repository.listAudit(value)).value.filter(event => event.jobId === job.id);
     expect(audit.map(event => event.phase).sort()).toEqual(["requested", "sent", "started", "succeeded"]);
@@ -258,7 +258,7 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     } else {
       expect(provider.getStatus).toHaveBeenCalledTimes(2);
       expect(provider.setQuarantine).not.toHaveBeenCalled();
-      expect(await repository.get(value, job.id)).toMatchObject({ status: "waiting_authorization", completed: 0, canResume: true });
+      expect(await repository.get(value, job.id)).toMatchObject({ status: "waiting_authorization", completed: 0, canResume: false });
       expect((await fixture.operator.query("SELECT sent_at FROM copilot_quarantine_job_items WHERE job_id=$1", [job.id])).rows).toEqual([{ sent_at: null }]);
     }
     expect(await repository.isQualified(value, authority, [frozen])).toBe(false);
@@ -291,6 +291,52 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
       status: "failed", results: [{ errorCode: "quarantine_target_ambiguous" }],
     });
   });
+
+  it.each(["case-replaced", "bot-identity-removed"] as const)(
+    "retains an inconclusive sent receipt without publishing its readback to %s inventory", async change => {
+      const value = scope();
+      const nativeId = "ABCDEFAB-ABCD-4ABC-8ABC-ABCDEFABCDEF";
+      const publish = async (replacement = false) => {
+        const root = await nativeInventoryFixture(fixture.runtime, value, [{
+          nativeId: replacement && change === "case-replaced" ? nativeId.toLowerCase() : nativeId,
+          environmentId, displayName: "Agent", lifecycle: "published", details: { isQuarantined: false },
+          identifiers: [{ kind: "environment_id", value: environmentId },
+            ...(!replacement || change !== "bot-identity-removed" ? [{ kind: "cds_bot_id" as const, value: nativeId }] : [])],
+        }]);
+        await reconcileInventoryFixture(fixture.runtime, value);
+        return root;
+      };
+      const original = await publish();
+      const frozen = target(original.baselineId);
+      const input = { action: "quarantine" as const, targets: [{ ...frozen, resourceNativeId: nativeId, botId: nativeId,
+        directStatus: { ...frozen.directStatus, botId: nativeId } }], actor: actor(value), authority, requestPath: "/api/quarantine/jobs" };
+      const job = await repository.submit(value, { ...input, idempotencyKey: randomUUID(),
+        confirmationHash: createQuarantineConfirmation(input).confirmationHash });
+      let quarantined = false;
+      let replacement: Awaited<ReturnType<typeof publish>> | undefined;
+      const provider = {
+        getStatus: vi.fn(async () => ({ ...status(quarantined), botId: nativeId })),
+        setQuarantine: vi.fn(async () => {
+          quarantined = true;
+          replacement = await publish(true);
+          return { ...status(true), botId: nativeId };
+        }),
+      };
+
+      await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
+
+      expect(provider.setQuarantine).toHaveBeenCalledOnce();
+      expect(await repository.get(value, job.id)).toMatchObject({
+        status: "inconclusive", succeeded: 0, inconclusive: 1, canReconcile: true,
+        results: [{ status: "inconclusive", observedState: null, reconciliationStatus: "required" }],
+      });
+      expect((await fixture.runtime.query(`SELECT r.residual->'details'->'isQuarantined' AS quarantined
+        FROM inventory_roots root JOIN inventory_memberships member ON member.baseline_id=root.baseline_id
+          AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
+        JOIN power_platform_record_rows r ON r.generation_id=member.generation_id AND r.identity=member.identity
+        WHERE root.scope_id=$1 AND root.current`, [replacement!.scopeId])).rows).toEqual([{ quarantined: false }]);
+    },
+  );
 
   it("blocks dispatch tenant-wide while another principal has an unresolved exact-target write", async () => {
     const firstScope = scope();
@@ -365,12 +411,12 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
           }),
         };
         const lock = repository.withTargetLock.bind(repository);
-        vi.spyOn(repository, "withTargetLock").mockImplementation((lease, item, operation) => lock(lease, item, async () => {
+        const lockMock = vi.spyOn(repository, "withTargetLock").mockImplementation((lease, item, operation) => lock(lease, item, async signal => {
           if (stage === "lock") await closeAdmissions();
-          return operation();
+          return operation(signal);
         }));
         const markSent = repository.markSent.bind(repository);
-        vi.spyOn(repository, "markSent").mockImplementation(async (...args) => {
+        const markSentMock = vi.spyOn(repository, "markSent").mockImplementation(async (...args) => {
           await markSent(...args);
           if (stage === "sent") await closeAdmissions();
         });
@@ -402,7 +448,8 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
           vi.unstubAllEnvs();
           await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
           await loadOperationalState(fixture.runtime);
-          vi.restoreAllMocks();
+          lockMock.mockRestore();
+          markSentMock.mockRestore();
         }
       }
     },
@@ -440,9 +487,9 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
           return { ...status(false), ...selected };
         }).mockClear();
         const lock = repository.withReconciliationLock.bind(repository);
-        vi.spyOn(repository, "withReconciliationLock").mockImplementation((owner, item, operation) => lock(owner, item, async () => {
+        const lockMock = vi.spyOn(repository, "withReconciliationLock").mockImplementation((owner, item, operation) => lock(owner, item, async signal => {
           if (stage === "lock") await closeAdmissions();
-          return operation();
+          return operation(signal);
         }));
         const record = repository.recordReconciliation.bind(repository);
         const publications = vi.spyOn(repository, "recordReconciliation").mockImplementation(async (...args) => {
@@ -466,7 +513,8 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
           vi.unstubAllEnvs();
           await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
           await loadOperationalState(fixture.runtime);
-          vi.restoreAllMocks();
+          lockMock.mockRestore();
+          publications.mockRestore();
         }
         provider.getStatus.mockImplementation(async (_token, selected) => ({ ...status(false), ...selected }));
         const reconciled = await reconcileCopilotStudioQuarantineJob(job.id, value, repository, provider, authorize);

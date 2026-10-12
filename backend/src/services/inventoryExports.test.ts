@@ -11,6 +11,7 @@ import { InventoryReconciliation } from "./inventoryReconciliation.js";
 import { DataExports } from "./dataExports.js";
 import { inventoryExportColumns, inventoryExportSource, type InventoryExportKind } from "./inventoryExports.js";
 import { allowlistedPackage } from "./packageObservation.js";
+import { retainRecordData } from "../db/dataRetention.js";
 
 describe("durable selected inventory exports", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -36,6 +37,22 @@ describe("durable selected inventory exports", () => {
     const selection = await inventory.capture(identity, root.scopeId);
     return { identity, selection };
   }
+
+  it.each(["queued", "ready"] as const)("revokes a %s artifact and collects its retained pins after reviewed associations change", async status => {
+    const { identity, selection } = await select(1, true);
+    const id = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind: "unified_agents", filename: "revision.csv" });
+    if (status === "ready") await exports.build(id, identity, inventoryExportColumns.unified_agents, inventoryExportSource(inventory, identity));
+    await fixture.operator.query(`INSERT INTO agent_usage_state(tenant_id,revision) VALUES($1,1)
+      ON CONFLICT(tenant_id) DO UPDATE SET revision=agent_usage_state.revision+1`, [identity.tenantId]);
+    await expect(exports.status(id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(exports.download(id, identity, new AbortController().signal).next()).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect(await exports.expire(id)).toBe(1);
+    for (let slice = 0; slice < 16; slice++) await exports.connections.run(client => retainRecordData(client));
+    expect((await fixture.runtime.query("SELECT ordinal FROM data_export_chunks WHERE export_id=$1", [id])).rows).toEqual([]);
+    expect((await fixture.runtime.query("SELECT ordinal FROM data_generation_pins WHERE selection_id=$1", [selection.id])).rows).toEqual([]);
+    expect((await fixture.runtime.query("SELECT status FROM data_exports WHERE id=$1", [id])).rows[0].status).toBe("expired");
+  });
 
   it.each(["unified_agents", "power_platform_agents"] as const)(
     "rejects %s for an empty package source instead of inferring its kind from zero rows", async kind => {
@@ -104,11 +121,11 @@ describe("durable selected inventory exports", () => {
     await streamedPackageFixture(fixture.runtime, scope, ["B package", "D package", "F package"].map((displayName, index) =>
       allowlistedPackage({ id: `export-package-${index}`, displayName, isBlocked: false })));
     const native = {
-      tenantId: identity.tenantId, type: "microsoft.copilotstudio/agents", environmentId: null, location: null,
+      tenantId: identity.tenantId, type: "microsoft.copilotstudio/agents" as const, environmentId: null, location: null,
       createdAt: null, createdBy: null, lastPublishedAt: null, sourceSystem: "power_platform" as const,
       authoringTool: "Copilot Studio", creatorType: "unknown" as const, agentKind: "copilot_studio_agent" as const,
       lifecycle: "draft" as const, identityConfidence: "exact_native" as const, identifiers: [], provenance: {}, unknownFieldCount: 0,
-      details: { ownerId: null, lastModifiedBy: null, lastModifiedAt: null },
+      details: {},
     };
     await nativeInventoryFixture(fixture.runtime, scope, ["A native", "C native", "E native"].map((displayName, index) => ({
       ...native, nativeId: `export-native-${index}`, displayName,
@@ -124,6 +141,44 @@ describe("durable selected inventory exports", () => {
       cursor = page.page.nextCursor ?? undefined;
     } while (cursor);
     expect(names).toEqual(["B package", "D package", "F package"]);
+  });
+
+  it.each([false, true])("rejects a partially missing explicit Graph selection and emits only the exact valid ID (canonical=%s)", async canonical => {
+    const { identity, selection } = await select(1, canonical);
+    const ids = ["package-000000", "missing"];
+    await expect(inventory.resolveExportReferences(selection.id, identity, ids, "graph_packages"))
+      .rejects.toMatchObject({ code: "export_selection_changed" });
+    const id = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind: "graph_packages", filename: "explicit.csv", ids });
+    await expect(exports.build(id, identity, inventoryExportColumns.graph_packages, inventoryExportSource(inventory, identity)))
+      .rejects.toMatchObject({ code: "export_selection_changed" });
+    expect(await exports.status(id, identity)).toMatchObject({ status: "failed", error: "export_selection_changed" });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_export_chunks WHERE export_id=$1", [id])).rows[0].count).toBe(0);
+    await expect(exports.download(id, identity, new AbortController().signal).next()).rejects.toThrow("export_not_ready");
+    const exact = await inventory.resolveExportReferences(selection.id, identity, [ids[0]], "graph_packages");
+    const valid = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind: "graph_packages", filename: "exact.csv", ids: exact });
+    await exports.build(valid, identity, inventoryExportColumns.graph_packages, inventoryExportSource(inventory, identity));
+    let csv = "";
+    for await (const chunk of exports.download(valid, identity, new AbortController().signal)) csv += chunk.toString();
+    expect((parseCsv(csv, { bom: true, columns: true }) as Array<Record<string, string>>).map(row => row.id)).toEqual([ids[0]]);
+  });
+
+  it.each([false, true])("rejects a raw native ID that names two environments (canonical=%s)", async canonical => {
+    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
+    let root = await nativeInventoryFixture(fixture.runtime, scope,
+      [randomUUID(), randomUUID()].map(environmentId => ({ nativeId: "repeated-native-id", environmentId, identifiers: [] })));
+    if (canonical) root = (await reconcileInventoryFixture(fixture.runtime, scope))!;
+    const selection = await inventory.capture(identity, root.scopeId);
+    await expect(inventory.resolveExportReferences(selection.id, identity, ["repeated-native-id"], "power_platform_agents"))
+      .rejects.toMatchObject({ code: "export_selection_changed" });
+    const id = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind: "power_platform_agents", filename: "ambiguous.csv", ids: ["repeated-native-id"] });
+    await expect(exports.build(id, identity, inventoryExportColumns.power_platform_agents, inventoryExportSource(inventory, identity)))
+      .rejects.toMatchObject({ code: "export_selection_changed" });
+    expect(await exports.status(id, identity)).toMatchObject({ status: "failed", error: "export_selection_changed" });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM data_export_chunks WHERE export_id=$1", [id])).rows[0].count).toBe(0);
   });
 
   it.each(["graph_packages", "unified_agents"] as const)("keeps private access assignments out of %s CSV child rows", async kind => {

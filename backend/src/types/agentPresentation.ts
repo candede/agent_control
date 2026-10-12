@@ -1,6 +1,7 @@
-import { formatAgentAuthoringTool, formatPackageFacetLabel, normalizePackageAuthoringTool, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
+import { formatAgentAuthoringTool, formatPackageFacetLabel, isDirectoryObjectId, normalizePackageAuthoringTool, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
 import { powerPlatformAuthoringTool } from "./powerPlatformInventory.js";
 import type { SavedAgentPerson, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
+import { normalizeEnvironmentIdentity } from "../services/inventoryIdentity.js";
 
 export type AgentRelevanceReason = "organization_created" | "organization_shared" | "microsoft" | "deployed" | "reported_usage";
 export type AgentColumnValue = string | number | null;
@@ -126,7 +127,8 @@ export function agentAuthoringToolLabels(record: UnifiedAgentRecord) {
 }
 
 export function agentPersonLabel(person: SavedAgentPerson | undefined, nativeId: string | null | undefined): string | null {
-  if (!person || !nativeId || person.objectId.toLowerCase() !== nativeId.trim().toLowerCase()) return nativeId ?? null;
+  if (!person || typeof nativeId !== "string" || !isDirectoryObjectId(nativeId) || !isDirectoryObjectId(person.objectId)
+    || person.objectId.toLowerCase() !== nativeId.toLowerCase()) return nativeId ?? null;
   const name = person.displayName && person.userPrincipalName ? `${person.displayName} (${person.userPrincipalName})`
     : person.displayName || person.userPrincipalName || nativeId;
   return person.status === "not_found" ? `${nativeId} (not found)`
@@ -139,7 +141,7 @@ export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgen
   const details = resource?.details;
   switch (column) {
     case "displayName": return record.displayName;
-    case "environment": return record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : null;
+    case "environment": return record.environmentId ? environmentNames[normalizeEnvironmentIdentity(record.environmentId)] || record.environmentId : null;
     case "builtWith": return agentAuthoringToolLabels(record).join(" / ") || null;
     case "availability": return agentUserAvailabilityLabel(record);
     case "status": {

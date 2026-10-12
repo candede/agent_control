@@ -7,8 +7,8 @@ import type {
   BulkJobStatus,
   PackageAccessUpdate,
 } from "../api/client";
-import { CircleStop, LoaderCircle, Play, RefreshCw, X } from "lucide-react";
-import { isJobPolling } from "../jobStatus";
+import { CircleStop, LoaderCircle, Play, RefreshCw } from "lucide-react";
+import { isJobPolling, jobStatusMessage } from "../jobStatus";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { PreviewBadge } from "./PermissionCenter";
 
@@ -83,12 +83,14 @@ export function BulkActions({
   const completed = job?.completed ?? progress?.completed;
   const total = summary?.total ?? 0;
   const percent = completed === undefined ? undefined : total === 0 ? 100 : Math.round(completed / total * 100);
-  const canCancel = job && !job.cancelRequested && (isJobPolling(job.status) || job.canResume);
+  const canCancel = job && !job.cancelRequested && (isJobPolling(job.status) || job.canResume || job.isCanary && job.queued > 0);
   const statusUnavailable = statusUnrecognized || Boolean(job && isJobPolling(job.status) && jobError && !busyAction && !jobCommand);
   const canDismiss = Boolean(summary && !active && (!needsReconciliation || job?.cancelRequested));
   const showProgress = completed !== undefined && active;
   const currentAgentName = job?.status === "running" ? job.currentAgentName : !job ? progress?.currentAgentName : undefined;
   const message = job?.cancelRequested ? `Cancellation was requested. Changes already in progress may still finish.${needsReconciliation ? " Uncertain results remain recorded, but cancelled jobs cannot be reconciled or resumed." : ""}`
+    : job?.isCanary && (job.status === "waiting_authorization" || job.status === "partial" && job.queued > 0)
+      ? jobStatusMessage(job.status, true)
     : job?.status === "waiting_authorization" ? "Sign in again, then resume unprocessed tasks."
     : job?.status === "cancelled" ? "Unprocessed tasks were cancelled. Changes already in progress may still finish."
     : needsReconciliation ? "Check uncertain results before starting another change. This only reads the current provider state."
@@ -162,8 +164,8 @@ export function BulkActions({
               onClick={() => onJobCommand("refresh")}>
               <RefreshCw size={16} aria-hidden="true" />{jobCommand === "refresh" ? "Checking status..." : "Refresh status"}
             </button> : null}
-            {job.status === "waiting_authorization" ? <a className="primary-link secondary" href="/api/auth/login">Sign in again</a> : null}
-            {job.canResume ? <WorkbenchActionGate actionId="packages.resume" compact>
+            {job.status === "waiting_authorization" && !job.isCanary ? <a className="primary-link secondary" href="/api/auth/login">Sign in again</a> : null}
+            {job.canResume && !job.isCanary ? <WorkbenchActionGate actionId="packages.resume" compact>
               <button type="button" className="secondary" disabled={Boolean(jobCommand) || statusUnrecognized}
                 onClick={() => onJobCommand("resume")} title="Resume only tasks that have not started. Uncertain changes are not replayed.">
                 <Play size={16} aria-hidden="true" />{jobCommand === "resume" ? "Resuming..." : "Resume unprocessed tasks"}

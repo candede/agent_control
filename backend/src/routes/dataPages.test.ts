@@ -350,7 +350,7 @@ describe("users/report route-to-client boundary", () => {
       const download = await api(`/data-exports/${job.id}/download`);
       expect(download.status).toBe(409); expect(download.headers.get("content-disposition")).toBeNull();
       expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM audit_events
-        WHERE tenant_id=$1 AND action='export-official-usage-users' AND status='failed' AND error_code='export_cancelled'`,
+        WHERE tenant_id=$1 AND action='export-official-usage-users' AND status='cancelled' AND error_code='export_cancelled'`,
       [identity.tenantId])).rows[0].n).toBe(1);
     } finally { await replacement.drain(); original.start(); }
   });

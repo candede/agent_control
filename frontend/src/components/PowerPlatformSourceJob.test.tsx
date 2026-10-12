@@ -27,87 +27,17 @@ function job(status: api.InventoryRefreshJob["status"]): api.InventoryRefreshJob
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe("Power Platform source job", () => {
-  it("shares an identical in-flight job across different poll revisions and cancels only the departing consumer", async () => {
-    vi.useFakeTimers();
-    const client = createSavedQueryClient(), first = vi.fn(), second = vi.fn();
-    let resolve!: (value: api.InventoryRefreshJob) => void;
-    vi.mocked(api.getInventoryRefreshJob).mockReturnValue(new Promise(yes => { resolve = yes; }));
-    const panel = (id: string, initial = false) => <PowerPlatformSourceJob key={id} jobId="exact-job"
-      initialJob={initial ? job("running") : undefined} onSelect={vi.fn()} onObserved={id === "first" ? first : second} />;
-    const view = render(<SavedQueryProvider client={client}>{panel("first", true)}</SavedQueryProvider>);
-    await act(() => vi.advanceTimersByTimeAsync(2500));
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
-    const signal = vi.mocked(api.getInventoryRefreshJob).mock.calls[0][1]!.signal!;
-    view.rerender(<SavedQueryProvider client={client}>{panel("first", true)}{panel("second")}</SavedQueryProvider>);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
-    view.rerender(<SavedQueryProvider client={client}>{panel("second")}</SavedQueryProvider>);
-    expect(signal.aborted).toBe(false);
-    await act(async () => resolve(job("succeeded")));
-    expect(first).not.toHaveBeenCalled();
-    expect(second).toHaveBeenCalledTimes(1);
-    await act(() => vi.advanceTimersByTimeAsync(60_000));
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
+  it.each([
+    ["full", "Full (hint only)"],
+    ["ai", "AI (hint only)"],
+    ["unknown", "Not supplied"],
+  ] as const)("separates the %s directory-role hint from the immutable requested scope", async (roleScope, hint) => {
+    vi.mocked(api.getInventoryRefreshJob).mockResolvedValue({ ...job("waiting_authorization"), roleScope });
+    render(<PowerPlatformSourceJob jobId="exact-job" onSelect={vi.fn()} onObserved={vi.fn()} />);
+    expect(await screen.findByText(`Optional directory-role hint: ${hint}.`)).toBeVisible();
+    expect(screen.getByText("Request scope: All environments requested. Requested: microsoft.copilotstudio/agents, microsoft.powerplatform/environments.")).toBeVisible();
     expect(api.refreshInventory).not.toHaveBeenCalled();
-    view.unmount();
-    client.clear();
-  });
-
-  it("suspends an owned status transport while offline and does not resume a completed observation", async () => {
-    vi.useFakeTimers();
-    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
-    vi.mocked(api.getInventoryRefreshJob).mockResolvedValue(job("succeeded"));
-    const view = render(<PowerPlatformSourceJob jobId="exact-job" onSelect={vi.fn()} onObserved={vi.fn()} />);
-    await act(() => vi.advanceTimersByTimeAsync(60_000));
-    expect(api.getInventoryRefreshJob).not.toHaveBeenCalled();
-    online.mockReturnValue(true);
-    await act(async () => { window.dispatchEvent(new Event("online")); });
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
-    online.mockReturnValue(false);
-    await act(async () => { window.dispatchEvent(new Event("offline")); });
-    online.mockReturnValue(true);
-    await act(async () => { window.dispatchEvent(new Event("online")); });
-    await act(() => vi.advanceTimersByTimeAsync(60_000));
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
-    view.unmount();
-    online.mockRestore();
-  });
-
-  it("does not join another consumer's pre-command status after an explicit resume", async () => {
-    vi.useFakeTimers();
-    const client = createSavedQueryClient(), observed = vi.fn();
-    let resolve!: (value: api.InventoryRefreshJob) => void;
-    vi.mocked(api.getInventoryRefreshJob).mockReturnValueOnce(new Promise(yes => { resolve = yes; }))
-      .mockResolvedValueOnce(job("succeeded"));
-    vi.mocked(api.resumeInventoryRefresh).mockResolvedValue(job("running"));
-    const view = render(<SavedQueryProvider client={client}>
-      <PowerPlatformSourceJob jobId="exact-job" onSelect={vi.fn()} onObserved={vi.fn()} />
-      <PowerPlatformSourceJob jobId="exact-job" initialJob={job("waiting_authorization")} onSelect={vi.fn()} onObserved={observed} />
-    </SavedQueryProvider>);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    const oldSignal = vi.mocked(api.getInventoryRefreshJob).mock.calls[0][1]?.signal;
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume source job" })));
-    await act(() => vi.advanceTimersByTimeAsync(2500));
-    expect(api.resumeInventoryRefresh).toHaveBeenCalledOnce();
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(2);
-    expect(observed).toHaveBeenLastCalledWith(job("succeeded"), job("running"));
-    expect(oldSignal?.aborted).toBe(false);
-    await act(async () => resolve(job("waiting_authorization")));
-    view.unmount();
-    client.clear();
-  });
-
-  it("observes a different job after the previous selected job completed", async () => {
-    vi.useFakeTimers();
-    vi.mocked(api.getInventoryRefreshJob).mockResolvedValueOnce(job("succeeded"))
-      .mockResolvedValueOnce({ ...job("succeeded"), id: "next-job" });
-    const observed = vi.fn();
-    const view = render(<PowerPlatformSourceJob jobId="exact-job" onSelect={vi.fn()} onObserved={observed} />);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    view.rerender(<PowerPlatformSourceJob jobId="next-job" onSelect={vi.fn()} onObserved={observed} />);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(2);
-    expect(observed).toHaveBeenLastCalledWith({ ...job("succeeded"), id: "next-job" }, undefined);
+    expect(api.resumeInventoryRefresh).not.toHaveBeenCalled();
   });
 
   it.each(["failed", "waiting_authorization", "running", "succeeded", "cancelled"] as const)("inspects the exact %s job without starting provider work", async status => {
@@ -153,6 +83,30 @@ describe("Power Platform source job", () => {
     expect(select).toHaveBeenCalledWith("new-job", { ...job("running"), id: "new-job" });
     expect(api.getInventoryRefreshJob).toHaveBeenCalledTimes(1);
     expect(observed).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["missing_permission", "missing_internal_role"] as const)(
+    "directs a failed %s job to permissions rather than sign-in or resume", async errorCode => {
+      vi.mocked(api.getInventoryRefreshJob).mockResolvedValue({ ...job("failed"), errorCode, message: "Required authority is unavailable." });
+      render(<PowerPlatformSourceJob jobId="exact-job" onSelect={vi.fn()} onObserved={vi.fn()} />);
+      expect(await screen.findByRole("link", { name: "Review Permissions" })).toHaveAttribute("href", "/permissions");
+      expect(screen.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Resume source job" })).not.toBeInTheDocument();
+      expect(api.refreshInventory).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["inventory_job_expired", "provider_timeout"])("replaces a %s job explicitly without offering sign-in, permissions or resume", async errorCode => {
+    vi.mocked(api.getInventoryRefreshJob).mockResolvedValue({ ...job("failed"), errorCode,
+      message: "The inventory refresh deadline expired. Start a new refresh; saved data is unchanged." });
+    vi.mocked(api.refreshInventory).mockResolvedValue({ ...job("running"), id: "replacement" });
+    const select = vi.fn();
+    render(<PowerPlatformSourceJob jobId="exact-job" onSelect={select} onObserved={vi.fn()} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Start a new source refresh" }));
+    expect(api.resumeInventoryRefresh).not.toHaveBeenCalled();
+    expect(select).toHaveBeenCalledWith("replacement", expect.objectContaining({ status: "running" }));
+    expect(screen.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Review Permissions" })).not.toBeInTheDocument();
   });
 
   it.each(["running", "waiting_authorization", "succeeded", "failed", "cancelled"] as const)(

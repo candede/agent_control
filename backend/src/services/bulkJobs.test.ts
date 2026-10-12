@@ -446,9 +446,9 @@ describe("Durable bulk execution", () => {
           return details;
         });
         const lock = jobs.withReconciliationLock.bind(jobs);
-        vi.spyOn(jobs, "withReconciliationLock").mockImplementation((owner, item, operation) => lock(owner, item, async () => {
+        vi.spyOn(jobs, "withReconciliationLock").mockImplementation((owner, item, operation) => lock(owner, item, async signal => {
           if (stage === "lock") await closeAdmissions();
-          return operation();
+          return operation(signal);
         }));
         const record = jobs.recordReconciliation.bind(jobs);
         const publications = vi.spyOn(jobs, "recordReconciliation").mockImplementation(async (...args) => {
@@ -648,6 +648,49 @@ describe("Durable bulk execution", () => {
       expect(fetcher).toHaveBeenCalledTimes(1);
       await jobs.cancel(job.id, scope);
     }
+  });
+
+  it.each([false, true])("honors cancellation during an authorization-failed pre-read with an inconclusive sibling=%s", async sibling => {
+    const owner = { ...scope, principalId: randomUUID() };
+    const job = await jobs.submit(owner, confirmedInput({
+      ...input(), scope: "bulk", actor: { ...input().actor, homeAccountId: owner.principalId },
+      targets: (sibling ? ["ambiguous-package", "cancelled-package"] : ["cancelled-package"])
+        .map(id => ({ id, displayName: id, prestate: { kind: "block", isBlocked: false } })),
+    }));
+    const fetcher = vi.fn<FetchLike>(async (url, request) => {
+      const parts = new URL(url).pathname.split("/");
+      const id = decodeURIComponent(request?.method === "POST" ? parts.at(-2)! : parts.at(-1)!);
+      if (id === "cancelled-package") {
+        await jobs.cancel(job.id, owner);
+        throw new AppError(403, "provider_authorization_error", "Synthetic pre-read denial.");
+      }
+      return request?.method === "POST"
+        ? Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 })
+        : Response.json({ id, displayName: id, isBlocked: false });
+    });
+    const provider = new GraphPackagesClient(fetcher, { maxAttempts: 1 });
+
+    await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
+
+    expect(await jobs.get(job.id, owner)).toMatchObject({
+      status: sibling ? "partial" : "cancelled", cancelRequested: true, canResume: false,
+      completed: sibling ? 2 : 1, queued: 0, cancelled: 1, inconclusive: sibling ? 1 : 0,
+      reconciliationRequired: sibling ? 1 : 0,
+    });
+    expect((await jobs.items(job.id, await usageIdentity(fixture.runtime, owner))).value)
+      .toMatchObject(sibling ? [
+        { id: "ambiguous-package", status: "inconclusive", reconciliationStatus: "required" },
+        { id: "cancelled-package", status: "cancelled", retryEligible: false },
+      ] : [{ id: "cancelled-package", status: "cancelled", retryEligible: false }]);
+    expect((await fixture.runtime.query("SELECT lease_owner,lease_until FROM jobs WHERE id=$1", [job.id])).rows[0])
+      .toEqual({ lease_owner: null, lease_until: null });
+    const receipt = await fixture.runtime.query(`SELECT status,message FROM audit_events
+      WHERE operation_id=$1 AND agent_id='cancelled-package' AND status='cancelled'`, [job.id]);
+    expect(receipt.rows).toEqual([{ status: "cancelled", message: "Cancellation stopped this attempt before provider dispatch." }]);
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(sibling ? 1 : 0);
+    const calls = fetcher.mock.calls.length;
+    await runBulkJob(job.id, owner, true, jobs, provider, async () => "synthetic-token");
+    expect(fetcher).toHaveBeenCalledTimes(calls);
   });
 
   it("executes an explicitly confirmed access update once, preserving existing and unselected principals", async () => {

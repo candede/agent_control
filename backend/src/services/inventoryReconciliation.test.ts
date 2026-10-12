@@ -49,7 +49,7 @@ describe("durable bounded reconciliation", () => {
     for (let index=0;index<21;index++) {
       const principalId = randomUUID();
       const root = await streamedPackageFixture(fixture.runtime,{ tenantId,principalId },[
-        { id: "admission-package",displayName: "Admission package",isBlocked: false },
+        allowlistedPackage({ id: "admission-package",displayName: "Admission package",isBlocked: false }),
       ]);
       const input = inventoryInput(principalId,"canonical");
       input.scope.tenantId = tenantId;
@@ -74,9 +74,9 @@ describe("durable bounded reconciliation", () => {
     authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published",
     identityConfidence: "exact_native", identifiers, provenance: {}, details, unknownFieldCount: 0,
   });
-  const packaged = (id: string, linked = true) => packageInventoryRecord({ id, displayName: id, isBlocked: false,
+  const packaged = (id: string, linked = true) => packageInventoryRecord(allowlistedPackage({ id, displayName: id, isBlocked: false,
     ...(linked ? { elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity",
-      definition: JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: bot } }) }] }] } : {}) });
+      definition: JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: bot } }) }] }] } : {}) }));
   it("bounds orphan control cleanup without attempting publication from an expired or missing baseline", async () => {
     const principalId = randomUUID(), scope = { tenantId: "synthetic-tenant", principalId };
     const client = await fixture.runtime.connect();
@@ -123,9 +123,9 @@ describe("durable bounded reconciliation", () => {
     expect(canonical.changed).toBe(2);
     expect(await changes(graph.scopeId)).toBe(0);
     expect(await changes(canonical.scopeId)).toBe(0);
-    graph = await publish(principal,"packages",[packageInventoryRecord({
+    graph = await publish(principal,"packages",[packageInventoryRecord(allowlistedPackage({
       id: "baseline-a",displayName: "Changed",isBlocked: true,
-    })],true);
+    }))],true);
     expect(graph.changed).toBe(1);
     expect(await changes(graph.scopeId)).toBe(1);
     await reconcile.request(input,[graph]);
@@ -188,8 +188,8 @@ describe("durable bounded reconciliation", () => {
     const update = async (batch: number) => publish(principal, "packages",
       Array.from({ length: 20 }, (_, index) => {
         const number = batch * 20 + index;
-        return packageInventoryRecord({ id: `package-${String(number).padStart(6, "0")}`,
-          displayName: `Changed batch ${batch} row ${index}`, isBlocked: false });
+        return packageInventoryRecord(allowlistedPackage({ id: `package-${String(number).padStart(6, "0")}`,
+          displayName: `Changed batch ${batch} row ${index}`, isBlocked: false }));
       }), true);
     const activeRoot = await update(0);
     const requested = await reconcile.request(input, [activeRoot]);
@@ -351,14 +351,15 @@ describe("durable bounded reconciliation", () => {
   });
   it("publishes and independently pages five thousand legal child definitions without loading them into canonical work", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
-    const value = { id: "wide-children", displayName: "Wide children", isBlocked: false,
-      identityDetailsCollected: true, version: "1", manifestId: bot, lastModifiedDateTime: new Date().toISOString(),
-      detailFreshness: { state: "fresh" as const, observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() },
+    const value = { ...allowlistedPackage({ id: "wide-children", displayName: "Wide children", isBlocked: false,
+      version: "1", manifestId: bot, lastModifiedDateTime: new Date().toISOString(),
       elementDetails: Array.from({ length: 50 }, (_, group) => ({ elementType: `PublishedContent${group}`,
         elements: Array.from({ length: 100 }, (_, index) => ({
           id: `child-${String(group * 100 + index).padStart(5, "0")}`,
           definition: JSON.stringify({ description: `${group * 100 + index}:${"x".repeat(256)}` }),
-        })) })) };
+        })) })) }),
+      identityDetailsCollected: true as const,
+      detailFreshness: { state: "fresh" as const, observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() } };
     const record = packageInventoryRecord(value);
     expect(Buffer.byteLength(JSON.stringify(record.facts))).toBeGreaterThan(1_048_576);
     const source = await publish(principal, "packages", [record]);
@@ -418,6 +419,27 @@ describe("durable bounded reconciliation", () => {
         AND f.kind='element'`, [next.baselineId, next.revision])).rows[0].count).toBe(5000);
     }
   });
+  it("reconciles legal isolated packages whose combined host facts exceed one canonical work batch", async () => {
+    const principal = randomUUID(), input = inventoryInput(principal, "canonical");
+    const records = Array.from({ length: 40 }, (_, index) => packageInventoryRecord(allowlistedPackage({
+      id: `wide-hosts-${String(index).padStart(3, "0")}`, displayName: `Wide hosts ${index}`, isBlocked: false,
+      supportedHosts: Array.from({ length: 100 }, (_, host) => `${host}:${"x".repeat(240)}`),
+    })));
+    const source = await publish(principal, "packages", records);
+    await reconcile.request(input, [source]);
+    const canonical = (await reconcile.runNext(input, async () => {}))!;
+    expect(canonical.inserted).toBe(records.length);
+    const members = (await fixture.runtime.query(`SELECT member.source_identity,m.identity,
+      (SELECT count(*)::int FROM inventory_facts f WHERE f.generation_id=m.generation_id
+        AND f.identity=m.identity AND f.kind='host') AS hosts
+      FROM inventory_memberships m JOIN unified_agent_memberships member
+        ON member.generation_id=m.generation_id AND member.identity=m.identity
+      WHERE ${inventoryAsOf()} ORDER BY member.source_identity COLLATE "C"`,
+    [canonical.baselineId, canonical.revision])).rows;
+    expect(members.map(row => row.source_identity)).toEqual(records.map(record => record.identity));
+    expect(new Set(members.map(row => row.identity)).size).toBe(records.length);
+    expect(members.every(row => row.hosts === 100)).toBe(true);
+  }, 30_000);
   it("clears scoped inventory heads and pending readbacks atomically without reusing historical revision numbers", async () => {
     const principal = randomUUID(), other = randomUUID(), input = inventoryInput(principal, "canonical");
     const scope = { tenantId: "synthetic-tenant", principalId: principal };
@@ -454,10 +476,10 @@ describe("durable bounded reconciliation", () => {
   it("preserves case-distinct opaque Graph IDs and both canonical survivors on an ordinary update", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
     const ids = ["abcdefab-abcd-4abc-8abc-abcdefabcdef", "ABCDEFAB-ABCD-4ABC-8ABC-ABCDEFABCDEF"];
-    const rows = () => ids.map((id, index) => packageInventoryRecord({ id, displayName: id, isBlocked: false,
+    const rows = () => ids.map((id, index) => packageInventoryRecord(allowlistedPackage({ id, displayName: id, isBlocked: false,
       elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity", definition: JSON.stringify({
         SourceIds: { EnvironmentId: environment, CdsBotId: bot, SchemaName: `schema${index}` },
-      }) }] }] }));
+      }) }] }] })));
     const root = await publish(principal, "packages", rows());
     await reconcile.request(input, [root]);
     const first = (await reconcile.runNext(input, async () => {}))!;
@@ -730,16 +752,16 @@ describe("durable bounded reconciliation", () => {
   it.each(["manifest", "custom-engine", "conflicting"] as const)("preserves %s identity evidence through the indexed SQL frontier", async scenario => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical"), application = randomUUID();
     const metadata = (id: string, cds: string) => ({ id, definition: JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: cds } }) });
-    const engine = (id: string, anchored: boolean) => packageInventoryRecord({ id, displayName: id, isBlocked: false, elementDetails: [
+    const engine = (id: string, anchored: boolean) => packageInventoryRecord(allowlistedPackage({ id, displayName: id, isBlocked: false, elementDetails: [
       ...anchored ? [{ elementType: "AgentMetadatas", elements: [metadata("identity", bot)] }] : [],
       { elementType: "Bots", elements: [{ id: application, definition: JSON.stringify({ botId: application }) }] },
       { elementType: "CustomEngineCopilots", elements: [{ id: application, definition: JSON.stringify({ id: application, type: "bot" }) }] },
-    ] });
-    const packages = scenario === "manifest" ? [packageInventoryRecord({ id: "manifest", displayName: "Manifest", isBlocked: false, manifestId: bot,
-      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "declarative", definition: "{}" }] }] })]
+    ] }));
+    const packages = scenario === "manifest" ? [packageInventoryRecord(allowlistedPackage({ id: "manifest", displayName: "Manifest", isBlocked: false, manifestId: bot,
+      elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "declarative", definition: "{}" }] }] }))]
       : scenario === "custom-engine" ? [engine("anchor", true), engine("legacy", false)]
-        : [packageInventoryRecord({ id: "conflict", displayName: "Conflict", isBlocked: false,
-          elementDetails: [{ elementType: "AgentMetadatas", elements: [metadata("one", bot), metadata("two", randomUUID())] }] })];
+        : [packageInventoryRecord(allowlistedPackage({ id: "conflict", displayName: "Conflict", isBlocked: false,
+          elementDetails: [{ elementType: "AgentMetadatas", elements: [metadata("one", bot), metadata("two", randomUUID())] }] }))];
     const pp = await publish(principal, "power_platform", [scenario === "manifest" ? native(bot.toUpperCase(), [], { schemaName: bot }) : native("native")]);
     const graph = await publish(principal, "packages", packages);
     await reconcile.request(input, [graph, pp]);

@@ -1,4 +1,6 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, getEventListeners } from "node:events";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
 import type { Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseCsv } from "csv-parse/sync";
@@ -23,8 +25,17 @@ class FakeResponse extends EventEmitter {
   writableFinished = false;
   forceBackpressure = false;
 
+  get headersSent() { return this.writes.some(chunk => chunk.byteLength > 0); }
+
   setHeader(name: string, value: string) {
     this.headers.set(name, value);
+  }
+
+  removeHeader(name: string) { this.headers.delete(name); }
+
+  destroy() {
+    this.destroyed = true;
+    this.emit("close");
   }
 
   write(value: Buffer) {
@@ -78,14 +89,38 @@ describe("bounded CSV publication", () => {
     expect(csvValue("a\"b")).toBe("\"a\"\"b\"");
   });
 
-  it("uses compact empty cells without conflating zero, false, unknown or formula-safe text", () => {
+  it("neutralizes LF and whitespace-hidden formula prefixes without stripping source text", () => {
+    const formulas = ["\n=1", " =1", "  +1", "\u00a0-1", "\uFEFF@value", " \tcmd", " \rcmd", " \ncmd", " \u22121"];
+    const plain = '  A, "quoted"\r\n界😀\tend  ';
+    const buffer = Buffer.from(`\uFEFFtext\r\n${formulas.map(text => `"'${text}"\r\n`).join("")}"  A, ""quoted""\r\n界😀\tend  "\r\n`);
+    const budget = { maximumRows: formulas.length + 1, maximumBytes: buffer.byteLength, deadlineAt: Date.now() + 10_000 };
+    const rows = [...formulas, plain].map(text => ({ text }));
+
+    expect(buildBoundedCsv(["text"], rows, budget)).toEqual({
+      buffer, byteCount: buffer.byteLength, rowCount: rows.length,
+    });
+    expect(parseCsv(buffer, { columns: true, bom: true })).toEqual([
+      ...formulas.map(text => ({ text: `'${text}` })), { text: plain },
+    ]);
+    expect(() => buildBoundedCsv(["text"], rows, { ...budget, maximumBytes: buffer.byteLength - 1 }))
+      .toThrowError(expect.objectContaining({ code: "export_byte_limit" }));
+  });
+
+  it("quotes explicit empty cells distinctly from null and missing while retaining zero and false", () => {
     const csv = buildBoundedCsv(["empty", "missing", "unknown", "zero", "disabled", "formula"], [{
       empty: "", missing: undefined, unknown: null, zero: 0, disabled: false, formula: "=SUM(1,1)",
     }], { maximumRows: 1, maximumBytes: 1_000, deadlineAt: Date.now() + 10_000 });
-    expect(csv.buffer.toString("utf8")).toContain('\r\n,,,"0","false","\'=SUM(1,1)"\r\n');
+    expect(csv.buffer.toString("utf8")).toContain('\r\n"",,,"0","false","\'=SUM(1,1)"\r\n');
     expect(parseCsv(csv.buffer, { columns: true, bom: true })).toEqual([{
       empty: "", missing: "", unknown: "", zero: "0", disabled: "false", formula: "'=SUM(1,1)",
     }]);
+  });
+
+  it("rejects duplicate and oversized schemas even for empty selections", () => {
+    const budget = { maximumRows: 1, maximumBytes: 10_000, deadlineAt: Date.now() + 10_000 };
+    for (const columns of [["id", "id"], Array.from({ length: 129 }, (_, index) => `column${index}`), ["a".repeat(129)]]) {
+      expect(() => buildBoundedCsv(columns, [], budget)).toThrow(expect.objectContaining({ code: "invalid_export_schema" }));
+    }
   });
 
   it("rejects row, byte, and deadline budget violations before publication", () => {
@@ -340,6 +375,232 @@ describe("bounded CSV publication", () => {
     expect(response.listenerCount("close")).toBe(0);
     expect(request.listenerCount("aborted")).toBe(0);
   });
+
+  it("ends immediately after the final authorized write even when it reports backpressure", async () => {
+    const { request, response } = transport();
+    let current = true;
+    const end = vi.spyOn(response, "end").mockImplementation(() => {
+      expect(current).toBe(true);
+      response.writableEnded = true;
+      response.writableFinished = true;
+      response.emit("finish");
+    });
+    response.write = chunk => {
+      response.writes.push(Buffer.from(chunk));
+      queueMicrotask(() => { current = false; response.emit("drain"); });
+      return false;
+    };
+    await publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("private\r\n"), {
+      deadlineAt: Date.now() + 1_000,
+      validate: async () => { if (!current) throw AppError.unauthorized(); },
+    });
+    expect(end).toHaveBeenCalledOnce();
+    expect(response.listenerCount("drain")).toBe(0);
+  });
+
+  it.each([0, 1, 1_024, 1_025, 2_048])("audits once and publishes the exact %i-byte payload at chunk boundaries", async size => {
+    const { request, response } = transport();
+    const csv = Buffer.alloc(size, 65);
+    const end = vi.spyOn(response, "end");
+    const beforeEnd = vi.fn(async () => {
+      const published = Buffer.concat(response.writes).byteLength;
+      if (size) expect(published).toBeLessThan(size);
+      else expect(published).toBe(0);
+    });
+    await publishBoundedCsv(request, response as unknown as Response, "safe.csv", csv, {
+      deadlineAt: Date.now() + 1_000, validate: async () => undefined, chunkBytes: 1_024, beforeEnd,
+    });
+    expect(Buffer.concat(response.writes)).toEqual(csv);
+    expect(response.headers.get("Content-Length")).toBe(String(size));
+    expect(beforeEnd).toHaveBeenCalledOnce();
+    expect(end).toHaveBeenCalledOnce();
+  });
+
+  it.each(["drain", "finish"] as const)("preserves a primary transport error during %s and cleans listeners", async phase => {
+    const { request, response } = transport();
+    const failure = new Error("synthetic transport failure");
+    if (phase === "drain") {
+      response.write = chunk => {
+        response.writes.push(Buffer.from(chunk));
+        queueMicrotask(() => response.emit("error", failure));
+        return false;
+      };
+    } else {
+      response.end = () => { queueMicrotask(() => response.emit("error", failure)); };
+    }
+    await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(2_048), {
+      deadlineAt: Date.now() + 1_000, validate: async () => undefined, chunkBytes: 1_024,
+    })).rejects.toBe(failure);
+    expect(response.destroyed).toBe(true);
+    for (const event of ["drain", "finish", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+    expect(request.listenerCount("aborted")).toBe(0);
+  });
+
+  it.each([false, true])("cleans synchronous end failures after prior bytes %s", async partial => {
+    const { request, response } = transport();
+    const failure = new Error("synthetic end failure");
+    if (!partial) response.write = () => true;
+    response.end = () => { throw failure; };
+    await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("id\r\n"), {
+      deadlineAt: Date.now() + 1_000, validate: async () => undefined,
+    })).rejects.toBe(failure);
+    expect(response.destroyed).toBe(partial);
+    expect(response.headers.has("Content-Disposition")).toBe(partial);
+    expect(response.headers.has("Content-Length")).toBe(partial);
+    for (const event of ["drain", "finish", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+    expect(request.listenerCount("aborted")).toBe(0);
+  });
+
+  it("terminates partial downloads on deadline while waiting for the final audit to settle", async () => {
+    const { request, response } = transport();
+    const auditStarted = Promise.withResolvers<void>();
+    const auditFinished = Promise.withResolvers<void>();
+    const closed = Promise.withResolvers<void>();
+    response.once("close", () => closed.resolve());
+    const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(2_048), {
+      deadlineAt: Date.now() + 30, validate: async () => undefined, chunkBytes: 1_024,
+      beforeEnd: () => { auditStarted.resolve(); return auditFinished.promise; },
+    });
+    const rejected = expect(publication).rejects.toMatchObject({ code: "export_deadline" });
+    await auditStarted.promise;
+    try {
+      await Promise.race([closed.promise, new Promise<void>(resolve => setTimeout(resolve, 100))]);
+      expect(response.destroyed).toBe(true);
+      expect(response.writes).toHaveLength(1);
+    } finally {
+      auditFinished.resolve();
+      await rejected;
+    }
+    for (const event of ["drain", "finish", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+  });
+
+  it("does not replace a rejected final audit or release its last chunk", async () => {
+    const { request, response } = transport();
+    const failure = new Error("synthetic audit failure");
+    const end = vi.spyOn(response, "end");
+    await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(2_048), {
+      deadlineAt: Date.now() + 1_000, validate: async () => undefined, chunkBytes: 1_024,
+      beforeEnd: async () => { throw failure; },
+    })).rejects.toBe(failure);
+    expect(response.writes).toHaveLength(1);
+    expect(response.destroyed).toBe(true);
+    expect(end).not.toHaveBeenCalled();
+  });
+
+  it("preserves a disconnect while waiting for a final audit that later rejects", async () => {
+    const { request, response } = transport();
+    const auditStarted = Promise.withResolvers<void>();
+    const auditFinished = Promise.withResolvers<void>();
+    const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(2_048), {
+      deadlineAt: Date.now() + 1_000, validate: async () => undefined, chunkBytes: 1_024,
+      beforeEnd: () => { auditStarted.resolve(); return auditFinished.promise; },
+    });
+    const rejected = expect(publication).rejects.toMatchObject({ code: "export_disconnected" });
+    await auditStarted.promise;
+    request.emit("aborted");
+    auditFinished.reject(new Error("late synthetic audit failure"));
+    await rejected;
+    expect(response.destroyed).toBe(true);
+    expect(response.writes).toHaveLength(1);
+    expect(request.listenerCount("aborted")).toBe(0);
+  });
+
+  it("observes late rejected validation after disconnect without publishing or retaining listeners", async () => {
+    const { request, response } = transport();
+    const readStarted = Promise.withResolvers<void>();
+    const readFinished = Promise.withResolvers<void>();
+    const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("id\r\n"), {
+      deadlineAt: Date.now() + 1_000,
+      validate: () => { readStarted.resolve(); return readFinished.promise; },
+    });
+    const rejected = expect(publication).rejects.toMatchObject({ code: "export_disconnected" });
+    await readStarted.promise;
+    request.emit("aborted");
+    await rejected;
+    readFinished.reject(new Error("late synthetic validation failure"));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(response.headers.size).toBe(0);
+    for (const event of ["drain", "finish", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+    expect(request.listenerCount("aborted")).toBe(0);
+  });
+
+  it("does not write to or end a response that ended during validation", async () => {
+    const { request, response } = transport();
+    const end = vi.spyOn(response, "end");
+    await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("id\r\n"), {
+      deadlineAt: Date.now() + 1_000,
+      validate: async () => { response.end(); },
+    })).rejects.toMatchObject({ code: "export_disconnected" });
+    expect(response.headers.size).toBe(0);
+    expect(response.writes).toHaveLength(0);
+    expect(end).toHaveBeenCalledOnce();
+  });
+
+  it.each(["during read", "before subscription"] as const)("removes cancelled read listeners %s even if the read never settles", async phase => {
+    const { request, response } = transport();
+    const cancellation = new AbortController();
+    const controller = vi.spyOn(globalThis, "AbortController").mockImplementation(function () { return cancellation; });
+    const readStarted = Promise.withResolvers<void>();
+    const readFinished = Promise.withResolvers<void>();
+    try {
+      const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("id\r\n"), {
+        deadlineAt: Date.now() + 1_000,
+        validate: () => {
+          readStarted.resolve();
+          if (phase === "before subscription") request.emit("aborted");
+          return readFinished.promise;
+        },
+      });
+      const rejected = expect(publication).rejects.toMatchObject({ code: "export_disconnected" });
+      await readStarted.promise;
+      if (phase === "during read") request.emit("aborted");
+      await rejected;
+      expect(getEventListeners(cancellation.signal, "abort")).toHaveLength(0);
+      expect(response.writes).toHaveLength(0);
+    } finally {
+      readFinished.reject(new Error("late synthetic read failure"));
+      controller.mockRestore();
+    }
+  });
+
+  it("does not retroactively fail a timely finish when the publication continuation runs after the deadline", async () => {
+    const socket = new Socket();
+    const output: Buffer[] = [];
+    socket._write = (chunk, _encoding, callback) => { output.push(Buffer.from(chunk)); callback(); };
+    socket._writev = (chunks, callback) => {
+      output.push(...chunks.map(({ chunk }) => Buffer.from(chunk)));
+      callback();
+    };
+    const request = new IncomingMessage(socket);
+    Object.assign(request, { method: "GET", httpVersionMajor: 1, httpVersionMinor: 1, complete: true });
+    const response = new ServerResponse(request);
+    response.assignSocket(socket);
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const end = response.end.bind(response);
+    response.end = () => {
+      end();
+      response.once("finish", () => { now = deadlineAt; });
+      return response;
+    };
+    try {
+      const csv = Buffer.from("\uFEFFid\r\n\"界😀\"\r\n");
+      await publishBoundedCsv(request as unknown as Request, response as unknown as Response, "safe.csv", csv, {
+        deadlineAt, validate: async () => undefined,
+      });
+      expect(response.writableFinished).toBe(true);
+      expect(response.destroyed).toBe(false);
+      const wire = Buffer.concat(output);
+      const boundary = wire.indexOf("\r\n\r\n") + 4;
+      expect(wire.subarray(boundary)).toEqual(csv);
+      expect(wire.subarray(0, boundary).toString()).toContain(`Content-Length: ${csv.byteLength}\r\n`);
+      for (const event of ["drain", "finish", "close", "error"]) expect(response.listenerCount(event)).toBe(0);
+    } finally {
+      socket.destroy();
+      clock.mockRestore();
+    }
+  });
 });
 
 describe("export session publication fence", () => {
@@ -441,4 +702,62 @@ describe("export session publication fence", () => {
     await expect(validate()).rejects.toMatchObject({ code: "unauthorized" });
     expect(validateSource).toHaveBeenCalledTimes(2);
   });
+
+  it("rechecks durable session revocation after a source read without holding the logout lock", async () => {
+    const { request, response } = authorizedTransport();
+    const sourceStarted = Promise.withResolvers<void>();
+    const sourceFinished = Promise.withResolvers<void>();
+    let checks = 0;
+    const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+    const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("private\r\n"), {
+      deadlineAt: Date.now() + 1_000,
+      validate: () => validateSession(async () => {
+        if (++checks !== 2) return;
+        sourceStarted.resolve();
+        await sourceFinished.promise;
+      }),
+    });
+    const rejected = expect(publication).rejects.toMatchObject({ code: "unauthorized" });
+    await sourceStarted.promise;
+    storedSession.query.mockResolvedValue({ rowCount: 0, rows: [] });
+    sourceFinished.resolve();
+    await rejected;
+    expect(response.headers.size).toBe(0);
+    expect(response.writes).toHaveLength(0);
+  });
+
+  it.each([
+    ["logout", "first chunk"], ["superseding login", "first chunk"], ["role removal", "first chunk"],
+    ["logout", "between chunks"], ["logout", "after audit"], ["logout", "empty payload"],
+  ] as const)(
+    "rejects %s after async validation resolves for the %s", async (change, phase) => {
+      const { request, response } = authorizedTransport();
+      const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+      let checks = 0;
+      let mutation: Promise<unknown> | undefined;
+      const size = phase === "empty payload" ? 0 : phase === "between chunks" ? 2_048 : 512;
+      const pendingCheck = phase === "between chunks" || phase === "after audit" ? 3 : 2;
+      const beforeEnd = phase === "after audit" ? vi.fn(async () => undefined) : undefined;
+      const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(size), {
+        deadlineAt: Date.now() + 1_000, chunkBytes: 1_024, beforeEnd,
+        validate: () => {
+          const validated = validateSession(async () => undefined);
+          if (++checks === pendingCheck) void validated.then(() => {
+            if (change === "logout") {
+              mutation = revokeAccountSessionMutations("csv-tenant", request.session.accountId!, async () => undefined);
+            } else if (change === "superseding login") {
+              mutation = activateAccountSession("csv-tenant", request.session.accountId!, async () => undefined);
+            } else request.session.user!.roles = [];
+          });
+          return validated;
+        },
+      });
+      await expect(publication).rejects.toMatchObject({ code: "unauthorized" });
+      await mutation;
+      expect(response.writes).toHaveLength(phase === "between chunks" ? 1 : 0);
+      expect(response.headers.size).toBe(phase === "between chunks" ? 4 : 0);
+      expect(response.destroyed).toBe(phase === "between chunks");
+      if (beforeEnd) expect(beforeEnd).toHaveBeenCalledOnce();
+    },
+  );
 });

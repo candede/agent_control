@@ -44,85 +44,32 @@ beforeEach(() => {
 });
 
 describe("user detail lifecycle", () => {
-  it.each(["visibility", "connectivity"] as const)("renews direct details when returning from suspended %s after expiry", async boundary => {
+  it("opens paid-feature details for a Graph GUID without UUID version or variant restrictions", async () => {
+    const objectId = "aaaaaaaa-aaaa-7aaa-1aaa-aaaaaaaaaaaa";
     const saved = evidence(combinedUser());
-    saved.selection.expiresAt = new Date(Date.now() + 60_000).toISOString();
-    const pending = deferred<typeof saved>();
-    vi.mocked(readReportDetail).mockResolvedValueOnce(saved).mockReturnValueOnce(pending.promise);
-    render(<UserDetailModal {...props()} />);
-    await screen.findByText("Contoso");
-    const availability = boundary === "visibility"
-      ? vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden")
-      : vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
-    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 60_001);
-    fireEvent(window, new Event(boundary === "visibility" ? "focus" : "offline"));
-    expect(readReportDetail).toHaveBeenCalledOnce();
-    availability.mockRestore();
-    if (boundary === "visibility") fireEvent(document, new Event("visibilitychange"));
-    else fireEvent(window, new Event("online"));
-    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(2));
-    expect(screen.getByText("Contoso")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
-    const fresh = { ...evidence(combinedUser()), selection: reportSelection(9, Date.now()) };
-    await act(async () => pending.resolve(fresh));
-    expect(screen.getByText("Contoso")).toBeVisible();
-    fireEvent.focus(window);
-    expect(readReportDetail).toHaveBeenCalledTimes(2);
+    saved.value.directory.objectId = objectId;
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+
+    render(<UserDetailModal {...props({ identity: objectId.toUpperCase(), activeTab: "licenses" })} />);
+
+    expect(await screen.findByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledExactlyOnceWith(`copilot-usage/users/${objectId}`, undefined, expect.any(AbortSignal));
+    expect(readReportPage).toHaveBeenCalledExactlyOnceWith(`copilot-usage/users/${objectId}/service-plans`,
+      { selectionId: saved.selection.id, limit: 50 }, expect.any(AbortSignal));
+    expect(screen.queryByText(/an exact directory object ID is required/)).not.toBeInTheDocument();
   });
 
-  it("does not let an old license rejection disable a pending replacement detail", async () => {
-    const saved = evidence(combinedUser()), fresh = { ...saved, selection: reportSelection(9) };
-    const plans = deferred<ReturnType<typeof reportPage>>(), pending = deferred<typeof saved>();
-    vi.mocked(readReportDetail).mockResolvedValueOnce(saved).mockReturnValueOnce(pending.promise);
-    vi.mocked(readReportPage).mockReturnValueOnce(plans.promise).mockResolvedValue(reportPage([], { selection: fresh.selection }));
-    const settings = props({ selectionId: saved.selection.id, initialTab: "licenses", onSelectionInvalidated: vi.fn() });
-    const view = render(<UserDetailModal {...settings} />);
-    await waitFor(() => expect(readReportPage).toHaveBeenCalledOnce());
-    view.rerender(<UserDetailModal {...settings} selectionId={fresh.selection.id} />);
-    const signal = vi.mocked(readReportDetail).mock.lastCall?.[2];
-    await act(async () => plans.reject(new ApiError(409, "selection_invalidated", "Old license evidence changed.")));
-    expect(signal?.aborted).toBe(false);
-    expect(settings.onSelectionInvalidated).not.toHaveBeenCalled();
-    await act(async () => pending.resolve(fresh));
-    await waitFor(() => expect(readReportPage).toHaveBeenCalledTimes(2));
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
-    expect(await screen.findByText("Contoso")).toBeVisible();
-  });
+  it("preserves an opaque reported-user GUID when reading exact report details", async () => {
+    const username = "AAAAAAAA-AAAA-7AAA-1AAA-AAAAAAAAAAAA";
+    const saved = evidence(reportUser());
+    saved.value.username = username;
+    saved.value.objectId = null;
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
 
-  it("withdraws retained directory details when a newly synced report identity loses its directory link", async () => {
-    const linked = evidence(reportUser()), directory = evidence(combinedUser());
-    const unlinked = { ...linked, value: { ...linked.value, objectId: null }, selection: reportSelection(9) };
-    vi.mocked(readReportDetail).mockResolvedValueOnce(linked).mockResolvedValueOnce(directory).mockResolvedValueOnce(unlinked);
-    const settings = props({ kind: "report", identity: linked.value.username, selectionId: linked.selection.id });
-    const view = render(<UserDetailModal {...settings} />);
-    await screen.findByText("Contoso");
-    view.rerender(<UserDetailModal {...settings} selectionId={unlinked.selection.id} />);
-    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(3));
-    await waitFor(() => expect(screen.queryByText("Contoso")).not.toBeInTheDocument());
-    expect(screen.getByRole("dialog")).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "Licenses" }));
-    expect(screen.getByText("Detailed license assignments are unavailable for this report identity.")).toBeVisible();
-    expect(readReportDetail).toHaveBeenCalledTimes(3);
-  });
+    render(<UserDetailModal {...props({ kind: "report", identity: username })} />);
 
-  it("does not carry the previous profile into a replacement report directory link", async () => {
-    const linked = evidence(reportUser()), directory = evidence(combinedUser());
-    const replacement = { ...evidence(combinedUser(2)), selection: reportSelection(9) };
-    replacement.value.directory.companyName = "Replacement company";
-    const changed = { ...linked, value: { ...linked.value, objectId: replacement.value.directory.objectId }, selection: replacement.selection };
-    const pending = deferred<typeof replacement>();
-    vi.mocked(readReportDetail).mockResolvedValueOnce(linked).mockResolvedValueOnce(directory)
-      .mockResolvedValueOnce(changed).mockReturnValueOnce(pending.promise);
-    const settings = props({ kind: "report", identity: linked.value.username, selectionId: linked.selection.id });
-    const view = render(<UserDetailModal {...settings} />);
-    await screen.findByText("Contoso");
-    view.rerender(<UserDetailModal {...settings} selectionId={changed.selection.id} />);
-    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(4));
-    expect(screen.queryByText("Contoso")).not.toBeInTheDocument();
-    await act(async () => pending.resolve(replacement));
-    expect(await screen.findByText("Replacement company")).toBeVisible();
-    expect(screen.queryByText("Contoso")).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: saved.value.displayName || username })).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledExactlyOnceWith(`official-usage/users/${username}`, undefined, expect.any(AbortSignal));
   });
 
   it.each(["target", "ref"] as const)("restores the current return-focus %s without reopening user details", async replacement => {

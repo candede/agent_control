@@ -3,7 +3,7 @@ import { testDatabase } from "./testDatabase.js";
 
 const mocks = vi.hoisted(() => {
   const createPool = () => ({
-    query: vi.fn(async (_sql: string) => ({ rows: [] })),
+    query: vi.fn<(sql: string) => Promise<{ rowCount: number; rows: unknown[] }>>(async () => ({ rowCount: 0, rows: [] })),
     end: vi.fn(async () => undefined),
   });
   return {
@@ -31,7 +31,7 @@ vi.mock("../src/db/schema.js", () => ({ verifySchema: mocks.verify }));
 
 beforeEach(() => {
   for (const pool of [mocks.admin, mocks.operator, mocks.runtime]) {
-    pool.query.mockReset().mockResolvedValue({ rows: [] });
+    pool.query.mockReset().mockResolvedValue({ rowCount: 0, rows: [] });
     pool.end.mockReset().mockResolvedValue(undefined);
   }
   for (const operation of [mocks.bootstrap, mocks.initializeSchema, mocks.grantRuntime]) {
@@ -44,6 +44,9 @@ beforeEach(() => {
     .mockImplementationOnce(function () { return mocks.admin; })
     .mockImplementationOnce(function () { return mocks.operator; })
     .mockImplementationOnce(function () { return mocks.runtime; });
+  mocks.runtime.query.mockResolvedValue({ rowCount: 1, rows: [{
+    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+  }] });
 });
 afterEach(() => { vi.useRealTimers(); });
 
@@ -55,6 +58,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
       `CREATE DATABASE "${fixture.name}" TEMPLATE "agentcontrol_test_schema_1234" ALLOW_CONNECTIONS true`);
     expect(mocks.bootstrap).toHaveBeenCalledOnce();
     expect(mocks.verify).toHaveBeenCalledExactlyOnceWith(mocks.runtime);
+    expect(mocks.runtime.query).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("FROM operational_state"));
     expect(mocks.initializeSchema).not.toHaveBeenCalled();
     expect(mocks.grantRuntime).not.toHaveBeenCalled();
     await fixture.close();
@@ -95,6 +99,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
     expect(mocks.bootstrap).not.toHaveBeenCalled();
     expect(mocks.initializeSchema).not.toHaveBeenCalled();
     expect(mocks.grantRuntime).not.toHaveBeenCalled();
+    expect(mocks.runtime.query).not.toHaveBeenCalled();
     await fixture.close();
     expect(mocks.admin.end).toHaveBeenCalledOnce();
   });
@@ -106,6 +111,15 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
     expect(mocks.admin.end).toHaveBeenCalledOnce();
     expect(mocks.admin.query).toHaveBeenCalledOnce();
     expect(mocks.Pool).toHaveBeenCalledOnce();
+  });
+
+  it("cleans up rather than returning an initialized fixture with invalid operational state", async () => {
+    mocks.runtime.query.mockResolvedValueOnce({ rowCount: 1, rows: [{
+      mode: "normal", provider_work_enabled: "false", restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    }] });
+    await expect(testDatabase()).rejects.toThrow("Operational state is invalid.");
+    for (const pool of [mocks.admin, mocks.operator, mocks.runtime]) expect(pool.end).toHaveBeenCalledOnce();
+    expect(mocks.admin.query).toHaveBeenLastCalledWith(expect.stringMatching(/^DROP DATABASE "agentcontrol_test_[a-f0-9]{32}"$/));
   });
 
   it.each(["bootstrap", "initializeSchema", "grantRuntime"] as const)("cleans up when %s fails before returning a fixture", async stage => {
@@ -132,7 +146,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
     const setupFailure = new Error("schema initialization failed");
     const cleanupFailure = new Error("drop failed");
     mocks.initializeSchema.mockRejectedValueOnce(setupFailure);
-    mocks.admin.query.mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(cleanupFailure);
+    mocks.admin.query.mockResolvedValueOnce({ rowCount: 0, rows: [] }).mockRejectedValueOnce(cleanupFailure);
     await expect(testDatabase()).rejects.toMatchObject({
       name: "AggregateError", errors: [setupFailure, cleanupFailure],
     });

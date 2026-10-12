@@ -4,7 +4,7 @@ import { X } from "lucide-react";
 import type { CombinedUser, ReportUser } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail } from "../../../backend/src/types/officialReportApi";
 import type { ResponsibilityPerson } from "../../../backend/src/types/agentResponsibility";
-import { isDirectoryObjectId } from "../../../backend/src/types/copilotPackage";
+import { isGraphGuid } from "../../../backend/src/types/copilotUsage";
 import { readReportDetail } from "../api/reportData";
 import { ApiError } from "../api/client";
 import { useSavedQueryClient } from "../savedQueries";
@@ -61,7 +61,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
   const owner = JSON.stringify([principal, kind, identity, selectionId, dataRevision]);
   const [rejected, setRejected] = useState<{ owner: string; error: Error }>();
   if (rejected && rejected.owner !== owner) setRejected(undefined);
-  const validIdentity = kind !== "directory" || isDirectoryObjectId(identity);
+  const validIdentity = kind !== "directory" || isGraphGuid(identity);
   const directUser = kind === "directory" && !selectionId;
   function changeTab(next: UserDetailTab) {
     setTab(next);
@@ -210,7 +210,8 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     !current ? "Usage unknown" : directory.agentActivityState === "active" && reportCurrent ? "Using agents"
       : directory.agentActivityState === "none" && reportCurrent ? "No reported agent activity" : "Usage unknown",
     current && reportCurrent && directory.attention.some(value => value === "agent_usage_low" || value === "agent_usage_zero") ? "Offer adoption help" : null,
-    current && detail?.sources.app_activity.state === "available" && directory.attention.includes("app_activity_inactive") ? "Review app activity" : null,
+    current && (detail?.sources.app_activity.state === "available" || detail?.sources.app_activity.state === "partial")
+      && directory.attention.includes("app_activity_inactive") ? "Review app activity" : null,
     current && directory.copilotServiceState !== "enabled" && directory.copilotServiceState !== "unknown" ? "Review paid features" : null,
   ].filter((value): value is string => value !== null) : [];
   useEffect(() => {

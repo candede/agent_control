@@ -7,8 +7,9 @@ import {
   type NetworkResponse,
 } from "@azure/msal-node";
 import { createHash, randomBytes } from "node:crypto";
+import { types } from "node:util";
 import { authConfigured, config, getTenantConfiguration, loginScopes, normalizeSignInUsername, type TenantConfiguration } from "../config.js";
-import { AppError } from "../errors.js";
+import { AppError, isApplicationError } from "../errors.js";
 import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, assertTenantConfiguration, authenticationScopes, authFlowLifetimeMs, tenantConfigurationFingerprint } from "./flows.js";
 import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
@@ -432,23 +433,37 @@ async function sendMsalRequest<T>(url: string, method: "GET" | "POST", options: 
   }
 }
 
+function ownErrorField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object" || types.isProxy(value)) return undefined;
+  const property = Object.getOwnPropertyDescriptor(value, key);
+  return property && Object.hasOwn(property, "value") ? property.value : undefined;
+}
+
 export function isRetryableIdentityProviderError(error: unknown): boolean {
-  return error instanceof AppError && error.code === "identity_provider_error" && error.status >= 500
-    && error.details !== null && typeof error.details === "object"
-    && "retryable" in error.details && error.details.retryable === true;
+  if (!isApplicationError(error)) return false;
+  const code = ownErrorField(error, "code");
+  const status = ownErrorField(error, "status");
+  const details = ownErrorField(error, "details");
+  return code === "identity_provider_error" && typeof status === "number" && Number.isFinite(status) && status >= 500
+    && ownErrorField(details, "retryable") === true;
 }
 
 function normalizeTokenError(error: unknown) {
-  if (error instanceof AppError) return error;
-  const fields = error !== null && typeof error === "object" ? error : {};
-  const code = "errorCode" in fields && typeof fields.errorCode === "string" ? fields.errorCode.toLowerCase() : "";
-  const subError = "subError" in fields && typeof fields.subError === "string" ? fields.subError.toLowerCase() : "";
-  const errorNo = "errorNo" in fields && typeof fields.errorNo === "string" ? fields.errorNo
-    : "errorMessage" in fields && typeof fields.errorMessage === "string" ? fields.errorMessage.match(/\bAADSTS(\d{5,9})\b/)?.[1] : undefined;
-  const correlationId = "correlationId" in fields && typeof fields.correlationId === "string"
-    && /^[a-zA-Z0-9-]{1,128}$/.test(fields.correlationId) ? fields.correlationId : undefined;
-  const httpStatus = "status" in fields && typeof fields.status === "number" && Number.isInteger(fields.status)
-    && fields.status >= 400 && fields.status <= 599 ? fields.status : undefined;
+  if (isApplicationError(error)) return error;
+  const errorCode = ownErrorField(error, "errorCode");
+  const errorSubCode = ownErrorField(error, "subError");
+  const errorNumber = ownErrorField(error, "errorNo");
+  const errorMessage = ownErrorField(error, "errorMessage");
+  const errorCorrelationId = ownErrorField(error, "correlationId");
+  const errorStatus = ownErrorField(error, "status");
+  const code = typeof errorCode === "string" ? errorCode.toLowerCase() : "";
+  const subError = typeof errorSubCode === "string" ? errorSubCode.toLowerCase() : "";
+  const errorNo = typeof errorNumber === "string" ? errorNumber
+    : typeof errorMessage === "string" ? errorMessage.match(/\bAADSTS(\d{5,9})\b/)?.[1] : undefined;
+  const correlationId = typeof errorCorrelationId === "string"
+    && /^[a-zA-Z0-9-]{1,128}$/.test(errorCorrelationId) ? errorCorrelationId : undefined;
+  const httpStatus = typeof errorStatus === "number" && Number.isInteger(errorStatus)
+    && errorStatus >= 400 && errorStatus <= 599 ? errorStatus : undefined;
   const details = {
     ...(correlationId ? { correlationId } : {}),
     ...(httpStatus === undefined ? {} : { httpStatus }),

@@ -4,6 +4,7 @@ import {
   parseDirectoryUser, parseReportedIdentity, parseReportUser, parseSubscribedSku, reportHeaders,
   validateGraphUrl, validateReportDownloadUrl,
 } from "./userSourceGraphFields.js";
+import { directoryPlanRecord, directorySourceRecord } from "./userSourceRecords.js";
 
 const skuId = "639dec6b-bb19-468b-871c-c5c441c4b0cb";
 const otherSku = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
@@ -78,12 +79,66 @@ describe("native user-source Graph fields", () => {
     }
   });
 
+  it.each([
+    [buildCopilotUsersUrl([skuId]), "directory"], [buildSubscribedSkusUrl(), "catalog"],
+  ] as const)("bounds pagination to the requested %s projection", (initial, kind) => {
+    const next = new URL(initial);
+    next.searchParams.set("$skiptoken", "opaque+/=%token");
+    expect(() => validateGraphUrl(next.toString(), kind)).not.toThrow();
+    for (const change of [
+      (url: URL) => url.searchParams.delete("$select"),
+      (url: URL) => url.searchParams.set("$select", "id"),
+      (url: URL) => url.searchParams.append("$select", url.searchParams.get("$select")!),
+      (url: URL) => url.searchParams.set("$expand", "manager"),
+      (url: URL) => url.searchParams.set("$skiptoken", ""),
+      (url: URL) => url.searchParams.append("$skiptoken", "second"),
+      (url: URL) => { url.hash = "fragment"; },
+      (url: URL) => url.searchParams.set("$skiptoken", "x".repeat(8192)),
+    ]) {
+      const invalid = new URL(next);
+      change(invalid);
+      expect(() => validateGraphUrl(invalid.toString(), kind))
+        .toThrow(expect.objectContaining({ status: 502, code: "invalid_provider_link" }));
+    }
+  });
+
+  it("requires bounded directory query controls and a query-free exact report endpoint", () => {
+    for (const [field, value] of [
+      ["$count", "false"], ["$top", "101"], ["$top", "1"], ["$filter", ""], ["$filter", " \t "],
+      ["$orderby", "displayName"], ["filter", "accountEnabled eq true"],
+    ]) {
+      const invalid = new URL(buildReportedUsersUrl([upn]));
+      invalid.searchParams.set(field, value);
+      expect(() => validateGraphUrl(invalid.toString(), "directory")).toThrow();
+    }
+    for (const field of ["$select", "$filter", "$count", "$top"]) {
+      const invalid = new URL(buildReportedUsersUrl([upn]));
+      invalid.searchParams.delete(field);
+      expect(() => validateGraphUrl(invalid.toString(), "directory")).toThrow();
+    }
+    expect(() => validateGraphUrl(`${buildCopilotReportUrl()}?$format=json`, "report")).toThrow();
+  });
+
+  it("bounds the serialized URL when an opaque token expands through percent encoding", () => {
+    const token = "é".repeat(1500);
+    const graph = `${buildSubscribedSkusUrl()}&$skiptoken=${token}`;
+    const report = `https://reports.office.com/data/v1.0/download?token=${token}`;
+    for (const url of [graph, report]) {
+      expect(url.length).toBeLessThan(8192);
+      expect(new URL(url).toString().length).toBeGreaterThan(8192);
+    }
+    expect(() => validateGraphUrl(graph, "catalog")).toThrow();
+    expect(() => validateReportDownloadUrl(report)).toThrow();
+  });
+
   it.each(["https://reports.office.com", "https://reportsweu.office.com"])("recognizes only documented signed report paths on %s", origin => {
     for (const path of ["/data/download/opaque_123-a", "/data/v1.0/download?token=signed"]) {
       expect(validateReportDownloadUrl(origin + path)).toBe(origin + path);
     }
     for (const path of ["/", "/data/download/", "/data/download/private/more", "/data/v1.0/download",
-      "/data/v1.0/download?token=", "/data/v1.0/download?token=one&token=two", "/data/download/opaque#fragment"]) {
+      "/data/v1.0/download?token=", "/data/v1.0/download?token=one&token=two", "/data/download/opaque#fragment",
+      "/data/download/opaque?token=one&token=two", "/data/download/opaque?redirect=https%3A%2F%2Fattacker.invalid",
+      "/data/v1.0/download?token=one&%74oken=two", "/data/v1.0/download?token=one&format=json"]) {
       expect(() => validateReportDownloadUrl(origin + path)).toThrow();
     }
   });
@@ -161,6 +216,24 @@ describe("native user-source Graph fields", () => {
       expect(user?.servicePlans).toHaveLength(1);
     });
 
+  it.each([false, true])("rejects conflicting effective assignments of the same SKU (reverse: %s)", reverse => {
+    const assignedLicenses = [{ skuId, disabledPlans: [apps] }, { skuId: skuId.toUpperCase(), disabledPlans: [] }];
+    if (reverse) assignedLicenses.reverse();
+    for (const filter of [productFilter, exactFilter]) {
+      expect(() => parseDirectoryUser({ ...graphUser(), assignedLicenses }, catalog, filter))
+        .toThrow(expect.objectContaining({ status: 502, code: "provider_schema" }));
+    }
+  });
+
+  it("accepts equivalent duplicate SKU assignments without confusing them with independent products", () => {
+    const original = { ...graphUser(), assignedLicenses: [{ skuId, disabledPlans: [apps, teams] }] };
+    const duplicate = { skuId: skuId.toUpperCase(), disabledPlans: [teams.toUpperCase(), apps, apps] };
+    for (const filter of [productFilter, exactFilter]) {
+      expect(parseDirectoryUser({ ...original, assignedLicenses: [...original.assignedLicenses, duplicate] }, catalog, filter))
+        .toEqual(parseDirectoryUser(original, catalog, filter));
+    }
+  });
+
   it.each([teams, chat])("recognizes paid component %s without an Apps or E7 assignment", servicePlanId => {
     const original = graphUser();
     const user = parseDirectoryUser({ ...original, assignedPlans: [{ ...original.assignedPlans[0], servicePlanId }] },
@@ -199,6 +272,35 @@ describe("native user-source Graph fields", () => {
     }
     expect(parse([{ ...observation, assignedDateTime: "2026-01-01T00:30:00Z" }, offset])?.servicePlans[0].assignedDateTime)
       .toBe("2026-01-01T00:30:00.000Z");
+  });
+
+  it.each([
+    "2026-01-01T00:00:00", "2026-01-01T00:00:00.1234500", "2026-01-01", "January 1, 2026",
+    "2026-02-30T00:00:00Z", "2025-02-29T01:00:00+01:00", "2026-01-01T24:00:00Z",
+    "2026-01-01T00:00:60Z", "2026-01-01T00:00:00+24:00", "0000-01-01T00:00:00Z",
+    "0001-01-01T00:00:00+01:00", "9999-12-31T23:30:00-01:00",
+  ])("rejects assignment dates without a valid explicit instant: %s", assignedDateTime => {
+    const original = graphUser();
+    for (const filter of [productFilter, exactFilter]) {
+      expect(() => parseDirectoryUser({ ...original, assignedPlans: [{ ...original.assignedPlans[0], assignedDateTime }] }, catalog, filter))
+        .toThrow(expect.objectContaining({ status: 502, code: "provider_schema" }));
+    }
+  });
+
+  it.each([
+    ["2024-02-29T23:59:59.1234500Z", "2024-02-29T23:59:59.12345Z"],
+    ["2026-01-01T00:30:00.0000001+01:00", "2025-12-31T23:30:00.0000001Z"],
+    ["2025-12-31T23:30:00.1-0100", "2026-01-01T00:30:00.100Z"],
+    ["0001-01-01T01:00:00+01:00", "0001-01-01T00:00:00.000Z"],
+    ["9999-12-31T22:59:59.9999999-01:00", "9999-12-31T23:59:59.9999999Z"],
+  ])("preserves valid calendar and timezone boundaries: %s", (assignedDateTime, expected) => {
+    const original = graphUser();
+    const user = parseDirectoryUser({ ...original, assignedPlans: [{ ...original.assignedPlans[0], assignedDateTime }] }, catalog, productFilter)!;
+    expect(user.servicePlans[0].assignedDateTime).toBe(expected);
+    const parent = directorySourceRecord(user);
+    expect(directoryPlanRecord(parent.identity, user.servicePlans[0])).toMatchObject({
+      assigned_at: expected, residual: { assignedDateTime: expected },
+    });
   });
 
   it.each([{ assignments: [] as string[] }, { assignments: [otherSku] }])("distinguishes an exact known non-paid user from unknown SKU evidence %j", ({ assignments }) => {
@@ -264,5 +366,16 @@ describe("native user-source Graph fields", () => {
     expect(() => parseReportUser(row.map((value, index) => index === 12 ? "7" : value))).toThrow();
     expect(() => parseReportUser(row.map((value, index) => index === 12 ? "30" : value))).toThrow();
     expect(() => parseReportUser(row.map((value, index) => index === 2 ? "x".repeat(1025) : value))).toThrow();
+  });
+
+  it("rejects year zero in required and optional report dates while retaining positive four-digit years", () => {
+    const row = ["2026-09-13", upn, "Person", "", "", "", "", "", "", "", "", "", "28"];
+    for (const index of [0, 3, 4, 5, 6, 7, 8, 9, 10, 11]) {
+      expect(() => parseReportUser(row.map((value, field) => field === index ? "0000-01-01" : value)))
+        .toThrow(expect.objectContaining({ status: 502, code: "provider_schema" }));
+    }
+    for (const reportRefreshDate of ["0001-01-01", "9999-12-31"]) {
+      expect(parseReportUser([reportRefreshDate, ...row.slice(1)]).activity.reportRefreshDate).toBe(reportRefreshDate);
+    }
   });
 });

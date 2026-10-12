@@ -10,7 +10,7 @@ describe("targeted current native identity evidence", () => {
   const scope = { tenantId: "identity-query-tenant", principalId: "identity-reader" };
   const types = ["microsoft.copilotstudio/agents"] as const;
   const blueprint = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-  const source = (value = "Bot-A", environmentId: string | null = "ENVIRONMENT-A"): InventoryIdentityRecord => ({
+  const source = (value = "Bot-A", environmentId: string | null = "environment-a"): InventoryIdentityRecord => ({
     tenantId: scope.tenantId, nativeId: "audit-row", environmentId, sourceSystem: "power_platform",
     resourceType: types[0], identifiers: [{ kind: "cds_bot_id", value }],
   });
@@ -37,7 +37,7 @@ describe("targeted current native identity evidence", () => {
   it("preserves opaque identifier case, requires an environment and isolates the current principal", async () => {
     await expect(resolve(source("bot-a"))).resolves.toMatchObject({ status: "resolved", matchedKind: "cds_bot_id",
       candidate: { nativeId: "case-sensitive-bot", environmentId: "environment-a" } });
-    for (const value of [source("Bot-A", null), source("Bot-A", "different-environment"), source("missing")]) {
+    for (const value of [source("Bot-A", null), source("Bot-A", "ENVIRONMENT-A"), source("Bot-A", "different-environment"), source("missing")]) {
       await expect(resolve(value)).resolves.toEqual({ status: "unresolved", reason: "no_documented_exact_identifier" });
     }
     await expect(resolve(source(), "different-reader")).resolves.toEqual({ status: "unresolved", reason: "no_documented_exact_identifier" });

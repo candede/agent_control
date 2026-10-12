@@ -27,6 +27,7 @@ type Dependencies = {
   provider: UserSourceProvider; revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: (capability: CapabilityId, user: AuthenticatedUser) => Promise<unknown>; observeOperation: typeof capabilities.observeOperation;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   admissions: typeof requireProviderAdmissions;
 };
 export class CopilotUsageService {
@@ -40,24 +41,32 @@ export class CopilotUsageService {
     this.sources = this.reports.sources;
     this.dependencies = { provider: new UserSourceProvider(), revalidateUser: revalidateAuthenticatedUser,
       delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
-      observeOperation: capabilities.observeOperation.bind(capabilities), admissions: requireProviderAdmissions, ...dependencies };
+      observeOperation: capabilities.observeOperation.bind(capabilities),
+      beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities), admissions: requireProviderAdmissions, ...dependencies };
   }
   async refreshUsers(user: AuthenticatedUser, signal: AbortSignal | undefined, options: {
     incompleteOnly?: boolean; automatic?: boolean; signedInAt?: number; publication: UserSourcePublication;
-    onDirectoryProgress?: (count: number) => void | Promise<void>;
+    onDirectoryProgress?: (count: number, assertCurrent: () => void) => void | Promise<void>;
   }): Promise<CopilotUsageRefreshResult> {
-    const identity = await reportIdentity(this.database, user), scope = { tenantId: identity.tenantId, principalId: identity.principalId };
+    if (!user.tenantId) throw AppError.unauthorized();
+    const scope = { tenantId: user.tenantId, principalId: user.homeAccountId };
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const fence = () => { signal?.throwIfAborted(); assertAccountSessionValidation(validation); this.dependencies.admissions(); };
     fence();
+    const sourceValidations = {
+      directory: this.dependencies.beginOperationValidation("graph.licenses.read", user),
+      app_activity: this.dependencies.beginOperationValidation("reports.copilotUsage.read", user),
+    };
+    const identity = await reportIdentity(this.database, user);
+    fence();
     const before = await this.sources.refreshStatus(identity, "delegated");
-    const reportChanged = options.automatic && await directoryNeedsReportRefresh(this.database, scope);
+    fence();
     const due = (source: UserSourceMetadata) => {
       if (!options.automatic) return !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
       if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
-      if (source.attemptedAt && source.attemptStatus !== "available" && Date.now() - Date.parse(source.attemptedAt) < 900000) return false;
-      if (source.source === "directory" && reportChanged) return true;
+      const retryDelay = source.attemptStatus === "waiting_authorization" || source.attemptStatus === "permission_required" ? 3600000 : 900000;
+      if (source.attemptedAt && source.attemptStatus !== "available" && Date.now() - Date.parse(source.attemptedAt) < retryDelay) return false;
       return !source.generationId || !source.observedAt || Date.now() - Date.parse(source.observedAt) >= (source.source === "directory" ? 900000 : 21600000);
     };
     const requested = (["directory", "app_activity"] as const).filter(source => due(before.sources[source]));
@@ -65,17 +74,19 @@ export class CopilotUsageService {
     fence();
     const outcomes = await Promise.allSettled(requested.map(async source => {
       const capability = source === "directory" ? "graph.licenses.read" : "reports.copilotUsage.read";
+      const assertAuthority = sourceValidations[source];
+      const sourceFence = () => { fence(); assertAuthority(); };
       const authorize = async (_source: UserSourceKind, providerSignal: AbortSignal) => {
-        fence(); providerSignal.throwIfAborted();
+        sourceFence(); providerSignal.throwIfAborted();
         const fresh = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
         return commitAccountSessionValidation(validation, async () => {
-          fence(); providerSignal.throwIfAborted();
+          sourceFence(); providerSignal.throwIfAborted();
           if (fresh.tenantId !== scope.tenantId || fresh.homeAccountId !== scope.principalId
             || !hasAppRole(fresh.roles, "AgentControl.Viewer")) throw AppError.unauthorized();
           await this.dependencies.requireAvailable(capability, fresh);
-          fence(); providerSignal.throwIfAborted();
+          sourceFence(); providerSignal.throwIfAborted();
           const token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, capability);
-          fence(); providerSignal.throwIfAborted();
+          sourceFence(); providerSignal.throwIfAborted();
           return token;
         });
       };
@@ -87,23 +98,29 @@ export class CopilotUsageService {
         observedAt: now, expiresAt: new Date(now.getTime() + 7 * 86400000),
         deadlineAt: new Date(now.getTime() + 30 * 60000), reserveBytes: 8 * 1024 ** 3,
       }, {
-        authorize, signal,
+        authorize, signal, assertCurrent: sourceFence,
         identities: source === "directory" ? async (lease, providerSignal) => {
+          sourceFence();
           providerSignal.throwIfAborted();
           const selected = await this.reports.captureReportIdentities(identity);
+          sourceFence();
           providerSignal.throwIfAborted();
-          return this.reports.feedPositiveIdentities(selected.id, identity, this.stages, lease);
+          await this.reports.feedPositiveIdentities(selected.id, identity, this.stages, lease, providerSignal, sourceFence);
+          sourceFence();
+          providerSignal.throwIfAborted();
         } : undefined,
-        progress: async count => { fence(); await options.onDirectoryProgress?.(count); fence(); },
+        progress: async count => { sourceFence(); await options.onDirectoryProgress?.(count, sourceFence); sourceFence(); },
         completeJob: async (client, result) => {
-          fence();
+          sourceFence();
           await requireUserPublication(client, scope, options.publication);
+          sourceFence();
           // Each source's published attempt is terminal in this transaction. The
           // shared Users job remains running until both sources and people settle.
           await client.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp(),
             count=CASE WHEN $5='directory' THEN $6 ELSE count END
             WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND job_id=$4 AND source_id='users' AND status='running'`,
           [options.publication.runId, scope.tenantId, scope.principalId, options.publication.jobId, result.source, result.rows]);
+          sourceFence();
         },
       }), { signal });
     }));
@@ -114,6 +131,7 @@ export class CopilotUsageService {
       });
     }
     const after = await this.sources.refreshStatus(identity, "delegated");
+    fence();
     const failed = outcomes.flatMap((outcome, index) => outcome.status === "rejected" ? [requested[index]] : []);
     return { status: after.status === "succeeded" && failed.length ? "partial" : after.status,
       count: requested.includes("directory") ? after.sources.directory.attemptObservedCount : null,

@@ -3,6 +3,7 @@ import type pg from "pg";
 import { randomUUID } from "node:crypto";
 import { NativeInventory } from "../db/nativeInventory.js";
 import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { powerPlatformInventory } from "../services/powerPlatformInventory.js";
@@ -27,7 +28,15 @@ policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authe
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await refreshJobs.listJobs(requestScope(request), positiveInteger(first(request.query.limit), 20, 50)));
+  const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  assertAccountSessionValidation(validation);
+  const jobs = await refreshJobs.listJobs(scope, positiveInteger(first(request.query.limit), 20, 50)).catch(error => {
+    assertAccountSessionValidation(validation);
+    throw error;
+  });
+  assertAccountSessionValidation(validation);
+  response.json(jobs);
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
@@ -137,7 +146,7 @@ function first(value: unknown) {
 }
 
 async function startOrWaiting(user: NonNullable<Express.Request["session"]["user"]>, id: string) {
-  try { return await powerPlatformInventory.start(user, id); }
+  try { return await powerPlatformInventory.start(user, id, { retryFailed: true }); }
   catch (error) {
     if (error instanceof AppError && (error.status === 401 || error.status === 403 || ["interaction_required", "authorization_expired", "missing_permission"].includes(error.code))) return powerPlatformInventory.get(user, id);
     throw error;

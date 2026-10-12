@@ -14,7 +14,7 @@ import { policyRoute } from "./policy.js";
 
 export const copilotStudioQuarantineRouter = Router();
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/status", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.quarantine.read" }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/status", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await copilotStudioQuarantineControl.status(request.session.user!, requiredUuid(first(request.query.snapshotId), "snapshotId"), requiredNativeId(first(request.query.nativeId)), first(request.query.force) === "true"));
 });
 
@@ -22,7 +22,7 @@ policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/preview", { acce
   response.json(await copilotStudioQuarantineControl.preview(request.session.user!, parseIntent(request.body, false)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_control", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_control", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const intent = parseIntent(request.body, true);
   response.status(202).json(await copilotStudioQuarantineControl.submit(request.session.user!, {
     ...intent,

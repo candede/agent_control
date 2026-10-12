@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
+import { AppError } from "../errors.js";
 import type { DefenderHuntingFilters, DefenderHuntingTemplateId } from "../types/defenderHunting.js";
 import { GraphHuntingClient, createHuntingRequest, expectedHuntingSchema, validateDefenderHuntingFilters } from "./graphHunting.js";
 
@@ -76,49 +77,31 @@ function response(templateId: DefenderHuntingTemplateId, results: unknown[], sta
 
 function row(templateId: DefenderHuntingTemplateId, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const values = Object.fromEntries(expectedHuntingSchema(templateId).map(({ name }) => [name, ""]));
+  const actionType = overrides.ActionType ?? (templateId === "agent_tools" ? "ExecuteToolBySDK" : "InvokeAgent");
   return templateId === "agents_inventory"
     ? { ...values, ObservationTime: "2026-09-09T11:30:00.000Z", AgentId: agentId, AgentName: "Bounded agent", Platform: "CopilotStudio", EntraAgentId: agentId, EntraBlueprintId: blueprintId, PublishedStatus: "Published", LifecycleStatus: "Active", InstanceCount: "1", OwnerCount: "2", PermissionMetadataKeyCount: "3", OwnersState: "present_unqualified_shape", SharedWithState: "empty", PermissionsState: "present_unqualified_shape", AuthenticationState: "not_supplied", RiskState: "not_exposed", ProjectionValid: "true", ...overrides }
-    : { ...values, Timestamp: "2026-09-09T11:30:00.000Z", ActionType: "InvokeAgent", ApplicationId: "20893", AppInstanceId: "1", AccountObjectId: agentId, OAuthAppId: blueprintId, Operation: "invoke_agent", OrganizationId: tenantId, TargetAgentId: agentId, TargetAgentBlueprintId: blueprintId, OpId: "0123456789abcdef", CreationTime: "2026-09-09T11:30:00.000Z", CompletionTime: "2026-09-09T11:30:01.000Z",
+    : { ...values, Timestamp: "2026-09-09T11:30:00.000Z", ActionType: actionType, ApplicationId: "20893", AppInstanceId: "1", AccountObjectId: agentId, OAuthAppId: blueprintId, Operation: actionType === "InvokeAgent" ? "invoke_agent" : actionType === "InferenceCall" ? "chat" : "execute_tool", OrganizationId: tenantId, TargetAgentId: agentId, TargetAgentBlueprintId: blueprintId, OpId: "0123456789abcdef", CreationTime: "2026-09-09T11:30:00.000Z", CompletionTime: "2026-09-09T11:30:01.000Z",
       ProjectionValid: "true",
-      ConversationIdState: "empty", ThreadIdState: "unavailable", ChannelNameState: "empty", HumanUserKeyState: "empty", AgentUserKeyState: "unavailable",
-      TargetAgentUserKeyState: "empty", CompletionTimeState: "value", ErrorTypeState: "empty", PlatformAgentIdState: "empty", PlatformAgentTypeState: "empty", ...overrides };
+      ConversationIdState: "empty", ThreadIdState: actionType === "InferenceCall" ? "empty" : "unavailable",
+      ChannelNameState: actionType === "InferenceCall" ? "unavailable" : "empty",
+      HumanUserKeyState: actionType === "InvokeAgent" ? "empty" : "unavailable", AgentUserKeyState: actionType === "InvokeAgent" ? "unavailable" : "empty",
+      TargetAgentUserKeyState: actionType === "InvokeAgent" ? "empty" : "unavailable", CompletionTimeState: "value",
+      ErrorTypeState: templateId === "agent_tools" ? "unavailable" : "empty", PlatformAgentIdState: "empty", PlatformAgentTypeState: "empty", ...overrides };
 }
 
 describe("Microsoft Graph v1.0 curated hunting contract", () => {
-  it("compiles a user-on-agent invocation query in the human caller namespace", () => {
-    const selected = validateDefenderHuntingFilters({ ...filters(), userObjectId: blueprintId, entraAgentApplicationIds: [agentId],
-      operations: ["InvokeAgent"] }, { now });
-    const { Query } = createHuntingRequest(selected);
-    expect(Query).toContain(`tostring(Event.UserKey) in~ (@'${blueprintId}')`);
-    expect(Query).toContain("ActionType in (@'InvokeAgent')");
-    expect(Query).not.toContain(`AccountObjectId in~ (@'${blueprintId}')`);
-    expect(compileKusto(Query, publishedHuntingTables).diagnostics.filter(item => item.severity === "Error")).toEqual([]);
+  it.each([
+    (text: string) => text.replace('"results":', '"results":[{"foreign":"evidence"}],"results":'),
+    (text: string) => text.replace('"OrganizationId":', '"OrganizationId":"foreign","OrganizationId":'),
+    (text: string) => text.replace('"name":"Timestamp"', '"name":"Foreign","name":"Timestamp"'),
+  ])("rejects overwritten hunting result, tenant, and schema evidence", async body => {
+    const text = JSON.stringify({ schema: expectedHuntingSchema("agent_activity"), results: [row("agent_activity")] });
+    const fetcher = vi.fn(async () => new Response(body(text)));
+    const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", filters(), { tenantId })).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it.each(["InferenceCall", "ExecuteToolBySDK"])("does not attribute %s agent-account telemetry to a human", operation => {
-    expect(() => validateDefenderHuntingFilters({ ...filters(operation === "InferenceCall" ? "agent_activity" : "agent_tools"),
-      operations: [operation], userObjectId: blueprintId }, { now })).toThrow(/human-attributed/);
-  });
-
-  it("rejects a different human caller even when the account or selected agent matches", async () => {
-    const selected = { ...filters(), operations: ["InvokeAgent"], userObjectId: blueprintId, entraAgentApplicationIds: [agentId] };
-    const fetcher = vi.fn(async () => response("agent_activity", [row("agent_activity", {
-      AccountObjectId: blueprintId, HumanUserKey: agentId, HumanUserKeyState: "value",
-    })]));
-    const client = new GraphHuntingClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
-    await expect(client.runQuery("token", selected, { tenantId })).rejects.toMatchObject({ code: "provider_scope_mismatch" });
-  });
-
-  it("accepts a matching human invocation without requiring the account column to identify the same person", async () => {
-    const selected = { ...filters(), operations: ["InvokeAgent"], userObjectId: blueprintId, entraAgentApplicationIds: [agentId] };
-    const fetcher = vi.fn(async () => response("agent_activity", [row("agent_activity", {
-      AccountObjectId: agentId, HumanUserKey: blueprintId, HumanUserKeyState: "value",
-    })]));
-    const client = new GraphHuntingClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
-    await expect(client.runQuery("token", selected, { tenantId })).resolves.toMatchObject({
-      storedRowCount: 1, complete: true, rows: [expect.objectContaining({ humanActorUserObjectId: blueprintId })],
-    });
-  });
   it("compiles typed Entra scopes without using platform/native aliases as identity predicates", () => {
     for (const template of ["agents_inventory", "agent_activity", "agent_tools"] as const) {
       const selected = { ...filters(template), ...(template === "agents_inventory" ? { entraAgentIds: [agentId] } : { entraAgentApplicationIds: [agentId] }) };
@@ -277,7 +260,7 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     expect(fetcher.mock.calls[0]?.[0]).toBe("https://graph.microsoft.com/v1.0/security/runHuntingQuery");
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ method: "POST", redirect: "manual", headers: expect.objectContaining({ "client-request-id": "local-request" }) });
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(createHuntingRequest(filters()));
-    expect(onResponse).toHaveBeenCalledWith("provider-request");
+    expect(onResponse).toHaveBeenCalledWith("provider-request", expect.any(AbortSignal));
   });
 
   it("projects current AgentsInfo identifiers while retaining only counts for undocumented dynamic shapes", async () => {
@@ -329,6 +312,46 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     const invalid = row("agent_activity", { ConversationId: null, ConversationIdState: "value" });
     const client = new GraphHuntingClient({ fetch: vi.fn(async () => response("agent_activity", [invalid])) as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(client.runQuery("token", filters())).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    ["InvokeAgent", "invoke_agent", { ThreadIdState: "null" }],
+    ["InvokeAgent", "invoke_agent", { ConversationIdState: "unavailable" }],
+    ["InferenceCall", "chat", { ChannelNameState: "null" }],
+    ["InferenceCall", "chat", { HumanUserId: "human@example.invalid" }],
+    ["InvokeAgent", "invoke_agent", { AgentUserId: "agent@example.invalid" }],
+    ["ExecuteToolBySDK", "execute_tool", { ErrorTypeState: "empty" }],
+  ] as const)("rejects field availability outside the %s mapping", async (actionType, operation, states) => {
+    const templateId = actionType === "ExecuteToolBySDK" ? "agent_tools" : "agent_activity";
+    const projected = row(templateId, {
+      ActionType: actionType, Operation: operation,
+      ConversationIdState: "empty", ThreadIdState: actionType === "InferenceCall" ? "empty" : "unavailable",
+      ChannelNameState: actionType === "InferenceCall" ? "unavailable" : "empty",
+      HumanUserKeyState: actionType === "InvokeAgent" ? "empty" : "unavailable",
+      AgentUserKeyState: actionType === "InvokeAgent" ? "unavailable" : "empty",
+      TargetAgentUserKeyState: actionType === "InvokeAgent" ? "empty" : "unavailable",
+      ErrorTypeState: templateId === "agent_tools" ? "unavailable" : "empty",
+      ...states,
+    });
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => response(templateId, [projected])), wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", filters(templateId))).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    { OwnersState: "not_exposed" },
+    { RiskState: "empty" },
+    { RiskState: "present_unqualified_shape" },
+  ])("rejects inventory states not emitted by their selected projection: %j", async states => {
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => response("agents_inventory", [row("agents_inventory", states)])),
+      wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", filters("agents_inventory"))).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it("rejects native or arbitrary literals in the typed blueprint namespace", () => {
+    for (const blueprint of ["native-blueprint", "blueprint'); union CloudAppEvents //"]) {
+      expect(() => validateDefenderHuntingFilters({ ...filters(), blueprintIds: [blueprint] }, { now }))
+        .toThrowError(expect.objectContaining({ code: "invalid_hunting_filters" }));
+    }
   });
 
   it.each([
@@ -512,6 +535,15 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     await expect(client.runQuery("token", filters())).rejects.toMatchObject({ code: "provider_error" });
   });
 
+  it.each([10_000, 30_000])("does not dispatch when admission consumes %s ms before deadline timers run", async elapsed => {
+    let clock = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => response("agent_activity", []));
+    const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, now: () => clock });
+    await expect(client.runQuery("token", filters(), { beforeRequest: async () => { clock = elapsed; } }))
+      .rejects.toMatchObject({ status: 502, code: "provider_error" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it.each(["beforeRequest", "onResponse"] as const)("bounds stalled %s hooks and never retries local hook failures", async hookName => {
     const fetcher = vi.fn<typeof fetch>(async () => response("agent_activity", []));
     const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 5 });
@@ -604,12 +636,206 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     const fetcher = vi.fn<typeof fetch>(async () => { throw new TypeError("network failure"); });
     const wait = vi.fn(async () => undefined);
     const beforeRequest = vi.fn(async () => undefined);
+    const assertCurrent = vi.fn();
     const onResponse = vi.fn(async () => undefined);
     const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0 });
-    await expect(client.runQuery("token", filters(), { beforeRequest, onResponse })).rejects.toMatchObject({ code: "provider_error" });
+    await expect(client.runQuery("token", filters(), { beforeRequest, assertCurrent, onResponse })).rejects.toMatchObject({ code: "provider_error" });
     expect(fetcher).toHaveBeenCalledTimes(3);
     expect(beforeRequest).toHaveBeenCalledTimes(3);
+    expect(fetcher.mock.invocationCallOrder.every(order => assertCurrent.mock.invocationCallOrder.includes(order - 1))).toBe(true);
     expect(wait).toHaveBeenCalledTimes(2);
     expect(onResponse).not.toHaveBeenCalled();
+  });
+
+  it.each(["beforeRequest", "fetch", "onResponse", "body", "wait"] as const)(
+    "gives changed authority precedence over a rejected %s without retry or body leakage", async stage => {
+      let current = true;
+      const authorityError = new AppError(401, "authorization_expired", "The initiating authority changed.");
+      const assertCurrent = () => { if (!current) throw authorityError; };
+      const reject = () => {
+        current = false;
+        throw new Error("private provider or bookkeeping failure");
+      };
+      const cancel = vi.fn(async () => undefined);
+      const fetcher = vi.fn<typeof fetch>(async () => {
+        if (stage === "fetch") return reject();
+        return new Response(new ReadableStream({
+          pull: stage === "body" ? reject : undefined, cancel,
+        }), { status: stage === "wait" ? 429 : 200 });
+      });
+      const wait = vi.fn(stage === "wait" ? reject : async () => undefined);
+      const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0 });
+      await expect(client.runQuery("token", filters(), { assertCurrent,
+        ...(stage === "beforeRequest" || stage === "onResponse" ? { [stage]: reject } : {}),
+      })).rejects.toBe(authorityError);
+      expect(fetcher).toHaveBeenCalledTimes(stage === "beforeRequest" ? 0 : 1);
+      expect(wait).toHaveBeenCalledTimes(stage === "wait" ? 1 : 0);
+    },
+  );
+
+  it.each(["headers", "body", "retry"] as const)("rechecks authority after successful %s settlement", async stage => {
+    let current = true;
+    const failure = new AppError(401, "authorization_expired", "The initiating authority changed.");
+    const assertCurrent = () => { if (!current) throw failure; };
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      if (stage === "headers") {
+        current = false;
+        return new Response(new ReadableStream({ cancel }));
+      }
+      if (stage === "retry") return new Response("", { status: 429 });
+      return new Response(new ReadableStream({
+        start(stream) { stream.enqueue(new TextEncoder().encode(JSON.stringify({ schema: expectedHuntingSchema("agent_activity"), results: [] }))); },
+        pull(stream) { current = false; stream.close(); },
+      }, { highWaterMark: 0 }));
+    });
+    const wait = vi.fn(async () => { current = false; });
+    const onResponse = vi.fn(async () => undefined);
+    const beforeRequest = vi.fn(async () => undefined);
+    const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0 });
+    await expect(client.runQuery("token", filters(), { assertCurrent, beforeRequest, onResponse })).rejects.toBe(failure);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(beforeRequest).toHaveBeenCalledOnce();
+    expect(onResponse).toHaveBeenCalledTimes(stage === "headers" ? 0 : 1);
+    if (stage === "headers") expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("sanitizes a failed successful-response stream while retaining safe HTTP diagnostics", async () => {
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => new Response(new ReadableStream({
+      pull() { throw new TypeError("private provider body failure"); },
+    }), { headers: { "request-id": "body-request" } })), wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", filters())).rejects.toMatchObject({
+      status: 502, code: "provider_error", message: "Microsoft Graph hunting response consumption failed.",
+      details: { httpStatus: 200, correlationId: "body-request" },
+    });
+  });
+
+  it.each([401, 403, 429, 503])("preserves received HTTP %s, retry timing and safe correlation without consuming an error body", async status => {
+    const pull = vi.fn(() => { throw new Error("private provider error body"); });
+    const cancel = vi.fn(() => Promise.reject(new Error("private cleanup failure")));
+    const wait = vi.fn(async () => undefined);
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+      status, headers: { "retry-after": "120", "request-id": "safe-request" },
+    })), wait, random: () => 0 });
+    const pending = client.runQuery("token", filters());
+    await expect(pending).rejects.toMatchObject({ status, details: { httpStatus: status, retryAfterMs: 120_000, correlationId: "safe-request" },
+      retryAfterSeconds: 120 });
+    expect(pull).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["Wed, 09 Sep 2026 12:00:02 GMT", undefined, 2_000],
+    ["Wed, 09 Sep 2026 12:00:02 GMT", "Wed, 09 Sep 2026 11:59:59 GMT", 3_000],
+    ["Wed, 09 Sep 2026 11:59:59 GMT", undefined, 0],
+    ["-1", undefined, 1_000],
+    ["2026-09-09T12:00:02Z", undefined, 1_000],
+  ] as const)("uses an HTTP-date or safe fallback for Retry-After %s / Date %s", async (retryAfter, date, expectedWait) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response("", {
+      status: 429, headers: { "retry-after": retryAfter, ...(date ? { date } : {}) },
+    })).mockResolvedValueOnce(response("agent_activity", []));
+    const wait = vi.fn(async () => undefined);
+    const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0, now: () => now.getTime() });
+    await expect(client.runQuery("token", filters())).resolves.toMatchObject({ complete: true });
+    expect(wait).toHaveBeenCalledWith(expectedWait, expect.any(AbortSignal));
+  });
+
+  it.each(["http", "transport"] as const)("does not let a stalled %s retry wait erase the last observed HTTP status", async failureKind => {
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => milliseconds === 30_000 ? deadline.signal : timeout(milliseconds));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response("", {
+      status: 503, headers: { "request-id": "last-response", "retry-after": "0" },
+    })).mockRejectedValueOnce(new TypeError("private network failure"));
+    const wait = vi.fn<(milliseconds: number, signal?: AbortSignal) => Promise<void>>(async () => undefined).mockImplementationOnce(() => {
+      if (failureKind === "http") deadline.abort(new DOMException("Budget expired", "TimeoutError"));
+      return Promise.resolve();
+    }).mockImplementationOnce(() => {
+      deadline.abort(new DOMException("Budget expired", "TimeoutError"));
+      return new Promise<void>(() => undefined);
+    });
+    const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0 });
+    try {
+      await expect(client.runQuery("token", filters())).rejects.toMatchObject({
+        status: 503, code: "provider_error", details: { httpStatus: 503, correlationId: "last-response", retryAfterMs: 0 },
+      });
+      expect(fetcher).toHaveBeenCalledTimes(failureKind === "http" ? 1 : 2);
+    } finally { timeoutSpy.mockRestore(); }
+  });
+
+  it.each([1, 2])("disposes a response cancelled between transport settlement and delivery (%s microtasks)", async depth => {
+    const controller = new AbortController();
+    const reason = new DOMException("Caller cancelled", "AbortError");
+    const cancel = vi.fn(async () => undefined);
+    const received = new Response(new ReadableStream({ cancel }, { highWaterMark: 0 }));
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      const abortLater = (remaining: number) => queueMicrotask(() => {
+        if (remaining === 0) controller.abort(reason);
+        else abortLater(remaining - 1);
+      });
+      abortLater(depth);
+      return received;
+    });
+    const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", filters(), { signal: controller.signal })).rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(received.body?.locked).toBe(false);
+  });
+
+  it("retains headers settled immediately before a transport deadline wins delivery", async () => {
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds =>
+      milliseconds === 10_000 ? deadline.signal : timeout(milliseconds));
+    const pull = vi.fn();
+    const cancel = vi.fn(async () => undefined);
+    const onResponse = vi.fn(async () => undefined);
+    const client = new GraphHuntingClient({
+      fetch: vi.fn<typeof fetch>(async () => {
+        queueMicrotask(() => deadline.abort(new DOMException("Attempt expired", "TimeoutError")));
+        return new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+          status: 429, headers: { "retry-after": "120", "request-id": "settled-response" },
+        });
+      }), wait: vi.fn(), random: () => 0,
+    });
+    try {
+      await expect(client.runQuery("token", filters(), { onResponse })).rejects.toMatchObject({
+        status: 429, code: "provider_throttled",
+        details: { httpStatus: 429, retryAfterMs: 120_000, correlationId: "settled-response" },
+      });
+      expect(onResponse).not.toHaveBeenCalled();
+      expect(pull).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { timeoutSpy.mockRestore(); }
+  });
+
+  it.each(["\t", "\u001b", "\u007f", "\u0085", "\u009f", "\u202e", "\u2028"])(
+    "omits unsafe request-ID metadata from bookkeeping and diagnostics (%j)", async control => {
+      const received = new Response("", { status: 403 });
+      const getHeader = received.headers.get.bind(received.headers);
+      vi.spyOn(received.headers, "get").mockImplementation(name => name === "request-id" ? `request${control}id` : getHeader(name));
+      const onResponse = vi.fn(async () => undefined);
+      const client = new GraphHuntingClient({ fetch: vi.fn(async () => received), wait: vi.fn(), random: () => 0 });
+      await expect(client.runQuery("token", filters(), { onResponse })).rejects.toMatchObject({
+        code: "hunting_access_denied", details: { httpStatus: 403 },
+      });
+      expect(onResponse).toHaveBeenCalledWith(null, expect.any(AbortSignal));
+    },
+  );
+
+  it.each([
+    "abcdefab-1234-7000-0123-abcdefabcdef",
+    "abcdefab-1234-0000-0123-abcdefabcdef",
+  ])("accepts opaque Graph GUID bits across verified identity filters and projected rows: %s", async identity => {
+    const selected = validateDefenderHuntingFilters({ ...filters(), entraAgentApplicationIds: [identity.toUpperCase()],
+      actorObjectIds: [identity.toUpperCase()] }, { now });
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => response("agent_activity", [row("agent_activity", {
+      TargetAgentId: identity, AccountObjectId: identity.toUpperCase(), OrganizationId: identity,
+    })])), wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", selected, { tenantId: identity })).resolves.toMatchObject({
+      rows: [{ actorAccountObjectId: identity, organizationId: identity }], storedRowCount: 1,
+    });
   });
 });

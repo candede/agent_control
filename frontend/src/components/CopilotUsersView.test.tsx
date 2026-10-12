@@ -598,6 +598,16 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(modal.getByText(attention === "app_activity_inactive" ? "Review app activity" : "Offer adoption help")).toBeVisible();
     expect(rows()[0]).not.toHaveTextContent(/Offer adoption help|Review app activity/);
   });
+  it.each(["available", "partial", "stale", "unavailable"] as const)("uses exact inactive-app evidence with %s report coverage", async state => {
+    const data = page(); data.sources.app_activity.state = state;
+    detail({ ...ada, attention: ["app_activity_inactive"], activityState: "inactive" }, data);
+    render(<CopilotUsersView />); const { modal } = await open();
+    if (state === "available" || state === "partial") {
+      expect(modal.getByText("Review app activity")).toBeVisible();
+    } else {
+      expect(modal.queryByText("Review app activity")).not.toBeInTheDocument();
+    }
+  });
   it("keeps null organization fields explicitly unknown without hiding independently paged assignments", async () => {
     detail({ ...ada, directory: { ...ada.directory, companyName: null, department: null } });
     vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/service-plans") ? reportPage([plan]) : page());

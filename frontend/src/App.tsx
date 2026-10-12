@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { InventoryRefreshTargets } from "./components/InventoryRefreshTargets";
+import { normalizeEnvironmentIdentity } from "../../backend/src/services/inventoryIdentity";
 import {
   ArrowRight,
   Ban,
@@ -216,7 +217,7 @@ function LinkedAgentJobStatus({
       {refreshJob ? (
         <section className="job-status-panel" aria-label="Selected package refresh job">
           <strong>Package refresh · {refreshJob.status.replaceAll("_", " ")}</strong>
-          <span>{refreshJob.observedCount}{refreshJob.totalRecords === null ? "" : ` of ${refreshJob.totalRecords}`} packages observed</span>
+          <span>{refreshJob.observedCount}{refreshJob.totalRecords === null ? "" : ` of ${refreshJob.totalRecords}`} {refreshJob.scopeKind === "exact" ? "targets checked" : "packages observed"}</span>
           <code>{refreshJob.id}</code>
           {refreshJob.message ? <span>{refreshJob.message}</span> : null}
           {refreshJob.scopeKind === "exact" ? <InventoryRefreshTargets job={refreshJob} owner={owner} /> : null}
@@ -1364,7 +1365,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const platformOptions: Array<{ value: string; label: string }> = [];
   const agentEnvironmentNames = Object.fromEntries((unifiedAgentPage?.value ?? [])
     .flatMap(record => record.environmentId && record.environment?.displayName
-      ? [[record.environmentId.toLowerCase(), record.environment.displayName]] : []));
+      && normalizeEnvironmentIdentity(record.environment.id) === normalizeEnvironmentIdentity(record.environmentId)
+      ? [[normalizeEnvironmentIdentity(record.environmentId), record.environment.displayName]] : []));
 
   const canReadSensitiveUsage = hasRole(user, "AgentControl.Viewer");
   const authorizedViews = allowedViews(user);
@@ -2711,7 +2713,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           applyBulkActionResult(result, !invalidatedBulkJobResults.current.has(resultKey), bulkJobSelections.current.get(jobId));
         } else setBulkResult(result);
       }
-      const message = jobStatusMessage(job.status);
+      const message = jobStatusMessage(job.status, job.isCanary);
       if (packageId && message) setPackageControlError({ packageId, message });
     } catch (requestError) {
       if (ownsBulkJobRequest(requestId, owner)) {
@@ -4383,6 +4385,10 @@ function errorMessage(error: unknown) {
       return "The saved inventory selection is no longer available. Reload saved inventory.";
     }
     if (error.code === "invalid_origin") return error.message;
+    if (error.code === "maintenance") return `${error.message} Retry after maintenance ends.`;
+    if (error.code === "provider_requalification_required") {
+      return `${error.message} Contact the deployment administrator to review and requalify provider access.`;
+    }
     if (error.status === 403) {
       return `${error.message} Open Permissions for the current account's exact requirements. Consent does not assign roles or licenses.`;
     }

@@ -44,9 +44,13 @@ describe("paid-feature evidence details", () => {
     expect(screen.queryByText(/No paid Copilot services are assigned/)).not.toBeInTheDocument();
   });
 
-  it("renders normalized assignment evidence without changing the effective paid-feature state", async () => {
+  it.each([
+    "2026-01-01T01:00:00+01:00",
+    "2026-01-01T01:00:00.1234567891+01:00",
+    `2026-01-01T00:00:00.${"1".repeat(107)}Z`,
+  ])("renders normalized assignment evidence without changing the effective paid-feature state: %s", async assignedDateTime => {
     const plan = resolveCopilotServicePlan(servicePlanId, false, [{
-      servicePlanId, assignedDateTime: "2026-01-01T01:00:00+01:00", capabilityStatus: "Enabled",
+      servicePlanId, assignedDateTime, capabilityStatus: "Enabled",
     }]);
     vi.mocked(readReportPage).mockResolvedValue(reportPage([plan]));
     render(<CopilotServiceDetails path={path} selectionId={selectionId} copilotServiceState="disabled" current />);

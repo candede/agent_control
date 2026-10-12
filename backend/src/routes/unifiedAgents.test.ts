@@ -1,10 +1,42 @@
-import { describe, expect, it } from "vitest";
-import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
+import { response as expressResponse, type Request, type RequestHandler, type Response, type Router } from "express";
+import session from "express-session";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentPeopleResolveInput, agentResponsibilityQuery, createUnifiedAgentsRouter, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
+import { activateAccountSession } from "../db/sessions.js";
+import { LiveInventory } from "../db/liveInventory.js";
+import { capabilities } from "../services/capabilities.js";
+import * as operationalState from "../services/operationalState.js";
+import { AppError } from "../errors.js";
+import type { RoutePolicy } from "./policy.js";
 import {
   parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys,
   unifiedAgentViews, unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
 } from "../types/unifiedAgents.js";
 import { decodeInventoryFacet, encodeInventoryFacet, inventoryFacetFields } from "../types/inventoryFacets.js";
+
+vi.mock("../db/pool.js", () => ({
+  pool: { query: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }) },
+  secretValue: (name: string) => {
+    const settings: Record<string, string> = {
+      TENANTS_JSON: JSON.stringify([{
+        tenantId: "11111111-1111-4111-8111-111111111111", clientId: "22222222-2222-4222-8222-222222222222",
+        clientSecret: "synthetic-unified-route-secret", domains: ["example.invalid"],
+      }]),
+      SESSION_SECRET: "synthetic-unified-route-session-secret",
+    };
+    return settings[name];
+  },
+}));
+const handlers = vi.hoisted(() => new Map<string, RequestHandler>());
+vi.mock("./policy.js", () => ({
+  policyRoute: (_router: Router, method: string, path: string, _policy: RoutePolicy, handler: RequestHandler) => {
+    handlers.set(`${method} ${path}`, handler);
+  },
+}));
+
+afterEach(() => vi.restoreAllMocks());
 
 const enums = {
   view: unifiedAgentViews, endUserAccess: unifiedAgentAccessFilters, reportedUsage: unifiedAgentUsageFilters,
@@ -91,13 +123,14 @@ describe("selected inventory query protocol", () => {
 
   it("normalizes native GUID links and encoding without lowercasing opaque native or package identities", () => {
     const nativeId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-    expect(unifiedAgentRecordId({ source: "power_platform", environmentId: "Default-ENV", nativeId }))
-      .toBe(`power_platform:default-env:${nativeId.toLowerCase()}`);
-    expect(unifiedAgentInventoryQuery({ recordId: `power_platform:Default-ENV:${nativeId}` }).recordId)
-      .toBe(`power_platform:default-env:${nativeId.toLowerCase()}`);
+    const environmentId = `Default-${nativeId}`;
+    expect(unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId }))
+      .toBe(`power_platform:${environmentId.toLowerCase()}:${nativeId.toLowerCase()}`);
+    expect(unifiedAgentInventoryQuery({ recordId: `power_platform:${environmentId}:${nativeId}` }).recordId)
+      .toBe(`power_platform:${environmentId.toLowerCase()}:${nativeId.toLowerCase()}`);
     for (const nativeId of ["Opaque/Native", "Native%2Fvalue", "公司/🌏"]) {
       const formatted = unifiedAgentRecordId({ source: "power_platform", environmentId: "ENV", nativeId });
-      expect(parseUnifiedAgentRecordId(formatted)).toEqual({ source: "power_platform", environmentId: "env", nativeId });
+      expect(parseUnifiedAgentRecordId(formatted)).toEqual({ source: "power_platform", environmentId: "ENV", nativeId });
     }
     expect(unifiedAgentRecordId({ source: "graph_packages", packageId: nativeId })).toBe(`graph_packages:${nativeId}`);
     expect(unifiedAgentInventoryQuery({ recordId: "graph_packages:Package%2fone%252Ftwo" }).recordId)
@@ -108,6 +141,8 @@ describe("selected inventory query protocol", () => {
     const selectionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", selectionId, cursor: "selected-page", limit: "100" }))
       .toEqual({ objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", search: undefined, selectionId, cursor: "selected-page", limit: 100 });
+    expect(agentResponsibilityQuery({ objectId: "ABCDEF01-2345-6789-CDEF-0123456789AB" }).objectId)
+      .toBe("abcdef01-2345-6789-cdef-0123456789ab");
     for (const query of [{ objectId: "alice@example.invalid" }, { objectId: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
       { tenantId: "other" }, { principalId: "other" }, { name: "Alice" }, { limit: "101" }, { offset: "-1" },
       { offset: "30001" }, { search: "bad\nname" }, { search: "x".repeat(257) }]) {
@@ -123,5 +158,62 @@ describe("selected inventory query protocol", () => {
       { recordId: "graph_packages:package", principalId: "other" }, { ids: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] }]) {
       expect(() => agentPeopleResolveInput(input)).toThrow();
     }
+  });
+});
+
+describe("resolved people response authority", () => {
+  it.each(["current", "first membership", "saved labels", "failed labels", "final membership"] as const)("enforces directory authority after %s reads", async stage => {
+    const user = { tenantId: "11111111-1111-4111-8111-111111111111", homeAccountId: "people-reader",
+      username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer" as const] };
+    const objectId = "abcdef01-2345-6789-cdef-0123456789ab", recordId = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await activateAccountSession(user.tenantId, user.homeAccountId, async () => undefined);
+    let current = true;
+    vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+      if (!current) throw new AppError(401, "authorization_expired", "Directory capability changed.");
+    });
+    vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Unit tests must not access Microsoft Graph."); }));
+    const inventory = new LiveInventory();
+    vi.spyOn(inventory, "record").mockResolvedValue({
+      id: recordId, revision: "current-revision", displayName: "Agent", environmentId: null,
+      identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: null },
+      people: { owner: objectId.toUpperCase() }, native: null,
+    });
+    const membership = vi.spyOn(inventory, "assertCurrent").mockResolvedValue();
+    if (stage === "first membership") membership.mockImplementationOnce(async () => { current = false; });
+    if (stage === "final membership") membership.mockResolvedValueOnce().mockImplementationOnce(async () => { current = false; });
+    const person = { objectId, displayName: "Owner", userPrincipalName: null, observedAt: "2026-10-01T00:00:00Z" };
+    const savedPeople = { read: vi.fn(async () => {
+      if (stage === "saved labels") current = false;
+      if (stage === "failed labels") {
+        current = false;
+        throw new AppError(503, "read_failed", "Saved labels failed.");
+      }
+      return new Map([[objectId, person]]);
+    }) };
+    const people = { generation: vi.fn(async () => ({
+      sessionEpoch: "0", scopeEpoch: "0", scopeId: "33333333-3333-4333-8333-333333333333",
+    })), resolve: vi.fn(async () => ({ changed: true, resolved: 1, notFound: 0, failed: 0 })) };
+    createUnifiedAgentsRouter(undefined, { inventory, people, savedPeople });
+    const handler = handlers.get("post /agent-inventory/people/resolve");
+    if (!handler) throw new Error("People handler was not registered.");
+    const response = Object.assign(new ServerResponse(new IncomingMessage(new Socket())), expressResponse, { json: vi.fn<Response["json"]>() });
+    const request: Partial<Request> = { body: { recordId }, sessionID: "people-session" };
+    new session.MemoryStore().createSession(request as Request, {
+      cookie: new session.Cookie(), tenantId: user.tenantId, accountId: user.homeAccountId,
+      clientId: "22222222-2222-4222-8222-222222222222", user,
+    });
+    try {
+      const pending = Promise.resolve(handler(request as Request, response, error => { if (error) throw error; }));
+      if (stage === "current") {
+        await pending;
+        expect(response.json).toHaveBeenCalledExactlyOnceWith({ people: { owner: person }, changed: true });
+      } else {
+        await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+        expect(response.json).not.toHaveBeenCalled();
+      }
+      if (stage === "first membership") expect(savedPeople.read).not.toHaveBeenCalled();
+      expect(response.listenerCount("close")).toBe(0);
+    } finally { vi.unstubAllGlobals(); }
   });
 });

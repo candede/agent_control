@@ -129,17 +129,20 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
   const filters = makeFilters({ templateId, startDateTime, endDateTime, entraAgentIds, entraAgentApplicationIds, userObjectId, operations });
   const qualification = filters && catalog?.qualifications.find(evidence => evidence.capabilityId === capabilityId
     && evidence.templateId === filters.templateId && equalQualificationScope(evidence.approvedScope, filters)
-    && evidence.queryVersion === 3 && Date.parse(evidence.expiresAt) > now);
-  const retainedScope = filters && catalog?.retainedScopes.find(scope => scope.capabilityId === capabilityId
+    && evidence.queryVersion === 3 && Date.parse(evidence.expiresAt) > now
+    && (!applicationMode || evidence.approvedBy === capability.user?.homeAccountId));
+  const retainedScopes = filters ? catalog?.retainedScopes.filter(scope => scope.capabilityId === capabilityId
     && scope.templateId === filters.templateId && equalQualificationScope(scope.approvedScope, filters)
-    && scope.queryVersion === 3 && scope.revokedAt === null && Date.parse(scope.expiresAt) > now);
+    && scope.queryVersion === 3 && scope.revokedAt === null && Date.parse(scope.expiresAt) > now) ?? [] : [];
+  const retainedScope = retainedScopes[0];
+  const providerRetainedScope = retainedScopes.find(scope => scope.approvedBy === capability.user?.homeAccountId);
   const canRevokeRetainedScope = retainedScope
     ? retainedScope.tokenMode === "delegated"
       ? hasRole(capability.user, "AgentControl.Viewer")
       : hasRole(capability.user, "AgentControl.Admin")
     : false;
   const available = active && identityAvailable && (applicationMode
-    ? Boolean(qualification && retainedScope && (!capabilityView || capabilityModeEnabled(capabilityView)
+    ? Boolean(qualification && providerRetainedScope && (!capabilityView || capabilityModeEnabled(capabilityView)
       && capabilityView.configuration?.sharedDataScope !== false))
     : providerActionAllowed(capabilityView, false, capability.now));
   const rangeError = rangeMessage(filters, catalog);
@@ -478,7 +481,7 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
     if (!savedCurrent || !searchAction || !available || !catalog || !searchAction.roles.some(role => hasRole(capability.user, role))
       || busy || historyLoading || !filters || rangeError || operationError) return;
     if (applicationMode && (!(Date.parse(qualification?.expiresAt ?? "") > Date.now())
-      || !(Date.parse(retainedScope?.expiresAt ?? "") > Date.now()))) return;
+      || !(Date.parse(providerRetainedScope?.expiresAt ?? "") > Date.now()))) return;
     await perform("search", async (requestGeneration, requestAction, signal) => {
       const job = await submitDefenderHunt(tokenMode, filters, { signal, agentRecordId, userObjectId });
       if (!currentRequest(requestGeneration, requestAction)) return;
@@ -590,6 +593,7 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
   }
 
   async function handleCancel(job: DefenderHuntingJob) {
+    if (actionsDisabled || job.authorizationPrincipalId !== capability.user?.homeAccountId) return;
     await perform(`cancel:${job.id}`, async (requestGeneration, requestAction, signal) => {
       const draft = approvalGeneration.current;
       const cancelled = await cancelDefenderHunt(job.id, { signal, agentRecordId, userObjectId });
@@ -600,7 +604,7 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
   }
 
   async function handleDelete(job: DefenderHuntingJob) {
-    if (actionsDisabled) return;
+    if (actionsDisabled || job.authorizationPrincipalId !== capability.user?.homeAccountId) return;
     if (!window.confirm("Delete this minimized local hunting cache? Defender source data is unchanged.")) return;
     await perform(`delete:${job.id}`, async (requestGeneration, requestAction, signal) => {
       await deleteDefenderHunt(job.id, { signal, agentRecordId, userObjectId });
@@ -680,6 +684,7 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
           ? <div className="error-banner" role="alert">{rangeError ?? operationError ?? qualificationRangeError ?? qualificationTargetError}</div> : null}
 
         {!identityAvailable ? <p className="agent-insight-note">This template cannot run for the selected agent until its required identity is available. No broader query will be used.</p> : !available && applicationMode ? <section className="hunting-qualification" aria-label="Hunting qualification required"><div><strong>Shared application hunting is not qualified</strong>
+          <p>Provider hunting requires this signed-in account&apos;s qualification. Another account&apos;s approved shared results remain readable.</p>
           {(capabilityView?.decision.remediation ?? ["Open Permissions to review the exact Defender hunting contract."]).map(item => <p key={item}>{item}</p>)}</div>
           <div className="hunting-qualification-actions"><button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
             {canQualify ? <label><input type="checkbox" checked={approvalAcknowledged} onChange={event => setApprovalAcknowledged(event.target.checked)} /><span>Approve one bounded fixed-template provider query</span></label> : null}
@@ -697,8 +702,10 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
       <section className="hunting-history" aria-labelledby="hunting-history-title"><header><div><h3 id="hunting-history-title">Hunting history</h3></div><span>{historyCount === undefined ? "Unknown" : historyCount.toLocaleString()} jobs</span></header>
         {historyLoading && !retainedPresentation ? <div className="compact-empty-state" role="status">Loading hunting history...</div>
           : historyCount === undefined ? <div className="compact-empty-state"><strong>Hunting history unavailable</strong><span>Refresh hunting history to try again.</span></div>
-          : jobs.length === 0 ? <div className="compact-empty-state"><strong>No hunting history</strong><span>Run a hunt to collect results for this selection.</span></div>
-          : <HistoryTable jobs={jobs} selectedId={selected?.id} busy={actionsDisabled} onView={handleView} onResume={handleResume} onCancel={handleCancel} onDelete={handleDelete} onExport={handleExport} />}
+          : jobs.length === 0 ? <div className="compact-empty-state"><strong>No hunting history</strong><span>Run a hunt to collect results for this agent.</span></div>
+          : <HistoryTable jobs={jobs} selectedId={selected?.id} busy={actionsDisabled} currentPrincipalId={capability.user?.homeAccountId}
+            applicationQualificationAllowed={hasRole(capability.user, "AgentControl.Admin")}
+            onView={handleView} onResume={handleResume} onCancel={handleCancel} onDelete={handleDelete} onExport={handleExport} />}
         {historyCount !== undefined && historyCount > historyPageSize ? <div className="hunting-page-actions"><button type="button" className="secondary" disabled={actionsDisabled || historyOffset === 0}
           onClick={() => void perform("history:previous", (requestGeneration, requestAction, signal) => loadHistory(Math.max(0, historyOffset - historyPageSize), requestGeneration, signal, requestAction))}>Previous</button>
           <span>{historyOffset + 1}-{Math.min(historyOffset + jobs.length, historyCount)} of {historyCount}</span>
@@ -713,7 +720,8 @@ function DefenderHuntingSession({ agentRecordId, entraAgentIds = [], entraAgentA
   );
 }
 
-function HistoryTable({ jobs, selectedId, busy, onView, onResume, onCancel, onDelete, onExport }: { jobs: DefenderHuntingJob[]; selectedId?: string; busy: boolean;
+function HistoryTable({ jobs, selectedId, busy, currentPrincipalId, applicationQualificationAllowed, onView, onResume, onCancel, onDelete, onExport }: {
+  jobs: DefenderHuntingJob[]; selectedId?: string; busy: boolean; currentPrincipalId?: string; applicationQualificationAllowed: boolean;
   onView: (job: DefenderHuntingJob) => Promise<void>; onResume: (job: DefenderHuntingJob) => Promise<void>; onCancel: (job: DefenderHuntingJob) => Promise<void>;
   onDelete: (job: DefenderHuntingJob) => Promise<void>; onExport: (job: DefenderHuntingJob) => Promise<void> }) {
   return <div className="table-shell hunting-history-table" role="region" aria-label="Defender hunting history"><table><thead><tr><th>Template / source</th><th>Requested range</th><th>Status</th><th>Coverage</th><th>Rows</th><th>Observed</th><th>Actions</th></tr></thead><tbody>{jobs.map(job => <tr key={job.id} className={selectedId === job.id ? "selected-row" : undefined}>
@@ -724,10 +732,11 @@ function HistoryTable({ jobs, selectedId, busy, onView, onResume, onCancel, onDe
     <td>{job.storedRowCount.toLocaleString()}<small>{job.providerRowCount.toLocaleString()} provider rows</small></td>
     <td>{job.finishedAt ? formatDateTime(job.finishedAt) : "Pending"}<small>expires {formatDateTime(job.expiresAt)}</small></td>
     <td><div className="hunting-row-actions">{readableStatuses.has(job.status) ? <IconAction label={`View hunt ${shortId(job.id)}`} title="View minimized rows" disabled={busy} onClick={() => void onView(job)}><Eye /></IconAction> : null}
-      {job.canResume ? <IconAction label={`Resume hunt ${shortId(job.id)}`} title="Resume with current authorization" disabled={busy} onClick={() => void onResume(job)}><Play /></IconAction> : null}
-      {activeStatuses.has(job.status) ? <IconAction label={`Cancel hunt ${shortId(job.id)}`} title="Cancel local execution" disabled={busy} onClick={() => void onCancel(job)}><Pause /></IconAction> : null}
+      {job.canResume && job.authorizationPrincipalId === currentPrincipalId && (!job.qualification || job.tokenMode !== "application" || applicationQualificationAllowed)
+        ? <IconAction label={`Resume hunt ${shortId(job.id)}`} title="Resume with current authorization" disabled={busy} onClick={() => void onResume(job)}><Play /></IconAction> : null}
+      {job.authorizationPrincipalId === currentPrincipalId && (activeStatuses.has(job.status) || job.status === "waiting_authorization") ? <IconAction label={`Cancel hunt ${shortId(job.id)}`} title="Cancel local execution" disabled={busy} onClick={() => void onCancel(job)}><Pause /></IconAction> : null}
       {readableStatuses.has(job.status) ? <IconAction label={`Export hunt ${shortId(job.id)}`} title="Export minimized CSV" disabled={busy} onClick={() => void onExport(job)}><Download /></IconAction> : null}
-      {!activeStatuses.has(job.status) ? <IconAction label={`Delete hunt ${shortId(job.id)}`} title="Delete local cache" disabled={busy} onClick={() => void onDelete(job)}><Trash2 /></IconAction> : null}</div></td>
+      {job.authorizationPrincipalId === currentPrincipalId && !activeStatuses.has(job.status) ? <IconAction label={`Delete hunt ${shortId(job.id)}`} title="Delete local cache" disabled={busy} onClick={() => void onDelete(job)}><Trash2 /></IconAction> : null}</div></td>
   </tr>)}</tbody></table></div>;
 }
 
@@ -745,7 +754,10 @@ function HuntingDetail({ job, rows, rowOffset, busy, loadingRows, onPageChange, 
       <div><span>Coverage</span><strong>{job.complete ? "Complete bounded request" : job.partialReason === "hunting_row_limit" ? "Row cap reached" : "Not complete"}</strong></div></div>
     {job.noData ? <div className="hunting-no-data"><strong>No data returned</strong><span>No rows matched this hunt. Try another time range or check log setup in Permissions.</span></div> : null}
     {job.status === "partial" ? <div className="warning-banner">{job.partialReason === "hunting_row_limit" ? "The 200-row local cap was reached."
-      : `The saved result is partial${job.partialReason ? ` (${statusLabel(job.partialReason)})` : ""}.`} Results are incomplete for the requested interval.</div> : null}
+      : `The saved result is partial${job.partialReason ? ` (${statusLabel(job.partialReason)})` : ""}.`} Results are incomplete for the requested interval.
+      {job.qualification ? " Partial qualification does not approve shared hunting access. Review and approve a narrower qualification." : null}</div> : null}
+    {job.message && (job.status === "failed" || job.status === "inconclusive")
+      ? <div className={job.status === "failed" ? "error-banner" : "warning-banner"} role="alert">{job.message}</div> : null}
     {job.priorSuccessfulJobId && !readableStatuses.has(job.status) ? <div className="hunting-prior-result"><span>The previous successful result is still available.</span>
       <button type="button" className="secondary" disabled={busy} onClick={() => onViewPrior(job.priorSuccessfulJobId!)}><Eye aria-hidden="true" /> View prior successful result</button></div> : null}
     {loadingRows ? <p role="status">Loading minimized rows...</p> : null}

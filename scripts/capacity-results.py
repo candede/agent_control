@@ -10,6 +10,41 @@ MIB = 1024 ** 2
 GC = re.compile(r"^\[(\d+):([^\]]+)\]\s+([\d.]+)\s+ms:")
 NUMBER = re.compile(r"\b([a-z_]+)=([0-9.e+-]+)(?=\s|$)")
 STAGES = {"provider.parse", "batch.stringify", "sql.result", "import.transform", "response.serialize", "export.encode"}
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def byte_count(value):
+    return (type(value) is int and 0 <= value <= MAX_SAFE_INTEGER
+            or type(value) is float and math.isfinite(value) and 0 <= value <= MAX_SAFE_INTEGER and value.is_integer())
+
+
+def milliseconds(value):
+    return type(value) in (int, float) and 0 <= value <= MAX_SAFE_INTEGER and math.isfinite(value)
+
+
+def same_identity(row, identity):
+    return (isinstance(row, dict) and isinstance(identity, dict)
+            and type(row.get("pid")) is int and byte_count(row["pid"]) and row["pid"] > 0
+            and type(row.get("isolate")) is int and byte_count(row["isolate"])
+            and row["pid"] == identity.get("pid") and row["isolate"] == identity.get("isolate"))
+
+
+def workload_identity(identity):
+    return bool(same_identity(identity, identity) and isinstance(identity.get("node"), str) and identity["node"]
+                and isinstance(identity.get("v8"), str) and identity["v8"]
+                and isinstance(identity.get("heap"), dict) and byte_count(identity["heap"].get("heap_size_limit"))
+                and identity["heap"]["heap_size_limit"] > 0 and isinstance(identity.get("execArgv"), list)
+                and "--max-old-space-size=768" in identity["execArgv"])
+
+
+def memory_sample(row):
+    return (all(byte_count(row.get(key)) for key in ("rss", "heapUsed", "heapTotal", "external", "arrayBuffers"))
+            and milliseconds(row.get("eventLoopMaxMs")))
+
+
+def stage_checkpoint(row, identity):
+    stage = row.get("stage")
+    return same_identity(row, identity) and isinstance(stage, str) and stage in STAGES | {"probe.live"} and byte_count(row.get("heapUsed"))
 
 
 def read_json(path):
@@ -69,38 +104,41 @@ def worker_memory(directory, gc):
                 except ValueError:
                     malformed += 1
                     continue
+                if not isinstance(row, dict):
+                    malformed += 1
+                    continue
                 if row.get("event") == "identity":
+                    if identity is not None:
+                        malformed += 1
                     identity = row
                 elif row.get("event") == "summary":
+                    if summary is not None:
+                        malformed += 1
                     summary = row
                 elif row.get("event") == "sample":
                     samples += 1
-                    numeric = ("rss", "heapUsed", "heapTotal", "external", "arrayBuffers", "eventLoopMaxMs")
-                    complete = all(isinstance(row.get(key), (int, float)) and math.isfinite(row[key]) and row[key] >= 0 for key in numeric)
-                    memory_covered = memory_covered and complete and bool(identity and row.get("pid") == identity.get("pid")
-                                                                         and row.get("isolate") == identity.get("isolate"))
+                    complete = memory_sample(row) and same_identity(row, identity)
+                    memory_covered = memory_covered and complete
                     if complete:
                         numeric_samples += 1
                         heap = max(heap, row["heapUsed"])
                         rss = max(rss, row["rss"])
                     pool = row.get("pool")
-                    pool_covered = pool_covered and isinstance(pool, dict) and all(isinstance(pool.get(key), int) and pool[key] >= 0
+                    pool_covered = pool_covered and isinstance(pool, dict) and all(type(pool.get(key)) is int and byte_count(pool[key])
                         for key in ("total", "waiting", "idle", "maximum", "foreground", "queue"))
                     pool_covered = pool_covered and pool["maximum"] == 4 and pool["total"] <= 4
                 elif row.get("event") == "checkpoint":
-                    if identity and row.get("pid") == identity.get("pid") and row.get("isolate") == identity.get("isolate"):
+                    if stage_checkpoint(row, identity):
                         stages[row["stage"]] = max(stages.get(row["stage"], 0), row["heapUsed"])
                     else:
                         malformed += 1
         raw = [row for row in gc.values() if identity and row["pid"] == identity.get("pid")
                and row["isolate"].endswith(":"+str(identity.get("isolate")))]
         pre = max((row["gcPreHeapUsedMax"] for row in raw if row["gcPreHeapUsedMax"] is not None), default=None)
-        scope = bool(identity and path.name == f"lease-worker-{identity.get('pid')}-memory.jsonl"
-                     and identity.get("node") and identity.get("v8") and identity.get("heap", {}).get("heap_size_limit")
-                     and "--max-old-space-size=768" in identity.get("execArgv", []))
+        scope = bool(workload_identity(identity) and path.name == f"lease-worker-{identity['pid']}-memory.jsonl")
         covered = (scope and samples > 0 and memory_covered and pool_covered and "sql.result" in stages and summary is not None
-                   and summary.get("dropped") == 0 and not malformed and sum(row["records"] for row in raw) > 0
-                   and summary.get("pid") == identity.get("pid") and summary.get("isolate") == identity.get("isolate")
+                   and byte_count(summary.get("dropped")) and summary["dropped"] == 0
+                   and not malformed and sum(row["records"] for row in raw) > 0 and same_identity(summary, identity)
                    and not any(row["incomplete"] for row in raw))
         observed = max(([heap] if numeric_samples else []) + list(stages.values()) + ([pre] if pre is not None else []), default=None)
         workers.append({"file": path.name, "identity": identity, "samples": samples, "poolCovered": pool_covered and samples > 0,
@@ -143,6 +181,14 @@ def summarize(directory, mode):
                 if not identity:
                     malformed += 1
                     continue
+                try:
+                    pid, at = int(identity[1]), float(identity[3])
+                except ValueError:
+                    malformed += 1
+                    continue
+                if not byte_count(pid) or pid <= 0 or not milliseconds(at):
+                    malformed += 1
+                    continue
                 fields = {key: float(value) for key, value in NUMBER.findall(line)}
                 before = fields.get("start_object_size", fields.get("total_size_before"))
                 after = fields.get("end_object_size", fields.get("total_size_after"))
@@ -151,7 +197,7 @@ def summarize(directory, mode):
                 record = gc.setdefault(key, {"pid": int(identity[1]), "isolate": identity[2],
                                             "records": 0, "incomplete": 0, "gcPreHeapUsedMax": None,
                                             "gcPostHeapUsedMax": None, "allocatedBytes": 0})
-                if before is None or after is None or allocated is None or not all(math.isfinite(value) for value in (before, after, allocated)):
+                if not all(byte_count(value) for value in (before, after, allocated)):
                     record["incomplete"] += 1
                     continue
                 record["records"] += 1
@@ -161,6 +207,7 @@ def summarize(directory, mode):
                 if active_window is not None and active_window["pid"]==int(identity[1]) and key.endswith(":0"):
                     active_window["gcPreHeapUsedMax"] = max(active_window["gcPreHeapUsedMax"] or 0,int(before))
     summary, identity, stages, samples, query_max, pool_max = None, None, {}, 0, 0, 0
+    numeric_samples, memory_covered = 0, True
     response_times, categories, cycles, reader_rejections, checkpoints, rss, heap, peak = {}, {}, [], 0, 0, 0, 0, None
     publications, publication_max, publication_rejections, lock_wait_max = {}, 0, 0, None
     publication_classes, http_requests, http_failures = {}, 0, 0
@@ -176,16 +223,32 @@ def summarize(directory, mode):
                 except json.JSONDecodeError:
                     malformed += 1
                     continue
+                if not isinstance(record, dict):
+                    malformed += 1
+                    continue
                 event = record.get("event")
                 if event == "identity":
+                    if identity is not None:
+                        malformed += 1
                     identity = record
                 elif event == "summary":
+                    if summary is not None:
+                        malformed += 1
                     summary = record
                 elif event == "checkpoint":
+                    if not stage_checkpoint(record, identity):
+                        malformed += 1
+                        continue
                     stages[record["stage"]] = max(stages.get(record["stage"], 0), record["heapUsed"])
                     checkpoints = max(checkpoints, record["heapUsed"])
                 elif event == "sample":
                     samples += 1
+                    complete = memory_sample(record) and same_identity(record, identity)
+                    memory_covered = memory_covered and complete
+                    if not complete:
+                        malformed += 1
+                        continue
+                    numeric_samples += 1
                     rss, heap = max(rss, record["rss"]), max(heap, record["heapUsed"])
                     group = record.get("cgroup") or {}
                     value = group.get("memory.peak", "")
@@ -249,29 +312,36 @@ def summarize(directory, mode):
                     mutation_probes[record["count"]] = {key: record.get(key) for key in ("keys","physical","wal","coverage")}
                 elif event == "detail-sweep":
                     sweep_results.append(record)
-    pre = max((r["gcPreHeapUsedMax"] for r in gc.values() if r["gcPreHeapUsedMax"] is not None), default=None)
     incomplete = malformed + sum(r["incomplete"] for r in gc.values())
     probe = read_json(directory / "probe.json")
     if probe is None:
         probe = read_json(directory / "probe-result.json")
     workers = worker_memory(directory, gc)
+    identities = [value for value in [identity, *[worker["identity"] for worker in workers]] if same_identity(value, value)]
+    scoped_gc = [row for row in gc.values() if not identities or any(row["pid"] == value["pid"]
+                 and row["isolate"].endswith(":"+str(value["isolate"])) for value in identities)]
+    pre = max((row["gcPreHeapUsedMax"] for row in scoped_gc if row["gcPreHeapUsedMax"] is not None), default=None)
     heap = max([heap, *[worker["sampledHeapUsedMax"] for worker in workers if worker["sampledHeapUsedMax"] is not None]])
     rss = max([rss, *[worker["sampledRssMax"] for worker in workers if worker["sampledRssMax"] is not None]])
     checkpoints = max([checkpoints, *[worker["stageCheckpointHeapUsedMax"] for worker in workers if worker["stageCheckpointHeapUsedMax"] is not None]])
-    observed = max(([heap] if samples else []) + list(stages.values()) + ([pre] if pre is not None else [])
+    observed = max(([heap] if numeric_samples else []) + list(stages.values()) + ([pre] if pre is not None else [])
                    + [worker["observedHeapUsedMax"] for worker in workers if worker["observedHeapUsedMax"] is not None], default=None)
     workers_covered = all(worker["covered"] for worker in workers) and (mode != "full" or len(workers) >= 2)
     coverage = {"timerIsLowerBound": True, "rawGcRecords": sum(r["records"] for r in gc.values()),
-                "workloadGcRecords": sum(r["records"] for r in gc.values() if identity and r["pid"] == identity["pid"]
+                "workloadGcRecords": sum(r["records"] for r in gc.values() if same_identity(identity, identity) and r["pid"] == identity["pid"]
                                          and r["isolate"].endswith(":"+str(identity["isolate"]))),
                 "malformedOrIncomplete": incomplete, "finalSummaryPresent": summary is not None,
+                "memorySamplesCovered": memory_covered and samples > 0,
+                "workloadIdentityCovered": workload_identity(identity) and same_identity(summary, identity),
                 "missingStages": sorted(STAGES - set(stages)), "dropped": summary.get("dropped") if summary else None,
                 "probePassed": bool(probe and probe.get("status") == "passed"),
                 "isolates": list(gc.values()),
                 "leaseWorkers": workers, "leaseWorkersCovered": workers_covered,
-                "scope": "Sample/stage maxima include workload and lease processes. Raw GC also includes loader isolates. Workload stages and separately declared lease-worker SQL/timer/terminal coverage are required."}
+                "scope": "Sample/stage/GC maxima include identified workload and lease processes. Raw GC retains separate loader isolates; without identity, raw GC is unscoped lower-bound evidence only. Workload stages and separately declared lease-worker SQL/timer/terminal coverage are required."}
     covered = (coverage["workloadGcRecords"] > 0 and not incomplete and summary is not None
-               and not coverage["missingStages"] and coverage["dropped"] == 0 and coverage["probePassed"] and workers_covered)
+               and coverage["memorySamplesCovered"] and coverage["workloadIdentityCovered"]
+               and not coverage["missingStages"] and byte_count(coverage["dropped"]) and coverage["dropped"] == 0
+               and coverage["probePassed"] and workers_covered)
     gates = {
         "heapObserved615MiB": "failed" if observed is not None and observed > 615*MIB else "passed" if covered else "inconclusive",
         "appCharged80Percent": "inconclusive" if peak is None else "passed" if peak <= .8*1536*MIB else "failed",
@@ -378,14 +448,23 @@ def summarize(directory, mode):
             all(row["latency"]["p95"] <= 2000 and row["latency"]["p99"] <= 5000 for row in comparison) else "failed")
     window_peaks = {}
     for window in windows:
+        window["numericCoverage"] = (byte_count(window.get("sampledHeapUsedMax"))
+            and byte_count(window.get("stageCheckpointHeapUsedMax")) and milliseconds(window.get("startedAt"))
+            and milliseconds(window.get("finishedAt")) and window["finishedAt"] >= window["startedAt"])
+        if not window["numericCoverage"]:
+            window["peakSensitiveHeapObservedMax"] = None
+            continue
         window["peakSensitiveHeapObservedMax"] = max(window["sampledHeapUsedMax"],window["stageCheckpointHeapUsedMax"],
                                                     window["gcPreHeapUsedMax"] or 0)
         window_peaks[window["count"]] = max(window_peaks.get(window["count"],0),window["peakSensitiveHeapObservedMax"])
     delta = window_peaks[100000]-window_peaks[10000] if all(count in window_peaks for count in (10000,100000)) else None
-    gates["requestWorkingSet64MiB"] = ("inconclusive" if delta is None or len(windows)!=6 or not all(window["closed"] for window in windows)
+    gates["requestWorkingSet64MiB"] = ("inconclusive" if delta is None or len(windows)!=6
+        or not all(window["closed"] and window["numericCoverage"] for window in windows)
+        or any({window["index"] for window in windows if window["count"] == count} != {0, 1, 2} for count in (10000, 100000))
         or not identity or any(window.get("pid")!=identity["pid"] for window in windows)
         or any(not {"sql.result","response.serialize"}.issubset(window.get("stages",[])) for window in windows)
-        or incomplete or not coverage["probePassed"] or not summary or summary.get("dropped")!=0
+        or incomplete or not coverage["probePassed"] or not coverage["memorySamplesCovered"] or not coverage["workloadIdentityCovered"]
+        or not summary or not byte_count(summary.get("dropped")) or summary["dropped"]!=0
         or not coverage["workloadGcRecords"] else "passed" if delta<=64*MIB else "failed")
     if functional:
         if functional.get("status") == "failed":
@@ -397,7 +476,7 @@ def summarize(directory, mode):
             gates["functionalProfiles"] = status
         elif mode == "full" and functional.get("status") == "failed":
             gates["functionalProfiles"] = "failed"
-    sampled = samples > 0 or any(worker["sampledHeapUsedMax"] is not None for worker in workers)
+    sampled = numeric_samples > 0 or any(worker["sampledHeapUsedMax"] is not None for worker in workers)
     staged = bool(stages) or any(worker["stageCheckpointHeapUsedMax"] is not None for worker in workers)
     return {"mode": mode, "identity": identity, "sampledHeapUsedMax": heap if sampled else None, "sampledRssMax": rss if sampled else None,
             "gcPreHeapUsedMax": pre, "stageCheckpointHeapUsedMax": checkpoints if staged else None,

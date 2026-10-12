@@ -686,14 +686,18 @@ describe("UnifiedAgentTable", () => {
     expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(group);
   });
 
-  it("uses lowercase environment lookup keys with an honest ID fallback", () => {
-    const { update } = renderTable({ records: [{ ...record, environmentId: "ENVIRONMENT-A" }], environmentNames: { "environment-a": "Friendly environment" } });
+  it("uses validated environment lookup keys with an honest ID fallback", () => {
+    const environmentId = "Default-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const { update } = renderTable({ records: [{ ...record, environmentId }], environmentNames: { [environmentId.toLowerCase()]: "Friendly environment" } });
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByText("Friendly environment")).toBeInTheDocument();
     update({ environmentNames: {} });
+    expect(screen.getByText(environmentId)).toBeInTheDocument();
+    update({ records: [{ ...record, environmentId: "ENVIRONMENT-A" }], environmentNames: { "environment-a": "Wrong environment" } });
     expect(screen.getByText("ENVIRONMENT-A")).toBeInTheDocument();
+    expect(screen.queryByText("Wrong environment")).not.toBeInTheDocument();
   });
 
   it("does not infer availability, blocking, quarantine or authoring from a published resource", () => {

@@ -94,24 +94,15 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("streamed complete-set import confirmation", () => {
-  it("uses the server-selected first report without a separate selection request", async () => {
-    activeRevision = "1";
-    vi.mocked(api.acceptReportBundle).mockImplementationOnce(async (_id, input) => {
-      expect(input).toMatchObject({ expectedActiveRevision: "1", preserveSelection: true });
-      activeRevision = "2";
-      return { setId: reportSetId, activeRevision, complete: true };
-    });
-    render(<OfficialUsageImportPanel {...callbacks} />);
-    await choose();
-    await accept();
-    await imported();
-    expect(api.reportPages.agents).toHaveBeenCalledExactlyOnceWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: "Close" }));
-    expect(callbacks.onDone).toHaveBeenCalledOnce();
-    expect(callbacks.onChanged).toHaveBeenCalledOnce();
+  it.each(["bundle", "stage"] as const)("resumes an uppercase %s UUID using canonical saved receipts", async kind => {
+    const bundle = "abcdefab-1234-4567-89ab-abcdefabcdef", stage = "fedcbafe-1234-4567-89ab-fedcbafedcba";
+    stages = kinds.map((kind, index) => reportStage(kind, bundle, index === 0 ? { id: stage } : {}));
+    render(<OfficialUsageImportPanel {...callbacks} {...(kind === "bundle"
+      ? { initialBundleId: bundle.toUpperCase() } : { initialStagingId: stage.toUpperCase() })} />);
+    expect(await ready()).toBeEnabled();
+    expect(api.previewReportBundle).toHaveBeenCalledWith(bundle, expect.any(AbortSignal));
+    if (kind === "stage") expect(api.readReportStage).toHaveBeenCalledWith(stage, expect.any(AbortSignal));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("starts empty without enumerating unrelated drafts, including Strict Mode replay", () => {
@@ -203,6 +194,21 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.stageReport).toHaveBeenCalledTimes(3);
     expect(api.acceptReportBundle).not.toHaveBeenCalled();
   });
+  it("shows field-limit failures without discarding valid companions and allows the rejected file to be replaced", async () => {
+    render(<OfficialUsageImportPanel {...callbacks} />);
+    await choose([files()[0]]);
+    await screen.findByText("Still needed: Users & agents, Users.");
+    vi.mocked(api.stageReport).mockRejectedValueOnce(new ApiError(400, "field_limit_exceeded", "CSV field exceeds 4 KiB."));
+    await choose([file("users.csv", `User,${" ".repeat(4097)},0,0,`)]);
+    expect(await screen.findByRole("alert")).toHaveTextContent("users.csv: CSV field exceeds 4 KiB.");
+    expect(stages).toHaveLength(1);
+    expect(api.discardReportStage).not.toHaveBeenCalled();
+    expect(api.acceptReportBundle).not.toHaveBeenCalled();
+    await choose(files().slice(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Import reports" })).toBeEnabled());
+    expect(stages).toHaveLength(3);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
   it("accepts dropped File objects without buffering CSV contents or bypassing confirmation", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     fireEvent.drop(screen.getByText("Drop your three CSV exports here").parentElement!, { dataTransfer: { files: files() } });
@@ -291,6 +297,10 @@ describe("streamed complete-set import confirmation", () => {
   });
   it.each([
     { cause: new ApiError(400, "invalid_report_schema", "Missing Users columns"), message: "Missing Users columns" },
+    { cause: new ApiError(400, "invalid_csv", "Malformed CSV structure or oversized record."), message: "Malformed CSV structure or oversized record." },
+    { cause: new ApiError(408, "upload_deadline", "Upload deadline exceeded."), message: "Upload deadline exceeded." },
+    { cause: new ApiError(500, "upload_cleanup_failed", "Upload cleanup could not be verified. Inspect owned staging before retrying."),
+      message: "Upload cleanup could not be verified. Inspect owned staging before retrying." },
     { cause: new Error("CSV header missing."), message: "CSV header missing." },
     { cause: null, message: "CSV validation failed." },
   ])("retains valid companions and the filename-specific error '$message' until the failed companion is replaced", async ({ cause, message }) => {

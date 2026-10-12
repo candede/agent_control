@@ -10,16 +10,39 @@ export function createRefreshExecutionSignal(
   cancellationSignal: AbortSignal,
   deadlineMs: number,
 ) {
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0) {
+    throw new RangeError("Refresh deadlines must be non-negative safe integer milliseconds.");
+  }
   const controller = new AbortController();
-  // Forward eagerly so pending authorization cannot lose the first abort reason.
-  const removeListeners = [cancellationSignal, AbortSignal.timeout(deadlineMs)].map(source => {
-    const onAbort = () => controller.abort(source.reason);
-    if (source.aborted) onAbort();
-    else source.addEventListener("abort", onAbort, { once: true });
-    return () => source.removeEventListener("abort", onAbort);
-  });
-  return {
-    signal: controller.signal,
-    dispose: () => { for (const removeListener of removeListeners) removeListener(); },
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const dispose = () => {
+    clearTimeout(timer);
+    cancellationSignal.removeEventListener("abort", onCancellation);
   };
+  const abort = (reason: unknown) => {
+    dispose();
+    controller.abort(reason);
+  };
+  const onCancellation = () => abort(cancellationSignal.reason);
+  const onDeadline = () => abort(new DOMException("Refresh execution deadline expired.", "TimeoutError"));
+  // Native timeout signals cannot be disposed, and oversized Node timers expire in 1 ms.
+  const startedAt = performance.now();
+  let remainingMs = deadlineMs;
+  const schedule = () => {
+    const duration = Math.min(remainingMs, 2 ** 31 - 1);
+    timer = setTimeout(() => {
+      // Timer delivery is not elapsed-time evidence: early callbacks must rearm.
+      remainingMs = Math.max(0, Math.ceil(deadlineMs - (performance.now() - startedAt)));
+      if (remainingMs > 0) schedule();
+      else onDeadline();
+    }, duration);
+    timer.unref();
+  };
+  if (cancellationSignal.aborted) onCancellation();
+  else if (deadlineMs === 0) onDeadline();
+  else {
+    cancellationSignal.addEventListener("abort", onCancellation, { once: true });
+    schedule();
+  }
+  return { signal: controller.signal, dispose };
 }

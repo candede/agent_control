@@ -22,6 +22,7 @@ vi.mock("../services/purviewAudit.js", () => ({
 }));
 vi.mock("../services/capabilities.js", () => ({ capabilities: {
   requireAvailable: mocks.requireAvailable,
+  beginOperationValidation: vi.fn(() => () => undefined),
   observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
 } }));
 vi.mock("../services/telemetry.js", async original => ({
@@ -85,8 +86,12 @@ describe("persisted agent people endpoint", () => {
     expect(mocks.record).toHaveBeenCalledExactlyOnceWith(scope, recordId);
     expect(mocks.resolve).toHaveBeenCalledWith(expect.objectContaining({ tenantId: config.tenants[0].tenantId, homeAccountId: "reader" }),
       [creatorId, ownerId], { generation: "initial", force: true, signal: expect.any(AbortSignal) });
-    expect(mocks.assertCurrent).toHaveBeenCalledExactlyOnceWith(scope, recordId, record.revision);
+    expect(mocks.assertCurrent).toHaveBeenCalledTimes(2);
+    expect(mocks.assertCurrent).toHaveBeenNthCalledWith(1, scope, recordId, record.revision);
+    expect(mocks.assertCurrent).toHaveBeenNthCalledWith(2, scope, recordId, record.revision);
     expect(mocks.read).toHaveBeenCalledWith(scope, [creatorId, ownerId]);
+    expect(mocks.assertCurrent.mock.invocationCallOrder[0]).toBeLessThan(mocks.read.mock.invocationCallOrder[0]);
+    expect(mocks.assertCurrent.mock.invocationCallOrder[1]).toBeGreaterThan(mocks.read.mock.invocationCallOrder[0]);
   });
 
   it("rejects missing sessions, roles, CSRF, wrong tenants and unavailable capability before reading private data", async () => {
@@ -115,7 +120,21 @@ describe("persisted agent people endpoint", () => {
     expect(mocks.read).not.toHaveBeenCalled();
   });
 
-  it.each(["generation", "inventory", "projection"] as const)(
+  it("rejects inventory changes during the final saved-people read", async () => {
+    let changed = false;
+    mocks.assertCurrent.mockImplementation(async () => {
+      if (changed) throw new AppError(409, "inventory_changed", "The current source membership changed.");
+    });
+    mocks.read.mockImplementationOnce(async () => {
+      changed = true;
+      return new Map([[creatorId, people.createdBy]]);
+    });
+    expect(await request({ recordId })).toMatchObject({ status: 409, body: { code: "inventory_changed" } });
+    expect(mocks.resolve).toHaveBeenCalledOnce();
+    expect(mocks.read).toHaveBeenCalledOnce();
+  });
+
+  it.each(["generation", "inventory", "projection", "final inventory"] as const)(
     "rejects a superseded account session during the %s read", async phase => {
       const replaceSession = async () => {
         await revokeAccountSessionMutations(config.tenants[0].tenantId!, "reader", async () => {});
@@ -133,8 +152,9 @@ describe("persisted agent people endpoint", () => {
         await replaceSession();
         return new Map([[creatorId, people.createdBy]]);
       });
+      if (phase === "final inventory") mocks.assertCurrent.mockResolvedValueOnce(undefined).mockImplementationOnce(replaceSession);
       expect(await request({ recordId })).toMatchObject({ status: 401, body: { code: "unauthorized" } });
-      if (phase !== "projection") expect(mocks.resolve).not.toHaveBeenCalled();
+      if (phase === "generation" || phase === "inventory") expect(mocks.resolve).not.toHaveBeenCalled();
     },
   );
 });

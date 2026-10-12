@@ -51,6 +51,36 @@ afterEach(() => {
 });
 
 describe("authoritative saved agent people responses", () => {
+  it.each([` ${ownerId} `, "Opaque_ABC:/?😀", "J\u030c", " "])(
+    "preserves a non-GUID source reference %j without lookup or saved-name attribution", async id => {
+      const original: UnifiedAgentRecord = { ...record, people: { owner: {
+        ...savedPerson, objectId: id.trim() === ownerId ? ownerId : id.toLowerCase(),
+      } }, powerPlatformResource: { ...record.powerPlatformResource!, createdBy: null, details: { ownerId: id } } };
+      const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({ people: {}, changed: false });
+      const { result } = renderHook(() => useAgentPeople(original, ["AgentControl.Viewer"]), { wrapper: authorized });
+      expect(result.current.people.owner).toEqual({ id, invalidId: true, status: "unverified" });
+      expect(result.current.canRetry).toBe(false);
+      await act(async () => result.current.retry());
+      expect(lookup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("permits lookup of documented Graph GUID references without RFC version or variant restrictions", async () => {
+    const objectId = "ABCDEF01-2345-6789-CDEF-0123456789AB";
+    const original: UnifiedAgentRecord = { ...record,
+      powerPlatformResource: { ...record.powerPlatformResource!, createdBy: null, details: { ownerId: objectId } } };
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({
+      people: { owner: { ...savedPerson, objectId: objectId.toLowerCase() } }, changed: true,
+    });
+    const { result } = renderHook(() => useAgentPeople(original, ["AgentControl.Viewer"]), { wrapper: authorized });
+    expect(result.current.people.owner?.invalidId).toBe(false);
+    expect(result.current.canRetry).toBe(true);
+    await act(async () => result.current.retry());
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(result.current.people.owner?.displayName).toBe("Saved owner");
+    expect(result.current.error).toBeUndefined();
+  });
+
   it.each(["resolved", "invalid", "absent", "denied", "no-role"] as const)(
     "does not admit lookup when its action is unavailable: %s", async state => {
       let allowed = state !== "denied";

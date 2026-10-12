@@ -90,6 +90,16 @@ function pendingAccessUpdate() {
 }
 
 describe("AccessAssignmentModal scope-dependent directory resolution", () => {
+  it("keeps an explicit unknown scope unknown despite saved principal entries", async () => {
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals");
+    renderAccessModal(true, { initialStatus: "futureScope" });
+    await act(async () => {});
+    expect(screen.getByText("Current: Unknown")).toBeVisible();
+    expect(screen.getByRole("radio", { name: /Specific users or groups/ })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("admits initial directory resolution once during Strict Mode effect replay", async () => {
     const request = pendingDirectoryLookup();
     const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockReturnValue(request.promise);

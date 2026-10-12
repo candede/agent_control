@@ -1529,6 +1529,60 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onSetPackageBlocked).toHaveBeenCalledExactlyOnceWith(record.packages[0], false);
   });
 
+  it.each((["availability", "installation"] as const).flatMap(target => [
+    { scope: "deployedToAll", principals: [] },
+    { scope: "deployedToNone", principals: [{ resourceType: "group", resourceId: " Exact_Opaque_Group " }] },
+    { scope: "some", principals: [] },
+  ].map(untouched => ({ target, ...untouched }))))(
+    "blocks $target editing that cannot preserve untouched $scope assignments, without blocking inverse or block controls",
+    async ({ target, scope, principals }) => {
+      const detail = {
+        ...record.packages[0], availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+        [target === "availability" ? "deployedTo" : "availableTo"]: scope,
+        [target === "availability" ? "acquireUsersAndGroups" : "allowedUsersAndGroups"]: principals,
+      };
+      const { props, update } = renderDetail({ activeTab: "controls", packageDetail: detail });
+      if (target === "installation") fireEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+      expect(screen.getByText(/collection-only PATCH cannot preserve the saved/)).toBeVisible();
+      const apply = screen.getByRole("button", { name: "Apply" });
+      expect(apply).toBeDisabled();
+      fireEvent.click(apply);
+      expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Block Package one (package-1)" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: target === "availability" ? /^Installed for/ : /^Available to/ }));
+      expect(screen.getByRole("radio", { name: /No users/ })).toBeEnabled();
+      fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
+      expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: target === "availability" ? /^Available to/ : /^Installed for/ }));
+      update({ packageDetail: { ...detail,
+        [target === "availability" ? "deployedTo" : "availableTo"]: "none",
+        [target === "availability" ? "acquireUsersAndGroups" : "allowedUsersAndGroups"]: [],
+      } });
+      expect(screen.queryByText(/collection-only PATCH cannot preserve the saved/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+    },
+  );
+
+  it("does not claim to resolve a scope-restricted draft and resumes directory resolution after the untouched scope recovers", async () => {
+    const principal: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "11111111-1111-4111-8111-111111111111", displayName: "Assigned user", principalKind: "user",
+    };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: [principal] });
+    const detail = {
+      ...record.packages[0], availableTo: "some", deployedTo: "all",
+      allowedUsersAndGroups: [principal], acquireUsersAndGroups: [],
+    };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail }, capabilitiesWithDirectory());
+    await act(async () => {});
+    expect(resolve).not.toHaveBeenCalled();
+    expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
+    expect(screen.getByText(principal.resourceId, { exact: true })).toBeVisible();
+    update({ packageDetail: { ...detail, deployedTo: "none" } }, capabilitiesWithDirectory());
+    expect(await screen.findByText(principal.displayName, { exact: true })).toBeVisible();
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+  });
+
   it("edits availability and installation directly, preserving their separate drafts across the main tabs", async () => {
     const { props } = renderDetail({ packageDetail: { ...record.packages[0], availableTo: "all", deployedTo: "none" } });
     await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
@@ -2421,7 +2475,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(onQuarantineJobChange).toHaveBeenCalledOnce();
   });
 
-  it("does not retire a detail quarantine receipt for equivalent native GUID casing", async () => {
+  it("does not associate a detail quarantine receipt with a case-changed opaque resource GUID", async () => {
     const observed = observedRecord();
     const nativeId = "abcdefab-2222-4222-8222-222222222222";
     observed.powerPlatformResource = { ...observed.powerPlatformResource!, nativeId };
@@ -2436,17 +2490,19 @@ describe("UnifiedAgentDetailModal", () => {
     const submitted = deferred<api.QuarantineJob>();
     vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
     vi.mocked(api.submitQuarantine).mockReturnValue(submitted.promise);
-    const { update } = renderDetail({ record: observed, activeTab: "controls" });
+    const onQuarantineJobChange = vi.fn();
+    const { update } = renderDetail({ record: observed, activeTab: "controls", onQuarantineJobChange });
     await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
     const confirmation = screen.getByRole("dialog", { name: "Quarantine 1 agent" });
     await userEvent.click(within(confirmation).getByRole("checkbox"));
     await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
     const signal = vi.mocked(api.submitQuarantine).mock.calls[0][2]?.signal;
     update({ record: { ...observed, powerPlatformResource: { ...observed.powerPlatformResource!, nativeId: nativeId.toUpperCase() } } });
-    expect(signal?.aborted).toBe(false);
-    expect(screen.getByRole("dialog", { name: "Quarantine 1 agent" })).toBe(confirmation);
+    expect(signal?.aborted).toBe(true);
+    expect(screen.queryByRole("dialog", { name: "Quarantine 1 agent" })).not.toBeInTheDocument();
     await act(async () => submitted.resolve(job));
-    expect(screen.getByText("Quarantine job: Succeeded")).toBeVisible();
+    expect(screen.queryByText("Quarantine job: Succeeded")).not.toBeInTheDocument();
+    expect(onQuarantineJobChange).not.toHaveBeenCalled();
     expect(api.submitQuarantine).toHaveBeenCalledOnce();
   });
 

@@ -13,15 +13,16 @@ export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlat
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
 import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
-import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
+import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineReconciliationResult } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
+import { parseWorkbenchMetadataJson, workbenchMetadataMaximumBytes } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentInventoryUnavailable, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
 import { encodeInventoryFacet, inventoryFacetFields, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
 export type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
 import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 export type { AgentResponsibilityPage } from "../../../backend/src/types/agentResponsibility";
-import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
+import type { AgentUsageAuditAction, AuditActor, InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
 export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
@@ -39,7 +40,7 @@ export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, P
 export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 export { automaticDataSyncSourceIds, dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
-export type { QuarantineAction, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
+export type { QuarantineAction, QuarantineJob, QuarantineReconciliationResult } from "../../../backend/src/types/copilotStudioQuarantine";
 
 export type QuarantineStatusView = {
   target: { resourceNativeId: string; displayName: string; environmentId: string; botId: string };
@@ -175,6 +176,7 @@ export type BulkJobStatus = "queued" | "running" | "waiting_authorization" | "su
 
 type BulkActionJobBase = {
   id: string;
+  isCanary?: true;
   status: BulkJobStatus;
   cancelRequested?: true;
   canResume: boolean;
@@ -267,7 +269,7 @@ type AuditEventBase = {
   scope: AuditScope;
   agentId: string;
   agentDisplayName?: string;
-  actor: SessionUser;
+  actor: AuditActor;
   startedAt: string;
   completedAt?: string;
   status: AuditStatus;
@@ -305,6 +307,11 @@ type AuditRequestContext = {
   signal?: AbortSignal;
 };
 
+function safeRequestId(value: unknown) {
+  return typeof value === "string" && value.length > 0 && value.length <= 128
+    && /^[A-Za-z0-9]/.test(value) && !/[^A-Za-z0-9_-]/.test(value) ? value : undefined;
+}
+
 export class ApiError extends Error {
   details?: { reason?: "expired" | "unavailable" | "changed" };
   retryAfterSeconds?: number;
@@ -323,11 +330,11 @@ export class ApiError extends Error {
     super(message);
     this.status = status;
     this.code = code;
-    this.requestId = options.requestId;
+    this.requestId = safeRequestId(options.requestId);
     this.type = options.type;
     this.kind = options.kind ?? "problem";
-    this.retryAfterSeconds = options.retryAfterSeconds;
-    this.details = options.details;
+    this.retryAfterSeconds = typeof options.retryAfterSeconds === "number"
+      && Number.isSafeInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 ? options.retryAfterSeconds : undefined;
   }
 
   get authenticationExpired() {
@@ -417,7 +424,50 @@ function validCheckProgress(value: unknown): value is CapabilityCheckProgress {
 }
 
 export function getWorkbenchMetadata(options: { signal?: AbortSignal } = {}) {
-  return request<WorkbenchMetadata>("/api/workbench/metadata", { signal: options.signal });
+  return requestBody("/api/workbench/metadata", { signal: options.signal, headers: { Accept: "application/json" } },
+    response => readWorkbenchMetadata(response, options.signal));
+}
+
+async function readWorkbenchMetadata(response: Response, signal?: AbortSignal): Promise<WorkbenchMetadata> {
+  const invalid = () => new ApiError(response.status, "invalid_response", "The server returned invalid workbench metadata.", {
+    requestId: response.headers.get("X-Request-ID") ?? undefined,
+  });
+  if (!response.body) throw invalid();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decode = (bytes?: Uint8Array, stream = false) => {
+    try { return decoder.decode(bytes, { stream }); }
+    catch { throw invalid(); }
+  };
+  let text = "", bytes = 0, cancelled = false;
+  const cancel = () => {
+    if (!cancelled) { cancelled = true; void reader.cancel().catch(() => undefined); }
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      const chunk = await reader.read();
+      signal?.throwIfAborted();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > workbenchMetadataMaximumBytes) throw invalid();
+      text += decode(chunk.value, true);
+    }
+    text += decode();
+    signal?.throwIfAborted();
+    try { return parseWorkbenchMetadataJson(text); }
+    catch (error) {
+      if (error instanceof SyntaxError) throw invalid();
+      throw error;
+    }
+  } catch (error) {
+    cancel();
+    throw error;
+  } finally {
+    reader.releaseLock();
+    signal?.removeEventListener("abort", cancel);
+  }
 }
 
 export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
@@ -517,7 +567,7 @@ export function getInventoryFacets(selectionId: string, field: InventoryFacetFie
       `/api/agent-inventory/${encodeURIComponent(recordId)}/children?${params}`, { signal: options.signal });
   }
 
-export function getInventorySections(selectionId: string, recordId: string, member: InventoryMember,
+export function getInventorySections(selectionId: string, recordId: string, member: Pick<InventoryMember, "source_scope_id" | "source_identity"> & Partial<InventoryMember>,
   options: { cursor?: string; signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ selectionId, sourceScopeId: member.source_scope_id, sourceIdentity: member.source_identity, limit: "50" });
   if (options.cursor) params.set("cursor", options.cursor);
@@ -663,7 +713,7 @@ export function resumeQuarantineJob(id: string, options: { signal?: AbortSignal 
 }
 
 export function reconcileQuarantineJob(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<QuarantineJob>(`/api/quarantine/jobs/${encodeURIComponent(id)}/reconcile`, {
+  return request<QuarantineReconciliationResult>(`/api/quarantine/jobs/${encodeURIComponent(id)}/reconcile`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
     signal: options.signal,
   });
@@ -1193,8 +1243,8 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
     "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
     {
-      details: reason === "expired" || reason === "unavailable" || reason === "changed" ? { reason } : undefined,
-      requestId: "requestId" in problem && typeof problem.requestId === "string" ? problem.requestId : response.headers.get("X-Request-ID") ?? undefined,
+      requestId: safeRequestId("requestId" in problem ? problem.requestId : undefined)
+        ?? safeRequestId(response.headers.get("X-Request-ID")),
       type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,
       retryAfterSeconds: /^\d+$/.test(response.headers.get("Retry-After") ?? "")
         ? Number(response.headers.get("Retry-After")) : undefined,

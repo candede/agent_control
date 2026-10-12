@@ -16,12 +16,11 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   const [cancellation, setCancellation] = useState<"pending" | "failed">();
   const [retry, setRetry] = useState<"admission" | "status">();
   const [owner, setOwner] = useState<string>();
-  const context = JSON.stringify([preserveOnRefresh ? null : selectionId, kind, ids]);
-  const withdrawn = disabled && !preserveOnRefresh;
-  const visibleStatus = !withdrawn && owner === context ? status : undefined, preparing = !withdrawn && owner === context && pending;
-  const cancelling = !withdrawn && owner === context && cancellation === "pending";
-  const cancellationFailed = !withdrawn && owner === context && cancellation === "failed";
-  const retrying = !withdrawn && owner === context ? retry : undefined;
+  const context = JSON.stringify([selectionId?.toLowerCase(), kind, ids]);
+  const visibleStatus = !disabled && owner === context ? status : undefined, preparing = !disabled && owner === context && pending;
+  const cancelling = !disabled && owner === context && cancellation === "pending";
+  const cancellationFailed = !disabled && owner === context && cancellation === "failed";
+  const retrying = !disabled && owner === context ? retry : undefined;
   const controller = useRef<AbortController | undefined>(undefined);
   const operation = useRef<"preparing" | "checking" | "cancelling" | undefined>(undefined);
   const attempt = useRef<{ input: OfficialReportExportRequest; id?: string; settled: boolean } | undefined>(undefined);
@@ -86,7 +85,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
         const next = await reportExportStatus(id, abort.signal);
         if (abort.signal.aborted) return;
         setStatus(next);
-        if (next.status === "failed" && next.error === "selection_invalidated") invalidated();
+        if (next.status === "failed" && ["selection_invalidated", "export_selection_changed"].includes(next.error ?? "")) invalidated();
         if (!["queued", "building"].includes(next.status)) { request.settled = true; break; }
         interval = Math.min(interval + 1000, 10000);
       }
@@ -126,7 +125,8 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
       }
     } catch (cause) {
       if (controller.current === cancelled && !cancelled.signal.aborted) {
-        if (cause instanceof ApiError && cause.code === "selection_invalidated") {
+        if (cause instanceof ApiError && ["selection_invalidated", "export_selection_changed"].includes(cause.code)) {
+          attempt.current = undefined;
           setStatus(undefined); setCancellation(undefined);
           invalidated(cause);
         } else if (exportUnavailable(cause)) {
@@ -159,13 +159,13 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
       if (current.status === "ready" && Date.parse(current.expiresAt) > Date.now() && anchor.isConnected) {
         nativeDownload.current = current.id;
         try { anchor.click(); } finally { nativeDownload.current = undefined; }
-      } else if (current.error === "selection_invalidated") {
+      } else if (["selection_invalidated", "export_selection_changed"].includes(current.error ?? "")) {
         invalidated();
       }
     } catch (cause) {
       if (!abort.signal.aborted) {
         setStatus(undefined);
-        if (cause instanceof ApiError && cause.code === "selection_invalidated") invalidated(cause);
+        if (cause instanceof ApiError && ["selection_invalidated", "export_selection_changed"].includes(cause.code)) invalidated();
         else {
           if (attempt.current) attempt.current.settled = exportUnavailable(cause);
           setRetry(exportUnavailable(cause) ? undefined : "status");

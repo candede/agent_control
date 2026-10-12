@@ -1,4 +1,6 @@
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
+import { AppError } from "../errors.js";
 import { GraphAgentIdentityClient } from "./graphAgentIdentity.js";
 import type { FetchLike } from "./graphPackages.js";
 import { verifiedAgentIdentityClientIdProvenance, type VerifiedAgentIdentityIds } from "../types/agentInvestigations.js";
@@ -31,6 +33,15 @@ describe("typed Graph agent identity", () => {
       await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", id, signal(), async () => {}))
         .resolves.toEqual(resolved);
     }
+  });
+
+  it("canonicalizes Graph GUIDs without imposing RFC version or variant bits", async () => {
+    const candidate = "ABCDEFAB-CDEF-0000-0000-ABCDEFABCDEF";
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ id: candidate, servicePrincipalType: "ServiceIdentity" }));
+    await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", candidate, signal(), async () => {}))
+      .resolves.toEqual({ ...resolved, objectId: candidate.toLowerCase(), applicationId: candidate.toLowerCase() });
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      `https://graph.microsoft.com/v1.0/servicePrincipals/${candidate.toLowerCase()}/microsoft.graph.agentIdentity?$select=id,servicePrincipalType`);
   });
 
   it.each([undefined, null, appId])("uses the typed identity ID without @odata.type, ignoring unselected appId %s", async ownAppId => {
@@ -82,6 +93,16 @@ describe("typed Graph agent identity", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("retains safe not-found request diagnostics without leaking provider body messages", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ error: { code: "NotFound", message: "private provider details" } }, {
+      status: 404, headers: { "request-id": "fixture-request", "Retry-After": "30" },
+    }));
+    const error = await new GraphAgentIdentityClient(fetcher).resolve("fixture", id, signal(), async () => {}).catch(error => error);
+    expect(error).toMatchObject({ status: 404, code: "agent_identity_not_found",
+      details: { httpStatus: 404, providerErrorCode: "NotFound", correlationId: "fixture-request", retryAfterMs: 30_000 } });
+    expect(JSON.stringify(error)).not.toContain("private provider details");
+  });
+
   it("rechecks admission on the single bounded retry and respects long Retry-After without retrying early", async () => {
     const wait = vi.fn(async () => undefined);
     const before = vi.fn(async () => undefined);
@@ -114,6 +135,45 @@ describe("typed Graph agent identity", () => {
     await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", id, pending.signal, async () => {})).rejects.toBeDefined();
   });
 
+  it.each(["admission", "retry wait"].flatMap(stage => ["resolve", "reject"].map(settlement => ({ stage, settlement }))))(
+    "bounds non-cooperative $stage and observes late $settlement after cancellation", async ({ stage, settlement }) => {
+      const caller = new AbortController();
+      const reason = new DOMException("cancelled", "AbortError");
+      let complete!: () => void;
+      let fail!: (error: Error) => void;
+      const hook = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+      const pending = vi.fn(() => hook);
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({}, { status: 503 }));
+      const client = new GraphAgentIdentityClient(fetcher, stage === "retry wait" ? pending : async () => {});
+      const running = client.resolve("fixture", id, caller.signal, stage === "admission" ? pending : async () => {}).catch(error => error);
+      try {
+        await vi.waitFor(() => expect(pending).toHaveBeenCalledOnce());
+        caller.abort(reason);
+        expect(await Promise.race([running, setImmediate("still pending")])).toBe(reason);
+      } finally {
+        if (settlement === "reject") fail(new Error("private late hook rejection"));
+        else complete();
+        await running;
+        await setImmediate();
+      }
+      expect(fetcher).toHaveBeenCalledTimes(stage === "admission" ? 0 : 1);
+    },
+  );
+
+  it.each(["admission", "retry wait"] as const)("prioritizes current authority when %s rejects", async stage => {
+    let current = true;
+    const reason = AppError.unauthorized("Authority changed");
+    const pending = async () => {
+      current = false;
+      throw new Error("private hook rejection");
+    };
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({}, { status: 503 }));
+    const client = new GraphAgentIdentityClient(fetcher, stage === "retry wait" ? pending : async () => {});
+    await expect(client.resolve("fixture", id, new AbortController().signal, stage === "admission" ? pending : async () => {},
+      () => { if (!current) throw reason; })).rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledTimes(stage === "admission" ? 0 : 1);
+  });
+
   it.each(["headers", "body"] as const)("reports a local %s timeout as a provider timeout, not a resolution deadline", async stage => {
     const deadline = new AbortController();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
@@ -133,6 +193,92 @@ describe("typed Graph agent identity", () => {
       expect(fetcher).toHaveBeenCalledOnce();
       if (stage === "body") expect(cancel).toHaveBeenCalledOnce();
     } finally { timeout.mockRestore(); }
+  });
+
+  it.each(["timeout", "cancellation"] as const)("bounds a non-cooperative fetch on %s and cancels its late body", async mode => {
+    const deadline = new AbortController();
+    const caller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let complete!: (response: Response) => void;
+    const response = new Promise<Response>(resolve => { complete = resolve; });
+    const fetcher = vi.fn<FetchLike>(() => response);
+    const cancel = vi.fn();
+    const reason = new DOMException(mode, mode === "timeout" ? "TimeoutError" : "AbortError");
+    const pending = new GraphAgentIdentityClient(fetcher).resolve("fixture", id, caller.signal, async () => {}).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      (mode === "timeout" ? deadline : caller).abort(reason);
+      const result = await Promise.race([pending, setImmediate("still pending")]);
+      if (mode === "timeout") expect(result).toMatchObject({ status: 504, code: "provider_timeout" });
+      else expect(result).toBe(reason);
+    } finally {
+      complete(new Response(new ReadableStream({ cancel })));
+      await pending;
+      await setImmediate();
+      timeout.mockRestore();
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("observes a late transport rejection after caller cancellation", async () => {
+    const caller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    let fail!: (error: Error) => void;
+    const response = new Promise<Response>((_resolve, reject) => { fail = reject; });
+    const fetcher = vi.fn<FetchLike>(() => response);
+    const pending = new GraphAgentIdentityClient(fetcher).resolve("fixture", id, caller.signal, async () => {}).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      caller.abort(reason);
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+    } finally {
+      fail(new TypeError("private late transport details"));
+      await pending;
+      await setImmediate();
+    }
+  });
+
+  it("checks synchronous authority after asynchronous attempt admission and before dispatch", async () => {
+    const fetcher = vi.fn<FetchLike>();
+    const reason = AppError.unauthorized("Authority changed");
+    let current = true;
+    const before = async () => { queueMicrotask(() => { current = false; }); };
+    const assertCurrent = () => { if (!current) throw reason; };
+    await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", id, signal(), before, assertCurrent)).rejects.toBe(reason);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([200, 403, 404, 429])("rejects changed authority after HTTP %s headers without reading the body", async status => {
+    let current = true;
+    const reason = AppError.unauthorized("Authority changed");
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async () => {
+      current = false;
+      return new Response(new ReadableStream({ cancel }), { status });
+    });
+    const caller = new AbortController();
+    const pending = new GraphAgentIdentityClient(fetcher).resolve("fixture", id, caller.signal, async () => {},
+      () => { if (!current) throw reason; }).catch(error => error);
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+    } finally { caller.abort(); await pending; }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["headers", "body"] as const)("prioritizes changed authority over a %s failure", async stage => {
+    let current = true;
+    const reason = AppError.unauthorized("Authority changed");
+    const fetcher = vi.fn<FetchLike>(async () => {
+      if (stage === "headers") {
+        current = false;
+        throw new TypeError("private transport details");
+      }
+      return new Response(new ReadableStream({
+        pull(controller) { current = false; controller.error(new TypeError("private transport details")); },
+      }, { highWaterMark: 0 }));
+    });
+    await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", id, signal(), async () => {},
+      () => { if (!current) throw reason; })).rejects.toBe(reason);
   });
 
   it.each([401, 403, 404, 429])("retains HTTP %s evidence when the error body times out", async status => {

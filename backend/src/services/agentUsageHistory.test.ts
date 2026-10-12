@@ -5,18 +5,21 @@ import { inventorySelectionFixture } from "../../scripts/inventoryFixtures.js";
 import { OfficialReportImports } from "../db/officialReportImports.js";
 import { deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent } from "../db/agentUsageTestSupport.js";
 import { OfficialAgentUsage } from "./officialAgentUsage.js";
-import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
+import { LargeTenantUsersReports, reportQuery, type ReportReadContext } from "./largeTenantUsersReports.js";
+import { readAgentHistory } from "./officialAgentHistory.js";
+import type { UserSourceMetadata } from "../types/userSources.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>, reports: LargeTenantUsersReports;
-beforeAll(async () => {
-  fixture = await testDatabase();
-  reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-agent-history-regression-secret", 35);
-}, 30_000);
 afterEach(() => vi.restoreAllMocks());
-afterAll(async () => { await fixture?.close(); });
 const dates = (date: string) => (_kind: string, csv: string) => csv.replaceAll(/2026-09-\d{2}/g, date);
 
 describe("exact agent report history", () => {
+  beforeAll(async () => {
+    fixture = await testDatabase();
+    reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-agent-history-regression-secret", 35);
+  }, 30_000);
+  afterAll(async () => { await fixture?.close(); });
+
   it("compares overlapping snapshots without addition and keeps historical drilldown local", async () => {
     const scope = newUsageScope(), [record] = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
     const first = await publishUsageReports(fixture.runtime, scope, 200, (_kind, csv) =>
@@ -66,12 +69,21 @@ describe("exact agent report history", () => {
 
   it("uses upload time only when every retained report lacks date metadata", async () => {
     const scope = newUsageScope(), [record] = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
-    await publishUsageReports(fixture.runtime, scope, 3, dates(""));
-    const latest = await publishUsageReports(fixture.runtime, scope, 4, dates(""));
+    const imported = [await publishUsageReports(fixture.runtime, scope, 0, dates("")),
+      await publishUsageReports(fixture.runtime, scope, 4, dates(""))];
+    const latest = [...imported].sort((left, right) => left.setId < right.setId ? -1 : 1)[0];
+    await fixture.operator.query(`UPDATE official_usage_sets
+      SET accepted_at=clock_timestamp()-CASE WHEN id=$2::uuid THEN interval '1 second' ELSE interval '2 seconds' END
+      WHERE tenant_id=$1`, [scope.tenantId, latest.setId]);
     const selected = await inventorySelectionFixture(fixture.runtime, scope), usage = new OfficialAgentUsage(reports, selected.queries);
     const history = await usage.history(selected.selection.id, selected.identity, record.id, { limit: 1 });
     expect(history.latestReportSetId).toBe(latest.setId);
+    expect(history.latestReported).toMatchObject({ setId: latest.setId, responses: imported[0] === latest ? 0 : 4 });
+    expect(history.value[0].setId).not.toBe(latest.setId);
     expect(history.value).toMatchObject([{ reportingStart: null, reportingEnd: null }]);
+    const next = await usage.history(selected.selection.id, selected.identity, record.id, { limit: 1, cursor: history.page.nextCursor! });
+    expect(next.latestReported).toEqual(history.latestReported);
+    expect(next.latestReportSetId).toBe(history.latestReportSetId);
   });
 
   it("preserves zero, missing, and undated reports and does not use bridge-only agent matches", async () => {
@@ -168,5 +180,48 @@ describe("exact agent report history", () => {
     const history = await usage.history(current.selection.id, current.identity, record.id);
     expect(history.value).toMatchObject([{ setId: corrected.setId, responses: 15 }]);
     expect(history.value).toHaveLength(1);
+  });
+});
+
+describe("agent history discovery query", () => {
+  it("orders undated discovery by acceptance time without changing the page's UUID boundary", async () => {
+    const database = new pg.Pool({ max: 4 }), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
+    const query = vi.spyOn(client, "query");
+    const source = (source: UserSourceMetadata["source"]): UserSourceMetadata => ({
+      source, generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
+      attemptedAt: null, attemptStatus: null, attemptObservedCount: null, errorCode: null, message: null,
+      rowCount: null, state: "unavailable", reportRefreshDate: null, period: null, reportVersion: null,
+    });
+    const reportMetadata: ReportReadContext["report"] = { setId: null, activeSetId: null, activeRevision: "1", historyRevision: "2", historyEpoch: "0",
+      availability: "not_selected", staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: null,
+      acceptedAt: null, expiresAt: null, reportingPeriod: null, lineages: [] };
+    const context: ReportReadContext = {
+      identity: { tenantId: "history-unit-tenant", principalId: "history-unit-principal", authorizationHash: "viewer", sessionEpoch: "1" },
+      tokenMode: "delegated", endpoint: "official_agents", query: reportQuery("official_agents"), queryHash: "query",
+      evaluatedAt: new Date(), metadata: { directory: source("directory"), app_activity: source("app_activity") }, report: reportMetadata,
+      selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1",
+        evaluatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() },
+    };
+    const item = { id: "ffffffff-ffff-4fff-8fff-ffffffffffff", reporting_start: null, reporting_end: null,
+      period_provenance: "unknown", accepted_at: "2026-10-01T00:00:00Z", responses: "4", association_count: "1", last_activity: null, page_key: null };
+    const latest = { ...item, id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", accepted_at: "2026-10-02T00:00:00Z", responses: "0" };
+    query.mockImplementationOnce(async () => ({ command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] }))
+      .mockImplementationOnce(async () => ({ command: "SELECT", rowCount: 1, oid: 0, fields: [],
+        rows: [{ item, latest, latest_set_id: latest.id, total: "2" }] }));
+    const localReports = new LargeTenantUsersReports(database, "synthetic-agent-history-unit-regression-secret", 35);
+    const target = { id: "canonical-agent", context: { selectionId: context.selection.id, reportSetId: null,
+      usageRevision: "usage", inventoryRevision: "inventory", reports: reportMetadata } };
+    try {
+      const history = await readAgentHistory(client, localReports, context, target, "agent:canonical-agent", { limit: 1 });
+      expect(history.latestReported).toMatchObject({ setId: latest.id, responses: 0, lastActivityDateUtc: null });
+      const sql = String(query.mock.calls[1][0]);
+      expect(sql).toMatch(/WHERE responses IS NOT NULL\s+ORDER BY \(page_key IS NULL\)::int,page_key COLLATE "C" DESC,\s+CASE WHEN page_key IS NULL THEN accepted_at END DESC,id DESC/);
+      expect(sql).toContain("COALESCE(page_key,'') COLLATE \"C\",id::text COLLATE \"C\"");
+      expect(sql).not.toContain("userAgents");
+      expect(query.mock.calls[1][1]).toEqual([context.identity.tenantId, "2", context.identity.principalId,
+        target.id, context.evaluatedAt, null, "", "", 2]);
+      expect(database.connect).not.toHaveBeenCalled();
+    } finally { await database.end(); }
   });
 });

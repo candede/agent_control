@@ -31,21 +31,18 @@ const sorts = {
   history: ["reportingPeriod", "acceptedAt"], overview: ["name", "lastActivity"], unresolved: ["name", "responses"], plans: ["name"], observations: ["name"],
 } as const;
 export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportQuery {
-  if (!(endpoint in sorts) || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
-  if (endpoint === "adoption" && Object.keys(input).some(key => !["setId", "search", "company", "department", "adoptionChamps", "adoptionAgents", "sort", "order",
-    "lowResponseThreshold", "inactiveDays", "activityWindowDays"].includes(key))) throw new SelectionError("invalid_cursor");
-  for (const key of ["adoptionChamps", "adoptionAgents"] as const) {
-    if (input[key] !== undefined && (endpoint !== "adoption" || !["with", "without"].includes(input[key]))) throw new SelectionError("invalid_cursor");
-  }
+  if (!Object.hasOwn(sorts, endpoint) || !input || typeof input !== "object" || Array.isArray(input)
+    || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
   const query = { ...input };
   for (const key of ["company", "department", "creatorType", "agentId", "username"] as const) {
     const value = query[key];
     if (value !== undefined && !(value === null && ["company", "department"].includes(key))
       && (typeof value !== "string" || value.length > (key === "agentId" || key === "username" ? 512 : 256)
         || (key === "agentId" || key === "username") && !value.trim()
+        || (key === "agentId" || key === "username") && /[\p{Cc}\p{Cs}]/u.test(value)
         || /[\0\r\n]/.test(value))) throw new SelectionError("invalid_cursor");
   }
-  if (query.setId !== undefined) reportUuid(query.setId);
+  if (query.setId !== undefined) query.setId = reportUuid(query.setId).toLowerCase();
   for (const [key, values] of [
     ["scope", ["history", "selected"]], ["entitlement", ["paid_active", "paid_inactive", "no_paid", "unknown"]],
     ["serviceState", ["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"]],
@@ -56,7 +53,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
   if (query.responsesOnly !== undefined && typeof query.responsesOnly !== "boolean") throw new SelectionError("invalid_cursor");
   for (const key of ["startDate", "endDate"] as const) {
     const value = query[key];
-    if (value !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))
+    if (value !== undefined && (typeof value !== "string" || !/^(?!0000-)\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))
       || new Date(value).toISOString().slice(0, 10) !== value)) throw new SelectionError("invalid_cursor");
   }
   if (query.startDate && query.endDate && query.startDate > query.endDate) throw new SelectionError("invalid_cursor");
@@ -64,8 +61,8 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
     if (query[key] !== undefined && (!Number.isSafeInteger(query[key]) || query[key]! < 1 || query[key]! > maximum)) throw new SelectionError("invalid_cursor");
     query[key] ??= fallback;
   }
+  if (query.sort !== undefined && !(sorts[endpoint] as readonly string[]).includes(query.sort)) throw new SelectionError("invalid_cursor");
   query.sort ??= endpoint === "history" ? "reportingPeriod" : endpoint === "official_agents" ? "responses" : "name";
-  if (!(sorts[endpoint] as readonly string[]).includes(query.sort)) throw new SelectionError("invalid_cursor");
   query.order ??= endpoint === "history" || endpoint === "official_agents" ? "desc" : "asc";
   if (query.search !== undefined) query.search = reportSearch(query.search);
   // A accepted filter must be meaningful on the chosen endpoint, never ignored.
@@ -476,6 +473,12 @@ export class LargeTenantUsersReports {
       await client.query("SELECT set_config('enable_nestloop','on',true),set_config('enable_mergejoin','on',true)");
       const nonNull = (options.exportAfter !== undefined || ["name", "upn", "service"].includes(q.sort ?? "name"))
         && (!edge || edge.nullRank === 0 && edge.key !== null);
+      const nameOrder = options.exportAfter === undefined && (q.sort ?? "name") === "name";
+      const prefixBoundary = nameOrder && edge ? ` AND left(page_key,128) COLLATE "C" ${direction === "DESC" ? "<=" : ">="}
+        left($${values.push(edge.key)}::text,128) COLLATE "C"` : "";
+      const candidateOrder = nonNull
+        ? `${nameOrder ? `left(page_key,128) COLLATE "C" ${direction},` : ""}page_key COLLATE "C" ${direction},identity COLLATE "C" ${identityDirection}`
+        : order;
       const candidate = options.exactIds ? `SELECT generation_id,identity,upn,upn_key,display_name,sort_key,company,department,
         account_enabled,user_type,employee_type,service_state,plan_count FROM directory_user_rows
         WHERE generation_id=$1 AND identity=ANY($${exactParameter}::text[]) LIMIT 100`
@@ -487,8 +490,8 @@ export class LargeTenantUsersReports {
             WHEN d.service_state IN ('enabled','warning','partially_enabled') THEN 'paid_active'
             WHEN d.plan_count=0 THEN 'no_paid' ELSE 'paid_inactive' END AS entitlement
         FROM directory_user_rows d WHERE d.generation_id=$1
-      ) dataset WHERE ${where}) selected WHERE ${nonNull ? nonNullBoundary : boundary}
-        ORDER BY ${nonNull ? `page_key COLLATE "C" ${direction},identity COLLATE "C" ${identityDirection}` : order} LIMIT $${limitParameter}`;
+      ) dataset WHERE ${where}) selected WHERE ${nonNull ? nonNullBoundary : boundary}${prefixBoundary}
+        ORDER BY ${candidateOrder} LIMIT $${limitParameter}`;
       const relation = selectedDirectoryReportRelationsSql(candidate, `$${values.push(rootCounts.unresolved)}`);
       base = `WITH dataset AS (${relation} ${sql.slice(reportRelationsSql.length)}),
         ordered AS (SELECT *,${key} AS page_key FROM dataset WHERE ${where})`;
@@ -511,6 +514,7 @@ export class LargeTenantUsersReports {
         left($${values.push(edge.key)}::text,128) COLLATE "C"` : "";
       const candidate = `SELECT * FROM (
         SELECT f.${identityColumn} AS identity,f.identity_key,f.payload_hash,
+          lower(btrim(f.username) COLLATE "default") COLLATE "C" AS directory_identity_key,
           lower(normalize(${nameColumn},NFKC) COLLATE "default") AS page_key
         FROM official_usage_row_facts f WHERE f.tenant_id=$4 AND f.kind='${reportedKind}'
           AND EXISTS(SELECT 1 FROM official_usage_set_versions m JOIN official_usage_version_rows r
@@ -627,7 +631,7 @@ export class LargeTenantUsersReports {
       const counts = (await client.query(`${base} SELECT count(*)::text AS filtered,
         (SELECT count(*) FROM (SELECT ${facetKey} FROM dataset GROUP BY ${facetKey}) all_options)::text AS total FROM ordered`, values)).rows[0];
       const expected = { identity, endpoint: `facets:${options.field}`, selectionId: id, revision: context.selection.revision,
-        queryHash: digest(`${context.queryHash}:${options.field}:${options.search ?? ""}`) };
+        queryHash: digest(`${context.queryHash}:${options.field}:${search}`) };
       const cursor = options.cursor ? this.codec.decode(options.cursor, expected) : undefined, previous = cursor?.direction === "previous";
       const edge = await this.cursorBoundary(client, base, values, cursor?.boundary);
       let boundary = "true";
@@ -696,7 +700,8 @@ export class LargeTenantUsersReports {
       measuredActivityUsers: counts && (context.report.availability === "active" || context.metadata.app_activity.state === "available") ? exactCount(counts.measured) : null,
       needsAttentionUsers: counts ? exactCount(counts.attention) : null, unknownMetricsUsers: counts ? exactCount(counts.unknown) : null,
       unresolvedIdentities: exactCount(source.unresolved), activeWithoutPaidUsers: directoryCurrent ? exactCount(source.unpaid) : null,
-      paidActiveReportUsers: directoryCurrent ? exactCount(source.paid) : null, unknownLicenseActiveReportUsers: exactCount(source.unknown_license),
+      paidActiveReportUsers: directoryCurrent ? exactCount(source.paid) : null,
+      unknownLicenseActiveReportUsers: exactCount(directoryCurrent ? source.unknown_license : source.active_users),
       reportedResponses: total("agents", source.responses), bridgeResponses: total("userAgents", source.bridge), userReportedResponses: total("users", source.users),
       distinctActiveReportUsers: context.report.setId ? exactCount(source.active_users) : null, licensedOccurrences: total("agents", source.licensed), unlicensedOccurrences: total("agents", source.unlicensed),
       responseReconciliation: metrics.length < 2 ? "not_comparable" : Math.max(...metrics) === Math.min(...metrics) ? "matching" : "mismatch",
@@ -710,26 +715,35 @@ export class LargeTenantUsersReports {
       return { roots: [await this.history.root(client, identity.tenantId, evaluatedAt)], queryValues: { setId: report.setId } };
     });
   }
-  async feedPositiveIdentities(id: string, identity: SelectionIdentity, stages: UserSourceStages, lease: GenerationLease) {
+  async feedPositiveIdentities(id: string, identity: SelectionIdentity, stages: UserSourceStages, lease: GenerationLease,
+    signal?: AbortSignal, assertCurrent?: () => void) {
+    const fence = () => { signal?.throwIfAborted(); assertCurrent?.(); };
+    fence();
     if (lease.tenantId !== identity.tenantId) throw new SelectionError("selection_invalidated");
-    if (!(await this.database.query(`SELECT 1 FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
+    const owned = await this.database.query(`SELECT 1 FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
       WHERE g.id=$1 AND g.owner=$2 AND g.tenant_id=$3 AND s.principal_id=$4 AND g.session_epoch=$5 AND s.source='directory'`,
-    [lease.id, lease.owner, identity.tenantId, identity.principalId, identity.sessionEpoch])).rowCount) throw new SelectionError("selection_invalidated");
-    let after = "";
+    [lease.id, lease.owner, identity.tenantId, identity.principalId, identity.sessionEpoch]);
+    fence();
+    if (!owned.rowCount) throw new SelectionError("selection_invalidated");
+    let after = { key: "", username: "" };
     for (;;) {
       const rows = await this.selections.read(id, identity, async (client, { selection }) => {
+        fence();
         if (selection.endpoint !== "directory_report_inputs") throw new SelectionError("selection_invalidated");
-        return (await client.query(`SELECT DISTINCT f.identity_key COLLATE "C" AS identity_key
+        return (await client.query<{ identity_key: string; username: string }>(`SELECT DISTINCT f.identity_key COLLATE "C" AS identity_key,f.username COLLATE "C" AS username
           FROM official_usage_set_versions m JOIN official_usage_version_rows r ON r.version_id=m.version_id AND r.tenant_id=m.tenant_id AND r.kind=m.kind
           JOIN official_usage_row_facts f ON f.tenant_id=r.tenant_id AND f.kind=r.kind AND f.payload_hash=r.payload_hash
           WHERE m.tenant_id=$1 AND m.set_id=$2 AND f.kind IN ('users','userAgents') AND f.responses>0
-            AND f.identity_key COLLATE "C">$3::text COLLATE "C" ORDER BY 1 LIMIT 250`,
-        [identity.tenantId, selection.query_json.setId, after])).rows;
+            AND (f.identity_key COLLATE "C",f.username COLLATE "C")>($3::text COLLATE "C",$4::text COLLATE "C")
+          ORDER BY 1,2 LIMIT 250`,
+        [identity.tenantId, selection.query_json.setId, after.key, after.username])).rows;
       });
+      fence();
       if (!rows.length) break;
       encodeBatch(rows);
-      await stages.identities(lease, rows.map(row => row.identity_key as string));
-      after = rows.at(-1)!.identity_key;
+      await stages.identities(lease, rows.map(row => row.username));
+      fence();
+      after = { key: rows.at(-1)!.identity_key, username: rows.at(-1)!.username };
     }
   }
 }
@@ -741,7 +755,7 @@ function reportSearch(value: string) {
   if (search.length > 256) throw new SelectionError("invalid_cursor");
   return search;
 }
-function reportSearchSql(expression: string) {
+export function reportSearchSql(expression: string) {
   return `normalize(lower(normalize(${expression},NFKC) COLLATE "default"),NFKC)`;
 }
 function sortKey(sort: NonNullable<ReportQuery["sort"]>, endpoint: ReportEndpoint) {
@@ -781,7 +795,7 @@ function project(endpoint: ReportEndpoint, row: pg.QueryResultRow): ReportRow {
     department: row.department, entitlement: row.entitlement, reportedResponses: nullableCount(row.responses), reportedAgentsUsed: nullableCount(row.agents_used),
     bridgeResponses: nullableCount(row.bridge_responses), relationshipCount: exactCount(row.relationship_count), responseProducingAgentCount: exactCount(row.active_agent_count),
     userLastActivityDateUtc: date(row.user_last_activity), lastActivityDateUtc: date(row.last_activity), missingUserReport: exactCount(row.user_rows) === 0,
-    hasReportMismatch: exactCount(row.user_rows) > 0 && exactCount(row.relationship_count) > 0 && (row.responses !== row.bridge_responses || row.agents_used !== row.relationship_count),
+    hasReportMismatch: exactCount(row.user_rows) > 0 && exactCount(row.relationship_count) > 0 && (row.responses !== row.bridge_responses || row.agents_used !== row.active_agent_count),
     reviewCohort: row.review_cohort, hasActivity: row.has_activity };
   if (endpoint === "official_agents") return { agentId: row.agent_id, agentName: row.name ?? row.agent_id, creatorType: row.creator_type ?? "",
     responses: exactCount(row.responses), responseSource: row.response_source, activeUsers: nullableCount(row.active_users),
@@ -794,7 +808,7 @@ function project(endpoint: ReportEndpoint, row: pg.QueryResultRow): ReportRow {
     username: row.username, responses: exactCount(row.responses), lastActivityDateUtc: date(row.last_activity), identityStatus: "unresolved" };
   if (endpoint === "history") return { id: row.id, bundleId: row.bundle_id, contentHash: row.content_hash, reportingStart: date(row.reporting_start),
     reportingEnd: date(row.reporting_end), periodProvenance: row.period_provenance, supersedesSetId: row.supersedes_set_id,
-    acceptedAt: row.accepted_at.toISOString(), visibility: row.visibility, active: row.active };
+    acceptedAt: row.accepted_at.toISOString(), visibility: row.visibility, active: row.active === true };
   if (endpoint === "overview") return { agentId: row.agent_id, agentName: row.name ?? row.agent_id, observationCount: exactCount(row.observation_count),
     hasResponses: row.has_responses, earliestActivityDateUtc: date(row.earliest_activity), lastActivityDateUtc: date(row.last_activity), active30Days: row.active,
     creatorTypeCount: exactCount(row.creator_type_count), latestSetId: row.latest_set_id, latestAcceptedAt: row.latest_accepted_at.toISOString() };

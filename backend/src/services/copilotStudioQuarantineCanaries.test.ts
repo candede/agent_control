@@ -6,6 +6,7 @@ import { CopilotStudioQuarantineRepository } from "../db/copilotStudioQuarantine
 import { PowerPlatformRefreshJobs } from "../db/powerPlatformRefreshJobs.js";
 import { refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { powerPlatformInventoryRecord } from "./inventoryRecordProjection.js";
+import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotStudioQuarantineCanaryService } from "./copilotStudioQuarantineCanaries.js";
 
@@ -27,23 +28,24 @@ function users(tenantId: string) {
   return { administrator, operator };
 }
 
-async function approvals(administrator: AuthenticatedUser) {
-  const original = await canaries.createApproved(administrator, { target, action: "quarantine", prestate: false, prestateProviderUpdatedAt: "2026-09-09T19:00:00.1234567Z", poststate: true, authority });
-  const restoration = await canaries.createApproved(administrator, { target, action: "unquarantine", prestate: true, prestateProviderUpdatedAt: null, poststate: false, authority });
+async function approvals(administrator: AuthenticatedUser, sourceTarget = target) {
+  const original = await canaries.createApproved(administrator, { target: sourceTarget, action: "quarantine", prestate: false, prestateProviderUpdatedAt: "2026-09-09T19:00:00.1234567Z", poststate: true, authority });
+  const restoration = await canaries.createApproved(administrator, { target: { ...sourceTarget, environmentId: sourceTarget.environmentId.toLowerCase(),
+    botId: sourceTarget.botId.toLowerCase() }, action: "unquarantine", prestate: true, prestateProviderUpdatedAt: null, poststate: false, authority });
   return { original, restoration };
 }
 
-async function seedOperatorInventory(operator: AuthenticatedUser) {
+async function seedOperatorInventory(operator: AuthenticatedUser, sourceTarget = target) {
   const inventory = new PowerPlatformRefreshJobs(fixture.runtime);
   const scope = { tenantId: operator.tenantId!, principalId: operator.homeAccountId };
   const job = await inventory.submit(scope, { idempotencyKey: `canary-operator-${randomUUID()}`, roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
   await inventory.markRunning(scope, job.id);
   await refreshInventoryFixture(fixture.runtime, scope, job.id, "power_platform", [powerPlatformInventoryRecord({
-    tenantId: operator.tenantId!, nativeId: target.resourceNativeId, type: "microsoft.copilotstudio/agents",
-    location: null, displayName: target.displayName, environmentId: target.environmentId, createdAt: null, createdBy: null, lastPublishedAt: null,
+    tenantId: operator.tenantId!, nativeId: sourceTarget.resourceNativeId, type: "microsoft.copilotstudio/agents",
+    location: null, displayName: sourceTarget.displayName, environmentId: sourceTarget.environmentId, createdAt: null, createdBy: null, lastPublishedAt: null,
     sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published",
-    identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: target.resourceNativeId },
-      { kind: "environment_id", value: target.environmentId }, { kind: "cds_bot_id", value: target.botId }], provenance: {}, details: {}, unknownFieldCount: 0,
+    identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: sourceTarget.resourceNativeId },
+      { kind: "environment_id", value: sourceTarget.environmentId }, { kind: "cds_bot_id", value: sourceTarget.botId }], provenance: {}, details: {}, unknownFieldCount: 0,
   })], ["microsoft.copilotstudio/agents"]);
   return (await inventory.getJob(scope, job.id))!.snapshotId!;
 }
@@ -54,7 +56,7 @@ function service(operator: AuthenticatedUser, provider: { getStatus: ReturnType<
   return new CopilotStudioQuarantineCanaryService(canaries, jobs, {} as never, provider as never, dependencies as never);
 }
 
-function provider(conflictBeforeRestoration = false, preserveTimestamp = false) {
+function provider(conflictBeforeRestoration = false, preserveTimestamp = false, providerTarget = target) {
   let state = false;
   let providerUpdatedAt = "2026-09-09T19:00:00.1234567Z";
   let reads = 0;
@@ -62,13 +64,13 @@ function provider(conflictBeforeRestoration = false, preserveTimestamp = false) 
   const getStatus = vi.fn(async () => {
     reads += 1;
     if (conflictBeforeRestoration && writes === 1 && reads === 4) providerUpdatedAt = "2026-09-09T19:00:02Z";
-    return { environmentId: target.environmentId, botId: target.botId, isBotQuarantined: state, lastUpdateTimeUtc: providerUpdatedAt, observedAt: new Date().toISOString(), correlationId: randomUUID() };
+    return { environmentId: providerTarget.environmentId, botId: providerTarget.botId, isBotQuarantined: state, lastUpdateTimeUtc: providerUpdatedAt, observedAt: new Date().toISOString(), correlationId: randomUUID() };
   });
   const setQuarantine = vi.fn(async (_token: string, _target: unknown, requestedState: boolean) => {
     writes += 1;
     state = requestedState;
     if (!preserveTimestamp) providerUpdatedAt = `2026-09-09T19:00:0${writes}Z`;
-    return { environmentId: target.environmentId, botId: target.botId, isBotQuarantined: state, lastUpdateTimeUtc: providerUpdatedAt, observedAt: new Date().toISOString(), correlationId: randomUUID() };
+    return { environmentId: providerTarget.environmentId, botId: providerTarget.botId, isBotQuarantined: state, lastUpdateTimeUtc: providerUpdatedAt, observedAt: new Date().toISOString(), correlationId: randomUUID() };
   });
   return { getStatus, setQuarantine };
 }
@@ -85,6 +87,30 @@ describe.sequential("Copilot Studio quarantine full-cycle canaries", () => {
     expect(result).toMatchObject({ original: { status: "qualified" }, restoration: { status: "qualified" }, qualification: { qualified: true },
       jobs: { original: { status: "succeeded" }, restoration: { status: "succeeded" } } });
     expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(true);
+  });
+
+  it("qualifies source-cased targets and counts older casing-alias evidence only once", async () => {
+    const { administrator, operator } = users(`canary-case-${randomUUID()}`);
+    const source = { ...target, environmentId: `Default-a${randomUUID().slice(1)}`.toUpperCase(), botId: `b${randomUUID().slice(1)}`.toUpperCase() };
+    const canonical = { ...source, environmentId: source.environmentId.toLowerCase(), botId: source.botId.toLowerCase() };
+    const approved = await approvals(administrator, source);
+    await seedOperatorInventory(operator, source);
+    const fakeProvider = provider(false, false, source);
+    await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id))
+      .resolves.toMatchObject({ qualification: { qualified: true } });
+    expect(fakeProvider.setQuarantine.mock.calls.map(call => call[2])).toEqual([true, false]);
+    const scope = { tenantId: operator.tenantId! };
+    expect((await fixture.runtime.query("SELECT target_environment_id,target_bot_id FROM copilot_quarantine_qualifications WHERE tenant_id=$1", [scope.tenantId])).rows)
+      .toEqual([{ target_environment_id: canonical.environmentId, target_bot_id: canonical.botId }]);
+    await fixture.runtime.query(`INSERT INTO copilot_quarantine_qualifications
+      (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,
+       contract_revision,permission_revision,configuration_revision,auth_mode)
+      SELECT gen_random_uuid(),tenant_id,upper(target_environment_id),upper(target_bot_id),original_approval_id,restoration_approval_id,
+        original_job_id,restoration_job_id,contract_revision,permission_revision,configuration_revision,auth_mode
+      FROM copilot_quarantine_qualifications WHERE tenant_id=$1`, [scope.tenantId]);
+    expect(await jobs.isQualified(scope, authority, [source, canonical])).toBe(true);
+    expect(await jobs.isQualified(scope, authority, [{ ...source, botId: randomUUID() }])).toBe(false);
+    expect(await jobs.isQualified(scope, { ...authority, configurationRevision: 2 }, [canonical])).toBe(false);
   });
 
   it("stops before restoration POST and publishes no qualification after timestamp conflict", async () => {
@@ -170,6 +196,28 @@ describe.sequential("Copilot Studio quarantine full-cycle canaries", () => {
       expect.objectContaining({ id: approved.original.id, status: "failed" }),
       expect.objectContaining({ id: approved.restoration.id, status: "failed" }),
     ]));
+    expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
+  });
+
+  it("never offers ordinary resume when an unsent canary pauses and terminal cycle persistence fails", async () => {
+    const { administrator, operator } = users(`canary-paused-${randomUUID()}`);
+    const approved = await approvals(administrator);
+    await seedOperatorInventory(operator);
+    const fakeProvider = provider();
+    fakeProvider.getStatus.mockRejectedValue(new AppError(401, "provider_authorization_error", "Provider authorization expired."));
+    vi.spyOn(canaries, "completeCycle").mockRejectedValue(new Error("Terminal cycle persistence failed"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id))
+      .rejects.toMatchObject({ code: "canary_original_unverified" });
+
+    const original = (await canaries.list(administrator)).value.find(value => value.id === approved.original.id)!;
+    expect(original).toMatchObject({ status: "claimed", jobId: expect.any(String) });
+    expect(await jobs.get({ tenantId: operator.tenantId!, principalId: operator.homeAccountId }, original.jobId!))
+      .toMatchObject({ isCanary: true, status: "waiting_authorization", canResume: false,
+        results: [expect.objectContaining({ status: "queued" })] });
+    expect(fakeProvider.setQuarantine).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledOnce();
     expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
   });
 

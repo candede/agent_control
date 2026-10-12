@@ -5,6 +5,7 @@ import { bootstrap, initializeSchema, grantRuntime } from "./database.js";
 import { closeFixtureResources } from "./fixtureSupport.js";
 import { prepareTestSchemaTemplate } from "./testDatabaseTemplate.js";
 import { verifySchema } from "../src/db/schema.js";
+import { loadOperationalState } from "../src/services/operationalState.js";
 
 export const fixturePassword = secretValue("APP_PGPASSWORD") ?? "isolated-fixture-password-never-production-01";
 
@@ -57,6 +58,7 @@ export async function testDatabase(initialize = true) {
         await initializeSchema(operator);
         await grantRuntime(operator);
       }
+      await loadOperationalState(runtime);
     }
     if (process.env.AGENT_CONTROL_ISOLATED_TESTS === "1") process.stdout.write(JSON.stringify({
       event: "test_database_initialization", database: name, template: template ?? null,

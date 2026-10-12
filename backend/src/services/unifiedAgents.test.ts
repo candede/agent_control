@@ -1,10 +1,13 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { parse } from "csv-parse/sync";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { seedSelectedInventory, selectedInventoryCsv } from "../../scripts/selectedInventoryFixture.js";
+import { seedSelectedInventory, selectedInventoryCsv, type SelectedInventoryFixtureInput } from "../../scripts/selectedInventoryFixture.js";
 import { fixtureDirectoryUser } from "../../scripts/userSourceFixture.js";
 import type { InventoryQuery } from "../db/inventoryQueries.js";
 import { inventoryPresentation } from "./inventoryPresentation.js";
+import { buildRecords } from "./inventoryComponent.js";
+import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
+import { nativeInventoryKey } from "./inventoryRecordProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { agentColumnValue } from "../types/agentPresentation.js";
 import { unifiedAgentSortKeys, unifiedAgentInventoryScopes, unifiedAgentRecordId,
@@ -44,6 +47,21 @@ function resource(environmentId: string | null, nativeId = "shared-native"): Pow
 function environment(id: string, name: string): PowerPlatformResource {
   return { ...resource(null, id), type: "microsoft.powerplatform/environments", displayName: name, identifiers: [] };
 }
+function sourceBackedRecord(record: UnifiedAgentRecord, input: SelectedInventoryFixtureInput): UnifiedAgentRecord {
+  const packages = record.packages.map(item => {
+    const source = input.packages?.find(value => value.id === item.id);
+    if (!source) throw new Error("sort_oracle_package_missing");
+    return allowlistedPackage(source);
+  });
+  const native = record.powerPlatformResource;
+  const source = native ? input.resources?.find(value => nativeInventoryKey(value) === nativeInventoryKey(native)) : undefined;
+  if (native && !source) throw new Error("sort_oracle_resource_missing");
+  const resources = source ? [source] : [];
+  const rebuilt = buildRecords(packages, resources, resolvePackageAgentLinks("fixture", packages, resources),
+    record.observations.graphPackages, record.observations.powerPlatform, record.observations.packageSnapshots);
+  if (rebuilt.length !== 1) throw new Error("sort_oracle_group_mismatch");
+  return { ...record, ...rebuilt[0], id: record.id, columns: undefined };
+}
 async function csvRows(scenario: Scenario, selected: Awaited<ReturnType<Scenario["select"]>>) {
   return parse((await selectedInventoryCsv(database.runtime, scenario, selected.selection)).csv,
     { bom: true, columns: true }) as Record<string, string>[];
@@ -66,6 +84,7 @@ async function pages(scenario: Scenario, selected: Awaited<ReturnType<Scenario["
   return values;
 }
 
+describe("selected canonical inventory SQL parity", () => {
 beforeAll(async () => {
   database = await testDatabase();
   scoped = await seedSelectedInventory(database.runtime, {
@@ -125,7 +144,6 @@ afterEach(async () => {
   for (const scenario of [scoped, quick, sortable]) await scenario?.releaseSelections();
 });
 
-describe("selected canonical inventory SQL parity", () => {
   it.each(["displayName", "publisher", "versions"] as const)(
     "preserves the existing English base-sensitivity and numeric-version comparator for %s", async sortBy => {
       const scenario = await seedSelectedInventory(database.runtime, { packages: [
@@ -233,11 +251,7 @@ describe("selected canonical inventory SQL parity", () => {
 
   it.each(unifiedAgentSortKeys.flatMap(sortBy => (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection }))))(
     "matches displayed $sortBy values in $sortDirection first/middle/last/previous pages and CSV", async query => {
-      const full = (await sortable.select()).page!.value.map(record => ({ ...record,
-        packages: record.packages.map(item => allowlistedPackage(sortable.input.packages!.find(value => value.id === item.id)!)),
-        powerPlatformResource: record.powerPlatformResource
-          ? sortable.input.resources!.find(value => value.nativeId === record.powerPlatformResource!.nativeId)! : null,
-      }));
+      const full = (await sortable.select()).page!.value.map(record => sourceBackedRecord(record, sortable.input));
       const environments = { [environmentA]: "Zebra environment", [environmentB]: "Alpha environment" };
       const compare = (left: UnifiedAgentRecord, right: UnifiedAgentRecord) => {
         const a = agentColumnValue(left, query.sortBy, environments), b = agentColumnValue(right, query.sortBy, environments);
@@ -248,7 +262,12 @@ describe("selected canonical inventory SQL parity", () => {
         return (query.sortDirection === "desc" ? -value : value) || tie;
       };
       const expected = [...full].sort(compare), selected = await sortable.select(query, 2);
-      expect((await pages(sortable, selected)).map(record => record.id)).toEqual(expected.map(record => record.id));
+      const actual = await pages(sortable, selected);
+      expect(actual.map(record => record.id)).toEqual(expected.map(record => record.id));
+      for (const record of actual) {
+        const source = full.find(value => value.id === record.id)!;
+        expect(agentColumnValue(record, query.sortBy, environments)).toEqual(agentColumnValue(source, query.sortBy, environments));
+      }
       const rows = (await csvRows(sortable, selected)).filter(row => row.recordType === "agent");
       expect(rows.map(row => row.agentId)).toEqual(expected.map(record => record.id));
     });
@@ -336,5 +355,35 @@ describe("selected canonical inventory SQL parity", () => {
     const exported = await scenario.select({ publisher: "=untrusted" });
     expect((await csvRows(scenario, exported)).find(row => row.recordType === "agent")!.publisher).toBe("'=untrusted");
     expect((await scenario.select({ publisher: "~null" })).page!.value.map(identify)).toEqual(["constructor"]);
+  });
+});
+
+describe("source-backed inventory sort oracle", () => {
+  it("derives expected display and column values from sources instead of returned SQL projections", () => {
+    const input = { packages: [{
+      ...packageValue("source-package", "Éclair"), publisher: "Original publisher", version: "2", supportedHosts: ["Teams"],
+    }] };
+    const [record] = buildRecords(input.packages, [], resolvePackageAgentLinks("fixture", input.packages, []), null, null);
+    const returned = { ...record, displayName: "Incorrect name",
+      packages: record.packages.map(item => ({ ...item, publisher: "Incorrect publisher", version: "10", supportedHosts: [] })),
+      columns: { displayName: "Incorrect name", publisher: "Incorrect publisher", versions: "10", hosts: null } };
+    const expected = sourceBackedRecord(returned, input);
+    expect(expected.displayName).toBe("Éclair");
+    expect((["displayName", "publisher", "versions", "hosts"] as const).map(key => agentColumnValue(expected, key)))
+      .toEqual(["Éclair", "Original publisher", "2", "Teams"]);
+  });
+
+  it("restores complete native values from the exact environment-qualified source when native IDs repeat", () => {
+    const input = { resources: [
+      { ...resource(environmentA), details: { model: "First model", channels: ["Teams"] } },
+      { ...resource(environmentB), details: { model: "Second model", channels: ["Outlook"] } },
+    ] };
+    const records = buildRecords([], input.resources, [], null, null);
+    const record = records.find(value => value.environmentId === environmentB)!;
+    const returned = { ...record, powerPlatformResource: { ...record.powerPlatformResource!, details: {} },
+      columns: { model: "Incorrect model", channels: null } };
+    const expected = sourceBackedRecord(returned, input);
+    expect(agentColumnValue(expected, "model")).toBe("Second model");
+    expect(agentColumnValue(expected, "channels")).toBe("Outlook");
   });
 });

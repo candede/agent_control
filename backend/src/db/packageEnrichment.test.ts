@@ -154,7 +154,8 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     const automatic = (await jobs.claimDueDetails(owner, owner.principalId))!;
     expect(await targetIds(owner, automatic)).toEqual(["changed", "new", "old"]);
     await jobs.markFailed(owner, automatic.id, "provider_error", "Unavailable.");
-    await publish(owner, [{ ...summary("changed", "2"), displayName: "Only a name changed" }, summary("old"), summary("new")]);
+    await publish(owner, [{ ...summary("changed", "2"), displayName: "Only a name changed",
+      manifestId: summary().manifestId!.toUpperCase() }, summary("old"), summary("new")]);
     expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
     await publish(owner, [summary("changed", "3"), summary("old"), summary("new")]);
     const changed = (await jobs.claimDueDetails(owner, owner.principalId))!;

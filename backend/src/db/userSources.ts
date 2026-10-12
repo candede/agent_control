@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { isProxy } from "node:util/types";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { dataConnections } from "./dataConnections.js";
-import { digest, encodeBatch, exactCount } from "./dataBounds.js";
+import { dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "../services/dataSelections.js";
-import { isCopilotAppActivityFresh } from "../types/copilotUsage.js";
+import { isCopilotAppActivityFresh, isGraphGuid } from "../types/copilotUsage.js";
 import type { AgentPersonObservation } from "./agentPeople.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
+import { agentPersonLabel } from "../types/agentPresentation.js";
 import type {
   UserSourceFacts, UserSourceFilter, UserSourceMetadata, UserSourcePage,
   UserSourcePeople, UserSourceScope, UserSourceSummary, UserSourcePlan,
@@ -24,7 +26,7 @@ export type UserSourceReadContext = {
 
 export function userSourceFilter(query: UserSourceFilter): UserSourceFilter {
   if (Object.keys(query).some(key => !queryFields.includes(key as typeof queryFields[number]))) throw new SelectionError("invalid_cursor");
-  for (const key of ["search", "company", "department"] as const) {
+  for (const key of ["company", "department"] as const) {
     const value = query[key];
     if (value !== undefined && value !== null && (typeof value !== "string" || value.length > 256 || /[\0\r\n]/.test(value))) throw new SelectionError("invalid_cursor");
   }
@@ -35,7 +37,7 @@ export function userSourceFilter(query: UserSourceFilter): UserSourceFilter {
     || query.serviceState !== undefined && !["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"].includes(query.serviceState)) {
     throw new SelectionError("invalid_cursor");
   }
-  return { ...query, ...(query.search === undefined ? {} : { search: query.search.trim().normalize("NFKC").toLowerCase() }),
+  return { ...query, ...(query.search === undefined ? {} : { search: userSourceSearch(query.search) }),
     sort: query.sort ?? "name", order: query.order ?? "asc" };
 }
 
@@ -251,19 +253,20 @@ export class UserSourcesRepository {
     return this.read(selectionId, identity, async (client, context) => {
       const limit = pageLimit(options.limit);
       const order = context.query.order!;
-      const cursor = this.cursor(options.cursor, identity, context, endpoint, context.queryHash);
       const parameters = userSourceSqlParameters(context);
       const where = filters(context.query, parameters);
       const key = sortKeys[context.query.sort!];
+      const base = `WITH facts AS NOT MATERIALIZED (${userSourceFactsSql()}),
+        ordered AS (SELECT facts.*,${key} AS page_key FROM facts WHERE ${where})`;
+      const cursor = await this.cursor(client, options.cursor, identity, context, endpoint, context.queryHash, base, parameters);
       const boundary = keyset(cursor?.boundary, cursor?.direction, order, parameters);
       parameters.push(limit + 1);
       const descending = order === "desc";
       const previous = cursor?.direction === "previous";
       const rowOrder = previous !== descending ? "DESC" : "ASC";
-      const rows = (await client.query(`WITH facts AS NOT MATERIALIZED (${userSourceFactsSql()}),
-        ordered AS (SELECT facts.*,${key} AS page_key FROM facts WHERE ${where})
-        SELECT * FROM ordered WHERE ${boundary} ORDER BY (page_key IS NULL)::int ${previous ? "DESC" : "ASC"},
-          coalesce(page_key,'') COLLATE "C" ${rowOrder},identity COLLATE "C" ${rowOrder} LIMIT $${parameters.length}`, parameters)).rows;
+      const namePrefix = context.query.sort === "name" ? `left(coalesce(page_key,''),128) COLLATE "C" ${rowOrder},` : "";
+      const rows = (await client.query(`${base} SELECT * FROM ordered WHERE ${boundary} ORDER BY (page_key IS NULL)::int ${previous ? "DESC" : "ASC"},
+          ${namePrefix}coalesce(page_key,'') COLLATE "C" ${rowOrder},identity COLLATE "C" ${rowOrder} LIMIT $${parameters.length}`, parameters)).rows;
       const counts = await this.countsInRead(client, context);
       const result = this.envelope(rows, limit, previous, Boolean(cursor), identity, context, endpoint, context.queryHash,
         row => ({ key: row.page_key, id: row.identity, nullRank: row.page_key === null ? 1 : 0 }), facts, counts);
@@ -312,24 +315,18 @@ export class UserSourcesRepository {
   }
 
   people(selectionId: string, identity: SelectionIdentity, ids: readonly string[]) {
-    userSourceObjectIds(ids);
+    const requested = userSourceObjectIds(ids);
     return this.read(selectionId, identity, async (client, context) => bounded(await userSourcePeopleInRead(client, context.scope,
       context.metadata.directory.generationId ? { generationId: context.metadata.directory.generationId,
-        observedAt: new Date(context.metadata.directory.observedAt!) } : null, ids, context.evaluatedAt)));
+        observedAt: new Date(context.metadata.directory.observedAt!) } : null, requested, context.evaluatedAt)));
   }
 
   projectPeople(selectionId: string, identity: SelectionIdentity, records: readonly UnifiedAgentRecord[]) {
-    if (records.length > 100) throw new AppError(400, "data_page_limit", "Project at most 100 caller records.");
-    const requested = new Set<string>();
-    for (const record of records) {
-      const resource = record.powerPlatformResource;
-      if (resource && resource.tenantId !== identity.tenantId) throw new AppError(403, "scope_mismatch", "Inventory belongs to another tenant.");
-      for (const id of [resource?.createdBy, resource?.details.ownerId, resource?.details.lastModifiedBy]) {
-        if (typeof id === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)) requested.add(id.toLowerCase());
-      }
-    }
-    return this.read(selectionId, identity, async (client, context) => {
-      const ids = [...requested];
+    assertPeopleData(identity);
+    const selectedIdentity = structuredClone(identity);
+    const snapshot = snapshotAgentPeopleRecords(records, selectedIdentity.tenantId);
+    const ids = agentPeopleRecordIds(snapshot);
+    return this.read(selectionId, selectedIdentity, async (client, context) => {
       const people = new Map<string, UserSourcePeople>();
       for (let offset = 0; offset < ids.length; offset += 100) {
         for (const person of await userSourcePeopleInRead(client, context.scope,
@@ -338,16 +335,7 @@ export class UserSourcesRepository {
           people.set(person.objectId, person);
         }
       }
-      return bounded(records.map(record => {
-        const resource = record.powerPlatformResource;
-        const { people: _prior, ...inventory } = record;
-        const owner = people.get(resource?.details.ownerId?.toLowerCase() ?? "");
-        const createdBy = people.get(resource?.createdBy?.toLowerCase() ?? "");
-        const lastModifiedBy = people.get(resource?.details.lastModifiedBy?.toLowerCase() ?? "");
-        return { ...inventory, ...(owner || createdBy || lastModifiedBy ? { people: {
-          ...(owner ? { owner } : {}), ...(createdBy ? { createdBy } : {}), ...(lastModifiedBy ? { lastModifiedBy } : {}),
-        } } : {}) };
-      }));
+      return bounded(projectAgentPeopleRecords(snapshot, people));
     });
   }
 
@@ -357,16 +345,16 @@ export class UserSourcesRepository {
       const limit = pageLimit(options.limit);
       const childEndpoint = `${endpoint}/${id}/service-plans`;
       const hash = digest(`${context.queryHash}:${id}`);
-      const cursor = this.cursor(options.cursor, identity, context, childEndpoint, hash);
       const parameters: unknown[] = [context.metadata.directory.generationId, id];
+      const base = `WITH ordered AS (
+        SELECT identity,plan_id,service,display_name,state,capability_status,
+          residual->>'assignedDateTime' AS assigned_text,plan_id AS page_key
+          FROM directory_service_plan_rows WHERE generation_id=$1 AND user_id=$2)`;
+      const cursor = await this.cursor(client, options.cursor, identity, context, childEndpoint, hash, base, parameters);
       const boundary = keyset(cursor?.boundary, cursor?.direction, "asc", parameters);
       parameters.push(limit + 1);
       const previous = cursor?.direction === "previous";
-      const rows = (await client.query(`WITH ordered AS (
-        SELECT identity,plan_id,service,display_name,state,capability_status,
-          residual->>'assignedDateTime' AS assigned_text,plan_id AS page_key
-          FROM directory_service_plan_rows WHERE generation_id=$1 AND user_id=$2)
-        SELECT * FROM ordered WHERE ${boundary} ORDER BY page_key COLLATE "C" ${previous ? "DESC" : "ASC"},identity COLLATE "C" ${previous ? "DESC" : "ASC"}
+      const rows = (await client.query(`${base} SELECT * FROM ordered WHERE ${boundary} ORDER BY page_key COLLATE "C" ${previous ? "DESC" : "ASC"},identity COLLATE "C" ${previous ? "DESC" : "ASC"}
         LIMIT $${parameters.length}`, parameters)).rows;
       const n = exactCount((await client.query("SELECT count(*)::text AS n FROM directory_service_plan_rows WHERE generation_id=$1 AND user_id=$2",
         [context.metadata.directory.generationId, id])).rows[0].n);
@@ -381,25 +369,23 @@ export class UserSourcesRepository {
   facets(selectionId: string, identity: SelectionIdentity, options: {
     field: "company" | "department"; search?: string; limit?: number; cursor?: string;
   }) {
-    if (!["company", "department"].includes(options.field) || options.search !== undefined && (typeof options.search !== "string" || options.search.length > 256)) {
-      throw new SelectionError("invalid_cursor");
-    }
+    if (!["company", "department"].includes(options.field)) throw new SelectionError("invalid_cursor");
+    const search = options.search === undefined ? "" : userSourceSearch(options.search);
     return this.read(selectionId, identity, async (client, context) => {
       const limit = pageLimit(options.limit);
       const field = options.field;
       const facetEndpoint = `${endpoint}/facets/${field}`;
-      const search = options.search?.normalize("NFKC").toLowerCase() ?? "";
       const hash = digest(`${context.queryHash}:${field}:${search}`);
-      const cursor = this.cursor(options.cursor, identity, context, facetEndpoint, hash);
       const parameters = userSourceSqlParameters(context);
       const query = { ...context.query };
       delete query[field];
       const where = filters(query, parameters);
       parameters.push(search);
-      const facetFilter = `strpos(lower(normalize(coalesce(${field},''),NFKC) COLLATE "default"),$${parameters.length})>0`;
+      const facetFilter = `strpos(${userSourceSearchSql(`coalesce(${field},'')`)},$${parameters.length})>0`;
       const base = `WITH facts AS NOT MATERIALIZED (${userSourceFactsSql()}), options AS (
         SELECT ${field} AS value,count(*)::text AS count FROM facts WHERE ${where} AND ${facetFilter} GROUP BY ${field}),
         ordered AS (SELECT *,lower(normalize(value,NFKC) COLLATE "default") AS page_key,coalesce(value,chr(1)||'null') AS identity FROM options)`;
+      const cursor = await this.cursor(client, options.cursor, identity, context, facetEndpoint, hash, base, parameters);
       const counts = (await client.query(`${base} SELECT (SELECT count(*) FROM (SELECT ${field} FROM (${userSourceFactsSql()}) all_facts GROUP BY ${field}) all_options)::text AS total,
         count(*)::text AS filtered FROM ordered`, parameters)).rows[0];
       const boundary = keyset(cursor?.boundary, cursor?.direction, "asc", parameters);
@@ -458,10 +444,20 @@ export class UserSourcesRepository {
     });
   }
 
-  private cursor(cursor: string | undefined, identity: SelectionIdentity, context: UserSourceReadContext, route: string, hash: string) {
-    return cursor === undefined ? undefined : this.codec.decode(cursor, {
+  private async cursor(client: pg.PoolClient, cursor: string | undefined, identity: SelectionIdentity, context: UserSourceReadContext,
+    route: string, hash: string, base: string, parameters: readonly unknown[]) {
+    if (cursor === undefined) return undefined;
+    const decoded = this.codec.decode(cursor, {
       identity, endpoint: route, selectionId: context.selection.id, revision: context.selection.revision, queryHash: hash,
     });
+    if (decoded.boundary.key !== "\0") return decoded;
+    const found = (await client.query(`${base} SELECT page_key,identity FROM ordered
+      WHERE encode(sha256(convert_to(identity,'UTF8')),'hex')=$${parameters.length + 1} LIMIT 2`,
+    [...parameters, decoded.boundary.id])).rows;
+    if (found.length !== 1) throw new SelectionError("selection_invalidated");
+    const boundary: CursorBoundary = { key: found[0].page_key, id: found[0].identity,
+      nullRank: found[0].page_key === null ? 1 : 0 };
+    return { ...decoded, boundary };
   }
 
   private envelope<T>(rows: pg.QueryResultRow[], limit: number, previous: boolean, hasCursor: boolean,
@@ -471,10 +467,15 @@ export class UserSourcesRepository {
     const more = rows.length > limit;
     const page = rows.slice(0, limit);
     if (previous) page.reverse();
-    const token = (row: pg.QueryResultRow, direction: "next" | "previous") => this.codec.encode({
-      identity, endpoint: route, selectionId: context.selection.id, revision: context.selection.revision,
-      queryHash: hash, boundary: boundary(row), direction,
-    });
+    const token = (row: pg.QueryResultRow, direction: "next" | "previous") => {
+      const input = { identity, endpoint: route, selectionId: context.selection.id, revision: context.selection.revision,
+        queryHash: hash, direction };
+      const edge = boundary(row);
+      try { return this.codec.encode({ ...input, boundary: edge }); }
+      catch (error) { if (!(error instanceof SelectionError) || error.code !== "invalid_cursor") throw error; }
+      // NUL cannot be a PostgreSQL text key; resolve its compact anchor in the pinned relation.
+      return this.codec.encode({ ...input, boundary: { key: "\0", id: digest(edge.id), nullRank: 0 } });
+    };
     return bounded({ value: page.map(project), counts, selection: context.selection,
       page: { limit, nextCursor: page.length && (previous ? hasCursor : more) ? token(page.at(-1)!, "next") : null,
         previousCursor: page.length && (previous ? more : hasCursor) ? token(page[0], "previous") : null } });
@@ -486,6 +487,16 @@ const sortKeys = {
   department: 'lower(normalize(department,NFKC) COLLATE "default")', service: "service_state", activity: "last_activity_date::text",
 } as const;
 
+export function userSourceSearch(value: string) {
+  if (typeof value !== "string" || value.length > 256 || /[\p{Cc}\p{Cs}]/u.test(value)) throw new SelectionError("invalid_cursor");
+  const search = value.normalize("NFKC").toLowerCase().normalize("NFKC").trim();
+  if (search.length > 256) throw new SelectionError("invalid_cursor");
+  return search;
+}
+export function userSourceSearchSql(expression: string) {
+  return `normalize(lower(normalize(${expression},NFKC) COLLATE "default"),NFKC)`;
+}
+
 function filters(query: UserSourceFilter, parameters: unknown[]) {
   const clauses: string[] = ["true"];
   for (const field of ["company", "department"] as const) {
@@ -496,7 +507,7 @@ function filters(query: UserSourceFilter, parameters: unknown[]) {
   }
   if (query.search) {
     parameters.push(query.search);
-    clauses.push(`(strpos(lower(normalize(coalesce(display_name,''),NFKC) COLLATE "default"),$${parameters.length})>0 OR strpos(lower(normalize(upn,NFKC) COLLATE "default"),$${parameters.length})>0)`);
+    clauses.push(`(strpos(${userSourceSearchSql("coalesce(display_name,'')")},$${parameters.length})>0 OR strpos(${userSourceSearchSql("upn")},$${parameters.length})>0)`);
   }
   return clauses.join(" AND ");
 }
@@ -540,10 +551,111 @@ export function facts(row: pg.QueryResultRow): UserSourceFacts {
 }
 
 export function userSourceObjectIds(ids: readonly string[]) {
-  if (ids.length > 100 || ids.some(id => typeof id !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id))) {
+  if (isProxy(ids) || !Array.isArray(ids) || Object.getPrototypeOf(ids) !== Array.prototype || ids.length > 100
+    || Reflect.ownKeys(ids).length !== ids.length + 1) {
     throw new AppError(400, "data_exact_ids_limit", "Supply at most 100 exact directory object IDs.");
   }
-  return [...new Set(ids.map(id => id.toLowerCase()))];
+  const requested: string[] = [];
+  for (let index = 0; index < ids.length; index++) {
+    const property = Object.getOwnPropertyDescriptor(ids, String(index));
+    if (!property || !Object.hasOwn(property, "value") || typeof property.value !== "string" || !isGraphGuid(property.value)) {
+      throw new AppError(400, "data_exact_ids_limit", "Supply at most 100 exact directory object IDs.");
+    }
+    requested.push(property.value.toLowerCase());
+  }
+  return [...new Set(requested)];
+}
+
+function assertPeopleData(input: unknown) {
+  let bytes = 0;
+  const ancestors = new Set<object>();
+  const invalid = () => new AppError(500, "saved_source_invalid", "Agent people projection requires bounded own-data inventory.");
+  const visit = (value: unknown, depth: number): void => {
+    bytes += 1;
+    if (typeof value === "string") bytes += Buffer.byteLength(value);
+    if (bytes > dataLimits.batchBytes) throw new AppError(413, "data_response_bytes", "Response exceeds 1 MiB.");
+    if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean"
+      || typeof value === "number" && Number.isFinite(value)) return;
+    if (isProxy(value) || typeof value !== "object" || depth > 64 || ancestors.has(value)) throw invalid();
+    const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
+    if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) throw invalid();
+    const keys = Reflect.ownKeys(value);
+    if (array && keys.length !== value.length + 1) throw invalid();
+    ancestors.add(value);
+    for (const key of keys) {
+      if (array && key === "length") continue;
+      if (typeof key !== "string") throw invalid();
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (!property || !Object.hasOwn(property, "value") || !property.enumerable
+        || array && !/^(0|[1-9]\d*)$/.test(key)) throw invalid();
+      bytes += Buffer.byteLength(key);
+      visit(property.value, depth + 1);
+    }
+    ancestors.delete(value);
+  };
+  visit(input, 0);
+}
+
+export function snapshotAgentPeopleRecords(records: readonly UnifiedAgentRecord[], tenantId: string): UnifiedAgentRecord[] {
+  if (isProxy(records) || !Array.isArray(records)) {
+    throw new AppError(500, "saved_source_invalid", "Agent people projection requires an own-data inventory page.");
+  }
+  if (records.length > 100) throw new AppError(400, "data_page_limit", "Project at most 100 caller records.");
+  assertPeopleData(records);
+  const snapshot = structuredClone(records).map(record => record);
+  for (const record of snapshot) {
+    if (!record || typeof record !== "object" || Array.isArray(record) || !Object.hasOwn(record, "powerPlatformResource")
+      || record.powerPlatformResource !== null && (!record.powerPlatformResource
+        || typeof record.powerPlatformResource !== "object" || !Object.hasOwn(record.powerPlatformResource, "tenantId")
+        || !Object.hasOwn(record.powerPlatformResource, "details") || !record.powerPlatformResource.details
+        || typeof record.powerPlatformResource.details !== "object" || Array.isArray(record.powerPlatformResource.details))) {
+      throw new AppError(500, "saved_source_invalid", "Agent people projection requires valid native inventory.");
+    }
+    const resource = record.powerPlatformResource;
+    if (resource && resource.tenantId !== tenantId) throw new AppError(403, "scope_mismatch", "Inventory belongs to another tenant.");
+    if (resource && (resource.sourceSystem !== "power_platform" || !["power_platform", "both"].includes(record.presence))
+      || record.columns !== undefined && (!record.columns || typeof record.columns !== "object" || Array.isArray(record.columns))) {
+      throw new AppError(500, "saved_source_invalid", "Saved agent people require valid native source and column records.");
+    }
+    if (recordPeopleReferences(record)
+      .some(id => id !== null && id !== undefined && typeof id !== "string")) {
+      throw new AppError(500, "saved_source_invalid", "Saved agent person references must be text.");
+    }
+  }
+  return bounded(snapshot);
+}
+
+export function agentPeopleRecordIds(records: readonly UnifiedAgentRecord[]) {
+  return [...new Set(records.flatMap(recordPeopleReferences)
+    .filter((id): id is string => typeof id === "string" && isGraphGuid(id)).map(id => id.toLowerCase()))];
+}
+
+function recordPeopleReferences(record: UnifiedAgentRecord): unknown[] {
+  const resource = record.powerPlatformResource;
+  return [resource ? Object.getOwnPropertyDescriptor(resource, "createdBy")?.value : undefined,
+    resource ? Object.getOwnPropertyDescriptor(resource.details, "ownerId")?.value : undefined,
+    resource ? Object.getOwnPropertyDescriptor(resource.details, "lastModifiedBy")?.value : undefined];
+}
+
+export function projectAgentPeopleRecords(records: readonly UnifiedAgentRecord[], people: ReadonlyMap<string, UserSourcePeople>): UnifiedAgentRecord[] {
+  const person = (id: unknown) => typeof id === "string" && isGraphGuid(id) ? people.get(id.toLowerCase()) : undefined;
+  return bounded(records.map(record => {
+    const { people: _prior, ...inventory } = record;
+    const [creatorId, ownerId, modifierId] = recordPeopleReferences(record);
+    const owner = person(ownerId), createdBy = person(creatorId), lastModifiedBy = person(modifierId);
+    if (inventory.columns) {
+      inventory.columns = { ...inventory.columns };
+      if (Object.hasOwn(inventory.columns, "owner")) {
+        inventory.columns.owner = agentPersonLabel(owner, typeof ownerId === "string" ? ownerId : null);
+      }
+      if (Object.hasOwn(inventory.columns, "createdBy")) {
+        inventory.columns.createdBy = agentPersonLabel(createdBy, typeof creatorId === "string" ? creatorId : null);
+      }
+    }
+    return { ...inventory, ...(owner || createdBy || lastModifiedBy ? { people: {
+      ...(owner ? { owner } : {}), ...(createdBy ? { createdBy } : {}), ...(lastModifiedBy ? { lastModifiedBy } : {}),
+    } } : {}) };
+  }));
 }
 
 // The caller supplies a validated selected-read client, never a pool.

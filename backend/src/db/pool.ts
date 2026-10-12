@@ -44,7 +44,8 @@ export function databaseSettings(): PoolConfig {
 export const pool = new BoundedPool(databaseSettings());
 pool.on("error", () => operationalLog("error", "database_pool_error"));
 
-export async function transaction<T>(database: pg.Pool, work: (client: PoolClient) => Promise<T>, signal?: AbortSignal) {
+export async function transaction<T>(database: pg.Pool, work: (client: PoolClient) => Promise<T>, signal?: AbortSignal,
+  beforeCommit?: () => void) {
   const client = await database.connect();
   const state = clientErrorState(client);
   let discard: Error | undefined;
@@ -53,6 +54,7 @@ export async function transaction<T>(database: pg.Pool, work: (client: PoolClien
     const result = await work(client);
     if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Database transaction was cancelled.");
     if (state.error) throw state.error;
+    beforeCommit?.();
     await client.query("COMMIT");
     return result;
   } catch (error) {

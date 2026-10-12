@@ -6,6 +6,7 @@ import { PackageMutationQualificationRepository } from "../db/packageMutationQua
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { bulkJobs, runTrackedBulkJob } from "../services/bulkJobs.js";
 import { capabilities } from "../services/capabilities.js";
+import { loadOperationalState } from "../services/operationalState.js";
 import type { RoutePolicy } from "./policy.js";
 import "./agents.js";
 
@@ -65,12 +66,16 @@ const originalJob: NonNullable<Awaited<ReturnType<typeof bulkJobs.get>>> = {
   id: "original-job", capabilityId: identity.capabilityId, tokenMode: "delegated", action: "block",
   status: "succeeded", targetBlockedState: true, confirmationHash: null, confirmation: null, confirmedAt: null,
   total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
-  results: [], result: undefined, currentAgentName: undefined, canResume: false,
+  queued: 0, reconciliationRequired: 0, retryEligible: 0, resultRevision: "1",
+  currentAgentName: undefined, canResume: false,
   createdAt: original.approvedAt, updatedAt: original.approvedAt,
 };
 const restorationJob = { ...originalJob, id: "restoration-job", action: "unblock" as const, targetBlockedState: false };
 
 beforeEach(async () => {
+  await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
+    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+  }] }) });
   await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
   vi.mocked(revalidateAuthenticatedUser).mockReset().mockResolvedValue(user);
   vi.mocked(acquireDelegatedToken).mockReset().mockResolvedValue("fixture-token");
@@ -87,6 +92,10 @@ function fixture() {
   const authorize = vi.spyOn(repository, "authorizeCycleJob").mockResolvedValue(original);
   const complete = vi.spyOn(repository, "completeCycle").mockResolvedValue({ original, restoration });
   const qualificationIdentity = vi.spyOn(capabilities, "packageQualificationIdentity").mockResolvedValue(identity);
+  let capabilityCurrent = true;
+  vi.spyOn(capabilities, "beginOperationValidation").mockImplementation(() => () => {
+    if (!capabilityCurrent) throw new Error("Synthetic capability replacement.");
+  });
   const submit = vi.spyOn(bulkJobs, "submit").mockImplementation(async (_scope, input) =>
     ({ ...(input.action === "block" ? originalJob : restorationJob), status: "queued" }));
   const get = vi.spyOn(bulkJobs, "get").mockImplementation(async id => id === originalJob.id ? originalJob : restorationJob);
@@ -94,14 +103,14 @@ function fixture() {
     if (!authorizeJob) throw new Error("Expected approval-bound authorization.");
     await authorizeJob(owner, identity.capabilityId);
   });
-  function request(approve = false) {
+  function request(approve = false, overrides: Record<string, unknown> = {}) {
     const path = approve ? "/agents/mutation-canaries" : "/agents/mutation-canaries/:id/execute";
     const handler = handlers.get(`post ${path}`);
     if (!handler) throw new Error("Canary handler was not registered.");
     const req: Partial<Request> = {
       path, params: { id: original.id }, sessionID: "canary-session",
       body: approve
-        ? { targetId: original.targetId, action: original.action, prestate: original.prestate, poststate: original.poststate }
+        ? { targetId: original.targetId, action: original.action, prestate: original.prestate, poststate: original.poststate, ...overrides }
         : { confirmed: true, restorationApprovalId: restoration.id },
     };
     new session.MemoryStore().createSession(req as Request, {
@@ -112,7 +121,8 @@ function fixture() {
     const pending = Promise.resolve(handler(req as Request, response as Response, error => { if (error) throw error; }));
     return { pending, json };
   }
-  return { getApproved, createApproved, claim, record, authorize, complete, qualificationIdentity, submit, get, run, request };
+  return { getApproved, createApproved, claim, record, authorize, complete, qualificationIdentity, submit, get, run, request,
+    invalidateCapability: () => { capabilityCurrent = false; } };
 }
 
 async function replaceSession() {
@@ -121,12 +131,59 @@ async function replaceSession() {
 }
 
 describe("package canary session authorization", () => {
+  it("rejects a coercible action without resolving authority", async () => {
+    const f = fixture();
+    await expect(f.request(true, { action: ["block"] }).pending).rejects.toMatchObject({ code: "invalid_mutation_action" });
+    expect(f.createApproved).not.toHaveBeenCalled();
+    expect(revalidateAuthenticatedUser).not.toHaveBeenCalled();
+  });
+
+  it.each([1, null, ["package-1"], { id: "package-1" }])("rejects non-string package targets without coercion (%j)", async targetId => {
+    const f = fixture();
+    await expect(f.request(true, { targetId }).pending).rejects.toMatchObject({ code: "invalid_qualification" });
+    expect(f.createApproved).not.toHaveBeenCalled();
+    expect(revalidateAuthenticatedUser).not.toHaveBeenCalled();
+  });
+
+  it("does not approve a capability replaced while its identity is being resolved", async () => {
+    const f = fixture();
+    f.qualificationIdentity.mockImplementationOnce(async () => { f.invalidateCapability(); return identity; });
+    await expect(f.request(true).pending).rejects.toThrow("Synthetic capability replacement.");
+    expect(f.createApproved).not.toHaveBeenCalled();
+  });
+
+  it.each(["token", "attachment", "result"] as const)("does not renew the cycle's initiating capability after replacement during %s", async stage => {
+    const f = fixture();
+    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+      f.invalidateCapability(); return "fixture-token";
+    });
+    if (stage === "attachment") f.record.mockImplementationOnce(async () => { f.invalidateCapability(); return original; });
+    if (stage === "result") f.get.mockImplementationOnce(async () => { f.invalidateCapability(); return originalJob; });
+    await expect(f.request().pending).rejects.toMatchObject({ code: "canary_cycle_incomplete" });
+    expect(f.submit).toHaveBeenCalledOnce();
+    expect(f.complete.mock.calls.every(call => call[3].status !== "qualified")).toBe(true);
+  });
+
+  it("does not publish qualification when maintenance closes during the final identity read", async () => {
+    const f = fixture();
+    let identities = 0;
+    f.qualificationIdentity.mockImplementation(async () => {
+      if (++identities === 6) await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
+        mode: "maintenance", provider_work_enabled: false, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      }] }) });
+      return identity;
+    });
+    await expect(f.request().pending).rejects.toMatchObject({ code: "canary_cycle_incomplete" });
+    expect(f.submit).toHaveBeenCalledTimes(2);
+    expect(f.complete.mock.calls.every(call => call[3].status !== "qualified")).toBe(true);
+  });
+
   it("approves using the current Admin without acquiring a provider token", async () => {
     const f = fixture();
     const current = { ...user, displayName: "Current Admin" };
     vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(current);
     await f.request(true).pending;
-    expect(f.createApproved).toHaveBeenCalledWith(current, expect.objectContaining({ targetId: original.targetId }));
+    expect(f.createApproved).toHaveBeenCalledWith(current, expect.objectContaining({ targetId: original.targetId }), expect.any(Function));
     expect(acquireDelegatedToken).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -154,7 +211,7 @@ describe("package canary session authorization", () => {
     await pending;
     expect(f.submit).toHaveBeenCalledTimes(2);
     expect(f.authorize).toHaveBeenCalledTimes(2);
-    expect(f.complete).toHaveBeenCalledWith(user, original.id, restoration.id, { status: "qualified" }, identity, identity);
+    expect(f.complete).toHaveBeenCalledWith(user, original.id, restoration.id, { status: "qualified" }, identity, identity, expect.any(Function));
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ status: "qualified" }));
     expect(fetch).not.toHaveBeenCalled();
   });

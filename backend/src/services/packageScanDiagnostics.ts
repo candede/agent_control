@@ -22,6 +22,7 @@ function readCounters() {
 
 export class PackageScanDiagnostics {
   private readonly startedAt = performance.now();
+  private finishedAt?: number;
   private detailStartedAt?: number;
   private pages = 0;
   private listedCount = 0;
@@ -38,6 +39,7 @@ export class PackageScanDiagnostics {
   constructor(private readonly mode: "broad" | "exact") {}
 
   catalogPage(values: readonly unknown[], page: number, hasContinuation: boolean, durationMs: number, totalRecords?: number) {
+    if (this.finishedAt !== undefined) return;
     this.pages = page;
     this.listedCount += values.length;
     this.log("package_catalog_page", {
@@ -72,12 +74,13 @@ export class PackageScanDiagnostics {
   }
 
   startDetails(count: number) {
+    if (this.finishedAt !== undefined) return;
     this.targetCount = count;
     this.detailStartedAt = performance.now();
   }
 
   compareDetail(summary: CopilotPackageDetail | undefined, detail: CopilotPackageDetail) {
-    if (!summary) return;
+    if (this.finishedAt !== undefined || !summary) return;
     this.comparedCount += 1;
     if (isDeepStrictEqual(summary, detail)) this.matchingObservationCount += 1;
     for (const comparison of this.comparisons) {
@@ -92,12 +95,14 @@ export class PackageScanDiagnostics {
   }
 
   completeDetail(found: boolean) {
+    if (this.finishedAt !== undefined) return;
     this.checkedCount += 1;
     if (found) this.foundCount += 1;
     if (this.checkedCount % 100 === 0) this.readSummary("identity", "package_scan_progress", "collecting");
   }
 
   recordAttempt(stage: PackageReadStage, durationMs: number, attempt: number, readIntervalMs: number) {
+    if (this.finishedAt !== undefined) return;
     const counts = this.reads[stage];
     counts.requestCount += 1;
     if (attempt > 1) counts.retryCount += 1;
@@ -107,14 +112,18 @@ export class PackageScanDiagnostics {
   }
 
   recordThrottle(stage: PackageReadStage) {
+    if (this.finishedAt !== undefined) return;
     this.reads[stage].throttleCount += 1;
   }
 
   recordWait(stage: PackageReadStage, kind: "admissionWaitMs" | "retryWaitMs", durationMs: number) {
+    if (this.finishedAt !== undefined) return;
     this.reads[stage][kind] += durationMs;
   }
 
   finish(outcome: "collected" | "failed" | "cancelled" | "timed_out") {
+    if (this.finishedAt !== undefined) return;
+    this.finishedAt = performance.now();
     if (this.mode === "broad") this.readSummary("catalog", "package_scan_summary", outcome);
     if (this.detailStartedAt !== undefined) this.readSummary("identity", "package_scan_summary", outcome);
     if (this.comparedCount === 0) return;
@@ -129,11 +138,13 @@ export class PackageScanDiagnostics {
 
   private readSummary(stage: PackageReadStage, event: string, outcome: string) {
     const counts = this.reads[stage];
+    const now = this.finishedAt ?? performance.now();
     const durationMs = stage === "catalog"
-      ? (this.detailStartedAt ?? performance.now()) - this.startedAt
-      : performance.now() - (this.detailStartedAt ?? this.startedAt);
+      ? (this.detailStartedAt ?? now) - this.startedAt
+      : now - (this.detailStartedAt ?? this.startedAt);
     this.log(event, {
-      stage, outcome, pages: this.pages, totalRecords: this.targetCount,
+      stage, outcome, pages: this.pages,
+      totalRecords: stage === "catalog" ? outcome === "collected" ? this.listedCount : undefined : this.targetCount,
       count: stage === "catalog" ? this.listedCount : this.checkedCount,
       observedCount: stage === "catalog" ? this.listedCount : this.foundCount,
       ...counts, durationMs: Math.round(durationMs),

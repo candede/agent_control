@@ -34,8 +34,8 @@ export function isValidLowResponseThreshold(value: string) {
 }
 
 function usageTimestamp(value: string | null | undefined) {
-  if (!value) return null;
-  const parts = value.match(/^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2}))?$/);
+  if (!value || value.length > 128) return null;
+  const parts = value.match(/^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2}))?$/);
   if (!parts) return null;
   const day = Date.parse(parts[1]);
   // Date.parse normalizes impossible calendar days, such as February 30.

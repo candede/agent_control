@@ -1,10 +1,50 @@
 // @vitest-environment node
 import { afterEach, expect, it, vi } from "vitest";
 import { ApiError, request } from "./client";
-import { cancelReportExport, createReportExport, normalizeReportSearch, previewReportBundle, reportExportStatus } from "./reportData";
+import { cancelReportExport, createReportExport, mutateAgentReportAssociation, normalizeReportSearch, previewReportBundle, reportExportStatus, stageReport } from "./reportData";
+import type { CandidateAgentUsageMutation } from "../../../backend/src/types/officialReportApi";
 
 vi.mock("./client", async original => ({ ...await original<typeof import("./client")>(), request: vi.fn() }));
 afterEach(() => { vi.useRealTimers(); vi.mocked(request).mockReset(); });
+
+it("omits absent upload metadata but retains explicit blank assertions for server validation", async () => {
+  const file = new File(["CSV"], "users.csv", { type: "text/csv" }), signal = new AbortController().signal;
+  await stageReport(file, { bundleId: "owned-bundle", rejectDuplicateKind: true }, {
+    reportingStart: undefined, downloadedAt: "", sourceAsOf: "", sourceAsOfProvenance: "operator_asserted",
+  }, signal);
+  const [path, init] = vi.mocked(request).mock.calls[0];
+  expect(path).toBe("/api/official-usage/staging?bundleId=owned-bundle&rejectDuplicateKind=true");
+  expect(init).toMatchObject({ method: "POST", signal });
+  const body = init!.body;
+  expect(body).toBeInstanceOf(FormData);
+  expect(Array.from((body as FormData).entries())).toEqual([
+    ["downloadedAt", ""], ["sourceAsOf", ""], ["sourceAsOfProvenance", "operator_asserted"], ["file", file],
+  ]);
+});
+
+it("sends exact association and removal shapes without losing an explicit null environment", async () => {
+  const input: CandidateAgentUsageMutation = {
+    selectionId: "abcdefab-1234-4567-89ab-abcdefabcdef", reportSetId: "fedcbafe-1234-4567-89ab-fedcbafedcba",
+    usageRevision: "a".repeat(64), inventoryRevision: "b".repeat(64), reportAgentId: "Exact/Report-ID", confirmed: true,
+  };
+  const targets: CandidateAgentUsageMutation["target"][] = [
+    { source: "graph_packages", packageId: "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF" },
+    { source: "power_platform", nativeId: "Exact/Native-ID", environmentId: null },
+    { source: "power_platform", nativeId: "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", environmentId: "Default-ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF" },
+  ];
+  const recordId = "graph_packages:Exact%2FPackage-ID", signal = new AbortController().signal;
+  for (const target of targets) {
+    await mutateAgentReportAssociation(recordId, { ...input, target }, "associate", signal);
+    expect(request).toHaveBeenLastCalledWith(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...input, target }), signal,
+    });
+  }
+  await mutateAgentReportAssociation(recordId, input, "remove", signal, input.selectionId);
+  expect(request).toHaveBeenLastCalledWith(
+    `/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations?inventorySelectionId=${input.selectionId}`, {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal,
+    });
+});
 
 it.each([
   [" Researcher ", "researcher"],

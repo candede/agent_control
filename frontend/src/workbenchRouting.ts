@@ -4,9 +4,11 @@ import {
   type UnifiedAgentInventoryScope, type UnifiedAgentSort,
   type UnifiedAgentAccessFilter, type UnifiedAgentUsageFilter, type UnifiedAgentManagementFilter, type UnifiedAgentRelevanceFilter,
 } from "../../backend/src/types/unifiedAgents";
-import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
+import { isGraphGuid } from "../../backend/src/types/copilotUsage";
 import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
 import { decodeInventoryFacet, encodeInventoryFacet, type InventoryFacetValue } from "../../backend/src/types/inventoryFacets";
+import { quarantineTargetKey } from "./quarantineTarget";
+import { normalizeEnvironmentIdentity } from "../../backend/src/services/inventoryIdentity";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
@@ -172,10 +174,10 @@ export function parseAgentRoute(search: string): AgentRouteState {
   const selectionCount = boundedSelectionCount(params.get("selectionCount"));
   const selectionStored = params.get("selectionState") === "session" && selectionCount !== undefined;
   const environment = routeFacet(params, "environment", 512);
-  const environmentId = typeof environment === "string" ? environment.toLowerCase() : environment;
+  const environmentId = typeof environment === "string" ? normalizeEnvironmentIdentity(environment) : environment;
   const rawDetailId = agentRecordId(params.get("detail"));
   const detailId = rawDetailId && !parseUnifiedAgentRecordId(rawDetailId) && params.get("source") === "power_platform" && environmentId
-    ? unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: rawDetailId })
+    ? quarantineTargetKey({ environmentId, nativeId: rawDetailId })
     : rawDetailId;
   return {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
@@ -255,7 +257,8 @@ export function agentRouteSearch(state: AgentRouteState) {
   }
   setDurableRouteId(params, "controlJob", state.controlJobId);
   setDurableRouteId(params, "syncRun", state.syncRunId);
-  if (state.environmentId !== undefined) params.set("environment", encodeInventoryFacet(state.environmentId?.toLowerCase() ?? null));
+  if (state.environmentId !== undefined) params.set("environment",
+    encodeInventoryFacet(state.environmentId === null ? null : normalizeEnvironmentIdentity(state.environmentId)));
   setDurableRouteId(params, "inventorySnapshot", state.inventorySnapshotId, 64);
   for (const id of [...new Set(state.selectedPowerPlatformIds.map(agentRecordId).filter(value => value !== undefined))].slice(0, 25)) params.append("selectedResource", id);
   setDurableRouteId(params, "quarantineJob", state.quarantineJobId);
@@ -357,7 +360,7 @@ export function parseUsersRoute(search: string): UsersRouteState {
     } : {}),
     view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
     ...(detailId !== null ? {
-      detailId: isDirectoryObjectId(detailId) ? detailId.toLowerCase() : "invalid",
+      detailId: isGraphGuid(detailId) ? detailId.toLowerCase() : "invalid",
       detailTab: userDetailTabs.find(tab => tab === params.get("tab")) ?? (legacyResponsibility ? "responsibility" : "overview"),
     } : {}),
     search: bounded(params.get("q"), 256) ?? "",
@@ -379,7 +382,7 @@ export function usersRouteSearch(state: UsersRouteState) {
   }
   if (state.view === "activity") params.set("view", state.view);
   if (state.detailId) {
-    params.set("detail", isDirectoryObjectId(state.detailId) ? state.detailId.toLowerCase() : "invalid");
+    params.set("detail", isGraphGuid(state.detailId) ? state.detailId.toLowerCase() : "invalid");
     if (state.detailTab && state.detailTab !== "overview") params.set("tab", state.detailTab);
   }
   const search = bounded(state.search.trim().slice(0, 256), 256);
@@ -415,6 +418,7 @@ function agentRecordId(value: string | null): string | undefined {
   if (!value || value.length > 10000) return undefined;
   try {
     const target = parseUnifiedAgentRecordId(value);
+    if (target?.source === "power_platform") return quarantineTargetKey(target);
     return target ? unifiedAgentRecordId(target) : validSelectedId(value) ? value : undefined;
   } catch (error) {
     if (error instanceof URIError || error instanceof RangeError) return undefined;

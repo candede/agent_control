@@ -7,7 +7,7 @@ import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { liveInventory } from "../db/liveInventory.js";
-import { normalizeNativeIdentity, resolveExactInventoryIdentity } from "./inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity, resolveExactInventoryIdentity } from "./inventoryIdentity.js";
 
 type InventoryScope = Parameters<typeof liveInventory.record>[0];
 
@@ -41,8 +41,8 @@ export class AgentInvestigationsService {
     const observation = record.native?.observation;
     const uncertain = record.identity.invalidMetadata || ["ambiguous", "conflicting"].includes(record.identity.state);
     const current = Boolean(record.revision) && resource?.type === "microsoft.copilotstudio/agents"
-      && resource.tenantId.toLowerCase() === scope.tenantId.toLowerCase()
-      && observation?.current === true;
+      && normalizeNativeIdentity(resource.tenantId) === normalizeNativeIdentity(scope.tenantId)
+      && observation?.current === true && Date.parse(observation.expiresAt) > Date.now();
     const unsupported = !resource || resource.type !== "microsoft.copilotstudio/agents" || resource.agentKind === "agent_builder_agent";
     const commonReasonCode: AgentInvestigationReasonCode | undefined = unsupported ? "unsupported_identity_crosswalk"
       : uncertain ? "ambiguous_identity" : !current ? "stale_source" : undefined;
@@ -51,7 +51,7 @@ export class AgentInvestigationsService {
       : !current ? "A current authorized Power Platform agent identity is required. Refresh Agents first." : undefined;
     const exactIds = (kind: "entra_app_id" | "cds_bot_id" | "entra_agent_id") => {
       const values = record.native?.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value) ?? [];
-      if (values.some(id => !isDirectoryObjectId(id))) return [];
+      if (values.some(id => !isDirectoryObjectId(id) || id === "00000000-0000-0000-0000-000000000000")) return [];
       return [...new Set(values.map(id => id.toLowerCase()))];
     };
     const applicationIds = exactIds("entra_app_id");
@@ -68,7 +68,7 @@ export class AgentInvestigationsService {
         environmentId: resource.environmentId, sourceSystem: "power_platform", resourceType: resource.type,
         identifiers: [{ kind, value: ids[0] }] }, candidates);
       return match.status === "resolved" && normalizeNativeIdentity(match.candidate.nativeId) === normalizeNativeIdentity(resource.nativeId)
-        && match.candidate.environmentId?.toLowerCase() === resource.environmentId?.toLowerCase();
+        && normalizeEnvironmentIdentity(match.candidate.environmentId ?? "") === normalizeEnvironmentIdentity(resource.environmentId ?? "");
     };
     const agentProvenance = resource?.provenance?.entraAgentId;
     const candidateMissing = !record.native?.identifiers.some(identifier => identifier.kind === "entra_agent_id");
@@ -79,7 +79,8 @@ export class AgentInvestigationsService {
             ? "invalid_identity_candidate"
             : !unambiguous("entra_agent_id", agentIds) ? "ambiguous_identity"
               : !observation?.snapshotId || !isDirectoryObjectId(observation.snapshotId)
-                || !resource.environmentId || record.environmentId?.toLowerCase() !== resource.environmentId.toLowerCase() ? "stale_source" : undefined);
+                || observation.snapshotId === "00000000-0000-0000-0000-000000000000"
+                || !resource.environmentId || normalizeEnvironmentIdentity(record.environmentId ?? "") !== normalizeEnvironmentIdentity(resource.environmentId) ? "stale_source" : undefined);
     const resolutionReason = commonReason ?? (resolutionCode === "unsupported_identity_crosswalk" ? "The typed directory crosswalk requires a source-declared Copilot Studio agent. Other provider-native log identities need a separately verified crosswalk."
       : resolutionCode === "missing_identity_candidate" ? "The saved source does not supply properties.entraAgentId. Refresh the source; bot, package and blueprint IDs cannot substitute."
         : resolutionCode === "invalid_identity_candidate" ? "The saved Entra identity candidate or its properties.entraAgentId provenance is invalid."
@@ -128,7 +129,7 @@ export class AgentInvestigationsService {
       reason: runtimeReason ?? (mapping ? "Verified Entra agentIdentity client ID: its object and client IDs have the same value by the documented contract. This identifies the child agent, not its blueprint, but does not establish comprehensive telemetry coverage."
         : "Can query by the saved, documented legacy application identity; this does not verify runtime correlation or comprehensive telemetry coverage.") };
     const environment = resource?.environmentId;
-    const purviewReason = commonReason ?? (bots.length !== 1 || !environment || record.environmentId?.toLowerCase() !== environment.toLowerCase()
+    const purviewReason = commonReason ?? (bots.length !== 1 || !environment || normalizeEnvironmentIdentity(record.environmentId ?? "") !== normalizeEnvironmentIdentity(environment)
       || !unambiguous("cds_bot_id", bots)
       ? "Purview search requires an unambiguous saved bot identity and environment." : undefined);
     return {
@@ -154,8 +155,7 @@ export class AgentInvestigationsService {
           ...(purviewReason ? { reason: purviewReason, reasonCode: commonReasonCode ?? "purview_identity_unavailable" as const } : {}),
           mode: "search", presets: purviewReason ? [] : legacyAvailable ? ["copilot_interactions", "copilot_studio_admin"] : ["copilot_studio_admin"] },
       },
-      ...(!purviewReason ? { purviewTarget: { environmentId: environment!.toLowerCase(), botId: bots[0],
-        ...(legacyAvailable ? { applicationId: applicationIds[0] } : {}) } } : {}),
+      ...(!purviewReason ? { purviewTarget: { environmentId: normalizeEnvironmentIdentity(environment!), botId: bots[0] } } : {}),
     };
   }
 

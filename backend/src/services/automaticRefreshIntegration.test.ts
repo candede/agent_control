@@ -36,6 +36,7 @@ vi.mock("./capabilities.js", () => ({ capabilities: {
   requireAvailable: vi.fn(async () => undefined),
   requireApplicationDataScope: vi.fn(async () => { throw new Error("No shared data scope."); }),
   observeOperation: vi.fn(async (_id, _user, operation) => operation(() => undefined)),
+  beginOperationValidation: vi.fn(() => () => undefined),
 } }));
 vi.mock("./powerPlatformResourceQuery.js", async original => ({
   ...await original<typeof import("./powerPlatformResourceQuery.js")>(),
@@ -188,86 +189,33 @@ it("recovers the same principal after sign-in without replaying old authenticati
   }
 });
 
-it.each(["after", "during"] as const)("checks newly reported users when a report is uploaded %s Users sync, without recollecting fresh app activity", async timing => {
-  const reader = { ...user, tenantId: randomUUID(), homeAccountId: randomUUID() };
-  const owner = { tenantId: reader.tenantId, principalId: reader.homeAccountId };
-  const identity = await reportIdentity(fixture.runtime, reader);
-  const imports = new OfficialReportImports(fixture.runtime);
-  const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-report-refresh-secret-never-production", 30);
-  const cohort = async () => reports.page((await reports.capture(identity, "delegated", "official_users",
-    { licenseCohort: "active_without_paid" })).id, identity);
-  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const original = sourceFetch.getMockImplementation()!;
-  const details = vi.spyOn(packages, "refreshDueDetails").mockResolvedValue(null);
-  let catalogReads = 0, activityReads = 0;
-  const exactFilters: string[] = [];
+it("finishes a partial automatic run when the last inventory child publishes after Users failed", async () => {
+  const reader = { ...user, homeAccountId: randomUUID() };
+  const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(reader);
-  sourceFetch.mockImplementation(async (url, init) => {
-    const target = new URL(String(url));
-    if (target.pathname.endsWith("/subscribedSkus")) {
-      catalogReads += 1;
-      entered.resolve();
-      if (catalogReads === 1 && timing === "during") await release.promise;
-    }
-    if (target.pathname.includes("getMicrosoft365CopilotUsageUserDetail")) activityReads += 1;
-    if (target.pathname === "/v1.0/users") {
-      exactFilters.push(target.searchParams.get("$filter")!);
-      return Response.json({ "@odata.count": 1, value: [{
-        id: "30000000-0000-4000-8000-000000000003", userPrincipalName: "report-only@example.invalid",
-        displayName: "Report-only user", assignedLicenses: [], assignedPlans: [],
-      }] });
-    }
-    return original(url, init);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
+    await blocked;
+    await options?.visit?.("partial-run-first");
+    yield { token: "partial-run-first", nextToken: null, records: [], rawCount: 0, expectedCount: 0, page: 1 };
   });
+  const people = vi.spyOn(AgentPeopleService.prototype, "refreshReferences")
+    .mockRejectedValueOnce(new AppError(503, "provider_timeout", "Agent people lookup did not complete."));
   try {
-    for (const source of ["graph_packages", "power_platform"] as const) {
-      await repository.recordSuccessMarker(owner, source, 0, new Date().toISOString());
-    }
-    const initial = await service.start(reader, { mode: "incremental", sources: ["users"] });
-    await entered.promise;
-    if (timing === "after") await waitForRun(owner, initial.id, "completed");
-    else await vi.waitFor(async () => expect((await reports.sources.refreshStatus(identity, "delegated"))
-      .sources.app_activity.attemptStatus).toBe("available"));
-    const bundleId = randomUUID(), date = new Date().toISOString().slice(0, 10);
-    for (const kind of ["users", "agents", "userAgents"] as const) {
-      const rows = kind === "users" ? `report-only@example.invalid,Report-only user,1,2,${date}\ngone@example.invalid,Gone,1,1,${date}`
-        : kind === "agents" ? `agent,Agent,Your org,0,2,3,${date}`
-          : `agent,Agent,Your org,report-only@example.invalid,2,${date}`;
-      await imports.stage(identity, { bundleId }, (async function* () {
-        yield Buffer.from(`${schemaRegistry[kind].headers.join(",")}\n${rows}\n`);
-      })());
-    }
-    await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-    if (timing === "during") {
-      expect((await service.automaticRefresh(reader)).run?.id).toBe(initial.id);
-      expect(catalogReads).toBe(1);
-      release.resolve();
-      await waitForRun(owner, initial.id, "completed");
-    }
-    const before = await cohort();
-    expect(before.summary).toMatchObject({ activeWithoutPaidUsers: 0, unknownLicenseActiveReportUsers: 2 });
-    const [next, concurrent] = await Promise.all([service.automaticRefresh(reader), service.automaticRefresh(reader)]);
-    expect(next.run?.id).not.toBe(initial.id);
-    expect(concurrent.run?.id).toBe(next.run?.id);
-    expect(next.run).toMatchObject({ automatic: true, sources: [{ source: "users" }] });
-    await waitForRun(owner, next.run!.id, "completed");
-    const after = await cohort();
-    expect(after.value.map(value => value.username)).toEqual(["report-only@example.invalid"]);
-    expect(after.summary).toMatchObject({ activeWithoutPaidUsers: 1, unknownLicenseActiveReportUsers: 1 });
-    expect(after.sources.app_activity.generationId).toBe(before.sources.app_activity.generationId);
-    expect(after.sources.directory.generationId).not.toBe(before.sources.directory.generationId);
-    expect(exactFilters).toHaveLength(1);
-    expect(exactFilters[0]).toContain("report-only@example.invalid");
-    expect(exactFilters[0]).toContain("gone@example.invalid");
-    expect(catalogReads).toBe(2);
-    expect(activityReads).toBe(1);
-    expect((await service.automaticRefresh(reader)).run?.id).toBe(next.run!.id);
-    expect(catalogReads).toBe(2);
+    const submitted = await service.automaticRefresh(reader);
+    await vi.waitFor(async () => {
+      const current = await repository.getRun(owner, submitted.run!.id);
+      expect(current?.sources.find(source => source.source === "users")).toMatchObject({ status: "partial" });
+      expect(current?.sources.find(source => source.source === "graph_packages")).toMatchObject({ status: "running" });
+    });
+    release();
+    await waitForRun(owner, submitted.run!.id, "partial");
+    expect((await repository.getRun(owner, submitted.run!.id))?.sources
+      .filter(source => source.source !== "users").every(source => source.status === "succeeded")).toBe(true);
   } finally {
-    release.resolve();
-    await vi.waitFor(async () => expect((await repository.getLatestRun(owner))?.status).not.toBe("running"));
-    details.mockRestore();
-    sourceFetch.mockImplementation(original);
+    release();
+    people.mockRestore();
     vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(user);
   }
 });

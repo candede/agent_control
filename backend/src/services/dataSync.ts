@@ -114,7 +114,8 @@ export class DataSyncService {
         const failures = await this.cancelChildJobs(user, previous);
         if (failures.length) throw failures[0];
       }
-      const submitted = await commitSync(authorization, () => this.dependencies.repository.submitDue(owner, signedInAt));
+      const submitted = await commitSync(authorization, () => this.dependencies.repository.submitDue(owner, signedInAt,
+        () => assertCurrentSync(authorization)));
       if (submitted.created && submitted.run) authorization.admittedRunId = submitted.run.id;
       assertCurrentSync(authorization);
       if (submitted.created && submitted.run) {
@@ -148,13 +149,19 @@ export class DataSyncService {
   async start(user: AuthenticatedUser, input: StartDataSyncInput): Promise<DataSyncRun> {
     requireViewer(user);
     return this.admit(user, undefined, async (scope, authorization) => {
-      const submitted = await commitSync(authorization, () => this.dependencies.repository.submit(scope, input));
+      const submitted = await commitSync(authorization, () => this.dependencies.repository.submit(scope, input,
+        () => assertCurrentSync(authorization)));
       if (submitted.created) authorization.admittedRunId = submitted.run.id;
       assertCurrentSync(authorization);
-      let run = await this.reconcileUsage(scope, submitted.run);
+      let run = submitted.run;
+      const sources = run.sources.filter(executableSource).map(source => source.source);
+      // Committed provider work must have an owner before auxiliary usage-status reads.
+      if (submitted.created && sources.length) {
+        this.launch(user, scope, run.id, sources, false, authorization);
+      }
+      run = await this.reconcileUsage(scope, run);
       assertCurrentSync(authorization);
-      if (submitted.created && run.sources.some(source => executableSource(source))) {
-        this.launch(user, scope, run.id, run.sources.filter(executableSource).map(source => source.source), false, authorization);
+      if (submitted.created && sources.length) {
         run = (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
       }
       assertCurrentSync(authorization);
@@ -182,7 +189,8 @@ export class DataSyncService {
       const cancelFailures = await this.cancelChildJobs(user, reconciled, requested);
       if (cancelFailures.length) throw cancelFailures[0];
       assertCurrentSync(authorization);
-      const selected = await commitSync(authorization, () => this.dependencies.repository.retry(scope, id, requested));
+      const selected = await commitSync(authorization, () => this.dependencies.repository.retry(scope, id, requested,
+        () => assertCurrentSync(authorization)));
       authorization.admittedRunId = id;
       assertCurrentSync(authorization);
       this.launch(user, scope, id, selected.filter(source => source !== "usage_reports"), true, authorization, current.automatic);
@@ -228,8 +236,15 @@ export class DataSyncService {
     }
   }
 
-  async recover() {
-    const count = await this.dependencies.repository.recoverInterrupted();
+  async recover(admissionsOpen?: () => Promise<boolean>) {
+    let count = 0;
+    for (;;) {
+      if (admissionsOpen && !await admissionsOpen()) break;
+      const recovered = await this.dependencies.repository.recoverInterrupted();
+      count += recovered;
+      if (!recovered) break;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
     if (count) operationalLog("warn", "data_sync_recovered", { count });
     return count;
   }
@@ -299,7 +314,8 @@ export class DataSyncService {
     const controller = new AbortController();
     const authorization: SyncAuthorization = { controller, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId), providerWork };
     const admission: RunAdmission<T> = {
-      scope, runId, controller,
+      scope, controller,
+      get runId() { return authorization.admittedRunId ?? runId; },
       operation: Promise.resolve().then(async () => {
         assertCurrentSync(authorization);
         const cleanup = await this.cleanupRuns(pending);
@@ -413,7 +429,7 @@ export class DataSyncService {
     const inventoryReady = sources.includes("power_platform")
       ? this.runPowerPlatform(user, scope, runId, activeRun, incompleteOnly) : undefined;
     const results = await Promise.allSettled(sources.map(source => {
-      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, activeRun, inventoryReady, automatic, signedInAt);
+      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, activeRun, inventoryReady, automatic && !incompleteOnly, signedInAt);
       if (source === "graph_packages") return this.runPackages(user, scope, runId, activeRun, incompleteOnly);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
@@ -442,27 +458,25 @@ export class DataSyncService {
     const signal = authorization.controller.signal;
     const jobId = randomUUID();
     let observedCount: number | null = null;
-    const progress = async (message: string, count: number | null = null) => {
+    const progress = async (message: string, count: number | null = null, assertSourceCurrent?: () => void) => {
       const current = await commitSync(authorization, () => this.dependencies.repository.updateSource(scope, runId, "users", {
         status: "running", jobId, count, message, canRetry: false,
-      }));
+      }, () => { assertCurrentSync(authorization); assertSourceCurrent?.(); }));
       assertCurrentSync(authorization);
-      const source = current?.sources.find(value => value.source === "users");
-      if (source?.jobId !== jobId || source.status !== "running") {
-        throw new AppError(409, "data_sync_publication_superseded", "This user-source attempt stopped or was superseded.");
-      }
+      requireRunningSource(current, "users", jobId);
     };
     try {
-      await commitSync(authorization, () => this.dependencies.repository.attachJob(scope, runId, "users", jobId));
+      await commitSync(authorization, () => this.dependencies.repository.attachJob(scope, runId, "users", jobId,
+        () => assertCurrentSync(authorization)));
       await progress("Checking M365 Copilot feature eligibility and app-activity sources, not all tenant accounts.");
       let result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
         incompleteOnly, publication: { runId, jobId },
         ...(automatic ? { automatic: true, signedInAt } : {}),
-        onDirectoryProgress: async count => {
+        onDirectoryProgress: async (count, assertSourceCurrent) => {
           observedCount = count;
           await progress(`Checked ${count} directory users from Copilot-capable products and active report identities. ${
             automatic ? "License verification is in progress; app activity refreshes on its own cadence."
-              : "License verification and app-activity collection are in progress."}`, count);
+              : "License verification and app-activity collection are in progress."}`, count, assertSourceCurrent);
         },
       });
       assertCurrentSync(authorization);
@@ -490,7 +504,8 @@ export class DataSyncService {
           message: `${result.message} Agent people were not fully refreshed. ${error instanceof AppError ? error.message : "Directory lookup failed; retry Users sync."}`,
         };
       }
-      await commitSync(authorization, () => this.dependencies.repository.updateSource(scope, runId, "users", userSourceUpdate(jobId, result)));
+      await commitSync(authorization, () => this.dependencies.repository.updateSource(scope, runId, "users", userSourceUpdate(jobId, result),
+        () => assertCurrentSync(authorization)));
     } catch (error) {
       await this.handleSourceFailure(scope, runId, "users", jobId, signal.aborted ? signal.reason : error);
     }
@@ -510,16 +525,17 @@ export class DataSyncService {
       jobId = job.id;
       this.trackChild(activeRun, "graph_packages", jobId);
       assertCurrentSync(activeRun);
-      await this.dependencies.repository.attachJob(scope, runId, "graph_packages", jobId);
+      await this.dependencies.repository.attachJob(scope, runId, "graph_packages", jobId, () => assertCurrentSync(activeRun));
       assertCurrentSync(activeRun);
-      await this.dependencies.repository.updateSource(scope, runId, "graph_packages", {
+      const current = await this.dependencies.repository.updateSource(scope, runId, "graph_packages", {
         status: "running",
         jobId,
         count: job.observedCount,
         message: "Checking delegated authorization to collect the agent list. Package details refresh separately.",
         canRetry: false,
-      });
+      }, () => assertCurrentSync(activeRun));
       assertCurrentSync(activeRun);
+      requireRunningSource(current, "graph_packages", jobId);
       const started = job.status === "waiting_authorization"
         ? await this.dependencies.packages.start(user, job.id, "delegated", { retryFailed })
         : job;
@@ -544,16 +560,17 @@ export class DataSyncService {
       jobId = job.id;
       this.trackChild(activeRun, "power_platform", jobId);
       assertCurrentSync(activeRun);
-      await this.dependencies.repository.attachJob(scope, runId, "power_platform", jobId);
+      await this.dependencies.repository.attachJob(scope, runId, "power_platform", jobId, () => assertCurrentSync(activeRun));
       assertCurrentSync(activeRun);
-      await this.dependencies.repository.updateSource(scope, runId, "power_platform", {
+      const current = await this.dependencies.repository.updateSource(scope, runId, "power_platform", {
         status: "running",
         jobId,
         count: job.observedCount,
         message: "Checking delegated authorization to read Power Platform agents and supporting environment metadata.",
         canRetry: false,
-      });
+      }, () => assertCurrentSync(activeRun));
       assertCurrentSync(activeRun);
+      requireRunningSource(current, "power_platform", jobId);
       const started = job.status === "waiting_authorization"
         ? await this.dependencies.powerPlatform.start(user, job.id, { retryFailed })
         : job;
@@ -575,12 +592,15 @@ export class DataSyncService {
     const signal = authorization.controller.signal;
     let job = initial;
     while (job.status === "running") {
-      await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job));
+      const current = await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job, () => assertCurrentSync(authorization)));
+      assertCurrentSync(authorization);
+      if (current?.sources.some(source => source.source === "graph_packages" && source.jobId === job.id && source.status === "succeeded")) return;
+      requireRunningSource(current, "graph_packages", job.id);
       await this.dependencies.wait(childPollIntervalMs, signal);
       assertCurrentSync(authorization);
       job = await this.dependencies.packages.get(user, job.id, "delegated");
     }
-    await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job));
+    await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job, () => assertCurrentSync(authorization)));
   }
 
   private async trackPowerPlatformJob(
@@ -593,28 +613,31 @@ export class DataSyncService {
     const signal = authorization.controller.signal;
     let job = initial;
     while (job.status === "running") {
-      await commitSync(authorization, async () => this.reconcilePowerPlatformJob(scope, runId, job));
+      const current = await commitSync(authorization, async () => this.reconcilePowerPlatformJob(scope, runId, job, () => assertCurrentSync(authorization)));
+      assertCurrentSync(authorization);
+      if (current?.sources.some(source => source.source === "power_platform" && source.jobId === job.id && source.status === "succeeded")) return;
+      requireRunningSource(current, "power_platform", job.id);
       await this.dependencies.wait(childPollIntervalMs, signal);
       assertCurrentSync(authorization);
       job = await this.dependencies.powerPlatform.get(user, job.id);
     }
-    await commitSync(authorization, async () => this.reconcilePowerPlatformJob(scope, runId, job));
+    await commitSync(authorization, async () => this.reconcilePowerPlatformJob(scope, runId, job, () => assertCurrentSync(authorization)));
   }
 
-  private reconcilePackageJob(scope: DataSyncScope, runId: string, job: PackageJob) {
+  private reconcilePackageJob(scope: DataSyncScope, runId: string, job: PackageJob, beforeCommit?: () => void) {
     if (job.errorCode === "data_sync_cleanup") return;
     return this.dependencies.repository.updateSource(scope, runId, "graph_packages", childSourceUpdate(
       "Graph package",
       job,
-    ));
+    ), beforeCommit);
   }
 
-  private reconcilePowerPlatformJob(scope: DataSyncScope, runId: string, job: PowerPlatformJob) {
+  private reconcilePowerPlatformJob(scope: DataSyncScope, runId: string, job: PowerPlatformJob, beforeCommit?: () => void) {
     if (job.errorCode === "data_sync_cleanup") return;
     return this.dependencies.repository.updateSource(scope, runId, "power_platform", childSourceUpdate(
       "Power Platform",
       job,
-    ));
+    ), beforeCommit);
   }
 
   private async handleSourceFailure(
@@ -745,15 +768,19 @@ export class DataSyncService {
   }
 
   private async cancelChildJobs(user: AuthenticatedUser, run: DataSyncRun, selectedSources?: readonly DataSyncSourceId[]) {
-    const operations: Promise<unknown>[] = [];
+    const tracker = this.active.get(run.id) ?? this.cleanupPending.get(run.id) ?? childTracker(run.id, dataScope(user), user);
+    const selected = new Set<string>();
     for (const source of run.sources) {
       if (!source.jobId || source.status === "succeeded" || (selectedSources && !selectedSources.includes(source.source))) continue;
       if (source.source === "graph_packages" || source.source === "power_platform") {
-        operations.push(this.cancelChild(user, { source: source.source, jobId: source.jobId }, true));
+        this.trackChild(tracker, source.source, source.jobId);
+        selected.add(childKey(source.source, source.jobId));
       }
     }
-    const results = await Promise.allSettled(operations);
-    return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
+    await this.cleanupTrackedChildren(tracker, selected);
+    if (tracker.cleanupFailures.size && !this.active.has(run.id)) this.cleanupPending.set(run.id, tracker);
+    else if (!tracker.cleanupFailures.size && this.cleanupPending.get(run.id) === tracker) this.cleanupPending.delete(run.id);
+    return [...tracker.cleanupFailures.values()];
   }
 
   private async cancelChild(user: AuthenticatedUser, child: TrackedChild, cleanup = false) {
@@ -806,6 +833,13 @@ function validateRunId(value: string) {
 
 function executableSource(source: DataSyncSourceStatus) {
   return source.source !== "usage_reports" && source.status === "queued";
+}
+
+function requireRunningSource(run: DataSyncRun | undefined, sourceId: DataSyncSourceId, jobId: string) {
+  const source = run?.sources.find(value => value.source === sourceId);
+  if (source?.jobId !== jobId || source.status !== "running") {
+    throw new AppError(409, "data_sync_publication_superseded", "This data sync source attempt stopped or was superseded.");
+  }
 }
 
 function userSourceUpdate(jobId: string, result: CopilotUsageRefreshResult) {
@@ -877,6 +911,7 @@ function safeSyncFailure(error: unknown) {
   if (error instanceof AppError && [
     "provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit",
     "provider_response_size_limit", "provider_count_mismatch", "report_download_failed",
+    "inventory_job_expired", "package_refresh_timeout", "package_refresh_expired",
   ].includes(error.code)) return error.message.slice(0, 1024);
   return "The source failed before complete saved-data publication.";
 }

@@ -147,6 +147,18 @@ describe("native report row semantics and exact children", () => {
     expect(page.analytics.agents?.mostResponses.map(row => row.responses)).toEqual([100, 10, 9]);
     expect(page.analytics.agents?.leastResponses.map(row => row.responses)).toEqual([9, 10, 100]);
   });
+  it("distinguishes absent response evidence from empty complete reports and empty filtered cohorts", async () => {
+    const identity = owner();
+    expect((await agents(identity)).analytics.responses).toBeNull();
+    await publish(identity, { agents: [], userAgents: [], users: [] });
+    expect((await agents(identity)).analytics).toMatchObject({ rowCount: 0, responses: 0 });
+    expect((await users(identity)).analytics).toMatchObject({ rowCount: 0, responses: 0 });
+    await publish(identity);
+    const filtered = await agents(identity, { search: "no-such-agent" });
+    expect(filtered.counts).toEqual({ total: 3, filtered: 0 });
+    expect(filtered.summary.reportedResponses).toBe(13);
+    expect(filtered.analytics).toMatchObject({ rowCount: 0, responses: 0 });
+  });
   it.each([["absent", "unknown"], ["unresolved", "unknown"], ["empty", "none"]] as const)(
     "preserves the no-matching-report activity golden with %s evidence", async (evidence, state) => {
       const identity = owner(); await directory(identity, [directoryUser(1, "person@example.invalid", "enabled")]);
@@ -243,6 +255,8 @@ describe("native report row semantics and exact children", () => {
     expect(page.value.find(row => row.agentId === "zero")).toMatchObject({ activeUsers: 0, activeUsersBasis: "userAgents_distinct_identity" });
     expect(page.value.find(row => row.agentId === "missing")).toMatchObject({ activeUsers: null, activeUsersBasis: "unknown" });
     expect(page.summary.distinctActiveReportUsers).toBe(0);
+    expect((await users(identity)).value).toMatchObject([{ reportedAgentsUsed: 0, relationshipCount: 1,
+      responseProducingAgentCount: 0, hasReportMismatch: false }]);
   });
   it("rejects inexact aggregate totals instead of rounding safe individual rows", async () => {
     const identity = owner(), value = 4503599627370496;
@@ -387,6 +401,7 @@ describe("native current licensing and organization evidence", () => {
     await directory(identity, [directoryUser(1, "person@example.invalid")]);
     const prior = await users(identity, { licenseCohort: "active_without_paid" });
     expect(prior.counts.filtered).toBe(1);
+    expect(prior.summary.unknownLicenseActiveReportUsers).toBe(0);
     const stages = new UserSourceStages(fixture.runtime);
     await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
       async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
@@ -395,7 +410,7 @@ describe("native current licensing and organization evidence", () => {
     expect(reread).toEqual({ ...prior, selection: { ...prior.selection, validatedAt: reread.selection.validatedAt } });
     const page = await users(identity, { licenseCohort: "active_without_paid" });
     expect(page.value).toEqual([]); expect(page.sources.directory).toMatchObject({ state: "partial", attemptStatus: "failed" });
-    expect(page.summary.activeWithoutPaidUsers).toBeNull();
+    expect(page.summary).toMatchObject({ activeWithoutPaidUsers: null, paidActiveReportUsers: null, unknownLicenseActiveReportUsers: 1 });
     expect((await reports.facets(page.selection.id, identity, { field: "company" })).value).toEqual([]);
     expect((await users(identity)).value).toMatchObject([{ username: "person@example.invalid", reportedResponses: 1 }]);
   });

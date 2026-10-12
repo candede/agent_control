@@ -2,7 +2,7 @@ import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, use
 import { skipToken, useMutationState, useQuery, type QueryClient } from "@tanstack/react-query";
 import type { CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageMutation, CandidateAgentUsageUsers, AgentUsageUser } from "../../../backend/src/types/officialReportApi";
 import type { InventoryReportContext, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
-import { readAgentReportSummary, readAgentReportHistory, readAgentReportAssociations, mutateAgentReportAssociation } from "../api/reportData";
+import { readAgentReportSummary, readAgentReportHistory, readAgentReportAssociations, mutateAgentReportAssociation, normalizeReportSearch } from "../api/reportData";
 import { ApiError } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
@@ -319,7 +319,7 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
   async function saveRemoval() {
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted || removing.current === signal || !remove || !confirmed
-      || unavailable || !periodReady || !canManageViewedReport || disabled || busy) return;
+      || !remove.context.reportSetId || unavailable || !periodReady || !canManageViewedReport || disabled || busy) return;
     removing.current = signal;
     setError(undefined);
     try {
@@ -443,7 +443,7 @@ function AgentUsers({ recordId, agentName, context, revision, onRestartSelection
   const [readRevision, setReadRevision] = useState(revision);
   if (active && !requested) setRequested(true);
   if (active && readRevision !== revision) setReadRevision(revision);
-  const normalizedSearch = search.trim().toLowerCase();
+  const normalizedSearch = normalizeReportSearch(search);
   const read = useReportPage<AgentUsageUser, CandidateAgentUsageUsers>(`agent-inventory/${encodeURIComponent(recordId)}/usage-users`,
     { selectionId: context.selectionId, ...(inventorySelectionId ? { inventorySelectionId } : {}),
       ...(setId ? { setId } : {}), search: normalizedSearch || undefined, limit: 25 }, readRevision, requested, onRestartSelection,

@@ -4,6 +4,8 @@ import type pg from "pg";
 import * as schema from "./schema.js";
 import { schemaSql, schemaFingerprint, verifySchema } from "./schema.js";
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
+import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
 
 function markerRows() {
   return [{ singleton: true, fingerprint: schemaFingerprint, initialized: true }];
@@ -23,6 +25,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "usage structures", rows: [usageContract] },
     { name: "usage grants", rows: [{ valid: true }] },
     { name: "data sync cleanup", rows: [{ valid: true }] },
+    { name: "data sync attempts", rows: [{ valid: true }] },
     { name: "data generations", rows: [{ valid: true }] },
     { name: "user sources", rows: [{ valid: true }] },
     { name: "user report periods", rows: [{ periods: true, immutable: true }] },
@@ -37,7 +40,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "refresh targets", rows: [{ targets: true, target_job: true, retired_arrays: true,
       detail_metadata: true, retired_triggers: true, permissions: true }] },
     { name: "inventory authority", rows: [{ current_memberships: true, retired_registry: true, application_fence: true }] },
-    { name: "live identity", rows: [{ live_sources: true, generation_reference: true, retired_reference: true, live_guard: true }] },
+    { name: "live identity", rows: [{ live_sources: true, generation_reference: true, retired_reference: true, live_guard: true, normalized_keys: true }] },
     { name: "control queue", rows: [{ valid: true }] },
     { name: "mutation stages", rows: [{ valid: true }] },
     { name: "native control", rows: [{ valid: true }] },
@@ -46,7 +49,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "observer", rows: [{ counter: true, guards: 3 }] },
     { name: "inventory cutover", rows: [{ retired: true, controls: true, clear: true, functions: true }] },
     { name: "provider metadata", rows: Array.from({ length: 3 }, () => ({ data_type: "integer", is_nullable: "NO" })) },
-    { name: "refresh contract", rows: [{ retired_mode: true, bounded_detail_mode: true }] },
+    { name: "refresh contract", rows: [{ retired_mode: true, bounded_detail_mode: true, progress_bounds: true }] },
     { name: "identity lookup", rows: [{ exact_identity: true, identifier_index: true }] },
     { name: "query context", rows: [{ present: 1 }] },
     { name: "attempt fence", rows: [{ present: 1 }] },
@@ -109,7 +112,7 @@ describe("current schema source contracts", () => {
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
     }
-    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(157);
+    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(158);
     const alterations = topLevel.split(";").map(statement => statement.trim()).filter(statement => /^ALTER /i.test(statement));
     expect(alterations).toHaveLength(94);
     for (const statement of alterations) {
@@ -141,6 +144,13 @@ describe("current schema source contracts", () => {
     }
   });
 
+  it("indexes exact report-directory alias prefixes without compatibility folding or full-width index keys", () => {
+    const index = topLevel.match(/CREATE INDEX official_usage_fact_directory_identity[\s\S]*?;/)?.[0];
+    expect(index).toContain('("left"(lower(btrim(username) COLLATE "default"), 128) COLLATE "C")');
+    expect(index).toContain("WHERE kind IN ('users', 'userAgents')");
+    expect(index).not.toContain("normalize");
+  });
+
   it("allows cleanup only for the complete three-source automatic scope", () => {
     const cleanup = schemaSql.match(/CONSTRAINT data_sync_cleanup_full_scope CHECK[\s\S]*?(?=\n  , CONSTRAINT)/)?.[0];
     expect(cleanup).toContain("NOT clear_saved_data");
@@ -150,9 +160,81 @@ describe("current schema source contracts", () => {
     expect(cleanup).not.toContain("usage_reports");
     expect(cleanup).not.toContain("= 4");
   });
+
+  it.each(["power_platform_refresh_jobs", "package_refresh_jobs"])(
+    "persists provider-admitted progress and completion beyond the retired limits in %s", table => {
+      const definition = schemaSql.match(new RegExp(`CREATE TABLE ${table} \\([\\s\\S]*?\\n\\);`))?.[0];
+      expect(definition).toBeDefined();
+      for (const [column, admitted, ceiling] of [
+        ["observed_count", 5_001, inventoryLimits.sourceRows],
+        ["total_records", 5_001, inventoryLimits.sourceRows],
+        ["page_count", 101, inventoryLimits.pages],
+      ] as const) {
+        const predicate = definition!.match(new RegExp(
+          `CONSTRAINT ${table}_${column}_check CHECK \\(${column} >= (\\d+)\\s+AND ${column} <= (\\d+)\\)`,
+        ));
+        expect(predicate).not.toBeNull();
+        const permits = (value: number) => value >= Number(predicate![1]) && value <= Number(predicate![2]);
+        expect(permits(admitted)).toBe(true);
+        expect(permits(ceiling)).toBe(true);
+        expect(permits(ceiling + 1)).toBe(false);
+        expect(permits(-1)).toBe(false);
+      }
+    },
+  );
+
+  it("enqueues quarantine readbacks only for case-exact native resource IDs, including GUID-looking IDs", () => {
+    const enqueue = schemaSql.match(/CREATE FUNCTION inventory_fence_native_readback\(\)[\s\S]*?END\$\$/)?.[0];
+    expect(enqueue).toContain(`(${normalizeEnvironmentIdentitySql("r.environment_id")})=(${normalizeEnvironmentIdentitySql("NEW.environment_id")})`);
+    expect(enqueue).toContain("r.native_id=NEW.resource_native_id");
+    expect(enqueue).not.toContain("lower(r.native_id)");
+    expect(enqueue).not.toContain("lower(NEW.resource_native_id)");
+  });
+
+  it("uses the query normalization authority and binary keys for generated associations and live source lookup", () => {
+    const associations = schemaSql.match(/CREATE TABLE agent_usage_associations \([\s\S]*?\n\);/)?.[0];
+    const sources = schemaSql.match(/CREATE VIEW inventory_live_sources[\s\S]*?(?=\nCREATE )/)?.[0];
+    for (const column of ["environment_id", "native_id"]) {
+      expect(associations).toContain(`normalized_${column} text COLLATE pg_catalog."C" GENERATED ALWAYS AS`);
+    }
+    expect(associations).toContain(normalizeEnvironmentIdentitySql("environment_id"));
+    expect(associations).toContain(normalizeNativeIdentitySql("native_id"));
+    expect(sources).toContain(normalizeEnvironmentIdentitySql("r.environment_id"));
+    expect(sources).toContain(normalizeNativeIdentitySql("r.native_id"));
+    expect(sources).toContain("WHEN r.domain = CAST('power_platform' AS text)");
+    expect(sources).toContain("ELSE r.native_id");
+  });
 });
 
 describe("schema verification without a database", () => {
+  it("checks validated progress constraints for both streamed refresh sources against the provider bounds", async () => {
+    const database = databaseWithResults(...schemaResults().map(result => result.rows));
+    await expect(verifySchema(database)).resolves.toBeUndefined();
+    const progressQuery = database.query.mock.calls.find(([sql]) => sql.includes("AS progress_bounds"));
+    expect(progressQuery?.[1]).toEqual([inventoryLimits.sourceRows, inventoryLimits.pages]);
+    for (const table of ["power_platform_refresh_jobs", "package_refresh_jobs"]) {
+      expect(progressQuery?.[0]).toContain(`('${table}')`);
+    }
+    for (const column of ["observed_count", "total_records", "page_count"]) {
+      expect(progressQuery?.[0]).toContain(`('${column}',`);
+    }
+    expect(progressQuery?.[0]).toContain("c.contype='c' AND c.convalidated");
+    expect(progressQuery?.[0]).toContain("pg_get_expr(c.conbin,c.conrelid)=format(");
+  });
+
+  it("rejects nonbinary or nongenerated live and reviewed-association identity keys and indexes", async () => {
+    const row = schemaResults().find(result => result.name === "live identity")!.rows[0] as Record<string, unknown>;
+    const database = databaseWithResults(...schemaResults().map(result => result.rows));
+    await expect(verifySchema(database)).resolves.toBeUndefined();
+    const statement = database.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes("AS normalized_keys"))?.[0];
+    expect(statement).toContain('attcollation=\'"C"\'::regcollation');
+    expect(statement).toContain("attgenerated='s'");
+    expect(statement).toContain('i.indcollation[3]=\'"C"\'::regcollation');
+    expect(statement).toContain('i.indcollation[4]=\'"C"\'::regcollation');
+    await expect(verifySchema(databaseWithResults(...resultsBefore("live identity"), [{ ...row, normalized_keys: false }])))
+      .rejects.toThrow("inventory_identity_schema");
+  });
+
   it("requires typed facts and the exact membership foreign key",async () => {
     const database = databaseWithResults([{ valid: true,keys: true }]);
     await expect(verifyReportCapacitySchema(database)).resolves.toBeUndefined();
@@ -198,6 +280,12 @@ describe("schema verification without a database", () => {
       const definition = database.query.mock.calls.at(-1)?.[1]?.[0];
       expect(definition).toContain("jsonb_array_length(source_ids) = 3");
       expect(definition).not.toContain("usage_reports");
+    });
+
+  it.each([[], [{ valid: false }]].map(rows => ({ rows })))(
+    "rejects a missing or unprotected data sync attempt boundary: $rows", async ({ rows }) => {
+      const database = databaseWithResults(...resultsBefore("data sync attempts"), rows);
+      await expect(verifySchema(database)).rejects.toThrow("Data sync attempt boundary schema");
     });
 
   it.each([
@@ -272,7 +360,7 @@ describe("schema verification without a database", () => {
       await expect(verifySchema(database)).rejects.toThrow("inventory_schema_privileges");
     });
 
-  it.each(["refresh targets", "inventory authority", "live identity", "inventory cutover", "inventory classification"])(
+  it.each(["refresh targets", "refresh contract", "inventory authority", "live identity", "inventory cutover", "inventory classification"])(
     "requires every named inventory contract flag at %s", async stage => {
     const row = schemaResults().find(result => result.name === stage)!.rows[0] as Record<string, boolean>;
     for (const key of Object.keys(row)) for (const missing of [false, true]) {

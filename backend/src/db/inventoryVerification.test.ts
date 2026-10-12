@@ -39,11 +39,11 @@ describe("typed immutable inventory verification", () => {
     const page = await selected.queries.page(selected.selection.id, selected.identity, { limit: 1 });
     expect(page.counts).toMatchObject({ total: 2, scoped: 2, filtered: 1 });
     expect(page.value.map(row => row.nativeId)).toEqual([nativeIds[0]]);
-    expect(inventorySourceStatuses(page.freshness.sources).powerPlatform).toMatchObject({
+    expect(inventorySourceStatuses(page.freshness.sources, page.selection.evaluatedAt as Date).powerPlatform).toMatchObject({
       state: "available", observation: { snapshotId: root.baselineId, roleScope, coverage: "covered",
         observedCount: 2, totalRecords: 2, pageCount: 1, coveredCount: 2,
         verification: { status: "verified", scope: "authorized_query", storedCount: 2, uniqueIdentityCount: 2,
-          queriedTypes: expect.arrayContaining(powerPlatformResourceTypes) } },
+          queriedTypes: expect.arrayContaining([...powerPlatformResourceTypes]) } },
     });
   });
 
@@ -91,7 +91,7 @@ describe("typed immutable inventory verification", () => {
     const page = inventoryPresentation(selected.raw);
     expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["current-global-agent"]);
     expect(page.value[0].environment).toMatchObject({ displayName: "Finance production" });
-    expect(inventorySourceStatuses(selected.raw.freshness.sources).powerPlatform)
+    expect(inventorySourceStatuses(selected.raw.freshness.sources, selected.raw.selection.evaluatedAt as Date).powerPlatform)
       .toMatchObject({ observation: { snapshotId: latest.baselineId, environmentScope: null, observedCount: 1 } });
     await expect(new LiveInventory(fixture.runtime).record(scope,
       unifiedAgentRecordId({ source: "power_platform", nativeId: "obsolete-global-agent", environmentId })))
@@ -203,7 +203,7 @@ describe("typed immutable inventory verification", () => {
   it("does not claim that an unrequested environment source was verified empty", async () => {
     const { scope } = await publishInventory("unknown", [agentType]);
     const { raw } = await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform");
-    expect(inventorySourceStatuses(raw.freshness.sources).powerPlatform.observation).toMatchObject({
+    expect(inventorySourceStatuses(raw.freshness.sources, raw.selection.evaluatedAt as Date).powerPlatform.observation).toMatchObject({
       roleScope: "unknown", verification: { queriedTypes: [agentType] },
     });
     expect(raw.freshness.sources[0].resource_types).not.toContain("microsoft.powerplatform/environments");

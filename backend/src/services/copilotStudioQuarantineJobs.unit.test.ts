@@ -1,10 +1,15 @@
+import pg from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as msal from "../auth/msal.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineJobRow } from "../db/copilotStudioQuarantine.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, QuarantineJob } from "../types/copilotStudioQuarantine.js";
+import type { AuthenticatedUser } from "../types/session.js";
+import type { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 
 const settleControls = vi.hoisted(() => vi.fn(async (_scope: unknown, signal: AbortSignal) => { signal.throwIfAborted(); }));
+const inventoryAuthority = vi.hoisted(() => vi.fn<(assertCurrent?: () => void) => void>());
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -15,7 +20,10 @@ vi.mock("./maintenance.js", () => ({ maintenanceActive: vi.fn(() => false) }));
 vi.mock("./operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
 vi.mock("./inventoryRuntime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./inventoryRuntime.js")>(),
-  InventoryRuntime: class { settleControls = settleControls; },
+  InventoryRuntime: class {
+    constructor(_database: unknown, _authorize: unknown, assertCurrent?: () => void) { inventoryAuthority(assertCurrent); }
+    settleControls = settleControls;
+  },
 }));
 
 import { capabilities } from "./capabilities.js";
@@ -69,7 +77,7 @@ function fixture(repository = new CopilotStudioQuarantineRepository()) {
   vi.spyOn(repository, "claim").mockResolvedValue({ jobId, scope, owner: "worker", version: 1 });
   vi.spyOn(repository, "waitForAuthorization").mockResolvedValue(undefined);
   vi.spyOn(repository, "beginItem").mockResolvedValue(undefined).mockResolvedValueOnce({ job, item });
-  vi.spyOn(repository, "withTargetLock").mockImplementation(async (_lease, _item, operation) => operation());
+  vi.spyOn(repository, "withTargetLock").mockImplementation(async (_lease, _item, operation) => operation(new AbortController().signal));
   vi.spyOn(repository, "assertDispatchReady").mockResolvedValue(undefined);
   vi.spyOn(repository, "markSent").mockResolvedValue(undefined);
   vi.spyOn(repository, "finishItem").mockResolvedValue(undefined);
@@ -77,13 +85,13 @@ function fixture(repository = new CopilotStudioQuarantineRepository()) {
   vi.spyOn(repository, "release").mockResolvedValue(undefined);
   vi.spyOn(repository, "cancel").mockResolvedValue(summary);
   vi.spyOn(repository, "reconciliationItems").mockResolvedValue({ job, items: [{ ...item, status: "inconclusive", reconciliation_status: "required" }] });
-  vi.spyOn(repository, "withReconciliationLock").mockImplementation(async (_scope, _item, operation) => operation());
+  vi.spyOn(repository, "withReconciliationLock").mockImplementation(async (_scope, _item, operation) => operation(new AbortController().signal));
   vi.spyOn(repository, "assertReconciliationTarget").mockResolvedValue(undefined);
   vi.spyOn(repository, "recordReconciliation").mockResolvedValue(undefined);
   let state = false;
   const provider = {
-    getStatus: vi.fn(async () => status(state)),
-    setQuarantine: vi.fn(async () => { state = true; return status(state); }),
+    getStatus: vi.fn(async (..._args: Parameters<CopilotStudioQuarantineClient["getStatus"]>) => status(state)),
+    setQuarantine: vi.fn(async (..._args: Parameters<CopilotStudioQuarantineClient["setQuarantine"]>) => { state = true; return status(state); }),
   };
   const authorize = vi.fn(async () => authorization);
   return { repository, provider, authorize };
@@ -103,6 +111,7 @@ async function replaceSession() {
 
 beforeEach(async () => {
   settleControls.mockReset().mockImplementation(async (_scope, signal) => { signal.throwIfAborted(); });
+  inventoryAuthority.mockClear();
   await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
   vi.mocked(requireProviderAdmissions).mockImplementation(() => undefined);
   vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined));
@@ -111,13 +120,127 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("quarantine execution session and cancellation boundaries", () => {
+  it.each((["execution", "reconciliation"] as const).flatMap(operation =>
+    (["session", "capability", "provider-admission"] as const).map(cause => ({ operation, cause }))))(
+    "fences inventory settlement commits during $operation after $cause invalidation", async ({ operation, cause }) => {
+      const { repository, provider, authorize } = fixture();
+      const failure = new AppError(401, "authorization_expired", "Synthetic inventory authority changed.");
+      let invalidated = false, published = false;
+      vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+        if (cause === "capability" && invalidated) throw failure;
+      });
+      vi.mocked(requireProviderAdmissions).mockImplementation(() => {
+        if (cause === "provider-admission" && invalidated) throw failure;
+      });
+      settleControls.mockImplementationOnce(async () => {
+        if (cause === "session") await replaceSession();
+        invalidated = true;
+        inventoryAuthority.mock.lastCall?.[0]?.();
+        published = true;
+      });
+
+      const pending = operation === "execution"
+        ? runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize)
+        : reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize);
+      if (cause === "session") await expect(pending).rejects.toMatchObject({ code: "unauthorized" });
+      else await expect(pending).rejects.toBe(failure);
+      expect(published).toBe(false);
+      expect(provider.getStatus).not.toHaveBeenCalled();
+      expect(provider.setQuarantine).not.toHaveBeenCalled();
+      expect(repository.beginItem).not.toHaveBeenCalled();
+      if (operation === "execution") expect(repository.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["authorization", "readback", "commit"] as const)(
+    "does not dispatch or publish verified work after capability invalidation during %s", async stage => {
+      const { repository, provider, authorize } = fixture();
+      const failure = new AppError(401, "authorization_expired", "Authority changed.");
+      let invalidated = false, published = false;
+      vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+        if (invalidated) throw failure;
+      });
+      if (stage === "authorization") authorize.mockImplementationOnce(async () => { invalidated = true; return authorization; });
+      if (stage === "readback") provider.getStatus.mockImplementationOnce(async () => { invalidated = true; return status(false); });
+      if (stage === "commit") vi.mocked(repository.finishItem).mockImplementationOnce(async (_lease, _item, _outcome, _evidence, _signal, beforeCommit) => {
+        invalidated = true;
+        beforeCommit?.();
+        published = true;
+      });
+      const pending = runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
+      if (stage === "authorization") await expect(pending).rejects.toBe(failure);
+      else await pending;
+      expect(published).toBe(false);
+      expect(provider.setQuarantine).toHaveBeenCalledTimes(stage === "commit" ? 1 : 0);
+      if (stage === "readback") expect(repository.pauseItemForAuthorization).toHaveBeenCalledOnce();
+      if (stage === "commit") expect(repository.finishItem).toHaveBeenLastCalledWith(expect.anything(), item, "inconclusive",
+        expect.objectContaining({ errorCode: "authorization_expired" }));
+    },
+  );
+
+  it("does not publish GET-only reconciliation after capability invalidation without a session change", async () => {
+    const { repository, provider, authorize } = fixture();
+    const failure = new AppError(401, "authorization_expired", "Authority changed.");
+    let invalidated = false;
+    vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+      if (invalidated) throw failure;
+    });
+    provider.getStatus.mockImplementationOnce(async () => { invalidated = true; return status(true); });
+    await expect(reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize)).rejects.toBe(failure);
+    expect(repository.recordReconciliation).not.toHaveBeenCalled();
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each(["revalidation", "capability", "authority"] as const)(
+    "does not request an ordinary worker token after session replacement during %s", async stage => {
+      const { repository, provider } = fixture();
+      const user: AuthenticatedUser = { tenantId: scope.tenantId, homeAccountId: scope.principalId,
+        displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
+      vi.spyOn(msal, "revalidateAuthenticatedUser").mockImplementation(async () => {
+        if (stage === "revalidation") await replaceSession();
+        return user;
+      });
+      vi.spyOn(capabilities, "requireAvailable").mockImplementation(async capabilityId => {
+        if (stage === "capability") await replaceSession();
+        return { capabilityId, status: "available", authorized: true, fresh: true, previewQualification: "not_required", remediation: [] };
+      });
+      vi.spyOn(capabilities, "quarantineAuthorityContext").mockImplementation(async () => {
+        if (stage === "authority") await replaceSession();
+        return authority;
+      });
+      const token = vi.spyOn(msal, "acquireDelegatedToken").mockResolvedValue("fixture");
+
+      await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider))
+        .rejects.toMatchObject({ code: "unauthorized" });
+      expect(token).not.toHaveBeenCalled();
+      expect(repository.claim).not.toHaveBeenCalled();
+      expect(provider.getStatus).not.toHaveBeenCalled();
+      expect(provider.setQuarantine).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects ordinary resume of an interrupted canary before acquiring fresh authority or dispatching", async () => {
+    const { repository, provider, authorize } = fixture();
+    vi.mocked(repository.get).mockResolvedValue({ ...summary, isCanary: true,
+      status: "waiting_authorization", canResume: false });
+    await replaceSession();
+
+    await expect(runCopilotStudioQuarantineJob(jobId, scope, true, repository, provider, authorize))
+      .rejects.toMatchObject({ code: "not_resumable" });
+
+    expect(authorize).not.toHaveBeenCalled();
+    expect(repository.claim).not.toHaveBeenCalled();
+    expect(provider.getStatus).not.toHaveBeenCalled();
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+  });
+
   it("preserves one-shot writes and verified success", async () => {
     const { repository, provider, authorize } = fixture();
     await runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
     expect(repository.markSent).toHaveBeenCalledOnce();
     expect(provider.setQuarantine).toHaveBeenCalledOnce();
     expect(provider.getStatus).toHaveBeenCalledTimes(3);
-    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "succeeded", expect.objectContaining({ observed: status(true) }));
+    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "succeeded", expect.objectContaining({ observed: status(true) }), expect.any(AbortSignal), expect.any(Function));
     expect(repository.release).toHaveBeenCalledOnce();
     expect(settleControls).toHaveBeenCalledWith(scope, expect.any(AbortSignal));
   });
@@ -132,6 +255,127 @@ describe("quarantine execution session and cancellation boundaries", () => {
     expect(repository.release).toHaveBeenCalledOnce();
   });
 
+  it.each(["session", "capability", "admissions"] as const)(
+    "does not begin an item after %s changes while inventory controls settle", async boundary => {
+      const { repository, provider, authorize } = fixture();
+      const failure = new AppError(boundary === "admissions" ? 503 : 401,
+        boundary === "admissions" ? "provider_requalification_required" : "unauthorized", "Authority changed.");
+      let invalidated = false;
+      vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+        if (boundary === "capability" && invalidated) throw failure;
+      });
+      settleControls.mockImplementationOnce(async () => {
+        if (boundary === "session") await replaceSession();
+        else if (boundary === "admissions") vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw failure; });
+        else invalidated = true;
+      });
+      await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize))
+        .rejects.toMatchObject({ code: failure.code });
+      expect(repository.beginItem).not.toHaveBeenCalled();
+      expect(provider.getStatus).not.toHaveBeenCalled();
+      expect(provider.setQuarantine).not.toHaveBeenCalled();
+      expect(repository.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([1, 2, 3, 4])("settles shutdown without waiting for pending authorization %s", async boundary => {
+    const { repository, provider, authorize } = fixture();
+    const controller = new AbortController();
+    const pending = deferred<typeof authorization>();
+    let authorizations = 0;
+    authorize.mockImplementation(async () => ++authorizations === boundary ? pending.promise : authorization);
+    const execution = runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize, controller.signal);
+    try {
+      await vi.waitFor(() => expect(authorize).toHaveBeenCalledTimes(boundary));
+      controller.abort(new AppError(503, "shutdown", "Stopped."));
+      await vi.waitFor(() => {
+        if (boundary === 1) expect(repository.waitForAuthorization).toHaveBeenCalledOnce();
+        else expect(repository.release).toHaveBeenCalledOnce();
+      });
+    } finally {
+      pending.resolve(authorization);
+      await execution;
+    }
+    expect(provider.setQuarantine).toHaveBeenCalledTimes(boundary === 4 ? 1 : 0);
+    if (boundary >= 3) expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), item,
+      boundary === 4 ? "inconclusive" : "cancelled", expect.objectContaining({ errorCode: "shutdown" }));
+    expect(repository.claim).toHaveBeenCalledTimes(boundary === 1 ? 0 : 1);
+  });
+
+  it.each(["revalidation", "capability", "authority"] as const)(
+    "does not request a worker token after capability invalidation during %s", async boundary => {
+      const { repository, provider } = fixture();
+      const failure = new AppError(401, "authorization_expired", "Authority changed.");
+      let invalidated = false;
+      vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+        if (invalidated) throw failure;
+      });
+      vi.spyOn(msal, "revalidateAuthenticatedUser").mockImplementation(async () => {
+        if (boundary === "revalidation") invalidated = true;
+        return { tenantId: scope.tenantId, homeAccountId: scope.principalId,
+          displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
+      });
+      vi.spyOn(capabilities, "requireAvailable").mockImplementation(async capabilityId => {
+        if (boundary === "capability") invalidated = true;
+        return { capabilityId, status: "available", authorized: true, fresh: true, previewQualification: "not_required", remediation: [] };
+      });
+      vi.spyOn(capabilities, "quarantineAuthorityContext").mockImplementation(async () => {
+        if (boundary === "authority") invalidated = true;
+        return authority;
+      });
+      const token = vi.spyOn(msal, "acquireDelegatedToken").mockResolvedValue("fixture");
+      await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider)).rejects.toBe(failure);
+      expect(token).not.toHaveBeenCalled();
+      expect(repository.claim).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves an execution error when releasing its job lease also fails", async () => {
+    const { repository, provider, authorize } = fixture();
+    const primary = new AppError(409, "inventory_control_conflict", "Sensitive primary details");
+    settleControls.mockRejectedValueOnce(primary);
+    vi.mocked(repository.release).mockRejectedValueOnce(new Error("Sensitive lease cleanup details"));
+    await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize)).rejects.toBe(primary);
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledOnce();
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("Sensitive");
+  });
+
+  it("surfaces lease-release failure without replacing a committed verified outcome", async () => {
+    const { repository, provider, authorize } = fixture();
+    const failure = new Error("Lease cleanup failed");
+    vi.mocked(repository.release).mockRejectedValueOnce(failure);
+    await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize)).rejects.toBe(failure);
+    expect(provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(repository.finishItem).toHaveBeenCalledOnce();
+    expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "succeeded",
+      expect.objectContaining({ observed: status(true) }), expect.any(AbortSignal), expect.any(Function));
+  });
+
+  it.each(["authorization_wait", "authorization_pause", "terminal_item"] as const)(
+    "preserves the primary failure if %s persistence also fails", async stage => {
+      const { repository, provider, authorize } = fixture();
+      const primary = new AppError(stage === "terminal_item" ? 502 : 401, "provider_error", "Sensitive primary details");
+      const secondary = new Error("Sensitive persistence details");
+      if (stage === "authorization_wait") {
+        authorize.mockRejectedValueOnce(primary);
+        vi.mocked(repository.waitForAuthorization).mockRejectedValueOnce(secondary);
+      } else if (stage === "authorization_pause") {
+        provider.getStatus.mockRejectedValueOnce(primary);
+        vi.mocked(repository.pauseItemForAuthorization).mockRejectedValueOnce(secondary);
+      } else {
+        provider.setQuarantine.mockRejectedValueOnce(primary);
+        vi.mocked(repository.finishItem).mockRejectedValueOnce(secondary);
+      }
+      await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize)).rejects.toBe(primary);
+      const entries = vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(String(entry)));
+      expect(entries).toContainEqual(expect.objectContaining({ event: "quarantine_job_cleanup_failed", jobId, stage,
+        outcome: "requires_review", errorCode: "internal_error" }));
+      expect(JSON.stringify(entries)).not.toContain("Sensitive");
+      expect(repository.release).toHaveBeenCalledTimes(stage === "authorization_wait" ? 0 : 1);
+    },
+  );
+
   it.each(["initial-authorization", "lock", "pre-read", "immediate", "sent", "post", "readback", "no-op", "publication"] as const)(
     "does not revive stale work after replacement sign-in during %s", async stage => {
       const { repository, provider, authorize } = fixture();
@@ -145,7 +389,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
       });
       vi.mocked(repository.withTargetLock).mockImplementation(async (_lease, _item, operation) => {
         if (stage === "lock") await replaceSession();
-        return operation();
+        return operation(new AbortController().signal);
       });
       vi.mocked(repository.markSent).mockImplementation(async () => {
         if (stage === "sent") replacement = replaceSession();
@@ -165,8 +409,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
       await replacement;
 
       expect(provider.setQuarantine).toHaveBeenCalledTimes(["post", "readback", "publication"].includes(stage) ? 1 : 0);
-      expect(repository.finishItem).not.toHaveBeenCalledWith(expect.anything(), item, "succeeded", expect.anything());
-      expect(repository.finishItem).not.toHaveBeenCalledWith(expect.anything(), item, "skipped", expect.anything());
+      expect(vi.mocked(repository.finishItem).mock.calls.some(([, , outcome]) => outcome === "succeeded" || outcome === "skipped")).toBe(false);
       if (["sent", "post", "readback", "publication"].includes(stage)) {
         expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "inconclusive", expect.objectContaining({ errorCode: "unauthorized" }));
       } else if (stage === "initial-authorization") {
@@ -225,7 +468,42 @@ describe("quarantine execution session and cancellation boundaries", () => {
     await runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
     expect(provider.setQuarantine).not.toHaveBeenCalled();
     expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, noOp ? "skipped" : "failed",
-      expect.objectContaining(noOp ? { observed: status(true, "2026-09-24T12:02:00Z") } : { errorCode: "quarantine_prestate_conflict" }));
+      expect.objectContaining(noOp ? { observed: status(true, "2026-09-24T12:02:00Z") } : { errorCode: "quarantine_prestate_conflict" }),
+      ...(noOp ? [expect.any(AbortSignal), expect.any(Function)] : []));
+  });
+
+  it.each(["authorization", "prestate"] as const)("retains %s failure classification when target unlock also fails", async boundary => {
+    const database = new pg.Pool();
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockImplementation(async () => client);
+    const cleanup = new Error("Sensitive lock cleanup details.");
+    vi.spyOn(client, "query").mockImplementation(vi.fn(async text => {
+      if (String(text).startsWith("SELECT pg_advisory_unlock")) {
+        client.emit("error", cleanup);
+        throw cleanup;
+      }
+      const rows = String(text).startsWith("SELECT * FROM copilot_quarantine_jobs") ? [job] : [];
+      return { command: "", oid: 0, fields: [], rowCount: rows.length, rows };
+    }));
+    const { repository, provider, authorize } = fixture(new CopilotStudioQuarantineRepository(database));
+    vi.mocked(repository.withTargetLock).mockRestore();
+    if (boundary === "authorization") {
+      provider.getStatus.mockRejectedValue(new AppError(401, "provider_authorization_error", "Provider authorization expired."));
+    } else provider.getStatus.mockResolvedValue(status(false, "2026-09-24T12:02:00Z"));
+
+    await runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
+
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(cleanup);
+    if (boundary === "authorization") {
+      expect(repository.pauseItemForAuthorization).toHaveBeenCalledOnce();
+      expect(repository.finishItem).not.toHaveBeenCalled();
+    } else {
+      expect(repository.pauseItemForAuthorization).not.toHaveBeenCalled();
+      expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), item, "failed",
+        expect.objectContaining({ errorCode: "quarantine_prestate_conflict" }));
+    }
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("Sensitive");
   });
 
   it("retains the deadline outcome over a late transport rejection", async () => {
@@ -239,9 +517,135 @@ describe("quarantine execution session and cancellation boundaries", () => {
     expect(repository.finishItem).toHaveBeenCalledWith(expect.anything(), item, "failed", expect.objectContaining({ errorCode: "provider_timeout" }));
     expect(provider.setQuarantine).not.toHaveBeenCalled();
   });
+
+  it.each(["read", "dispatch", "post", "publication"] as const)("fences lock loss during %s without replay or verified publication", async stage => {
+    const { repository, provider, authorize } = fixture();
+    const controller = new AbortController();
+    const failure = new AppError(409, "quarantine_lock_lost", "Synthetic lock loss.");
+    vi.mocked(repository.withTargetLock).mockImplementation(async (_lease, _item, operation) => operation(controller.signal));
+    const read = provider.getStatus.getMockImplementation()!;
+    provider.getStatus.mockImplementation(async (...args) => {
+      if (stage === "read") controller.abort(failure);
+      return read(...args);
+    });
+    vi.mocked(repository.markSent).mockImplementation(async () => {
+      if (stage === "dispatch") controller.abort(failure);
+    });
+    const write = provider.setQuarantine.getMockImplementation()!;
+    provider.setQuarantine.mockImplementation(async (...args) => {
+      if (stage === "post") controller.abort(failure);
+      return write(...args);
+    });
+    let authorizations = 0;
+    authorize.mockImplementation(async () => {
+      if (++authorizations === 4 && stage === "publication") controller.abort(failure);
+      return authorization;
+    });
+
+    await runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
+    expect(provider.setQuarantine).toHaveBeenCalledTimes(["post", "publication"].includes(stage) ? 1 : 0);
+    expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), item,
+      stage === "read" ? "failed" : "inconclusive", expect.objectContaining({ errorCode: failure.code }));
+    expect(provider.getStatus.mock.calls.every(([, , options]) => options?.signal?.aborted)).toBe(true);
+  });
+
+  it("does not overwrite a committed result when target-lock cleanup fails", async () => {
+    const { repository, provider, authorize } = fixture();
+    const failure = new Error("Synthetic lock cleanup failure.");
+    vi.mocked(repository.withTargetLock).mockImplementation(async (_lease, _item, operation) => {
+      await operation(new AbortController().signal);
+      throw failure;
+    });
+    await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize)).rejects.toBe(failure);
+    expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), item, "succeeded",
+      expect.objectContaining({ observed: status(true) }), expect.any(AbortSignal), expect.any(Function));
+    expect(provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(repository.release).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish exhausted readback evidence after the initiating session changes during failure reporting", async () => {
+    vi.useFakeTimers();
+    try {
+      const { repository, provider, authorize } = fixture();
+      provider.setQuarantine.mockResolvedValue(status(true));
+      vi.mocked(capabilities.observeOperation).mockImplementation(async (_id, _principal, operation) => {
+        try { return await operation(() => undefined); }
+        catch (error) {
+          if (error instanceof AppError && error.code === "verification_inconclusive") await replaceSession();
+          throw error;
+        }
+      });
+      let published = false;
+      vi.mocked(repository.finishItem).mockImplementation(async (_lease, _item, _outcome, _evidence, _signal, beforeCommit) => {
+        beforeCommit?.();
+        published = true;
+      });
+      const assertion = expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize))
+        .rejects.toMatchObject({ code: "verification_inconclusive" });
+      await vi.advanceTimersByTimeAsync(3_000);
+      await assertion;
+      expect(published).toBe(false);
+      expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual(
+        expect.objectContaining({ event: "quarantine_job_cleanup_failed", stage: "terminal_item", errorCode: "unauthorized" }),
+      );
+      expect(provider.setQuarantine).toHaveBeenCalledOnce();
+      expect(repository.release).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("preserves the readback failure when persisted authority rejects inconclusive evidence publication", async () => {
+    const { repository, provider, authorize } = fixture();
+    let primary: AppError | undefined;
+    vi.mocked(capabilities.observeOperation).mockImplementation(async (_id, _principal, operation) => {
+      try { return await operation(() => undefined); }
+      catch (error) {
+        if (error instanceof AppError && error.code === "verification_inconclusive") primary = error;
+        throw error;
+      }
+    });
+    provider.getStatus.mockResolvedValue(status(false));
+    vi.mocked(repository.finishItem).mockRejectedValueOnce(new AppError(409, "cancelled", "Persisted cancellation closed publication."));
+
+    const execution = runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider, authorize);
+    await expect(execution).rejects.toMatchObject({ code: "verification_inconclusive" });
+    expect(await execution.catch(error => error)).toBe(primary);
+
+    expect(repository.markSent).toHaveBeenCalledOnce();
+    expect(provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(provider.getStatus).toHaveBeenCalledTimes(7);
+    expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), item, "inconclusive",
+      expect.objectContaining({ observed: status(false), readbackCount: 5, errorCode: "verification_inconclusive" }),
+      expect.any(AbortSignal), expect.any(Function));
+    expect(repository.release).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual(
+      expect.objectContaining({ event: "quarantine_job_cleanup_failed", stage: "terminal_item", errorCode: "cancelled" }),
+    );
+  });
 });
 
 describe("quarantine GET-only reconciliation boundaries", () => {
+  it.each([1, 2, 3])("bounds pending reconciliation authorization %s by its deadline", async boundary => {
+    const { repository, provider, authorize } = fixture();
+    const controller = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    const pending = deferred<typeof authorization>();
+    let authorizations = 0, settled = false;
+    authorize.mockImplementation(async () => ++authorizations === boundary ? pending.promise : authorization);
+    const execution = reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize);
+    const result = execution.then(() => { settled = true; }, error => { settled = true; throw error; });
+    const assertion = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+    try {
+      await vi.waitFor(() => expect(authorize).toHaveBeenCalledTimes(boundary));
+      controller.abort(new DOMException("Deadline exceeded.", "TimeoutError"));
+      await vi.waitFor(() => expect(settled).toBe(true));
+    } finally {
+      pending.resolve(authorization);
+      await assertion;
+    }
+    expect(repository.recordReconciliation).toHaveBeenCalledTimes(boundary === 3 ? 1 : 0);
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+  });
+
   it.each(["lookup", "authorization", "lock", "readback", "next-item", "final-authorization", "response"] as const)(
     "rejects a superseded reconciliation session during %s", async stage => {
       const { repository, provider, authorize } = fixture();
@@ -258,7 +662,7 @@ describe("quarantine GET-only reconciliation boundaries", () => {
       });
       vi.mocked(repository.withReconciliationLock).mockImplementation(async (_scope, _item, operation) => {
         if (stage === "lock") await replaceSession();
-        return operation();
+        return operation(new AbortController().signal);
       });
       provider.getStatus.mockImplementation(async () => {
         if (stage === "readback") await replaceSession();
@@ -286,7 +690,7 @@ describe("quarantine GET-only reconciliation boundaries", () => {
     await expect(reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize)).resolves.toMatchObject({
       id: jobId, reconciliation: { attempted: 1, failed: 0, errors: [] },
     });
-    expect(repository.recordReconciliation).toHaveBeenCalledWith(scope, job, expect.anything(), outcome, expect.anything(), expect.any(String));
+    expect(repository.recordReconciliation).toHaveBeenCalledWith(scope, job, expect.anything(), outcome, expect.anything(), expect.any(String), expect.any(AbortSignal), expect.any(Function));
     expect(provider.setQuarantine).not.toHaveBeenCalled();
   });
 
@@ -294,6 +698,34 @@ describe("quarantine GET-only reconciliation boundaries", () => {
     const { repository, provider, authorize } = fixture();
     vi.mocked(repository.get).mockResolvedValue(undefined);
     await expect(reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("does not call a committed reconciliation a failed read when lock cleanup fails", async () => {
+    const { repository, provider, authorize } = fixture();
+    provider.getStatus.mockResolvedValue(status(true));
+    const failure = new Error("Synthetic lock cleanup failure.");
+    vi.mocked(repository.withReconciliationLock).mockImplementation(async (_scope, _item, operation) => {
+      await operation(new AbortController().signal);
+      throw failure;
+    });
+    await expect(reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize)).rejects.toBe(failure);
+    expect(repository.recordReconciliation).toHaveBeenCalledOnce();
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
+  });
+
+  it("fences GET-only reconciliation publication when its target lock is lost during authorization", async () => {
+    const { repository, provider, authorize } = fixture();
+    const controller = new AbortController();
+    vi.mocked(repository.withReconciliationLock).mockImplementation(async (_scope, _item, operation) => operation(controller.signal));
+    let authorizations = 0;
+    authorize.mockImplementation(async () => {
+      if (++authorizations === 2) controller.abort(new AppError(409, "quarantine_lock_lost", "Synthetic lock loss."));
+      return authorization;
+    });
+    const result = await reconcileCopilotStudioQuarantineJob(jobId, scope, repository, provider, authorize);
+    expect(result.reconciliation).toMatchObject({ attempted: 1, failed: 1 });
+    expect(repository.recordReconciliation).not.toHaveBeenCalled();
+    expect(provider.setQuarantine).not.toHaveBeenCalled();
   });
 });
 

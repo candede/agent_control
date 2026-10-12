@@ -68,12 +68,13 @@ describe("findUnifiedAgentRecord", () => {
     expect(findUnifiedAgentRecord([canonical, upper], upper.id)).toBeUndefined();
   });
 
-  it("matches native GUIDs and environments case-insensitively, but never opaque native or package IDs", () => {
+  it("matches native GUIDs and validated environments case-insensitively, but never opaque native or package IDs", () => {
     const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const native = { ...record, powerPlatformResource: { ...record.powerPlatformResource!, nativeId } };
-    expect(findUnifiedAgentRecord([native], "power_platform:ENVIRONMENT-A:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")).toBe(native);
-    expect(findUnifiedAgentRecord([native], nativeId.toUpperCase(), "ENVIRONMENT-A")).toBe(native);
-    expect(findUnifiedAgentRecord([record], "power_platform:ENVIRONMENT-A:native%2fid")).toBe(record);
+    const environmentId = `Default-${nativeId}`;
+    const native = { ...record, environmentId, powerPlatformResource: { ...record.powerPlatformResource!, environmentId, nativeId } };
+    expect(findUnifiedAgentRecord([native], `power_platform:${environmentId.toUpperCase()}:${nativeId.toUpperCase()}`)).toBe(native);
+    expect(findUnifiedAgentRecord([native], nativeId.toUpperCase(), environmentId.toUpperCase())).toBe(native);
+    expect(findUnifiedAgentRecord([record], "power_platform:ENVIRONMENT-A:native%2fid")).toBeUndefined();
     expect(findUnifiedAgentRecord([record], "power_platform:environment-a:NATIVE%2Fid")).toBeUndefined();
     expect(findUnifiedAgentRecord([record], "graph_packages:package%2fa")).toBe(record);
     expect(findUnifiedAgentRecord([record], "graph_packages:PACKAGE%2Fa")).toBeUndefined();
@@ -96,11 +97,25 @@ describe("findUnifiedAgentRecord", () => {
 
   it("does not let GUID casing hide ambiguous native ownership or manufacture a null environment", () => {
     const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const lower = { ...record, powerPlatformResource: { ...record.powerPlatformResource!, nativeId } };
+    const environmentId = `default-${nativeId}`;
+    const lower = { ...record, powerPlatformResource: { ...record.powerPlatformResource!, nativeId, environmentId } };
     const upper = { ...record, id: "agent:22222222-2222-4222-8222-222222222222",
-      powerPlatformResource: { ...record.powerPlatformResource!, nativeId: nativeId.toUpperCase(), environmentId: "ENVIRONMENT-A" } };
-    expect(findUnifiedAgentRecord([lower, upper], `power_platform:environment-a:${nativeId}`)).toBeUndefined();
-    expect(findUnifiedAgentRecord([lower], `power_platform::${nativeId}`, "environment-a")).toBeUndefined();
+      powerPlatformResource: { ...record.powerPlatformResource!, nativeId: nativeId.toUpperCase(), environmentId: environmentId.toUpperCase() } };
+    expect(findUnifiedAgentRecord([lower, upper], `power_platform:${environmentId}:${nativeId}`)).toBeUndefined();
+    expect(findUnifiedAgentRecord([lower], `power_platform::${nativeId}`, environmentId)).toBeUndefined();
+  });
+
+  it("preserves distinct opaque environment memberships instead of choosing or merging a case collision", () => {
+    const upper = { ...record, id: "agent:22222222-2222-4222-8222-222222222222", environmentId: "Environment-A",
+      powerPlatformResource: { ...record.powerPlatformResource!, environmentId: "Environment-A" } };
+    for (const records of [[record, upper], [upper, record]]) {
+      expect(findUnifiedAgentRecord(records, unifiedAgentRecordId({
+        source: "power_platform", nativeId: record.powerPlatformResource!.nativeId, environmentId: "Environment-A",
+      }))).toBe(upper);
+      expect(findUnifiedAgentRecord(records, unifiedAgentRecordId({
+        source: "power_platform", nativeId: record.powerPlatformResource!.nativeId, environmentId: "environment-a",
+      }))).toBe(record);
+    }
   });
 
   it("decodes opaque source IDs exactly once, including source-like package values", () => {

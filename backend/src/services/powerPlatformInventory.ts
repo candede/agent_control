@@ -20,6 +20,7 @@ type InventoryRefreshDependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   streams: (database: ConstructorParameters<typeof StreamedInventory>[0]) => Pick<StreamedInventory, "powerPlatformCatalog">;
 };
 
@@ -28,6 +29,7 @@ const defaultDependencies: InventoryRefreshDependencies = {
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
+  beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   streams: database => new StreamedInventory(database),
 };
 
@@ -48,15 +50,28 @@ export class PowerPlatformInventoryService {
 
   async submit(user: AuthenticatedUser, input: Omit<InventoryRefreshInput, "roleScope">) {
     requireReader(user);
-    requireProviderAdmissions();
     const scope = dataScope(user);
-    const roleScope = inventoryRoleScope(user);
-    const job = await this.repository.submit(scope, { ...input, roleScope });
-    operationalLog("info", "inventory_refresh_submitted", {
-      jobId: job.id, status: job.status, requestedTypeCount: job.requestedTypes.length,
-      environmentScoped: Boolean(job.environmentScope),
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const validateCapability = this.dependencies.beginOperationValidation("powerPlatform.inventory.read", {
+      tenantId: scope.tenantId, homeAccountId: scope.principalId,
     });
-    return job;
+    const assertCurrent = () => {
+      assertAccountSessionValidation(validation);
+      validateCapability();
+      requireProviderAdmissions();
+    };
+    assertCurrent();
+    const roleScope = inventoryRoleScope(user);
+    return commitAccountSessionValidation(validation, async () => {
+      assertCurrent();
+      const job = await this.repository.submit(scope, { ...input, roleScope }, assertCurrent);
+      assertCurrent();
+      operationalLog("info", "inventory_refresh_submitted", {
+        jobId: job.id, status: job.status, requestedTypeCount: job.requestedTypes.length,
+        environmentScoped: Boolean(job.environmentScope),
+      });
+      return job;
+    });
   }
 
   async start(user: AuthenticatedUser, id: string, options: { retryFailed?: boolean } = {}) {
@@ -77,35 +92,49 @@ export class PowerPlatformInventoryService {
     }
     const controller = new AbortController();
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const validateCapability = this.dependencies.beginOperationValidation("powerPlatform.inventory.read", {
+      tenantId: scope.tenantId, homeAccountId: scope.principalId,
+    });
     const starting: StartingRefresh = {
       scope, controller,
-      operation: Promise.resolve().then(() => this.startRefresh(scope, id, controller, validation, options))
+      operation: Promise.resolve().then(() => this.startRefresh(scope, id, controller, validation, validateCapability, options))
         .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
     };
     this.starting.set(id, starting);
     return starting.operation;
   }
 
-  private async startRefresh(scope: InventoryDataScope, id: string, controller: AbortController, validation: ReturnType<typeof beginAccountSessionValidation>, options: { retryFailed?: boolean }) {
+  private async startRefresh(scope: InventoryDataScope, id: string, controller: AbortController, validation: ReturnType<typeof beginAccountSessionValidation>, validateCapability: () => void, options: { retryFailed?: boolean }) {
     const startedAt = performance.now();
     let stage = "load_job";
     let ownedWaitingJob = false;
     let markedRunning = false;
     let dispatched = false;
+    let signal = controller.signal;
+    let execution: ReturnType<typeof createRefreshExecutionSignal> | undefined;
+    let deadlineAt = Infinity;
     const assertCurrent = () => {
+      signal.throwIfAborted();
       controller.signal.throwIfAborted();
+      if (Date.now() >= deadlineAt) throw new DOMException("Inventory refresh deadline expired.", "TimeoutError");
       assertAccountSessionValidation(validation);
+      validateCapability();
       requireProviderAdmissions();
     };
     try {
       assertCurrent();
-      const current = await this.repository.getJob(scope, id);
+      const admitted = await this.repository.getJobForExecution(scope, id);
       assertCurrent();
+      const current = admitted?.job;
       if (!current) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
       if (current.status !== "waiting_authorization") throw new AppError(409, "inventory_job_state", "Only a waiting inventory refresh can be started.");
       ownedWaitingJob = true;
+      deadlineAt = admitted.deadlineAt.getTime();
+      execution = createRefreshExecutionSignal(signal, Math.max(0, Math.min(refreshExecutionDeadlineMs, deadlineAt - Date.now())));
+      signal = execution.signal;
+      assertCurrent();
       stage = "revalidate_user";
-      const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
+      const freshUser = await interruptibleAuthorization(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId), signal);
       assertCurrent();
       let token = "";
       await this.dependencies.observeOperation("powerPlatform.inventory.read", freshUser, async () => {
@@ -114,10 +143,10 @@ export class PowerPlatformInventoryService {
         requireSamePrincipal(scope, freshUser);
         requireReader(freshUser);
         requireSameQueryScope(current, freshUser);
-        await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser, options);
+        await interruptibleAuthorization(() => this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser, options), signal);
         assertCurrent();
         stage = "delegated_token";
-        token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "powerPlatform.inventory.read");
+        token = await interruptibleAuthorization(() => this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "powerPlatform.inventory.read"), signal);
         assertCurrent();
         // Serialize the state change, not provider calls that would delay sign-out.
         await commitAccountSessionValidation(validation, async () => {
@@ -126,17 +155,16 @@ export class PowerPlatformInventoryService {
           markedRunning = await this.repository.markRunning(scope, id);
           if (!markedRunning) throw new AppError(409, "inventory_job_state", "Inventory refresh was already started or expired.");
         });
-      }, { signal: controller.signal, clearOnSuccess: false });
+      }, { signal, clearOnSuccess: false });
       assertCurrent();
       operationalLog("info", "inventory_refresh_started", {
         jobId: id, durationMs: Math.round(performance.now() - startedAt),
         requestedTypeCount: current.requestedTypes.length, environmentScoped: Boolean(current.environmentScope),
       });
-      const execution = createRefreshExecutionSignal(controller.signal, refreshExecutionDeadlineMs);
       stage = "dispatch";
-      const operation = withTelemetryContext({ jobId: id }, () => this.run(scope, current, id, token, execution.signal, validation))
+      const operation = withTelemetryContext({ jobId: id }, () => this.run(scope, current, id, token, signal, validation, validateCapability))
         .finally(() => {
-          execution.dispose();
+          execution?.dispose();
           if (this.active.get(id)?.operation === operation) this.active.delete(id);
         });
       this.active.set(id, { scope, controller, operation });
@@ -144,50 +172,89 @@ export class PowerPlatformInventoryService {
       void operation.catch(error => {
         operationalLog("error", "inventory_refresh_status_failed", { jobId: id, ...errorTelemetry(error) });
       });
-      return (await this.repository.getJob(scope, id))!;
+      const result = await this.repository.getJob(scope, id);
+      assertCurrent();
+      if (!result) throw new AppError(409, "inventory_job_expired", "The inventory refresh expired before its status could be returned.");
+      return result;
     } catch (error) {
-      let failure = error;
-      try { assertCurrent(); } catch (currentError) { failure = currentError; }
+      let cause = error;
+      try { assertCurrent(); } catch (currentError) { cause = currentError; }
+      const expired = signal.aborted ? isTimeoutError(signal.reason) : !controller.signal.aborted && Date.now() >= deadlineAt;
+      const failure = expired ? new AppError(409, "inventory_job_expired",
+        "The inventory refresh deadline expired. Start a new refresh; saved data is unchanged.") : cause;
       operationalLog("warn", "inventory_refresh_start_failed", {
         jobId: id, stage, durationMs: Math.round(performance.now() - startedAt), ...errorTelemetry(failure),
       });
-      if (markedRunning && !dispatched && (controller.signal.aborted || isAuthorizationFailure(failure))) {
-        if (controller.signal.reason instanceof AppError && controller.signal.reason.code === "read_job_cancelled") {
+      if (markedRunning && !dispatched && (signal.aborted && !expired || isAuthorizationFailure(failure))) {
+        if (signal.reason instanceof AppError && signal.reason.code === "read_job_cancelled") {
           await this.repository.cancel(scope, id);
         } else {
           await this.repository.markWaitingAuthorization(scope, id);
         }
-      } else if (ownedWaitingJob && !dispatched && failure instanceof AppError
-        && dataSyncFailureStatus(failure.code, failure.status) === "permission_required") {
+      } else if (ownedWaitingJob && !dispatched && (!signal.aborted || expired) && !isAuthorizationFailure(failure)
+        && (markedRunning || stage !== "mark_running" || expired)) {
         await this.repository.markFailed(scope, id, failureCode(failure), safeFailureMessage(failure));
       }
-      assertCurrent();
+      if (!expired) assertCurrent();
       throw failure;
+    } finally {
+      if (!dispatched) execution?.dispose();
     }
   }
 
   async get(user: AuthenticatedUser, id: string) {
-    const job = await this.repository.getJob(dataScope(user), id);
-    if (!job) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
-    return job;
+    requireReader(user);
+    const scope = dataScope(user);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    assertAccountSessionValidation(validation);
+    try {
+      const job = await this.repository.getJob(scope, id);
+      assertAccountSessionValidation(validation);
+      if (!job) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
+      return job;
+    } catch (error) {
+      assertAccountSessionValidation(validation);
+      throw error;
+    }
   }
 
   async cancel(user: AuthenticatedUser, id: string, cancellationReason: RefreshCancellationReason = "requested") {
     requireReader(user);
     const scope = dataScope(user);
+    const validation = cancellationReason === "requested" ? beginAccountSessionValidation(scope.tenantId, scope.principalId) : undefined;
+    const assertCurrent = () => { if (validation) assertAccountSessionValidation(validation); };
+    assertCurrent();
     id = id.toLowerCase();
-    const job = await this.repository.getJob(scope, id);
-    if (!job) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
-    const cancelled = await this.repository.cancel(scope, id, cancellationReason);
-    operationalLog("info", "inventory_refresh_cancel_requested", { jobId: id, status: cancelled?.status });
-    const reason = new AppError(409, "read_job_cancelled", "Inventory refresh was cancelled.");
-    this.starting.get(id)?.controller.abort(reason);
-    this.active.get(id)?.controller.abort(reason);
-    return cancelled!;
+    try {
+      const job = await this.repository.getJob(scope, id);
+      assertCurrent();
+      if (!job) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
+      // Cancellation must not queue behind a pending admission write.
+      const cancelled = validation
+        ? await this.repository.cancel(scope, id, cancellationReason, assertCurrent)
+        : await this.repository.cancel(scope, id, cancellationReason);
+      operationalLog("info", "inventory_refresh_cancel_requested", { jobId: id, status: cancelled?.status });
+      const reason = new AppError(409, "read_job_cancelled", "Inventory refresh was cancelled.");
+      this.starting.get(id)?.controller.abort(reason);
+      this.active.get(id)?.controller.abort(reason);
+      assertCurrent();
+      if (!cancelled) throw new AppError(409, "inventory_job_expired", "The inventory refresh expired before its cancellation status could be returned.");
+      return cancelled;
+    } catch (error) {
+      assertCurrent();
+      throw error;
+    }
   }
 
-  async recover() {
-    const count = await this.repository.recoverInterrupted();
+  async recover(admissionsOpen?: () => Promise<boolean>) {
+    let count = 0;
+    for (;;) {
+      if (admissionsOpen && !await admissionsOpen()) break;
+      const recovered = await this.repository.recoverInterrupted();
+      count += recovered;
+      if (!recovered) break;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
     if (count) operationalLog("warn", "inventory_refresh_recovered", { count });
     return count;
   }
@@ -211,14 +278,18 @@ export class PowerPlatformInventoryService {
     }
   }
 
-  private async run(scope: InventoryDataScope, current: InventoryRefreshJob, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
+  private async run(scope: InventoryDataScope, current: InventoryRefreshJob, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>, validateCapability: () => void) {
     const startedAt = performance.now();
     let stage = "query";
     let sourceAuthorized = false;
     let committed = false;
+    let execution: ReturnType<typeof createRefreshExecutionSignal> | undefined;
+    let deadlineAt = Infinity;
     const assertCurrent = () => {
       signal.throwIfAborted();
+      if (Date.now() >= deadlineAt) throw new DOMException("Inventory refresh deadline expired.", "TimeoutError");
       assertAccountSessionValidation(validation);
+      validateCapability();
       requireProviderAdmissions();
     };
     try {
@@ -227,10 +298,15 @@ export class PowerPlatformInventoryService {
       const input = await inventoryJobInput(this.repository.database, scope, "power_platform", id, {
         environmentId: current.environmentScope ?? undefined, resourceTypes: queryTypes,
       });
+      deadlineAt = input.deadlineAt.getTime();
+      execution = createRefreshExecutionSignal(signal, Math.max(0, Math.min(refreshExecutionDeadlineMs, deadlineAt - Date.now())));
+      signal = execution.signal;
+      assertCurrent();
       await this.dependencies.observeOperation("powerPlatform.inventory.read",
         { tenantId: scope.tenantId, homeAccountId: scope.principalId }, async () => {
         await this.dependencies.streams(this.repository.database).powerPlatformCatalog(input, token, queryTypes, {
         signal,
+        assertCurrent,
         expectedTenantId: scope.tenantId,
         environmentId: current.environmentScope ?? undefined,
         roleScope: current.roleScope,
@@ -249,12 +325,12 @@ export class PowerPlatformInventoryService {
         authorize: async () => {
           stage = sourceAuthorized ? "publication_authorization" : "collection_authorization";
           assertCurrent();
-          const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
+          const freshUser = await interruptibleAuthorization(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId), signal);
           assertCurrent();
           requireSamePrincipal(scope, freshUser);
           requireReader(freshUser);
           requireSameQueryScope(current, freshUser);
-          await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser);
+          await interruptibleAuthorization(() => this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser), signal);
           assertCurrent();
           sourceAuthorized = true;
           stage = "query";
@@ -263,19 +339,14 @@ export class PowerPlatformInventoryService {
           assertCurrent();
           await operation();
         }),
+        onCommitted: () => { committed = true; },
         completeJob: async (...args) => {
           assertCurrent();
           stage = "publication";
           await completeInventoryJob(input, "power_platform")(...args);
         },
         });
-        committed = true;
       }, { signal });
-      await inventoryRuntime(this.repository.database).enqueue(scope);
-      operationalLog("info", "inventory_refresh_succeeded", {
-        jobId: id, status: "succeeded", queriedTypeCount: queryTypes.length,
-        environmentScoped: current.environmentScope !== null, durationMs: Math.round(performance.now() - startedAt),
-      });
     } catch (error) {
       if (committed) {
         operationalLog("warn", "inventory_followup_failed", { jobId: id, stage, ...errorTelemetry(error, "inventory_reconciliation_pending") });
@@ -301,6 +372,18 @@ export class PowerPlatformInventoryService {
       const code = failureCode(failure);
       await this.repository.markFailed(scope, id, code, safeFailureMessage(failure));
       operationalLog("error", "inventory_refresh_failed", { jobId: id, status: "failed", errorCode: code, stage });
+    } finally {
+      if (committed) {
+        try { await inventoryRuntime(this.repository.database).enqueue(scope); }
+        catch (error) {
+          operationalLog("warn", "inventory_followup_failed", { jobId: id, stage: "reconciliation", ...errorTelemetry(error, "inventory_reconciliation_pending") });
+        }
+        operationalLog("info", "inventory_refresh_succeeded", {
+          jobId: id, status: "succeeded", queriedTypeCount: current.requestedTypes.length,
+          environmentScoped: current.environmentScope !== null, durationMs: Math.round(performance.now() - startedAt),
+        });
+      }
+      execution?.dispose();
     }
   }
 }
@@ -340,9 +423,23 @@ function failureCode(error: unknown) {
 }
 
 function safeFailureMessage(error: unknown) {
+  if (error instanceof AppError && error.code === "missing_internal_role") {
+    return "The Agent Control Viewer or Admin application role is required. Review application role assignments; Microsoft provider consent does not grant this role. Saved data is unchanged.";
+  }
   if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
     return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
   }
-  if (error instanceof AppError && ["provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit", "incomplete_inventory_coverage", "scope_mismatch", "inventory_scope_changed"].includes(error.code)) return error.message.slice(0, 1024);
+  if (error instanceof AppError && ["provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit", "incomplete_inventory_coverage", "scope_mismatch", "inventory_scope_changed", "inventory_job_expired"].includes(error.code)) return error.message.slice(0, 1024);
   return "Power Platform inventory refresh failed before complete publication.";
+}
+
+async function interruptibleAuthorization<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { return await Promise.race([operation(), cancelled]); }
+  finally { signal.removeEventListener("abort", onAbort); }
 }

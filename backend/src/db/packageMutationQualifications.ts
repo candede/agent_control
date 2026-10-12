@@ -4,8 +4,9 @@ import { AppError } from "../errors.js";
 import type { AuditAction } from "../types/audit.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole } from "../types/capability.js";
-import type { PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
-import { canonicalAccessEntities, packageMutationStatesEqual, type PackageMutationState } from "../services/packageMutationState.js";
+import { isDirectoryObjectId, isPackageId, isWritablePackageAccessScope, packageAccessCollectionLimit, type PackageAccessEntity, type PackageAccessUpdate } from "../types/copilotPackage.js";
+import { canonicalAccessEntities, packageMutationStatesEqual, requirePersistablePackageMutationState, type PackageMutationState } from "../services/packageMutationState.js";
+import { requireProviderAdmissions } from "../services/operationalState.js";
 import { pool, transaction } from "./pool.js";
 
 export type QualificationInput = {
@@ -54,7 +55,8 @@ type QualificationRow = {
 export class PackageMutationQualificationRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async createApproved(user: AuthenticatedUser, input: QualificationInput) {
+  async createApproved(user: AuthenticatedUser, input: QualificationInput, assertCurrent?: () => void) {
+    assertCurrent?.();
     requireQualificationAdministrator(user);
     const tenantId = requireTenant(user);
     const prepared = validateAndProjectInput(input);
@@ -74,7 +76,7 @@ export class PackageMutationQualificationRepository {
         VALUES($1,$2,$3,'copilot_package',$4,$5,$6,$7,$8,'delegated',$9,$10,$11,'approved',clock_timestamp()+interval '30 minutes',3) RETURNING *`,
       [randomUUID(), tenantId, prepared.targetId, prepared.action, user.displayName.slice(0, 256), user.homeAccountId, prepared.contractRevision, prepared.configurationRevision, prepared.prestate, prepared.poststate, prepared.restorationCriteria]);
       return project(rows[0]);
-    });
+    }, undefined, assertCurrent);
   }
 
   async getApproved(user: AuthenticatedUser, id: string) {
@@ -84,7 +86,9 @@ export class PackageMutationQualificationRepository {
     return rows[0] ? project(rows[0]) : undefined;
   }
 
-  async claimCycle(user: AuthenticatedUser, originalId: string, restorationId: string, originalIdentity: QualificationIdentity, restorationIdentity: QualificationIdentity) {
+  async claimCycle(user: AuthenticatedUser, originalId: string, restorationId: string, originalIdentity: QualificationIdentity, restorationIdentity: QualificationIdentity, assertCurrent?: () => void) {
+    const requireCurrent = () => { assertCurrent?.(); requireProviderAdmissions(); };
+    requireCurrent();
     requireQualificationOperator(user);
     const tenantId = requireTenant(user);
     const result = await transaction(this.database, async client => {
@@ -113,7 +117,7 @@ export class PackageMutationQualificationRepository {
         original: project(claimed.rows.find(row => row.id === ids[0])!),
         restoration: project(claimed.rows.find(row => row.id === ids[1])!),
       } };
-    });
+    }, undefined, requireCurrent);
     if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The Admin executing the canary cycle must differ from both approving Admins.");
     if (result.kind === "invalidated") throw new AppError(409, "qualification_invalidated", "The approved canary intent was invalidated by a contract, authentication mode, or configuration revision change.");
     if (result.kind === "mismatch") throw new AppError(409, "canary_cycle_mismatch", "The restoration approval must be the exact inverse action, target, and semantic state of the original approval.");
@@ -143,7 +147,12 @@ export class PackageMutationQualificationRepository {
     return project(rows[0]);
   }
 
-  async completeCycle(user: AuthenticatedUser, originalId: string, restorationId: string, completion: QualificationCompletion, originalIdentity?: QualificationIdentity, restorationIdentity?: QualificationIdentity) {
+  async completeCycle(user: AuthenticatedUser, originalId: string, restorationId: string, completion: QualificationCompletion, originalIdentity?: QualificationIdentity, restorationIdentity?: QualificationIdentity, assertCurrent?: () => void) {
+    const requireCurrent = () => {
+      assertCurrent?.();
+      if (completion.status === "qualified") requireProviderAdmissions();
+    };
+    requireCurrent();
     requireQualificationOperator(user);
     const tenantId = requireTenant(user);
     return transaction(this.database, async client => {
@@ -152,7 +161,9 @@ export class PackageMutationQualificationRepository {
         WHERE id=ANY($1::uuid[]) AND tenant_id=$2 AND workflow_version=3 AND status='restoring' AND actor_principal_id=$3 ORDER BY id FOR UPDATE`, [ids, tenantId, user.homeAccountId]);
       const original = current.rows.find(row => row.id === ids[0]);
       const restoration = current.rows.find(row => row.id === ids[1]);
-      if (!original || !restoration || !isExactInverse(original, restoration)) throw new AppError(409, "canary_cycle_state", "The paired canary cycle cannot be completed from its current state.");
+      if (!original || !restoration || original.paired_qualification_id !== restoration.id || restoration.paired_qualification_id !== original.id
+        || original.cycle_stage !== "original" || restoration.cycle_stage !== "restoration"
+        || !isExactInverse(original, restoration)) throw new AppError(409, "canary_cycle_state", "The paired canary cycle cannot be completed from its current state.");
       if (completion.status === "qualified") {
         if (!originalIdentity || !restorationIdentity || !identityMatches(original, originalIdentity) || !identityMatches(restoration, restorationIdentity)) {
           throw new AppError(409, "qualification_invalidated", "The canary contract, authentication mode, or configuration changed before qualification publication.");
@@ -172,7 +183,7 @@ export class PackageMutationQualificationRepository {
       [ids, tenantId, user.homeAccountId, completion.status, completion.status === "qualified" ? null : safeErrorCode(completion.errorCode), completion.status === "qualified" ? null : safeCompletionMessage(completion.status)]);
       if (rows.length !== 2) throw new AppError(409, "canary_cycle_state", "The paired canary cycle was not completed atomically.");
       return { original: project(rows.find(row => row.id === ids[0])!), restoration: project(rows.find(row => row.id === ids[1])!) };
-    });
+    }, undefined, requireCurrent);
   }
 
   async recoverInterrupted(tenantId: string) {
@@ -217,12 +228,12 @@ export function assessCanaryRestoration(prestate: PackageMutationState, poststat
 }
 
 function validateAndProjectInput(input: QualificationInput) {
-  if (!input.targetId.trim() || input.targetId.length > 512 || !/^[a-f0-9]{64}$/.test(input.contractRevision) || !Number.isSafeInteger(input.configurationRevision) || input.configurationRevision < 1) {
+  if (!isPackageId(input.targetId) || !/^[a-f0-9]{64}$/.test(input.contractRevision) || !Number.isSafeInteger(input.configurationRevision) || input.configurationRevision < 1) {
     throw new AppError(400, "invalid_qualification", "Canary qualification target, contract, or configuration revision is invalid.");
   }
   const prestate = projectMutationState(input.prestate);
   const poststate = projectMutationState(input.poststate);
-  const prepared = { ...input, targetId: input.targetId.trim(), prestate, poststate };
+  const prepared = { ...input, prestate, poststate };
   const restoration = assessCanaryRestoration(prestate, poststate, poststate);
   const { touchedField } = packageCanaryMutation(prepared);
   if (restoration.status !== "restore") throw new AppError(400, "invalid_qualification_state", "Qualification must prove one action-matched reversible transition.");
@@ -234,6 +245,8 @@ export function packageCanaryMutation(input: Pick<PreparedQualificationInput, "a
   accessUpdate?: PackageAccessUpdate;
 } {
   const { prestate, poststate } = input;
+  requirePersistablePackageMutationState(prestate);
+  requirePersistablePackageMutationState(poststate);
   if (input.action === "block" || input.action === "unblock") {
     if (prestate.kind !== "block" || poststate.kind !== "block" || prestate.isBlocked === poststate.isBlocked
       || poststate.isBlocked !== (input.action === "block")) return invalidCanaryAction();
@@ -254,6 +267,14 @@ export function packageCanaryMutation(input: Pick<PreparedQualificationInput, "a
     if (!(scope === "none" && principalCount === 0 || scope === "some" && principalCount > 0)) {
       throw new AppError(400, "invalid_qualification_state", "Both canary directions must use a writable access scope: none with no principals, or some with principals. All-users access cannot be restored by the documented write contract.");
     }
+    if (principalCount > 500 || state[touchedField].some(principal =>
+      !["user", "group"].includes(principal.resourceType) || !isDirectoryObjectId(principal.resourceId))) {
+      throw new AppError(400, "invalid_qualification_state", "Both canary directions require at most 500 native user or group IDs in the selected access collection.");
+    }
+  }
+  if (!isWritablePackageAccessScope(target === "availability" ? prestate.deployedTo : prestate.availableTo,
+    target === "availability" ? prestate.acquireUsersAndGroups : prestate.allowedUsersAndGroups)) {
+    throw new AppError(400, "invalid_qualification_state", "The untouched canary access setting must be representable by the documented collection-only PATCH in both directions.");
   }
   const accessUpdate: PackageAccessUpdate = poststate[scopeField] === "none"
     ? { target, mode: "replace", scope: "none", principals: [] }
@@ -303,11 +324,11 @@ function projectMutationState(value: unknown): PackageMutationState {
 }
 
 function projectPrincipals(value: unknown) {
-  if (!Array.isArray(value) || value.length > 500) throw invalidState();
+  if (!Array.isArray(value) || value.length > packageAccessCollectionLimit) throw invalidState();
   return canonicalAccessEntities(value.map(item => {
     const record = strictRecord(item);
     exactKeys(record, ["resourceType", "resourceId"]);
-    if ((record.resourceType !== "user" && record.resourceType !== "group") || typeof record.resourceId !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(record.resourceId)) throw invalidState();
+    if (typeof record.resourceType !== "string" || !/^(user|group)$/i.test(record.resourceType) || typeof record.resourceId !== "string") throw invalidState();
     return { resourceType: record.resourceType, resourceId: record.resourceId };
   }));
 }
@@ -329,7 +350,7 @@ function invalidState(): never {
 
 function qualificationId(value: string) {
   if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_qualification_id", "Canary qualification ID is invalid.");
-  return value;
+  return value.toLowerCase();
 }
 
 function safeErrorCode(value: string | undefined) {
@@ -367,7 +388,8 @@ async function requireVerifiedCycleJobs(client: pg.PoolClient, original: Qualifi
   if (!original.job_id || !restoration.job_id) throw new AppError(409, "canary_cycle_unverified", "Both approved canary directions require durable jobs.");
   const jobs = await client.query<{ id: string; action: AuditAction; status: string; target_id: string; item_status: string; prestate: unknown; poststate: unknown }>(`SELECT job.id,job.action,job.status,item.target_id,item.status AS item_status,item.prestate,item.poststate
     FROM jobs job JOIN job_items item ON item.job_id=job.id
-    WHERE job.id=ANY($1::uuid[]) AND job.tenant_id=$2 AND job.principal_id=$3`, [[original.job_id, restoration.job_id], original.tenant_id, original.actor_principal_id]);
+    WHERE job.id=ANY($1::uuid[]) AND job.tenant_id=$2 AND job.principal_id=$3 AND job.token_mode='delegated'`, [[original.job_id, restoration.job_id], original.tenant_id, original.actor_principal_id]);
+  if (original.job_id === restoration.job_id || jobs.rows.length !== 2) throw new AppError(409, "canary_cycle_unverified", "Each canary direction requires its own exact one-target durable job.");
   for (const row of [original, restoration]) {
     const job = jobs.rows.find(value => value.id === row.job_id);
     if (!job || job.action !== row.action || job.target_id !== row.target_id || job.status !== "succeeded" || job.item_status !== "succeeded"

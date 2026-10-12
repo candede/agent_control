@@ -13,6 +13,8 @@ const recordTables = [
 export const invalidExportSelectionSql = `EXISTS(SELECT 1 FROM data_read_selections selection
   LEFT JOIN data_principal_epochs principal ON principal.tenant_id=selection.tenant_id AND principal.principal_id=selection.principal_id
   WHERE selection.id=e.selection_id AND (selection.invalidated_at IS NOT NULL OR selection.session_epoch IS DISTINCT FROM principal.epoch
+    OR EXISTS(SELECT 1 FROM inventory_read_contexts context LEFT JOIN agent_usage_state usage ON usage.tenant_id=context.tenant_id
+      WHERE context.selection_id=selection.id AND context.association_revision<>coalesce(usage.revision,0))
     OR EXISTS(SELECT 1 FROM data_generation_pins pin JOIN data_scope_epochs scope ON scope.id=pin.scope_id
       WHERE pin.selection_id=selection.id AND (pin.scope_epoch<>scope.epoch OR pin.session_epoch<>scope.session_epoch OR pin.expires_at<=clock_timestamp()))))`;
 
@@ -60,6 +62,8 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
   const protectedSelection = `EXISTS(SELECT 1 FROM data_read_selections s
     LEFT JOIN data_principal_epochs p ON p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id
     WHERE s.id=target.selection_id AND s.invalidated_at IS NULL AND s.session_epoch=p.epoch
+      AND NOT EXISTS(SELECT 1 FROM inventory_read_contexts context LEFT JOIN agent_usage_state usage ON usage.tenant_id=context.tenant_id
+        WHERE context.selection_id=s.id AND context.association_revision<>coalesce(usage.revision,0))
       AND NOT EXISTS(SELECT 1 FROM data_generation_pins pin JOIN data_scope_epochs source ON source.id=pin.scope_id
         WHERE pin.selection_id=s.id AND (pin.scope_epoch<>source.epoch OR pin.session_epoch<>source.session_epoch
           OR pin.expires_at<=clock_timestamp()))
@@ -100,6 +104,9 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
       AND (selection.invalidated_at IS NOT NULL OR selection.expires_at<=clock_timestamp())))
     AND NOT EXISTS(SELECT 1 FROM inventory_mutation_targets item WHERE item.stage_id=target.id)`);
   await update("recordInvalidSelections", "data_read_selections", `target.invalidated_at IS NULL AND (
+    EXISTS(SELECT 1 FROM inventory_read_contexts context LEFT JOIN agent_usage_state usage ON usage.tenant_id=context.tenant_id
+      WHERE context.selection_id=target.id AND context.association_revision<>coalesce(usage.revision,0))
+    OR
     EXISTS(SELECT 1 FROM data_generation_pins pin JOIN data_scope_epochs source ON source.id=pin.scope_id
       WHERE pin.selection_id=target.id AND (pin.scope_epoch<>source.epoch OR pin.session_epoch<>source.session_epoch
         OR pin.expires_at<=clock_timestamp()))

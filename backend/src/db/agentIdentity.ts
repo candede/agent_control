@@ -87,7 +87,7 @@ export class AgentIdentityRepository {
   }
 
   async save(scope: PackageDataScope, source: AgentIdentitySource, value: VerifiedAgentIdentityIds,
-    fence: () => Promise<void>) {
+    fence: () => void) {
     sourceParameters(scope, source);
     if (value.objectId !== source.candidateId || !isDirectoryObjectId(value.objectId)
       || value.applicationId !== value.objectId || value.runtimeStatus !== "available"
@@ -98,7 +98,7 @@ export class AgentIdentityRepository {
       runtimeProvenance: value.runtimeProvenance, outcome: "resolved", errorCode: null, ttlMs: 3_600_000 }, fence);
   }
 
-  async saveFailure(scope: PackageDataScope, source: AgentIdentitySource, failure: AgentIdentityFailure, fence: () => Promise<void>) {
+  async saveFailure(scope: PackageDataScope, source: AgentIdentitySource, failure: AgentIdentityFailure, fence: () => void) {
     if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(failure.code)) {
       throw new AppError(400, "invalid_agent_identity_outcome", "Identity resolution failure metadata must be a bounded diagnostic code.");
     }
@@ -109,7 +109,7 @@ export class AgentIdentityRepository {
   private async write(scope: PackageDataScope, source: AgentIdentitySource, value: {
     applicationId: string | null; runtimeStatus: AgentIdentityRuntimeStatus; runtimeProvenance: AgentIdentityRuntimeProvenance | null;
     outcome: AgentIdentityResolutionOutcome; errorCode: string | null; ttlMs: number;
-  }, fence: () => Promise<void>) {
+  }, fence: () => void) {
     const parameters = sourceParameters(scope, source);
     return dataConnections(this.database).run(async client => {
       await client.query("SET LOCAL lock_timeout='3s'; SET LOCAL statement_timeout='5s'");
@@ -121,6 +121,13 @@ export class AgentIdentityRepository {
       if (current.rowCount !== 1) throw new AppError(409, "agent_identity_source_changed", "The current saved source changed during identity resolution. Refresh Agents.");
       for (const scopeId of [current.rows[0].source_scope_id, current.rows[0].canonical_scope_id].sort()) {
         await lockDataScope(client, scopeId, scope.tenantId);
+      }
+      if (value.outcome !== "resolved") {
+        const newer = await client.query(`SELECT 1 FROM agent_identity_cache WHERE tenant_id=$1 AND principal_id=$2
+          AND snapshot_id=$3 AND native_id=$4 AND environment_id=$5 AND candidate_id=$6::uuid
+          AND record_id=$7 AND source_revision=$8 AND outcome='resolved' AND expires_at>clock_timestamp()`,
+        [...parameters, source.recordId, source.sourceRevision]);
+        if (newer.rowCount) return;
       }
       await client.query(`DELETE FROM agent_identity_cache WHERE tenant_id=$1 AND (expires_at<=clock_timestamp()
         OR (principal_id=$2 AND record_id=$3))`, [scope.tenantId, scope.principalId, source.recordId]);
@@ -142,12 +149,14 @@ export class AgentIdentityRepository {
       if ((await client.query(`SELECT snapshot.id ${sourceJoin} WHERE ${sourceWhere}`, [...parameters, source.recordId])).rowCount !== 1) {
         throw new AppError(409, "agent_identity_source_changed", "The current source expired before identity publication.");
       }
-    });
+    }, false, undefined, undefined, fence);
   }
 }
 
 function sourceParameters(scope: PackageDataScope, source: AgentIdentitySource) {
   if (!scope.tenantId || !scope.principalId || !isDirectoryObjectId(source.snapshotId) || !isDirectoryObjectId(source.candidateId)
+    || source.snapshotId === "00000000-0000-0000-0000-000000000000"
+    || source.candidateId === "00000000-0000-0000-0000-000000000000"
     || !source.recordId || source.recordId.length > 2_048 || parseUnifiedAgentRecordId(source.recordId)?.source !== "canonical"
     || !source.nativeId || source.nativeId.length > 512
     || !source.environmentId || source.environmentId.length > 512 || !/^[a-f0-9]{64}$/.test(source.sourceRevision)) {

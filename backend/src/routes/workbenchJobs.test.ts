@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { WorkbenchJobsResponse } from "../types/workbench.js";
 import type { RoutePolicy } from "./policy.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 
 const mocks = vi.hoisted(() => ({
   handlers: new Map<string, RequestHandler>(),
@@ -73,7 +74,8 @@ async function jobs(currentUser = user): Promise<WorkbenchJobsResponse> {
   return json.mock.calls[0][0];
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await activateAccountSession(user.tenantId!, user.homeAccountId, async () => {});
   for (const load of [mocks.packages, mocks.inventory, mocks.controls, mocks.quarantine, mocks.purview, mocks.defender]) {
     load.mockReset().mockResolvedValue({ value: [] });
   }
@@ -83,6 +85,17 @@ beforeEach(() => {
 });
 
 describe("sync history aggregation", () => {
+  it("rejects revoked account history instead of returning a partial successful response", async () => {
+    let resolve!: (value: { value: typeof packageJob[] }) => void;
+    const pending = new Promise<{ value: typeof packageJob[] }>(done => { resolve = done; });
+    mocks.packages.mockReturnValueOnce(pending);
+    const reading = jobs();
+    const stopped = expect(reading).rejects.toMatchObject({ code: "unauthorized" });
+    await revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => {});
+    resolve({ value: [packageJob] });
+    await stopped;
+  });
+
   it("uses authenticated Viewer policy and bounded principal-scoped collection loaders", async () => {
     const result = await jobs();
     expect(mocks.policies.get("get /workbench/jobs")).toEqual({

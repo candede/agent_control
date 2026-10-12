@@ -2,7 +2,7 @@ import { Router, type Request, type RequestHandler } from "express";
 import { once } from "node:events";
 import { requestScope } from "../middleware/auth.js";
 import { policyRoute, type RouteMethod } from "./policy.js";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { OfficialReportImports, reportUuid, type ReportConfirmation } from "../db/officialReportImports.js";
 import { LargeTenantUsersReports, reportQuery, reportQueryFields } from "../services/largeTenantUsersReports.js";
 import { OfficialReportExports, type OfficialExportKind } from "../services/officialReportExports.js";
@@ -14,7 +14,8 @@ import type { ReportUser, ReportEndpoint, ReportQuery } from "../types/officialR
 import { officialReportMultipart } from "./officialReportMultipart.js";
 import { InventoryQueries } from "../db/inventoryQueries.js";
 import { config } from "../config.js";
-import { readAdoptionGroups } from "../services/adoptionGroups.js";
+import { abortableRead, createExportPublicationValidator } from "../services/csvExport.js";
+import { operationalLog } from "../services/telemetry.js";
 
 export type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
 export type ReportHandlerOptions = {
@@ -30,7 +31,7 @@ function scalar(value: unknown, maximum = 4096) {
 }
 function reportIdentifier(value: unknown) {
   const id = scalar(value, 512);
-  if (!id.trim()) throw new AppError(400, "invalid_usage_query", "Expected one nonblank report identity.");
+  if (!id.trim() || /[\p{Cc}\p{Cs}]/u.test(id)) throw new AppError(400, "invalid_usage_query", "Expected one valid nonblank report identity.");
   return id;
 }
 function pageOptions(query: Record<string, unknown>) {
@@ -82,8 +83,12 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     try { response.setHeader("Cache-Control", "private, no-store"); await handler(request, response, next); }
     catch (error) {
       const known: Record<string, number> = { export_not_found: 404, export_expired: 409, export_not_ready: 409, export_not_queued: 409, export_fenced: 409 };
-      const mapped = error instanceof Error && Object.hasOwn(known, error.message) ? new AppError(known[error.message], error.message, "Export is unavailable.") : error;
-      if (response.headersSent) response.destroy(mapped instanceof Error ? mapped : undefined); else next(mapped);
+      const mapped = error instanceof Error && Object.hasOwn(known, error.message) ? new AppError(known[error.message], error.message, "Export is unavailable.")
+        : request.path.startsWith("/data-exports") && !(error instanceof AppError)
+          ? new AppError(500, "export_failed", "The export could not be completed.") : error;
+      if (response.headersSent) {
+        if (!response.destroyed) response.destroy(mapped instanceof Error ? mapped : undefined);
+      } else next(mapped);
     }
   };
   async function selected(request: Request, endpoint: ReportEndpoint, facet = false, candidate = false, child = false, localReport = false) {
@@ -105,7 +110,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       try { selection = JSON.parse(Buffer.from(scalar(request.query.cursor).split(".")[0], "base64url").toString()).selectionId; reportUuid(selection); }
       catch { throw new SelectionError("invalid_cursor"); }
     }
-    const id = selection === undefined ? (await reports.capture(who.identity, who.tokenMode, endpoint, query)).id : reportUuid(selection);
+    const id = selection === undefined ? (await reports.capture(who.identity, who.tokenMode, endpoint, query)).id : reportUuid(selection).toLowerCase();
     if (selection !== undefined) await reports.read(id, who.identity, async (_client, context) => {
       if (context.endpoint !== endpoint) throw new AppError(400, "invalid_cursor", "Selection endpoint mismatch.");
       const keys = Object.keys(raw).filter(key => reportQueryFields.includes(key as typeof reportQueryFields[number]));
@@ -117,14 +122,14 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     return { ...who, id, childQuery };
   }
   async function selectedAgentUsage(request: Request, users = false) {
-    const setId = request.query.setId === undefined ? undefined : reportUuid(request.query.setId);
+    const setId = request.query.setId === undefined ? undefined : reportUuid(request.query.setId).toLowerCase();
     if (request.query.inventorySelectionId === undefined) return { ...await selected(request, "official_agents", false, false, users, true), reader: usage, setId };
     const allowed = ["inventorySelectionId", "selectionId", "cursor", "limit", "setId", ...(users ? ["search"] : [])];
     if (Object.keys(request.query).some(key => !allowed.includes(key))) throw new AppError(400, "invalid_usage_query", "Unsupported selected inventory usage query.");
     pageOptions(request.query);
-    const who = await options.identity(request), id = reportUuid(request.query.inventorySelectionId);
+    const who = await options.identity(request), id = reportUuid(request.query.inventorySelectionId).toLowerCase();
     if (who.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires delegated inventory.");
-    if (request.query.selectionId !== undefined && reportUuid(request.query.selectionId) !== id) throw new SelectionError("invalid_cursor");
+    if (request.query.selectionId !== undefined && reportUuid(request.query.selectionId).toLowerCase() !== id) throw new SelectionError("invalid_cursor");
     const childQuery = users ? requestQuery("relationships", request.query.search === undefined ? {} : { search: request.query.search }) : undefined;
     return { ...who, id, childQuery, reader: inventoryUsage, setId };
   }
@@ -159,10 +164,10 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   }));
   route("get", "/copilot-usage/users/:objectId", "read", failSafe(async (request, response) => {
     const context = await selected(request, "copilot_users");
-    response.json(await reports.exact(context.id, context.identity, reportUuid(request.params.objectId)));
+    response.json(await reports.exact(context.id, context.identity, reportUuid(request.params.objectId).toLowerCase()));
   }));
   route("get", "/copilot-usage/users/:objectId/service-plans", "read", failSafe(async (request, response) => {
-    const context = await selected(request, "copilot_users"), child = reportUuid(request.params.objectId);
+    const context = await selected(request, "copilot_users"), child = reportUuid(request.params.objectId).toLowerCase();
     await reports.exact(context.id, context.identity, child);
     response.json(await reports.page(context.id, context.identity, { ...pageOptions(request.query), endpoint: "plans", child }));
   }));
@@ -195,7 +200,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   }
   route("get", "/copilot-usage/users/:objectId/agents", "read", failSafe(async (request, response) => {
     const context = await selected(request, "copilot_users", false, false, true);
-    const objectId = reportUuid(request.params.objectId);
+    const objectId = reportUuid(request.params.objectId).toLowerCase();
     response.json(await reports.read(context.id, context.identity, async (client, read) => {
       await reports.exactInRead(client, read, objectId);
       return reports.pageInRead(client, read, { ...pageOptions(request.query), endpoint: "relationships",
@@ -203,7 +208,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     }));
   }));
   route("get", "/official-usage/history/:setId/observations", "read", failSafe(async (request, response) => {
-    const context = await selected(request, "history"), child = reportUuid(request.params.setId);
+    const context = await selected(request, "history"), child = reportUuid(request.params.setId).toLowerCase();
     await reports.exact(context.id, context.identity, child);
     response.json(await reports.page(context.id, context.identity, { ...pageOptions(request.query), endpoint: "observations", child }));
   }));
@@ -248,7 +253,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await imports.confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
   }));
   route("post", "/official-usage/confirmations/:id", "admin", failSafe(async (request, response) => {
-    if (request.body?.id !== request.params.id) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
+    if (reportUuid(request.body?.id) !== reportUuid(request.params.id)) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
     response.json(await imports.confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
   }));
   route("get", "/agent-inventory/:recordId/usage", "read", failSafe(async (request, response) => {
@@ -290,26 +295,42 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   for (const method of ["post", "delete"] as const) route(method, "/agent-inventory/:recordId/usage-associations", "admin", failSafe(async (request, response) => {
     const input = officialAgentUsageMutation(request.body);
     if (Object.keys(request.query).some(key => key !== "inventorySelectionId") || method === "post" && !input.target || method === "delete" && input.target) throw new AppError(400, "invalid_agent_usage", "Association action mismatch.");
-    const inventoryId = request.query.inventorySelectionId === undefined ? undefined : reportUuid(request.query.inventorySelectionId);
+    const inventoryId = request.query.inventorySelectionId === undefined ? undefined : reportUuid(request.query.inventorySelectionId).toLowerCase();
     if (inventoryId && (method !== "delete" || inventoryId !== input.selectionId)) throw new SelectionError("invalid_cursor");
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
     response.json(await (inventoryId ? inventoryUsage : usage).mutate((await options.identity(request)).identity, recordId, input, request.session.user!));
   }));
   const producer = (request: Request) => new OfficialReportExports(reports, request.session.user!);
   route("post", "/data-exports", "read", failSafe(async (request, response) => {
+    const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
+    const assertCurrent = await validate();
     const who = await options.identity(request), exports = producer(request);
-    const id = await exports.create(who.identity, request.body);
+    const id = await exports.create(who.identity, request.body, assertCurrent);
     try { await options.enqueueExport({ id, identity: who.identity, kind: request.body.kind, producer: exports }); }
-    catch (error) { await exports.engine.cancel(id, who.identity); throw error; }
+    catch (error) {
+      try { await exports.engine.cancel(id, who.identity); }
+      catch (failure) { operationalLog("error", "export_cancel_cleanup_failed", errorTelemetry(failure)); }
+      throw error;
+    }
+    (await validate())();
     response.status(202).json({ id });
   }));
   route("get", "/data-exports/:id", "read", failSafe(async (request, response) => {
-    response.json(await producer(request).status(reportUuid(request.params.id), (await options.identity(request)).identity));
+    const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
+    await validate();
+    const status = await producer(request).status(reportUuid(request.params.id), (await options.identity(request)).identity);
+    (await validate())();
+    response.json(status);
   }));
   route("delete", "/data-exports/:id", "read", failSafe(async (request, response) => {
-    await producer(request).engine.cancel(reportUuid(request.params.id), (await options.identity(request)).identity); response.status(204).end();
+    const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
+    const assertCurrent = await validate();
+    await producer(request).engine.cancel(reportUuid(request.params.id), (await options.identity(request)).identity, assertCurrent);
+    (await validate())();
+    response.status(204).end();
   }));
   route("get", "/data-exports/:id/download", "read", failSafe(async (request, response) => {
+    const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
     const who = await options.identity(request), exports = producer(request), id = reportUuid(request.params.id);
     const status = await exports.engine.status(id, who.identity);
     if (status.status !== "ready") throw new AppError(409, "export_not_ready", "Export is not ready.");
@@ -321,23 +342,75 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       return row.filename as string;
     });
     response.set(exports.engine.downloadHeaders(filename, status.bytes));
-    const controller = new AbortController(), abort = () => { if (!response.writableFinished) controller.abort(); };
+    const controller = new AbortController();
+    const deadlineAt = status.expiresAt.getTime();
+    const assertActive = () => {
+      if (Date.now() >= deadlineAt) controller.abort(new AppError(409, "export_expired", "Export is unavailable."));
+      if (request.aborted || response.destroyed || response.writableEnded) controller.abort(new AppError(499, "export_disconnected", "The export download disconnected."));
+      controller.signal.throwIfAborted();
+    };
+    const terminate = () => {
+      if (response.headersSent && !response.destroyed && !response.writableFinished) response.destroy();
+    };
+    controller.signal.addEventListener("abort", terminate, { once: true });
+    const deadline = setTimeout(() => controller.abort(new AppError(409, "export_expired", "Export is unavailable.")),
+      Math.max(0, deadlineAt - Date.now()));
+    deadline.unref();
+    let finishedAt: string | undefined;
+    const finished = () => {
+      const now = Date.now();
+      if (now >= deadlineAt) controller.abort(new AppError(409, "export_expired", "Export is unavailable."));
+      else finishedAt = new Date(now).toISOString();
+      clearTimeout(deadline);
+    };
+    const abort = () => { if (!response.writableFinished) controller.abort(new AppError(499, "export_disconnected", "The export download disconnected.")); };
+    const failed = (error: Error) => controller.abort(error);
+    request.once("aborted", abort);
     response.once("close", abort);
+    response.once("error", failed);
+    response.once("finish", finished);
+    let assertCurrent: (() => void) | undefined;
     try {
       let finalChunk: Buffer | undefined;
-      for await (const bytes of exports.engine.download(id, who.identity, controller.signal)) {
+      const validate = async () => {
+        assertActive();
+        assertCurrent = await abortableRead(validateSession(async () => {
+          const current = await exports.engine.status(id, who.identity);
+          if (current.status !== "ready" || current.bytes !== status.bytes) throw new AppError(409, "export_not_ready", "Export is unavailable.");
+          if (Date.now() >= current.expiresAt.getTime()) throw new AppError(409, "export_expired", "Export is unavailable.");
+        }), controller.signal);
+        assertActive();
+        return assertCurrent;
+      };
+      const finish = async () => {
+        // Do not satisfy Content-Length until checksum, authority and audit checks succeed.
+        assertActive();
+        assertCurrent?.();
+        const completion = once(response, "finish", { signal: controller.signal });
+        try { response.end(finalChunk); await completion; controller.signal.throwIfAborted(); }
+        catch (error) { controller.abort(error); await completion.catch(() => {}); throw controller.signal.reason; }
+        return finishedAt;
+      };
+      for await (const bytes of exports.engine.download(id, who.identity, controller.signal, { validate, finish, failed: terminate })) {
+        assertActive();
+        assertCurrent?.();
         if (finalChunk && !response.write(finalChunk)) await once(response, "drain", { signal: controller.signal });
         finalChunk = bytes;
       }
-      // Do not satisfy Content-Length until the final checksum, authority and audit checks succeed.
-      controller.signal.throwIfAborted();
-      response.end(finalChunk);
     } catch (error) {
+      terminate();
       if (!response.headersSent) {
         for (const header of ["Content-Disposition", "Content-Length", "Content-Type"]) response.removeHeader(header);
       }
-      throw error;
-    } finally { response.removeListener("close", abort); }
+      throw controller.signal.aborted ? controller.signal.reason : error;
+    } finally {
+      clearTimeout(deadline);
+      request.removeListener("aborted", abort);
+      response.removeListener("close", abort);
+      response.removeListener("error", failed);
+      response.removeListener("finish", finished);
+      controller.signal.removeEventListener("abort", terminate);
+    }
   }));
   return router;
 }

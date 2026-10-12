@@ -13,6 +13,8 @@ import { reportIdentity } from "../services/reportIdentity.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { pool } from "../db/pool.js";
+import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
+import { createInventoryDataRouter } from "./inventoryData.js";
 import { capabilities } from "../services/capabilities.js";
 import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
 import type { FetchLike } from "../services/graphPackages.js";
@@ -31,7 +33,9 @@ import {
 } from "./agents.js";
 
 vi.mock("../db/pool.js", () => ({
-  pool: { query: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }) },
+  pool: { options: { max: 4 },
+    query: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
+    connect: vi.fn(async () => { throw new Error("Unit tests must not connect to a database."); }) },
   secretValue: vi.fn((name: string) => {
     const settings: Record<string, string> = {
       TENANTS_JSON: JSON.stringify([{
@@ -70,6 +74,7 @@ describe("package job cancellation metadata", () => {
   it.each([false, true])("exposes requested cancellation in status and history without changing uncertain counts (%s)", async cancelled => {
     const row = {
       id: groupId, capability: "graph.package.block.manage", token_mode: "delegated", status: "partial",
+      request_path: "/api/agents/block",
       cancel_requested: cancelled, confirmation_summary: null, confirmed_at: null,
       action: "block", access_update: null, result_revision: "1", within_budget: true,
       created_at: new Date("2026-09-24T12:00:00.000Z"), updated_at: new Date("2026-09-24T12:00:00.000Z"),
@@ -119,6 +124,66 @@ describe("package refresh admission responses", () => {
       expect(response.json).toHaveBeenCalledWith(failed);
     },
   );
+});
+
+describe("selected package refresh authority", () => {
+  it("does not adopt a replacement account while approving application refresh history", async () => {
+    const user = { tenantId: groupId, homeAccountId: "application-history-reader", displayName: "Reader",
+      username: "reader@example.invalid", roles: ["AgentControl.Admin" as const] };
+    await activateAccountSession(user.tenantId, user.homeAccountId, async () => {});
+    let resolve!: () => void;
+    const pending = new Promise<void>(done => { resolve = done; });
+    vi.spyOn(capabilities, "requireApplicationDataScope").mockImplementationOnce(async () => {
+      await pending;
+      return {} as never;
+    });
+    const list = vi.spyOn(PackageRefreshJobs.prototype, "listJobs");
+    const request: Partial<Request> = { query: { mode: "application" } };
+    new session.MemoryStore().createSession(request as Request, {
+      cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, clientId: userId, user,
+    });
+    const response = { json: vi.fn<Response["json"]>() };
+    const handler = handlers.get("get /agents/refresh-jobs");
+    if (!handler) throw new Error("Package refresh history handler was not registered.");
+    const reading = Promise.resolve(handler(request as Request, response as Response, error => { if (error) throw error; }));
+    const stopped = expect(reading).rejects.toMatchObject({ code: "unauthorized" });
+    await activateAccountSession(user.tenantId, user.homeAccountId, async () => {});
+    resolve();
+    await stopped;
+    expect(list).not.toHaveBeenCalled();
+    expect(response.json).not.toHaveBeenCalled();
+  });
+
+  it.each(["logout", "capability"] as const)("fences %s during selection identity lookup without creating a job", async action => {
+    const user = { tenantId: groupId, homeAccountId: "selected-package-reader", displayName: "Reader",
+      username: "reader@example.invalid", roles: ["AgentControl.Viewer" as const] };
+    await activateAccountSession(user.tenantId, user.homeAccountId, async () => {});
+    createInventoryDataRouter(pool);
+    let resolve!: (identity: Awaited<ReturnType<typeof reportIdentity>>) => void;
+    const pending = new Promise<Awaited<ReturnType<typeof reportIdentity>>>(done => { resolve = done; });
+    vi.mocked(reportIdentity).mockReturnValueOnce(pending);
+    let current = true;
+    vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+      if (!current) throw new AppError(401, "authorization_expired", "Selection capability changed.");
+    });
+    vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {});
+    const submit = vi.spyOn(PackageRefreshJobs.prototype, "submitSelected");
+    const request: Partial<Request> = { body: { selectionId: groupId }, query: {}, get: vi.fn() };
+    new session.MemoryStore().createSession(request as Request, {
+      cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, clientId: userId, user,
+    });
+    const response = { json: vi.fn<Response["json"]>(), status: vi.fn<Response["status"]>().mockReturnThis() };
+    const handler = handlers.get("post /agents/refresh-selection");
+    if (!handler) throw new Error("Selected package refresh handler was not registered.");
+    const operation = Promise.resolve(handler(request as Request, response as Response, error => { if (error) throw error; }));
+    const stopped = expect(operation).rejects.toMatchObject({ code: action === "logout" ? "unauthorized" : "authorization_expired" });
+    if (action === "logout") await revokeAccountSessionMutations(user.tenantId, user.homeAccountId, async () => {});
+    else current = false;
+    resolve({ tenantId: user.tenantId, principalId: user.homeAccountId, sessionEpoch: "0", authorizationHash: "viewer" });
+    await stopped;
+    expect(submit).not.toHaveBeenCalled();
+    expect(response.json).not.toHaveBeenCalled();
+  });
 });
 
 describe("directory request lifecycle", () => {
@@ -206,6 +271,50 @@ describe("directory request lifecycle", () => {
     expect(DirectoryPrincipalsClient.prototype.search).not.toHaveBeenCalled();
     expect(DirectoryPrincipalsClient.prototype.resolve).not.toHaveBeenCalled();
     expect(json).not.toHaveBeenCalled();
+  });
+
+  it.each((["get", "post"] as const).flatMap(method =>
+    (["token", "lookup"] as const).map(stage => ({ method, stage })),
+  ))("rejects changed capability authority during $method $stage", async ({ method, stage }) => {
+    let current = true;
+    vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
+      if (!current) throw new AppError(401, "authorization_expired", "Directory capability changed.");
+    });
+    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+      current = false;
+      return "token";
+    });
+    else {
+      const lookup = method === "get" ? DirectoryPrincipalsClient.prototype.search : DirectoryPrincipalsClient.prototype.resolve;
+      vi.mocked(lookup).mockImplementationOnce(async () => { current = false; return [principal]; });
+    }
+    const { pending, json } = startRequest(method);
+    await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+    expect(capabilities.beginOperationValidation).toHaveBeenCalledWith("graph.directory.read", user);
+    if (stage === "token") {
+      expect(DirectoryPrincipalsClient.prototype.search).not.toHaveBeenCalled();
+      expect(DirectoryPrincipalsClient.prototype.resolve).not.toHaveBeenCalled();
+    }
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it.each((["get", "post"] as const).flatMap(method =>
+    (["capability", "token", "lookup"] as const).map(stage => ({ method, stage })),
+  ))("prioritizes replaced authority when $method $stage rejects", async ({ method, stage }) => {
+    const failure = async () => {
+      await replaceSession();
+      throw new AppError(503, "provider_error", "Upstream failure.");
+    };
+    if (stage === "capability") vi.mocked(capabilities.requireAvailable).mockImplementationOnce(failure);
+    else if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(failure);
+    else {
+      const lookup = method === "get" ? DirectoryPrincipalsClient.prototype.search : DirectoryPrincipalsClient.prototype.resolve;
+      vi.mocked(lookup).mockImplementationOnce(failure);
+    }
+    const { pending, response, json } = startRequest(method);
+    await expect(pending).rejects.toMatchObject({ code: "unauthorized" });
+    expect(json).not.toHaveBeenCalled();
+    expect(response.listenerCount("close")).toBe(0);
   });
 
   it.each(["get", "post"] as const)("does not dispatch %s directory work after disconnection during token acquisition", async method => {
@@ -470,6 +579,17 @@ describe("package mutation worker admission", () => {
     expect(launchBulkJob).toHaveBeenCalledWith(receipt.id, scope, true);
   });
 
+  it("rejects ordinary canary resume before provider tokens or recovery", async () => {
+    vi.spyOn(bulkJobs, "get").mockResolvedValue({ ...receipt, isCanary: true, status: "waiting_authorization", canResume: false });
+    const recover = vi.spyOn(bulkJobs, "recover").mockResolvedValue(0);
+    vi.mocked(acquireDelegatedToken).mockClear();
+    await expect(requestMutation("/agents/bulk-jobs/:id/resume", { confirmed: true }))
+      .rejects.toMatchObject({ code: "canary_cycle_authorization_required" });
+    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(launchBulkJob).not.toHaveBeenCalled();
+  });
+
   it.each(["token", "recovery"] as const)("does not resume after session replacement during %s", async stage => {
     vi.spyOn(bulkJobs, "get").mockResolvedValue({ ...receipt, status: "waiting_authorization", canResume: true });
     vi.spyOn(bulkJobs, "recover").mockImplementation(async () => {
@@ -510,9 +630,9 @@ describe("package canary failure completion", () => {
     expect(log.mock.calls[0][0]).not.toContain("Fixture result");
   });
 
-  it.each(["original", "restoration"] as const)("does not treat a missing or still-running %s job as a definite failure", async stage => {
+  it.each(["original", "restoration"] as const)("does not treat an unresolved %s job as a definite failure", async stage => {
     const get = vi.spyOn(bulkJobs, "get");
-    for (const unresolved of [undefined, job]) {
+    for (const unresolved of [undefined, job, ...(["queued", "waiting_authorization", "partial"] as const).map(status => ({ ...job, status }))]) {
       get.mockReset();
       if (stage === "restoration") get.mockResolvedValueOnce({ ...job, status: "succeeded" });
       get.mockResolvedValueOnce(unresolved);
@@ -560,7 +680,7 @@ describe("access canary job submission", () => {
           targets: [{ id: approval.targetId, displayName: "Approved package canary", prestate: approval.prestate }],
           confirmationHash: expect.stringMatching(/^[a-f0-9]{64}$/),
           idempotencyKey: `canary-${approval.id}-${stage}`,
-        }));
+        }), undefined);
       }
       expect(submit).toHaveBeenCalledTimes(2);
     } finally {
@@ -581,9 +701,29 @@ describe("package identity refresh targets", () => {
       expect(() => parsePackageRefreshIds(input)).toThrow();
     }
   });
+
+  it("rejects unsafe path identities while preserving exact opaque IDs", () => {
+    for (const id of [".", "..", "id\nsuffix", "id\u0000suffix", "id\uD800"]) {
+      expect(() => parsePackageRefreshIds([id])).toThrow();
+      expect(() => parseIds([id], 5000)).toThrow();
+    }
+    const id = "P_/..?#%😀";
+    expect(parsePackageRefreshIds([id])).toEqual([id]);
+    expect(parseIds([id], 5000)).toEqual([id]);
+  });
 });
 
 describe("parsePackageAccessUpdate", () => {
+  it("accepts and canonicalizes broad Graph GUID principals but rejects hidden control characters", () => {
+    const id = "ABCDEF01-2345-6789-CDEF-0123456789AB";
+    const update = { target: "availability", mode: "replace", scope: "specific",
+      principals: [{ resourceType: "user", resourceId: ` ${id} ` }] };
+    expect(parsePackageAccessUpdate(update).principals).toEqual([{ resourceType: "user", resourceId: id.toLowerCase() }]);
+    expect(() => parsePackageAccessUpdate({ ...update,
+      principals: [{ resourceType: "user", resourceId: `\n${userId}` }],
+    })).toThrow(expect.objectContaining({ code: "invalid_principal" }));
+  });
+
   it("parses a specific principal update", () => {
     expect(
       parsePackageAccessUpdate({

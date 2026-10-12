@@ -5,9 +5,9 @@ import { AppError } from "../errors.js";
 import { AuditLog, type DataScope } from "../services/auditLog.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type { AuditAction, AuditActor, AuditScope } from "../types/audit.js";
-import type { CopilotPackageDetail, PackageAccessUpdate } from "../types/copilotPackage.js";
-import type { CapabilityId } from "../types/capability.js";
-import { canonicalAccessEntities, capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, type PackageMutationState } from "../services/packageMutationState.js";
+import { isPackageId, type CopilotPackageDetail, type PackageAccessUpdate } from "../types/copilotPackage.js";
+import { packageMutationCapability, type CapabilityId } from "../types/capability.js";
+import { canonicalAccessEntities, capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, packageMutationStatesEqual, requirePersistablePackageMutationState, requirePreservablePackageAccessScope, type PackageMutationState } from "../services/packageMutationState.js";
 import { lockPackageInventoryScope, publishPackageReadback, readPackageInventoryGeneration } from "./packageControls.js";
 import { exactCount, encodeBatch, digest, dataLimitError } from "./dataBounds.js";
 import { dataConnections } from "./dataConnections.js";
@@ -17,6 +17,7 @@ import { assertCurrentJobTarget, assertCurrentMutationTargets } from "./inventor
 import { lockInventorySelection, lockInventorySources } from "./inventoryAuthority.js";
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { lifecycleLimits } from "./lifecycleSlice.js";
+import { clientErrorState } from "./clientErrors.js";
 
 export type JobStatus = "queued" | "running" | "waiting_authorization" | "succeeded" | "failed" | "cancelled" | "partial";
 export type ItemOutcome = "succeeded" | "failed" | "cancelled" | "inconclusive" | "skipped";
@@ -42,7 +43,7 @@ export type JobInput = JobIntentInput & { idempotencyKey: string; confirmationHa
 export type MutationRetryIntent = Pick<JobIntentInput, "action" | "accessUpdate" | "requestPath" | "scope"> & { targetIds?: string[] };
 export type JobRow = {
   id: string; tenant_id: string; principal_id: string; token_mode: "delegated" | "application"; capability: CapabilityId; action: AuditAction;
-  access_update: PackageAccessUpdate | null; reassign_user_id: string | null; request_hash: string; confirmation_hash: string | null; confirmation_summary: MutationConfirmationSummary | null; confirmed_at: Date | null; status: JobStatus; scope: AuditScope;
+  access_update: PackageAccessUpdate | null; reassign_user_id: string | null; request_hash: string; confirmation_hash: string | null; confirmation_summary: Omit<MutationConfirmationSummary, "targets"> | null; confirmed_at: Date | null; status: JobStatus; scope: AuditScope;
   actor_username: string; actor_name: string; request_path: string; cancel_requested: boolean;
   lease_owner: string | null; lease_version: number; lease_until: Date | null; attempts: number;
   created_at: Date; updated_at: Date;
@@ -57,13 +58,15 @@ export type FinishItemEvidence = {
 
 const jobCountNames = ["total", "completed", "succeeded", "failed", "skipped", "inconclusive", "cancelled",
   "queued", "reconciliationRequired", "retryEligible"] as const;
+const packageCanaryPathPattern = "^/api/agents/mutation-canaries/[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}/execute/(original|restoration)$";
+const packageCanaryPath = new RegExp(packageCanaryPathPattern);
 type JobMetadataRow = Omit<JobRow, "confirmation_summary"> & {
   confirmation_summary: Omit<MutationConfirmationSummary, "targets"> | null;
   within_budget: boolean; counts: Record<typeof jobCountNames[number], string>; current_agent_name: string | null;
 };
 const jobMetadataSql = `SELECT job.id,job.token_mode,job.capability,job.action,job.access_update,job.reassign_user_id,
   job.status,job.confirmation_hash,job.confirmation_summary-'targets' AS confirmation_summary,job.confirmed_at,
-  job.cancel_requested,job.created_at,job.updated_at,job.result_revision,
+  job.cancel_requested,job.created_at,job.updated_at,job.result_revision,job.request_path,
   job.attempts<10 AND job.deadline_at>clock_timestamp() AS within_budget,
   (SELECT display_name FROM job_items WHERE job_id=job.id AND status='running' ORDER BY ordinal LIMIT 1) AS current_agent_name,
   counts.value AS counts FROM jobs job
@@ -85,12 +88,14 @@ function jobMetadata(job: JobMetadataRow) {
   const action = job.access_update ? { action: job.action, accessUpdate: job.access_update }
     : job.action === "reassign" ? { action: job.action, reassignUserId: job.reassign_user_id }
       : { action: job.action, targetBlockedState: job.action === "block" };
+  const isCanary = packageCanaryPath.test(job.request_path);
   return { id: job.id, capabilityId: job.capability, tokenMode: job.token_mode, status: job.status,
+    ...(isCanary ? { isCanary: true as const } : {}),
     ...(job.cancel_requested ? { cancelRequested: true as const } : {}),
     confirmationHash: job.confirmation_hash, confirmation: job.confirmation_summary, confirmedAt: job.confirmed_at?.toISOString() ?? null,
     ...action, ...counts, resultRevision: job.result_revision, currentAgentName: job.current_agent_name ?? undefined,
     createdAt: job.created_at.toISOString(), updatedAt: job.updated_at.toISOString(),
-    canResume: job.token_mode === "delegated" && job.within_budget && !job.cancel_requested
+    canResume: !isCanary && job.token_mode === "delegated" && job.within_budget && !job.cancel_requested
       && counts.queued > 0 && ["waiting_authorization", "partial"].includes(job.status) };
 }
 
@@ -134,7 +139,8 @@ export function createJobConfirmation(input: JobIntentInput) {
 export class JobRepository {
   constructor(private database: pg.Pool = pool) {}
 
-  async submit(scope: DataScope, input: JobInput) {
+  async submit(scope: DataScope, input: JobInput, assertCurrent?: () => void) {
+    assertCurrent?.();
     requireProviderAdmissions();
     if (!scope.tenantId || !scope.principalId || input.actor.tenantId !== scope.tenantId || input.actor.homeAccountId !== scope.principalId) throw new AppError(403, "scope_mismatch", "Job scope mismatch.");
     if (typeof input.idempotencyKey !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)) throw new AppError(400, "invalid_idempotency_key", "Idempotency-Key must contain 1-128 letters, digits, underscores or hyphens.");
@@ -143,7 +149,7 @@ export class JobRepository {
     const { prepared, requestHash, summary } = confirmation;
     const jobId = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${scope.tenantId}:${scope.principalId}`]);
-      const capabilityId = jobCapability(prepared.action);
+      const capabilityId = packageMutationCapability(prepared.action);
       const existing = await client.query<JobRow>("SELECT * FROM jobs WHERE tenant_id=$1 AND principal_id=$2 AND capability=$3 AND idempotency_key=$4", [scope.tenantId, scope.principalId, capabilityId, input.idempotencyKey]);
       if (existing.rows[0]) {
         if (existing.rows[0].request_hash !== requestHash || existing.rows[0].confirmation_hash !== input.confirmationHash) throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different request.");
@@ -153,7 +159,7 @@ export class JobRepository {
       if (outstanding.rows[0].count >= 5) throw new AppError(429, "job_limit", "At most five unfinished jobs are allowed per principal.");
       const id = randomUUID();
       await client.query(`INSERT INTO jobs (id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope)
-        VALUES ($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15)`, [id, scope.tenantId, scope.principalId, capabilityId, prepared.action, requestHash, input.idempotencyKey, prepared.accessUpdate ?? null, input.confirmationHash, summary, prepared.reassignUserId ?? null, prepared.actor.displayName.slice(0,256), prepared.actor.username.slice(0,256), prepared.requestPath.slice(0,1024), prepared.scope]);
+        VALUES ($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15)`, [id, scope.tenantId, scope.principalId, capabilityId, prepared.action, requestHash, input.idempotencyKey, prepared.accessUpdate ?? null, input.confirmationHash, jobConfirmationMetadata(summary), prepared.reassignUserId ?? null, prepared.actor.displayName.slice(0,256), prepared.actor.username.slice(0,256), prepared.requestPath.slice(0,1024), prepared.scope]);
       for (let offset = 0; offset < prepared.targets.length;) {
         let size = Math.min(250, prepared.targets.length - offset);
         let targets = prepared.targets.slice(offset, offset + size);
@@ -182,8 +188,10 @@ export class JobRepository {
         offset += size;
       }
       return id;
-    });
-    return (await this.get(jobId, scope))!;
+    }, undefined, assertCurrent);
+    const result = (await this.get(jobId, scope))!;
+    assertCurrent?.();
+    return result;
   }
 
   async getByIdempotency(scope: DataScope, capabilityId: CapabilityId, idempotencyKey: string, retryIntent?: MutationRetryIntent) {
@@ -226,7 +234,7 @@ export class JobRepository {
     const intent = stage.intent, scope = { tenantId: identity.tenantId, principalId: identity.principalId };
     if (intent.actor.tenantId !== scope.tenantId || intent.actor.homeAccountId !== scope.principalId) throw new AppError(403, "scope_mismatch", "Mutation actor changed.");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${scope.tenantId}:${scope.principalId}`]);
-    const capability = jobCapability(intent.action);
+    const capability = packageMutationCapability(intent.action);
     const existing = (await client.query(`SELECT id,confirmation_hash,request_hash FROM jobs
       WHERE tenant_id=$1 AND principal_id=$2 AND capability=$3 AND idempotency_key=$4`,
     [scope.tenantId, scope.principalId, capability, input.idempotencyKey])).rows[0];
@@ -245,7 +253,7 @@ export class JobRepository {
       access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope)
       VALUES($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15)`,
     [id, scope.tenantId, scope.principalId, capability, intent.action, stage.request_hash, input.idempotencyKey,
-      intent.accessUpdate ?? null, input.confirmationHash, stage.summary, intent.reassignUserId ?? null,
+      intent.accessUpdate ?? null, input.confirmationHash, jobConfirmationMetadata(stage.summary), intent.reassignUserId ?? null,
       intent.actor.displayName.slice(0, 256), intent.actor.username.slice(0, 256), input.requestPath.slice(0, 1024), intent.scope]);
     let ordinal = -1, inserted = 0;
     for (;;) {
@@ -340,7 +348,8 @@ export class JobRepository {
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND cancel_requested=false AND attempts<10 AND deadline_at>clock_timestamp()
       AND (lease_until IS NULL OR lease_until<clock_timestamp())
       AND (status='queued' OR ($5 AND status IN ('waiting_authorization','partial')))
-      AND EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='queued') RETURNING *`, [id, scope.tenantId, scope.principalId, owner, authorizedResume]);
+      AND (NOT $5 OR request_path !~ $6)
+      AND EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='queued') RETURNING *`, [id, scope.tenantId, scope.principalId, owner, authorizedResume, packageCanaryPathPattern]);
     return result.rows[0] ? { jobId: id, scope, owner, version: result.rows[0].lease_version } : undefined;
   }
 
@@ -376,11 +385,17 @@ export class JobRepository {
     });
   }
 
-  async settleInventoryControls(scope: DataScope, signal: AbortSignal, authorize: () => Promise<void>) {
-    await new InventoryRuntime(this.database, authorize).settleControls(scope, signal);
+  async settleInventoryControls(lease: Lease, itemId: string, signal: AbortSignal, authorize: () => Promise<void>, assertCurrent?: () => void) {
+    assertCurrent?.();
+    if ((await this.database.query(`SELECT 1 FROM job_items item JOIN jobs job ON job.id=item.job_id
+      WHERE item.id=$1 AND job.id=$2 AND job.tenant_id=$3 AND job.principal_id=$4 AND item.source_generation_id IS NOT NULL`,
+    [itemId, lease.jobId, lease.scope.tenantId, lease.scope.principalId])).rowCount) {
+      await new InventoryRuntime(this.database, authorize, assertCurrent).settleControls(lease.scope, signal);
+    }
+    assertCurrent?.();
   }
 
-  async markSent(lease: Lease, itemId: string, observedPrestateHash: string) {
+  async markSent(lease: Lease, itemId: string, observedPrestateHash: string, signal?: AbortSignal, assertCurrent?: () => void) {
     requireProviderAdmissions();
     await transaction(this.database, async client => {
       await lockInventorySources(client, lease.scope);
@@ -393,43 +408,39 @@ export class JobRepository {
       if (result.rowCount !== 1) throw new AppError(409, "already_dispatched", "An item must never be dispatched twice.");
       await client.query("UPDATE job_attempts SET sent_at=clock_timestamp(),prestate_hash=$3 WHERE item_id=$1 AND lease_version=$2", [itemId, lease.version, observedPrestateHash]);
       await client.query("UPDATE jobs SET lease_until=clock_timestamp()+interval '120 seconds' WHERE id=$1", [lease.jobId]);
-    });
+    }, signal, assertCurrent);
   }
 
-  async finishItem(lease: Lease, itemId: string, outcome: ItemOutcome, evidence: FinishItemEvidence = {}) {
+  async finishItem(lease: Lease, itemId: string, outcome: ItemOutcome, evidence: FinishItemEvidence = {}, signal?: AbortSignal, assertCurrent?: () => void) {
     await transaction(this.database, async client => {
       if (evidence.readback) await lockPackageInventoryScope(lease.scope, client);
       const job = await this.fence(client, lease);
-      const poststateHash = evidence.poststate ? packageMutationStateHash(evidence.poststate) : null;
+      const poststate = evidence.poststate ? requirePersistablePackageMutationState(evidence.poststate) : null;
+      const poststateHash = poststate ? packageMutationStateHash(poststate) : null;
       const result = await client.query<{ target_id: string }>(`UPDATE job_items SET status=$3,message=$4,error_code=$5,poststate=$6,poststate_hash=$7,
         reconciliation_status=CASE WHEN $3='inconclusive' THEN 'required' ELSE 'not_required' END,updated_at=clock_timestamp()
-        WHERE id=$1 AND job_id=$2 AND status='running' RETURNING target_id`, [itemId, lease.jobId, outcome, evidence.message?.slice(0,1024) ?? null, evidence.errorCode?.slice(0,128) ?? null, evidence.poststate ?? null, poststateHash]);
+        WHERE id=$1 AND job_id=$2 AND status='running' RETURNING target_id`, [itemId, lease.jobId, outcome, evidence.message?.slice(0,1024) ?? null, evidence.errorCode?.slice(0,128) ?? null, poststate, poststateHash]);
       if (!result.rowCount) throw new AppError(409, "terminal_item", "Terminal items cannot be overwritten.");
       let snapshotId: string | undefined;
       if (evidence.readback) {
-        if (!["succeeded", "skipped"].includes(outcome) || !evidence.poststate
+        if (!["succeeded", "skipped"].includes(outcome) || !poststate
           || evidence.readback.id !== result.rows[0].target_id
           || packageMutationStateHash(capturePackageMutationState(evidence.readback, job.action)) !== poststateHash) {
           throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact target and verified mutation state.");
         }
-        snapshotId = await publishPackageReadback(lease.scope, evidence.readback, client, evidence.inventoryGeneration, evidence.poststate);
+        snapshotId = await publishPackageReadback(lease.scope, evidence.readback, client, evidence.inventoryGeneration, poststate);
       }
       await client.query("UPDATE job_attempts SET finished_at=clock_timestamp(),outcome=$3,readback_count=$4 WHERE item_id=$1 AND lease_version=$2", [itemId, lease.version, outcome, Math.min(Math.max(evidence.readbackCount ?? 0, 0), 20)]);
       await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: outcome, message: evidence.message, errorCode: evidence.errorCode, metadata: { poststateHash: poststateHash ?? "", readbackCount: evidence.readbackCount ?? 0, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required", verification: outcome === "succeeded" || snapshotId ? "provider_readback" : "not_verified", ...(snapshotId ? { snapshotId } : {}) } });
-    });
+    }, signal, assertCurrent);
   }
 
-  async withTargetLock<T>(lease: Lease, item: JobItem, operation: () => Promise<T>) {
-    const client = await this.database.connect();
-    const key = `package-mutation:${lease.scope.tenantId}:${item.target_id}`;
-    try {
-      await client.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [key]);
+  async withTargetLock<T>(lease: Lease, item: JobItem, operation: (signal: AbortSignal) => Promise<T>) {
+    return this.withPackageLock(lease.scope, item.target_id, async (client, signal) => {
       await this.fence(client, lease);
-      return await operation();
-    } finally {
-      await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [key]).catch(() => undefined);
-      client.release();
-    }
+      signal.throwIfAborted();
+      return await operation(signal);
+    });
   }
 
   async reconciliationContext(id: string, scope: DataScope, after = -1) {
@@ -445,17 +456,54 @@ export class JobRepository {
       || items.rows.length > 0 && exactCount(items.rows[0].candidate_count) > items.rows.length };
   }
 
-  async withReconciliationLock<T>(scope: DataScope, item: JobItem, operation: () => Promise<T>) {
-    const client = await this.database.connect();
-    const key = `package-mutation:${scope.tenantId}:${item.target_id}`;
-    try {
-      await client.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [key]);
+  async withReconciliationLock<T>(scope: DataScope, item: JobItem, operation: (signal: AbortSignal) => Promise<T>) {
+    return this.withPackageLock(scope, item.target_id, async (client, signal) => {
       const current = await client.query("SELECT 1 FROM job_items item JOIN jobs job ON job.id=item.job_id WHERE item.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.cancel_requested=false AND item.status='inconclusive' AND item.reconciliation_status='required'", [item.id, scope.tenantId, scope.principalId]);
       if (!current.rowCount) throw new AppError(409, "reconciliation_state", "The package item no longer requires reconciliation.");
-      return await operation();
+      signal.throwIfAborted();
+      return await operation(signal);
+    });
+  }
+
+  private async withPackageLock<T>(scope: DataScope, targetId: string, operation: (client: pg.PoolClient, signal: AbortSignal) => Promise<T>) {
+    const client = await this.database.connect();
+    const state = clientErrorState(client);
+    const key = `package-mutation:${scope.tenantId}:${targetId}`;
+    let locked = false, failure: unknown, discard: Error | undefined;
+    const controller = new AbortController();
+    const loseLock = (error?: Error) => {
+      controller.abort(new AppError(409, "package_lock_lost", "The package lock connection was lost; dispatch and verified publication stopped."));
+      discard ??= error ?? controller.signal.reason;
+    };
+    client.on("error", loseLock);
+    client.on("end", loseLock);
+    try {
+      await client.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [key]);
+      locked = true;
+      if (state.error) throw state.error;
+      controller.signal.throwIfAborted();
+      const value = await operation(client, controller.signal);
+      if (state.error) throw state.error;
+      controller.signal.throwIfAborted();
+      return value;
+    } catch (error) {
+      failure = error;
+      if (!locked) discard = error instanceof Error ? error : new Error("package_mutation_lock_failed", { cause: error });
+      throw error;
     } finally {
-      await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [key]).catch(() => undefined);
-      client.release();
+      try {
+        if (locked) {
+          const unlocked = await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0)) AS unlocked", [key]);
+          if (unlocked.rows[0]?.unlocked !== true) throw new Error("package_mutation_unlock_failed");
+        }
+      } catch (error) {
+        discard = error instanceof Error ? error : new Error("package_mutation_unlock_failed", { cause: error });
+        throw failure === undefined ? error : new AggregateError([failure, error], "package_mutation_cleanup_failed");
+      } finally {
+        client.removeListener("error", loseLock);
+        client.removeListener("end", loseLock);
+        client.release(discard ?? state.error);
+      }
     }
   }
 
@@ -463,7 +511,7 @@ export class JobRepository {
     return readPackageInventoryGeneration(scope, this.database);
   }
 
-  async recordReconciliation(scope: DataScope, itemId: string, status: Exclude<ReconciliationStatus, "not_required" | "required">, observed: PackageMutationState, message: string, observation?: { details: CopilotPackageDetail; inventoryGeneration: string | null }) {
+  async recordReconciliation(scope: DataScope, itemId: string, status: Exclude<ReconciliationStatus, "not_required" | "required">, observed: PackageMutationState, message: string, observation?: { details: CopilotPackageDetail; inventoryGeneration: string | null }, signal?: AbortSignal, assertCurrent?: () => void) {
     await transaction(this.database, async client => {
       if (observation) await lockPackageInventoryScope(scope, client);
       const item = await client.query<JobItem & { job_id: string; lease_version: number; action: AuditAction }>(`SELECT item.*,attempt.lease_version,job.action FROM job_items item
@@ -471,24 +519,25 @@ export class JobRepository {
         JOIN LATERAL (SELECT lease_version FROM job_attempts WHERE item_id=item.id ORDER BY lease_version DESC LIMIT 1) attempt ON true
         WHERE item.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.cancel_requested=false AND item.status='inconclusive' AND item.reconciliation_status='required' FOR UPDATE`, [itemId, scope.tenantId, scope.principalId]);
       if (!item.rows[0]) throw new AppError(409, "reconciliation_state", "The package item no longer requires reconciliation.");
-      const poststateHash = packageMutationStateHash(observed);
+      const poststate = requirePersistablePackageMutationState(observed);
+      const poststateHash = packageMutationStateHash(poststate);
       let snapshotId: string | undefined;
       if (observation) {
         if (observation.details.id !== item.rows[0].target_id
           || packageMutationStateHash(capturePackageMutationState(observation.details, item.rows[0].action)) !== poststateHash) {
           throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact reconciled target and observed state.");
         }
-        snapshotId = await publishPackageReadback(scope, observation.details, client, observation.inventoryGeneration, observed);
+        snapshotId = await publishPackageReadback(scope, observation.details, client, observation.inventoryGeneration, poststate);
       }
       await client.query(`UPDATE job_items SET status=CASE WHEN $2='verified_applied' THEN 'succeeded' ELSE status END,
-        poststate=$3,poststate_hash=$4,reconciliation_status=$2,reconciled_at=clock_timestamp(),message=$5,updated_at=clock_timestamp() WHERE id=$1`, [itemId, status, observed, poststateHash, message.slice(0,1024)]);
+        poststate=$3,poststate_hash=$4,reconciliation_status=$2,reconciled_at=clock_timestamp(),message=$5,updated_at=clock_timestamp() WHERE id=$1`, [itemId, status, poststate, poststateHash, message.slice(0,1024)]);
       await new AuditLog(scope, client).completeEvent(`${itemId}:${item.rows[0].lease_version}`, {
         status: status === "verified_applied" ? "succeeded" : "inconclusive",
         message,
         metadata: { poststateHash, reconciliationStatus: status, verification: "provider_reconciliation", ...(snapshotId ? { snapshotId } : {}) },
       });
       await this.aggregate(client, item.rows[0].job_id);
-    });
+    }, signal, assertCurrent);
   }
 
   async release(lease: Lease) {
@@ -595,11 +644,13 @@ export class JobRepository {
 
   async pauseItemForAuthorization(lease: Lease, itemId: string) {
     await transaction(this.database, async client => {
-      await this.fence(client, lease);
-      const item = await client.query("UPDATE job_items SET status='queued',message=NULL,error_code=NULL,updated_at=clock_timestamp() WHERE id=$1 AND job_id=$2 AND status='running' AND sent_at IS NULL RETURNING id", [itemId, lease.jobId]);
+      const job = await this.fence(client, lease);
+      const item = await client.query("UPDATE job_items SET status=$3,message=NULL,error_code=NULL,updated_at=clock_timestamp() WHERE id=$1 AND job_id=$2 AND status='running' AND sent_at IS NULL RETURNING id", [itemId, lease.jobId, job.cancel_requested ? "cancelled" : "queued"]);
       if (item.rowCount !== 1) throw new AppError(409, "already_dispatched", "Sent work cannot return to authorization wait.");
       await client.query("UPDATE job_attempts SET finished_at=clock_timestamp(),outcome='cancelled' WHERE item_id=$1 AND lease_version=$2 AND sent_at IS NULL AND finished_at IS NULL", [itemId, lease.version]);
-      await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: "cancelled", message: "Attempt ended before dispatch because current authorization is required." });
+      await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: "cancelled", message: job.cancel_requested
+        ? "Cancellation stopped this attempt before provider dispatch."
+        : "Attempt ended before dispatch because current authorization is required." });
       await this.aggregate(client, lease.jobId);
       await client.query("UPDATE jobs SET lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
     });
@@ -626,22 +677,34 @@ export function mutationRetryIntentHash(input: MutationRetryIntent) {
   });
 }
 
+function jobConfirmationMetadata(summary: MutationConfirmationSummary) {
+  const { targets: _targets, ...metadata } = summary;
+  return metadata;
+}
+
 function prepareIntent(input: JobIntentInput) {
+  if ((input.action === "update-availability" || input.action === "update-installation") !== Boolean(input.accessUpdate)) throw new AppError(400, "invalid_mutation_intent", "The package mutation action and access payload do not match.");
+  if (input.accessUpdate && input.action !== (input.accessUpdate.target === "availability" ? "update-availability" : "update-installation")) throw new AppError(400, "invalid_mutation_intent", "The package access action does not match its selected target.");
   if (!Array.isArray(input.targets) || input.targets.length < 1 || input.targets.length > 5000) throw new AppError(400, "invalid_targets", "Submit 1-5000 exact package targets.");
   if (input.targets.some(target => typeof target?.id !== "string")) throw new AppError(400, "invalid_targets", "Each package target requires an exact native ID of at most 512 characters.");
   const ids = input.targets.map(target => target.id);
-  if (ids.some(id => !id || id.length > 512)) throw new AppError(400, "invalid_targets", "Each package target requires an exact native ID of at most 512 characters.");
+  if (ids.some(id => !isPackageId(id))) throw new AppError(400, "invalid_targets", "Each package target requires an exact bounded native ID without controls or dot path segments.");
   if (new Set(ids).size !== ids.length) throw new AppError(400, "duplicate_target", "Duplicate package mutation targets are not allowed.");
   const targets = input.targets.map((target, index) => {
     const displayName = target.displayName.trim();
     if (!displayName || displayName.length > 256 || Buffer.byteLength(JSON.stringify(target.prestate)) > 65_000) throw new AppError(400, "invalid_targets", "Each package target requires a bounded display name and prestate.");
-    expectedPackageMutationState(target.prestate, input.action, input.accessUpdate);
-    return { id: ids[index], displayName, prestate: target.prestate, prestateHash: packageMutationStateHash(target.prestate) };
+    const prestate = requirePersistablePackageMutationState(target.prestate);
+    const expected = expectedPackageMutationState(prestate, input.action, input.accessUpdate);
+    requirePersistablePackageMutationState(expected);
+    if (input.accessUpdate && prestate.kind === "access" && !packageMutationStatesEqual(prestate, expected)) {
+      const availability = input.accessUpdate.target === "availability";
+      requirePreservablePackageAccessScope(availability ? prestate.deployedTo : prestate.availableTo,
+        availability ? prestate.acquireUsersAndGroups : prestate.allowedUsersAndGroups);
+    }
+    return { id: ids[index], displayName, prestate, prestateHash: packageMutationStateHash(prestate) };
   }).sort((left, right) => ordinal(left.id, right.id));
   const accessUpdate = input.accessUpdate ? { ...input.accessUpdate, principals: canonicalAccessEntities(input.accessUpdate.principals) } as PackageAccessUpdate : undefined;
   if (accessUpdate && Buffer.byteLength(JSON.stringify(accessUpdate)) > 60_000) throw new AppError(400, "request_too_large", "Access intent is too large.");
-  if ((input.action === "update-availability" || input.action === "update-installation") !== Boolean(accessUpdate)) throw new AppError(400, "invalid_mutation_intent", "The package mutation action and access payload do not match.");
-  if (accessUpdate && input.action !== (accessUpdate.target === "availability" ? "update-availability" : "update-installation")) throw new AppError(400, "invalid_mutation_intent", "The package access action does not match its selected target.");
   const reassignUserId = input.reassignUserId?.trim();
   if (input.action === "reassign" || reassignUserId) throw new AppError(409, "reassign_verification_unavailable", "Reassign owner is disabled because the documented package detail contract has no owner field for provider verification.");
   return { ...input, targets, accessUpdate, reassignUserId };
@@ -668,8 +731,4 @@ function hash(value: unknown) {
 
 function ordinal(left: string, right: string) {
   return Buffer.compare(Buffer.from(left), Buffer.from(right));
-}
-
-function jobCapability(action: AuditAction): "graph.package.block.manage" | "graph.package.access.manage" | "graph.package.reassign.manage" {
-  return action === "block" || action === "unblock" ? "graph.package.block.manage" : action === "reassign" ? "graph.package.reassign.manage" : "graph.package.access.manage";
 }

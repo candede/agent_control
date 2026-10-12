@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import { ApiError, getInventoryFacets, type InventoryFacetField } from "../api/client";
 import { decodeInventoryFacet, encodeInventoryFacet, inventoryFacetLabel, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import { formatPackageFacetLabel, formatPackageType } from "../../../backend/src/types/copilotPackage";
-import { isExpiredSelection } from "../selectedRead";
+import { normalizeEnvironmentIdentity } from "../../../backend/src/services/inventoryIdentity";
 
 export function InventoryFacetSelect({ selectionId, scopeKey = selectionId, field, value, label, allLabel, loading, onChange, onInvalidated, onError, selectRef, compact, onOptionLabel }: {
   selectionId: string; field: InventoryFacetField; value?: InventoryFacetValue; label: string; allLabel: string;
@@ -41,7 +41,8 @@ export function InventoryFacetSelect({ selectionId, scopeKey = selectionId, fiel
   }, [selectionId, field, requestSearch, cursor, owner, retry]);
   const visible = state?.owner === owner ? state : undefined;
   const selectedValue = field === "environmentId" && typeof value === "string"
-    ? visible?.page?.value.find(option => typeof option.value === "string" && option.value.toLowerCase() === value.toLowerCase())?.value ?? value : value;
+    ? visible?.page?.value.find(option => typeof option.value === "string"
+      && normalizeEnvironmentIdentity(option.value) === normalizeEnvironmentIdentity(value))?.value ?? value : value;
   const selectedKey = selectedValue === undefined ? "" : encodeInventoryFacet(selectedValue);
   const selectedOption = visible?.page?.value.find(option => encodeInventoryFacet(option.value) === selectedKey);
   useEffect(() => {

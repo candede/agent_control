@@ -29,6 +29,22 @@ export function isAuditOperationPrefix(value: unknown): value is string {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(value);
 }
 
+export function auditMetadata(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result: Record<string, string | number | boolean> = {};
+  for (const key of ["target", "mode", "scope", "template", "rowCount", "requestCount", "previousCount", "resultingCount", "resultingBytes", "source", "snapshotId", "revision", "selection", "partial", "jobId", "reportSetId", "reportingStart", "reportingEnd", "leaseVersion", "correlationId", "confirmationHash", "targetSelectionHash", "prestateHash", "poststateHash", "readbackCount", "reconciliationStatus", "verification", "reportAgentHash", "inventoryRevision", "changed", "phase"]) {
+    const entry: unknown = Reflect.get(value, key);
+    if (typeof entry === "string" && entry.length <= 128 || typeof entry === "number" && Number.isFinite(entry) || typeof entry === "boolean") {
+      result[key] = entry;
+    }
+  }
+  for (const key of ["checksum", "queryHash"]) {
+    const hash: unknown = Reflect.get(value, key);
+    if (typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash)) result[key] = hash;
+  }
+  return result;
+}
+
 export type AuditStatus = "requested" | "started" | "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
 
 export type AuditActor = {

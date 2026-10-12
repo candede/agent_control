@@ -137,7 +137,7 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     expect(first.counts).toMatchObject({ total: 2, filtered: 2 });
     expect(first.value.map(row => row.nativeId)).toEqual(["agent-a"]);
     expect(first.page.nextCursor).toEqual(expect.any(String));
-    expect(inventorySourceStatuses(first.freshness.sources).powerPlatform.observation).toMatchObject({
+    expect(inventorySourceStatuses(first.freshness.sources, first.selection.evaluatedAt as Date).powerPlatform.observation).toMatchObject({
       observedCount: 2, pageCount: 2, coveredCount: 2, verification: { storedCount: 2, uniqueIdentityCount: 2 },
     });
     expect(await jobs.getJob(scope, job.id)).toMatchObject({ status: "succeeded", snapshotId: root.baselineId, observedCount: 2 });
@@ -175,7 +175,7 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     expect(second.counts.total).toBe(2);
     expect(new Set([...first.value, ...second.value].map(row => row.environmentId)).size).toBe(2);
     expect(previous.value).toEqual(first.value);
-    expect(inventorySourceStatuses(first.freshness.sources).powerPlatform.observation)
+    expect(inventorySourceStatuses(first.freshness.sources, first.selection.evaluatedAt as Date).powerPlatform.observation)
       .toMatchObject({ observedCount: 3, coveredCount: 2 });
   });
 
@@ -247,7 +247,7 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
       const page = (await selected(scope, next)).raw;
       expect(page.value.map(row => row.nativeId)).toEqual(values);
       expect(page.counts.total).toBe(values.length);
-      expect(inventorySourceStatuses(page.freshness.sources).powerPlatform.observation).toMatchObject({
+      expect(inventorySourceStatuses(page.freshness.sources, page.selection.evaluatedAt as Date).powerPlatform.observation).toMatchObject({
         roleScope: "unknown", coverage: "covered", verification: { storedCount: values.length, uniqueIdentityCount: values.length },
       });
       expect((await pin.queries.page(pin.selection.id, pin.identity)).counts.total).toBe(2);
@@ -258,10 +258,12 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     expect(inventoryQueryTypes("ai", powerPlatformResourceTypes)).toEqual(powerPlatformResourceTypes);
     const scope = owner();
     const empty = await collect(scope, await running(scope, "empty"), provider([]));
-    expect(inventorySourceStatuses((await selected(scope, empty)).raw.freshness.sources).powerPlatform.observation)
-      .toMatchObject({ coverage: "covered", coveredCount: 0, verification: { queriedTypes: expect.arrayContaining(powerPlatformResourceTypes) } });
+    const emptyPage = (await selected(scope, empty)).raw;
+    expect(inventorySourceStatuses(emptyPage.freshness.sources, emptyPage.selection.evaluatedAt as Date).powerPlatform.observation)
+      .toMatchObject({ coverage: "covered", coveredCount: 0, verification: { queriedTypes: expect.arrayContaining([...powerPlatformResourceTypes]) } });
     const environments = await collect(scope, await running(scope, "environments", [environmentType]), provider([]));
-    expect(inventorySourceStatuses((await selected(scope, environments)).raw.freshness.sources).powerPlatform)
+    const environmentPage = (await selected(scope, environments)).raw;
+    expect(inventorySourceStatuses(environmentPage.freshness.sources, environmentPage.selection.evaluatedAt as Date).powerPlatform)
       .toMatchObject({ state: "partial", observation: { coverage: "not_requested", coveredCount: null,
         verification: { queriedTypes: [environmentType] } } });
   });

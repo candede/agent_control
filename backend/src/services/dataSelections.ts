@@ -17,8 +17,8 @@ export type DependencyRoot =
   | { kind: "tenant_history"; scopeId: string; revision: string; expiresAt: Date }
   | { kind: "user_sources"; scopeId: string; revision: string; expiresAt: Date }
   | { kind: "inventory_delta"; scopeId: string; generationId: string; revision: string; expiresAt: Date };
-export type DomainRootValidator = (client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity) => Promise<void>;
-export type Selection = { id: string; revision: string; expiresAt: Date; evaluatedAt: Date; validatedAt: Date; endpoint: string; queryHash: string };
+export type DomainRootValidator = (client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) => Promise<void>;
+export type Selection = { id: string; revision: string; expiresAt: Date; evaluatedAt: Date; endpoint: string; queryHash: string };
 export type CursorBoundary = { key: string | null; id: string; nullRank: 0 | 1 };
 type CursorPayload = {
   version: 1; identity: SelectionIdentity; endpoint: string; selectionId: string; revision: string;
@@ -49,11 +49,24 @@ export function canonicalQuery(input: Record<string, unknown>, allowed: readonly
   return digest(JSON.stringify(canonicalFilters(input, allowed)));
 }
 
+function validCursorBoundary(value: unknown): value is CursorBoundary {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const boundary = value as Record<string, unknown>;
+  return typeof boundary.id === "string" && boundary.id.length > 0 && boundary.id.length <= 512
+    && (boundary.key === null || typeof boundary.key === "string")
+    && boundary.nullRank === (boundary.key === null ? 1 : 0);
+}
+
+function cursorSelectionKey(value: string) {
+  return /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value) ? value.toLowerCase() : value;
+}
+
 export class CursorCodec {
   constructor(private readonly secret: string) {
     if (Buffer.byteLength(secret) < 32) throw new Error("cursor_secret_required");
   }
   encode(payload: Omit<CursorPayload, "version">) {
+    if (!validCursorBoundary(payload.boundary)) throw new SelectionError("invalid_cursor");
     const encoded = Buffer.from(JSON.stringify({ ...payload, version: 1 })).toString("base64url");
     const signature = createHmac("sha256", this.secret).update(encoded).digest("base64url");
     const cursor = `${encoded}.${signature}`;
@@ -66,17 +79,16 @@ export class CursorCodec {
       const [encoded, signature] = cursor.split(".");
       const actual = Buffer.from(signature, "base64url");
       const calculated = createHmac("sha256", this.secret).update(encoded).digest();
-      if (actual.length !== calculated.length || !timingSafeEqual(actual, calculated)) throw new Error();
+      if (actual.toString("base64url") !== signature || actual.length !== calculated.length || !timingSafeEqual(actual, calculated)) throw new Error();
       const parsed: CursorPayload = JSON.parse(Buffer.from(encoded, "base64url").toString());
       if (parsed.version !== 1 || !["next", "previous"].includes(parsed.direction)
         || parsed.endpoint !== expected.endpoint || parsed.queryHash !== expected.queryHash
-        || parsed.selectionId !== expected.selectionId || parsed.revision !== expected.revision
+        || cursorSelectionKey(parsed.selectionId) !== cursorSelectionKey(expected.selectionId)
+        || cursorSelectionKey(parsed.revision) !== cursorSelectionKey(expected.revision)
         || parsed.identity.tenantId !== expected.identity.tenantId || parsed.identity.principalId !== expected.identity.principalId
         || parsed.identity.authorizationHash !== expected.identity.authorizationHash
         || parsed.identity.sessionEpoch !== expected.identity.sessionEpoch
-        || typeof parsed.boundary.id !== "string" || !parsed.boundary.id || parsed.boundary.id.length > 512
-        || parsed.boundary.key !== null && typeof parsed.boundary.key !== "string"
-        || parsed.boundary.nullRank !== (parsed.boundary.key === null ? 1 : 0)) throw new Error();
+        || !validCursorBoundary(parsed.boundary)) throw new Error();
       return parsed;
     } catch { throw new SelectionError("invalid_cursor"); }
   }
@@ -126,10 +138,11 @@ export class DataSelections {
         if (scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) {
           throw new SelectionError("selection_invalidated");
         }
-        await this.validateRoot(client, root, identity);
         epochs.push(scope);
       }
-      const selection: Selection = { id: randomUUID(), revision: randomUUID(), expiresAt, evaluatedAt: now, validatedAt: now, endpoint, queryHash };
+      // Domain revision locks come after every scope fence, not between scopes.
+      for (const root of ordered) await this.validateRoot(client, root, identity);
+      const selection: Selection = { id: randomUUID(), revision: randomUUID(), expiresAt, evaluatedAt: now, endpoint, queryHash };
       await client.query(`INSERT INTO data_read_selections(id,tenant_id,principal_id,authorization_hash,endpoint,query_hash,evaluated_at,expires_at,revision,session_epoch,query_json,root_count)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)`,
       [selection.id, identity.tenantId, identity.principalId, identity.authorizationHash, endpoint, queryHash, now, expiresAt, selection.revision, identity.sessionEpoch, JSON.stringify(filters), roots.length]);
@@ -147,7 +160,7 @@ export class DataSelections {
     }, { admissionTenantId: identity.tenantId });
   }
 
-  async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity) {
+  async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) {
     // A temporal inventory anchor is retained storage, not the observation
     // generation that authorizes this revision. Its domain validator checks that revision.
     if ("generationId" in root) {
@@ -160,7 +173,7 @@ export class DataSelections {
     }
     if (root.kind !== "generation") {
       if (!this.validateDomainRoot) throw new Error("data_domain_root_validator_required");
-      await this.validateDomainRoot(client, root, identity);
+      await this.validateDomainRoot(client, root, identity, exportSelectionId);
     }
   }
 
@@ -188,14 +201,13 @@ export class DataSelections {
     for (const pin of pins) {
       const scope = await lockDataScope(client, pin.scope_id, identity.tenantId, isSelectedRead(client) ? "share" : "update");
       if (scope.epoch !== pin.scope_epoch || scope.session_epoch !== pin.session_epoch
-        || scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) throw new SelectionError("selection_invalidated", "changed");
-      if (pin.expired) {
-        throw new SelectionError("selection_invalidated", "expired");
-      }
+        || scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) throw new SelectionError("selection_invalidated");
+    }
+    for (const pin of pins) {
       const root: DependencyRoot = pin.root_kind === "tenant_history" || pin.root_kind === "user_sources"
         ? { kind: pin.root_kind, scopeId: pin.scope_id, revision: pin.revision, expiresAt: pin.expires_at }
         : { kind: pin.root_kind, scopeId: pin.scope_id, generationId: pin.generation_id, revision: pin.revision, expiresAt: pin.expires_at };
-      await this.validateRoot(client, root, identity);
+      await this.validateRoot(client, root, identity, exportId === undefined ? undefined : id);
     }
     const selection = (await client.query(`SELECT *,clock_timestamp() AS validated_at,
       EXISTS(SELECT 1 FROM data_generation_pins pin WHERE pin.selection_id=data_read_selections.id

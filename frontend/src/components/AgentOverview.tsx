@@ -9,6 +9,7 @@ import { AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
 import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 import { CapabilityContext } from "../capabilityContext";
 import { AgentConnectorOperations, SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../../../backend/src/services/inventoryIdentity";
 
 const connectorPageSize = 10;
 type Property = { label: string; value: ReactNode; wide?: boolean };
@@ -50,7 +51,8 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
   const offset = navigation.owner === connectorOwner
     ? Math.min(navigation.offset, Math.max(0, Math.ceil((connectors?.length ?? 0) / connectorPageSize) - 1) * connectorPageSize) : 0;
   if (navigation.owner !== connectorOwner || navigation.offset !== offset) setNavigation({ owner: connectorOwner, offset });
-  const environment = record.environment?.id.toLowerCase() === record.environmentId?.toLowerCase() ? record.environment : undefined;
+  const environment = record.environment && record.environmentId !== null
+    && normalizeEnvironmentIdentity(record.environment.id) === normalizeEnvironmentIdentity(record.environmentId) ? record.environment : undefined;
   const nextExpiry = [environment?.observation.expiresAt, record.observations.powerPlatform?.expiresAt]
     .map(value => Date.parse(value ?? "")).filter(expiry => Number.isFinite(expiry) && expiry > now)
     .sort((left, right) => left - right)[0];
@@ -72,8 +74,8 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
     { label: "Built with", value: agentColumnValue(observedRecord, "builtWith") },
     { label: "Agent type", value: metadata?.type ? formatPackageType(metadata.type) : undefined },
     { label: "Version", value: metadata?.version },
-    { label: "Hosts", value: metadata?.supportedHosts?.map(formatPackageFacetLabel).join(", ") },
-    { label: "Categories", value: packageDetail?.categories?.map(formatPackageFacetLabel).join(", ") },
+    { label: "Hosts", value: metadata ? metadata.supportedHosts?.map(formatPackageFacetLabel).join(", ") || (metadata.supportedHosts ? "None reported" : "Not reported") : undefined },
+    { label: "Categories", value: packageDetail ? packageDetail.categories?.map(formatPackageFacetLabel).join(", ") || (packageDetail.categories ? "None reported" : "Not reported") : undefined },
     { label: "Sensitivity", value: packageDetail?.sensitivity ? formatPackageFacetLabel(packageDetail.sensitivity) : undefined },
   ]);
   const dates = properties([
@@ -103,7 +105,8 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
   const identifiers = properties([
     { label: "Agent ID", value: resource?.nativeId },
     { label: "Schema name", value: resource?.details.schemaName },
-    { label: "Bot ID", value: nativeBotId?.toLowerCase() !== resource?.nativeId.toLowerCase() ? nativeBotId : undefined },
+    { label: "Bot ID", value: nativeBotId && resource
+      && normalizeNativeIdentity(nativeBotId) !== normalizeNativeIdentity(resource.nativeId) ? nativeBotId : undefined },
     { label: "Entra agent ID", value: resource?.identifiers.find(item => item.kind === "entra_agent_id")?.value },
     { label: "Package ID", value: metadata?.id },
     { label: "Package app ID", value: metadata?.appId },
@@ -144,7 +147,7 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
             { label: "Environment group", value: environment?.groupName },
             { label: "Environment ID", value: record.environmentId, wide: true },
           ])} />
-          {environment ? !(Date.parse(environment.observation.expiresAt) > now)
+          {environment ? !environment.observation.current || !(Date.parse(environment.observation.observedAt) <= now && Date.parse(environment.observation.expiresAt) > now)
             ? <p className="notice">Environment details are out of date. Refresh them in Sync.</p> : null
             : <p>Environment details are unavailable. Check inventory coverage in Sync.</p>}
         </section> : null}
@@ -162,6 +165,9 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
       ])} />
       {record.observations.powerPlatform && !(Date.parse(record.observations.powerPlatform.expiresAt) > now)
         ? <p className="notice">Configuration details have expired. Refresh them in Sync.</p> : null}
+      {!record.observations.powerPlatform || !record.observations.powerPlatform.current
+        || !(Date.parse(record.observations.powerPlatform.observedAt) <= now)
+        ? <p className="notice">Configuration source authority is unavailable or out of date. Refresh inventory in Sync.</p> : null}
       {connectors?.length ? <>
         <ul className="agent-service-list" aria-label="Configured connector details">
           {connectors.slice(offset, offset + connectorPageSize).map((connector, index) => <li key={`${offset + index}:${connector.connectorId}`}>

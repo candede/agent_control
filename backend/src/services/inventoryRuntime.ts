@@ -4,7 +4,7 @@ import type pg from "pg";
 import { observeDataWork } from "./dataMetrics.js";
 import { revalidateAuthenticatedUser } from "../auth/msal.js";
 import { DataGenerations, type BeginGeneration } from "../db/dataGenerations.js";
-import { finalizeRun } from "../db/dataSync.js";
+import { finalizeDataSyncRun } from "../db/dataSync.js";
 import { InventoryGenerations, inventorySelector, type InventoryIntent } from "../db/inventoryGenerations.js";
 import { pool } from "../db/pool.js";
 import { AppError, errorTelemetry } from "../errors.js";
@@ -57,13 +57,14 @@ export function completeInventoryJob(input: BeginGeneration, domain: Domain) {
       last_success_at=clock_timestamp(),updated_at=clock_timestamp(),message='Complete source published.',can_retry=false
       FROM data_sync_runs r WHERE s.run_id=r.id AND s.run_id=$1 AND s.tenant_id=$2 AND s.principal_id=$3
         AND s.job_id=$4 AND s.source_id=$6 AND s.status='running' AND r.status IN ('running','waiting')
+        AND r.expires_at>clock_timestamp()
       RETURNING s.run_id`, [input.runId, input.scope.tenantId, input.scope.principalId, result.jobId, result.rows, source]);
     if (published.rowCount !== 1) throw new AppError(409, "inventory_run_fenced", "The source run stopped before publication.");
     await client.query(`INSERT INTO data_sync_success_markers(tenant_id,principal_id,source_id,count,last_success_at,updated_at)
       VALUES($1,$2,$3,$4,clock_timestamp(),clock_timestamp()) ON CONFLICT(tenant_id,principal_id,source_id)
       DO UPDATE SET count=EXCLUDED.count,last_success_at=EXCLUDED.last_success_at,updated_at=EXCLUDED.updated_at`,
     [input.scope.tenantId, input.scope.principalId, source, result.rows]);
-    await finalizeRun(client, { tenantId: input.scope.tenantId, principalId: input.scope.principalId }, input.runId);
+    await finalizeDataSyncRun(client, { tenantId: input.scope.tenantId, principalId: input.scope.principalId! }, input.runId);
   };
 }
 
@@ -83,9 +84,34 @@ export class InventoryRuntime {
       throw AppError.unauthorized();
     }
     signal.throwIfAborted();
-  }) {
+  }, private readonly validateCurrent?: () => void) {
     this.reconciliation = new InventoryReconciliation(database);
     this.stages = new InventoryGenerations(database);
+  }
+  private readonly assertCurrent = () => {
+    this.validateCurrent?.();
+    if (this.stopped || maintenanceActive()) {
+      throw new AppError(503, "maintenance", "Inventory publication is paused for maintenance.");
+    }
+  };
+  private async admissionsOpen(signal: AbortSignal) {
+    signal.throwIfAborted();
+    if (this.stopped || maintenanceActive()) return false;
+    const state = await readOperationalState(this.database);
+    signal.throwIfAborted();
+    return !this.stopped && !maintenanceActive() && state.mode === "normal";
+  }
+  private async requireAdmissions(signal: AbortSignal) {
+    this.assertCurrent();
+    if (!await this.admissionsOpen(signal)) {
+      throw new AppError(503, "maintenance", "Inventory control publication is paused for maintenance.");
+    }
+    this.assertCurrent();
+  }
+  private async authorizeCurrent(scope: Scope, signal: AbortSignal) {
+    this.assertCurrent();
+    await interruptibleAuthorization(() => this.authorize(scope, signal), signal);
+    this.assertCurrent();
   }
   private async input(scope: Scope): Promise<BeginGeneration> {
     return { scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_canonical", selector: "complete" },
@@ -93,10 +119,15 @@ export class InventoryRuntime {
       observedAt: new Date(), expiresAt: new Date(Date.now() + 86_400_000), deadlineAt: new Date(Date.now() + 1_799_000),
       reserveBytes: 1024 ** 3, jobKind: "derived", jobId: randomUUID() };
   }
-  async enqueue(scope: Scope, schedule = true) {
-    if ((await this.database.query(`SELECT 1 WHERE EXISTS(SELECT 1 FROM inventory_control_pending
+  async enqueue(scope: Scope, schedule = true, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    this.assertCurrent();
+    const pending = await this.database.query(`SELECT 1 WHERE EXISTS(SELECT 1 FROM inventory_control_pending
       WHERE tenant_id=$1 AND principal_id=$2) OR EXISTS(SELECT 1 FROM inventory_native_control_pending
-      WHERE tenant_id=$1 AND principal_id=$2)`, [scope.tenantId, scope.principalId])).rowCount) return false;
+      WHERE tenant_id=$1 AND principal_id=$2)`, [scope.tenantId, scope.principalId]);
+    signal?.throwIfAborted();
+    this.assertCurrent();
+    if (pending.rowCount) return false;
     const roots = (await this.database.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r
       JOIN data_scope_epochs s ON s.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
@@ -104,12 +135,16 @@ export class InventoryRuntime {
         AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
         AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated
       ORDER BY r.scope_id LIMIT 17`, [scope.tenantId, scope.principalId])).rows;
+    signal?.throwIfAborted();
     if (roots.length > 16) throw new AppError(413, "inventory_source_limit", "At most 16 source roots may form a canonical inventory.");
-    if (roots.length) await this.reconciliation.request(await this.input(scope), roots);
+    if (roots.length) await this.reconciliation.request(await this.input(scope), roots, this.assertCurrent, signal);
+    signal?.throwIfAborted();
+    this.assertCurrent();
     if (this.timer && schedule) this.wake();
     return roots.length > 0;
   }
   async publishControls(scope: Scope, signal = new AbortController().signal) {
+    this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
       await client.query(`DELETE FROM inventory_control_pending WHERE (tenant_id,principal_id,target_id) IN (
@@ -120,7 +155,7 @@ export class InventoryRuntime {
               AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='delegated'
               AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.target_id COLLATE "C" LIMIT 250)`, [scope.tenantId, scope.principalId]);
-    });
+    }, false, signal, undefined, this.assertCurrent);
     const pending = (await this.database.query(`SELECT p.target_id,p.observation_id,p.updated_at
       FROM inventory_control_pending p WHERE p.tenant_id=$1 AND p.principal_id=$2
         AND EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
@@ -132,15 +167,16 @@ export class InventoryRuntime {
       ORDER BY p.updated_at,p.target_id COLLATE "C" LIMIT 20`, [scope.tenantId, scope.principalId])).rows;
     for (const target of pending) {
       signal.throwIfAborted();
+      this.assertCurrent();
       const authorize = (authorizationSignal: AbortSignal) =>
-        interruptibleAuthorization(() => this.authorize(scope, authorizationSignal), authorizationSignal);
+        this.authorizeCurrent(scope, authorizationSignal);
       const input: BeginGeneration = {
         scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_packages", selector: "complete" },
         schemaVersion: 1, sessionEpoch: await this.stages.generations.sessionEpoch(scope.tenantId, scope.principalId),
         jobId: target.observation_id, jobKind: "derived", observedAt: target.updated_at,
         expiresAt: new Date(Date.now() + 86_400_000), deadlineAt: new Date(Date.now() + 899_000), reserveBytes: 16 * 1_048_576,
       };
-      await new StreamedInventory(this.database).controlReadback(input, target.target_id, { signal, authorize,
+      await new StreamedInventory(this.database).controlReadback(input, target.target_id, { signal, authorize, assertCurrent: this.assertCurrent,
         validateInputs: async client => {
           if (!(await client.query(`SELECT 1 FROM inventory_control_pending
             WHERE tenant_id=$1 AND principal_id=$2 AND target_id=$3 AND observation_id=$4`,
@@ -156,9 +192,12 @@ export class InventoryRuntime {
           }
         } });
     }
+    signal.throwIfAborted();
+    this.assertCurrent();
     return pending.length;
   }
   async publishNativeControls(scope: Scope, signal = new AbortController().signal) {
+    this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
       await client.query(`DELETE FROM inventory_native_control_pending WHERE (scope_id,identity) IN (
@@ -168,9 +207,9 @@ export class InventoryRuntime {
             WHERE root.scope_id=p.scope_id AND root.current AND g.session_epoch=s.session_epoch
               AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.scope_id,p.identity LIMIT 250)`, [scope.tenantId, scope.principalId]);
-    });
+    }, false, signal, undefined, this.assertCurrent);
     const pending = (await this.database.query(`SELECT p.scope_id,p.identity,p.observation_id,p.updated_at,s.selector,observation.observed_at AS receipt_observed_at,
-      coalesce(record.native_id,observation.resource_native_id) AS resource_native_id,observation.environment_id,observation.bot_id,
+      observation.resource_native_id,observation.environment_id,observation.bot_id,
       observation.is_bot_quarantined,observation.provider_updated_at,
       attempt.environment_id AS environment_scope,attempt.resource_types,attempt.role_scope
       FROM inventory_native_control_pending p JOIN copilot_quarantine_status_observations observation ON observation.id=p.observation_id
@@ -178,14 +217,12 @@ export class InventoryRuntime {
       JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
       JOIN data_generations generation ON generation.id=revision.generation_id
       JOIN inventory_attempts attempt ON attempt.generation_id=revision.generation_id
-      LEFT JOIN inventory_memberships member ON member.baseline_id=root.baseline_id AND member.identity=p.identity
-        AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
-      LEFT JOIN power_platform_record_rows record ON record.generation_id=member.generation_id AND record.identity=member.identity
       WHERE p.tenant_id=$1 AND p.principal_id=$2 AND generation.session_epoch=s.session_epoch
         AND generation.state IN ('published','retired') AND generation.validated ORDER BY p.updated_at,p.scope_id,p.identity LIMIT 20`,
     [scope.tenantId, scope.principalId])).rows;
     for (const target of pending) {
       signal.throwIfAborted();
+      this.assertCurrent();
       const input: BeginGeneration = {
         scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_power_platform", selector: target.selector },
         schemaVersion: 1, sessionEpoch: await this.stages.generations.sessionEpoch(scope.tenantId, scope.principalId),
@@ -196,7 +233,8 @@ export class InventoryRuntime {
         identity: target.identity, nativeId: target.resource_native_id, environmentId: target.environment_id, botId: target.bot_id,
         state: target.is_bot_quarantined, updatedAt: target.provider_updated_at, resourceTypes: target.resource_types,
         environmentScope: target.environment_scope, roleScope: target.role_scope,
-      }, { signal, authorize: authorizationSignal => interruptibleAuthorization(() => this.authorize(scope, authorizationSignal), authorizationSignal),
+      }, { signal, assertCurrent: this.assertCurrent,
+        authorize: authorizationSignal => this.authorizeCurrent(scope, authorizationSignal),
         validateInputs: async client => {
           if (!(await client.query(`SELECT 1 FROM inventory_native_control_pending
             WHERE scope_id=$1 AND identity=$2 AND observation_id=$3`, [target.scope_id, target.identity, target.observation_id])).rowCount) {
@@ -210,30 +248,42 @@ export class InventoryRuntime {
           }
         } });
     }
+    signal.throwIfAborted();
+    this.assertCurrent();
     return pending.length;
   }
   private async reconcile(scope: Scope, signal: AbortSignal) {
-    signal.throwIfAborted();
+    await this.requireAdmissions(signal);
     await this.publishControls(scope, signal);
+    await this.requireAdmissions(signal);
     await this.publishNativeControls(scope, signal);
-    if (await this.enqueue(scope, false)) {
+    await this.requireAdmissions(signal);
+    if (await this.enqueue(scope, false, signal)) {
+      await this.requireAdmissions(signal);
       await this.reconciliation.runNext(await this.input(scope), authorizationSignal =>
-        interruptibleAuthorization(() => this.authorize(scope, authorizationSignal), authorizationSignal), signal);
+        this.authorizeCurrent(scope, authorizationSignal), signal, this.assertCurrent);
     }
+    this.assertCurrent();
   }
   async settleControls(scope: Scope, signal: AbortSignal) {
     do {
       signal.throwIfAborted();
-      if (maintenanceActive() || (await readOperationalState(this.database)).mode !== "normal") {
-        throw new AppError(503, "maintenance", "Inventory control publication is paused for maintenance.");
-      }
+      this.assertCurrent();
       await this.reconcile(scope, signal);
       const pending = await this.database.query(`SELECT 1 WHERE
         EXISTS(SELECT 1 FROM inventory_control_pending WHERE tenant_id=$1 AND principal_id=$2)
         OR EXISTS(SELECT 1 FROM inventory_native_control_pending WHERE tenant_id=$1 AND principal_id=$2)
         OR EXISTS(SELECT 1 FROM inventory_reconciliation work JOIN data_scope_epochs scope ON scope.id=work.scope_id
-          WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL))`,
+          WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL)
+            AND EXISTS(SELECT 1 FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
+              JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
+              JOIN data_generations g ON g.id=v.generation_id
+              WHERE r.current AND s.tenant_id=scope.tenant_id AND s.principal_id=scope.principal_id
+                AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
+                AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()))`,
       [scope.tenantId, scope.principalId]);
+      signal.throwIfAborted();
+      this.assertCurrent();
       if (!pending.rowCount) return;
       await delay(100, undefined, { signal });
     } while (!signal.aborted);
@@ -268,10 +318,12 @@ export class InventoryRuntime {
   }
   async pass(signal = new AbortController().signal) {
     signal.throwIfAborted();
-    if ((await readOperationalState(this.database)).mode !== "normal") return false;
-    const scopes = (await this.database.query(`SELECT tenant_id,principal_id,min(id::text) AS id
-      FROM data_scope_epochs WHERE source IN ('inventory_packages','inventory_power_platform') AND token_mode='delegated'
-      GROUP BY tenant_id,principal_id HAVING min(id::text)>$1 ORDER BY min(id::text) LIMIT 20`, [this.after])).rows;
+    if (!await this.admissionsOpen(signal)) return false;
+    const scopes = (await this.database.query(`SELECT tenant_id,principal_id,min(id) AS id FROM (
+      SELECT tenant_id,principal_id,id::text AS id FROM data_scope_epochs
+        WHERE source IN ('inventory_packages','inventory_power_platform') AND token_mode='delegated'
+      UNION ALL SELECT tenant_id,principal_id,observation_id::text FROM inventory_control_pending
+      ) owners GROUP BY tenant_id,principal_id HAVING min(id)>$1 ORDER BY min(id) LIMIT 20`, [this.after])).rows;
     if (!scopes.length) { this.after = ""; await this.collect(signal); return false; }
     for (const row of scopes) {
       if (this.stopped || signal.aborted || maintenanceActive()) return false;
@@ -279,6 +331,7 @@ export class InventoryRuntime {
       try {
         await this.reconcile(scope, signal);
       } catch (error) {
+        if (error instanceof AppError && error.code === "maintenance") return false;
         operationalLog("error", "inventory_scope_reconciliation_failed", errorTelemetry(error, "inventory_scope_reconciliation_failed"));
       }
       this.after = row.id;
@@ -289,7 +342,8 @@ export class InventoryRuntime {
   async collect(signal = new AbortController().signal) {
     const started = performance.now();
     signal.throwIfAborted();
-    if (maintenanceActive() || (await readOperationalState(this.database)).mode !== "normal") return false;
+    if (!await this.admissionsOpen(signal)) return false;
+    this.assertCurrent();
     // Persist the scan boundary, not a list of reachable roots. Even pinned early roots and expired selectors advance.
     return this.stages.generations.connections.run(async client => {
     await client.query("SET LOCAL transaction_timeout='5s'; SET LOCAL statement_timeout='5s'");
@@ -304,7 +358,7 @@ export class InventoryRuntime {
       await client.query("UPDATE data_lifecycle_progress SET cursor='{}',slices=slices+1,updated_at=clock_timestamp() WHERE worker='inventory'");
       return false;
     }
-    const root = progress.stage ? undefined : (await client.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
+    const root = progress.stage && progress.scope === scope.id ? undefined : (await client.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch,r.first_revision FROM inventory_roots r
       JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.scope_id=$1 AND r.first_revision>$2
       ORDER BY r.first_revision LIMIT 1`, [scope.id, progress.scope === scope.id ? progress.revision ?? "0" : "0"])).rows[0];
@@ -327,7 +381,7 @@ export class InventoryRuntime {
     [JSON.stringify(next), rows, bytes]);
     observeDataWork("inventory_gc", { rows, bytes, durationMs: Math.ceil(performance.now() - started) });
     return true;
-    });
+    }, false, signal, undefined, this.assertCurrent);
   }
   async drain() {
     this.stopped = true;

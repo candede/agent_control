@@ -33,7 +33,8 @@ describe("record-backed Graph provider protocol", () => {
 
   function setup(fetcher: FetchLike) {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID() } });
+    const defaults = generationInput();
+    const input = { ...defaults, scope: { ...defaults.scope, principalId: randomUUID() } };
     const wait = vi.fn(async () => undefined);
     return { stages, input, wait, collect: (options: Partial<Options> = {}) =>
       new UserSourceProvider(fetcher, wait).refresh(stages, input, { authorize: async () => "synthetic-token", ...options }) };
@@ -117,6 +118,22 @@ describe("record-backed Graph provider protocol", () => {
       expect(requests).toBe(continuation ? 2 : 1);
       await noHead(run.input.scope.principalId);
     }
+  });
+
+  it.each(["catalog", "discovery", "identity"] as const)("rejects empty %s continuation links without publication", async source => {
+    const fetcher = vi.fn<FetchLike>(async target => {
+      const current = kind(new URL(String(target)));
+      return Response.json({
+        value: current === "catalog" ? catalog : [],
+        ...(current === "catalog" ? {} : { "@odata.count": 0 }),
+        ...(current === source ? { "@odata.nextLink": "" } : {}),
+      });
+    });
+    const run = setup(fetcher);
+    await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
+      .rejects.toMatchObject({ status: 502, code: "invalid_provider_link" });
+    expect(fetcher).toHaveBeenCalledTimes(source === "catalog" ? 1 : source === "discovery" ? 2 : 3);
+    await noHead(run.input.scope.principalId);
   });
 
   it.each(["no_paid_plans", "company_scope", "different_paid_plans"] as const)("rejects conflicting catalog eligibility: %s", async conflict => {

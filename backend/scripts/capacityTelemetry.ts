@@ -9,13 +9,16 @@ import { observePeakMemory, observeQueryWork, observePublicationWork, peakCheckp
 
 export const MiB = 1024 ** 2;
 export const requiredStages: PeakStage[] = ["provider.parse", "batch.stringify", "sql.result", "import.transform", "response.serialize", "export.encode"];
+let activeTelemetry: CapacityTelemetry | undefined;
 export function parseGcNvp(line: string) {
   const identity = /^\[(\d+):([^\]]+)\]\s+([\d.]+)\s+ms:/.exec(line);
   if (!identity || !/\bgc=/.test(line)) return null;
+  if (!Number.isSafeInteger(Number(identity[1])) || Number(identity[1]) <= 0
+    || !Number.isFinite(Number(identity[3])) || Number(identity[3]) < 0) return null;
   const fields = Object.fromEntries([...line.matchAll(/\b([a-z_]+)=([0-9.e+-]+)(?=\s|$)/g)].map(match => [match[1], Number(match[2])]));
   const before = fields.start_object_size ?? fields.total_size_before;
   const after = fields.end_object_size ?? fields.total_size_after;
-  if (![before, after, fields.allocated].every(Number.isFinite)) {
+  if (![before, after, fields.allocated].every(value => Number.isSafeInteger(value) && value >= 0)) {
     return { pid: Number(identity[1]), isolate: identity[2], at: Number(identity[3]), complete: false as const };
   }
   return { pid: Number(identity[1]), isolate: identity[2], at: Number(identity[3]), complete: true as const,
@@ -37,16 +40,21 @@ export class CapacityTelemetry {
   bytes = 0;
   private requestWindow?: { startedAt: number; sampledHeapUsedMax: number; stageCheckpointHeapUsedMax: number; stages: Set<PeakStage> };
   private timer?: NodeJS.Timeout;
+  private state: "ready" | "running" | "stopped" = "ready";
+  private readonly disposeObservers: Array<() => void> = [];
+  private result?: ReturnType<CapacityTelemetry["summary"]>;
   constructor(path: string, readonly pool: () => unknown = () => null) {
     this.fd = openSync(path, "wx");
     this.write({ event: "identity", pid: process.pid, isolate: threadId, node: process.versions.node, v8: process.versions.v8,
       wallTime: Date.now(), timeOrigin: performance.timeOrigin,
       execArgv: process.execArgv, nodeOptions: process.env.NODE_OPTIONS ?? null, heap: getHeapStatistics(),
       resourceCoverage: "The independent 250ms continuous-cgroup capture retains full memory.stat/cpu.stat; Node samples retain scalar limits, charge, events and swap without duplicating those blocks." });
-    observePeakMemory(point => this.checkpoint(point));
-    observePublicationWork(value => this.write({ event: "publication",at: performance.now(),...value,
-      scope: "Final transaction including acquisition; not ingestion duration." }));
-    observeQueryWork(value => {
+  }
+  private observe() {
+    this.disposeObservers.push(observePeakMemory(point => this.checkpoint(point)));
+    this.disposeObservers.push(observePublicationWork(value => this.write({ event: "publication",at: performance.now(),...value,
+      scope: "Final transaction including acquisition; not ingestion duration." })));
+    this.disposeObservers.push(observeQueryWork(value => {
       const hash = createHash("sha256").update(value.sql).digest("hex");
       const previous = this.queries.get(hash);
       const operation = currentCapacityOperation();
@@ -78,7 +86,7 @@ export class CapacityTelemetry {
         rows: (previous?.rows ?? 0) + value.rows, failures: (previous?.failures ?? 0) + Number(value.failed), sql: value.sql });
       if (!previous) this.write({ event: "sql-template",hash,sql: value.sql.slice(0,65536),truncated: value.sql.length>65536 });
       if (!previous || value.milliseconds > previous.maxMs) this.write({ event: "sql", hash, ...value, sql: undefined, parameters: undefined });
-    });
+    }));
   }
   async capturePlans(database: pg.Pool, labels: { count?: number;profile?: string }) {
     const { dataConnections } = await import("../src/db/dataConnections.js");
@@ -98,11 +106,23 @@ export class CapacityTelemetry {
     }
   }
   write(value: unknown) {
-    const line = JSON.stringify(value) + "\n";
-    if (this.bytes + Buffer.byteLength(line) > 256 * MiB) { this.dropped++; return; }
-    try { this.bytes += writeSync(this.fd, line); } catch { this.dropped++; }
+    if (this.state === "stopped") return;
+    try {
+      const encoded = JSON.stringify(value);
+      if (encoded === undefined) { this.dropped++; return; }
+      const line = Buffer.from(encoded + "\n");
+      if (this.bytes + line.length > 256 * MiB) { this.dropped++; return; }
+      let offset = 0;
+      while (offset < line.length) {
+        const written = writeSync(this.fd, line, offset, line.length - offset);
+        if (written <= 0) throw new Error("capacity_telemetry_write_incomplete");
+        this.bytes += written;
+        offset += written;
+      }
+    } catch { this.dropped++; }
   }
   checkpoint(point: PeakCheckpoint) {
+    if (this.state === "stopped") return;
     if (this.requestWindow) {
       this.requestWindow.stageCheckpointHeapUsedMax = Math.max(this.requestWindow.stageCheckpointHeapUsedMax,point.heapUsed);
       this.requestWindow.stages.add(point.stage);
@@ -114,6 +134,7 @@ export class CapacityTelemetry {
     if (!old || point.heapUsed > old.max) this.write({ event: "checkpoint", ...point });
   }
   sample() {
+    if (this.state === "stopped") return;
     const memory = process.memoryUsage();
     if (this.requestWindow) this.requestWindow.sampledHeapUsedMax = Math.max(this.requestWindow.sampledHeapUsedMax,memory.heapUsed);
     this.samples++;
@@ -130,26 +151,76 @@ export class CapacityTelemetry {
       eventLoopMaxMs: this.delay.max / 1e6, pool: this.pool(), cgroup });
     this.delay.reset();
   }
-  start() { this.delay.enable(); this.sample(); this.timer = setInterval(() => this.sample(), 250); }
+  start() {
+    if (this.state === "stopped") throw new Error("capacity_telemetry_stopped");
+    if (this.state === "running") return;
+    if (activeTelemetry) throw new Error("capacity_telemetry_overlap");
+    activeTelemetry = this;
+    this.state = "running";
+    try {
+      this.observe();
+      this.delay.enable();
+      this.sample();
+      this.timer = setInterval(() => {
+        try { this.sample(); }
+        catch (error) { this.fail(error); }
+      }, 250);
+      this.timer.unref();
+    } catch (error) { this.fail(error); }
+  }
   beginRequestWindow() {
+    if (this.state !== "running") throw new Error("capacity_telemetry_not_running");
     if (this.requestWindow) throw new Error("capacity_request_window_overlap");
     this.requestWindow = { startedAt: performance.now(),sampledHeapUsedMax: 0,stageCheckpointHeapUsedMax: 0,stages: new Set() };
+    try { this.sample(); }
+    catch (error) { this.requestWindow = undefined; throw error; }
   }
   endRequestWindow() {
     if (!this.requestWindow) throw new Error("capacity_request_window_missing");
-    const value = { ...this.requestWindow,stages: [...this.requestWindow.stages],finishedAt: performance.now() };
-    this.requestWindow = undefined; return value;
+    try {
+      this.sample();
+      return { ...this.requestWindow,stages: [...this.requestWindow.stages],finishedAt: performance.now() };
+    } finally { this.requestWindow = undefined; }
   }
-  stop() {
-    clearInterval(this.timer); this.sample(); this.delay.disable(); observePeakMemory(); observeQueryWork(); observePublicationWork();
-    const result = { event: "summary", pid: process.pid, isolate: threadId, sampledHeapUsedMax: this.sampledHeapUsedMax,
+  private summary() {
+    return { event: "summary", pid: process.pid, isolate: threadId, sampledHeapUsedMax: this.sampledHeapUsedMax,
       stageCheckpointHeapUsedMax: this.stageCheckpointHeapUsedMax, sampledRssMax: this.sampledRssMax,
       kernelChargedMemoryPeak: this.kernelChargedMemoryPeak, stages: Object.fromEntries(this.stages),
       missingStages: requiredStages.filter(stage => !this.stages.has(stage)), samples: this.samples, dropped: this.dropped, bytes: this.bytes };
-    for (const [hash, value] of this.queries) this.write({ event: "query-summary", hash, ...value });
-    for (const [hash, value] of this.explainQueries) this.write({ event: "explain-input", hash, ...value });
-    result.dropped = this.dropped; result.bytes = this.bytes;
-    this.write(result); closeSync(this.fd); return result;
+  }
+  private close() {
+    clearInterval(this.timer);
+    this.timer = undefined;
+    this.state = "stopped";
+    this.requestWindow = undefined;
+    if (activeTelemetry === this) activeTelemetry = undefined;
+    for (const dispose of this.disposeObservers) dispose();
+    this.disposeObservers.length = 0;
+    try { this.delay.disable(); }
+    finally { closeSync(this.fd); }
+  }
+  private fail(error: unknown): never {
+    try { this.close(); }
+    catch (cleanup) { throw new AggregateError([error, cleanup], "capacity_telemetry_cleanup_failed"); }
+    throw error;
+  }
+  stop() {
+    if (this.result) return this.result;
+    if (this.state === "stopped") throw new Error("capacity_telemetry_incomplete");
+    let result: ReturnType<CapacityTelemetry["summary"]>;
+    try {
+      clearInterval(this.timer);
+      this.sample();
+      for (const [hash, value] of this.queries) this.write({ event: "query-summary", hash, ...value });
+      for (const [hash, value] of this.explainQueries) this.write({ event: "explain-input", hash, ...value });
+      result = this.summary();
+      this.write(result);
+      result.dropped = this.dropped;
+      result.bytes = this.bytes;
+    } catch (error) { this.fail(error); }
+    this.close();
+    this.result = result;
+    return result;
   }
 }
 
@@ -172,19 +243,22 @@ export async function transientHeapProbe() {
   const tripwire = baseline + 16 * MiB;
   const timerSamples: number[] = [];
   const timer = setInterval(() => timerSamples.push(process.memoryUsage().heapUsed), 250);
-  const started = performance.now();
-  let values: number[] | null = new Array<number>(2_100_000).fill(1.25);
-  let encoded: string | null = JSON.stringify(values);
-  let parsed: number[] | null = JSON.parse(encoded) as number[];
-  const live = process.memoryUsage().heapUsed;
-  peakCheckpoint("probe.live");
-  const checksum = parsed.length + values.length + encoded.length;
-  values = null; encoded = null; parsed = null;
-  global.gc();
-  const durationMs = performance.now() - started;
-  await new Promise(resolve => setTimeout(resolve, 270));
-  clearInterval(timer);
-  const timerMaximum = Math.max(...timerSamples);
-  return { status: live - baseline >= 32 * MiB && durationMs < 250 && live > tripwire && timerMaximum < tripwire ? "passed" : "inconclusive",
-    baseline, live, retainedBytes: live - baseline, tripwire, durationMs, timerMaximum, timerSamples, checksum };
+  timer.unref();
+  try {
+    const started = performance.now();
+    let values: number[] | null = new Array<number>(2_100_000).fill(1.25);
+    let encoded: string | null = JSON.stringify(values);
+    let parsed: number[] | null = JSON.parse(encoded) as number[];
+    const live = process.memoryUsage().heapUsed;
+    peakCheckpoint("probe.live");
+    const checksum = parsed.length + values.length + encoded.length;
+    values = null; encoded = null; parsed = null;
+    global.gc();
+    const durationMs = performance.now() - started;
+    await new Promise(resolve => setTimeout(resolve, 270));
+    const timerMaximum = timerSamples.length ? Math.max(...timerSamples) : null;
+    return { status: live - baseline >= 32 * MiB && durationMs < 250 && live > tripwire
+      && timerMaximum !== null && timerMaximum < tripwire ? "passed" : "inconclusive",
+      baseline, live, retainedBytes: live - baseline, tripwire, durationMs, timerMaximum, timerSamples, checksum };
+  } finally { clearInterval(timer); }
 }

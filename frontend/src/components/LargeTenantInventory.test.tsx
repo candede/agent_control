@@ -463,16 +463,17 @@ describe("large inventory outcome consumers", () => {
     });
     it("searches environment names on the server, preserves an off-page choice and clears only the draft after selection", async () => {
       const onChange = vi.fn(), read = vi.mocked(getInventoryFacets);
-      read.mockResolvedValue({ value: [{ value: "env-finance", label: "Finance production" }], total: 6001, nextCursor: "next" });
+      const environmentId = "Default-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", selectedEnvironment = environmentId.toUpperCase();
+      read.mockResolvedValue({ value: [{ value: environmentId, label: "Finance production" }], total: 6001, nextCursor: "next" });
       const view = render(<InventoryFacetSelect selectionId="selected" field="environmentId" label="Environment"
-        allLabel="All environments" value="ENV-FINANCE" onChange={onChange} />);
-      expect(await screen.findByRole("option", { name: "Finance production (env-finance)" })).toBeVisible();
-      expect(screen.getByRole("combobox")).toHaveValue(encodeInventoryFacet("env-finance"));
+        allLabel="All environments" value={selectedEnvironment} onChange={onChange} />);
+      expect(await screen.findByRole("option", { name: `Finance production (${environmentId})` })).toBeVisible();
+      expect(screen.getByRole("combobox")).toHaveValue(encodeInventoryFacet(environmentId));
       const search = screen.getByRole("searchbox", { name: "Search environments" });
       read.mockResolvedValue({ value: [], total: 0, nextCursor: null });
       await userEvent.type(search, "missing");
       await waitFor(() => expect(screen.queryByRole("option", { name: "More options..." })).not.toBeInTheDocument());
-      expect(screen.getByRole("combobox")).toHaveValue(encodeInventoryFacet("ENV-FINANCE"));
+      expect(screen.getByRole("combobox")).toHaveValue(encodeInventoryFacet(selectedEnvironment));
       expect(onChange).not.toHaveBeenCalled();
       view.rerender(<InventoryFacetSelect selectionId="selected" field="environmentId" label="Environment"
         allLabel="All environments" value="retained-environment" onChange={onChange} />);

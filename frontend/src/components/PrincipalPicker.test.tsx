@@ -6,6 +6,16 @@ import { PrincipalPicker } from "./PrincipalPicker";
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("explicit directory searches", () => {
+  it("removes only the exact opaque principal rather than its case or whitespace variants", () => {
+    const selected: api.DirectoryPrincipal[] = ["Opaque_User", "opaque_user", " Opaque_User "].map(resourceId => ({
+      resourceId, resourceType: "user", principalKind: "unknown", displayName: `Principal ${JSON.stringify(resourceId)}`,
+    }));
+    const onChange = vi.fn();
+    render(<PrincipalPicker selected={selected} onChange={onChange} />);
+    fireEvent.click(screen.getByRole("button", { name: `Remove ${selected[0].displayName}` }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(selected.slice(1));
+  });
+
   it("does not search for short input and cancels superseded provider reads", async () => {
     let finish!: (value: { value: api.DirectoryPrincipal[] }) => void;
     const search = vi.spyOn(api, "searchDirectoryPrincipals")
@@ -84,6 +94,37 @@ describe("explicit directory searches", () => {
     expect(input).not.toHaveAttribute("aria-invalid", "true");
     await act(async () => { await vi.advanceTimersByTimeAsync(300); });
     expect(search).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
+  });
+
+  it.each(["Ad\0a", "Ad\u0085a", "\tAda"])("rejects controls in %j, cancels pending results, and recovers", async query => {
+    vi.useFakeTimers();
+    let completePrevious!: (value: { value: api.DirectoryPrincipal[] }) => void;
+    const previous = new Promise<{ value: api.DirectoryPrincipal[] }>(resolve => { completePrevious = resolve; });
+    const search = vi.spyOn(api, "searchDirectoryPrincipals")
+      .mockReturnValueOnce(previous)
+      .mockResolvedValue({ value: [] });
+    render(<PrincipalPicker selected={[]} onChange={vi.fn()} />);
+    const input = screen.getByRole("searchbox");
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fireEvent.change(input, { target: { value: query } });
+    expect(search.mock.calls[0][2]?.signal?.aborted).toBe(true);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent("Directory searches must be text without control characters.");
+    expect(screen.queryByText("Searching directory...")).not.toBeInTheDocument();
+    await act(async () => {
+      completePrevious({ value: [{
+        resourceType: "user", resourceId: "old-user", principalKind: "user", displayName: "Old result",
+      }] });
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(search).toHaveBeenCalledOnce();
+    expect(screen.queryByText("Old result")).not.toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "Ada" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByText("No matching unselected principals in these results.")).toBeVisible();
   });
 
@@ -179,7 +220,7 @@ describe("explicit directory searches", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("filters bounded directory results without requerying or duplicating a normalized selected identity", async () => {
+  it("filters bounded directory results without requerying or duplicating an exact selected identity", async () => {
     const selected: api.DirectoryPrincipal = {
       resourceId: "USER-A", resourceType: "user", principalKind: "user", displayName: "Selected user",
     };
@@ -190,7 +231,7 @@ describe("explicit directory searches", () => {
       resourceId: "team-group", resourceType: "group", principalKind: "microsoft365Group", displayName: "Team result",
     };
     const search = vi.spyOn(api, "searchDirectoryPrincipals").mockResolvedValue({
-      value: [{ ...selected, resourceId: "user-a", displayName: "Duplicate selected identity" }, security, team],
+      value: [{ ...selected, resourceType: "USER", displayName: "Duplicate selected identity" }, security, team],
     });
     const onChange = vi.fn();
     render(<PrincipalPicker selected={[selected]} onChange={onChange} />);

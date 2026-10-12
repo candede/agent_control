@@ -263,10 +263,20 @@ describe("inventory filter toolbar", () => {
     expect(props.onError).not.toHaveBeenCalled();
   });
 
-  it("resolves a bookmarked environment label using the server's case-insensitive identity", async () => {
-    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: "ENVIRONMENT-A" }}
+  it("resolves a bookmarked validated environment label using the server's case-insensitive identity", async () => {
+    const environmentId = "default-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    vi.mocked(getInventoryFacets).mockResolvedValue({ value: [{ value: environmentId, label: "Finance" }], total: 1, nextCursor: null });
+    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: environmentId.toUpperCase() }}
       options={{ ...options, environments: [] }} loading={false} onChange={vi.fn()} onClear={vi.fn()} onError={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("Finance"));
+  });
+
+  it("does not assign a case-colliding opaque environment's saved label", async () => {
+    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: "ENVIRONMENT-A" }}
+      options={{ ...options, environments: [] }} loading={false} onChange={vi.fn()} onClear={vi.fn()} onError={vi.fn()} />);
+    await waitFor(() => expect(getInventoryFacets).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("ENVIRONMENT-A");
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).not.toHaveTextContent("Finance");
   });
 
   it("does not revive a retired environment label while a revisited selection is revalidated", async () => {

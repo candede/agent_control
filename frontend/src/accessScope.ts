@@ -25,7 +25,7 @@ export function getInitialAccessScope(
     return "none";
   }
 
-  return principals.length > 0 ? "specific" : undefined;
+  return status === undefined && principals.length > 0 ? "specific" : undefined;
 }
 
 export function formatAccessScope(

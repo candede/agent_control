@@ -2,21 +2,23 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, CopilotStudioQuarantineTarget } from "../types/copilotStudioQuarantine.js";
-import { boundedProviderText } from "./providerJson.js";
+import { boundedProviderText, parseProviderContractJson } from "./providerJson.js";
+import { inventoryEnvironmentPattern, inventoryGuidPattern } from "./inventoryIdentity.js";
 
 const quarantineOrigin = "https://api.powerplatform.com";
 const quarantineApiVersion = "1";
 const maximumResponseBytes = 65_536;
 const defaultRequestTimeoutMs = 10_000;
 const defaultReadOperationTimeoutMs = 30_000;
-const nativeIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
-const environmentIdPattern = new RegExp(`^(?:Default-)?${nativeIdPattern.source.slice(1, -1)}$`, "i");
+const nativeIdPattern = new RegExp(inventoryGuidPattern, "i");
+const environmentIdPattern = new RegExp(inventoryEnvironmentPattern, "i");
 
 export type { CopilotStudioQuarantineStatus, CopilotStudioQuarantineTarget } from "../types/copilotStudioQuarantine.js";
 
 export type QuarantineReadOptions = {
   signal?: AbortSignal;
   correlationId?: string;
+  assertCurrent?: () => void;
 };
 
 export type QuarantineMutationOptions = {
@@ -67,10 +69,11 @@ export class CopilotStudioQuarantineClient {
     const operationSignal = options.signal ? AbortSignal.any([options.signal, operationTimeout]) : operationTimeout;
 
     for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
+      if (operationSignal.aborted) throw normalizedAbort(operationSignal);
+      options.assertCurrent?.();
+      let status: CopilotStudioQuarantineStatus;
       try {
-        const status = await this.requestStatus(url, accessToken, { method: "GET" }, validatedTarget, correlationId, operationSignal);
-        operationSignal.throwIfAborted();
-        return status;
+        status = await this.requestStatus(url, accessToken, { method: "GET" }, validatedTarget, correlationId, operationSignal);
       } catch (error) {
         if (operationSignal.aborted) throw normalizedAbort(operationSignal);
         if (attempt === this.retryPolicy.maxAttempts || !isRetryableReadError(error)) throw error;
@@ -83,7 +86,11 @@ export class CopilotStudioQuarantineClient {
           if (operationSignal.aborted) throw normalizedAbort(operationSignal);
           throw waitError;
         }
+        continue;
       }
+      if (operationSignal.aborted) throw normalizedAbort(operationSignal);
+      options.assertCurrent?.();
+      return status;
     }
 
     throw new AppError(500, "retry_exhausted", "Copilot Studio quarantine status retry attempts were exhausted.");
@@ -116,6 +123,7 @@ export class CopilotStudioQuarantineClient {
   ): Promise<CopilotStudioQuarantineStatus> {
     const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
     const signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
+    let providerFailure: AppError | undefined;
     try {
       signal.throwIfAborted();
       const response = await this.fetcher(url, {
@@ -132,7 +140,10 @@ export class CopilotStudioQuarantineClient {
         disposeResponse(response);
         throw new AppError(502, "invalid_provider_link", "Copilot Studio quarantine refused a redirected or foreign provider response.");
       }
-      if (!response.ok) throw await quarantineProviderError(response, signal);
+      if (!response.ok) {
+        providerFailure = await quarantineProviderError(response, signal);
+        throw providerFailure;
+      }
       if (response.status !== 200) {
         disposeResponse(response);
         throw new AppError(502, "provider_unexpected_status", "Copilot Studio quarantine returned an unexpected success status.");
@@ -147,7 +158,8 @@ export class CopilotStudioQuarantineClient {
       };
     } catch (error) {
       if (callerSignal?.aborted) throw normalizedAbort(callerSignal);
-      if (timeoutSignal.aborted) throw normalizedAbort(timeoutSignal);
+      // A received HTTP failure remains authoritative if only its optional error body times out.
+      if (timeoutSignal.aborted && (!providerFailure || error !== providerFailure)) throw normalizedAbort(timeoutSignal);
       throw error;
     }
   }
@@ -191,10 +203,11 @@ export function buildCopilotStudioQuarantineUrl(
 }
 
 export function validateQuarantineTarget(target: CopilotStudioQuarantineTarget) {
-  if (!target || typeof target.environmentId !== "string" || !environmentIdPattern.test(target.environmentId)) {
+  if (!target || typeof target.environmentId !== "string" || ![36, 44].includes(target.environmentId.length)
+    || !environmentIdPattern.test(target.environmentId)) {
     throw new AppError(400, "invalid_quarantine_target", "Copilot Studio quarantine requires an exact native environment ID.");
   }
-  if (typeof target.botId !== "string" || !nativeIdPattern.test(target.botId)) {
+  if (typeof target.botId !== "string" || target.botId.length !== 36 || !nativeIdPattern.test(target.botId)) {
     throw new AppError(400, "invalid_quarantine_target", "Copilot Studio quarantine requires an exact native bot ID.");
   }
   return target;
@@ -203,7 +216,7 @@ export function validateQuarantineTarget(target: CopilotStudioQuarantineTarget) 
 function parseQuarantineStatus(text: string) {
   let value: unknown;
   try {
-    value = JSON.parse(text) as unknown;
+    value = parseProviderContractJson(text, { root: { fields: ["isBotQuarantined", "lastUpdateTimeUtc"] } }, 1);
   } catch {
     throw new AppError(502, "provider_schema", "Copilot Studio quarantine returned invalid JSON.");
   }
@@ -217,14 +230,14 @@ function parseQuarantineStatus(text: string) {
 }
 
 async function quarantineProviderError(response: Response, signal: AbortSignal) {
-  const body = await boundedProviderText(response, maximumResponseBytes, signal).catch(() => {
-    if (signal.aborted) throw normalizedAbort(signal);
-    return "";
-  });
+  const body = await boundedProviderText(response, maximumResponseBytes, signal).catch(() => "");
   let providerCode: string | undefined;
   if (body) {
     try {
-      const value = JSON.parse(body) as unknown;
+      const value = parseProviderContractJson(body, {
+        root: { fields: ["error", "code"], objects: { error: "error" } },
+        error: { fields: ["code"] },
+      }, 2);
       if (isRecord(value)) {
         const error = isRecord(value.error) ? value.error : value;
         if (typeof error.code === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(error.code)) providerCode = error.code;

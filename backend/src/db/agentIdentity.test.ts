@@ -20,7 +20,7 @@ const applicationId = objectId;
 const otherId = "22222222-2222-4222-8222-222222222222";
 const mapping: VerifiedAgentIdentityIds = { objectId, applicationId, runtimeStatus: "available",
   runtimeProvenance: verifiedAgentIdentityClientIdProvenance };
-const fence = async () => {};
+const fence = () => {};
 
 beforeAll(async () => {
   fixture = await testDatabase();
@@ -185,6 +185,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     const f = await saved();
     for (const status of ["authorization_required", "not_found", "provider_error", "setup_required"] as const) {
       await repository.save(f.scope, f.source, mapping, fence);
+      await repository.invalidate(f.scope, f.source);
       await repository.saveFailure(f.scope, f.source, { status, code: "fixture_error" }, fence);
       const result = await repository.readState(f.scope, f.source);
       expect(result).toMatchObject({ status, lastErrorCode: "fixture_error" });

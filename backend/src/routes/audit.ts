@@ -1,10 +1,11 @@
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv } from "../services/csvEncoding.js";
 import { createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
+import { operationalLog } from "../services/telemetry.js";
 import type { AuditScope, AuditStatus, LocalAuditAction } from "../types/audit.js";
 import { auditMaximumOffset, auditMaximumSearchLength, isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
@@ -119,8 +120,13 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", {
         metadata: { source: "local_administrative_audit", resultingCount: csv.rowCount, resultingBytes: csv.byteCount } }).then(() => undefined),
     });
   } catch (error) {
-    await audit.completeEvent(receipt.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_export_failed" });
-    if (response.headersSent) { if (!response.destroyed) response.destroy(); return; }
+    if (response.headersSent && !response.destroyed && !response.writableFinished) response.destroy();
+    try {
+      await audit.completeEvent(receipt.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_export_failed" });
+    } catch (auditError) {
+      operationalLog("error", "export_audit_completion_failed", { source: "local_administrative_audit", ...errorTelemetry(auditError, "audit_completion_failed") });
+    }
+    if (request.aborted || response.headersSent || response.destroyed || response.writableEnded) return;
     throw error;
   }
 });

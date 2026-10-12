@@ -87,7 +87,14 @@ describe("automatic agent usage history fixture", () => {
     const unknownDates = agentUsageHistoryFixture(context, "agent", [undated, newerUpload], { limit: 1 });
     expect(unknownDates.value.map(row => row.setId)).toEqual(["z"]);
     expect(unknownDates.latestReportSetId).toBe("a");
-    expect(unknownDates.latestReported?.setId).toBe("z");
+    expect(unknownDates.latestReported).toMatchObject({ setId: "a", responses: 0 });
+    const next = agentUsageHistoryFixture(context, "agent", [undated, newerUpload],
+      { limit: 1, cursor: unknownDates.page.nextCursor! });
+    expect(next.latestReported).toEqual(unknownDates.latestReported);
+    const absent = point("newest", null, null, "2026-07-01T00:00:00.000Z");
+    const discovery = agentUsageHistoryFixture(context, "agent", [undated, newerUpload, absent], { limit: 1 });
+    expect(discovery.latestReportSetId).toBe("newest");
+    expect(discovery.latestReported).toMatchObject({ setId: "a", responses: 0 });
   });
 
   it.each(["selection", "usage", "inventory", "history", "record"] as const)("rejects cursors from a different %s owner", boundary => {

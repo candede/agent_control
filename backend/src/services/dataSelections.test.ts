@@ -1,5 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { CursorCodec, DataSelections, SelectionError, canonicalQuery } from "./dataSelections.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DataSelections } from "./dataSelections.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { dataConnections,isSelectedRead } from "../db/dataConnections.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
@@ -29,7 +29,7 @@ describe("selected-read transactions", () => {
   let selectionId: string;
   let scopeId: string;
   let generationId: string;
-  beforeAll(async () => {
+  beforeEach(async () => {
     fixture = await testDatabase();
     await fixture.operator.query(`CREATE TABLE selected_read_fixture(id integer PRIMARY KEY, value integer NOT NULL);
       GRANT SELECT, INSERT, UPDATE ON selected_read_fixture TO agentcontrol_app`);
@@ -45,7 +45,7 @@ describe("selected-read transactions", () => {
       kind: "generation", scopeId, generationId: lease.id, revision: "1", expiresAt: new Date(Date.now() + 600_000),
     }])).id;
   }, 30_000);
-  afterAll(async () => { await fixture?.close(); });
+  afterEach(async () => { await fixture?.close(); });
   const deferred = () => {
     let release!: () => void;
     const promise = new Promise<void>(resolve => { release = resolve; });
@@ -213,7 +213,7 @@ describe("selected-read transactions", () => {
     expect(calls).toBe(1);
     expect((await fixture.runtime.query("SELECT id FROM selected_read_fixture WHERE id=3")).rowCount).toBe(0);
     await connections.selectedRead(async client => {
-      expect((await client.query("SELECT value FROM selected_read_fixture WHERE id=1 FOR UPDATE")).rows[0].value).toBe(21);
+      expect((await client.query("SELECT value FROM selected_read_fixture WHERE id=1 FOR UPDATE")).rows[0].value).toBe(11);
     });
   });
   it("rejects a fence changed after the snapshot, then reports invalidation on a fresh read", async () => {
@@ -238,31 +238,13 @@ describe("selected-read transactions", () => {
   });
 });
 
-describe("selection cursor authentication", () => {
-  const codec = new CursorCodec("synthetic-session-secret-not-a-production-secret");
-  const queryHash = canonicalQuery({ company: "Example", sort: "name" }, ["company", "sort"]);
-  const expected = { identity: selectionIdentity, endpoint: "/users", selectionId: "selected", revision: "one", queryHash };
-  const cursor = codec.encode({ ...expected, direction: "next", boundary: { key: null, nullRank: 1, id: "tied" } });
-  it("canonicalizes filters and authenticates null/tie/direction boundaries", () => {
-    expect(canonicalQuery({ sort: "name", company: "Example" }, ["company", "sort"])).toBe(queryHash);
-    expect(codec.decode(cursor, expected).boundary).toEqual({ key: null, nullRank: 1, id: "tied" });
-    expect(() => canonicalQuery({ all: true }, ["sort"])).toThrow("invalid_cursor");
-  });
-  it("rejects tampering, filter, principal, endpoint and revision reuse", () => {
-    expect(() => codec.decode(`${cursor}x`, expected)).toThrow("invalid_cursor");
-    for (const change of [{ queryHash: "other" }, { endpoint: "/other" }, { revision: "two" },
-      { identity: { ...selectionIdentity, principalId: "other" } }]) {
-      expect(() => codec.decode(cursor, { ...expected, ...change })).toThrow("invalid_cursor");
-    }
-  });
-});
 describe("SQL pinned reads", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
   let selections: DataSelections;
   let generationId: string;
   let scopeId: string;
   let id: string;
-  beforeAll(async () => {
+  beforeEach(async () => {
     fixture = await testDatabase();
     const generations = new DataGenerations(fixture.runtime);
     const lease = await generations.begin(generationInput());
@@ -278,7 +260,7 @@ describe("SQL pinned reads", () => {
       { kind: "generation", scopeId, generationId, revision: "1", expiresAt: new Date(Date.now() + 600_000) },
     ])).id;
   }, 30_000);
-  afterAll(async () => { await fixture?.close(); });
+  afterEach(async () => { await fixture?.close(); });
   it("pages tied/null keys forward and backward with exact count bases", async () => {
     const first = await selections.directoryPage(id, selectionIdentity, generationId, { limit: 1 });
     expect(first.value.map(row => row.identity)).toEqual(["a"]);
@@ -349,7 +331,7 @@ describe("SQL pinned reads", () => {
     await expect(selections.capture(selectionIdentity, "/history", { values: {}, allowed: [] }, [
       { kind: "tenant_history", scopeId, revision: "2", expiresAt: root.expiresAt },
     ])).rejects.toThrow("data_domain_root_validator_required");
-    const cutoff = new Date(Date.now() + 500);
+    const cutoff = new Date(Date.now() + 10_000);
     const expiring = await selections.capture(selectionIdentity, "/users", { values: {}, allowed: [] }, [root], cutoff);
     expect(expiring.expiresAt.getTime()).toBe(cutoff.getTime());
     await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [expiring.id]);

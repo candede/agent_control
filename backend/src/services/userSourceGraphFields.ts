@@ -1,12 +1,11 @@
 import { AppError } from "../errors.js";
-import { copilotAppActivityPeriod, copilotAppActivityReportVersion, isCopilotServiceActive, type CopilotAppActivity, type CopilotDirectoryUser, type CopilotServicePlan } from "../types/copilotUsage.js";
+import { copilotAppActivityPeriod, copilotAppActivityReportVersion, isCopilotServiceActive, isGraphGuid, type CopilotAppActivity, type CopilotDirectoryUser, type CopilotServicePlan } from "../types/copilotUsage.js";
 import { copilotServicePlanDefinitions, resolveCopilotServicePlan, summarizeCopilotServices, type CopilotPlanObservation } from "./copilotServicePlans.js";
 import { normalizeCopilotIdentity } from "./copilotIdentityKey.js";
 
 const graphOrigin = "https://graph.microsoft.com";
 const graphV1 = `${graphOrigin}/v1.0`;
 const reportDownloadOrigins = new Set(["https://reports.office.com", "https://reportsweu.office.com"]);
-const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 export const reportHeaders = [
   "Report Refresh Date", "User Principal Name", "Display Name", "Last Activity Date", "Copilot Chat Last Activity Date",
   "Microsoft Teams Copilot Last Activity Date", "Word Copilot Last Activity Date", "Excel Copilot Last Activity Date",
@@ -25,7 +24,7 @@ export function buildCopilotUsersUrl(skuIds: readonly string[]) {
 export function buildReportedUsersUrl(identities: readonly string[]) {
   if (!identities.length || identities.length > 20) throw providerSchema("Directory identity filter has an invalid size.");
   return buildDirectoryUsersUrl(identities.map(identity =>
-    `${uuidPattern.test(identity) ? "id" : "userPrincipalName"} eq '${identity.replace(/'/g, "''")}'`).join(" or "));
+    `${isGraphGuid(identity) ? "id" : "userPrincipalName"} eq '${identity.replace(/'/g, "''")}'`).join(" or "));
 }
 function buildDirectoryUsersUrl(filter: string) {
   const url = new URL(`${graphV1}/users`);
@@ -41,26 +40,39 @@ export function validateReportDownloadUrl(value: string | null) {
   let target: URL;
   try { target = new URL(value); } catch { throw invalidReportDownloadLink(); }
   const tokens = target.searchParams.getAll("token");
-  const validPath = /^\/data\/download\/[A-Za-z0-9_-]+$/.test(target.pathname)
-    || (target.pathname === "/data/v1.0/download" && tokens.length === 1 && Boolean(tokens[0].trim()));
-  if (!reportDownloadOrigins.has(target.origin) || target.username || target.password || target.hash || !validPath) throw invalidReportDownloadLink();
+  const validPath = /^\/data\/download\/[A-Za-z0-9_-]+$/.test(target.pathname) && target.searchParams.size === 0
+    || (target.pathname === "/data/v1.0/download" && target.searchParams.size === 1 && tokens.length === 1 && Boolean(tokens[0].trim()));
+  if (!reportDownloadOrigins.has(target.origin) || target.username || target.password || target.hash || !validPath
+    || target.toString().length > 8192) throw invalidReportDownloadLink();
   return target.toString();
 }
 function invalidReportDownloadLink() { return new AppError(502, "invalid_provider_link", "Microsoft returned an unsupported report download link."); }
 export function validateGraphUrl(url: string, kind: GraphEndpoint) {
+  if (url.length > 8192) throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an invalid continuation link.");
   let target: URL, pathname: string;
   try { target = new URL(url); pathname = decodeURIComponent(target.pathname); }
   catch { throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an invalid continuation link."); }
   const validPath = kind === "directory" ? pathname === "/v1.0/users" : kind === "catalog" ? pathname === "/v1.0/subscribedSkus"
     : pathname === new URL(buildCopilotReportUrl()).pathname;
-  if (target.origin !== graphOrigin || target.username || target.password || !validPath) {
+  const filter = target.searchParams.get("$filter");
+  const expected = new URL(kind === "directory" ? buildDirectoryUsersUrl(filter ?? "")
+    : kind === "catalog" ? buildSubscribedSkusUrl() : buildCopilotReportUrl()).searchParams;
+  const allowed = new Set([...expected.keys(), ...(kind === "report" ? [] : ["$skiptoken"])]);
+  const skiptoken = target.searchParams.get("$skiptoken");
+  const validQuery = new Set(target.searchParams.keys()).size === target.searchParams.size
+    && [...target.searchParams.keys()].every(key => allowed.has(key))
+    && [...expected].every(([key, value]) => target.searchParams.get(key) === value)
+    && (kind !== "directory" || filter !== null && Boolean(filter.trim()))
+    && (skiptoken === null || Boolean(skiptoken.trim()));
+  if (target.origin !== graphOrigin || target.username || target.password || target.hash || !validPath || !validQuery
+    || target.toString().length > 8192) {
     throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned a continuation link outside the documented endpoint.");
   }
 }
 export function parseReportedIdentity(value: string): string | null {
   if (value.length > 320) return null;
   const identity = normalizeCopilotIdentity(value);
-  if (uuidPattern.test(identity)) return identity;
+  if (isGraphGuid(identity)) return identity;
   if (identity.startsWith(".") || identity.includes(".@") || identity.includes("..") || identity.length - identity.indexOf("@") - 1 > 253) return null;
   const upn = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
   return upn.test(identity) ? identity : null;
@@ -97,10 +109,16 @@ export function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, rea
 }
 function assignedLicenses(value: unknown) {
   if (!Array.isArray(value) || value.length > 1000) throw providerSchema("Directory assigned licenses are invalid.");
+  const seen = new Map<string, string>();
   return value.map(entry => {
     const license = object(entry, "Directory license assignment"), skuId = requiredUuid(license.skuId, "Directory license SKU ID");
     if (!Array.isArray(license.disabledPlans) || license.disabledPlans.length > 1000) throw providerSchema("Directory disabled plans are invalid.");
-    return { skuId, disabledPlans: license.disabledPlans.map(plan => requiredUuid(plan, "Directory disabled plan ID")) };
+    const disabledPlans = [...new Set(license.disabledPlans.map(plan => requiredUuid(plan, "Directory disabled plan ID")))].sort();
+    const evidence = disabledPlans.join(",");
+    // assignedLicenses is effective SKU evidence, not separate direct/group sources.
+    if (seen.has(skuId) && seen.get(skuId) !== evidence) throw providerSchema("Directory has conflicting assignments for the same SKU.");
+    seen.set(skuId, evidence);
+    return { skuId, disabledPlans };
   });
 }
 function assignedPlans(value: unknown): CopilotPlanObservation[] {
@@ -146,17 +164,22 @@ function optionalBoolean(value: unknown, field: string): boolean | null {
 }
 function requiredUuid(value: unknown, field: string) {
   const text = requiredText(value, field, 36).toLowerCase();
-  if (!uuidPattern.test(text)) throw providerSchema(`${field} is invalid.`);
+  if (!isGraphGuid(text)) throw providerSchema(`${field} is invalid.`);
   return text;
 }
-function optionalDateTime(value: unknown, field: string) {
+export function optionalDateTime(value: unknown, field: string) {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || value.length > 128 || Number.isNaN(Date.parse(value))) throw providerSchema(`${field} is invalid.`);
+  if (typeof value !== "string" || value.length > 128) throw providerSchema(`${field} is invalid.`);
+  const instant = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)$/i.exec(value);
+  const utcYear = new Date(value).getUTCFullYear();
+  // Date.parse accepts local times and rolls impossible calendar dates forward.
+  if (!instant || instant[1].startsWith("0000-") || !Number.isFinite(utcYear) || utcYear < 1 || utcYear > 9999
+    || new Date(`${instant[1]}T00:00:00Z`).toISOString().slice(0, 10) !== instant[1]) throw providerSchema(`${field} is invalid.`);
   return value;
 }
-function civilDate(value: unknown, field: string, optional = true): string | null {
+export function civilDate(value: unknown, field: string, optional = true): string | null {
   if (optional && (value === undefined || value === null || value === "")) return null;
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || value.startsWith("0000-") || Number.isNaN(Date.parse(`${value}T00:00:00Z`))
     || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) throw providerSchema(`Copilot report ${field} is invalid.`);
   return value;
 }

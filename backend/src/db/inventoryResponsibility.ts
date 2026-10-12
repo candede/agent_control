@@ -4,7 +4,7 @@ import { CursorCodec, SelectionError, type SelectionIdentity } from "../services
 import type { ReportCurrentData } from "../services/largeTenantUsersReports.js";
 import type { AgentResponsibilityQuery, ResponsibilityAgent, ResponsibilityPerson } from "../types/agentResponsibility.js";
 import { dataLimitError, digest, encodeBatch, exactCount } from "./dataBounds.js";
-import { userSourcePeopleInRead } from "./userSources.js";
+import { userSourcePeopleInRead, userSourceSearch, userSourceSearchSql } from "./userSources.js";
 
 const validObjectId = "^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$";
 const roles = `array_remove(ARRAY[
@@ -22,15 +22,15 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
     throw new SelectionError("invalid_cursor");
   }
   const objectId = options.objectId?.toLowerCase();
-  const search = options.search?.trim().normalize("NFKC").toLowerCase() ?? "";
+  const search = userSourceSearch(options.search ?? "");
   const searchParameter = `$${relation.values.length+1}`,objectParameter = `$${relation.values.length+2}`;
   const sql = `${relation.sql}, responsible AS (
     SELECT p.object_id,max(p.name) AS name,max(p.upn) AS upn,count(DISTINCT p.identity)::text AS agent_count,
       ${roles} AS roles,lower(normalize(coalesce(max(p.name),p.object_id),NFKC)) AS sort_key
     FROM people p WHERE p.object_id ~ '${validObjectId}' GROUP BY p.object_id
   ), filtered_people AS (
-    SELECT * FROM responsible WHERE ${searchParameter}::text='' OR strpos(lower(normalize(object_id,NFKC)),${searchParameter})>0
-      OR strpos(lower(normalize(name,NFKC)),${searchParameter})>0 OR strpos(lower(normalize(upn,NFKC)),${searchParameter})>0
+    SELECT * FROM responsible WHERE ${searchParameter}::text='' OR strpos(${userSourceSearchSql("object_id")},${searchParameter})>0
+      OR strpos(${userSourceSearchSql("name")},${searchParameter})>0 OR strpos(${userSourceSearchSql("upn")},${searchParameter})>0
   )`;
   const values = [...relation.values, search];
   const counts = (await client.query(`${sql} SELECT

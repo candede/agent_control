@@ -18,6 +18,21 @@ export const copilotServicePlanDefinitions = new Map([
 
 export type CopilotPlanObservation = Pick<CopilotServicePlan, "servicePlanId" | "assignedDateTime" | "capabilityStatus">;
 
+function assignmentTime(value: string) {
+  // Graph timestamps can retain precision beyond JavaScript Date's milliseconds.
+  const submillisecond = /[T ]\d{2}:\d{2}:\d{2}\.\d{3}(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i
+    .exec(value)?.[1].replace(/0+$/, "") ?? "";
+  return { time: Date.parse(value), submillisecond };
+}
+
+function formatAssignmentTime(value: ReturnType<typeof assignmentTime>) {
+  return new Date(value.time).toISOString().replace(/Z$/, `${value.submillisecond}Z`);
+}
+
+export function normalizeCopilotAssignmentTime(value: string) {
+  return formatAssignmentTime(assignmentTime(value));
+}
+
 export function resolveCopilotServicePlan(
   servicePlanId: string,
   enabledInAssignment: boolean,
@@ -31,10 +46,7 @@ export function resolveCopilotServicePlan(
     : statuses.has("Enabled") && [...statuses].every(status => status === "Enabled" || status === "Warning") ? "Enabled" : null;
   const dates = matching.flatMap(plan => {
     if (!plan.assignedDateTime) return [];
-    // Graph timestamps can retain precision beyond JavaScript Date's milliseconds.
-    const submillisecond = /[T ]\d{2}:\d{2}:\d{2}\.\d{3}(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i
-      .exec(plan.assignedDateTime)?.[1].replace(/0+$/, "") ?? "";
-    return [{ time: Date.parse(plan.assignedDateTime), submillisecond }];
+    return [assignmentTime(plan.assignedDateTime)];
   }).sort((left, right) => left.time - right.time || left.submillisecond.localeCompare(right.submillisecond));
   const latestDate = dates.at(-1);
   // Historical capabilities cannot override an explicit current per-user disable.
@@ -49,13 +61,12 @@ export function resolveCopilotServicePlan(
     ...definition,
     state,
     // Equivalent timestamp spellings must not cause conflicts between duplicate paged users.
-    assignedDateTime: latestDate === undefined ? null
-      : new Date(latestDate.time).toISOString().replace(/Z$/, `${latestDate.submillisecond}Z`),
+    assignedDateTime: latestDate === undefined ? null : formatAssignmentTime(latestDate),
     capabilityStatus,
   };
 }
 
-export function summarizeCopilotServices(plans: readonly CopilotServicePlan[]): CopilotServiceSummaryState {
+export function summarizeCopilotServices(plans: readonly Pick<CopilotServicePlan, "state">[]): CopilotServiceSummaryState {
   if (!plans.length) return "unknown";
   const active = plans.filter(plan => isCopilotServiceActive(plan.state));
   if (active.length) {

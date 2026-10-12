@@ -2,14 +2,14 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "re
 import { QueryClientProvider, useQuery } from "@tanstack/react-query";
 import type { InventoryConnectorOperation, PowerPlatformResource } from "../../../backend/src/types/powerPlatformInventory";
 import { formatPackageFacetLabel } from "../../../backend/src/types/copilotPackage";
-import { ApiError, getInventoryChildren } from "../api/client";
+import { ApiError, getInventoryChildren, getInventorySections } from "../api/client";
 import { useSavedQueryClient } from "../savedQueries";
 import { useReportPrincipalScope } from "../useReportPage";
 
 type Props = {
   selectionId: string; recordId: string; source: NonNullable<PowerPlatformResource["savedSource"]>; onInvalidated?: () => void;
 };
-type Page = Awaited<ReturnType<typeof getInventoryChildren>>;
+type Page = Awaited<ReturnType<typeof getInventoryChildren>> & { collectionPresent?: boolean };
 type Fact = Page["value"][number];
 function selectionInvalidated(error: Error | null) {
   return error instanceof ApiError && error.code === "selection_invalidated";
@@ -34,12 +34,28 @@ function useConfigurationPage({ selectionId, recordId, source, onInvalidated }: 
     queryKey, staleTime: Infinity, gcTime: 0,
     enabled: query => !selectionInvalidated(query.state.error),
     queryFn: async ({ signal }) => {
+      const member = { source_scope_id: source.scopeId, source_identity: source.identity };
       const page = await getInventoryChildren(selectionId, recordId,
-        { source_scope_id: source.scopeId, source_identity: source.identity }, kind, cursor, { signal, value, limit: 10 });
+        member, kind, cursor, { signal, value, limit: 10 });
       for (const row of page.value) {
         if (kind === "detail:connectors" && typeof row.payload.connectorId !== "string"
           || kind === "connectorOperation" && !isOperation(row.payload)
           || kind === "detail:channels" && typeof row.value !== "string") throw new Error("Saved agent configuration is invalid. Refresh inventory in Sync.");
+      }
+      if (kind === "detail:channels" && page.total === 0) {
+        let cursor: string | undefined;
+        for (;;) {
+          signal.throwIfAborted();
+          const sections = await getInventorySections(selectionId, recordId, member, { signal, ...cursor ? { cursor } : {} });
+          signal.throwIfAborted();
+          const collection = sections.value.find(section => section.kind === kind);
+          if (collection) {
+            if (collection.total !== 0) throw new Error("Saved agent configuration is invalid. Refresh inventory in Sync.");
+            return { ...page, collectionPresent: true };
+          }
+          if (!sections.nextCursor) return { ...page, collectionPresent: false };
+          cursor = sections.nextCursor;
+        }
       }
       return page;
     },
@@ -143,6 +159,6 @@ export function SavedAgentConnectors({ partial = false, ...props }: Props & { pa
 export function SavedAgentChannels(props: Props) {
   const read = useConfigurationPage(props, "detail:channels");
   return <><ConfigurationStatus read={read} />{read.page
-    ? <>{read.page.value.map(row => formatPackageFacetLabel(row.value)).join(", ") || "Not reported"}</> : null}
+    ? <>{read.page.value.map(row => formatPackageFacetLabel(row.value)).join(", ") || (read.page.collectionPresent ? "None reported" : "Not reported")}</> : null}
     <ConfigurationPages read={read} label="channels" /></>;
 }

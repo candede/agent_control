@@ -12,8 +12,8 @@ import {
   type PowerPlatformResourceDetails,
   type PowerPlatformResourceType,
 } from "../types/powerPlatformInventory.js";
-import { normalizeNativeIdentity, powerPlatformAgentKey, sortIdentifiers } from "./inventoryIdentity.js";
-import { boundedProviderJson } from "./providerJson.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity, powerPlatformAgentKey, sortIdentifiers } from "./inventoryIdentity.js";
+import { boundedProviderJson, parseProviderContractJson } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
 import { inventoryLimits, type InventoryPage } from "../types/inventoryRecords.js";
 
@@ -30,11 +30,15 @@ type RetryPolicy = {
   maxAttempts: number;
   baseDelayMs: number;
   maximumDelayMs: number;
-  delay: (delayMs: number) => Promise<unknown>;
+  delay: (delayMs: number, signal?: AbortSignal) => Promise<unknown>;
 };
 
 export type ResourceQueryOptions = {
   signal?: AbortSignal;
+  /** Absolute caller execution deadline in Unix milliseconds. */
+  executionDeadlineAt?: number;
+  assertCurrent?: () => void;
+  beforeRequest?: () => Promise<void>;
   getAccessToken?: () => Promise<string>;
   cloud?: "global" | "usgov" | "china";
   expectedTenantId?: string;
@@ -72,7 +76,7 @@ const defaultRetryPolicy: RetryPolicy = {
   maxAttempts: 3,
   baseDelayMs: 1_000,
   maximumDelayMs: 10_000,
-  delay,
+  delay: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
 };
 
 export class PowerPlatformResourceQueryClient {
@@ -92,8 +96,21 @@ export class PowerPlatformResourceQueryClient {
     const requestedTypes = validateTypes(types);
     const environmentId = validateEnvironmentId(options.environmentId);
     const expectedTenantId = validateExpectedTenantId(options.expectedTenantId);
-    const deadlineSignal = AbortSignal.timeout(inventoryLimits.powerPlatformDeadlineMs);
+    if (options.executionDeadlineAt !== undefined && !Number.isSafeInteger(options.executionDeadlineAt)) {
+      throw new AppError(500, "invalid_read_policy", "Inventory execution requires a finite absolute deadline.");
+    }
+    const durationMs = Math.max(0, Math.min(inventoryLimits.powerPlatformDeadlineMs,
+      options.executionDeadlineAt === undefined ? Infinity : options.executionDeadlineAt - Date.now()));
+    const deadlineAt = performance.now() + durationMs;
+    const deadlineSignal = AbortSignal.timeout(durationMs);
     const signal = options.signal ? AbortSignal.any([options.signal, deadlineSignal]) : deadlineSignal;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      options.assertCurrent?.();
+      if (performance.now() >= deadlineAt || options.executionDeadlineAt !== undefined && Date.now() >= options.executionDeadlineAt) {
+        throw new DOMException("Inventory enumeration deadline expired.", "TimeoutError");
+      }
+    };
     let observedCount = 0;
     let skipToken: string | undefined;
     let totalRecords: number | undefined;
@@ -104,10 +121,11 @@ export class PowerPlatformResourceQueryClient {
     let completedPages = 0;
     let completedCount = 0;
     let stage = "request";
+    let terminal = false;
     let metadata: ReturnType<typeof pageTelemetry> = {};
     operationalLog("info", "inventory_query_started", {
       ...logContext, requestedTypeCount: requestedTypes.length, environmentScoped: Boolean(environmentId),
-      pageSize: defaultPageSize, pageLimit: inventoryLimits.pages, rowLimit: inventoryLimits.sourceRows, deadlineMs: inventoryLimits.powerPlatformDeadlineMs,
+      pageSize: defaultPageSize, pageLimit: inventoryLimits.pages, rowLimit: inventoryLimits.sourceRows, deadlineMs: durationMs,
     });
 
     try {
@@ -115,13 +133,15 @@ export class PowerPlatformResourceQueryClient {
         logContext.page = pages + 1;
         metadata = {};
         stage = "request";
-        signal.throwIfAborted();
+        assertCurrent();
         if (pages >= inventoryLimits.pages) throw new AppError(502, "provider_page_limit", "Inventory exceeds 10000 pages.");
-        await options.visit(skipToken ?? "initial");
-
-        const page = await this.requestPage(options.getAccessToken ? await this.withSignal(options.getAccessToken, signal) : accessToken,
-          requestedTypes, skipToken, signal, environmentId, defaultPageSize, logContext, 600_000);
-        signal.throwIfAborted();
+        // The initial page must not collide with an opaque provider continuation.
+        const pageToken = JSON.stringify(skipToken ?? null);
+        await this.withSignal(() => options.visit(pageToken), signal);
+        assertCurrent();
+        const page = await this.requestPage(accessToken,
+          requestedTypes, skipToken, signal, environmentId, defaultPageSize, logContext, 600_000, assertCurrent, options.getAccessToken, options.beforeRequest);
+        assertCurrent();
         metadata = pageTelemetry(page);
         stage = "validation";
         const parsed = parsePage(page, requestedTypes, environmentId, expectedTenantId, observedCount);
@@ -129,6 +149,9 @@ export class PowerPlatformResourceQueryClient {
         pages += 1;
         totalRecords ??= parsed.totalRecords;
         if (parsed.totalRecords !== totalRecords) throw new InventorySchemaError("Power Platform inventory changed totalRecords during paging.", { reason: "changed_total", field: "totalRecords" });
+        if (parsed.skipToken === undefined && observedCount + parsed.resources.length !== totalRecords) {
+          throw new InventorySchemaError("Power Platform inventory ended before the documented total was enumerated.", { reason: "incomplete_enumeration" });
+        }
         observedCount += parsed.resources.length;
         const omittedFieldCount = parsed.unknownFieldCount + parsed.resources.reduce((count, resource) => count + resource.unknownFieldCount, 0);
         unknownFieldCount += omittedFieldCount;
@@ -137,35 +160,43 @@ export class PowerPlatformResourceQueryClient {
           ...logContext, ...metadata, omittedFieldCount,
         });
         stage = "save_page";
-        yield { token: skipToken ?? "initial", nextToken: parsed.skipToken ?? null, records: parsed.resources,
+        yield { token: pageToken, nextToken: parsed.skipToken === undefined ? null : JSON.stringify(parsed.skipToken), records: parsed.resources,
           rawCount: parsed.resources.length, expectedCount: totalRecords, page: pages, omittedFieldCount };
+        assertCurrent();
         skipToken = parsed.skipToken;
         stage = "record_progress";
-        await options.onProgress?.({ pages, observedCount, totalRecords });
-        signal.throwIfAborted();
+        const progress = { pages, observedCount, totalRecords };
+        if (options.onProgress) await this.withSignal(async () => options.onProgress!(progress), signal);
+        assertCurrent();
         completedPages = pages;
         completedCount = observedCount;
       } while (skipToken);
 
       stage = "completion";
-      if (observedCount !== totalRecords) {
-        throw new InventorySchemaError("Power Platform inventory ended before the documented total was enumerated.", { reason: "incomplete_enumeration" });
-      }
       operationalLog("info", "inventory_query_completed", {
         ...logContext, pages, observedCount, totalRecords,
         omittedFieldCount: unknownFieldCount, durationMs: Math.round(performance.now() - startedAt),
       });
+      terminal = true;
     } catch (error) {
-      const cause = signal.aborted ? signal.reason : error;
-      const failure = isTimeoutError(cause) ? new AppError(504, "provider_timeout", deadlineSignal.aborted && cause === deadlineSignal.reason
-        ? `Power Platform inventory exceeded the ${inventoryLimits.powerPlatformDeadlineMs / 1_000}-second enumeration limit. No incomplete source was saved. Retry the refresh or select a narrower scope.`
+      let cause = error;
+      try { assertCurrent(); } catch (currentError) { cause = currentError; }
+      const failure = isTimeoutError(cause) ? new AppError(504, "provider_timeout", (deadlineSignal.aborted && cause === deadlineSignal.reason || performance.now() >= deadlineAt)
+        ? `Power Platform inventory exceeded the ${durationMs / 1_000}-second enumeration limit. No incomplete source was saved. Retry the refresh or select a narrower scope.`
         : "Power Platform inventory page request timed out before complete enumeration. No incomplete snapshot was saved. Retry the refresh.") : cause;
       operationalLog("error", "inventory_query_failed", {
         ...logContext, ...metadata, stage, pages: completedPages, observedCount: completedCount,
         durationMs: Math.round(performance.now() - startedAt), ...errorTelemetry(failure, "provider_error"),
         ...(cause instanceof InventorySchemaError ? cause.diagnostics : {}),
       });
+      terminal = true;
       throw failure;
+    } finally {
+      // for-await closes a rejected durable consumer with return(), not throw().
+      if (!terminal) operationalLog("warn", "inventory_query_interrupted", {
+        ...logContext, stage, pages: completedPages, observedCount: completedCount,
+        outcome: "incomplete", durationMs: Math.round(performance.now() - startedAt),
+      });
     }
   }
 
@@ -192,7 +223,7 @@ export class PowerPlatformResourceQueryClient {
     }
   }
 
-  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId: string | undefined, pageSize: number, logContext: QueryLogContext, retryAfterLimit = this.retryPolicy.maximumDelayMs): Promise<ResourceQueryPage> {
+  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId: string | undefined, pageSize: number, logContext: QueryLogContext, retryAfterLimit = this.retryPolicy.maximumDelayMs, assertCurrent?: () => void, getAccessToken?: () => Promise<string>, beforeRequest?: () => Promise<void>): Promise<ResourceQueryPage> {
     const body = {
       TableName: "PowerPlatformResources",
       Clauses: [{
@@ -212,74 +243,122 @@ export class PowerPlatformResourceQueryClient {
     };
 
     for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
-      if (signal.aborted) throw signal.reason;
+      signal.throwIfAborted();
+      assertCurrent?.();
+      const token = getAccessToken ? await this.withSignal(getAccessToken, signal) : accessToken;
+      signal.throwIfAborted();
+      assertCurrent?.();
+      if (beforeRequest) await this.withSignal(beforeRequest, signal);
+      signal.throwIfAborted();
+      assertCurrent?.();
       const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       const startedAt = performance.now();
+      const assertRequestCurrent = () => {
+        signal.throwIfAborted();
+        assertCurrent?.();
+        requestSignal.throwIfAborted();
+        if (performance.now() - startedAt >= 10_000) throw new DOMException("Inventory page deadline expired.", "TimeoutError");
+      };
       const retry = async (retryDelayMs: number, reason: string) => {
         operationalLog("warn", "inventory_provider_retry", { ...logContext, attempt, retryDelayMs, reason });
         await this.waitForRetry(retryDelayMs, signal);
       };
       operationalLog("info", "inventory_provider_request", { ...logContext, attempt, pageSize, hasContinuation: Boolean(skipToken) });
       let response: Response;
+      let undeliveredResponse: Response | undefined;
+      let responseDisposed = false;
+      const dispose = (value: Response) => {
+        if (responseDisposed) return;
+        responseDisposed = true;
+        disposeResponse(value);
+      };
       try {
-        response = await this.fetcher(resourceQueryEndpoint, {
+        const fetching = this.fetcher(resourceQueryEndpoint, {
           method: "POST",
           redirect: "error",
           signal: requestSignal,
           headers: {
-            Authorization: `Bearer ${accessToken}`,
+            Authorization: `Bearer ${token}`,
             Accept: "application/json",
             "Content-Type": "application/json",
           },
           body: JSON.stringify(body),
         });
+        void fetching.then(value => {
+          undeliveredResponse = value;
+          if (requestSignal.aborted) dispose(value);
+        }, () => undefined);
+        response = await this.withSignal(() => fetching, requestSignal);
+        undeliveredResponse = undefined;
       } catch (error) {
+        if (undeliveredResponse) dispose(undeliveredResponse);
         operationalLog("warn", "inventory_provider_failure", {
           ...logContext, attempt, stage: "transport", durationMs: Math.round(performance.now() - startedAt),
           ...errorTelemetry(signal.aborted ? signal.reason : error, "provider_error"),
         });
         if (signal.aborted) throw signal.reason;
+        assertCurrent?.();
         if (attempt === this.retryPolicy.maxAttempts) throw error;
         await retry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), "transport");
         continue;
       }
 
+      try {
+        assertRequestCurrent();
+      } catch (error) {
+        dispose(response);
+        throw error;
+      }
       operationalLog(response.ok ? "info" : "warn", "inventory_provider_response", {
         ...logContext, attempt, status: response.status, durationMs: Math.round(performance.now() - startedAt),
         providerRequestId: response.headers.get("x-ms-request-id") ?? response.headers.get("request-id"),
         providerCorrelationId: response.headers.get("x-ms-correlation-request-id"),
       });
       if (response.redirected || response.url && new URL(response.url).origin !== new URL(resourceQueryEndpoint).origin) {
-        disposeResponse(response);
+        dispose(response);
         throw new AppError(502, "invalid_provider_link", "Power Platform inventory refused a redirected or foreign-origin response.");
       }
       if (response.ok) {
         try {
-          return await boundedProviderJson<ResourceQueryPage>(response, requestSignal);
+          const page = await boundedProviderJson<ResourceQueryPage>(response, requestSignal, undefined, parseResourceQueryJson);
+          assertRequestCurrent();
+          return page;
         } catch (error) {
           operationalLog("warn", "inventory_provider_failure", {
             ...logContext, attempt, stage: "response_body", durationMs: Math.round(performance.now() - startedAt),
             ...errorTelemetry(signal.aborted ? signal.reason : error, "provider_error"),
           });
           if (signal.aborted) throw signal.reason;
+          assertCurrent?.();
           if (error instanceof AppError || attempt === this.retryPolicy.maxAttempts) throw error;
-          disposeResponse(response);
+          dispose(response);
           await retry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), "response_body");
           continue;
         }
       }
-      disposeResponse(response);
-      if (attempt === this.retryPolicy.maxAttempts || (response.status !== 429 && response.status < 500)) {
-        throw new AppError(response.status, "provider_error", "Power Platform inventory query failed.");
+      dispose(response);
+      signal.throwIfAborted();
+      assertCurrent?.();
+      const retryAfter = retryAfterMs(response.headers.get("retry-after"));
+      const providerRequestId = response.headers.get("x-ms-request-id") ?? response.headers.get("request-id");
+      if (attempt === this.retryPolicy.maxAttempts || (response.status !== 429 && response.status < 500)
+        || retryAfter !== undefined && retryAfter > retryAfterLimit) {
+        throw new AppError(response.status, "provider_error", "Power Platform inventory query failed.", {
+          httpStatus: response.status,
+          ...(retryAfter === undefined ? {} : { retryAfterMs: retryAfter }),
+          ...(providerRequestId && /^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(providerRequestId)
+            ? { providerRequestId } : {}),
+        });
       }
-      await retry(retryAfterMs(response.headers.get("retry-after"), this.retryPolicy.baseDelayMs * attempt, retryAfterLimit), response.status === 429 ? "throttled" : "server_error");
+      await retry(retryAfter ?? Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs),
+        response.status === 429 ? "throttled" : "server_error");
     }
 
     throw new AppError(500, "retry_exhausted", "Power Platform inventory retry attempts were exhausted.");
   }
 
   private async waitForRetry(delayMs: number, signal: AbortSignal) {
-    await this.withSignal(() => this.retryPolicy.delay(delayMs), signal);
+    await this.withSignal(() => this.retryPolicy.delay(delayMs, signal), signal);
   }
 
   private async withSignal<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
@@ -374,7 +453,8 @@ function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResource
       reason: "duplicate_identity", resourceType: resource.type, resourceIndex: index + 1,
     });
     identities.add(identity);
-    const environmentMismatch = expectedEnvironmentId && resource.environmentId?.toLowerCase() !== expectedEnvironmentId.toLowerCase();
+    const environmentMismatch = expectedEnvironmentId && (resource.environmentId === null
+      || normalizeEnvironmentIdentity(resource.environmentId) !== normalizeEnvironmentIdentity(expectedEnvironmentId));
     if (!requested.has(resource.type) || environmentMismatch
       || expectedTenantId && normalizeNativeIdentity(resource.tenantId) !== normalizeNativeIdentity(expectedTenantId)) {
       const field = !requested.has(resource.type) ? "type" : environmentMismatch ? "environmentId" : "tenantId";
@@ -485,6 +565,26 @@ const resourcePropertySchemas: Record<PowerPlatformResourceType, ReadonlyMap<str
   "microsoft.copilotstudio/agents": schema(sharedProperties, ownedResourceProperties, fields("ga", "lastPublishedAt", "createdIn", "schemaName", "name", "botId", "entraAppId", "entraAgentId", "entraAgentBlueprintId"), fields("preview", "isQuarantined", "quarantinedAt", "isManaged", "orchestration", "model", "authentication", "channels", "capabilitiesCounts", "IsWebSearchEnabledForKnowledge"), connectorUsageProperties),
   "microsoft.powerplatform/environments": schema(sharedProperties, fields("ga", "environmentType", "isManaged", "environmentGroup", "environmentGroupId", "lastModifiedAt")),
 };
+
+function parseResourceQueryJson(text: string): unknown {
+  return parseProviderContractJson(text, {
+    root: { fields: ["totalRecords", "count", "resultTruncated", "skipToken", "data"], arrays: { data: "resource" } },
+    resource: {
+      fields: ["tenantId", "name", "type", "location", "properties"],
+      objects: { properties: value => !isRecord(value) ? undefined
+        : value.type === "microsoft.copilotstudio/agents" ? "agentProperties"
+          : value.type === "microsoft.powerplatform/environments" ? "environmentProperties" : undefined },
+    },
+    agentProperties: {
+      fields: [...resourcePropertySchemas["microsoft.copilotstudio/agents"].keys()],
+      objects: { capabilitiesCounts: "counts" }, arrays: { powerPlatformConnectors: "connector" },
+    },
+    environmentProperties: { fields: [...resourcePropertySchemas["microsoft.powerplatform/environments"].keys()] },
+    counts: { fields: ["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations"] },
+    connector: { fields: ["connectorId", "operations"], arrays: { operations: "operation" } },
+    operation: { fields: ["operationId", "createdBy", "usedAs", "isEnabled", "requiresEndUserConsent", "whenCanBeUsed", "connectionProvider"] },
+  }, 8);
+}
 
 type ProjectionContext = {
   properties: Record<string, unknown>;
@@ -628,7 +728,9 @@ function optionalDate(context: ProjectionContext, property: string, path: string
     delete context.provenance[property];
     return null;
   }
-  return date.toISOString();
+  const fraction = value.match(/\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/)?.[1];
+  // Normalize the timezone without discarding provider evidence below millisecond precision.
+  return fraction ? date.toISOString().replace(/\.\d{3}Z$/, `.${fraction.padEnd(3, "0")}Z`) : date.toISOString();
 }
 
 function optionalBoolean(context: ProjectionContext, property: string, path: string, fieldMaturity: InventoryFieldMaturity) {
@@ -684,13 +786,17 @@ function schema(...parts: ReadonlyMap<string, InventoryFieldMaturity>[]) {
   return new Map(parts.flatMap(part => [...part]));
 }
 
-function retryAfterMs(value: string | null, fallbackMs: number, maximumMs: number) {
-  if (value !== null && /^\d+(?:\.\d+)?$/.test(value.trim())) return Math.min(Math.max(Number(value) * 1_000, 0), maximumMs);
-  if (value !== null) {
-    const date = Date.parse(value);
-    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), maximumMs);
+function retryAfterMs(value: string | null) {
+  if (value === null) return undefined;
+  const text = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const milliseconds = Math.ceil(Number(text) * 1_000);
+    // An unrepresentable cooldown must fail closed rather than become shorter fallback backoff.
+    return Number.isSafeInteger(milliseconds) ? milliseconds : Number.MAX_SAFE_INTEGER;
   }
-  return Math.min(Math.max(fallbackMs, 0), maximumMs);
+  if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text)) return undefined;
+  const date = Date.parse(text);
+  return Number.isFinite(date) && new Date(date).toUTCString() === text ? Math.max(date - Date.now(), 0) : undefined;
 }
 
 function disposeResponse(response: Response) {

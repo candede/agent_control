@@ -64,23 +64,22 @@ const retryableSourceStates = new Set<DataSyncSourceState>([
 export class DataSyncRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async submitDue(scope: DataSyncScope, signedInAt?: number): Promise<{ run: DataSyncRun | null; created: boolean }> {
+  async submitDue(scope: DataSyncScope, signedInAt?: number, beforeCommit?: () => void): Promise<{ run: DataSyncRun | null; created: boolean }> {
     validateScope(scope);
-    const result = await transaction(this.database, async client => {
+    return transaction(this.database, async client => {
       await lockScope(client, scope);
-      await settleAutomaticRuns(client, scope);
+      await expireActiveRuns(client, scope);
       const active = await client.query<{ id: string }>(`SELECT id FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting')
           AND expires_at>clock_timestamp()
         ORDER BY started_at DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
-      if (active.rows[0]) return { id: active.rows[0].id, created: false };
-      const reportChanged = await directoryNeedsReportRefresh(client, scope);
+      if (active.rows[0]) return readAdmittedRun(client, scope, active.rows[0].id, false);
       const due = await client.query<{ source_id: DataSyncSourceId }>(`
         SELECT requested.source_id FROM unnest($3::text[]) requested(source_id)
         LEFT JOIN data_sync_success_markers marker
           ON marker.tenant_id=$1 AND marker.principal_id=$2 AND marker.source_id=requested.source_id
         LEFT JOIN LATERAL (
-          SELECT source.status,source.updated_at,run.started_at FROM data_sync_run_sources source
+          SELECT source.status,source.updated_at,source.attempt_started_at FROM data_sync_run_sources source
           JOIN data_sync_runs run ON run.id=source.run_id
           WHERE source.tenant_id=$1 AND source.principal_id=$2 AND source.source_id=requested.source_id
           ORDER BY source.updated_at DESC LIMIT 1
@@ -91,10 +90,10 @@ export class DataSyncRepository {
             OR attempt.updated_at<=clock_timestamp()-
             CASE WHEN attempt.status IN ('permission_required','waiting_authorization') THEN interval '1 hour'
               ELSE interval '15 minutes' END))
-          OR (attempt.status='waiting_authorization' AND attempt.started_at<$4::timestamptz)
+          OR (attempt.status='waiting_authorization' AND attempt.attempt_started_at<$4::timestamptz)
         ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, automaticDataSyncSourceIds,
-        signedInAt === undefined ? null : new Date(signedInAt), reportChanged]);
-      if (!due.rows.length) return { id: null, created: false };
+        signedInAt === undefined ? null : new Date(signedInAt)]);
+      if (!due.rows.length) return { run: (await readLatestRun(client, scope)) ?? null, created: false };
       const recent = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND started_at>clock_timestamp()-interval '1 hour'`,
       [scope.tenantId, scope.principalId]);
@@ -102,11 +101,8 @@ export class DataSyncRepository {
       const id = randomUUID();
       const sources = due.rows.map(row => row.source_id);
       await insertRun(client, scope, id, { mode: "incremental" }, sources, true);
-      return { id, created: true };
-    });
-    const run = result.id ? await this.getRun(scope, result.id) : await this.getLatestRun(scope);
-    if (result.id && !run) throw new AppError(409, "data_sync_state_changed", "The admitted automatic sync is no longer available. Check saved sync status.");
-    return { run: run ?? null, created: result.created };
+      return readAdmittedRun(client, scope, id, true);
+    }, undefined, beforeCommit);
   }
 
   async automaticRevisions(scope: DataSyncScope) {
@@ -122,7 +118,7 @@ export class DataSyncRepository {
     });
   }
 
-  async submit(scope: DataSyncScope, input: StartDataSyncInput): Promise<{ run: DataSyncRun; created: boolean }> {
+  async submit(scope: DataSyncScope, input: StartDataSyncInput, beforeCommit?: () => void): Promise<{ run: DataSyncRun; created: boolean }> {
     validateScope(scope);
     if (input.clearSavedData !== undefined && typeof input.clearSavedData !== "boolean") {
       throw new AppError(400, "invalid_data_sync_cleanup", "clearSavedData must be a boolean.");
@@ -132,8 +128,9 @@ export class DataSyncRepository {
     }
     const sources = normalizeSources(input.mode, input.sources);
     const requestHash = hash({ mode: input.mode, sources, ...(input.clearSavedData ? { clearSavedData: true } : {}) });
-    const result = await transaction(this.database, async client => {
+    return transaction(this.database, async client => {
       await lockScope(client, scope);
+      await expireActiveRuns(client, scope);
       const active = await client.query<RunRow>(`SELECT id,mode,status,started_at,updated_at,completed_at
         FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting') AND expires_at>clock_timestamp()
@@ -146,7 +143,7 @@ export class DataSyncRepository {
         if (existingHash.rows[0].request_hash !== requestHash) {
           throw new AppError(409, "data_sync_active", "A different data sync run is already active for this account.");
         }
-        return { id: active.rows[0].id, created: false };
+        return readAdmittedRun(client, scope, active.rows[0].id, false);
       }
       const recent = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND started_at>clock_timestamp()-interval '1 hour'`,
@@ -156,35 +153,23 @@ export class DataSyncRepository {
       }
       const id = randomUUID();
       await insertRun(client, scope, id, input, sources);
-      return { id, created: true };
-    }).catch((error: unknown) => {
+      return readAdmittedRun(client, scope, id, true);
+    }, undefined, beforeCommit).catch((error: unknown) => {
       if (error instanceof Error && "code" in error && error.code === "PDS01") {
         throw new AppError(409, "data_sync_source_active", "Finish or cancel active Graph package and Power Platform refresh jobs before clearing saved data.");
       }
       throw error;
     });
-    return { run: (await this.getRun(scope, result.id))!, created: result.created };
   }
 
   async getRun(scope: DataSyncScope, id: string): Promise<DataSyncRun | undefined> {
     validateScope(scope);
-    const run = await this.database.query<RunRow>(`SELECT id,mode,status,started_at,updated_at,completed_at,automatic
-      FROM data_sync_runs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp()`,
-    [id, scope.tenantId, scope.principalId]);
-    if (!run.rows[0]) return undefined;
-    const sources = await this.database.query<SourceRow>(`SELECT run_id,source_id,status,job_id,attempt,count,last_success_at,updated_at,message,can_retry
-      FROM data_sync_run_sources WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 ORDER BY source_id`,
-    [id, scope.tenantId, scope.principalId]);
-    return projectRun(run.rows[0], sources.rows);
+    return readRun(this.database, scope, id);
   }
 
   async getLatestRun(scope: DataSyncScope): Promise<DataSyncRun | undefined> {
     validateScope(scope);
-    // Retrying a retained run updates its activity, not its original start time.
-    const result = await this.database.query<{ id: string }>(`SELECT id FROM data_sync_runs
-      WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
-      ORDER BY updated_at DESC,started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
-    return result.rows[0] ? this.getRun(scope, result.rows[0].id) : undefined;
+    return readLatestRun(this.database, scope);
   }
 
   async listRuns(scope: DataSyncScope, limit = 20): Promise<DataSyncRun[]> {
@@ -210,8 +195,10 @@ export class DataSyncRepository {
 
   async getSourceAttempt(scope: DataSyncScope, runId: string, sourceId: DataSyncSourceId) {
     validateScope(scope);
-    const result = await this.database.query<{ attempt: number }>(`SELECT attempt FROM data_sync_run_sources
-      WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND source_id=$4`,
+    const result = await this.database.query<{ attempt: number }>(`SELECT source.attempt FROM data_sync_run_sources source
+      JOIN data_sync_runs run ON run.id=source.run_id
+      WHERE source.run_id=$1 AND source.tenant_id=$2 AND source.principal_id=$3 AND source.source_id=$4
+        AND run.status IN ('running','waiting') AND run.expires_at>clock_timestamp()`,
     [runId, scope.tenantId, scope.principalId, sourceId]);
     if (!result.rows[0]) throw new AppError(404, "not_found", "Data sync source was not found.");
     return result.rows[0].attempt;
@@ -237,14 +224,17 @@ export class DataSyncRepository {
     });
   }
 
-  async attachJob(scope: DataSyncScope, runId: string, sourceId: Exclude<DataSyncSourceId, "usage_reports">, jobId: string) {
+  async attachJob(scope: DataSyncScope, runId: string, sourceId: Exclude<DataSyncSourceId, "usage_reports">, jobId: string,
+    beforeCommit?: () => void) {
     validateScope(scope);
     validateUuid(jobId, "source job ID");
     await transaction(this.database, async client => {
       await lockScope(client, scope);
-      const source = await client.query<{ attempt: number }>(`SELECT attempt FROM data_sync_run_sources
-        WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND source_id=$4
-          AND status IN ('queued','running','waiting_authorization') FOR UPDATE`,
+      const source = await client.query<{ attempt: number }>(`SELECT source.attempt FROM data_sync_run_sources source
+        JOIN data_sync_runs run ON run.id=source.run_id
+        WHERE source.run_id=$1 AND source.tenant_id=$2 AND source.principal_id=$3 AND source.source_id=$4
+          AND source.status IN ('queued','running','waiting_authorization')
+          AND run.status IN ('running','waiting') AND run.expires_at>clock_timestamp() FOR UPDATE OF source,run`,
       [runId, scope.tenantId, scope.principalId, sourceId]);
       if (!source.rows[0]) throw new AppError(409, "data_sync_source_state", "The data sync source is no longer awaiting a child job.");
       await requireSourceJobScope(client, scope, runId, sourceId, jobId);
@@ -255,10 +245,11 @@ export class DataSyncRepository {
         WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND source_id=$4
           AND (job_id IS NULL OR job_id=$5)`, [runId, scope.tenantId, scope.principalId, sourceId, jobId]);
       if (updated.rowCount !== 1) throw new AppError(409, "data_sync_source_job_conflict", "The data sync source already has a different child job.");
-    });
+    }, undefined, beforeCommit);
   }
 
-  async updateSource(scope: DataSyncScope, runId: string, sourceId: DataSyncSourceId, update: SourceUpdate) {
+  async updateSource(scope: DataSyncScope, runId: string, sourceId: DataSyncSourceId, update: SourceUpdate,
+    beforeCommit?: () => void) {
     validateScope(scope);
     if (update.message.length < 1 || update.message.length > 1024) throw new AppError(500, "invalid_data_sync_message", "Data sync source status message is invalid.");
     if (update.count !== undefined && update.count !== null && (!Number.isSafeInteger(update.count) || update.count < 0)) {
@@ -283,6 +274,7 @@ export class DataSyncRepository {
         WHERE source.run_id=$1 AND source.tenant_id=$2 AND source.principal_id=$3 AND source.source_id=$4
           AND run.id=source.run_id AND run.tenant_id=source.tenant_id AND run.principal_id=source.principal_id
           AND run.status IN ('running','waiting')
+          AND run.expires_at>clock_timestamp()
           AND source.status<>'succeeded'
           AND ($6::uuid IS NULL OR source.job_id IS NULL OR source.job_id=$6::uuid)
           AND NOT EXISTS (
@@ -307,8 +299,8 @@ export class DataSyncRepository {
           result.rows[0].last_success_at,
         ]);
       }
-      await finalizeRun(client, scope, runId);
-    });
+      await finalizeDataSyncRun(client, scope, runId);
+    }, undefined, beforeCommit);
     return this.getRun(scope, runId);
   }
 
@@ -325,10 +317,11 @@ export class DataSyncRepository {
     [scope.tenantId, scope.principalId, sourceId, count, lastSuccessAt]);
   }
 
-  async retry(scope: DataSyncScope, id: string, requestedSources?: readonly DataSyncSourceId[]) {
+  async retry(scope: DataSyncScope, id: string, requestedSources?: readonly DataSyncSourceId[], beforeCommit?: () => void) {
     validateScope(scope);
     return transaction(this.database, async client => {
       await lockScope(client, scope);
+      await expireActiveRuns(client, scope);
       const run = await client.query<RunRow>(`SELECT id,mode,status,started_at,updated_at,completed_at
         FROM data_sync_runs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
           AND expires_at>clock_timestamp() FOR UPDATE`, [id, scope.tenantId, scope.principalId]);
@@ -354,7 +347,7 @@ export class DataSyncRepository {
       await client.query(`UPDATE data_sync_runs SET status='running',completed_at=NULL,updated_at=clock_timestamp()
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3`, [id, scope.tenantId, scope.principalId]);
       return selected;
-    });
+    }, undefined, beforeCommit);
   }
 
   async cancel(scope: DataSyncScope, id: string) {
@@ -418,11 +411,38 @@ export class DataSyncRepository {
     await this.database.query(`UPDATE data_sync_runs run SET status=CASE WHEN automatic THEN 'partial' ELSE 'waiting' END,
         completed_at=CASE WHEN automatic THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp()
       WHERE status IN ('running','waiting') AND expires_at>clock_timestamp()
+        AND NOT EXISTS (SELECT 1 FROM data_sync_run_sources source
+          WHERE source.run_id=run.id AND source.status IN ('queued','running'))
         AND EXISTS (SELECT 1 FROM data_sync_run_sources source
           WHERE source.run_id=run.id AND source.status IN ('waiting_authorization','permission_required','awaiting_upload'))`);
     return sources.rowCount ?? 0;
   }
 
+}
+
+async function readRun(database: Pick<pg.Pool, "query">, scope: DataSyncScope, id: string): Promise<DataSyncRun | undefined> {
+  const run = await database.query<RunRow>(`SELECT id,mode,status,started_at,updated_at,completed_at,automatic
+    FROM data_sync_runs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp()`,
+  [id, scope.tenantId, scope.principalId]);
+  if (!run.rows[0]) return undefined;
+  const sources = await database.query<SourceRow>(`SELECT run_id,source_id,status,job_id,attempt,count,last_success_at,updated_at,message,can_retry
+    FROM data_sync_run_sources WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 ORDER BY source_id`,
+  [id, scope.tenantId, scope.principalId]);
+  return projectRun(run.rows[0], sources.rows);
+}
+
+async function readLatestRun(database: Pick<pg.Pool, "query">, scope: DataSyncScope) {
+  // Retrying a retained run updates its activity, not its original start time.
+  const result = await database.query<{ id: string }>(`SELECT id FROM data_sync_runs
+    WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
+    ORDER BY updated_at DESC,started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+  return result.rows[0] ? readRun(database, scope, result.rows[0].id) : undefined;
+}
+
+async function readAdmittedRun(database: Pick<pg.Pool, "query">, scope: DataSyncScope, id: string, created: boolean) {
+  const run = await readRun(database, scope, id);
+  if (!run) throw new AppError(409, "data_sync_state_changed", "The admitted sync is no longer available. Check saved sync status.");
+  return { run, created };
 }
 
 function normalizeSources(mode: DataSyncMode, requested: readonly DataSyncSourceId[] | undefined) {
@@ -469,23 +489,7 @@ function projectSource(row: SourceRow): DataSyncSourceStatus {
   };
 }
 
-async function settleAutomaticRuns(client: pg.PoolClient, scope: DataSyncScope, runId?: string) {
-  await client.query(`UPDATE data_sync_runs run SET
-    status=CASE
-      WHEN NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status<>'succeeded') THEN 'completed'
-      WHEN NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status<>'cancelled') THEN 'cancelled'
-      ELSE 'partial' END,
-    completed_at=COALESCE(completed_at,clock_timestamp()),updated_at=clock_timestamp()
-    WHERE tenant_id=$1 AND principal_id=$2 AND automatic AND status IN ('running','waiting')
-      AND ($3::uuid IS NULL OR id=$3)
-      AND EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id)
-      AND NOT EXISTS(SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND
-        (source.status IN ('queued','running')
-          OR $3::uuid IS NULL AND source.status IN ('waiting_authorization','permission_required','awaiting_upload')))`,
-  [scope.tenantId, scope.principalId, runId ?? null]);
-}
-
-export async function finalizeRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {
+export async function finalizeDataSyncRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {
   const result = await client.query<{ status: DataSyncSourceState }>(`SELECT status FROM data_sync_run_sources
     WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3`, [runId, scope.tenantId, scope.principalId]);
   const statuses = result.rows.map(row => row.status);
@@ -545,6 +549,13 @@ function successfulMarkerMessage(sourceId: DataSyncSourceId, count: number | nul
 
 async function lockScope(client: pg.PoolClient, scope: DataSyncScope) {
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+}
+
+async function expireActiveRuns(client: pg.PoolClient, scope: DataSyncScope) {
+  // The unique active-run index includes expired rows until their state is retired.
+  await client.query(`UPDATE data_sync_runs SET status='partial',completed_at=clock_timestamp(),updated_at=clock_timestamp()
+    WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting') AND expires_at<=clock_timestamp()`,
+  [scope.tenantId, scope.principalId]);
 }
 
 async function requireSourceJobScope(client: pg.PoolClient, scope: DataSyncScope, runId: string, sourceId: DataSyncSourceId, jobId: string) {

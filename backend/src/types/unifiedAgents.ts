@@ -1,5 +1,5 @@
 import type { CopilotPackage } from "./copilotPackage.js";
-import { normalizeNativeIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 import type { CandidateAgentUsageSummary } from "./officialReportApi.js";
 import type { ReportMetadata } from "./officialReportData.js";
 import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
@@ -49,7 +49,7 @@ export function unifiedAgentRecordId(target: UnifiedAgentTarget) {
   return target.source === "canonical" ? `agent:${target.agentId.toLowerCase()}`
     : target.source === "graph_packages"
     ? `graph_packages:${encodeURIComponent(target.packageId)}`
-    : `power_platform:${encodeURIComponent(target.environmentId?.toLowerCase() ?? "")}:${encodeURIComponent(normalizeNativeIdentity(target.nativeId))}`;
+    : `power_platform:${encodeURIComponent(normalizeEnvironmentIdentity(target.environmentId ?? ""))}:${encodeURIComponent(normalizeNativeIdentity(target.nativeId))}`;
 }
 
 export function parseUnifiedAgentRecordId(value: string): UnifiedAgentTarget | undefined {
@@ -108,13 +108,14 @@ export type UnifiedAgentPowerPlatformObservation = UnifiedAgentSourceObservation
   observedCount: number;
   totalRecords: number;
   pageCount: number;
-  verification: InventorySnapshotVerification;
+  verification: InventorySnapshotVerification | null;
 };
 
 export type UnifiedAgentSourceError = {
   source: UnifiedAgentSource;
   code:
     | "snapshot_unavailable"
+    | "snapshot_stale"
     | "source_result_limit"
     | "coverage_unknown"
     | "environment_scope_limited"
@@ -130,7 +131,7 @@ export type UnifiedAgentSourceStatus =
     }
   | {
       state: "partial";
-      observation: UnifiedAgentPowerPlatformObservation;
+      observation: UnifiedAgentPackageObservation | UnifiedAgentPowerPlatformObservation;
       error: UnifiedAgentSourceError;
     }
   | {
@@ -221,7 +222,7 @@ export type UnifiedAgentInventoryVerification = {
     sourceScopes: boolean;
     packageMetadata: boolean;
     identityLinks: boolean;
-    sourceMemberships: true;
+    sourceMemberships: boolean;
   };
 };
 

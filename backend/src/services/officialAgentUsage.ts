@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { associationSourceHash, parseRecordId } from "./agentUsageIdentity.js";
-import { normalizeNativeIdentity } from "./inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { digest, encodeBatch } from "../db/dataBounds.js";
 import { officialReportCount as exactCount } from "../db/officialReportBounds.js";
 import { reportRelationsSql } from "../db/officialReportQueries.js";
-import { LargeTenantUsersReports, bounded, reportQuery, reportQueryFields, type ReportReadContext, type ReportCurrentData } from "./largeTenantUsersReports.js";
+import { LargeTenantUsersReports, bounded, reportQuery, reportQueryFields, reportSearchSql, type ReportReadContext, type ReportCurrentData } from "./largeTenantUsersReports.js";
 import type { InventoryReportSummary } from "../types/unifiedAgents.js";
 import { canonicalQuery, SelectionError, type SelectionIdentity } from "./dataSelections.js";
 import type { AuditActor } from "../types/audit.js";
@@ -54,7 +54,7 @@ export class OfficialAgentUsage {
     if (context.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires current delegated inventory evidence.");
     const target = parseRecordId(recordId), { tenantId, principalId } = context.identity;
     const native = target.source === "graph_packages" ? target.packageId : target.source === "power_platform" ? normalizeNativeIdentity(target.nativeId) : null;
-    const environment = target.source === "power_platform" ? (target.environmentId ?? "").toLowerCase() : "";
+    const environment = target.source === "power_platform" ? normalizeEnvironmentIdentity(target.environmentId ?? "") : "";
     const sources = context.inventorySelectionId ? selectedInventorySourcesSql("$1", "$2", "$3", "$4") : authorizedSourcesSql;
     const matches = (await client.query(`WITH sources AS (${sources})
       SELECT DISTINCT agent_id,control_revision FROM sources WHERE $5::text='canonical'
@@ -184,8 +184,7 @@ export class OfficialAgentUsage {
     options: { limit?: number; cursor?: string; search?: string; setId?: string }): Promise<CandidateAgentUsageUsers> {
     const limit = options.limit ?? 25;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError(400, "invalid_cursor", "Page limit must be 1..100.");
-    const search = options.search?.trim().toLowerCase() ?? "";
-    if (search.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(search)) throw new AppError(400, "invalid_usage_query", "User search must be a bounded text value.");
+    const search = reportQuery("relationships", options.search === undefined ? {} : { search: options.search }).search ?? "";
     return this.read(selectionId, identity, async (client, context) => {
       if (context.endpoint !== "official_agents") throw new AppError(400, "agent_usage_selection", "Agent users require an official_agents selection.");
       const target = await this.target(client, context, recordId), linked = this.links(context, target.id);
@@ -201,7 +200,7 @@ export class OfficialAgentUsage {
         SELECT u.username,u.responses,COALESCE(NULLIF(o.name,''),u.username) AS name
         FROM agent_users u LEFT JOIN official_users o ON o.username=u.username
       ), filtered_users AS (
-        SELECT * FROM named_users WHERE $10::text='' OR strpos(lower(username),$10)>0 OR strpos(lower(name),$10)>0
+        SELECT * FROM named_users WHERE $10::text='' OR strpos(${reportSearchSql("username")},$10)>0 OR strpos(${reportSearchSql("name")},$10)>0
       )`;
       const counts = (await client.query(`${sql} SELECT (SELECT count(*) FROM named_users)::text AS total,
         count(*)::text AS filtered FROM filtered_users`, values)).rows[0];
@@ -245,11 +244,11 @@ export class OfficialAgentUsage {
       const more = rows.length > limit, page = rows.slice(0, limit);
       if (previous) page.reverse();
       const encode = (row: pg.QueryResultRow, direction: "next" | "previous") => this.reports.codec.encode({ ...expected, direction,
-        boundary: { key: row.agent_id, id: row.agent_id, nullRank: 0 } });
+        boundary: { key: "", id: row.agent_id, nullRank: 0 } });
       return bounded({ value: page.map(row => ({ reportAgentId: row.agent_id as string, agentName: row.name as string, responses: exactCount(row.responses),
         basis: row.basis as "reviewed" | "exact_package_id",
         target: row.source === "graph_packages" ? { source: "graph_packages" as const, packageId: row.native_id as string, snapshotId: row.package_snapshot_id as string }
-          : { source: "power_platform" as const, nativeId: row.native_id as string, environmentId: row.environment_id as string, snapshotId: row.power_platform_snapshot_id as string } })),
+          : { source: "power_platform" as const, nativeId: row.native_id as string, environmentId: row.environment_id === "" ? null : row.environment_id as string, snapshotId: row.power_platform_snapshot_id as string } })),
       context: target.context, counts: { total: count, filtered: count }, page: { limit,
         nextCursor: page.length && (previous ? Boolean(cursor) : more) ? encode(page.at(-1)!, "next") : null,
         previousCursor: page.length && (previous ? more : Boolean(cursor)) ? encode(page[0], "previous") : null } });
@@ -266,7 +265,7 @@ export class OfficialAgentUsage {
     const audit = new AuditLog(identity, this.reports.database);
     const event = await audit.startEvent({ operationId: `agent-usage:${randomUUID()}`, scope: "single",
       action: input.target ? "associate-agent-usage" : "remove-agent-usage-association", agentId: recordId, actor,
-      requestPath: "/api/agents/usage-association", metadata });
+      requestPath: `/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, metadata });
     // Ordinary writer transaction; all source locks precede the selected read fences.
     try { return await this.reports.history.connections.run(async client => {
       await lockInventorySelection(client, identity, input.selectionId);
@@ -289,7 +288,7 @@ export class OfficialAgentUsage {
       let targetSelectionHash: string;
       if (input.target) {
         const nativeId = input.target.source === "graph_packages" ? input.target.packageId : normalizeNativeIdentity(input.target.nativeId);
-        const environment = input.target.source === "graph_packages" ? "" : (input.target.environmentId ?? "").toLowerCase();
+        const environment = input.target.source === "graph_packages" ? "" : normalizeEnvironmentIdentity(input.target.environmentId ?? "");
         const found = (await client.query(`WITH sources AS (${sources}) SELECT source,native_id,environment_id,normalized_native_id,normalized_environment_id
           FROM sources WHERE source=$5 AND normalized_native_id=$6 AND normalized_environment_id=$7`,
           [...target.values, input.target.source, nativeId, environment])).rows[0];
@@ -315,9 +314,13 @@ export class OfficialAgentUsage {
       await this.selections.assert(client, input.selectionId, identity);
       return (await this.target(client, { ...context, evaluatedAt: now }, recordId)).context;
     }); } catch (error) {
-      if ((await audit.getEvent(event.id))?.status !== "succeeded") await audit.completeEvent(event.id, {
-        status: "failed", errorCode: error instanceof AppError || error instanceof SelectionError ? error.code : "agent_usage_association_failed",
-      });
+      try {
+        if ((await audit.getEvent(event.id))?.status !== "succeeded") await audit.completeEvent(event.id, {
+          status: "failed", errorCode: error instanceof AppError || error instanceof SelectionError ? error.code : "agent_usage_association_failed",
+        });
+      } catch (cleanup) {
+        throw new AggregateError([error, cleanup], "agent_usage_association_cleanup_failed");
+      }
       throw error;
     }
   }

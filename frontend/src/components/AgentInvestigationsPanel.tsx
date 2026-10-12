@@ -73,7 +73,7 @@ function InvestigationSession({ recordId, agentName, identity, revision, user }:
     });
   }
   async function resolveIdentity() {
-    if (!current || !data?.defender.resolution?.canResolve || resolutionRequest.current || accessRefreshRequest.current) return;
+    if (!canUseContext() || !data?.defender.resolution?.canResolve || resolutionRequest.current || accessRefreshRequest.current) return;
     const controller = new AbortController();
     resolutionRequest.current = controller;
     setResolution({ key: contextKey, pending: true });

@@ -6,6 +6,7 @@ import { agentCapabilityExport } from "./agentContextExport.js";
 import { withTelemetryContext } from "./telemetry.js";
 import { measureNativePages, tinyNativePages } from "./inventoryProviderTestSupport.js";
 import { inventoryLimits } from "../types/inventoryRecords.js";
+import { powerPlatformInventoryRecord, restoreInventoryRecord } from "./inventoryRecordProjection.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
 
@@ -52,6 +53,89 @@ describe("PowerPlatformResourceQueryClient", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
   });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it.each([
+    '{"totalRecords":100001,"total\\u0052ecords":0,"count":0,"resultTruncated":false,"data":[]}',
+    '{"totalRecords":0,"count":1,"count":0,"resultTruncated":false,"data":[]}',
+    '{"totalRecords":0,"count":0,"resultTruncated":false,"skipToken":"private-next","skipToken":null,"data":[]}',
+    '{"totalRecords":0,"count":0,"resultTruncated":false,"data":[{"name":"private-agent"}],"data":[]}',
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"private-foreign","tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}"}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"private-first","na\\u006de":"agent","type":"${resource.type}"}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"environmentId":"private-foreign","environmentId":"environment-a"}}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"isQuarantined":true,"isQuarantined":false}}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"isQuarantined":true,"isQuarantined":false},"type":"microsoft.powerplatform/environments"}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"capabilitiesCounts":{"distinctPowerPlatformConnectors":5,"distinctPowerPlatformConnectors":0}}}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"powerPlatformConnectors":[{"connectorId":"private-first","connectorId":"connector","operations":[]}]}}]}`,
+    `{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{"tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{"powerPlatformConnectors":[{"connectorId":"connector","operations":[{"operationId":"private-first","operationId":"read"}]}]}}]}`,
+  ])("rejects repeated contract members before releasing or reporting a page: %s", async body => {
+    const progress = vi.fn(), fetcher = vi.fn(async () => new Response(body));
+    await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token", undefined, {
+      expectedTenantId: resource.tenantId, onProgress: progress,
+    })).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(progress).not.toHaveBeenCalled();
+    expect(JSON.stringify([...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls])).not.toContain("private-");
+  });
+
+  it("rejects repeated access-check counts instead of recording provider-read authority", async () => {
+    const fetcher = vi.fn(async () => new Response('{"totalRecords":0,"totalRecords":0,"count":0,"resultTruncated":false,"data":[]}'));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).checkAccess("opaque-token"))
+      .rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("continues to omit repeated unrelated authoring properties without rejecting a valid inventory", async () => {
+    const fetcher = vi.fn(async () => new Response(`{"totalRecords":1,"count":1,"resultTruncated":false,"data":[{
+      "tenantId":"${resource.tenantId}","name":"agent","type":"${resource.type}","properties":{
+        "displayName":"Agent","privateAuthoring":{"name":"first","name":"second"},
+        "privateAuthoring":{"environmentId":"first","environmentId":"second"}
+      }
+    }]}`));
+    const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
+    expect(result.resources[0]).toMatchObject({ nativeId: "agent", displayName: "Agent", unknownFieldCount: 1 });
+    expect(JSON.stringify(result)).not.toContain("privateAuthoring");
+  });
+
+  it.each(["retry", "token", "visit", "response", "body"] as const)(
+    "does not dispatch or release a page after authority changes during %s", async stage => {
+      let invalidated = false;
+      const failure = new AppError(401, "authorization_expired", "Capability authority changed.");
+      const assertCurrent = () => { if (invalidated) throw failure; };
+      const cancel = vi.fn();
+      const page = { totalRecords: 0, count: 0, resultTruncated: 0, data: [] };
+      const fetcher = vi.fn(async () => {
+        if (stage === "retry") return new Response(null, { status: 503 });
+        if (stage === "response") {
+          invalidated = true;
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              controller.enqueue(new TextEncoder().encode(JSON.stringify(page)));
+              controller.close();
+            },
+            cancel,
+          }, { highWaterMark: 0 }));
+        }
+        if (stage === "body") return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            controller.enqueue(new TextEncoder().encode(JSON.stringify(page)));
+            controller.close();
+            invalidated = true;
+          },
+        }, { highWaterMark: 0 }));
+        return Response.json(page);
+      });
+      const client = new PowerPlatformResourceQueryClient(fetcher, { delay: async () => { invalidated = true; } });
+      const pages = client.pages("opaque-token", ["microsoft.copilotstudio/agents"], {
+        assertCurrent,
+        visit: async () => { if (stage === "visit") invalidated = true; },
+        getAccessToken: async () => { if (stage === "token") invalidated = true; return "opaque-token"; },
+      });
+      await expect(pages.next()).rejects.toBe(failure);
+      expect(fetcher).toHaveBeenCalledTimes(stage === "token" || stage === "visit" ? 0 : 1);
+      if (stage === "response") expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
+
   it("limits default collection to agents and contextual environments", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
     const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
@@ -94,7 +178,7 @@ describe("PowerPlatformResourceQueryClient", () => {
     const page = client.pages("opaque-token", ["microsoft.powerplatform/environments"], { visit: async () => {} });
     if (totalRecords <= inventoryLimits.sourceRows) {
       expect((await page.next()).value).toMatchObject({ rawCount: 1, expectedCount: totalRecords });
-      await page.return();
+      await page.return(undefined);
     } else await expect(page.next()).rejects.toMatchObject({ code: "provider_result_limit" });
   });
 
@@ -175,6 +259,32 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(result.resources[0].details).toEqual({});
     expect(result.resources[0].unknownFieldCount).toBe(2);
     expect(JSON.stringify(result)).not.toContain("unsupported-connector");
+  });
+
+  it("does not admit agent-only fields as environment contract evidence when their JSON members repeat", async () => {
+    const properties = '"properties":{"displayName":"Environment","isQuarantined":true,"isQuarantined":false,'
+      + '"powerPlatformConnectors":[{"connectorId":"private-first","connectorId":"private-last",'
+      + '"operations":[{"operationId":"first","operationId":"last"}]}],'
+      + '"capabilitiesCounts":{"distinctPowerPlatformConnectors":5,"distinctPowerPlatformConnectors":0}}';
+    const type = '"type":"microsoft.powerplatform/environments"';
+    const agent = JSON.stringify({ ...resource, properties: { displayName: "Agent", isQuarantined: true } });
+    for (const typeFirst of [true, false]) {
+      const environment = `{
+        "tenantId":"${resource.tenantId}","name":"environment",
+        ${typeFirst ? `${type},${properties}` : `${properties},${type}`}
+      }`;
+      const body = `{"totalRecords":2,"count":2,"resultTruncated":false,"data":[${
+        typeFirst ? `${environment},${agent}` : `${agent},${environment}`
+      }]}`;
+      const fetcher = vi.fn(async () => new Response(body));
+      const result = await tinyNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token");
+      expect(result.resources.find(item => item.nativeId === "environment"))
+        .toMatchObject({ displayName: "Environment", details: {}, unknownFieldCount: 3 });
+      expect(result.resources.find(item => item.nativeId === resource.name))
+        .toMatchObject({ displayName: "Agent", details: { isQuarantined: true }, unknownFieldCount: 0 });
+      expect(JSON.stringify(result)).not.toContain("private-");
+      expect(fetcher).toHaveBeenCalledOnce();
+    }
   });
 
   it("retains raw authoring origin and GUID schema names without treating a declarative manifest as a bot", async () => {
@@ -278,6 +388,52 @@ describe("PowerPlatformResourceQueryClient", () => {
     ]);
   });
 
+  it.each(["initial", "null", '"initial"'])("keeps opaque continuation %s distinct from the durable first-page identity", async continuation => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 2, count: 1, resultTruncated: true, skipToken: continuation, data: [resource],
+      }))
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 2, count: 1, resultTruncated: false, data: [{ ...resource, name: "agent-b" }],
+      }));
+    const visited = new Set<string>();
+    let expectedToken: string | null | undefined;
+    const visit = vi.fn(async (token: string) => {
+      if (visited.has(token)) throw new AppError(502, "provider_continuation", "Repeated durable page.");
+      if (expectedToken !== undefined) expect(token).toBe(expectedToken);
+      visited.add(token);
+    });
+    const records = [];
+    for await (const page of new PowerPlatformResourceQueryClient(fetcher).pages("opaque-token", ["microsoft.copilotstudio/agents"], { visit })) {
+      expect(visited.has(page.token)).toBe(true);
+      expectedToken = page.nextToken;
+      records.push(...page.records);
+    }
+
+    expect(records.map(item => item.nativeId)).toEqual(["agent-a", "agent-b"]);
+    expect(visited.size).toBe(2);
+    expect(expectedToken).toBeNull();
+    expect(JSON.parse(String(fetcher.mock.calls[0][1].body)).Options).toEqual({ Top: 100, Skip: 0 });
+    expect(JSON.parse(String(fetcher.mock.calls[1][1].body)).Options).toEqual({ Top: 100, SkipToken: continuation });
+  });
+
+  it("enforces durable repeated-page rejection in the native fixture before a third provider request", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 3, count: 1, resultTruncated: true, skipToken: "loop", data: [resource],
+      }))
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 3, count: 1, resultTruncated: true, skipToken: "loop", data: [{ ...resource, name: "agent-b" }],
+      }))
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 3, count: 1, resultTruncated: false, data: [{ ...resource, name: "agent-c" }],
+      }));
+
+    await expect(measureNativePages(new PowerPlatformResourceQueryClient(fetcher), "opaque-token"))
+      .rejects.toMatchObject({ code: "provider_continuation" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("reacquires scoped authorization for each backpressured provider page", async () => {
     const getAccessToken = vi.fn().mockResolvedValueOnce("first-page-token").mockResolvedValueOnce("second-page-token");
     const fetcher = vi.fn()
@@ -293,6 +449,59 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(fetcher.mock.calls[1][1].headers.Authorization.split(" ")).toEqual(["Bearer", "second-page-token"]);
     expect((await pages.next()).done).toBe(true);
   });
+
+  it.each(["transport", "response_body", "throttled"] as const)(
+    "renews the delegated token before a %s retry of the same page", async failure => {
+      const getAccessToken = vi.fn().mockResolvedValueOnce("expired-token").mockResolvedValueOnce("renewed-token");
+      let attempts = 0;
+      const fetcher = vi.fn(async (_input: string | URL, _init?: RequestInit) => {
+        if (++attempts === 1) {
+          if (failure === "transport") throw new TypeError("synthetic transport failure");
+          if (failure === "response_body") return new Response(new ReadableStream({
+            pull(controller) { controller.error(new Error("synthetic stream failure")); },
+          }));
+          return new Response(null, { status: 429, headers: { "retry-after": "600" } });
+        }
+        return Response.json({ totalRecords: 0, count: 0, resultTruncated: false, data: [] });
+      });
+      const delay = vi.fn(async () => undefined);
+      const progress = vi.fn();
+      const visit = vi.fn(async () => {});
+      const pages = new PowerPlatformResourceQueryClient(fetcher, { delay }).pages("unused", ["microsoft.copilotstudio/agents"], {
+        visit, getAccessToken, onProgress: progress,
+      });
+      expect((await pages.next()).value).toMatchObject({ page: 1, rawCount: 0 });
+      expect((await pages.next()).done).toBe(true);
+      expect(getAccessToken).toHaveBeenCalledTimes(2);
+      expect(new Headers(fetcher.mock.calls[1][1]?.headers).get("Authorization")).toBe("Bearer renewed-token");
+      expect(fetcher.mock.calls[1][1]?.body).toBe(fetcher.mock.calls[0][1]?.body);
+      expect(visit).toHaveBeenCalledOnce();
+      expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 0, totalRecords: 0 });
+      expect(delay).toHaveBeenCalledExactlyOnceWith(failure === "throttled" ? 600_000 : 1_000, expect.any(AbortSignal));
+    },
+  );
+
+  it.each(["token", "retry", "progress"] as const)(
+    "preserves authority invalidation when the %s callback rejects", async stage => {
+      const failure = new AppError(401, "authorization_expired", "Inventory authority changed.");
+      let current = true;
+      const reject = async () => { current = false; throw new Error("synthetic callback failure"); };
+      const fetcher = vi.fn(async () => stage === "retry" ? new Response(null, { status: 503 })
+        : Response.json({ totalRecords: 0, count: 0, resultTruncated: false, data: [] }));
+      const pages = new PowerPlatformResourceQueryClient(fetcher, { delay: stage === "retry" ? reject : async () => {} })
+        .pages("synthetic", ["microsoft.copilotstudio/agents"], {
+          visit: async () => {},
+          assertCurrent: () => { if (!current) throw failure; },
+          ...(stage === "token" ? { getAccessToken: reject } : {}),
+          ...(stage === "progress" ? { onProgress: reject } : {}),
+        });
+      if (stage === "progress") expect((await pages.next()).value?.page).toBe(1);
+      await expect(pages.next()).rejects.toBe(failure);
+      expect(fetcher).toHaveBeenCalledTimes(stage === "token" ? 0 : 1);
+      expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
+        .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
+    },
+  );
 
   it("stops a cancelled token renewal without waiting for it or dispatching a late provider read", async () => {
     let release!: (value: string) => void;
@@ -310,6 +519,28 @@ describe("PowerPlatformResourceQueryClient", () => {
     release("late-synthetic-token");
     await Promise.resolve();
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("cancels the underlying retry timer when collection is aborted", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const reason = new AppError(409, "read_job_cancelled", "Inventory cancelled during retry.");
+    const delay = vi.fn((milliseconds: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, milliseconds);
+      signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    }));
+    const fetcher = vi.fn(async () => new Response(null, { status: 429, headers: { "retry-after": "600" } }));
+    const pending = new PowerPlatformResourceQueryClient(fetcher, { delay }).pages("synthetic", ["microsoft.copilotstudio/agents"], {
+      visit: async () => {}, signal: controller.signal,
+    }).next();
+    const rejected = expect(pending).rejects.toBe(reason);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delay).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1);
+    controller.abort(reason);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it.each([101, 201, 4_008])("enumerates %i agents and environments when explicit Skip overrides the continuation offset", async totalRecords => {
@@ -550,10 +781,9 @@ describe("PowerPlatformResourceQueryClient", () => {
     const settled = vi.fn();
     void pending.then(settled);
     await vi.waitFor(() => expect(onProgress).toHaveBeenCalledOnce());
-    expect(settled).not.toHaveBeenCalled();
-    finishProgress();
-
     expect(await pending).toEqual({ error: reason });
+    expect(settled).toHaveBeenCalledOnce();
+    finishProgress();
     expect(fetcher).toHaveBeenCalledOnce();
     expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
       .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
@@ -572,6 +802,41 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
       .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
   });
+
+  it.each(["cancellation", "authority", "deadline"] as const)(
+    "does not record progress after %s changes while the consumer saves a page", async change => {
+      if (change === "deadline") fakeDeadlineTimers();
+      const controller = new AbortController();
+      const reason = change === "authority"
+        ? new AppError(401, "authorization_expired", "The inventory authority changed while saving.")
+        : new AppError(409, "read_job_cancelled", "The inventory was cancelled while saving.");
+      let current = true;
+      const onProgress = vi.fn();
+      const fetcher = vi.fn(async () => Response.json({
+        totalRecords: 1, count: 1, resultTruncated: false, data: [resource],
+      }));
+      const pages = new PowerPlatformResourceQueryClient(fetcher).pages("opaque-token", ["microsoft.copilotstudio/agents"], {
+        signal: controller.signal, visit: async () => {}, onProgress,
+        assertCurrent: () => { if (!current) throw reason; },
+      });
+      expect((await pages.next()).value?.records).toHaveLength(1);
+      if (change === "cancellation") controller.abort(reason);
+      else if (change === "authority") current = false;
+      else await vi.advanceTimersByTimeAsync(inventoryLimits.powerPlatformDeadlineMs);
+
+      if (change === "deadline") await expect(pages.next()).rejects.toMatchObject({ code: "provider_timeout" });
+      else await expect(pages.next()).rejects.toBe(reason);
+      expect(onProgress).not.toHaveBeenCalled();
+      expect(fetcher).toHaveBeenCalledOnce();
+      const events = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.error).mock.calls]
+        .map(([entry]) => JSON.parse(entry));
+      expect(events).toContainEqual(expect.objectContaining({
+        event: "inventory_query_failed", pages: 0, observedCount: 0,
+        errorCode: change === "deadline" ? "provider_timeout" : reason.code,
+      }));
+      expect(events).not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
+    },
+  );
 
   it("applies the ten-second page limit while consuming a stalled response body", async () => {
     fakeDeadlineTimers();
@@ -594,6 +859,28 @@ describe("PowerPlatformResourceQueryClient", () => {
 
     const incomplete = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [resource] })));
     await expect(tinyNativePages(incomplete, "opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([false, true])("rejects an incomplete terminal page before releasing it (preceding page: %s)", async precedingPage => {
+    const onProgress = vi.fn();
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json(precedingPage
+        ? { totalRecords: 3, count: 1, resultTruncated: true, skipToken: "next", data: [resource] }
+        : { totalRecords: 3, count: 1, resultTruncated: false, data: [resource] }))
+      .mockResolvedValueOnce(Response.json({
+        totalRecords: 3, count: 1, resultTruncated: false, data: [{ ...resource, name: "agent-b" }],
+      }));
+    const pages = new PowerPlatformResourceQueryClient(fetcher).pages("opaque-token", ["microsoft.copilotstudio/agents"], {
+      visit: async () => {}, onProgress,
+    });
+    if (precedingPage) expect((await pages.next()).value?.page).toBe(1);
+
+    await expect(pages.next()).rejects.toMatchObject({
+      code: "provider_schema", diagnostics: { reason: "incomplete_enumeration" },
+    });
+    expect(fetcher).toHaveBeenCalledTimes(precedingPage ? 2 : 1);
+    expect(onProgress).toHaveBeenCalledTimes(precedingPage ? 1 : 0);
+    if (precedingPage) expect(onProgress).toHaveBeenCalledWith({ pages: 1, observedCount: 1, totalRecords: 3 });
   });
 
   it.each([
@@ -919,10 +1206,13 @@ describe("PowerPlatformResourceQueryClient", () => {
   });
 
   it.each([
-    ["2024-02-29T12:34:56.1234567Z", "2024-02-29T12:34:56.123Z"],
+    ["2024-02-29T12:34:56.1234567Z", "2024-02-29T12:34:56.1234567Z"],
+    ["2024-02-29T00:04:56.000000001+02:30", "2024-02-28T21:34:56.000000001Z"],
+    ["2026-01-01T23:00:00.999999999-03:00", "2026-01-02T02:00:00.999999999Z"],
+    ["2024-02-29T12:34:56.1Z", "2024-02-29T12:34:56.100Z"],
     ["2024-02-29T12:34:56+02:30", "2024-02-29T10:04:56.000Z"],
     ["2026-01-01T01:00:00-03:00", "2026-01-01T04:00:00.000Z"],
-  ])("keeps valid timestamp normalization and publication evidence (%s)", async (value, expected) => {
+  ])("keeps exact timestamp precision, UTC normalization and publication evidence through saved projection (%s)", async (value, expected) => {
     const properties = { createdAt: value, lastPublishedAt: value, lastModifiedAt: value, quarantinedAt: value };
     const fetcher = vi.fn(async () => Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }],
@@ -932,6 +1222,9 @@ describe("PowerPlatformResourceQueryClient", () => {
       createdAt: expected, lastPublishedAt: expected, lifecycle: "published", unknownFieldCount: 0,
       details: { lastModifiedAt: expected, quarantinedAt: expected },
     });
+    const projected = powerPlatformInventoryRecord(result.resources[0]);
+    expect(projected.modified_at).toBe(expected);
+    expect(restoreInventoryRecord(projected.residual, projected.facts, "power_platform")).toEqual(result.resources[0]);
     for (const field of Object.keys(properties)) expect(result.resources[0].provenance[field].path).toBe(`properties.${field}`);
   });
 
@@ -1011,6 +1304,37 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
       event: "inventory_provider_retry", page: 1, attempt: 1, reason: "throttled", retryDelayMs: 2_000,
     }));
+  });
+
+  it.each(["601", "999999999999999999999999999999", "Thu, 01 Oct 2026 12:10:01 GMT"])(
+    "does not shorten a Retry-After exceeding the retry ceiling (%s)", async retryAfter => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-01T12:00:00Z"));
+      const cancel = vi.fn();
+      const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), {
+        status: 429, headers: { "retry-after": retryAfter },
+      }));
+      const delay = vi.fn(async () => {});
+      await expect(tinyNativePages(new PowerPlatformResourceQueryClient(fetcher, { delay }), "synthetic"))
+        .rejects.toMatchObject({ status: 429, code: "provider_error" });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(delay).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("retains sanitized Retry-After and request correlation on a terminal provider denial", async () => {
+    const requestId = "22222222-2222-2222-2222-222222222222";
+    const fetcher = vi.fn(async () => new Response("private-provider-body", {
+      status: 429, headers: { "retry-after": "600", "x-ms-request-id": requestId },
+    }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }).checkAccess("synthetic"))
+      .rejects.toMatchObject({
+        status: 429, code: "provider_error",
+        details: { httpStatus: 429, retryAfterMs: 600_000, providerRequestId: requestId },
+      });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("private-provider-body");
   });
 
   it("validates bounded page metadata and expected response scope", async () => {

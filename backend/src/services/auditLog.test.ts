@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import type { StartAuditEvent } from "../types/audit.js";
-import { auditMetadata, AuditLog } from "./auditLog.js";
+import { AuditLog } from "./auditLog.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let audit: AuditLog;
@@ -11,18 +11,6 @@ beforeAll(async () => { fixture = await testDatabase(); audit = new AuditLog(sco
 afterAll(async () => { await fixture?.close(); });
 
 describe("PostgreSQL audit projection", () => {
-  it("retains bounded unified export provenance without identities, filters or exported data", () => {
-    const metadata = { source: "unified_agents", revision: "a".repeat(64), selection: "exact", partial: true, resultingCount: 2 };
-    expect(auditMetadata({ ...metadata, recordIds: ["private-agent"], query: { search: "private" }, rows: ["private-row"] })).toEqual(metadata);
-    expect(auditMetadata({ revision: "a".repeat(129), selection: {}, partial: [] })).toEqual({});
-  });
-
-  it("retains bounded official export lineage but never exported rows", () => {
-    expect(auditMetadata({ source: "official_usage", reportSetId: "set-1", reportingStart: "2026-09-01",
-      reportingEnd: "2026-09-07", resultingCount: 1, rows: [{ username: "private" }] })).toEqual({
-      source: "official_usage", reportSetId: "set-1", reportingStart: "2026-09-01", reportingEnd: "2026-09-07", resultingCount: 1,
-    });
-  });
   it("appends outcome events without changing the started row", async () => {
     const started = await audit.startEvent({ operationId: "operation-1", scope: "single", action: "block", targetBlockedState: true, agentId: "package-1", actor, requestPath: "/api/agents/package-1/block", metadata: { source: "test", accessToken: "must-not-persist" } });
     const completed = await audit.completeEvent(started.id, { status: "succeeded" });

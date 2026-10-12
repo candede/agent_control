@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { packageDetailRevision, projectPackageDetailAge, projectPackageDetails } from "./packageDetailProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
+import { projectPackageControl } from "./packageControlProjection.js";
+import { packageInventoryRecord, restoreInventoryRecord } from "./inventoryRecordProjection.js";
 
 const now = Date.parse("2026-09-24T10:00:00Z");
 const summary = allowlistedPackage({
@@ -23,17 +25,28 @@ const observation = {
 };
 
 describe("separate package detail projection", () => {
-  it("evaluates age at the supplied snapshot time without changing stored evidence", () => {
-    const saved = projectPackageDetails(summary, observation, false, now);
-    const afterExpiry = Date.parse(observation.expiresAt) + 1;
-    const aged = projectPackageDetailAge(saved, afterExpiry);
-    expect(aged).toMatchObject({
-      longDescription: detailed.longDescription, elementDetails: detailed.elementDetails,
-      detailFreshness: { state: "stale", expiresAt: observation.expiresAt },
+  it("ages identity evidence at exact sub-millisecond instants for number, Date and string evaluations", () => {
+    const value = { ...detailed, detailFreshness: {
+      state: "fresh" as const, observedAt: "2026-09-24T09:59:59.999999999Z", expiresAt: "2026-09-24T10:00:00.000000002Z",
+    } };
+    for (const evaluation of [now, new Date(now), "2026-09-24T10:00:00.000000001Z", "2026-09-24T12:00:00.000000001+02:00"]) {
+      expect(projectPackageDetailAge(value, evaluation)).toBe(value);
+    }
+    expect(projectPackageDetailAge(value, value.detailFreshness.expiresAt))
+      .toMatchObject({ detailFreshness: { state: "stale" } });
+    expect(projectPackageDetailAge(value, value.detailFreshness.expiresAt)).not.toHaveProperty("identityDetailsCollected");
+    expect(projectPackageDetailAge(value, "2026-09-24T09:59:59.999999998Z")).not.toHaveProperty("identityDetailsCollected");
+    expect(value.identityDetailsCollected).toBe(true);
+  });
+
+  it("does not persist early stale or fresh classifications when saved detail timestamps exceed millisecond precision", () => {
+    const saved = { ...observation, observedAt: "2026-09-24T09:59:59.999999Z", expiresAt: "2026-09-24T10:00:00.000001Z" };
+    expect(projectPackageDetails(summary, saved, false, now)).toMatchObject({
+      identityDetailsCollected: true, detailFreshness: { state: "fresh" },
     });
-    expect(aged).not.toHaveProperty("identityDetailsCollected");
-    expect(projectPackageDetailAge(saved, now)).toBe(saved);
-    expect(saved).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
+    const future = projectPackageDetails(summary, { ...saved, observedAt: "2026-09-24T10:00:00.000001Z", expiresAt: observation.expiresAt }, false, now);
+    expect(future.detailFreshness?.state).toBe("stale");
+    expect(future).not.toHaveProperty("identityDetailsCollected");
   });
 
   it("enriches descriptions, access and identity without replacing catalog summary/control fields", () => {
@@ -44,6 +57,45 @@ describe("separate package detail projection", () => {
       identityDetailsCollected: true,
       detailFreshness: { state: "fresh", observedAt: observation.observedAt, expiresAt: observation.expiresAt },
     });
+  });
+
+  it("reuses typed manifest GUID casing while keeping opaque revision markers exact", () => {
+    const current = { ...summary, manifestId: summary.manifestId!.toUpperCase() };
+    for (const catalogRevision of [undefined, packageDetailRevision(summary)]) {
+      expect(projectPackageDetails(current, { ...observation, catalogRevision }, false, now)).toMatchObject({
+        manifestId: current.manifestId, identityDetailsCollected: true, detailFreshness: { state: "fresh" },
+      });
+    }
+    for (const key of ["appId", "assetId", "version", "manifestVersion"] as const) {
+      const marker = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const saved = { ...observation, package: { ...detailed, [key]: marker },
+        catalogRevision: packageDetailRevision({ ...summary, [key]: marker }) };
+      expect(projectPackageDetails({ ...summary, [key]: marker.toUpperCase() }, saved, false, now)
+        .detailFreshness?.state).toBe("invalidated");
+    }
+  });
+
+  it("rejects malformed modification instants rather than binding reusable detail to Date.parse normalization", () => {
+    const current = { ...summary, lastModifiedDateTime: "2026-02-30T08:00:00Z" };
+    expect(projectPackageDetails(current, { ...observation, package: { ...detailed,
+      lastModifiedDateTime: current.lastModifiedDateTime } }, false, now).detailFreshness?.state).toBe("invalidated");
+  });
+
+  it("binds valid fractional modification instants even when the browser only parses millisecond ISO strings", () => {
+    const parse = Date.parse;
+    const browser = vi.spyOn(Date, "parse").mockImplementation(text =>
+      /\.\d{4,}(?:Z|[+-]\d{2}:\d{2})$/.test(text) ? NaN : parse(text));
+    try {
+      const current = { ...summary, lastModifiedDateTime: "2026-09-24T08:00:00.123456789Z" };
+      const saved = { ...observation, package: { ...detailed, lastModifiedDateTime: current.lastModifiedDateTime },
+        observedAt: "2026-09-24T09:59:59.999999999Z", expiresAt: "2026-09-24T10:00:00.000000002Z" };
+      expect(projectPackageDetails(current, saved, false, now)).toMatchObject({
+        identityDetailsCollected: true, detailFreshness: { state: "fresh" },
+      });
+      expect(projectPackageDetailAge({ ...current, identityDetailsCollected: true,
+        detailFreshness: { state: "fresh", observedAt: saved.observedAt, expiresAt: saved.expiresAt } },
+      "2026-09-24T10:00:00.000000001Z").detailFreshness?.state).toBe("fresh");
+    } finally { browser.mockRestore(); }
   });
 
   it("accepts sparse automatic details bound to the unchanged catalog revision", () => {
@@ -104,6 +156,45 @@ describe("separate package detail projection", () => {
     expect(resolvePackageAgentLinks("tenant", [result], [])[0].status).toBe("unmatched");
   });
 
+  it("retains a control identity conflict through catalog enrichment until an exact identity read", () => {
+    const readback = allowlistedPackage({
+      id: summary.id, displayName: summary.displayName, isBlocked: true,
+      elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
+        SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      }) }] }],
+    });
+    const conflicted = projectPackageControl(detailed, {
+      detail: readback, state: { kind: "block", isBlocked: true },
+      observation: { snapshotId: "control", observedAt: observation.observedAt, expiresAt: observation.expiresAt },
+    });
+    const record = packageInventoryRecord(conflicted);
+    const saved = restoreInventoryRecord(record.residual, record.facts, "packages") as typeof conflicted;
+    for (const catalogRevision of [undefined, packageDetailRevision(summary)]) {
+      const result = projectPackageDetails(summary, { ...observation, package: saved, catalogRevision }, false, now, now);
+      expect(result).toMatchObject({ identityRevalidationRequired: true, detailFreshness: { state: "fresh" } });
+      expect(result).not.toHaveProperty("identityDetailsCollected");
+      expect(packageInventoryRecord(result).facts.some(fact => fact.kind.startsWith("match:"))).toBe(false);
+      expect(resolvePackageAgentLinks("tenant", [result], [])[0]).not.toHaveProperty("grouping");
+    }
+    const exact = projectPackageDetails(detailed, observation, true, now);
+    expect(exact).not.toHaveProperty("identityRevalidationRequired");
+    expect(exact.identityDetailsCollected).toBe(true);
+  });
+
+  it.each([undefined, []])("retains the conflict even when prior details have no elements (%j)", elementDetails => {
+    const conflicted = projectPackageControl({ ...detailed, elementDetails }, {
+      detail: allowlistedPackage({ id: summary.id, displayName: summary.displayName, isBlocked: true, version: "2" }),
+      state: { kind: "block", isBlocked: true },
+      observation: { snapshotId: "control", observedAt: observation.observedAt, expiresAt: observation.expiresAt },
+    });
+    const result = projectPackageDetails({ ...summary, elementTypes: ["DeclarativeCopilots"] }, {
+      ...observation, package: conflicted, catalogRevision: packageDetailRevision(summary),
+    }, false, now, now);
+    expect(result).toMatchObject({ identityRevalidationRequired: true, detailFreshness: { state: "missing" } });
+    expect(result).not.toHaveProperty("identityDetailsCollected");
+    expect(resolvePackageAgentLinks("tenant", [result], [])[0]).not.toHaveProperty("grouping");
+  });
+
   it.each([
     { version: "2" }, { version: undefined }, { manifestId: undefined },
     { lastModifiedDateTime: undefined }, { lastModifiedDateTime: "invalid" },
@@ -148,6 +239,62 @@ describe("separate package detail projection", () => {
     const result = projectPackageDetails({ ...summary, availableTo: "none" }, observation, false, now);
     expect(result.availableTo).toBe("none");
     expect(result.allowedUsersAndGroups).toBeUndefined();
+  });
+
+  it.each([
+    ["availableTo", "allowedUsersAndGroups", "AllowedForSome"],
+    ["deployedTo", "acquireUsersAndGroups", "InstalledForSome"],
+  ] as const)("enriches %s aliases without replacing raw catalog scope or newer catalog membership", (scope, collection, alias) => {
+    const cached = [{ resourceId: "cached", resourceType: "user" }];
+    const current = { ...summary, [scope]: alias };
+    const saved = { ...observation, package: { ...detailed, [scope]: "some", [collection]: cached } };
+    const result = projectPackageDetails(current, saved, false, now);
+    expect(result[scope]).toBe(alias);
+    expect(result[collection]).toEqual(cached);
+    const record = packageInventoryRecord(result);
+    expect(restoreInventoryRecord(record.residual, record.facts, "packages")).toMatchObject({
+      [scope]: alias, [collection]: cached,
+    });
+    expect(projectPackageDetails({ ...current, [collection]: [] }, saved, false, now, now)[collection]).toEqual([]);
+    expect(projectPackageDetails({ ...current, [scope]: "future-scope" }, {
+      ...saved, package: { ...saved.package, [scope]: "other-future-scope" },
+    }, false, now)[collection]).toBeUndefined();
+  });
+
+  it("retains completed empty detail provenance across stale and conflicted inventory round trips", () => {
+    const empty = projectPackageDetails(summary, {
+      ...observation, package: { ...summary, identityDetailsCollected: true },
+    }, true, now);
+    const stale = projectPackageDetailAge(empty, observation.expiresAt);
+    const conflicted = projectPackageControl(empty, {
+      detail: { ...summary, version: "2" }, state: { kind: "block", isBlocked: true },
+      observation: { snapshotId: "control", observedAt: observation.observedAt, expiresAt: observation.expiresAt },
+    });
+    for (const value of [stale, conflicted]) {
+      const record = packageInventoryRecord(value);
+      const restored = restoreInventoryRecord(record.residual, record.facts, "packages") as typeof value;
+      const result = projectPackageDetails(summary, { ...observation, package: restored,
+        catalogRevision: packageDetailRevision(summary) }, false, Date.parse(observation.expiresAt));
+      expect(result.detailFreshness).toEqual({ ...empty.detailFreshness, state: "stale" });
+      expect(result).not.toHaveProperty("identityDetailsCollected");
+      expect(result.identityRevalidationRequired).toBe(value.identityRevalidationRequired);
+    }
+  });
+
+  it("does not reclassify an invalidated saved detail observation on a later unchanged catalog", () => {
+    const current = { ...summary, version: "2" };
+    const invalidated = projectPackageDetails(current, observation, false, now);
+    const record = packageInventoryRecord(invalidated);
+    const restored = restoreInventoryRecord(record.residual, record.facts, "packages") as typeof invalidated;
+    const result = projectPackageDetails(current, { ...observation, package: restored,
+      catalogRevision: packageDetailRevision(current) }, false, now);
+    expect(result.detailFreshness).toEqual(invalidated.detailFreshness);
+    expect(result.identityRevalidationRequired).toBe(true);
+    expect(result).not.toHaveProperty("identityDetailsCollected");
+    const reread = projectPackageDetails(current, { ...observation,
+      package: { ...current, identityDetailsCollected: true } }, true, now);
+    expect(reread.detailFreshness?.state).toBe("fresh");
+    expect(reread).not.toHaveProperty("identityRevalidationRequired");
   });
 
   it.each([

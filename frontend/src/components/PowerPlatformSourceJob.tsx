@@ -2,7 +2,8 @@ import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import { cancelInventoryRefresh, getInventoryRefreshJob, refreshInventory, resumeInventoryRefresh, type InventoryRefreshJob } from "../api/client";
 import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { useBrowserAvailability } from "../useBrowserAvailability";
+import { inventoryRequestScope, inventoryRoleHint } from "../inventoryVerification";
+import { dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
 
 export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved, onCancelRequested, paused = false }: {
   jobId: string;
@@ -115,9 +116,12 @@ export function PowerPlatformSourceJob({ jobId, initialJob, onSelect, onObserved
             <div><dt>Pages</dt><dd>{selected.pageCount}</dd></div>
             <div><dt>Omitted fields</dt><dd>{selected.unknownFieldCount}</dd></div>
           </dl>
-          <p>Scope: {selected.roleScope}; {selected.environmentScope ?? "all authorized environments"}. Requested: {selected.requestedTypes.join(", ")}.</p>
+          <p>Request scope: {inventoryRequestScope(selected.environmentScope)}. Requested: {selected.requestedTypes.join(", ")}.</p>
+          <p>Optional directory-role hint: {inventoryRoleHint(selected.roleScope)}.</p>
           <p>Created: {selected.createdAt}. Updated: {selected.updatedAt}. {selected.snapshotId ? `Saved snapshot: ${selected.snapshotId}` : "No snapshot published by this job."}</p>
           {selected.status === "waiting_authorization" ? <p><a href={`/api/auth/login?${new URLSearchParams({ returnTo: jobUrl })}`}>Sign in again</a>, then resume this exact job.</p> : null}
+          {selected.status === "failed" && dataSyncFailureStatus(selected.errorCode ?? "") === "permission_required"
+            ? <p><a href="/permissions">Review Permissions</a> and the required application/provider roles before starting a new refresh. Signing in again does not grant roles or permissions.</p> : null}
           <div className="inline-actions">
             {selected.status === "waiting_authorization" ? <WorkbenchActionGate actionId="power-platform.resume"><button type="button" disabled={busy} onClick={() => void act("resume")}>Resume source job</button></WorkbenchActionGate> : null}
             {["waiting_authorization", "running"].includes(selected.status) ? <WorkbenchActionGate actionId="power-platform.cancel"><button type="button" disabled={busy} onClick={() => void act("cancel")}>Cancel source job</button></WorkbenchActionGate> : null}

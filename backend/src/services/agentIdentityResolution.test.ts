@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import type { AgentIdentityRepository, AgentIdentitySource } from "../db/agentIdentity.js";
@@ -59,9 +60,12 @@ function setup(operationObserver = observeOperation) {
   const requireAvailable = vi.fn(async (capabilityId: CapabilityId) => ({ capabilityId, status: "available" as const,
     authorized: true, fresh: true, verification: "on_demand" as const, previewQualification: "not_required" as const, remediation: [] }));
   const admissions = vi.fn(() => undefined);
+  const capabilityFence = vi.fn(() => undefined);
+  const beginOperationValidation = vi.fn(() => capabilityFence);
   const service = new AgentIdentityResolutionService({ inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
-    observeOperation: operationObserver });
-  return { user, source, state, inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions, service };
+    beginOperationValidation, observeOperation: operationObserver });
+  return { user, source, state, inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
+    capabilityFence, beginOperationValidation, service };
 }
 
 describe("explicit saved-source identity resolution", () => {
@@ -70,12 +74,84 @@ describe("explicit saved-source identity resolution", () => {
     const result = await f.service.resolve(f.user, recordId);
     expect(result.defender).toMatchObject({ status: "available", entraAgentIds: [objectId], entraAgentApplicationIds: [applicationId] });
     expect(f.delegatedToken).toHaveBeenCalledExactlyOnceWith(f.user.tenantId, f.user.homeAccountId, "graph.agentIdentity.read");
-    expect(f.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture", objectId, expect.any(AbortSignal), expect.any(Function));
+    expect(f.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture", objectId, expect.any(AbortSignal), expect.any(Function), expect.any(Function));
     expect(f.repository.save).toHaveBeenCalledExactlyOnceWith({ tenantId: f.user.tenantId, principalId: f.user.homeAccountId },
       f.source, resolvedIdentity, expect.any(Function));
     expect(f.revalidateUser).toHaveBeenCalledTimes(3);
     expect(f.repository.invalidate).toHaveBeenCalledOnce();
     expect(f.inventory.resolve.mock.calls.length).toBeGreaterThan(4);
+    expect(f.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.agentIdentity.read",
+      { tenantId: f.user.tenantId, homeAccountId: f.user.homeAccountId });
+    expect(f.capabilityFence).toHaveBeenCalled();
+  });
+
+  it.each(["source", "capability", "token", "retry", "publication", "evidence", "response"] as const)(
+    "retains initiating capability authority through the %s boundary", async stage => {
+      const f = setup(async (_id, _user, operation) => {
+        const result = await operation(() => undefined);
+        if (stage === "evidence") changeAuthority();
+        return result;
+      });
+      const reason = new AppError(409, "capability_changed", "Initiating capability changed");
+      const changeAuthority = () => { f.capabilityFence.mockImplementation(() => { throw reason; }); };
+      if (stage === "source") f.inventory.resolve.mockImplementationOnce(async () => {
+        changeAuthority();
+        return structuredClone(f.state);
+      });
+      if (stage === "capability") f.requireAvailable.mockImplementationOnce(async capabilityId => {
+        changeAuthority();
+        return { capabilityId, status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [] };
+      });
+      if (stage === "token") f.delegatedToken.mockImplementationOnce(async () => { changeAuthority(); return "fixture"; });
+      if (stage === "retry") f.directory.resolve.mockImplementation(async (_token, _candidate, _signal, before) => {
+        await before();
+        changeAuthority();
+        await before();
+        throw new Error("Replacement authority admitted a retry");
+      });
+      if (stage === "publication") f.repository.save.mockImplementationOnce(async (_scope, _source, _value, fence) => {
+        changeAuthority();
+        await fence();
+      });
+      if (stage === "response") f.inventory.resolve.mockImplementation(async () => {
+        if (f.repository.save.mock.calls.length) changeAuthority();
+        return structuredClone(f.state);
+      });
+      await expect(f.service.resolve(f.user, recordId)).rejects.toBe(reason);
+      expect(f.beginOperationValidation).toHaveBeenCalledOnce();
+      if (["source", "capability"].includes(stage)) expect(f.delegatedToken).not.toHaveBeenCalled();
+      if (["source", "capability", "token"].includes(stage)) expect(f.directory.resolve).not.toHaveBeenCalled();
+      if (["source", "capability", "token", "retry"].includes(stage)) expect(f.repository.save).not.toHaveBeenCalled();
+      expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["source", "token", "provider"] as const)("prioritizes changed authority when the %s rejects", async stage => {
+    const f = setup();
+    const reason = new AppError(409, "capability_changed", "Initiating capability changed");
+    const fail = async () => {
+      f.capabilityFence.mockImplementation(() => { throw reason; });
+      throw new AppError(403, "agent_identity_permission_required", "Provider denied lookup");
+    };
+    if (stage === "source") f.inventory.resolve.mockImplementationOnce(fail);
+    if (stage === "token") f.delegatedToken.mockImplementationOnce(fail);
+    if (stage === "provider") f.directory.resolve.mockImplementationOnce(fail);
+    await expect(f.service.resolve(f.user, recordId)).rejects.toBe(reason);
+    expect(f.repository.saveFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a committed verified mapping after publication cleanup reports failure", async () => {
+    const f = setup();
+    const save = f.repository.save.getMockImplementation()!;
+    f.repository.save.mockImplementationOnce(async (...args) => {
+      await save(...args);
+      throw new AppError(503, "data_cleanup_failed", "Commit completed but cleanup failed");
+    });
+    await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ code: "data_cleanup_failed" });
+    expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    expect(f.state.context.defender.entraAgentIds).toEqual([objectId]);
+    expect(f.state.context.defender.entraAgentApplicationIds).toEqual([applicationId]);
   });
 
   it("does not return a one-sided cached result after successful typed identity verification", async () => {
@@ -168,6 +244,26 @@ describe("explicit saved-source identity resolution", () => {
     });
     await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: 401 });
   });
+
+  it.each(["source", "revision", "expired mapping"] as const)(
+    "withholds a verified context after the %s changes during operation-evidence recording", async change => {
+      const f = setup(async (_id, _user, operation) => {
+        const result = await operation(() => undefined);
+        if (change === "source") f.state.identitySource = undefined;
+        if (change === "revision") f.state.inventoryRevision = "revision-2";
+        if (change === "expired mapping") {
+          f.state.context.defender.entraAgentIds = [];
+          f.state.context.defender.entraAgentApplicationIds = [];
+          f.state.context.defender.status = "unavailable";
+          f.state.context.defender.resolution = { canResolve: true, capabilityId: "graph.agentIdentity.read", cacheStatus: "expired" };
+        }
+        return result;
+      });
+      await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: 409, code: "agent_identity_source_changed" });
+      expect(f.repository.save).toHaveBeenCalledOnce();
+      expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not acquire a token when revocation occurs during the capability check", async () => {
     const f = setup();
@@ -364,6 +460,39 @@ describe("explicit saved-source identity resolution", () => {
       await running;
       timeout.mockRestore();
     }
+  });
+
+  it("retires the actual directory client at the resolution deadline during a non-cooperative retry wait", async () => {
+    const f = setup();
+    const deadline = new AbortController();
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 25_000 ? deadline.signal : originalTimeout(ms));
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const wait = vi.fn(() => paused);
+    const fetcher = vi.fn(async () => Response.json({}, { status: 503, headers: { "Retry-After": "1" } }));
+    const directory = new GraphAgentIdentityClient(fetcher, wait);
+    const settled = vi.fn();
+    f.directory.resolve.mockImplementation(async (...args) => {
+      try { return await directory.resolve(...args); }
+      finally { settled(); }
+    });
+    const running = f.service.resolve(f.user, recordId).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(wait).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("Deadline exceeded", "TimeoutError"));
+      expect(await Promise.race([running, setImmediate("still pending")]))
+        .toMatchObject({ status: 504, code: "agent_identity_resolution_timeout" });
+      expect(settled).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(f.repository.save).not.toHaveBeenCalled();
+      expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await running;
+      timeout.mockRestore();
+    }
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("retains mutation serialization until a cancelled publication has finished its fence", async () => {

@@ -7,7 +7,7 @@ import { deferred } from "../test/deferred";
 import { SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
 
 vi.mock("../api/client", async original => ({
-  ...await original<typeof import("../api/client")>(), getInventoryChildren: vi.fn(),
+  ...await original<typeof import("../api/client")>(), getInventoryChildren: vi.fn(), getInventorySections: vi.fn(),
 }));
 
 const props = { selectionId: "selected", recordId: "agent:canonical",
@@ -31,6 +31,7 @@ function client() {
 }
 beforeEach(() => {
   vi.mocked(api.getInventoryChildren).mockImplementation(async (_selection, _record, _source, kind) => page(kind));
+  vi.mocked(api.getInventorySections).mockResolvedValue({ value: [], nextCursor: null });
 });
 afterEach(() => {
   cleanup();
@@ -39,6 +40,30 @@ afterEach(() => {
 });
 
 describe("saved configuration ownership and action admission", () => {
+  it.each([false, true])("distinguishes absent and confirmed-empty saved channels: present=%s", async present => {
+    vi.mocked(api.getInventoryChildren).mockResolvedValue({ value: [], total: 0, nextCursor: null });
+    vi.mocked(api.getInventorySections)
+      .mockResolvedValueOnce({ value: [{ kind: "categories", total: 0 }], nextCursor: "next-section" })
+      .mockResolvedValueOnce({ value: present ? [{ kind: "detail:channels", total: 0 }] : [], nextCursor: null });
+    render(<QueryClientProvider client={client()}><SavedAgentChannels {...props} /></QueryClientProvider>);
+    expect(await screen.findByText(present ? "None reported" : "Not reported")).toBeVisible();
+    const source = { source_scope_id: props.source.scopeId, source_identity: props.source.identity };
+    const signal = vi.mocked(api.getInventoryChildren).mock.lastCall?.[5]?.signal;
+    expect(api.getInventorySections).toHaveBeenNthCalledWith(1, props.selectionId, props.recordId, source, { signal });
+    expect(api.getInventorySections).toHaveBeenNthCalledWith(2, props.selectionId, props.recordId, source, { signal, cursor: "next-section" });
+  });
+
+  it("retires empty channel evidence when its collection-marker read rejects the selection", async () => {
+    const invalidated = vi.fn();
+    vi.mocked(api.getInventoryChildren).mockResolvedValue({ value: [], total: 0, nextCursor: null });
+    vi.mocked(api.getInventorySections).mockRejectedValue(new api.ApiError(409, "selection_invalidated", "Selection expired"));
+    render(<QueryClientProvider client={client()}><SavedAgentChannels {...props} onInvalidated={invalidated} /></QueryClientProvider>);
+    expect(await screen.findByRole("alert")).toHaveTextContent("This saved inventory selection changed or expired.");
+    expect(invalidated).toHaveBeenCalledOnce();
+    expect(screen.queryByText("None reported")).not.toBeInTheDocument();
+    expect(screen.queryByText("Not reported")).not.toBeInTheDocument();
+  });
+
   it.each(["channels", "connectors", "operations"] as const)(
     "does not leave a %s page when revalidation starts before React renders", async section => {
       const queries = client(), pending = deferred<Page>();

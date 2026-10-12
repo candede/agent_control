@@ -13,6 +13,7 @@ import { OfficialReportHistory } from "../src/db/officialReportHistory.js";
 import { backupTableKeys, fingerprintAlgorithm } from "./backupInventory.js";
 import { copyFingerprint } from "./backupFingerprintStream.js";
 import { checkpointQueries } from "../src/services/peakMemory.js";
+import { flushDataWorkMetrics } from "../src/services/dataMetrics.js";
 
 export async function validateBackupInventory(database: Pick<pg.Pool, "query">) {
   const tables = Object.keys(backupTableKeys).sort();
@@ -480,5 +481,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     : reopenRestoredDatabase(database,process.argv[3]);
   execution.then(() => console.log(JSON.stringify({event:"database_recovery_check",outcome:"succeeded"})))
     .catch(() => { console.error(JSON.stringify({event:"database_recovery_check",outcome:"failed"})); process.exitCode=1; })
-    .finally(() => database.end());
+    .finally(() => { flushDataWorkMetrics(); return database.end(); });
 }

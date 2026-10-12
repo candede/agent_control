@@ -29,7 +29,7 @@ import { useSavedQueryClient } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
-import { auditDefaultPageSize, auditMaximumSearchLength } from "../../../backend/src/types/audit";
+import { auditDefaultPageSize, auditMaximumSearchLength, auditMetadata } from "../../../backend/src/types/audit";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
@@ -736,7 +736,7 @@ function auditDetailsSummary(event: AuditEvent) {
     summarizeAuditMessage(event.message) ??
     accessMetadataSummary(event) ??
     event.errorCode ??
-    (usageAssociationMetadata(event) ? "Usage association evidence" : undefined) ??
+    (recordedAuditMetadata(event) ? isUsageAssociation(event.action) ? "Usage association evidence" : "Recorded audit evidence" : undefined) ??
     "Details"
   );
 }
@@ -744,11 +744,11 @@ function auditDetailsSummary(event: AuditEvent) {
 function fullAuditDetailsMessage(event: AuditEvent) {
   return event.message
     ? extractAuditErrorMessage(event.message)
-    : (accessMetadataSummary(event) ?? event.errorCode ?? (usageAssociationMetadata(event) ? "Usage association evidence" : "Details"));
+    : auditDetailsSummary(event);
 }
 
 function hasAuditDetails(event: AuditEvent) {
-  return Boolean(event.message || event.errorCode || accessMetadata(event) || usageAssociationMetadata(event));
+  return Boolean(event.message || event.errorCode || accessMetadata(event) || recordedAuditMetadata(event));
 }
 
 function summarizeAuditMessage(value: string | undefined) {
@@ -767,27 +767,15 @@ function summarizeAuditMessage(value: string | undefined) {
 }
 
 function formatAuditDetailsMessage(event: AuditEvent) {
-  const errorDetails = event.metadata?.errorDetails;
-  const usageDetails = usageAssociationMetadata(event);
+  const metadata = accessMetadata(event) ?? recordedAuditMetadata(event);
 
-  if (usageDetails) {
+  if (metadata) {
     return JSON.stringify({
-      ...usageDetails,
+      ...metadata,
       status: event.status,
       ...(event.message ? { message: event.message } : {}),
       ...(event.errorCode ? { errorCode: event.errorCode } : {}),
-      ...(errorDetails !== undefined ? { errorDetails } : {}),
     }, null, 2);
-  }
-
-  if (errorDetails !== undefined) {
-    return JSON.stringify(errorDetails, null, 2);
-  }
-
-  const accessDetails = accessMetadata(event);
-
-  if (accessDetails) {
-    return JSON.stringify(accessDetails, null, 2);
   }
 
   return event.message
@@ -799,19 +787,12 @@ function isUsageAssociation(action: LocalAuditAction) {
   return action === "associate-agent-usage" || action === "remove-agent-usage-association";
 }
 
-function usageAssociationMetadata(event: AuditEvent) {
-  if (!isUsageAssociation(event.action)) return undefined;
-  const metadata = event.metadata;
-  if (!metadata) return undefined;
-  const fields = ["source", "reportSetId", "revision", "selection", "reportAgentHash", "inventoryRevision", "changed", "targetSelectionHash"];
-  const details = Object.fromEntries(fields.flatMap(key => {
-    const value = metadata[key];
-    return typeof value === "string" || typeof value === "boolean" ? [[key, value]] : [];
-  }));
-  return Object.keys(details).length ? details : undefined;
+function recordedAuditMetadata(event: AuditEvent) {
+  const metadata = auditMetadata(event.metadata);
+  return metadata && Object.keys(metadata).length ? metadata : undefined;
 }
 
-function accessMetadata(event: AuditEvent) {
+function accessMetadata(event: AuditEvent): Record<string, string | number | boolean> | undefined {
   if (
     event.action !== "update-availability" &&
     event.action !== "update-installation"
@@ -819,15 +800,10 @@ function accessMetadata(event: AuditEvent) {
     return undefined;
   }
 
-  const metadata = event.metadata ?? {};
   return {
     setting:
       event.action === "update-availability" ? "Available to" : "Installed for",
-    mode: metadata.mode,
-    scope: metadata.scope,
-    principals: metadata.principals,
-    previousCount: metadata.previousCount,
-    resultingCount: metadata.resultingCount,
+    ...recordedAuditMetadata(event),
   };
 }
 

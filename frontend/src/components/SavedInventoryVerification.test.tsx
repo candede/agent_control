@@ -43,6 +43,23 @@ function withoutSource(inventory: UnifiedAgentInventoryPage, source: keyof Unifi
 }
 
 describe("SavedAgentInventoryVerification source availability", () => {
+  it.each(["superseded", "no provider receipt"] as const)("does not certify a %s native source", state => {
+    const inventory = emptyInventory();
+    const observation = inventory.sources.powerPlatform.observation!;
+    if (!("verification" in observation)) throw new Error("Expected native source fixture.");
+    if (state === "superseded") observation.current = false;
+    else {
+      observation.verification = null;
+      inventory.sources.powerPlatform = { state: "partial", observation, error: {
+        source: "power_platform", code: "coverage_unknown", message: "No complete provider receipt is available.",
+      } };
+    }
+    render(<SavedAgentInventoryVerification inventory={inventory} />);
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
+    expect(screen.getByText(/No current verified Power Platform snapshot is available/)).toBeVisible();
+  });
+
   it.each([
     { coverage: "covered", count: 0, label: "Authorized query verified" },
     { coverage: "covered", count: null, label: "Authorized query verified" },

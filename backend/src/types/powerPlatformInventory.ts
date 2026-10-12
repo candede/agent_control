@@ -4,6 +4,7 @@ export const powerPlatformResourceTypes = [
 ] as const;
 
 export type PowerPlatformResourceType = typeof powerPlatformResourceTypes[number];
+/** Optional ID-token role hint; not provider authority or measured query coverage. */
 export type InventoryRoleScope = "full" | "ai" | "unknown";
 export type InventoryCoverageStatus = "covered" | "not_requested" | "not_authorized_scope" | "unknown";
 export type InventoryJobStatus = "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";

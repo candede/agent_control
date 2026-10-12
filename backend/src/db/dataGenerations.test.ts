@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { encodeBatch } from "./dataBounds.js";
 import { DataGenerations, generationHeartbeat, prepareGenerationBatch } from "./dataGenerations.js";
+import { createRefreshExecutionSignal } from "../services/refreshExecution.js";
 import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
 import { directoryRecord, generationInput } from "../../scripts/largeTenantFixtures.js";
 import { initializeSchema, grantRuntime } from "../../scripts/database.js";
@@ -11,6 +12,27 @@ import { verifyDataGenerationAccountingSchema,verifyDataGenerationCharges } from
 
 describe("bounded generation batches", () => {
   describe("independent fenced heartbeats", () => {
+    it("preserves an explicit null cancellation through a nested refresh execution signal", async () => {
+      vi.useFakeTimers();
+      const parent = new AbortController();
+      const execution = createRefreshExecutionSignal(parent.signal, 60_000);
+      const renew = vi.fn(async () => {});
+      const heartbeat = generationHeartbeat(renew, execution.signal);
+      try {
+        parent.abort(null);
+        expect(execution.signal.reason).toBeNull();
+        expect(heartbeat.signal.aborted).toBe(true);
+        expect(heartbeat.signal.reason).toBe(execution.signal.reason);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(renew).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        await heartbeat.stop();
+        execution.dispose();
+        vi.useRealTimers();
+      }
+    });
+
     it("renews thirty times across an append-idle 600-second provider wait and validation", async () => {
       vi.useFakeTimers();
       try {

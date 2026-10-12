@@ -67,6 +67,7 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByRole("button", { name: "Verify saved inventory" })).not.toBeInTheDocument();
     await userEvent.click(disclosure);
     expect(screen.getByRole("dialog", { name: "Inventory diagnostics" })).toBeVisible();
+    expect(screen.getByText(/Refresh agents collects the full catalog/)).toHaveTextContent("separate scheduled batches");
     expect(screen.getByText("Saved inventory verified")).toBeVisible();
     expect(screen.getByText(/No manual verification or administrator approval is required after sync/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();

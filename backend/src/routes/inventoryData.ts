@@ -12,6 +12,9 @@ import { dataLimitError } from "../db/dataBounds.js";
 import { capabilities } from "../services/capabilities.js";
 import { randomUUID } from "node:crypto";
 import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { requestScope } from "../middleware/auth.js";
+import { requireProviderAdmissions } from "../services/operationalState.js";
 import type { UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
 
 function scalar(value: unknown, name: string, maximum = 4096) {
@@ -109,12 +112,24 @@ export function createInventoryDataRouter(database: pg.Pool) {
       || Object.keys(body).some(key => !["selectionId", "ids", "recordIds"].includes(key))) {
       throw new AppError(400, "invalid_inventory_query", "Select current inventory targets without a client-expanded target list.");
     }
+    const user = request.session.user!, owner = requestScope(request);
+    const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
+    const validateCapability = capabilities.beginOperationValidation("graph.package.read.delegated", user);
+    const assertCurrent = () => {
+      assertAccountSessionValidation(validation);
+      validateCapability();
+      requireProviderAdmissions();
+    };
+    assertCurrent();
     const identity = await reportIdentity(database, request.session.user!);
-    response.status(202).json(await new PackageRefreshJobs(database).submitSelected(
+    assertCurrent();
+    const job = await commitAccountSessionValidation(validation, () => new PackageRefreshJobs(database).submitSelected(
       { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: "delegated" }, identity, {
         selectionId: scalar(body.selectionId, "selectionId", 36), ids: body.ids, recordIds: body.recordIds,
         idempotencyKey: request.get("Idempotency-Key") ?? randomUUID(),
-      }));
+      }, assertCurrent));
+    assertCurrent();
+    response.status(202).json(job);
   });
   async function selected(request: Request, dependent = false, extra: string[] = [], unfiltered = false) {
     const identity = await reportIdentity(database, request.session.user!);
@@ -161,7 +176,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const query = agentResponsibilityQuery(request.query);
     const read = await selected(request, false, ["objectId"], true);
     const { sourceRows, selected: person, ...result } = await inventory.responsibility(read.id, read.identity, query);
-    const sources = inventorySourceStatuses(sourceRows);
+    const sources = inventorySourceStatuses(sourceRows, result.selection.evaluatedAt);
     response.json({ ...result, sources, selected: person ? { ...person,
       state: sources.powerPlatform.state === "unavailable" ? "unavailable" : person.count ? "reported" : "no_reported_relationships" } : null });
   });

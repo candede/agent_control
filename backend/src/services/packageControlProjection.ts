@@ -1,6 +1,6 @@
 import { AppError } from "../errors.js";
 import type { CopilotPackageDetail, PackageControlObservation } from "../types/copilotPackage.js";
-import { isPackageElementType, normalizedGuid, readPackageAgentMetadata, readPackageCustomEngineBotIdentity } from "./packageAgentMetadata.js";
+import { isPackageElementType, normalizedGuid, packageCustomEngineBotIdentityChanged, readPackageAgentMetadata } from "./packageAgentMetadata.js";
 import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
 
 export type SavedPackageControl = {
@@ -40,7 +40,8 @@ export function packageControlIdentityChanged(current: CopilotPackageDetail, inc
   for (const key of ["manifestId", "appId", "assetId", "version", "manifestVersion"] as const) {
     const before = current[key];
     const after = incoming[key];
-    if (after && (normalizedGuid(before) ?? before) !== (normalizedGuid(after) ?? after)) return true;
+    if (after && (key === "manifestId"
+      ? (normalizedGuid(before) ?? before) !== (normalizedGuid(after) ?? after) : before !== after)) return true;
   }
   const types = (values: string[]) => JSON.stringify([...new Set(values.map(value => value.toLowerCase()))].sort());
   if (incoming.elementTypes?.length && types(incoming.elementTypes) !== types(current.elementTypes ?? [])) return true;
@@ -62,18 +63,7 @@ export function packageControlIdentityChanged(current: CopilotPackageDetail, inc
     for (const key of ["environmentId", "cdsBotId", "schemaName", "manifestId", "entraApplicationId"] as const) {
       if (next.identity[key] !== undefined && previous.identity?.[key] !== next.identity[key]) return true;
     }
-    if (next.identity.graphAgentIds.length
-      && JSON.stringify(previous.identity?.graphAgentIds ?? []) !== JSON.stringify(next.identity.graphAgentIds)) return true;
+    if (next.identity.graphAgentIds.some(id => !previous.identity?.graphAgentIds.includes(id))) return true;
   }
-  const previousBot = readPackageCustomEngineBotIdentity(current);
-  const incomingBotGroups = incomingDetails.filter(group =>
-    ["Bots", "CustomEngineCopilots"].some(type => isPackageElementType(group.elementType, type)));
-  if (!previousBot || !incomingBotGroups.length) return false;
-  // Compare positive readback evidence with the retained complementary type; omissions are not deletions.
-  const elementDetails = [
-    ...current.elementDetails?.filter(group =>
-      !incomingBotGroups.some(incomingGroup => isPackageElementType(group.elementType, incomingGroup.elementType))) ?? [],
-    ...incomingBotGroups,
-  ];
-  return readPackageCustomEngineBotIdentity({ ...current, elementDetails })?.botApplicationId !== previousBot.botApplicationId;
+  return packageCustomEngineBotIdentityChanged(current, { ...incoming, elementDetails: incomingDetails });
 }

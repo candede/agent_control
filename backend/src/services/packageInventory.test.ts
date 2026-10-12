@@ -6,7 +6,8 @@ import { activateAccountSession, revokeAccountSessionMutations } from "../db/ses
 import type { AuthenticatedUser } from "../types/session.js";
 import { PackageInventoryService } from "./packageInventory.js";
 import type { StreamedInventory } from "./streamedInventory.js";
-import { inventoryRuntime } from "./inventoryRuntime.js";
+import { graphError } from "./graphPackages.js";
+import { inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import * as operationalState from "./operationalState.js";
 
@@ -18,9 +19,9 @@ vi.mock("connect-pg-simple", () => ({
   default: () => class { constructor() { throw new Error("Unit tests must not construct a session store."); } },
 }));
 vi.mock("./inventoryRuntime.js", () => ({
-  inventoryJobInput: async (database: { complete: () => Promise<void> }, scope: unknown, _domain: string, jobId: string) => ({
-    database, scope, jobId,
-  }),
+  inventoryJobInput: vi.fn(async (database: { complete: () => Promise<void> }, scope: unknown, _domain: string, jobId: string) => ({
+    database, scope, jobId, deadlineAt: new Date(Date.now() + packageRefreshExecutionDeadlineMs),
+  })),
   completeInventoryJob: (input: { database: { complete: () => Promise<void> } }) => async () => input.database.complete(),
   inventoryRuntime: vi.fn(() => ({ enqueue: async () => false })),
 }));
@@ -41,14 +42,14 @@ function fixture(options: { autoDetails?: boolean; exact?: boolean; application?
     autoDetails: options.autoDetails ?? false, targetCount: options.exact || options.autoDetails ? 20 : 0,
     status: "waiting_authorization", pageCount: 0, observedCount: 0, totalRecords: null as number | null,
     snapshotId: null, createdAt: "2026-09-09T00:00:00.000Z", attemptedAt: null,
-    updatedAt: "2026-09-09T00:00:00.000Z", finishedAt: null,
+    updatedAt: "2026-09-09T00:00:00.000Z", resultRevision: "2026-09-09 00:00:00+00", finishedAt: null,
   };
   const repository = {
-    submit: vi.fn(async () => job), getJob: vi.fn(async (_scope?: unknown, id = job.id) => ({ ...job, id })),
+    submit: vi.fn(async () => job), getJob: vi.fn(async (_scope?: unknown, id = job.id): Promise<typeof job | undefined> => ({ ...job, id })),
     claimDueDetails: vi.fn(async () => null as typeof job | null), latestAutomaticDetailsJob: vi.fn(async () => null as typeof job | null),
     markRunning: vi.fn(async () => true), recordProgress: vi.fn(async () => undefined), complete: vi.fn(async () => undefined),
     markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => job),
-    cancel: vi.fn(async () => ({ ...job, status: "cancelled" })), recoverInterrupted: vi.fn(async () => 0),
+    cancel: vi.fn(async (): Promise<typeof job | undefined> => ({ ...job, status: "cancelled" })), recoverInterrupted: vi.fn(async () => 0),
   };
   const collection = vi.fn(async (_token: string, _options: Options) => {});
   const execute = async (_input: unknown, token: string, options: Options) => {
@@ -57,6 +58,7 @@ function fixture(options: { autoDetails?: boolean; exact?: boolean; application?
     await options.authorize(options.signal!);
     expect(options.commitPublication).toBeTypeOf("function");
     await options.commitPublication!(() => options.completeJob!({} as never, {} as never));
+    options.onCommitted?.();
   };
   const streams = {
     graphCatalog: vi.fn(execute),
@@ -66,7 +68,8 @@ function fixture(options: { autoDetails?: boolean; exact?: boolean; application?
     observeOperation: vi.fn(async (_id: unknown, _user: unknown, operation: (failure: (error: unknown) => void) => Promise<unknown>) => operation(() => {})),
     revalidateUser: vi.fn(async () => owner), delegatedToken: vi.fn(async () => "synthetic-delegated"),
     applicationToken: vi.fn(async () => "synthetic-application"), requireAvailable: vi.fn(async () => undefined),
-    requireApplicationDataScope: vi.fn(async () => undefined), applicationPrincipalId: vi.fn(() => "synthetic-application-id"),
+    beginOperationValidation: vi.fn(() => () => undefined),
+    requireApplicationDataScope: vi.fn(async (): Promise<void> => undefined), applicationPrincipalId: vi.fn(() => "synthetic-application-id"),
     wait: vi.fn(async (_milliseconds: number, signal: AbortSignal) => { signal.throwIfAborted(); }),
     streams: () => streams,
   };
@@ -82,7 +85,10 @@ function pendingCollection(f: ReturnType<typeof fixture>) {
 }
 
 describe("streamed package refresh service", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
+      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    }] }) });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -105,6 +111,7 @@ describe("streamed package refresh service", () => {
       expect(f.repository.markRunning).toHaveBeenCalledBefore(f.collection);
       expect(f.collection).toHaveBeenCalledOnce();
       expect(f.collection.mock.calls[0][1].retryThrottlingUntilAborted).toBe(!mode.autoDetails);
+      expect(f.collection.mock.calls[0][1].executionDeadlineAt).toBeGreaterThan(Date.now());
       expect(f.streams.graphCatalog).toHaveBeenCalledTimes(mode.exact || mode.autoDetails ? 0 : 1);
       expect(f.streams.exactJob).toHaveBeenCalledTimes(mode.exact || mode.autoDetails ? 1 : 0);
       if (mode.exact || mode.autoDetails) expect(f.streams.exactJob.mock.calls[0][2]).toBe(Boolean(mode.autoDetails));
@@ -143,27 +150,275 @@ describe("streamed package refresh service", () => {
     await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
     expect(f.repository.recordProgress.mock.calls).toEqual([
       [expect.anything(), f.job.id, 1, 5, exact ? 20 : null],
-      [expect.anything(), f.job.id, 1, 5, exact ? 20 : null, expect.stringContaining("30 seconds before retrying (5 targets observed)")],
+      [expect.anything(), f.job.id, 1, 5, exact ? 20 : null,
+        expect.stringContaining(`30 seconds before retrying (5 ${exact ? "targets checked" : "packages observed"})`)],
       [expect.anything(), f.job.id, 2, 20, 20],
     ]);
   });
 
-  it.each(["enqueue", "observer"] as const)("does not turn committed success into provider failure after %s fails", async stage => {
+  it.each([false, true])("resets resumed %s-scope progress before a new attempt observes any packages", async exact => {
+    const f = fixture({ exact });
+    Object.assign(f.job, { pageCount: 7, observedCount: 12, totalRecords: 20 });
+    f.collection.mockImplementation(async (_token, options) => {
+      await options.onRetry!({ attempt: 1, retryDelayMs: 1_000, throttled: true });
+      await options.onProgress!({ pages: exact ? 0 : 1, observedCount: 1 });
+    });
+    await f.start();
+    await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
+    expect(f.repository.recordProgress.mock.calls).toEqual([
+      [expect.anything(), f.job.id, 0, 0, null, expect.stringContaining(`(0 ${exact ? "targets checked" : "packages observed"})`)],
+      [expect.anything(), f.job.id, exact ? 0 : 1, 1, exact ? 20 : null],
+    ]);
+    expect(f.collection).toHaveBeenCalledOnce();
+  });
+
+  it.each(["start", "cancel"] as const)("rejects an expired %s status handoff instead of returning an empty successful response", async action => {
+    const f = fixture();
+    pendingCollection(f);
+    if (action === "start") f.repository.getJob.mockResolvedValueOnce(f.job).mockResolvedValueOnce(undefined);
+    else f.repository.cancel.mockResolvedValueOnce(undefined);
+    await expect(action === "start" ? f.start() : f.service.cancel(f.owner, f.job.id, "delegated"))
+      .rejects.toMatchObject({ status: 409, code: "package_refresh_expired" });
+    expect(f.repository.complete).not.toHaveBeenCalled();
+  });
+
+  it.each(["collection", "publication"])("settles a stalled %s progress write without publishing or leaving the refresh running", async stage => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const f = fixture({ exact: true }), pending = deferred<undefined>();
+    f.repository.recordProgress.mockReturnValueOnce(pending.promise);
+    if (stage === "collection") f.collection.mockImplementation(async (_token, options) => {
+      await options.onProgress!({ pages: 0, observedCount: 1 });
+    });
+    else f.dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new AppError(504, "provider_timeout", "Publication readiness is temporarily unavailable."));
+    await f.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "provider_timeout",
+      expect.stringContaining("bounded deadline"));
+    expect(f.repository.complete).not.toHaveBeenCalled();
+    pending.reject(new Error("Observed late progress rejection."));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.repository.markFailed).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a late admission token even when its thirty-second timer is delayed", async () => {
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const f = fixture();
+    f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+      elapsed = 30_001;
+      return "late-token";
+    });
+    await expect(f.start()).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(f.collection).not.toHaveBeenCalled();
+    expect(f.repository.markRunning).not.toHaveBeenCalled();
+  });
+
+  it("reports execution expiry truthfully even when the deadline timer has not been delivered", async () => {
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const f = fixture();
+    f.collection.mockImplementation(async (_token, options) => {
+      elapsed = packageRefreshExecutionDeadlineMs + 1;
+      await options.onProgress!({ pages: 1, observedCount: 1 });
+    });
+    await f.start();
+    await vi.waitFor(() => expect(f.repository.markFailed).toHaveBeenCalledOnce());
+    expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "package_refresh_timeout",
+      expect.stringContaining("four-hour execution deadline"));
+    expect(f.repository.complete).not.toHaveBeenCalled();
+  });
+
+  it("interrupts pending authorization at an earlier persisted deadline instead of renewing the package budget", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const f = fixture(), pending = deferred<AuthenticatedUser>();
+    f.dependencies.revalidateUser.mockResolvedValueOnce(f.owner).mockReturnValueOnce(pending.promise);
+    vi.mocked(inventoryJobInput).mockResolvedValueOnce({
+      scope: { tenantId: f.owner.tenantId!, principalId: f.owner.homeAccountId, kind: "principal",
+        tokenMode: "delegated", source: "inventory_packages", selector: "complete" },
+      schemaVersion: 1, sessionEpoch: "0", jobId: f.job.id, jobKind: "package_refresh",
+      observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+      deadlineAt: new Date(Date.now() + 1000), reserveBytes: 1024,
+    });
+    try {
+      await f.start();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "package_refresh_timeout",
+        expect.stringContaining("previous complete inventory is unchanged"));
+      expect(f.collection).not.toHaveBeenCalled();
+      expect(f.repository.complete).not.toHaveBeenCalled();
+    } finally {
+      await f.service.drain();
+      pending.reject(new AppError(401, "interaction_required", "Late authorization rejection."));
+    }
+  });
+
+  it("does not relabel cancellation diagnostics when a joined collection settles after the deadline", async () => {
+    vi.useFakeTimers();
+    const f = fixture(), pending = deferred<void>();
+    f.collection.mockReturnValueOnce(pending.promise);
+    await f.start();
+    await vi.waitFor(() => expect(f.collection).toHaveBeenCalledOnce());
+    await f.service.cancel(f.owner, f.job.id, "delegated");
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + packageRefreshExecutionDeadlineMs + 1);
+    pending.reject(new Error("Late collection failure."));
+    await f.service.drain();
+    const summaries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))
+      .filter(entry => entry.event === "package_scan_summary");
+    expect(summaries).toMatchObject([{ outcome: "cancelled" }]);
+    expect(f.repository.markFailed).not.toHaveBeenCalled();
+    expect(f.repository.complete).not.toHaveBeenCalled();
+  });
+
+  it.each(["enqueue", "observer", "stream_cleanup"] as const)("does not turn committed success into provider failure after %s fails", async stage => {
     const f = fixture();
     if (stage === "enqueue") vi.mocked(inventoryRuntime).mockReturnValueOnce({
       enqueue: async () => { throw new Error("private follow-up failure"); },
     } as never);
-    else f.dependencies.observeOperation.mockImplementation(async (_id, _user, operation) => {
+    else if (stage === "observer") f.dependencies.observeOperation.mockImplementation(async (_id, _user, operation) => {
       const value = await operation(() => {});
       if (f.repository.complete.mock.calls.length) throw new Error("private follow-up failure");
       return value;
     });
+    else {
+      const publish = f.streams.graphCatalog.getMockImplementation();
+      if (!publish) throw new Error("Expected the fixture publication implementation.");
+      f.streams.graphCatalog.mockImplementationOnce(async (...args) => {
+        await publish(...args);
+        throw new Error("private stream cleanup failure");
+      });
+    }
     await f.start();
     await vi.waitFor(() => expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("package_inventory_followup_failed")));
     expect(f.repository.complete).toHaveBeenCalledOnce();
     expect(f.repository.markFailed).not.toHaveBeenCalled();
     expect(f.repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    expect(inventoryRuntime).toHaveBeenCalledOnce();
     expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("private follow-up");
+  });
+
+  it.each(["TypeError", "private_followup_error"])("bounds committed follow-up exception labels: %s", async name => {
+    const f = fixture();
+    vi.mocked(inventoryRuntime).mockReturnValueOnce({
+      enqueue: async () => { throw Object.assign(new Error("private-message"), { name }); },
+    } as never);
+    await f.start();
+    await vi.waitFor(() => expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("package_inventory_followup_failed")));
+    const followup = vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))
+      .find(entry => entry.event === "package_inventory_followup_failed");
+    if (name === "TypeError") expect(followup).toHaveProperty("reason", "TypeError");
+    else expect(followup).not.toHaveProperty("reason");
+    expect(f.repository.markFailed).not.toHaveBeenCalled();
+    expect(JSON.stringify(followup)).not.toMatch(/private[-_]/);
+  });
+
+  it.each([false, true])("finishes %s-scope collection metrics before failed publication readiness", async exact => {
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const f = fixture({ exact });
+    f.collection.mockImplementation(async (_token, options) => {
+      elapsed = 25;
+      if (exact) options.diagnostics!.completeDetail(true);
+      else options.diagnostics!.catalogPage([{}], 1, false, 25, 999);
+      await options.onProgress!({ pages: exact ? 0 : 1, observedCount: 1, totalRecords: exact ? 20 : 1 });
+    });
+    f.dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(async () => {
+        const summaries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))
+          .filter(entry => entry.event === "package_scan_summary");
+        expect(summaries).toMatchObject([{
+          stage: exact ? "identity" : "catalog", outcome: "collected", count: 1, durationMs: 25,
+          totalRecords: exact ? 20 : 1,
+        }]);
+        elapsed = 50_000;
+        throw new AppError(403, "missing_permission", "private publication denial");
+      });
+    await f.start();
+    await vi.waitFor(() => expect(f.repository.markFailed).toHaveBeenCalledOnce());
+    expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "missing_permission", expect.any(String));
+    expect(f.repository.complete).not.toHaveBeenCalled();
+    const summaries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))
+      .filter(entry => entry.event === "package_scan_summary");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({ outcome: "collected", durationMs: 25 });
+    expect(JSON.stringify(vi.mocked(console.log).mock.calls)).not.toContain("package_refresh_succeeded");
+  });
+
+  it.each([false, true])("logs readiness retries only after %s-scope collection has finished", async exact => {
+    const f = fixture({ exact });
+    const retry = new AppError(504, "provider_timeout", "private readiness failure");
+    f.dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(retry)
+      .mockResolvedValueOnce(undefined).mockRejectedValueOnce(retry);
+    f.collection.mockImplementation(async (_token, options) => {
+      if (exact) options.diagnostics!.completeDetail(true);
+      else options.diagnostics!.catalogPage([{}], 1, false, 0);
+      await options.onProgress!({ pages: exact ? 0 : 1, observedCount: 1, totalRecords: exact ? 20 : 1 });
+    });
+    await f.start();
+    await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
+    const logs = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls]
+      .map(([entry]) => JSON.parse(entry));
+    expect(logs.filter(entry => entry.event === "package_publication_readiness_retry")).toMatchObject([{
+      jobId: f.job.id, stage: "publication_authorization", count: 1, attempt: 1, retryDelayMs: 1_000,
+      errorCode: "provider_timeout",
+    }]);
+    expect(f.collection).toHaveBeenCalledOnce();
+    expect(f.dependencies.wait).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(logs)).not.toContain("private readiness");
+  });
+
+  it.each([
+    { status: 500, code: "interaction_required", expected: "graph_http_500", waiting: false },
+    { status: 401, code: "private_provider_code", expected: "interaction_required", waiting: true },
+    { status: 400, code: "private_provider_code", expected: "graph_http_400", waiting: false },
+  ])("uses HTTP $status rather than provider code $code for scan job state and messages", async ({ status, code, expected, waiting }) => {
+    const f = fixture();
+    const error = await graphError(Response.json({ error: { code, message: "private-message" } }, {
+      status, headers: { "request-id": "private-request-id" },
+    }));
+    f.collection.mockRejectedValueOnce(error);
+    await f.start();
+    await vi.waitFor(() => expect(f.repository.markFailed.mock.calls.length + f.repository.markWaitingAuthorization.mock.calls.length).toBe(1));
+    if (waiting) expect(f.repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+    else expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, expected, expect.any(String));
+    expect(f.repository.complete).not.toHaveBeenCalled();
+    const output = JSON.stringify([...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls,
+      ...vi.mocked(console.error).mock.calls, ...f.repository.markFailed.mock.calls]);
+    expect(output).not.toMatch(/private[-_]/);
+  });
+
+  it("releases a committed refresh after bounded canonical follow-up without losing durable success", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const f = fixture(), pending = deferred<boolean>();
+    const enqueue = vi.fn((_scope: unknown, _schedule: boolean, _signal: AbortSignal) => pending.promise);
+    vi.mocked(inventoryRuntime).mockReturnValueOnce({ enqueue } as never);
+    await f.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.repository.complete).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(enqueue.mock.calls[0][2].aborted).toBe(true);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("package_inventory_followup_failed"));
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("package_refresh_succeeded"));
+    expect(f.repository.markFailed).not.toHaveBeenCalled();
+    expect(f.repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    await expect(f.start()).resolves.toMatchObject({ id: f.job.id });
+    pending.reject(new Error("Observed late canonical follow-up rejection."));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.repository.markFailed).not.toHaveBeenCalled();
   });
 
   it.each(["provider_timeout", "provider_network_error", "provider_throttled"])(
@@ -240,6 +495,9 @@ describe("streamed package refresh service", () => {
     expect(f.repository.complete).toHaveBeenCalledTimes(stage === "commit" ? 1 : 0);
     expect(f.dependencies.wait).not.toHaveBeenCalled();
     expect(JSON.stringify(vi.mocked(console.log).mock.calls)).not.toContain("package_refresh_succeeded");
+    const summaries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))
+      .filter(entry => entry.event === "package_scan_summary");
+    expect(summaries).toMatchObject([{ stage: "identity", outcome: stage === "commit" ? "collected" : "failed" }]);
     expect(inventoryRuntime).not.toHaveBeenCalled();
   });
 
@@ -330,8 +588,9 @@ describe("streamed package refresh service", () => {
     (["cancel", "logout", "shutdown", "deadline"] as const).flatMap(action =>
       (["resolve", "reject"] as const).map(settlement => ({ stage, action, settlement })))))(
     "keeps $action authoritative after pending $stage authorization $settlement", async ({ stage, action, settlement }) => {
-      const f = fixture(), pending = deferred<AuthenticatedUser>(), deadline = new AbortController();
-      vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      vi.useFakeTimers();
+      const f = fixture(), pending = deferred<AuthenticatedUser>();
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
       f.dependencies.revalidateUser.mockResolvedValueOnce(f.owner);
       if (stage === "publication") f.dependencies.revalidateUser.mockResolvedValueOnce(f.owner);
       f.dependencies.revalidateUser.mockReturnValueOnce(pending.promise);
@@ -342,12 +601,16 @@ describe("streamed package refresh service", () => {
       if (action === "logout") await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, () =>
         f.service.waitForPrincipalAuthorization({ tenantId: f.owner.tenantId!, principalId: f.owner.homeAccountId }));
       if (action === "shutdown") draining = f.service.drain();
-      deadline.abort(new DOMException("Execution deadline", "TimeoutError"));
+      await vi.advanceTimersByTimeAsync(packageRefreshExecutionDeadlineMs);
       if (settlement === "resolve") pending.resolve(f.owner);
       else pending.reject(new AppError(403, "missing_permission", "Late private rejection."));
       await (draining ?? f.service.drain());
       expect(f.repository.complete).not.toHaveBeenCalled();
-      expect(getEventListeners(deadline.signal, "abort")).toHaveLength(0);
+      const summaries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))
+        .filter(entry => entry.event === "package_scan_summary");
+      expect(summaries).toHaveLength(1);
+      if (stage === "publication") expect(summaries[0]).toHaveProperty("outcome", "collected");
+      expect(vi.getTimerCount()).toBe(0);
       expect(f.repository.markFailed).toHaveBeenCalledTimes(action === "deadline" ? 1 : 0);
       if (action === "deadline") expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id,
         "package_refresh_timeout", expect.stringContaining("four-hour execution deadline"));
@@ -374,16 +637,15 @@ describe("streamed package refresh service", () => {
     vi.useFakeTimers();
     const f = fixture({ autoDetails });
     pendingCollection(f);
-    let execution!: AbortSignal;
+    const limit = autoDetails ? 300_000 : packageRefreshExecutionDeadlineMs;
     vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
       const controller = new AbortController();
-      execution = controller.signal;
       setTimeout(() => controller.abort(new DOMException("Execution deadline", "TimeoutError")), milliseconds);
       return controller.signal;
     });
     await f.start();
     await vi.advanceTimersByTimeAsync(0);
-    const limit = autoDetails ? 300_000 : packageRefreshExecutionDeadlineMs;
+    const execution = f.collection.mock.calls[0][1].signal!;
     expect(packageRefreshExecutionDeadlineMs).toBe(4 * 60 * 60_000);
     await vi.advanceTimersByTimeAsync(limit - 1);
     expect(execution.aborted).toBe(false);
@@ -393,6 +655,39 @@ describe("streamed package refresh service", () => {
       expect.stringContaining(autoDetails ? "five-minute" : "four-hour"));
     expect(f.repository.complete).not.toHaveBeenCalled();
     expect(getEventListeners(execution, "abort")).toHaveLength(0);
+  });
+
+  it.each(["token", "publication"] as const)("cannot adopt a replacement capability generation during %s", async stage => {
+    const f = fixture(), reason = new AppError(401, "authorization_expired", "Capability authority changed.");
+    let current = true;
+    f.dependencies.beginOperationValidation.mockReturnValue(() => { if (!current) throw reason; });
+    if (stage === "token") f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+      current = false;
+      return "late-token";
+    });
+    else f.collection.mockImplementationOnce(async () => { current = false; });
+    if (stage === "token") await expect(f.start()).rejects.toBe(reason);
+    else {
+      await f.start();
+      await vi.waitFor(() => expect(f.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
+    }
+    expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.delegated", f.owner);
+    expect(f.repository.complete).not.toHaveBeenCalled();
+    expect(f.collection).toHaveBeenCalledTimes(stage === "token" ? 0 : 1);
+  });
+
+  it("settles cancelled non-cooperative token acquisition without retaining the admission lane", async () => {
+    const f = fixture(), pending = deferred<string>();
+    f.dependencies.delegatedToken.mockReturnValueOnce(pending.promise);
+    const starting = f.start();
+    const assertion = expect(starting).rejects.toMatchObject({ code: "read_job_cancelled" });
+    await vi.waitFor(() => expect(f.dependencies.delegatedToken).toHaveBeenCalledOnce());
+    await f.service.cancel(f.owner, f.job.id, "delegated");
+    await assertion;
+    expect(f.repository.markRunning).not.toHaveBeenCalled();
+    expect(f.collection).not.toHaveBeenCalled();
+    pending.reject(new Error("private late token error"));
+    await f.service.drain();
   });
 
   it("reserves four foreground and two persisted automatic lanes, counts a job once, and conceals active jobs", async () => {
@@ -442,6 +737,44 @@ describe("streamed package refresh service", () => {
     expect(f.collection).not.toHaveBeenCalled();
   });
 
+  it.each((["unclaimed", "draining", "capacity"] as const).flatMap(branch =>
+    (["logout", "replace", "capability"] as const).map(action => ({ branch, action }))))(
+    "rejects pending automatic history on $action in the $branch fallback without provider work", async ({ branch, action }) => {
+      const f = fixture({ autoDetails: true }), pending = deferred<typeof f.job>();
+      const reason = new AppError(401, "authorization_expired", "Capability authority changed.");
+      let current = true;
+      f.dependencies.beginOperationValidation.mockReturnValue(() => { if (!current) throw reason; });
+      if (branch === "draining") await f.service.drain();
+      if (branch === "capacity") {
+        pendingCollection(f);
+        await f.start();
+        await f.service.start(f.owner, randomUUID(), "delegated");
+        await vi.waitFor(() => expect(f.collection).toHaveBeenCalledTimes(2));
+        f.dependencies.revalidateUser.mockClear();
+        f.dependencies.requireAvailable.mockClear();
+        f.dependencies.delegatedToken.mockClear();
+        f.repository.markRunning.mockClear();
+        f.collection.mockClear();
+      }
+      f.repository.latestAutomaticDetailsJob.mockReturnValueOnce(pending.promise);
+      const request = f.service.refreshDueDetails(f.owner);
+      const stopped = expect(request).rejects.toMatchObject({ code: action === "capability" ? reason.code : "unauthorized" });
+      await vi.waitFor(() => expect(f.repository.latestAutomaticDetailsJob).toHaveBeenCalledOnce());
+      if (action === "capability") current = false;
+      else if (action === "replace") await activateAccountSession(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+      else await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+      pending.resolve(f.job);
+      await stopped;
+      expect(f.repository.claimDueDetails).toHaveBeenCalledTimes(branch === "unclaimed" ? 1 : 0);
+      expect(f.dependencies.revalidateUser).not.toHaveBeenCalled();
+      expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
+      expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+      expect(f.repository.markRunning).not.toHaveBeenCalled();
+      expect(f.repository.markFailed).not.toHaveBeenCalled();
+      expect(f.collection).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["claim", "start"] as const)("joins coordinator cancellation during automatic %s without collecting", async stage => {
     const f = fixture({ autoDetails: true }), pending = deferred<unknown>(), controller = new AbortController();
     f.repository.claimDueDetails.mockResolvedValue(f.job);
@@ -457,13 +790,57 @@ describe("streamed package refresh service", () => {
     expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
   });
 
+  it.each(["claim", "token", "publication"] as const)(
+    "retains the initiating automatic capability generation through %s", async stage => {
+      const f = fixture({ autoDetails: true });
+      const reason = new AppError(401, "authorization_expired", "Capability authority changed.");
+      let generation = 0;
+      f.dependencies.beginOperationValidation.mockImplementation(() => {
+        const initiating = generation;
+        return () => { if (generation !== initiating) throw reason; };
+      });
+      f.repository.claimDueDetails.mockImplementationOnce(async () => {
+        if (stage === "claim") generation++;
+        return f.job;
+      });
+      if (stage === "token") f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+        generation++;
+        return "replacement-token";
+      });
+      const publication = deferred<void>();
+      if (stage === "publication") f.collection.mockImplementationOnce(async () => {
+        await publication.promise;
+        generation++;
+      });
+      if (stage === "publication") {
+        await f.service.refreshDueDetails(f.owner);
+        publication.resolve();
+        await vi.waitFor(() => expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id,
+          "interaction_required", expect.stringContaining("renewed")));
+      } else await expect(f.service.refreshDueDetails(f.owner)).rejects.toBe(reason);
+      expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.delegated", f.owner);
+      expect(f.dependencies.beginOperationValidation).toHaveBeenCalledBefore(f.repository.claimDueDetails);
+      expect(f.repository.markRunning).toHaveBeenCalledTimes(stage === "publication" ? 1 : 0);
+      expect(f.collection).toHaveBeenCalledTimes(stage === "publication" ? 1 : 0);
+      expect(f.repository.complete).not.toHaveBeenCalled();
+      if (stage === "claim") {
+        expect(f.dependencies.revalidateUser).not.toHaveBeenCalled();
+        expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
+        expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+        expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "authorization_expired",
+          expect.stringContaining("renewed"), f.job.resultRevision);
+      }
+    },
+  );
+
   it.each([401, 403])("backs off automatic admission with truthful HTTP %s status", async status => {
     const f = fixture({ autoDetails: true });
     f.repository.claimDueDetails.mockResolvedValue(f.job);
     f.dependencies.requireAvailable.mockRejectedValueOnce(new AppError(status, status === 401 ? "interaction_required" : "missing_permission", "Denied."));
     await f.service.refreshDueDetails(f.owner);
     expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id,
-      status === 401 ? "interaction_required" : "missing_permission", expect.stringContaining(status === 401 ? "renewed" : "permission"));
+      status === 401 ? "interaction_required" : "missing_permission", expect.stringContaining(status === 401 ? "renewed" : "permission"),
+      f.job.resultRevision);
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
 
@@ -474,7 +851,7 @@ describe("streamed package refresh service", () => {
       await f.service.submit(admin, { tokenMode, requestedIds: ["exact"], idempotencyKey: randomUUID() });
       expect(f.repository.submit).toHaveBeenLastCalledWith({ tenantId: f.owner.tenantId,
         principalId: tokenMode === "application" ? "synthetic-application-id" : f.owner.homeAccountId },
-      expect.objectContaining({ tokenMode, authorizationPrincipalId: f.owner.homeAccountId }));
+      expect.objectContaining({ tokenMode, authorizationPrincipalId: f.owner.homeAccountId }), expect.any(Function));
     }
     await expect(f.service.submit({ ...f.owner, roles: [] }, { tokenMode: "delegated", idempotencyKey: randomUUID() }))
       .rejects.toMatchObject({ code: "missing_internal_role" });
@@ -486,6 +863,53 @@ describe("streamed package refresh service", () => {
     expect(f.repository.cancel).toHaveBeenLastCalledWith(expect.anything(), f.job.id, f.owner.homeAccountId, "sync_cleanup");
     await f.service.recover();
     expect(f.repository.recoverInterrupted).toHaveBeenCalledOnce();
+  });
+
+  it.each(["logout", "replace", "capability"] as const)("rejects stale application submission on %s before creating a job", async action => {
+    const f = fixture({ application: true }), pending = deferred<void>();
+    const reason = new AppError(401, "authorization_expired", "Capability authority changed.");
+    let current = true;
+    f.dependencies.beginOperationValidation.mockReturnValue(() => { if (!current) throw reason; });
+    f.dependencies.requireApplicationDataScope.mockReturnValueOnce(pending.promise);
+    const submitted = f.service.submit(f.owner, { tokenMode: "application", idempotencyKey: randomUUID() });
+    const stopped = expect(submitted).rejects.toMatchObject({ code: action === "capability" ? reason.code : "unauthorized" });
+    await vi.waitFor(() => expect(f.dependencies.requireApplicationDataScope).toHaveBeenCalledOnce());
+    if (action === "capability") current = false;
+    else if (action === "replace") await activateAccountSession(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+    else await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+    pending.resolve();
+    await stopped;
+    expect(f.repository.submit).not.toHaveBeenCalled();
+    expect(f.collection).not.toHaveBeenCalled();
+  });
+
+  it.each(["logout", "replace"] as const)("rejects a pending saved status read on %s without checking provider availability", async action => {
+    const f = fixture(), pending = deferred<typeof f.job>();
+    f.repository.getJob.mockReturnValueOnce(pending.promise);
+    const reading = f.service.get(f.owner, f.job.id, f.job.tokenMode);
+    const stopped = expect(reading).rejects.toMatchObject({ code: "unauthorized" });
+    await vi.waitFor(() => expect(f.repository.getJob).toHaveBeenCalledOnce());
+    if (action === "replace") await activateAccountSession(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+    else await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+    pending.resolve(f.job);
+    await stopped;
+    expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
+    expect(f.dependencies.revalidateUser).not.toHaveBeenCalled();
+    expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
+  it.each(["requested", "sync_cleanup"] as const)("keeps %s cancellation's authority contract after account revocation during lookup", async reason => {
+    const f = fixture(), pending = deferred<typeof f.job>();
+    f.repository.getJob.mockReturnValueOnce(pending.promise);
+    const cancelling = f.service.cancel(f.owner, f.job.id, f.job.tokenMode, reason);
+    const outcome = reason === "requested" ? expect(cancelling).rejects.toMatchObject({ code: "unauthorized" })
+      : expect(cancelling).resolves.toMatchObject({ status: "cancelled" });
+    await revokeAccountSessionMutations(f.owner.tenantId!, f.owner.homeAccountId, async () => {});
+    pending.resolve(f.job);
+    await outcome;
+    expect(f.repository.cancel).toHaveBeenCalledTimes(reason === "requested" ? 0 : 1);
+    if (reason === "sync_cleanup") expect(f.repository.cancel).toHaveBeenCalledWith(expect.anything(), f.job.id, f.owner.homeAccountId, reason);
+    expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
   });
 
   it.each(["background", "drain"] as const)("surfaces sanitized status persistence failures to %s", async mode => {

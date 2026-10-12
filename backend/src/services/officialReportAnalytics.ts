@@ -37,14 +37,20 @@ export function officialReportAnalyticsQuery(reports: LargeTenantUsersReports, c
     values: context.endpoint === "official_agents" ? [...values, context.evaluatedAt, context.query.inactiveDays, context.query.activityWindowDays] : values };
 }
 export function projectReportAnalytics(totals: pg.QueryResultRow, context: ReportReadContext): ReportAnalytics {
-  const result: ReportAnalytics = { basis: "filtered_rows", rowCount: exactCount(totals.n), responses: n(totals.responses),
+  const rowCount = exactCount(totals.n);
+  const hasResponseSource = context.report.lineages.some(({ kind }) => context.endpoint === "official_agents"
+    ? kind === "agents" || kind === "userAgents" : context.endpoint === "relationships" ? kind === "userAgents"
+      : ["copilot_users", "official_users", "unresolved"].includes(context.endpoint) && kind === "users")
+    && (context.endpoint !== "copilot_users" || context.metadata.directory.generationId !== null);
+  const result: ReportAnalytics = { basis: "filtered_rows", rowCount,
+    responses: totals.responses === null && rowCount === 0 && hasResponseSource ? 0 : n(totals.responses),
     zeroResponses: n(totals.zero), unknownResponses: n(totals.unknown), review: null, agents: null, history: null, overview: null };
   if (["copilot_users", "official_users"].includes(context.endpoint)) {
     result.review = { zero: exactCount(totals.review_zero), low: exactCount(totals.review_low), unknown: exactCount(totals.review_unknown) };
   }
   if (context.endpoint === "official_agents") {
     const ranking = (rows: Array<{ agent_id: string; name: string; responses: string }>) =>
-      rows.map(row => ({ agentId: row.agent_id, name: row.name, responses: exactCount(row.responses) }));
+      rows.map(row => ({ agentId: row.agent_id, name: row.name || row.agent_id, responses: exactCount(row.responses) }));
     result.agents = { inactive: exactCount(totals.inactive), neverUsed: exactCount(totals.never), anchorDateUtc: totals.anchor,
       windowDays: context.query.activityWindowDays!, windowAgents: exactCount(totals.window_agents), windowResponses: n(totals.window_responses),
       windowDistinctActiveUsers: exactCount(totals.active_users), mostResponses: ranking(totals.most), leastResponses: ranking(totals.least) };

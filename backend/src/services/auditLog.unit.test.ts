@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { pool } from "../db/pool.js";
+import { auditMetadata } from "../types/audit.js";
 import { AuditLog } from "./auditLog.js";
 
 vi.mock("../db/pool.js", () => ({ pool: { query: vi.fn() }, secretValue: vi.fn() }));
@@ -18,6 +19,27 @@ const row = {
 
 beforeEach(() => {
   query.mockReset().mockRejectedValue(new Error("Unexpected audit database query."));
+});
+
+describe("audit metadata boundary", () => {
+  it("retains bounded unified export provenance without identities, filters or exported data", () => {
+    const metadata = { source: "unified_agents", revision: "a".repeat(64), selection: "exact", partial: true, resultingCount: 2 };
+    expect(auditMetadata({ ...metadata, recordIds: ["private-agent"], query: { search: "private" }, rows: ["private-row"] })).toEqual(metadata);
+    expect(auditMetadata({ revision: "a".repeat(129), selection: {}, partial: [] })).toEqual({});
+  });
+
+  it("retains bounded official export lineage but never exported rows", () => {
+    expect(auditMetadata({ source: "official_usage", reportSetId: "set-1", reportingStart: "2026-09-01",
+      reportingEnd: "2026-09-07", resultingCount: 1, rows: [{ username: "private" }] })).toEqual({
+      source: "official_usage", reportSetId: "set-1", reportingStart: "2026-09-01", reportingEnd: "2026-09-07", resultingCount: 1,
+    });
+  });
+
+  it("retains export phase and exact query fingerprints without accepting raw query content as a hash", () => {
+    expect(auditMetadata({ phase: "download", queryHash: "a".repeat(64), query: { username: "private" } }))
+      .toEqual({ phase: "download", queryHash: "a".repeat(64) });
+    expect(auditMetadata({ queryHash: "private filter", phase: "x".repeat(129) })).toEqual({});
+  });
 });
 
 describe("audit outcome evidence", () => {
@@ -54,9 +76,38 @@ describe("audit outcome evidence", () => {
     query.mockResolvedValueOnce({ ...emptyResult, rows: [row] }).mockResolvedValueOnce(emptyResult);
     expect((await new AuditLog(scope).completeEvent(row.event_id, { status: "cancelled" })).metadata).toEqual(row.metadata);
   });
+
+  it.each([undefined, { poststateHash: "after" }])("does not carry disallowed stored metadata into an outcome (%j)", async metadata => {
+    const storedMetadata = { ...row.metadata, accessToken: "synthetic-private-token", errorDetails: { message: "private-provider-body" },
+      principals: ["private-principal"], rows: ["private-row"], revision: "x".repeat(129) };
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [{ ...row, metadata: storedMetadata }] }).mockResolvedValueOnce(emptyResult);
+    const completed = await new AuditLog(scope).completeEvent(row.event_id, { status: "failed", metadata });
+    expect(completed.metadata).toEqual({ ...row.metadata, ...metadata });
+    expect(query.mock.calls[1][1]?.[18]).toEqual(completed.metadata);
+    expect(storedMetadata).toHaveProperty("accessToken", "synthetic-private-token");
+  });
 });
 
 describe("audit read contracts", () => {
+  it.each(["event", "list", "export"] as const)("redacts stored metadata at the %s read boundary", async method => {
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [{ ...row, metadata: {
+      ...row.metadata, accessToken: "synthetic-private-token", errorDetails: { message: "private-provider-body" },
+      principals: ["private-principal"], rows: ["private-row"], revision: "x".repeat(129),
+    } }] });
+    const audit = new AuditLog(scope);
+    const events = method === "event" ? [await audit.getEvent(row.event_id)]
+      : method === "list" ? await audit.listEvents() : await audit.getExportEvents([row.event_id]);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.metadata).toEqual(row.metadata);
+    expect(events[0]?.actor).toEqual({ tenantId: scope.tenantId, homeAccountId: scope.principalId,
+      username: row.actor_username, displayName: row.actor_name });
+  });
+
+  it.each(["private-stored-content", 1, ["private-row"]])("omits non-object stored metadata (%j)", async metadata => {
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [{ ...row, metadata }] });
+    expect((await new AuditLog(scope).getEvent(row.event_id))?.metadata).toBeUndefined();
+  });
+
   it.each(["event", "list", "count", "export", "operation"] as const)(
     "applies principal scope and 90-day expiry to %s reads before selection", async method => {
       query.mockResolvedValueOnce({ ...emptyResult, rows: method === "count" ? [{ count: 0 }] : [] });

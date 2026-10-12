@@ -98,6 +98,51 @@ describe("DirectoryPrincipalsClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each(["ma\0il", "ma\nil", "\tmail", "mail\u007f", "ma\u0085il", "mail\u009f"])("rejects control characters in search input: %j", async query => {
+    const fetcher = vi.fn<FetchLike>();
+    await expect(new DirectoryPrincipalsClient(fetcher).search("token", query))
+      .rejects.toMatchObject({ status: 400, code: "invalid_directory_search" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("returns unique canonical Graph GUIDs without changing directory labels or following continuation links", async () => {
+    const id = "ABCDEF01-2345-6789-CDEF-0123456789AB";
+    const fetcher = vi.fn<FetchLike>(async input => Response.json(new URL(input).pathname.endsWith("/users") ? {
+      value: [
+        { id, displayName: "Same user", mail: "Mail@Example.invalid", userPrincipalName: "Login@Example.invalid" },
+        { id: id.toLowerCase(), displayName: "Duplicate user" },
+      ],
+      "@odata.count": 3,
+      "@odata.nextLink": `${input}&$skiptoken=opaque`,
+    } : { value: [{
+      id: securityGroupId.toUpperCase(), displayName: "Security group", securityEnabled: true, groupTypes: [],
+    }] }));
+
+    await expect(new DirectoryPrincipalsClient(fetcher).search("token", "Same"))
+      .resolves.toEqual([
+        { resourceType: "user", resourceId: id.toLowerCase(), displayName: "Same user", principalKind: "user",
+          secondaryText: "Mail@Example.invalid", userPrincipalName: "Login@Example.invalid" },
+        expect.objectContaining({ resourceType: "group", resourceId: securityGroupId }),
+      ]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("breaks equal-name ties by typed identity before applying the combined limit", async () => {
+    const ids = [userId, microsoft365GroupId, securityGroupId];
+    for (const order of [ids, [...ids].reverse()]) {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({
+        value: order.map(id => ({
+          id, displayName: "Same name", securityEnabled: true,
+        })),
+      }));
+      await expect(new DirectoryPrincipalsClient(fetcher).search("token", "Same", 2))
+        .resolves.toEqual([
+          expect.objectContaining({ resourceType: "group", resourceId: securityGroupId }),
+          expect.objectContaining({ resourceType: "group", resourceId: microsoft365GroupId }),
+        ]);
+    }
+  });
+
   it.each(["users", "groups"])("rejects a null %s search collection", async (collection) => {
     const fetcher = vi.fn<FetchLike>(async (input) =>
       Response.json(new URL(input).pathname.endsWith(`/${collection}`) ? null : { value: [] }),
@@ -217,9 +262,9 @@ describe("DirectoryPrincipalsClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it.each([200, 403, 404].flatMap(status =>
+  it.each([200, 401, 403, 404, 429].flatMap(status =>
     [false, true].map(deadline => ({ status, deadline })),
-  ))("cancels a stalled directory body with status $status (deadline: $deadline)", async ({ status, deadline }) => {
+  ))("bounds a stalled directory body without losing status $status (request deadline: $deadline)", async ({ status, deadline }) => {
     const controller = new AbortController();
     const timeout = deadline ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal) : undefined;
     const cancel = vi.fn();
@@ -228,7 +273,7 @@ describe("DirectoryPrincipalsClient", () => {
       start(stream) { streamController = stream; },
       cancel,
     });
-    const fetcher = vi.fn<FetchLike>(async () => new Response(body, { status }));
+    const fetcher = vi.fn<FetchLike>(async () => new Response(body, { status, headers: { "Retry-After": "17" } }));
     const pending = new DirectoryPrincipalsClient(fetcher).resolve("token", [
       { resourceType: "user", resourceId: userId },
     ], deadline ? undefined : controller.signal);
@@ -242,7 +287,13 @@ describe("DirectoryPrincipalsClient", () => {
 
     try {
       const result = await Promise.race([observed, setImmediate().then(() => "still pending")]);
-      expect(result).toEqual({ status: "rejected", error: reason });
+      if (!deadline || status === 200) expect(result).toEqual({ status: "rejected", error: reason });
+      else if (status === 404) expect(result).toEqual({ status: "resolved", value: [
+        { resourceId: userId, resourceType: "user", displayName: userId, principalKind: "unknown" },
+      ] });
+      else expect(result).toMatchObject({
+        status: "rejected", error: { status, code: "graph_error", details: { httpStatus: status, retryAfterMs: 17_000 } },
+      });
       expect(cancel).toHaveBeenCalledOnce();
       if (timeout) expect(timeout).toHaveBeenCalledWith(10_000);
     } finally {
@@ -332,7 +383,7 @@ describe("DirectoryPrincipalsClient", () => {
     }
   });
 
-  it.each([200, 403, 404])("keeps the request deadline authoritative between body completion and response mapping for %s", async status => {
+  it.each([200, 403, 404])("preserves HTTP %s across a request deadline after body completion", async status => {
     const controller = new AbortController();
     const reason = new DOMException("Directory request timed out", "TimeoutError");
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
@@ -347,8 +398,12 @@ describe("DirectoryPrincipalsClient", () => {
       },
     }, { highWaterMark: 0 }), { status }));
     try {
-      await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType: "user", resourceId: userId }]))
-        .rejects.toBe(reason);
+      const pending = new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType: "user", resourceId: userId }]);
+      if (status === 200) await expect(pending).rejects.toBe(reason);
+      else if (status === 404) await expect(pending).resolves.toEqual([
+        { resourceId: userId, resourceType: "user", displayName: userId, principalKind: "unknown" },
+      ]);
+      else await expect(pending).rejects.toMatchObject({ status });
     } finally { timeout.mockRestore(); }
   });
 
@@ -364,6 +419,125 @@ describe("DirectoryPrincipalsClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each(["search", "resolve"] as const)("rejects changed authority after %s headers without reading a stalled body", async operation => {
+    let current = true;
+    const controller = new AbortController();
+    const reason = new AppError(401, "authorization_expired", "Directory authority changed.");
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async () => {
+      await Promise.resolve();
+      current = false;
+      return new Response(new ReadableStream<Uint8Array>({ cancel }));
+    });
+    const assertCurrent = () => { if (!current) throw reason; };
+    const client = new DirectoryPrincipalsClient(fetcher);
+    const pending = (operation === "search"
+      ? client.search("token", "person", 25, controller.signal, assertCurrent)
+      : client.resolve("token", [{ resourceType: "user", resourceId: userId }], controller.signal, assertCurrent))
+      .catch(error => error);
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+      expect(cancel).toHaveBeenCalledTimes(operation === "search" ? 2 : 1);
+    } finally {
+      controller.abort();
+      await pending;
+    }
+  });
+
+  it.each(["search", "resolve"] as const)("bounds non-cooperative %s fetches and cancels their late response bodies", async operation => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let completeResponse!: (value: Response) => void;
+    const response = new Promise<Response>(resolve => { completeResponse = resolve; });
+    const fetcher = vi.fn<FetchLike>(() => response);
+    const cancel = vi.fn();
+    const reason = new DOMException("Directory deadline", "TimeoutError");
+    const client = new DirectoryPrincipalsClient(fetcher);
+    const pending = (operation === "search"
+      ? client.search("token", "person")
+      : client.resolve("token", [{ resourceType: "user", resourceId: userId }]))
+      .catch(error => error);
+    try {
+      deadline.abort(reason);
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+    } finally {
+      completeResponse(new Response(new ReadableStream<Uint8Array>({ cancel })));
+      await pending;
+      await setImmediate();
+      timeout.mockRestore();
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["search", "resolve"] as const)("observes a late %s transport rejection after cancellation", async operation => {
+    const controller = new AbortController();
+    let rejectResponse!: (reason: Error) => void;
+    const response = new Promise<Response>((_resolve, reject) => { rejectResponse = reject; });
+    const fetcher = vi.fn<FetchLike>(() => response);
+    const reason = new DOMException("Directory cancelled", "AbortError");
+    const client = new DirectoryPrincipalsClient(fetcher);
+    const pending = (operation === "search"
+      ? client.search("token", "person", 25, controller.signal)
+      : client.resolve("token", [{ resourceType: "user", resourceId: userId }], controller.signal))
+      .catch(error => error);
+    try {
+      controller.abort(reason);
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+    } finally {
+      rejectResponse(new TypeError("Late network failure"));
+      await pending;
+      await setImmediate();
+    }
+  });
+
+  it.each([200, 403, 404, 429])("preserves received HTTP %s when the deadline races header admission", async status => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const reason = new DOMException("Directory deadline", "TimeoutError");
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async () => {
+      queueMicrotask(() => deadline.abort(reason));
+      return new Response(new ReadableStream<Uint8Array>({ cancel }), {
+        status, headers: { "Retry-After": "17" },
+      });
+    });
+    try {
+      const pending = new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType: "user", resourceId: userId }]);
+      if (status === 200) await expect(pending).rejects.toBe(reason);
+      else if (status === 404) await expect(pending).resolves.toEqual([
+        { resourceType: "user", resourceId: userId, displayName: userId, principalKind: "unknown" },
+      ]);
+      else await expect(pending).rejects.toMatchObject({
+        status, details: { httpStatus: status, retryAfterMs: 17_000 },
+      });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
+
+  it.each(["fetch", "body"] as const)("prioritizes changed search authority over a %s failure", async phase => {
+    let current = true;
+    const reason = AppError.unauthorized("Directory authority changed.");
+    const assertCurrent = () => { if (!current) throw reason; };
+    const fetcher = vi.fn<FetchLike>(async input => {
+      if (new URL(input).pathname.endsWith("/groups")) return Response.json({ value: [] });
+      if (phase === "fetch") {
+        await setImmediate();
+        current = false;
+        throw new TypeError("Network failure");
+      }
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(stream) {
+          await setImmediate();
+          current = false;
+          stream.enqueue(new TextEncoder().encode("invalid JSON"));
+          stream.close();
+        },
+      }, { highWaterMark: 0 }));
+    });
+    await expect(new DirectoryPrincipalsClient(fetcher).search("token", "person", 25, undefined, assertCurrent))
+      .rejects.toBe(reason);
+  });
+
   it("rejects a cancelled empty batch without returning a successful result", async () => {
     const reason = new DOMException("Directory lookup cancelled", "AbortError");
     const fetcher = vi.fn<FetchLike>();
@@ -377,6 +551,17 @@ describe("DirectoryPrincipalsClient", () => {
       { resourceType: "user", resourceId: userId },
       { resourceType: "device", resourceId: securityGroupId },
     ])).rejects.toMatchObject({ status: 400, code: "invalid_principal" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reason: "controls", resourceId: `\n${userId}` },
+    { reason: "C1 controls", resourceId: `${userId}\u0085` },
+    { reason: "oversized padding", resourceId: `${" ".repeat(5000)}${userId}` },
+  ])("rejects $reason in principal input before resolving the batch", async ({ resourceId }) => {
+    const fetcher = vi.fn<FetchLike>();
+    await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType: "user", resourceId }]))
+      .rejects.toMatchObject({ status: 400, code: "invalid_principal" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -463,7 +648,17 @@ describe("DirectoryPrincipalsClient", () => {
     await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [
       { resourceType, resourceId: userId },
     ])).resolves.toEqual([expect.objectContaining({
-      resourceType, resourceId: userId.toUpperCase(), displayName: "Same principal",
+      resourceType, resourceId: userId, displayName: "Same principal",
     })]);
+  });
+
+  it.each(["user", "group"])("canonicalizes a missing %s Graph GUID without RFC version or variant restrictions", async resourceType => {
+    const id = "ABCDEF01-2345-6789-CDEF-0123456789AB";
+    const fetcher = vi.fn<FetchLike>(async input => {
+      expect(new URL(input).pathname).toBe(`/v1.0/${resourceType}s/${id.toLowerCase()}`);
+      return Response.json({ error: { code: "Request_ResourceNotFound" } }, { status: 404 });
+    });
+    await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType, resourceId: id }]))
+      .resolves.toEqual([{ resourceType, resourceId: id.toLowerCase(), displayName: id.toLowerCase(), principalKind: "unknown" }]);
   });
 });

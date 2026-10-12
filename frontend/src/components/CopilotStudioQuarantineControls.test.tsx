@@ -4,7 +4,7 @@ import { useState, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import { cancelQuarantineJob, getQuarantineJob, getQuarantineJobs, getQuarantineStatus, previewQuarantine, reconcileQuarantineJob, resumeQuarantineJob, submitQuarantine, type CapabilityView, type QuarantineJob, type QuarantinePreview, type SessionUser } from "../api/client";
+import { cancelQuarantineJob, getQuarantineJob, getQuarantineJobs, getQuarantineStatus, previewQuarantine, reconcileQuarantineJob, resumeQuarantineJob, submitQuarantine, type CapabilityView, type QuarantineJob, type QuarantinePreview, type QuarantineReconciliationResult, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { deferred } from "../test/deferred";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
@@ -38,9 +38,9 @@ function onDemandDecision(): CapabilityView {
   };
 }
 
-function renderControls(view: CapabilityView, currentUser = user, props: Partial<ComponentProps<typeof CopilotStudioQuarantineControls>> = {}) {
+function renderControls(view: CapabilityView, currentUser = user, props: Partial<ComponentProps<typeof CopilotStudioQuarantineControls>> = {}, readView?: CapabilityView) {
   const wrap = (next: CapabilityView, actor: SessionUser, overrides = props) => <CapabilityContext value={{
-    views: [next, {
+    views: [next, readView ?? {
       ...onDemandDecision(), definition: capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.read")!,
       decision: { ...onDemandDecision().decision, capabilityId: "powerPlatform.quarantine.read",
         verification: "provider", checkedAt: snapshot.observedAt, expiresAt: snapshot.expiresAt },
@@ -163,6 +163,21 @@ describe("on-demand quarantine changes", () => {
     expect(cancelQuarantineJob).toHaveBeenCalledExactlyOnceWith(job.id, { signal: expect.any(AbortSignal) });
     expect(await screen.findByText("Quarantine job: Cancelled")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Cancel unsent work" })).not.toBeInTheDocument();
+  });
+
+  it("surfaces failed reconciliation reads while retaining the exact recovery receipt", async () => {
+    const job = { ...completedJob(), status: "inconclusive" as const, succeeded: 0, inconclusive: 1, canReconcile: true };
+    vi.mocked(getQuarantineJob).mockResolvedValue(job);
+    vi.mocked(reconcileQuarantineJob).mockResolvedValue({
+      ...job, reconciliation: { attempted: 1, failed: 1, errors: [{ resourceNativeId: target.nativeId,
+        message: "GET reconciliation could not be completed; no provider state was published." }] },
+    });
+    renderControls(onDemandDecision(), user, { variant: "bulk", initialJobId: job.id });
+    await userEvent.click(await screen.findByRole("button", { name: "Reconcile by status read" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Reconciliation failed for 1 of 1 target");
+    expect(screen.getByText("Quarantine job: Inconclusive")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reconcile by status read" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh job status" })).toBeEnabled();
   });
 
   it("withdraws pre-mutation direct status instead of presenting it as current after submission", async () => {
@@ -327,7 +342,7 @@ describe("on-demand quarantine changes", () => {
     expect(screen.getByRole("dialog")).toBeVisible();
   });
 
-  it.each(["detail", "bulk"] as const)("keeps a %s preview and its frozen native ID through GUID casing changes", async variant => {
+  it.each(["detail", "bulk"] as const)("retires a %s preview when the opaque resource GUID's case changes", async variant => {
     const pending = deferred<QuarantinePreview>();
     vi.mocked(previewQuarantine).mockReturnValue(pending.promise);
     const nativeId = "abcdefab-2222-4222-8222-222222222222";
@@ -335,18 +350,14 @@ describe("on-demand quarantine changes", () => {
     await userEvent.click(screen.getByRole("button", { name: variant === "detail" ? "Quarantine" : "Quarantine selected" }));
     const signal = vi.mocked(previewQuarantine).mock.calls[0][1]?.signal;
     controls.changeProps({ targets: [{ ...target, nativeId: nativeId.toUpperCase() }] });
-    expect(signal?.aborted).toBe(false);
+    expect(signal?.aborted).toBe(true);
     const result = preview();
     result.summary.targets[0].resourceNativeId = nativeId;
     result.statuses[0].target.resourceNativeId = nativeId;
     await act(async () => pending.resolve(result));
-    const dialog = screen.getByRole("dialog");
-    await userEvent.click(within(dialog).getByRole("checkbox"));
-    await userEvent.click(within(dialog).getByRole("button", { name: "Confirm quarantine" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(previewQuarantine).toHaveBeenCalledOnce();
-    expect(submitQuarantine).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      resourceNativeIds: [nativeId],
-    }), expect.any(String), { signal: expect.any(AbortSignal) });
+    expect(submitQuarantine).not.toHaveBeenCalled();
   });
 
   it("accepts new current evidence without waiting for the minute tick", async () => {
@@ -423,6 +434,38 @@ describe("on-demand quarantine changes", () => {
     const [first, second] = vi.mocked(submitQuarantine).mock.calls;
     expect(second.slice(0, 2)).toEqual(first.slice(0, 2));
     expect(await screen.findByText("Quarantine job: Succeeded")).toBeVisible();
+  });
+
+  it("can recover an attempted receipt after provider capability becomes unavailable, but not after losing Admin", async () => {
+    vi.mocked(submitQuarantine).mockRejectedValueOnce(new Error("Submission response unavailable.")).mockResolvedValue(completedJob());
+    const controls = renderControls(onDemandDecision());
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const dialog = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(dialog).getByRole("checkbox"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Confirm quarantine" }));
+    const denied = onDemandDecision();
+    denied.decision.status = "missing_permission";
+    controls.changeDecision(denied, { ...user, roles: ["AgentControl.Viewer"] });
+    expect(within(dialog).getByRole("button", { name: "Confirm quarantine" })).toBeDisabled();
+    controls.changeDecision(denied);
+    expect(within(dialog).getByRole("button", { name: "Confirm quarantine" })).toBeEnabled();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Confirm quarantine" }));
+    const [first, second] = vi.mocked(submitQuarantine).mock.calls;
+    expect(second.slice(0, 2)).toEqual(first.slice(0, 2));
+    expect(previewQuarantine).toHaveBeenCalledOnce();
+    expect(await screen.findByText("Quarantine job: Succeeded")).toBeVisible();
+  });
+
+  it("lets a Viewer read cached direct status without enabling a provider-only recheck", async () => {
+    const read = onDemandDecision();
+    read.definition = capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.read")!;
+    read.decision = { ...read.decision, capabilityId: "powerPlatform.quarantine.read", status: "missing_permission", authorized: false };
+    vi.mocked(getQuarantineStatus).mockResolvedValue({ ...preview().statuses[0], direct: { ...preview().statuses[0].direct, source: "cache" } });
+    renderControls(onDemandDecision(), { ...user, roles: ["AgentControl.Viewer"] }, { canManage: false }, read);
+    await userEvent.click(screen.getByRole("button", { name: "Check direct status" }));
+    expect(getQuarantineStatus).toHaveBeenCalledExactlyOnceWith(snapshot.id, target.nativeId, false, { signal: expect.any(AbortSignal) });
+    expect(screen.getByRole("button", { name: "Recheck direct status" })).toBeDisabled();
+    expect(screen.getByText(/· cache/)).toBeVisible();
   });
 
   it.each(["replacement", "cleared", "expired"] as const)("recovers an attempted bulk receipt after its selection is %s without clearing the newer selection", async boundary => {
@@ -604,8 +647,8 @@ describe("on-demand quarantine changes", () => {
     };
     const replacement = { ...completedJob(), id: "job-b" };
     vi.mocked(getQuarantineJob).mockImplementation(async id => id === initial.id ? initial : replacement);
-    let finish!: (value: QuarantineJob) => void;
-    vi.mocked(mutate).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    let finish!: (value: QuarantineReconciliationResult) => void;
+    vi.mocked(mutate).mockReturnValue(new Promise<QuarantineReconciliationResult>(resolve => { finish = resolve; }));
     const onJobChange = vi.fn();
     const controls = (initialJobId: string) => <CapabilityContext value={{
       views: [onDemandDecision()], user, now: Date.now(), loading: false, pending: false,
@@ -623,7 +666,7 @@ describe("on-demand quarantine changes", () => {
     view.rerender(controls(replacement.id));
     expect(signal?.aborted).toBe(true);
     expect(await screen.findByText("Quarantine job: Succeeded")).toBeVisible();
-    await act(async () => finish(initial));
+    await act(async () => finish({ ...initial, reconciliation: { attempted: 1, failed: 0, errors: [] } }));
     expect(onJobChange).not.toHaveBeenCalled();
     expect(screen.getByText("Quarantine job: Succeeded")).toBeVisible();
   });

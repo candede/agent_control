@@ -3,12 +3,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { findTenantConfiguration } from "../config.js";
 import { PackageRefreshJobs, type PackageDataScope, type PackageRefreshInput } from "../db/packageRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError } from "../errors.js";
+import { AppError, isTimeoutError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus } from "../types/dataSync.js";
 import { capabilities } from "./capabilities.js";
-import { graphErrorTelemetry, graphResponseDiagnostics } from "./graphPackages.js";
+import { graphErrorTelemetry, graphResponseDiagnostics, packageReadTimeoutMs } from "./graphPackages.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
@@ -24,6 +24,7 @@ type PackageRefreshDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   streams: (database: ConstructorParameters<typeof StreamedInventory>[0]) => Pick<StreamedInventory, "exactJob" | "graphCatalog">;
   applicationPrincipalId: (tenantId: string) => string | undefined;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -36,12 +37,17 @@ const defaultDependencies: PackageRefreshDependencies = {
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
+  beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   streams: database => new StreamedInventory(database),
   applicationPrincipalId: tenantId => findTenantConfiguration(tenantId)?.clientId,
   wait: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
 };
 
 type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
+type RefreshAuthority = {
+  validation: ReturnType<typeof beginAccountSessionValidation>;
+  validateCapability: () => void;
+};
 type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void>; autoDetails: boolean };
 type StartingRefresh = Omit<ActiveRefresh, "operation" | "autoDetails"> & {
   autoDetails?: boolean;
@@ -62,30 +68,52 @@ export class PackageInventoryService {
 
   async submit(user: AuthenticatedUser, input: RefreshInput) {
     requireRefreshRole(user);
-    requireProviderAdmissions();
-    if (input.tokenMode === "application") await this.dependencies.requireApplicationDataScope("graph.package.read.application", user);
+    const actor = actorScope(user);
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    const validateCapability = this.dependencies.beginOperationValidation(capabilityForMode(input.tokenMode), user);
+    const assertCurrent = () => {
+      assertAccountSessionValidation(validation);
+      validateCapability();
+      requireProviderAdmissions();
+    };
+    assertCurrent();
+    if (input.tokenMode === "application") await currentPackageWork(
+      () => this.dependencies.requireApplicationDataScope("graph.package.read.application", user),
+      new AbortController().signal, assertCurrent);
     const scope = dataScope(user, input.tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
-    return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
+    return commitAccountSessionValidation(validation, async () => {
+      assertCurrent();
+      const job = await this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId }, assertCurrent);
+      assertCurrent();
+      return job;
+    });
   }
 
   async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number, signal?: AbortSignal) {
     requireRefreshRole(user);
     const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId(user.tenantId!));
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const validateCapability = this.dependencies.beginOperationValidation("graph.package.read.delegated", user);
     const assertCurrent = () => {
       signal?.throwIfAborted();
       assertAccountSessionValidation(validation);
+      validateCapability();
       requireProviderAdmissions();
+    };
+    const latestCurrentJob = async () => {
+      const latest = await this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+      assertCurrent();
+      return latest;
     };
     assertCurrent();
     if (this.draining || this.laneCount(true) >= maximumAutomaticRefreshes) {
-      return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+      return latestCurrentJob();
     }
     const job = await commitAccountSessionValidation(validation, async () => {
       assertCurrent();
       return this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
     });
-    if (!job) return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+    if (!job) return latestCurrentJob();
     const abort = () => {
       this.starting.get(job.id)?.controller.abort(signal?.reason);
       this.active.get(job.id)?.controller.abort(signal?.reason);
@@ -93,14 +121,14 @@ export class PackageInventoryService {
     try {
       assertCurrent();
       signal?.addEventListener("abort", abort, { once: true });
-      const started = await this.start(user, job.id, "delegated");
+      const started = await this.startWithAuthority(user, job.id, "delegated", {}, { validation, validateCapability });
       assertCurrent();
       return started;
     } catch (error) {
       operationalLog("warn", "package_detail_admission_failed", { jobId: job.id, ...graphErrorTelemetry(error) });
       const failed = await this.repository.markFailed(scope, job.id, syncFailureCode(error),
         isAuthorizationFailure(error) && !isAdmissionPause(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
-          : safeFailureMessage(error));
+          : safeFailureMessage(error), job.resultRevision);
       assertCurrent();
       if (failed) return failed;
       throw error;
@@ -110,6 +138,11 @@ export class PackageInventoryService {
   }
 
   async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
+    return this.startWithAuthority(user, id, tokenMode, options);
+  }
+
+  private async startWithAuthority(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"],
+    options: { retryFailed?: boolean }, authority?: RefreshAuthority) {
     const actor = actorScope(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
     id = id.toLowerCase();
@@ -126,10 +159,13 @@ export class PackageInventoryService {
       throw refreshCapacityError();
     }
     const controller = new AbortController();
-    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    const { validation, validateCapability } = authority ?? {
+      validation: beginAccountSessionValidation(actor.tenantId, actor.principalId),
+      validateCapability: this.dependencies.beginOperationValidation(capabilityForMode(tokenMode), user),
+    };
     const starting: StartingRefresh = {
       actor, controller,
-      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, validation, options))
+      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, validation, validateCapability, options))
         .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
     };
     this.starting.set(id, starting);
@@ -141,11 +177,12 @@ export class PackageInventoryService {
       .filter(value => value.autoDetails === autoDetails).length;
   }
 
-  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, validation: ReturnType<typeof beginAccountSessionValidation>, options: { retryFailed?: boolean }) {
+  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, validation: ReturnType<typeof beginAccountSessionValidation>, validateCapability: () => void, options: { retryFailed?: boolean }) {
     const signal = controller.signal;
     const assertCurrent = () => {
       signal.throwIfAborted();
       assertAccountSessionValidation(validation);
+      validateCapability();
       requireProviderAdmissions();
     };
     let current: Awaited<ReturnType<PackageRefreshJobs["getJob"]>>;
@@ -166,23 +203,23 @@ export class PackageInventoryService {
       }
       // Persisted mode, not a caller hint, owns the lane before provider authorization begins.
       this.starting.get(id)!.autoDetails = autoDetails;
-      const freshUser = await this.dependencies.revalidateUser(actor.tenantId, actor.principalId);
+      const freshUser = await currentPackageWork(() => this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal, assertCurrent);
       assertCurrent();
       requireSamePrincipal(actor, freshUser);
       requireRefreshRole(freshUser);
       const capabilityId = capabilityForMode(tokenMode);
-      if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+      if (tokenMode === "application") await currentPackageWork(() => this.dependencies.requireApplicationDataScope(capabilityId, freshUser), signal, assertCurrent);
       assertCurrent();
-      await this.dependencies.requireAvailable(capabilityId, freshUser, options);
+      await currentPackageWork(() => this.dependencies.requireAvailable(capabilityId, freshUser, options), signal, assertCurrent, 120_000);
       assertCurrent();
-      token = await this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
+      token = await currentPackageWork(() => this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(actor.tenantId, capabilityId), { signal, clearOnSuccess: false });
+        : this.dependencies.applicationToken(actor.tenantId, capabilityId), { signal, clearOnSuccess: false }), signal, assertCurrent);
       assertCurrent();
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
         assertCurrent();
-        markedRunning = current!.autoDetails ? await this.repository.markRunning(scope, id, true) : await this.repository.markRunning(scope, id);
+        markedRunning = await this.repository.markRunning(scope, id, current!.autoDetails, assertCurrent);
         if (!markedRunning) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
       });
       assertCurrent();
@@ -201,8 +238,10 @@ export class PackageInventoryService {
       assertCurrent();
       throw failure;
     }
-    const execution = createRefreshExecutionSignal(signal, current.autoDetails ? 5 * 60_000 : packageRefreshExecutionDeadlineMs);
-    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal, validation))
+    const executionDuration = current.autoDetails ? 5 * 60_000 : packageRefreshExecutionDeadlineMs;
+    const executionDeadlineAt = Date.now() + executionDuration;
+    const execution = createRefreshExecutionSignal(signal, executionDuration);
+    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal, executionDeadlineAt, validation, validateCapability))
       .finally(() => {
         execution.dispose();
         if (this.active.get(id)?.operation === operation) this.active.delete(id);
@@ -211,26 +250,46 @@ export class PackageInventoryService {
     void operation.catch(error => {
       operationalLog("error", "package_refresh_status_failed", { jobId: id, ...graphErrorTelemetry(error) });
     });
-    return (await this.repository.getJob(scope, id))!;
+    const result = await this.repository.getJob(scope, id);
+    assertCurrent();
+    if (!result) throw new AppError(409, "package_refresh_expired", "The package refresh expired before its status could be returned.");
+    return result;
   }
 
   async get(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
-    const job = await this.repository.getJob(dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!)), id);
-    if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
-    return job;
+    requireRefreshRole(user);
+    const actor = actorScope(user);
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    assertAccountSessionValidation(validation);
+    try {
+      const job = await this.repository.getJob(dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!)), id);
+      assertAccountSessionValidation(validation);
+      if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
+      return job;
+    } catch (error) {
+      assertAccountSessionValidation(validation);
+      throw error;
+    }
   }
 
   async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], cancellationReason: RefreshCancellationReason = "requested") {
     requireRefreshRole(user);
+    const actor = actorScope(user);
+    const validation = cancellationReason === "requested" ? beginAccountSessionValidation(actor.tenantId, actor.principalId) : undefined;
+    const assertCurrent = () => { if (validation) assertAccountSessionValidation(validation); };
+    assertCurrent();
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
     id = id.toLowerCase();
     const job = await this.repository.getJob(scope, id);
+    assertCurrent();
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
     const cancelled = await this.repository.cancel(scope, id, user.homeAccountId, cancellationReason);
     const reason = new AppError(409, "read_job_cancelled", "Package refresh was cancelled.");
     this.starting.get(id)?.controller.abort(reason);
     this.active.get(id)?.controller.abort(reason);
-    return cancelled!;
+    assertCurrent();
+    if (!cancelled) throw new AppError(409, "package_refresh_expired", "The package refresh expired before its cancellation status could be returned.");
+    return cancelled;
   }
 
   recover() {
@@ -256,69 +315,86 @@ export class PackageInventoryService {
     }
   }
 
-  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageRefreshJobs["getJob"]>> & {}, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
+  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageRefreshJobs["getJob"]>> & {}, id: string, token: string, signal: AbortSignal, executionDeadlineAt: number, validation: ReturnType<typeof beginAccountSessionValidation>, validateCapability: () => void) {
     const startedAt = performance.now();
+    let executionDeadline = startedAt + Math.max(0, executionDeadlineAt - Date.now());
+    let persistedExecution: ReturnType<typeof createRefreshExecutionSignal> | undefined;
     let stage = "inventory_collection";
     let sourceAuthorized = false;
     let committed = false;
-    let diagnosticsFinished = false;
     const diagnostics = new PackageScanDiagnostics(current.scopeKind);
     if (current.scopeKind === "exact") diagnostics.startDetails(current.targetCount);
-    const finishDiagnostics = (outcome: Parameters<PackageScanDiagnostics["finish"]>[0]) => {
-      if (!diagnosticsFinished) { diagnostics.finish(outcome); diagnosticsFinished = true; }
+    let progress: { pages: number; observedCount: number; totalRecords: number | null } = {
+      pages: 0, observedCount: 0, totalRecords: null,
     };
-    let progress = { pages: current.pageCount, observedCount: current.observedCount, totalRecords: current.totalRecords };
     const assertCurrent = () => {
       signal.throwIfAborted();
+      if (performance.now() >= executionDeadline) throw new DOMException("Package execution deadline expired.", "TimeoutError");
       assertAccountSessionValidation(validation);
+      validateCapability();
       requireProviderAdmissions();
     };
     try {
       assertCurrent();
       operationalLog("info", "package_refresh_started", { mode: current.scopeKind });
       const input = await inventoryJobInput(this.repository.database, scope, "packages", id);
+      if (input.deadlineAt.getTime() < executionDeadlineAt) {
+        executionDeadlineAt = input.deadlineAt.getTime();
+        const remainingMs = Math.max(0, executionDeadlineAt - Date.now());
+        executionDeadline = Math.min(executionDeadline, performance.now() + remainingMs);
+        persistedExecution = createRefreshExecutionSignal(signal, remainingMs);
+        signal = persistedExecution.signal;
+      }
+      assertCurrent();
       const streams = this.dependencies.streams(this.repository.database);
       const options = {
-        signal, diagnostics, retryThrottlingUntilAborted: !current.autoDetails,
+        signal, executionDeadlineAt, assertCurrent, diagnostics, retryThrottlingUntilAborted: !current.autoDetails,
         onProgress: async (value: { pages: number; observedCount: number; totalRecords?: number | null }) => {
           assertCurrent();
           progress = { pages: value.pages, observedCount: value.observedCount,
             totalRecords: current.scopeKind === "exact" ? current.targetCount : value.totalRecords ?? null };
-          await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount,
-            progress.totalRecords);
+          await currentPackageWork(() => this.repository.recordProgress(scope, id, progress.pages, progress.observedCount,
+            progress.totalRecords), signal, assertCurrent);
+          assertCurrent();
         },
         onRetry: async (notice: { retryDelayMs: number; throttled: boolean }) => {
           assertCurrent();
           await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords,
-            `${notice.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph is retrying a package read."} Waiting ${Math.ceil(notice.retryDelayMs / 1_000)} seconds before retrying (${progress.observedCount} targets observed).`);
+            `${notice.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph is retrying a package read."} Waiting ${Math.ceil(notice.retryDelayMs / 1_000)} seconds before retrying (${progress.observedCount} ${current.scopeKind === "exact" ? "targets checked" : "packages observed"}).`);
           assertCurrent();
         },
         authorize: async (publicationSignal: AbortSignal) => {
+          if (sourceAuthorized) diagnostics.finish("collected");
           stage = sourceAuthorized ? "publication_authorization" : "collection_authorization";
           for (let attempt = 1; ; attempt++) {
           publicationSignal.throwIfAborted();
           try {
           assertCurrent();
-          const freshUser = await this.dependencies.revalidateUser(actor.tenantId, actor.principalId);
+          const freshUser = await currentPackageWork(() => this.dependencies.revalidateUser(actor.tenantId, actor.principalId), publicationSignal, assertCurrent);
           assertCurrent();
           requireSamePrincipal(actor, freshUser);
           requireRefreshRole(freshUser);
           const capabilityId = capabilityForMode(current.tokenMode);
-          if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+          if (current.tokenMode === "application") await currentPackageWork(() => this.dependencies.requireApplicationDataScope(capabilityId, freshUser), publicationSignal, assertCurrent);
           assertCurrent();
-          await this.dependencies.requireAvailable(capabilityId, freshUser, { retryFailed: true });
+          await currentPackageWork(() => this.dependencies.requireAvailable(capabilityId, freshUser, { retryFailed: true }), publicationSignal, assertCurrent, 120_000);
           assertCurrent();
+          stage = sourceAuthorized ? "publication" : "inventory_collection";
           sourceAuthorized = true;
-          stage = "inventory_collection";
           return;
           } catch (error) {
             if (!transientPublicationReadinessFailure(error)) throw error;
-            await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords,
+            await currentPackageWork(() => this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords,
               sourceAuthorized
                 ? "Collection is complete. Waiting for current Microsoft read authorization before publication; no packages are being downloaded again."
-                : "Waiting for current Microsoft read authorization before collection. No provider reads are running.");
+                : "Waiting for current Microsoft read authorization before collection. No provider reads are running."), publicationSignal, assertCurrent);
             assertCurrent();
-            await this.dependencies.wait(publicationReadinessRetryDelay(error, attempt), publicationSignal);
+            const retryDelay = publicationReadinessRetryDelay(error, attempt);
+            if (sourceAuthorized) operationalLog("warn", "package_publication_readiness_retry", {
+              stage: "publication_authorization", count: progress.observedCount, attempt, retryDelayMs: retryDelay,
+              ...graphErrorTelemetry(error),
+            });
+            await currentPackageWork(() => this.dependencies.wait(retryDelay, publicationSignal), publicationSignal, assertCurrent, retryDelay + packageReadTimeoutMs);
           }
           }
         },
@@ -335,6 +411,7 @@ export class PackageInventoryService {
           assertCurrent();
           await operation();
         }),
+        onCommitted: () => { committed = true; },
         completeJob: async (...args: Parameters<ReturnType<typeof completeInventoryJob>>) => {
           assertCurrent();
           stage = "publication";
@@ -345,22 +422,17 @@ export class PackageInventoryService {
         { tenantId: actor.tenantId, homeAccountId: actor.principalId }, async () => {
           if (current.scopeKind === "exact") await streams.exactJob(input, token, current.autoDetails, options);
           else await streams.graphCatalog(input, token, options);
-          committed = true;
         }, { signal });
-      finishDiagnostics("collected");
-      if (current.tokenMode === "delegated") await inventoryRuntime(this.repository.database).enqueue(scope);
-      operationalLog("info", "package_refresh_succeeded", {
-        status: "succeeded", durationMs: Math.round(performance.now() - startedAt),
-      });
     } catch (error) {
       if (committed) {
-        finishDiagnostics("collected");
+        diagnostics.finish("collected");
         operationalLog("warn", "package_inventory_followup_failed", { stage, ...graphErrorTelemetry(error) });
         return;
       }
       let failure = error;
       try { assertCurrent(); } catch (currentError) { failure = currentError; }
-      finishDiagnostics(signal.aborted ? signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "cancelled" : "failed");
+      const timedOut = signal.aborted ? isTimeoutError(signal.reason) : performance.now() >= executionDeadline;
+      diagnostics.finish(timedOut ? "timed_out" : signal.aborted ? "cancelled" : "failed");
       operationalLog("warn", "package_refresh_execution_failed", {
         stage, ...graphErrorTelemetry(failure), durationMs: Math.round(performance.now() - startedAt),
       });
@@ -375,22 +447,61 @@ export class PackageInventoryService {
         else await this.repository.markWaitingAuthorization(scope, id);
         return;
       }
-      const timedOut = signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError";
-      const diagnostics = graphResponseDiagnostics(failure);
-      const code = timedOut ? "package_refresh_timeout"
-        : failure instanceof AppError && dataSyncFailureStatus(failure.code, failure.status) === "permission_required"
-          ? syncFailureCode(failure) : diagnostics ? `graph_http_${diagnostics.status}` : syncFailureCode(failure);
+      const code = timedOut ? "package_refresh_timeout" : syncFailureCode(failure);
       await this.repository.markFailed(scope, id, code,
         timedOut ? current.autoDetails
           ? "Automatic detail enrichment reached its five-minute deadline. Saved details are unchanged; a later authorized check may retry after backoff."
           : "Package refresh reached its four-hour execution deadline. The previous complete inventory is unchanged; retry from Sync."
           : safeFailureMessage(failure));
       operationalLog("error", "package_refresh_failed", { stage, ...graphErrorTelemetry(failure), errorCode: code });
+    } finally {
+      if (committed) {
+        diagnostics.finish("collected");
+        try {
+          if (current.tokenMode === "delegated") await currentPackageWork(
+            followupSignal => inventoryRuntime(this.repository.database).enqueue(scope, true, followupSignal), signal, assertCurrent);
+        } catch (error) {
+          operationalLog("warn", "package_inventory_followup_failed", { stage: "canonical_reconciliation", ...graphErrorTelemetry(error) });
+        }
+        operationalLog("info", "package_refresh_succeeded", {
+          status: "succeeded", durationMs: Math.round(performance.now() - startedAt),
+        });
+      }
+      persistedExecution?.dispose();
     }
   }
 }
 
 export const packageInventory = new PackageInventoryService();
+
+async function currentPackageWork<T>(operation: (signal: AbortSignal) => Promise<T>, parent: AbortSignal, assertCurrent: () => void,
+  timeoutMs = packageReadTimeoutMs): Promise<T> {
+  const deadline = performance.now() + timeoutMs;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = AbortSignal.any([parent, timeout]);
+  let removeAbort = () => {};
+  try {
+    assertCurrent();
+    signal.throwIfAborted();
+    const work = operation(signal);
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+      removeAbort = () => signal.removeEventListener("abort", onAbort);
+    });
+    const result = await Promise.race([work, aborted]);
+    assertCurrent();
+    signal.throwIfAborted();
+    if (performance.now() >= deadline) throw new DOMException("Package authorization deadline expired.", "TimeoutError");
+    return result;
+  } catch (error) {
+    assertCurrent();
+    parent.throwIfAborted();
+    if (timeout.aborted || performance.now() >= deadline) throw new AppError(504, "provider_timeout", "Microsoft package authorization did not complete within its bounded deadline.");
+    throw error;
+  } finally { removeAbort(); }
+}
 
 function refreshCapacityError() {
   return new AppError(429, "package_refresh_capacity", "At most four foreground package refreshes and two automatic detail refreshes can run at once.");
@@ -441,29 +552,35 @@ function requireSamePrincipal(scope: PackageDataScope, user: AuthenticatedUser) 
 }
 
 function isAuthorizationFailure(error: unknown) {
+  const response = graphResponseDiagnostics(error);
+  if (response) return response.status === 401;
   return error instanceof AppError && (dataSyncFailureStatus(error.code, error.status) === "waiting_authorization"
     || isAdmissionPause(error));
 }
 
 function isAdmissionPause(error: unknown): error is AppError {
-  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
+  return error instanceof AppError && !graphResponseDiagnostics(error)
+    && ["maintenance", "provider_requalification_required"].includes(error.code);
 }
 
 function syncFailureCode(error: unknown) {
+  const response = graphResponseDiagnostics(error);
+  if (response) return response.status === 401 ? "interaction_required" : `graph_http_${response.status}`;
   if (!(error instanceof AppError)) return "provider_error";
   if (dataSyncFailureStatus(error.code) !== "failed") return error.code;
   return error.status === 401 ? "interaction_required" : error.status === 403 ? "missing_permission" : error.code;
 }
 
 function safeFailureMessage(error: unknown) {
+  const diagnostics = graphResponseDiagnostics(error);
   if (isAdmissionPause(error)) return `${error.message} Saved package data is unchanged.`;
-  if (error instanceof AppError && error.code === "identity_provider_error") {
+  if (!diagnostics && error instanceof AppError && error.code === "identity_provider_error") {
     return "Microsoft Entra ID could not renew authorization for package refresh. The previous complete inventory is unchanged; retry from Sync. If this persists, review the Entra sign-in logs and application configuration.";
   }
-  if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
+  if (diagnostics?.status === 403
+    || !diagnostics && error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
     return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
   }
-  const diagnostics = graphResponseDiagnostics(error);
   if (diagnostics) {
     return `${diagnostics.throttled ? "Microsoft Graph is throttling package reads" : "Microsoft Graph package read failed"} (HTTP ${diagnostics.status}${diagnostics.providerCode ? `, ${diagnostics.providerCode}` : ""}). The previous complete inventory is unchanged; ${diagnostics.throttled ? "allow the provider cooldown to finish, then retry" : "retry"} from Sync.${diagnostics.requestId ? ` Graph request ID: ${diagnostics.requestId}.` : ""}`;
   }

@@ -5,6 +5,16 @@ export type CopilotStudioQuarantineTarget = {
   botId: string;
 };
 
+export function quarantineTargetIdentity(target: CopilotStudioQuarantineTarget) {
+  return `${target.environmentId.toLowerCase()}:${target.botId.toLowerCase()}`;
+}
+
+export function sameQuarantineTarget(left: CopilotStudioQuarantineTarget, right: CopilotStudioQuarantineTarget) {
+  return typeof left.environmentId === "string" && typeof left.botId === "string"
+    && typeof right.environmentId === "string" && typeof right.botId === "string"
+    && quarantineTargetIdentity(left) === quarantineTargetIdentity(right);
+}
+
 export type CopilotStudioQuarantineStatus = CopilotStudioQuarantineTarget & {
   isBotQuarantined: boolean;
   lastUpdateTimeUtc: string;
@@ -103,4 +113,12 @@ export type QuarantineJob = {
     errorCode?: string;
     message?: string;
   }>;
+};
+
+export type QuarantineReconciliationResult = QuarantineJob & {
+  reconciliation: {
+    attempted: number;
+    failed: number;
+    errors: Array<{ resourceNativeId: string; message: string }>;
+  };
 };

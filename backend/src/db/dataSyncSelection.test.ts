@@ -18,7 +18,7 @@ afterAll(() => {
 
 describe("data sync current-run selection", () => {
   it("selects latest activity with deterministic ties while preserving ownership and retention", async () => {
-    query.mockResolvedValueOnce(emptyResult);
+    query.mockImplementationOnce(async () => emptyResult);
 
     expect(await new DataSyncRepository().getLatestRun(scope)).toBeUndefined();
     expect(query).toHaveBeenCalledExactlyOnceWith(
@@ -33,15 +33,15 @@ describe("data sync current-run selection", () => {
     const startedAt = new Date("2026-09-15T10:00:00.000Z");
     const updatedAt = new Date("2026-09-16T10:00:00.000Z");
     query
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ id }] })
-      .mockResolvedValueOnce({
+      .mockImplementationOnce(async () => ({ ...emptyResult, rowCount: 1, rows: [{ id }] }))
+      .mockImplementationOnce(async () => ({
         ...emptyResult, rowCount: 1,
         rows: [{
           id, mode: "incremental", status, started_at: startedAt, updated_at: updatedAt,
           completed_at: status === "completed" ? updatedAt : null,
         }],
-      })
-      .mockResolvedValueOnce({
+      }))
+      .mockImplementationOnce(async () => ({
         ...emptyResult, rowCount: 1,
         rows: [{
           run_id: id, source_id: "users", status: status === "completed" ? "succeeded" : "running",
@@ -49,7 +49,7 @@ describe("data sync current-run selection", () => {
           last_success_at: status === "completed" ? updatedAt : startedAt, updated_at: updatedAt,
           message: "Retry observation.", can_retry: false,
         }],
-      });
+      }));
 
     expect(await new DataSyncRepository().getLatestRun(scope)).toMatchObject({
       id, status, startedAt: startedAt.toISOString(), updatedAt: updatedAt.toISOString(),
@@ -61,7 +61,7 @@ describe("data sync current-run selection", () => {
   });
 
   it("keeps retained history ordered by original start time", async () => {
-    query.mockResolvedValueOnce(emptyResult);
+    query.mockImplementationOnce(async () => emptyResult);
 
     expect(await new DataSyncRepository().listRuns(scope, 12)).toEqual([]);
     expect(query).toHaveBeenCalledExactlyOnceWith(

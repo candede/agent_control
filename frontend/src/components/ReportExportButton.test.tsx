@@ -8,80 +8,50 @@ vi.mock("../api/reportData", () => ({ createReportExport: vi.fn(), reportExportS
   reportExportDownload: (id: string) => `/api/data-exports/${id}/download` }));
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-it("finishes an admitted frozen export after the read lease ends without admitting another export", async () => {
-  vi.useFakeTimers();
-  vi.mocked(createReportExport).mockResolvedValue({ id: "frozen-artifact" });
-  vi.mocked(reportExportStatus).mockResolvedValue({ id: "frozen-artifact", status: "ready", rows: 3, bytes: 100,
-    expiresAt: "2030-01-01T00:00:00Z", error: null, limit: null, observed: null });
-  let active = true;
-  const props = { selectionId: "frozen-selection", kind: "official_users" as const, label: "Export", admissionAllowed: () => active };
-  const view = render(<ReportExportButton {...props} />);
-  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
-  const signal = vi.mocked(createReportExport).mock.calls[0][1]!;
-  active = false;
-  view.rerender(<ReportExportButton {...props} />);
-  expect(signal.aborted).toBe(false);
-  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
-  expect(screen.getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/data-exports/frozen-artifact/download");
-  expect(screen.getByRole("button", { name: "Export" })).toBeDisabled();
-  expect(createReportExport).toHaveBeenCalledOnce();
-  expect(reportExportStatus).toHaveBeenCalledExactlyOnceWith("frozen-artifact", signal);
-});
-
-it("checks export admission against the monotonic lease before the timer renders", () => {
-  let active = true;
-  render(<ReportExportButton selectionId="frozen" kind="official_users" label="Export" admissionAllowed={() => active} />);
-  active = false;
-  fireEvent.click(screen.getByRole("button", { name: "Export" }));
-  expect(createReportExport).not.toHaveBeenCalled();
-});
-
-it.each(["admission", "building", "ready", "retry"] as const)("keeps a %s export independent of the current table selection", async phase => {
-  vi.useFakeTimers();
-  let admit!: (value: { id: string }) => void;
-  vi.mocked(createReportExport).mockReturnValueOnce(new Promise(resolve => { admit = resolve; }))
-    .mockResolvedValue({ id: "new-artifact" });
-  const ready = { id: "artifact", status: "ready" as const, rows: 117, bytes: 100,
-    expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
-  if (phase === "retry") vi.mocked(reportExportStatus).mockRejectedValueOnce(new Error("Status unavailable."));
-  vi.mocked(reportExportStatus).mockResolvedValue(phase === "building" ? { ...ready, status: "building" } : ready);
-  const props = { kind: "official_users" as const, label: "Export", preserveOnRefresh: true };
-  const view = render(<ReportExportButton {...props} selectionId="original" />);
-  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
-  if (phase !== "admission") await act(async () => { admit({ id: "artifact" }); await vi.advanceTimersByTimeAsync(2000); });
-  const signal = vi.mocked(createReportExport).mock.calls[0][1]!;
-  view.rerender(<ReportExportButton {...props} disabled />);
-  expect(signal.aborted).toBe(false);
-  view.rerender(<ReportExportButton {...props} selectionId="replacement" />);
-  if (phase === "retry") {
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Retry export status" }));
-      await vi.advanceTimersByTimeAsync(2000);
-    });
-  } else {
-    vi.mocked(reportExportStatus).mockResolvedValue(ready);
-    await act(async () => { if (phase === "admission") admit({ id: "artifact" }); await vi.advanceTimersByTimeAsync(3000); });
-  }
-  expect(screen.getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/data-exports/artifact/download");
-  expect(createReportExport).toHaveBeenCalledOnce();
-  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
-  expect(vi.mocked(createReportExport).mock.lastCall?.[0].selectionId).toBe("replacement");
-  expect(createReportExport).toHaveBeenCalledTimes(2);
-});
-
-it("does not invalidate a refreshed table when an older export selection is rejected", async () => {
+it("retains the same pending export when only the selection UUID spelling changes", async () => {
   vi.useFakeTimers();
   vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
-  vi.mocked(reportExportStatus).mockRejectedValue(new ApiError(409, "selection_invalidated", "Old selection retired."));
-  const onSelectionInvalidated = vi.fn();
-  const props = { kind: "official_users" as const, label: "Export", preserveOnRefresh: true, onSelectionInvalidated };
-  const view = render(<ReportExportButton {...props} selectionId="original" />);
-  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Export" })));
-  view.rerender(<ReportExportButton {...props} selectionId="replacement" />);
-  await act(() => vi.advanceTimersByTimeAsync(2000));
-  expect(screen.getByRole("alert")).toHaveTextContent("Export selection changed or expired.");
-  expect(onSelectionInvalidated).not.toHaveBeenCalled();
-  expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
+  vi.mocked(cancelReportExport).mockResolvedValue();
+  const selectionId = "abcdefab-1234-4567-89ab-abcdefabcdef", ids = [selectionId, selectionId.toUpperCase()];
+  const props = { kind: "official_users" as const, ids, label: "Export" };
+  const view = render(<ReportExportButton {...props} selectionId={selectionId.toUpperCase()} />);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
+  const signal = vi.mocked(createReportExport).mock.calls[0][1]!;
+  view.rerender(<ReportExportButton {...props} selectionId={selectionId} />);
+  expect(signal.aborted).toBe(false);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Cancel export" })); });
+  expect(createReportExport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ selectionId, ids }), signal);
+  expect(cancelReportExport).toHaveBeenCalledExactlyOnceWith("artifact", expect.any(AbortSignal));
+});
+
+it.each(["ready", "cancelled"] as const)("retains one queued export through a maintenance pause until it is %s", async outcome => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+  const queued = { id: "artifact", status: "queued" as const, rows: 0, bytes: 0,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
+  vi.mocked(reportExportStatus).mockResolvedValue(queued);
+  vi.mocked(cancelReportExport).mockResolvedValue();
+  render(<ReportExportButton selectionId="selected" kind="official_users" label="Export" />);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(reportExportStatus).toHaveBeenCalledTimes(2);
+  expect(screen.getByRole("status")).toHaveTextContent("queued");
+  expect(screen.getByRole("button", { name: "Preparing export..." })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Cancel export" })).toBeEnabled();
+  if (outcome === "ready") {
+    vi.mocked(reportExportStatus).mockResolvedValue({ ...queued, status: "ready", rows: 1, bytes: 10 });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(screen.getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/data-exports/artifact/download");
+    expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
+  } else {
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Cancel export" })); });
+    expect(cancelReportExport).toHaveBeenCalledExactlyOnceWith("artifact", expect.any(AbortSignal));
+    expect(screen.getByRole("alert")).toHaveTextContent("Export cancelled.");
+    expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(reportExportStatus).toHaveBeenCalledTimes(2);
+  }
+  expect(createReportExport).toHaveBeenCalledOnce();
 });
 
 it("aborts and clears a disabled owner's pending state, then permits a new explicit request", async () => {
@@ -243,6 +213,23 @@ it("withdraws prior build progress when a later status read invalidates the sele
   expect(createReportExport).toHaveBeenCalledOnce();
 });
 
+it.each(["selection_invalidated", "export_selection_changed"])("retires the selection when the durable builder records %s", async error => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+  vi.mocked(reportExportStatus).mockResolvedValue({ id: "artifact", status: "failed", rows: 1, bytes: 10,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), error, limit: null, observed: null });
+  const onSelectionInvalidated = vi.fn();
+  render(<ReportExportButton selectionId="selected" kind="unified_agents" label="Export" autoStart
+    onSelectionInvalidated={onSelectionInvalidated} />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(screen.getByRole("alert")).toHaveTextContent("Export selection changed or expired.");
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
+  expect(onSelectionInvalidated).toHaveBeenCalledOnce();
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(reportExportStatus).toHaveBeenCalledOnce();
+});
+
 it("invalidates exact selections rejected with the backend's missing-reference code", async () => {
   vi.mocked(createReportExport).mockRejectedValue(new ApiError(409, "export_selection_changed", "An exact selected source is missing or ambiguous."));
   const onSelectionInvalidated = vi.fn();
@@ -281,6 +268,37 @@ it("deduplicates download verification and discards its late result after cancel
   expect(screen.getByRole("alert")).toHaveTextContent("Export cancelled.");
 });
 
+it.each(["graph_packages", "power_platform_agents", "unified_agents"] as const)(
+  "natively downloads %s source/child CSV rows after rechecking the pinned artifact, without a Blob",
+  async kind => {
+    vi.useFakeTimers();
+    vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+    const ready = { id: "artifact", status: "ready" as const, rows: 302, bytes: 30_000,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null };
+    vi.mocked(reportExportStatus).mockResolvedValue(ready);
+    const fetch = vi.fn(), blob = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    vi.stubGlobal("Blob", blob);
+    const native = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this).toHaveAttribute("href", "/api/data-exports/artifact/download");
+      expect(fireEvent.click(this)).toBe(true);
+    });
+    render(<ReportExportButton selectionId="pinned-inventory" kind={kind} label="Export" />);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole("status")).toHaveTextContent("ready: 302 rows, 30,000 bytes.");
+    expect(createReportExport).toHaveBeenCalledWith(
+      expect.objectContaining({ selectionId: "pinned-inventory", kind }), expect.any(AbortSignal),
+    );
+    await act(async () => { fireEvent.click(screen.getByRole("link", { name: "Download CSV" })); });
+    expect(reportExportStatus).toHaveBeenCalledTimes(2);
+    expect(reportExportStatus).toHaveBeenLastCalledWith("artifact", expect.any(AbortSignal));
+    expect(native).toHaveBeenCalledOnce();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(blob).not.toHaveBeenCalled();
+  },
+);
+
 it("does not poll a late admission after cancellation before the export ID is known", async () => {
   vi.useFakeTimers();
   let finish!: (value: { id: string }) => void;
@@ -297,15 +315,33 @@ it("does not poll a late admission after cancellation before the export ID is kn
   expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
 });
 
-it("invalidates the selection when cancellation confirms it is no longer available", async () => {
+it.each(["selection_invalidated", "export_selection_changed"])("invalidates the selection when cancellation confirms %s", async code => {
   vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
-  vi.mocked(cancelReportExport).mockRejectedValue(new ApiError(409, "selection_invalidated", "Selection changed."));
+  vi.mocked(cancelReportExport).mockRejectedValue(new ApiError(409, code, "Selection changed."));
   const onSelectionInvalidated = vi.fn();
   render(<ReportExportButton selectionId="selected" kind="unified_agents" label="Export" onSelectionInvalidated={onSelectionInvalidated} />);
   await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
   await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Cancel export" })); });
   expect(onSelectionInvalidated).toHaveBeenCalledOnce();
   expect(screen.queryByRole("button", { name: "Cancel export" })).not.toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("Export selection changed or expired.");
+});
+
+it.each(["selection_invalidated", "export_selection_changed"])("withdraws a ready download when verification reports %s", async code => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+  vi.mocked(reportExportStatus).mockResolvedValueOnce({ id: "artifact", status: "ready", rows: 1, bytes: 10,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), error: null, limit: null, observed: null })
+    .mockRejectedValueOnce(new ApiError(409, code, "The selected query changed."));
+  const onSelectionInvalidated = vi.fn();
+  const native = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+  render(<ReportExportButton selectionId="selected" kind="unified_agents" label="Export" autoStart onSelectionInvalidated={onSelectionInvalidated} />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  await act(async () => { fireEvent.click(screen.getByRole("link", { name: "Download CSV" })); });
+  expect(onSelectionInvalidated).toHaveBeenCalledOnce();
+  expect(native).not.toHaveBeenCalled();
+  expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry export status" })).not.toBeInTheDocument();
   expect(screen.getByRole("alert")).toHaveTextContent("Export selection changed or expired.");
 });
 

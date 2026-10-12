@@ -4,23 +4,33 @@ import type { CandidateAgentUsageMutation } from "../types/officialReportApi.js"
 const invalid = () => new AppError(400, "invalid_agent_usage", "Supply an exact confirmed report identity and source-qualified target.");
 function uuid(value: unknown) {
   if (typeof value !== "string" || !/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_identifier", "Expected a UUID.");
-  return value;
+  return value.toLowerCase();
 }
 export function exactUsageText(value: unknown, maximum = 512): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maximum && value === value.trim() && !/[\p{Cc}\p{Cs}]/u.test(value);
 }
-function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => !keys.includes(key))) throw invalid();
-  return value as Record<string, unknown>;
+function object(value: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw invalid();
+  const input: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || !required.includes(key) && !optional.includes(key)) throw invalid();
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property || !Object.hasOwn(property, "value")) throw invalid();
+    input[key] = property.value;
+  }
+  if (required.some(key => !Object.hasOwn(input, key))) throw invalid();
+  return input;
 }
 export function officialAgentUsageMutation(value: unknown): CandidateAgentUsageMutation {
-  const input = object(value, ["selectionId", "reportSetId", "usageRevision", "inventoryRevision", "reportAgentId", "confirmed", "target"]);
+  const input = object(value, ["selectionId", "reportSetId", "usageRevision", "inventoryRevision", "reportAgentId", "confirmed"], ["target"]);
   if (input.confirmed !== true || !exactUsageText(input.reportAgentId)
     || typeof input.usageRevision !== "string" || !/^[a-f0-9]{64}$/.test(input.usageRevision)
     || typeof input.inventoryRevision !== "string" || !/^[a-f0-9]{64}$/.test(input.inventoryRevision)) throw invalid();
   let target: CandidateAgentUsageMutation["target"];
-  if ("target" in input) {
-    const source = object(input.target, ["source", "packageId", "nativeId", "environmentId"]);
+  if (Object.hasOwn(input, "target")) {
+    const source = object(input.target, ["source"], ["packageId", "nativeId", "environmentId"]);
     if (source.source === "graph_packages") {
       object(source, ["source", "packageId"]);
       if (!exactUsageText(source.packageId)) throw invalid();
@@ -31,7 +41,10 @@ export function officialAgentUsageMutation(value: unknown): CandidateAgentUsageM
       target = { source: source.source, nativeId: source.nativeId, environmentId: source.environmentId };
     } else throw invalid();
   }
-  return { selectionId: uuid(input.selectionId), reportSetId: uuid(input.reportSetId),
+  const mutation: CandidateAgentUsageMutation = { selectionId: uuid(input.selectionId), reportSetId: uuid(input.reportSetId),
     usageRevision: input.usageRevision, inventoryRevision: input.inventoryRevision, reportAgentId: input.reportAgentId,
     confirmed: true, ...(target ? { target } : {}) };
+  // An absent target must stay absent when callers choose associate versus remove.
+  Object.setPrototypeOf(mutation, null);
+  return mutation;
 }

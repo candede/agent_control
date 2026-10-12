@@ -75,7 +75,8 @@ export async function readAgentHistory(client: pg.PoolClient, reports: LargeTena
       ORDER BY (page_key IS NULL)::int ${previous ? "DESC" : "ASC"},page_key COLLATE "C" ${direction},id ${direction} LIMIT $9
     )
     SELECT to_jsonb(page) AS item,(SELECT to_jsonb(p) FROM points p WHERE responses IS NOT NULL
-      ORDER BY (page_key IS NULL)::int,page_key COLLATE "C" DESC,id DESC LIMIT 1) AS latest,
+      ORDER BY (page_key IS NULL)::int,page_key COLLATE "C" DESC,
+        CASE WHEN page_key IS NULL THEN accepted_at END DESC,id DESC LIMIT 1) AS latest,
       (SELECT id::text FROM points ORDER BY (page_key IS NULL)::int,page_key COLLATE "C" DESC,
         CASE WHEN page_key IS NULL THEN accepted_at END DESC,id DESC LIMIT 1) AS latest_set_id,
       (SELECT count(*)::text FROM points) AS total FROM page RIGHT JOIN (SELECT 1) anchor ON true

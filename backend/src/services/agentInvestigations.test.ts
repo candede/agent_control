@@ -75,6 +75,16 @@ describe("source-verified agent investigation context", () => {
     } finally { lookup.mockRestore(); }
   });
 
+  it("treats an all-zero internal snapshot as stale without reading directory mappings", async () => {
+    const fixture = modern();
+    fixture.record.observations.powerPlatform!.snapshotId = "00000000-0000-0000-0000-000000000000";
+    const result = await fixture.service.resolve(scope, recordId);
+    expect(result.context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
+      resolution: { canResolve: false, cacheStatus: "source_unavailable", reasonCode: "stale_source" } });
+    expect(result.identitySource).toBeUndefined();
+    expect(fixture.mappings.readState).not.toHaveBeenCalled();
+  });
+
   it.each(["legacy", "typed"] as const)("rejects a changed inventory revision after %s identity reads", async kind => {
     const fixture = kind === "legacy" ? setup() : modern();
     const changed = new AppError(409, "inventory_changed", "Saved inventory changed.");

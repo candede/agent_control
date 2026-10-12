@@ -11,7 +11,7 @@ import { buildRecords } from "./inventoryComponent.js";
 import { resolvePackageAgentLinks, withVerifiedControlIdentities } from "./packageAgentIdentity.js";
 import { nativeInventoryKey, canonicalRecord } from "./inventoryRecordProjection.js";
 import { storedInventoryRecord, storedInventoryRecords } from "./streamedInventory.js";
-import { normalizeNativeIdentity } from "./inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { inventoryNativeRootChoicesSql } from "../db/inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "../db/inventoryIdentityExpiry.js";
 import { projectPackageDetailAge } from "./packageDetailProjection.js";
@@ -35,7 +35,17 @@ export class InventoryReconciliation {
     if (count >= 20) throw dataAdmissionError("inventory_queue_admission");
   }
 
-  async request(input: BeginGeneration, inputs: readonly InventoryRoot[]) {
+  private async outputRoot(client: pg.PoolClient, scopeId: string, sessionEpoch: string) {
+    return (await client.query(`SELECT r.* FROM inventory_roots r
+      JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
+      JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=r.scope_id
+      WHERE r.scope_id=$1 AND r.current AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
+        AND g.session_epoch=$2 AND g.expires_at>clock_timestamp()`, [scopeId, sessionEpoch])).rows[0];
+  }
+
+  async request(input: BeginGeneration, inputs: readonly InventoryRoot[], assertCurrent?: () => void, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    assertCurrent?.();
     if (input.scope.source !== "inventory_canonical" || input.scope.tokenMode !== "delegated" || inputs.length > 16 || !inputs.length
       || new Set(inputs.map(root => root.scopeId)).size !== inputs.length) throw new Error("inventory_reconciliation_scope");
     if (input.deadlineAt.getTime() <= Date.now() || input.deadlineAt.getTime() - Date.now() > inventoryLimits.powerPlatformDeadlineMs) throw new Error("inventory_reconciliation_deadline");
@@ -68,7 +78,8 @@ export class InventoryReconciliation {
         && old.baselineId === root.baselineId && old.revision === root.revision && old.epoch === root.epoch))) {
         const expired = !existing.active_id && !existing.pending_inputs
           && (await client.query(`SELECT EXISTS(${pendingInventoryIdentityExpirySql}) AS expired`, [output])).rows[0].expired;
-        if (!expired) return { scopeId: output as string, active: existing.active_id as string | null, pendingSequence: existing.pending_sequence as string };
+        const reusable = existing.active_id || existing.pending_inputs || await this.outputRoot(client, output, input.sessionEpoch);
+        if (!expired && reusable) return { scopeId: output as string, active: existing.active_id as string | null, pendingSequence: existing.pending_sequence as string };
       }
       await this.admit(client, input.scope.tenantId, output);
       const state = (await client.query(`INSERT INTO inventory_reconciliation(scope_id,tenant_id,pending_inputs,pending_deadline,pending_sequence)
@@ -89,10 +100,11 @@ export class InventoryReconciliation {
         SELECT $1,$2,source_scope_id,source_identity FROM (${pendingInventoryIdentityExpirySql}) expired ON CONFLICT DO NOTHING`,
       [output, state.pending_sequence]);
       return { scopeId: output as string, active: state.active_id as string | null, pendingSequence: state.pending_sequence as string };
-    });
+    }, false, signal, undefined, assertCurrent);
   }
 
-  async runNext(input: BeginGeneration, authorize: (signal: AbortSignal) => Promise<void>, signal?: AbortSignal) {
+  async runNext(input: BeginGeneration, authorize: (signal: AbortSignal) => Promise<void>, signal?: AbortSignal, assertCurrent?: () => void) {
+    assertCurrent?.();
     const claim = await this.stages.generations.connections.run(async client => {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
       const s = input.scope;
@@ -115,7 +127,8 @@ export class InventoryReconciliation {
         Object.assign(root, { baselineId: current.baseline_id, revision: current.revision, epoch: current.epoch, expiresAt: current.expires_at.toISOString() });
       }
       const prior = state.published_inputs as CapturedRoot[] | null;
-      if (!state.pending_inputs && !state.active_id && prior && roots.every(root => prior.some(old => old.scopeId === root.scopeId
+      const reusable = await this.outputRoot(client, scope.id, input.sessionEpoch);
+      if (reusable && !state.pending_inputs && !state.active_id && prior && roots.every(root => prior.some(old => old.scopeId === root.scopeId
         && old.baselineId === root.baselineId && old.revision === root.revision && old.epoch === root.epoch))) return undefined;
       await this.admit(client, s.tenantId, scope.id);
       const sequence = !state.pending_inputs && !state.active_id ? (BigInt(state.pending_sequence) + 1n).toString() : state.pending_sequence as string;
@@ -134,7 +147,8 @@ export class InventoryReconciliation {
       const saved = (await client.query("SELECT * FROM inventory_roots WHERE scope_id=$1 AND current", [scope.id])).rows[0];
       const old: PreviousRoot | undefined = saved ? { ...saved,
         nativeScopes: (prior ?? []).filter(root => root.domain === "power_platform").map(root => root.scopeId) } : undefined;
-      const broad = !old || !prior || prior.length !== roots.length
+      // Staging replaces an expired/fenced head, so its frontier must include untouched sources too.
+      const broad = !reusable || !old || !prior || prior.length !== roots.length
         || roots.some(root => !prior.some(value => value.scopeId === root.scopeId && value.baselineId === root.baselineId));
       const native = (await client.query(`WITH roots AS (
         SELECT "baselineId" AS baseline_id,revision FROM jsonb_to_recordset($1::jsonb) r("baselineId" uuid,revision bigint)
@@ -142,7 +156,7 @@ export class InventoryReconciliation {
         .find(row => row.kind === "microsoft.copilotstudio/agents");
       return { job, scopeId: scope.id as string, sequence, afterSequence: state.published_sequence as string,
         inputRoots: roots, roots: roots.filter(root => root.domain === "packages" || root.scopeId === native?.scope_id), old, broad };
-    });
+    }, false, signal, undefined, assertCurrent);
     if (!claim) return null;
     try {
       return await this.stages.execute({ ...input, jobId: claim.job, jobKind: input.jobKind === "fixture" ? "fixture" : "derived" },
@@ -156,10 +170,11 @@ export class InventoryReconciliation {
             if (!component) break;
             await this.reconcileComponent(lease, claim, component, input.observedAt);
           }
-        }, { signal, authorize, validateInputs: async client => {
+        }, { signal, authorize, assertCurrent, validateInputs: async client => {
           await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
           await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}:${input.scope.principalId}`]);
           for (const scopeId of [claim.scopeId, ...claim.inputRoots.map(root => root.scopeId)].sort()) await lockDataScope(client, scopeId, input.scope.tenantId);
+          if (!claim.broad && !await this.outputRoot(client, claim.scopeId, input.sessionEpoch)) throw new Error("inventory_reconciliation_fenced");
           if ((await client.query(`UPDATE inventory_reconciliation SET active_until=clock_timestamp()+interval '60 seconds'
             WHERE scope_id=$1 AND active_id=$2 AND active_until>clock_timestamp()`, [claim.scopeId, claim.job])).rowCount !== 1) throw new Error("inventory_reconciliation_fenced");
           for (const root of claim.inputRoots) {
@@ -178,11 +193,15 @@ export class InventoryReconciliation {
           await client.query("DELETE FROM inventory_worker_pins WHERE worker_id=$1", [claim.job]);
         } });
     } catch (error) {
-      await this.stages.generations.connections.run(async client => {
-        await client.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_deadline=NULL,status='failed',
-          pending_inputs=coalesce(pending_inputs,active_inputs) WHERE scope_id=$1 AND active_id=$2`, [claim.scopeId, claim.job]);
-        await client.query("DELETE FROM inventory_worker_pins WHERE worker_id=$1", [claim.job]);
-      });
+      try {
+        await this.stages.generations.connections.run(async client => {
+          await client.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_deadline=NULL,status='failed',
+            pending_inputs=coalesce(pending_inputs,active_inputs) WHERE scope_id=$1 AND active_id=$2`, [claim.scopeId, claim.job]);
+          await client.query("DELETE FROM inventory_worker_pins WHERE worker_id=$1", [claim.job]);
+        });
+      } catch (cleanup) {
+        throw new AggregateError([error, cleanup], "inventory_reconciliation_and_cleanup_failed");
+      }
       throw error;
     }
   }
@@ -344,28 +363,26 @@ export class InventoryReconciliation {
         SELECT source_scope_id,identity,generation_id,agent_id FROM ordered WHERE ordinal=included ORDER BY ordinal`,
       [claim.job, JSON.stringify(claim.roots), claim.old?.baseline_id ?? null, claim.old?.revision ?? null, claim.old?.nativeScopes ?? []])).rows;
       if (!candidates.length) return [];
-      let batch = candidates;
-      let rows: Awaited<ReturnType<typeof storedInventoryRecords>>;
+      let selected = candidates;
       for (;;) {
         try {
-          rows = await storedInventoryRecords(client, batch.map(candidate => ({
+          const rows = await storedInventoryRecords(client, selected.map(candidate => ({
             generationId: candidate.generation_id, identity: candidate.identity,
           })), "canonical");
-          break;
+          if (!rows.length) throw new Error("inventory_component_incomplete");
+          const result: Component[] = [];
+          for (let index = 0; index < rows.length; index++) {
+            const row = rows[index], candidate = selected[index];
+            if (row.identity !== candidate.identity || row.generation_id !== candidate.generation_id) throw new Error("inventory_component_incomplete");
+            result.push({ rows: [row], previous: candidate.agent_id ? [{ agent_id: candidate.agent_id,
+              domain: row.domain, native_id: row.native_id, environment_id: row.environment_id }] : [] });
+          }
+          return result;
         } catch (error) {
-          if (!(error instanceof AppError) || error.code !== "inventory_record_work_bytes" || batch.length < 2) throw error;
-          batch = batch.slice(0, Math.ceil(batch.length / 2));
+          if (!(error instanceof Error) || error.message !== "inventory_record_work_bytes" || selected.length === 1) throw error;
+          selected = selected.slice(0, Math.floor(selected.length / 2));
         }
       }
-      if (!rows.length) throw new Error("inventory_component_incomplete");
-      const result: Component[] = [];
-      for (let index = 0; index < rows.length; index++) {
-        const row = rows[index], candidate = candidates[index];
-        if (row.identity !== candidate.identity || row.generation_id !== candidate.generation_id) throw new Error("inventory_component_incomplete");
-        result.push({ rows: [row], previous: candidate.agent_id ? [{ agent_id: candidate.agent_id,
-          domain: row.domain, native_id: row.native_id, environment_id: row.environment_id }] : [] });
-      }
-      return result;
     });
     if (!components.length) return 0;
     await this.publishComponents(lease, components, evaluatedAt);
@@ -537,13 +554,13 @@ export class InventoryReconciliation {
         ...record.packages.map(value => ({ source: "graph_packages" as const, environment_id: "", native_id: value.id,
           normalized_environment_id: "", normalized_native_id: value.id, package_snapshot_id: null, power_platform_snapshot_id: null, matching_evidence: [] })),
         ...record.powerPlatformResource ? [{ source: "power_platform" as const, environment_id: record.powerPlatformResource.environmentId ?? "",
-          native_id: record.powerPlatformResource.nativeId, normalized_environment_id: record.powerPlatformResource.environmentId?.toLowerCase() ?? "",
+          native_id: record.powerPlatformResource.nativeId, normalized_environment_id: normalizeEnvironmentIdentity(record.powerPlatformResource.environmentId ?? ""),
           normalized_native_id: normalizeNativeIdentity(record.powerPlatformResource.nativeId), package_snapshot_id: null, power_platform_snapshot_id: null, matching_evidence: [] }] : [],
-      ].sort((a, b) => sourceKey(a).localeCompare(sourceKey(b)));
+      ].sort((a, b) => sourceKey(a) < sourceKey(b) ? -1 : sourceKey(a) > sourceKey(b) ? 1 : 0);
       return { index, record, sources, sortKey: JSON.stringify(sources.map(sourceKey)) };
     }).sort((a, b) => a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0);
     const previous = loaded.previous.map(row => ({ source: row.domain === "packages" ? "graph_packages" as const : "power_platform" as const,
-      normalized_environment_id: row.domain === "packages" ? "" : row.environment_id?.toLowerCase() ?? "",
+      normalized_environment_id: row.domain === "packages" ? "" : normalizeEnvironmentIdentity(row.environment_id ?? ""),
       normalized_native_id: row.domain === "packages" ? row.native_id : normalizeNativeIdentity(row.native_id), agent_id: row.agent_id }));
     const survivors = assignSurvivors(groups, previous, new Map(previous.map(row => [sourceKey(row), row.agent_id])));
     const kept = new Set<string>();
@@ -559,8 +576,10 @@ export class InventoryReconciliation {
       record.observed_at = new Date(Math.max(...members.map(row => row.observed_at.getTime()))).toISOString();
       record.expires_at = new Date(Math.min(...members.map(row => row.expires_at.getTime()))).toISOString();
       output.push(record);
+      const packageEvidence = new Map(group.record.identity.packageEvidence.map(value => [value.packageId, value.evidence]));
       membershipRows.push(...members.map(row => ({ canonical: id, scope: row.scope_id, identity: row.identity,
-        generation: row.generation_id, evidence: group.record.identity.evidence })));
+        generation: row.generation_id, evidence: row.domain === "packages" ? packageEvidence.get(row.native_id) ?? []
+          : group.record.identity.evidence })));
     }
     for (const id of new Set(loaded.previous.map(row => row.agent_id as string))) if (!kept.has(id)) {
       output.push({ identity: id, native_id: id, environment_id: null, display_name: id, sort_key: id,

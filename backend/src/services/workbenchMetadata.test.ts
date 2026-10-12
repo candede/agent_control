@@ -1,13 +1,45 @@
 import { describe, expect, it } from "vitest";
 import { appRoles, capabilityIds } from "../types/capability.js";
-import { workbenchViewIds } from "../types/workbench.js";
+import { parseWorkbenchMetadataJson, workbenchViewIds } from "../types/workbench.js";
 import { createApp } from "../app.js";
 import { declaredRoutePolicies } from "../routes/policy.js";
-import { getWorkbenchMetadata } from "./workbenchMetadata.js";
+import { getWorkbenchMetadata, workbenchActions, workbenchViews } from "./workbenchMetadata.js";
 
 createApp();
 
 describe("workbench metadata", () => {
+  it("prevents exported definitions from corrupting subsequent authorization metadata", () => {
+    const expected = getWorkbenchMetadata();
+    const accessor = () => { throw new Error("Metadata accessors must not run."); };
+    const proxy = new Proxy(workbenchActions[0], { get: accessor, ownKeys: accessor });
+    expect(Reflect.set(workbenchActions, "0", proxy)).toBe(false);
+    expect(Reflect.set(workbenchActions[0], "capabilityId", null)).toBe(false);
+    expect(Reflect.set(workbenchActions[0].roles, "0", "AgentControl.Admin")).toBe(false);
+    expect(Reflect.defineProperty(workbenchViews[0], "source", { get: accessor })).toBe(false);
+    expect(getWorkbenchMetadata()).toEqual(expected);
+  });
+
+  it("isolates response edits from definitions and other metadata responses", () => {
+    const expected = getWorkbenchMetadata();
+    const changed = getWorkbenchMetadata();
+    changed.views[0].roles.push("AgentControl.Admin");
+    changed.actions[0].roles.splice(0);
+    changed.actions[0].route = "/api/changed";
+    changed.actions.pop();
+    expect(getWorkbenchMetadata()).toEqual(expected);
+  });
+
+  it("rejects caller-owned objects and proxies without executing them", () => {
+    const accessor = () => { throw new Error("Caller-owned metadata must not execute."); };
+    const object = { get views() { return accessor(); }, get toString() { return accessor(); } };
+    const proxy = new Proxy(object, { get: accessor, getOwnPropertyDescriptor: accessor, ownKeys: accessor });
+    const revoked = Proxy.revocable(object, {}); revoked.revoke();
+    for (const value of [object, proxy, revoked.proxy]) {
+      expect(() => Reflect.apply(parseWorkbenchMetadataJson, undefined, [value])).toThrow(SyntaxError);
+    }
+    expect(parseWorkbenchMetadataJson(JSON.stringify(getWorkbenchMetadata()))).toEqual(getWorkbenchMetadata());
+  });
+
   it("uses application authorization for application package refresh recovery", () => {
     expect(getWorkbenchMetadata().actions.find(action => action.id === "packages.refresh.application.resume")).toMatchObject({
       roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.application",

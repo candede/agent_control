@@ -5,7 +5,7 @@ import { assertResidualDatabaseBounds, assertInventoryFactDatabaseBounds, dataLi
 import { DataGenerations, type BeginGeneration, type GenerationLease } from "./dataGenerations.js";
 import { inventoryLimits, type InventoryDomain, type InventoryPage, type InventoryRoot } from "../types/inventoryRecords.js";
 import type { InventoryRecord } from "../services/inventoryRecordProjection.js";
-import { normalizeNativeIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 
 export const inventoryTables = { packages: "package_record_rows", power_platform: "power_platform_record_rows", canonical: "unified_agent_rows" } as const;
 export type InventoryIntent = {
@@ -17,7 +17,7 @@ export type InventoryIntent = {
   roleScope?: "full" | "ai" | "unknown";
 };
 export function inventorySelector(intent: Pick<InventoryIntent, "domain" | "environmentId" | "resourceTypes">) {
-  return intent.domain === "power_platform" ? JSON.stringify([intent.environmentId?.toLowerCase() ?? "", [...new Set(intent.resourceTypes ?? [])].sort()]) : "complete";
+  return intent.domain === "power_platform" ? JSON.stringify([normalizeEnvironmentIdentity(intent.environmentId ?? ""), [...new Set(intent.resourceTypes ?? [])].sort()]) : "complete";
 }
 type Completion = NonNullable<NonNullable<Parameters<DataGenerations["publish"]>[1]>["completeJob"]>;
 export const inventoryAsOf = (alias = "m", root = "$1", revision = "$2") =>
@@ -74,7 +74,9 @@ export class InventoryGenerations {
   async execute(input: BeginGeneration, intent: InventoryIntent,
     work: (lease: GenerationLease, signal: AbortSignal) => Promise<void>,
     options: { signal?: AbortSignal; authorize: (signal: AbortSignal) => Promise<void>; completeJob?: Completion;
+      assertCurrent?: () => void;
       validateInputs?: (client: pg.PoolClient) => Promise<void>; afterPublish?: (client: pg.PoolClient, root: InventoryRoot) => Promise<void>;
+      onCommitted?: () => void;
       commitPublication?: (operation: () => Promise<void>) => Promise<void> }) {
     if (input.scope.kind !== "principal" || input.scope.source !== `inventory_${intent.domain}` || input.schemaVersion !== 1) throw new Error("inventory_scope");
     if (input.scope.selector !== inventorySelector(intent)) throw new Error("inventory_selector");
@@ -112,6 +114,11 @@ export class InventoryGenerations {
       await options.authorize(signal);
       let result!: InventoryRoot & { inserted: number; closed: number; changed: number };
       const publish = async () => { await this.generations.publish(lease, {
+        onCommitted: options.onCommitted,
+        beforeCommit: () => {
+          signal.throwIfAborted();
+          options.assertCurrent?.();
+        },
         validateInputs: options.validateInputs,
         completeJob: async (client, completion) => {
           result = await this.publishMembership(client, lease);
@@ -123,6 +130,7 @@ export class InventoryGenerations {
       // acquire that account queue from inside a locked publication transaction.
       if (options.commitPublication) await options.commitPublication(publish);
       else await publish();
+      // The pre-commit fence is final: later invalidation cannot undo durable success.
       return result;
     }, options.signal, options.validateInputs);
   }
@@ -188,7 +196,7 @@ export class InventoryGenerations {
           && !(attempt.target_job_id ? (await client.query("SELECT 1 FROM inventory_refresh_targets WHERE job_id=$1 AND target_id=$2",
             [attempt.target_job_id, row.native_id])).rowCount : attempt.exact_targets.includes(row.native_id))) throw new Error("inventory_exact_target_mismatch");
         if (attempt.domain === "power_platform" && (normalizeNativeIdentity(String(row.residual.tenantId ?? "")) !== normalizeNativeIdentity(lease.tenantId)
-          || attempt.environment_id && normalizeNativeIdentity(row.environment_id ?? "").toLowerCase() !== attempt.environment_id.toLowerCase()
+          || attempt.environment_id && normalizeEnvironmentIdentity(row.environment_id ?? "") !== normalizeEnvironmentIdentity(attempt.environment_id)
           || !attempt.resource_types.includes(row.resource_type))) throw new Error("inventory_resource_scope");
       }
       const index = ordinal ?? generation.batch_count;
@@ -212,7 +220,8 @@ export class InventoryGenerations {
         SELECT $1,$2,$3,r.identity,1,r.content_hash,r.display_name,r.sort_key,r.native_id,r.environment_id,r.resource_type,r.publisher,
           r.modified_at,coalesce(r.observed_at,g.observed_at),coalesce(r.expires_at,g.expires_at),coalesce(r.read_started_at,a.read_started_at),r.residual,
           coalesce(r.catalog_generation,CASE WHEN a.channel IN ('catalog','exact') THEN $1 END),
-          coalesce(r.detail_generation,CASE WHEN a.channel IN ('exact','detail') THEN $1 END),
+          CASE WHEN r.residual->'detailFreshness'->>'state'='missing' THEN NULL
+            ELSE coalesce(r.detail_generation,CASE WHEN a.channel IN ('exact','detail') THEN $1 END) END,
           coalesce(r.control_generation,CASE WHEN a.channel='control' THEN $1 END),r.identity_expires_at,
           r.presence,r.link_state,r.availability,r.management
         FROM jsonb_to_recordset($4::jsonb) r(identity text,content_hash text,deleted boolean,display_name text,sort_key text,native_id text,
@@ -310,7 +319,11 @@ export class InventoryGenerations {
         batch_count=batch_count+1,content_hash=encode(sha256(convert_to(coalesce(content_hash,'')||$5,'UTF8')),'hex') WHERE id=$1`,
       [lease.id, rows.length, children, bytes, hash]);
       return { rows: rows.length, bytes, replay: false };
-    }).catch(async error => { await this.generations.abort(lease); throw error; });
+    }).catch(async error => {
+      try { await this.generations.abort(lease); }
+      catch (failure) { throw new AggregateError([error, failure], "data_poison_fence_failed"); }
+      throw error;
+    });
   }
 
   async appendBounded(lease: GenerationLease, rows: readonly InventoryRecord[]) {

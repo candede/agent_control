@@ -8,6 +8,8 @@ import { errorHandler } from "../errors.js";
 import { OfficialReportImports } from "../db/officialReportImports.js";
 import { canonicalQuery, SelectionError, type SelectionIdentity } from "../services/dataSelections.js";
 import { LargeTenantUsersReports, reportQuery, reportQueryFields, type ReportReadContext } from "../services/largeTenantUsersReports.js";
+import { reportBase } from "../services/officialReportFields.js";
+import { streamOfficialReport } from "../services/officialReportStream.js";
 import type { ReportEndpoint, ReportQuery } from "../types/officialReportData.js";
 import type { UserSourceMetadata } from "../types/userSources.js";
 import { reportQueryString } from "../../../frontend/src/api/reportData.js";
@@ -53,6 +55,7 @@ function context(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportReadC
 }
 function rows() {
   return { raw: [], value: [], counts: { total: 0, filtered: 0 },
+    summaryRow: undefined, analyticsRow: undefined,
     page: { limit: 50, nextCursor: null, previousCursor: null } };
 }
 
@@ -85,7 +88,8 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Unexpected provider request")));
   vi.spyOn(reports, "capture").mockImplementation(async (_identity, _tokenMode, endpoint, query) => {
     saved = context(endpoint, query);
-    return saved.selection;
+    return { ...saved.selection, endpoint: saved.endpoint, queryHash: saved.queryHash,
+      evaluatedAt: saved.evaluatedAt, expiresAt: new Date(saved.selection.expiresAt) };
   });
   vi.spyOn(reports, "read").mockImplementation((_id, _identity, work) => work(client, saved));
   vi.spyOn(reports, "rowsInRead").mockImplementation(async () => rows());
@@ -129,6 +133,76 @@ function allowPage() {
 }
 
 describe("report query HTTP contracts", () => {
+  it.each(["official-usage/overview", "official-usage/aggregate", "official-usage/users", "official-usage/agent-users", "copilot-usage/users"])(
+    "rejects PostgreSQL's unsupported year zero before capturing %s", async path => {
+      for (const field of ["startDate", "endDate"]) {
+        expect(await request("GET", `/${path}?${field}=0000-01-01`))
+          .toMatchObject({ status: 400, body: { code: "invalid_cursor" } });
+      }
+      expect(reports.capture).not.toHaveBeenCalled();
+      expect(reports.pageInRead).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["", "/service-plans", "/agents"])("canonicalizes Graph directory GUIDs for exact Users%s reads", async child => {
+    const objectId = "AAAAAAAA-AAAA-7AAA-1AAA-AAAAAAAAAAAA";
+    saved = context("copilot_users");
+    allowPage();
+    expect(await request("GET", `/copilot-usage/users/${objectId}${child}${reportQueryString({ selectionId })}`))
+      .toMatchObject({ status: 200 });
+    expect(reports.exactInRead).toHaveBeenCalledWith(client, saved, objectId.toLowerCase());
+    if (child) expect(reports.pageInRead).toHaveBeenCalledWith(client, saved, expect.objectContaining({
+      endpoint: child === "/agents" ? "relationships" : "plans", child: objectId.toLowerCase(),
+    }));
+  });
+
+  it("preserves opaque reported-user GUID spelling instead of treating it as a directory ID", async () => {
+    const username = "AAAAAAAA-AAAA-7AAA-1AAA-AAAAAAAAAAAA";
+    saved = context("official_users");
+    expect(await request("GET", `/official-usage/users/${username}${reportQueryString({ selectionId })}`))
+      .toMatchObject({ status: 200 });
+    expect(reports.exactInRead).toHaveBeenCalledExactlyOnceWith(client, saved, username);
+  });
+
+  it.each([
+    "/official-usage/agents/Agent%C2%85", "/official-usage/agents/Agent%09/users",
+    "/official-usage/users/User%C2%85", "/official-usage/users/User%09/agents",
+  ])("rejects malformed exact path identities before capturing a selection: %s", async path => {
+    expect(await request("GET", path)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(reports.exactInRead).not.toHaveBeenCalled();
+  });
+
+  it("canonicalizes a historical set UUID before checking cohort membership and reading observations", async () => {
+    const historicalSetId = "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF";
+    saved = context("history");
+    allowPage();
+    expect(await request("GET", `/official-usage/history/${historicalSetId}/observations${reportQueryString({ selectionId })}`))
+      .toMatchObject({ status: 200 });
+    expect(reports.exactInRead).toHaveBeenCalledExactlyOnceWith(client, saved, historicalSetId.toLowerCase());
+    expect(reports.pageInRead).toHaveBeenCalledExactlyOnceWith(client, saved, {
+      limit: 50, endpoint: "observations", child: historicalSetId.toLowerCase(),
+    });
+  });
+
+  it.each([
+    ["official-usage/aggregate", "official_agents"],
+    ["official-usage/users", "official_users"],
+    ["copilot-usage/users", "copilot_users"],
+    ["official-usage/history", "history"],
+    ["official-usage/overview", "overview"],
+  ] as const)("retains an immutable %s selection when the report-set UUID changes casing", async (path, endpoint) => {
+    const historicalSetId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    saved = context(endpoint, { setId: historicalSetId });
+    allowPage();
+    expect(await request("GET", `/${path}${reportQueryString({ selectionId, setId: historicalSetId.toUpperCase() })}`))
+      .toMatchObject({ status: 200 });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(await request("GET", `/${path}${reportQueryString({ selectionId, setId })}`))
+      .toMatchObject({ status: 400, body: { code: "invalid_cursor" } });
+    expect(reports.pageInRead).toHaveBeenCalledOnce();
+  });
+
   it.each(["official-usage/aggregate", "official-usage/users", "copilot-usage/users", "official-usage/agent-users"])(
     "round-trips a literal empty creator type through %s", async path => {
       allowPage();
@@ -137,7 +211,7 @@ describe("report query HTTP contracts", () => {
         expect.objectContaining({ creatorType: "" }));
     },
   );
-  it.each(["creatorType=&creatorType=Custom", "creatorType=%00", `creatorType=${"x".repeat(257)}`, "agentId=", "limit="])(
+  it.each(["creatorType=&creatorType=Custom", "creatorType=%00", `creatorType=${"x".repeat(257)}`, "agentId=", "agentId=Agent%09ID", "limit="])(
     "still rejects malformed scalars: %s", async query => {
       expect(await request("GET", `/official-usage/aggregate?${query}`)).toMatchObject({ status: 400 });
       expect(reports.capture).not.toHaveBeenCalled();
@@ -251,14 +325,87 @@ describe("report confirmation HTTP input", () => {
   });
 });
 
-function request(method: string, path: string, body?: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+describe("report multipart metadata validation without persistence", () => {
+  function upload(fields: Array<[string, string]>) {
+    const cancelled = vi.fn(async () => {});
+    vi.spyOn(OfficialReportImports.prototype, "open").mockImplementation(async () => {
+      const controller = new AbortController();
+      return {
+        id: selectionId, signal: controller.signal, cancel: cancelled,
+        receive: async input => {
+          const report = await streamOfficialReport(input, undefined, controller.signal, { batch: async () => {} });
+          return { kind: report.kind, rows: report.rowCount, wireBytes: report.wireBytes };
+        },
+        finish: async metadata => {
+          reportBase("users", metadata, []);
+          throw new Error("Unexpected successful import");
+        },
+      };
+    });
+    const boundary = "official-report-fixture";
+    const value = [
+      ...fields.map(([name, value]) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`),
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="users.csv"\r\nContent-Type: text/csv\r\n\r\nUsername,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\r\n`,
+      `--${boundary}--\r\n`,
+    ].join("");
+    return { cancelled, response: request("POST", `/official-usage/staging?bundleId=${setId}`, undefined,
+      { value, type: `multipart/form-data; boundary=${boundary}` }) };
+  }
+
+  it.each(([
+    [["downloadedAt", ""]], [["sourceAsOf", ""], ["sourceAsOfProvenance", ""]],
+    [["sourceAsOf", ""]], [["sourceAsOfProvenance", "operator_asserted"]],
+    [["downloadedAt", "2026-02-30T12:00:00Z"]], [["downloadedAt", "2026-07-08T12:00:00"]],
+    [["reportingStart", "2026-06-08"], ["reportingEnd", "2026-07-06"], ["periodProvenance", "operator_asserted"]],
+  ] satisfies Array<Array<[string, string]>>).map(fields => ({ fields })))("returns actionable 400 errors rather than dropping assertions or reporting 500: %j", async ({ fields }) => {
+    const { response, cancelled } = upload(fields);
+    expect(await response).toMatchObject({ status: 400, body: {
+      code: fields.some(([key]) => key === "reportingStart") ? "invalid_reporting_period" : "invalid_metadata",
+    } });
+    expect(cancelled).toHaveBeenCalledOnce();
+  });
+});
+
+describe("report multipart parser error contracts without persistence", () => {
+  const header = "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\n";
+  it.each([
+    ["Username,Unknown\n", "schema_drift"],
+    [header.replace("Display name", "username"), "duplicate_header"],
+    [`${header}user,"unterminated`, "invalid_csv"],
+    [`${header}first,First,9007199254740991,0,\nsecond,Second,1,0,\n`, "numeric_overflow"],
+    [`${header}user,Name,1,-1,\n`, "invalid_number"],
+    [`${header}user,Name,1,1,2026-02-30\n`, "invalid_date"],
+    [`${header}user,Name,1,1,\0\n`, "invalid_content"],
+    [`${header}user,${" ".repeat(4097)},1,1,\n`, "field_limit_exceeded"],
+  ])("returns the actionable parser code through real multipart handling (case %#)", async (csv, code) => {
+    const cancelled = vi.fn(async () => {});
+    vi.spyOn(OfficialReportImports.prototype, "open").mockImplementation(async (_identity, _intent, parent) => {
+      const signal = parent ?? new AbortController().signal;
+      return {
+        id: selectionId, signal, cancel: cancelled,
+        receive: async input => {
+          const report = await streamOfficialReport(input, undefined, signal, { batch: async () => {} });
+          return { kind: report.kind, rows: report.rowCount, wireBytes: report.wireBytes };
+        },
+        finish: async () => { throw new Error("Unexpected parser acceptance."); },
+      };
+    });
+    const boundary = "official-parser-fixture";
+    const value = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="users.csv"\r\nContent-Type: text/csv\r\n\r\n${csv}\r\n--${boundary}--\r\n`;
+    expect(await request("POST", `/official-usage/staging?bundleId=${setId}`, undefined,
+      { value, type: `multipart/form-data; boundary=${boundary}` })).toMatchObject({ status: 400, body: { code } });
+    expect(cancelled).toHaveBeenCalled();
+  });
+});
+
+function request(method: string, path: string, body?: unknown, raw?: { value: string; type: string }): Promise<{ status: number; body: Record<string, unknown> }> {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing fixture address");
-  const json = body === undefined ? undefined : JSON.stringify(body);
+  const content = raw?.value ?? (body === undefined ? undefined : JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const message = httpRequest({ host: "127.0.0.1", port: address.port, method, path: `/api${path}`,
       headers: { "x-csrf-token": "fixture-csrf",
-        ...(json ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) } : {}) },
+        ...(content ? { "Content-Type": raw?.type ?? "application/json", "Content-Length": Buffer.byteLength(content) } : {}) },
     }, response => {
       let text = "";
       response.setEncoding("utf8");
@@ -266,6 +413,6 @@ function request(method: string, path: string, body?: unknown): Promise<{ status
       response.on("end", () => resolve({ status: response.statusCode!, body: JSON.parse(text) }));
     });
     message.once("error", reject);
-    message.end(json);
+    message.end(content);
   });
 }

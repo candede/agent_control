@@ -132,6 +132,14 @@ describe("unified access job panel", () => {
     expect(getBulkActionJobItems).not.toHaveBeenCalled();
   });
 
+  it("does not suggest signing in and resuming an abandoned canary, but permits cancellation", () => {
+    const { panel } = mount({ job: { ...running, isCanary: true, status: "waiting_authorization", canResume: false } });
+    expect(panel.queryByRole("button", { name: "Resume unprocessed tasks" })).not.toBeInTheDocument();
+    expect(panel.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+    expect(panel.getByText(/canary cannot be resumed/i)).toBeVisible();
+    expect(panel.getByRole("button", { name: "Cancel unprocessed tasks" })).toBeEnabled();
+  });
+
   it.each(["cancel", "resume", "reconcile"] as const)("disables recovery controls while %s is pending", async operation => {
     vi.mocked(getBulkActionJobItems).mockResolvedValueOnce({
       value: [{ id: "result", displayName: "Saved result", status: "succeeded" }], revision: "1",

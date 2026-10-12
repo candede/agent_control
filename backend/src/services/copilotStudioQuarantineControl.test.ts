@@ -1,10 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
-import { createQuarantineConfirmation } from "../db/copilotStudioQuarantine.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createQuarantineConfirmation, type CopilotStudioQuarantineRepository } from "../db/copilotStudioQuarantine.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { QuarantineJob } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import type { CapabilityId } from "../types/capability.js";
+import { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 import { CopilotStudioQuarantineControlService } from "./copilotStudioQuarantineControl.js";
+import { requireProviderAdmissions } from "./operationalState.js";
+
+vi.mock("./operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
+afterEach(() => vi.mocked(requireProviderAdmissions).mockReset());
 
 const user: AuthenticatedUser = { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
 const viewer: AuthenticatedUser = { ...user, displayName: "Viewer", roles: ["AgentControl.Viewer"] };
@@ -17,17 +23,21 @@ const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".re
 
 function service(cached = false, currentUser = user) {
   const repository = {
-    existingSubmission: vi.fn<() => Promise<Pick<QuarantineJob, "id" | "status"> | undefined>>(async () => undefined), latestObservation: vi.fn(async () => cached ? direct : undefined), recordObservation: vi.fn(async () => direct),
+    existingSubmission: vi.fn<() => Promise<Pick<QuarantineJob, "id" | "status"> | undefined>>(async () => undefined), latestObservation: vi.fn(async () => cached ? direct : undefined),
+    recordObservation: vi.fn<CopilotStudioQuarantineRepository["recordObservation"]>(async () => direct),
     isQualified: vi.fn(async () => false), submit: vi.fn(),
   };
   const inventory = { resolveQuarantineTargets: vi.fn(async () => [target]) };
-  const provider = { getStatus: vi.fn(async () => direct) };
+  const provider = { getStatus: vi.fn<CopilotStudioQuarantineClient["getStatus"]>(async () => direct) };
+  const assertAuthority = vi.fn();
   const dependencies = {
+    beginOperationValidation: vi.fn(() => assertAuthority),
     observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
-    revalidateUser: vi.fn(async () => currentUser), delegatedToken: vi.fn(async () => "ephemeral-token"), requireAvailable: vi.fn(async () => undefined),
+    revalidateUser: vi.fn(async () => currentUser), delegatedToken: vi.fn(async () => "ephemeral-token"),
+    requireAvailable: vi.fn(async (_id: CapabilityId, _user: AuthenticatedUser) => undefined),
     authorityContext: vi.fn(async () => authority), launch: vi.fn(),
   };
-  return { repository, inventory, provider, dependencies, value: new CopilotStudioQuarantineControlService(repository as never, inventory as never, provider as never, dependencies as never) };
+  return { repository, inventory, provider, dependencies, assertAuthority, value: new CopilotStudioQuarantineControlService(repository as never, inventory as never, provider as never, dependencies as never) };
 }
 
 describe("Copilot Studio quarantine control", () => {
@@ -44,8 +54,77 @@ describe("Copilot Studio quarantine control", () => {
     expect(provider.getStatus).toHaveBeenCalledTimes(1);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.read", viewer);
     expect(dependencies.delegatedToken).toHaveBeenCalledWith(viewer.tenantId, viewer.homeAccountId, "powerPlatform.quarantine.read");
-    expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2);
-    expect(repository.recordObservation).toHaveBeenCalledWith({ tenantId: "tenant-a", principalId: "operator-a" }, target, direct);
+    expect(dependencies.revalidateUser).toHaveBeenCalledTimes(3);
+    expect(repository.recordObservation).toHaveBeenCalledWith({ tenantId: "tenant-a", principalId: "operator-a" }, target, direct, expect.any(Function));
+  });
+
+  it.each(["session", "admission", "authority"] as const)("stops an adapter GET retry after %s changes during backoff", async change => {
+    const current = { ...viewer, homeAccountId: `retry-fence-${change}` };
+    const f = service(false, current);
+    const failure = new AppError(401, "authorization_expired", "Authority changed.");
+    const fetcher = vi.fn(async () => Response.json({ error: { code: "TooManyRequests" } }, { status: 429 }));
+    const provider = new CopilotStudioQuarantineClient(fetcher, { delay: async () => {
+      if (change === "session") {
+        await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+        await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      } else if (change === "admission") {
+        vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw failure; });
+      } else {
+        f.assertAuthority.mockImplementation(() => { throw failure; });
+      }
+    } });
+    const value = new CopilotStudioQuarantineControlService(f.repository as never, f.inventory as never, provider, f.dependencies as never);
+    await expect(value.status(current, target.snapshotId, target.resourceNativeId, true))
+      .rejects.toMatchObject({ code: change === "session" ? "unauthorized" : "authorization_expired" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(f.repository.recordObservation).not.toHaveBeenCalled();
+  });
+
+  it.each(["token", "readback", "observation-commit", "authority", "submission-commit", "launch"] as const)(
+    "fences quarantine work against capability invalidation during %s without a session change", async boundary => {
+      const submission = boundary === "authority" || boundary === "submission-commit" || boundary === "launch";
+      const f = service(submission, submission ? user : viewer);
+      const failure = new AppError(401, "authorization_expired", "Authority changed.");
+      const invalidate = () => f.assertAuthority.mockImplementation(() => { throw failure; });
+      if (boundary === "token") f.dependencies.delegatedToken.mockImplementationOnce(async () => { invalidate(); return "ephemeral-token"; });
+      if (boundary === "readback") f.provider.getStatus.mockImplementationOnce(async () => { invalidate(); return direct; });
+      if (boundary === "observation-commit") f.repository.recordObservation.mockImplementationOnce(async (_scope, _target, status, beforeCommit) => {
+        invalidate();
+        beforeCommit?.();
+        return status;
+      });
+      if (boundary === "authority") f.dependencies.authorityContext.mockImplementationOnce(async () => { invalidate(); return authority; });
+      let committed = false;
+      f.repository.submit.mockImplementationOnce(async (_scope, _input, beforeCommit: () => void) => {
+        if (boundary === "submission-commit") invalidate();
+        beforeCommit();
+        committed = true;
+        if (boundary === "launch") invalidate();
+        return { id: "55555555-5555-4555-8555-555555555555", status: "queued", isCanary: false };
+      });
+      const pending = boundary === "authority" || boundary === "submission-commit" || boundary === "launch"
+        ? f.value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+          confirmationHash: "e".repeat(64), idempotencyKey: `authority-${boundary}` })
+        : f.value.status(viewer, target.snapshotId, target.resourceNativeId, true);
+      await expect(pending).rejects.toBe(failure);
+      expect(f.dependencies.launch).not.toHaveBeenCalled();
+      expect(committed).toBe(boundary === "launch");
+      if (boundary === "token") expect(f.provider.getStatus).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rechecks the actor's current role after token acquisition before reading a target", async () => {
+    const f = service(false, viewer);
+    let revoked = false;
+    const failure = new AppError(403, "missing_internal_role", "Viewer authority was revoked.");
+    f.dependencies.delegatedToken.mockImplementationOnce(async () => { revoked = true; return "ephemeral-token"; });
+    f.dependencies.revalidateUser.mockImplementation(async () => revoked ? { ...viewer, roles: [] } : viewer);
+    f.dependencies.requireAvailable.mockImplementation(async (_capabilityId, current) => {
+      if (!current.roles.length) throw failure;
+    });
+    await expect(f.value.status(viewer, target.snapshotId, target.resourceNativeId, true)).rejects.toBe(failure);
+    expect(f.provider.getStatus).not.toHaveBeenCalled();
+    expect(f.repository.recordObservation).not.toHaveBeenCalled();
   });
 
   it("propagates Microsoft denial without publishing a status observation", async () => {
@@ -55,6 +134,51 @@ describe("Copilot Studio quarantine control", () => {
     await expect(value.status(providerAuthorizedUser, target.snapshotId, target.resourceNativeId, true))
       .rejects.toThrow("Microsoft denied the exact status request.");
     expect(repository.recordObservation).not.toHaveBeenCalled();
+  });
+
+  it.each(["token", "readback", "commit"] as const)("stops direct status publication when provider admission closes during %s", async boundary => {
+    const { value, repository, provider, dependencies } = service(false, viewer);
+    const failure = new AppError(503, "maintenance", "Provider admission closed.");
+    const closeAdmission = () => vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw failure; });
+    let published = false;
+    if (boundary === "token") dependencies.delegatedToken.mockImplementationOnce(async () => { closeAdmission(); return "ephemeral-token"; });
+    if (boundary === "readback") provider.getStatus.mockImplementationOnce(async () => { closeAdmission(); return direct; });
+    repository.recordObservation.mockImplementationOnce(async (_scope, _target, status, beforeCommit) => {
+      if (boundary === "commit") closeAdmission();
+      beforeCommit?.();
+      published = true;
+      return status;
+    });
+    await expect(value.status(viewer, target.snapshotId, target.resourceNativeId, true)).rejects.toBe(failure);
+    expect(provider.getStatus).toHaveBeenCalledTimes(boundary === "token" ? 0 : 1);
+    expect(published).toBe(false);
+  });
+
+  it("rolls back new-job publication if provider admission closes during submission", async () => {
+    const { value, repository, dependencies } = service(true);
+    const failure = new AppError(503, "provider_requalification_required", "Provider admission closed.");
+    let published = false;
+    repository.submit.mockImplementationOnce(async (_scope, _input, beforeCommit: () => void) => {
+      vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw failure; });
+      beforeCommit();
+      published = true;
+      return { id: "55555555-5555-4555-8555-555555555555", status: "queued", isCanary: false };
+    });
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "closed-admission" })).rejects.toBe(failure);
+    expect(published).toBe(false);
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("keeps saved status and terminal receipts readable while provider work is disabled", async () => {
+    const { value, repository, provider } = service(true);
+    vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw new AppError(503, "maintenance", "Provider admission closed."); });
+    await expect(value.status(viewer, target.snapshotId, target.resourceNativeId)).resolves.toMatchObject({ direct: { source: "cache" } });
+    const receipt = { id: "55555555-5555-4555-8555-555555555555", status: "succeeded" as const };
+    repository.existingSubmission.mockResolvedValueOnce(receipt);
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "saved-receipt" })).resolves.toBe(receipt);
+    expect(provider.getStatus).not.toHaveBeenCalled();
   });
 
   it("builds an exact frozen preview without consulting optional canary qualification", async () => {
@@ -100,13 +224,13 @@ describe("Copilot Studio quarantine control", () => {
     expect(inventory.resolveQuarantineTargets).toHaveBeenLastCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, target.snapshotId, [target.resourceNativeId]);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.manage", user);
     expect(dependencies.delegatedToken).toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "powerPlatform.quarantine.manage");
-    expect(provider.getStatus).toHaveBeenCalledWith("ephemeral-token", target, { correlationId: expect.any(String) });
+    expect(provider.getStatus).toHaveBeenCalledWith("ephemeral-token", target, { correlationId: expect.any(String), assertCurrent: expect.any(Function) });
     expect(repository.submit).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, {
       action: input.action, targets: [{ ...target, directStatus: direct }],
       actor: { tenantId: user.tenantId, homeAccountId: user.homeAccountId, displayName: user.displayName, username: user.username },
       authority, requestPath: "/api/quarantine/jobs",
       idempotencyKey: input.idempotencyKey, confirmationHash: input.confirmationHash,
-    });
+    }, expect.any(Function));
     expect(dependencies.launch).toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555", { tenantId: user.tenantId, principalId: user.homeAccountId });
     expect(repository.isQualified).not.toHaveBeenCalled();
   });
@@ -157,7 +281,7 @@ describe("Copilot Studio quarantine control", () => {
     expect(dependencies.authorityContext).toHaveBeenCalledWith(current);
     expect(repository.submit).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, expect.objectContaining({
       actor: { tenantId: current.tenantId, homeAccountId: current.homeAccountId, displayName: current.displayName, username: current.username },
-    }));
+    }), expect.any(Function));
     expect(createQuarantineConfirmation(repository.submit.mock.calls[0][1]).confirmationHash).toBe(preview.confirmationHash);
   });
 
@@ -237,6 +361,53 @@ describe("Copilot Studio quarantine control", () => {
     expect(provider.getStatus).not.toHaveBeenCalled();
     expect(repository.recordObservation).not.toHaveBeenCalled();
   });
+
+  it.each(["status", "preview", "submit", "retry"] as const)(
+    "stops %s authorization before capability work if revalidation crosses sessions", async operation => {
+      const current = { ...user, homeAccountId: `revalidation-session-${operation}` };
+      const { value, repository, provider, dependencies } = service(operation !== "status", current);
+      if (operation === "retry") repository.existingSubmission.mockResolvedValue({
+        id: "55555555-5555-4555-8555-555555555555", status: "queued",
+      });
+      dependencies.revalidateUser.mockImplementationOnce(async () => {
+        await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+        await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+        return current;
+      });
+      const input = { action: "quarantine" as const, snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+        confirmationHash: "e".repeat(64), idempotencyKey: "revalidation-session" };
+      const result = operation === "status" ? value.status(current, input.snapshotId, target.resourceNativeId)
+        : operation === "preview" ? value.preview(current, input) : value.submit(current, input);
+
+      await expect(result).rejects.toMatchObject({ code: "unauthorized" });
+      expect(dependencies.requireAvailable).not.toHaveBeenCalled();
+      expect(dependencies.authorityContext).not.toHaveBeenCalled();
+      expect(dependencies.delegatedToken).not.toHaveBeenCalled();
+      expect(provider.getStatus).not.toHaveBeenCalled();
+      expect(repository.recordObservation).not.toHaveBeenCalled();
+      expect(repository.submit).not.toHaveBeenCalled();
+      expect(dependencies.launch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["preview", "submit"] as const)(
+    "stops cached %s before authority lookup if capability validation crosses sessions", async operation => {
+      const current = { ...user, homeAccountId: `capability-session-${operation}` };
+      const { value, repository, dependencies } = service(true, current);
+      dependencies.requireAvailable.mockImplementationOnce(async () => {
+        await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+        await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      });
+      const input = { action: "quarantine" as const, snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+        confirmationHash: "e".repeat(64), idempotencyKey: "capability-session" };
+
+      await expect(operation === "preview" ? value.preview(current, input) : value.submit(current, input))
+        .rejects.toMatchObject({ code: "unauthorized" });
+      expect(dependencies.authorityContext).not.toHaveBeenCalled();
+      expect(repository.submit).not.toHaveBeenCalled();
+      expect(dependencies.launch).not.toHaveBeenCalled();
+    },
+  );
 
   it("stops bulk reads after the initiating session is revoked", async () => {
     const current = { ...user, homeAccountId: "bulk-status-session" };

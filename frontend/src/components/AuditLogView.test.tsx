@@ -25,7 +25,7 @@ vi.mock("../api/client", async importOriginal => ({
 const associationEvent: AuditEvent = {
   id: "association-event", operationId: "associate-agent-usage:operation-1",
   action: "associate-agent-usage", scope: "single", agentId: "agent:11111111-1111-4111-8111-111111111111",
-  actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Admin"] },
+  actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture" },
   startedAt: "2026-09-17T00:00:00.000Z", status: "succeeded", requestPath: "/api/agent-inventory/agent/usage-associations",
   metadata: {
     source: "official_usage", reportSetId: "11111111-1111-4111-8111-111111111111",
@@ -142,7 +142,7 @@ describe("AuditLogView routing", () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
       id: "usage-event", operationId: "usage-operation", action, scope: "single",
       agentId: "agent:11111111-1111-4111-8111-111111111111",
-      actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Admin"] },
+      actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture" },
       startedAt: "2026-09-17T00:00:00.000Z", status: "succeeded", requestPath: "/api/agent-inventory/agent/usage-associations",
     }] });
     render(<AuditLogView agents={[{ id: associationEvent.agentId, displayName: "Unrelated native package" }]} />);
@@ -161,7 +161,7 @@ describe("AuditLogView routing", () => {
     window.history.replaceState({}, "", "/audit?action=export-agent-inventory&status=succeeded");
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
       id: "export-event", operationId: "export-operation", action: "export-agent-inventory", scope: "bulk",
-      agentId: "agent-inventory", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Viewer"] },
+      agentId: "agent-inventory", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture" },
       startedAt: "2026-09-17T00:00:00.000Z", status: "succeeded", requestPath: "/api/agent-inventory/export.csv",
     }] });
     render(<AuditLogView agents={[]} />);
@@ -212,6 +212,60 @@ describe("AuditLogView routing", () => {
     await userEvent.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it.each(["block", "export-agent-inventory", "query-hunting"] as const)(
+    "shows allowlisted %s provenance even without an outcome message", async action => {
+      const base = {
+        ...associationEvent,
+        metadata: {
+          source: "fixture", correlationId: "correlation-1", prestateHash: "a".repeat(64),
+          poststateHash: "b".repeat(64), verification: "provider_readback", readbackCount: 1,
+          partial: false, resultingCount: 2, checksum: "c".repeat(64), phase: "download", queryHash: "d".repeat(64),
+          rows: ["private-row"], accessToken: "private-token", errorDetails: { message: "private-response" },
+        },
+      };
+      const event: AuditEvent = action === "block"
+        ? { ...base, action, targetBlockedState: true } : { ...base, action };
+      vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [event] });
+      render(<AuditLogView agents={[]} />);
+      await userEvent.click(await screen.findByRole("button", { name: "View event details: Recorded audit evidence" }));
+      const details = screen.getByLabelText("Recorded audit details");
+      expect(details).toHaveTextContent('"correlationId": "correlation-1"');
+      expect(details).toHaveTextContent(`"prestateHash": "${"a".repeat(64)}"`);
+      expect(details).toHaveTextContent(`"poststateHash": "${"b".repeat(64)}"`);
+      expect(details).toHaveTextContent('"verification": "provider_readback"');
+      expect(details).toHaveTextContent('"readbackCount": 1');
+      expect(details).toHaveTextContent('"partial": false');
+      expect(details).toHaveTextContent('"resultingCount": 2');
+      expect(details).toHaveTextContent(`"checksum": "${"c".repeat(64)}"`);
+      expect(details).toHaveTextContent('"phase": "download"');
+      expect(details).toHaveTextContent(`"queryHash": "${"d".repeat(64)}"`);
+      expect(details).toHaveTextContent('"status": "succeeded"');
+      expect(details).not.toHaveTextContent("private-row");
+      expect(details).not.toHaveTextContent("private-token");
+      expect(details).not.toHaveTextContent("private-response");
+    },
+  );
+
+  it("shows access outcome provenance without unrestricted principal or error details", async () => {
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
+      ...associationEvent, action: "update-installation", status: "inconclusive", errorCode: "provider_timeout",
+      metadata: {
+        mode: "replace", scope: "specific", reconciliationStatus: "required", verification: "not_verified",
+        principals: [{ username: "private-principal" }], errorDetails: { message: "private-response" },
+      },
+    }] });
+    render(<AuditLogView agents={[]} />);
+    await userEvent.click(await screen.findByRole("button", { name: "View event details: replace specific" }));
+    const details = screen.getByLabelText("Recorded audit details");
+    expect(details).toHaveTextContent('"setting": "Installed for"');
+    expect(details).toHaveTextContent('"reconciliationStatus": "required"');
+    expect(details).toHaveTextContent('"verification": "not_verified"');
+    expect(details).toHaveTextContent('"status": "inconclusive"');
+    expect(details).toHaveTextContent('"errorCode": "provider_timeout"');
+    expect(details).not.toHaveTextContent("private-principal");
+    expect(details).not.toHaveTextContent("private-response");
   });
 
   it("keeps a failed association's conflict code alongside its report and revision evidence", async () => {
@@ -785,7 +839,7 @@ describe("AuditLogView routing", () => {
   it("exports exact displayed event IDs through the authorized server rather than serializing cached rows", async () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
       id: "event-1", operationId: "operation-1", action: "block", targetBlockedState: true, scope: "single",
-      agentId: "package-1", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Viewer"] },
+      agentId: "package-1", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture" },
       startedAt: "2026-09-10T10:00:00.000Z", status: "failed", requestPath: "/fixture",
     }] });
     vi.mocked(downloadAdministrativeAuditCsv).mockRejectedValue(new Error("Download not authorized"));

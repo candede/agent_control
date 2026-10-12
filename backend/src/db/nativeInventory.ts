@@ -7,7 +7,7 @@ import { currentInventorySourcesSql } from "./inventoryAuthority.js";
 import { dataConnections } from "./dataConnections.js";
 import { encodeBatch } from "./dataBounds.js";
 import { pool } from "./pool.js";
-import { normalizeNativeIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 
 type Scope = { tenantId: string; principalId: string };
 type Read = { client: pg.PoolClient; at: Date };
@@ -34,7 +34,7 @@ export class NativeInventory {
         JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
         WHERE source.source='power_platform' AND r.resource_type='microsoft.copilotstudio/agents'
           AND source.normalized_native_id=$5 AND ($6::uuid IS NULL OR revision.generation_id=$6)
-          AND ($7::text IS NULL OR source.normalized_environment_id=lower($7)) LIMIT 2
+          AND ($7::text IS NULL OR source.normalized_environment_id=$7) LIMIT 2
       ) SELECT native_id,environment_id,source_generation_id AS generation_id,root_generation_id,
         observed_at,LEAST(record_expires_at,authority_expires_at) AS expires_at,residual,
         (SELECT count(*)::int FROM inventory_facts f WHERE f.generation_id=selected.source_generation_id
@@ -46,10 +46,12 @@ export class NativeInventory {
           CROSS JOIN LATERAL (SELECT f.value FROM inventory_facts f
             WHERE f.generation_id=selected.source_generation_id AND f.identity=selected.source_identity
               AND f.kind='identifier' AND f.payload->>'kind'=kinds.kind ORDER BY ordinal LIMIT 2) identifier) ids),'[]'::jsonb) AS identifiers
-      FROM selected`, [scope.tenantId, scope.principalId, null, read.at, normalizeNativeIdentity(nativeId), snapshotId ?? null, environmentId ?? null])).rows;
+      FROM selected`, [scope.tenantId, scope.principalId, null, read.at, normalizeNativeIdentity(nativeId), snapshotId ?? null,
+      environmentId === undefined ? null : normalizeEnvironmentIdentity(environmentId)])).rows;
     encodeBatch(rows);
     if (!rows.length) throw new AppError(409, "quarantine_target_unavailable", "The exact target is absent from current authorized inventory. Refresh inventory.");
     if (rows.length !== 1) throw new AppError(409, "quarantine_target_ambiguous", "The native identity has multiple current memberships.");
+    if (rows[0].native_id !== nativeId) throw new AppError(409, "quarantine_target_unavailable", "The exact native resource identity does not match current authorized inventory. Refresh inventory.");
     return rows[0];
   }
 
@@ -91,7 +93,8 @@ export function nativeTarget(row: NativeRow, at: Date, maximumAgeMs = 86_400_000
     throw new AppError(409, "quarantine_inventory_stale", "The exact native inventory evidence expired. Refresh inventory.");
   }
   const target = row.control;
-  if (!target || target.environmentId !== row.environment_id) {
+  if (!target || typeof target.environmentId !== "string" || typeof row.environment_id !== "string"
+    || target.environmentId.toLowerCase() !== row.environment_id.toLowerCase()) {
     throw new AppError(409, "quarantine_native_identity_unavailable", "The current inventory does not prove one exact native environment and bot identity.");
   }
   validateQuarantineTarget(target);

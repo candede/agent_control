@@ -54,7 +54,7 @@ function entries(event: string): Record<string, unknown>[] {
 
 function expectPrivateValuesAbsent() {
   const logs = JSON.stringify([...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls]);
-  expect(logs).not.toMatch(/private-|person@example/);
+  expect(logs).not.toMatch(/private[-_]|person@example/);
 }
 
 describe("package scan diagnostics", () => {
@@ -79,6 +79,13 @@ describe("package scan diagnostics", () => {
     expect(entries("package_catalog_field_coverage").find(entry => entry.field === field)).toMatchObject({
       page: 1, field, count: 5, missingCount: 1, nullCount: 1, emptyCount: 1, nonemptyCount: 1, invalidCount: 1,
     });
+    expectPrivateValuesAbsent();
+  });
+
+  it("reports only a category for unknown provider resource annotations", () => {
+    const diagnostics = new PackageScanDiagnostics("broad");
+    diagnostics.catalogPage([{ "@odata.type": "private-provider-type" }], 1, false, 0);
+    expect(entries("package_catalog_response_type")).toMatchObject([{ actualType: "other", count: 1 }]);
     expectPrivateValuesAbsent();
   });
 
@@ -126,15 +133,15 @@ describe("package scan diagnostics", () => {
     const listed = [
       { ...rawPackage("private-first"), ...extended, "@odata.type": "#microsoft.graph.copilotPackageDetail" },
       { ...rawPackage("private-second"), longDescription: null, "@odata.type": "#microsoft.graph.copilotPackage" },
-      { ...rawPackage("private-third"), ...extended, elementDetails: [], "@odata.type": "private-provider-type" },
+      { ...rawPackage("private-third"), ...extended, elementDetails: [] },
     ];
     const details = listed.map(value => ({ ...value, ...extended, privateUnknownProperty: "person@example.invalid" }));
     const next = new URL(buildCopilotAgentsListUrl());
-    next.searchParams.set("next", "private-continuation");
+    next.searchParams.set("$skiptoken", "private-continuation");
     const fetcher = vi.fn<FetchLike>(async input => {
       const url = new URL(input);
       if (url.pathname.endsWith("/packages")) {
-        return Response.json(url.searchParams.has("next") ? { value: listed.slice(2), "@odata.count": 1 }
+        return Response.json(url.searchParams.has("$skiptoken") ? { value: listed.slice(2), "@odata.count": 1 }
           : { value: listed.slice(0, 2), "@odata.count": 2, "@odata.nextLink": next.href });
       }
       const detail = details.find(value => url.pathname.endsWith(`/${value.id}`));
@@ -160,11 +167,11 @@ describe("package scan diagnostics", () => {
     expect(entries("package_catalog_field_coverage").find(entry => entry.field === "longDescription" && entry.page === 1))
       .toMatchObject({ count: 2, nullCount: 1, nonemptyCount: 1, missingCount: 0 });
     expect(entries("package_catalog_response_type")).toMatchObject([
-      { actualType: "detail", count: 1 }, { actualType: "summary", count: 1 }, { actualType: "other", count: 1 },
+      { actualType: "detail", count: 1 }, { actualType: "summary", count: 1 }, { actualType: "missing", count: 1 },
     ]);
     expect(entries("package_detail_comparison")).toEqual([]);
     expect(entries("package_scan_summary")).toMatchObject([
-      { jobId: "job-diagnostics", stage: "catalog", outcome: "collected", requestCount: 2, retryCount: 0, count: 3 },
+      { jobId: "job-diagnostics", stage: "catalog", outcome: "collected", requestCount: 2, retryCount: 0, count: 3, totalRecords: 3 },
       { jobId: "job-details", stage: "identity", outcome: "collected", requestCount: 3, retryCount: 0, count: 3, observedCount: 3 },
     ]);
     expectPrivateValuesAbsent();
@@ -202,13 +209,12 @@ describe("package scan diagnostics", () => {
     expectPrivateValuesAbsent();
   });
 
-  it("keeps accepted trailing-slash continuation reads in the catalog stage", async () => {
+  it("keeps fixed-endpoint continuation reads in the catalog stage", async () => {
     const next = new URL(buildCopilotAgentsListUrl());
-    next.pathname += "/";
-    next.searchParams.set("next", "private-continuation");
+    next.searchParams.set("$skiptoken", "private-continuation");
     const fetcher = vi.fn<FetchLike>(async input => {
       await timerDelay(20);
-      return Response.json(new URL(input).searchParams.has("next") ? { value: [] } : { value: [rawPackage()], "@odata.nextLink": next.href });
+      return Response.json(new URL(input).searchParams.has("$skiptoken") ? { value: [] } : { value: [rawPackage()], "@odata.nextLink": next.href });
     });
     const scan = catalogue(new GraphPackagesClient(fetcher, packageInventoryReadPolicy));
     await Promise.all([expect(scan).resolves.toMatchObject([{ id: "private-package" }]), vi.runAllTimersAsync()]);
@@ -332,6 +338,101 @@ describe("package scan diagnostics", () => {
     expectPrivateValuesAbsent();
   });
 
+  it("does not attribute synchronous fetch work to both admission and request time", async () => {
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const fetcher = vi.fn<FetchLike>(async () => {
+      elapsed += 20;
+      return Response.json(rawPackage());
+    });
+    await exactDetails(new GraphPackagesClient(fetcher, { now: () => elapsed }), ["private-package"]);
+    expect(entries("package_scan_summary")).toMatchObject([{
+      requestCount: 1, requestDurationMs: 20, admissionWaitMs: 0, durationMs: 20,
+    }]);
+  });
+
+  it.each((["pending", "headers"] as const).flatMap(stage => [false, true].map(paced => ({ stage, paced }))))(
+    "settles dispatched attempt metrics when cancellation wins at $stage (paced=$paced)", async ({ stage, paced }) => {
+      const controller = new AbortController();
+      const reason = new DOMException("private-cancellation", "AbortError");
+      let release!: (value: Response) => void;
+      const cancel = vi.fn();
+      const fetcher = vi.fn<FetchLike>(async () => {
+        if (stage === "headers") {
+          controller.abort(reason);
+          return new Response(new ReadableStream({ cancel }));
+        }
+        return new Promise<Response>(resolve => { release = resolve; });
+      });
+      const scan = exactDetails(new GraphPackagesClient(fetcher, paced ? packageInventoryReadPolicy : {}), ["private-package"], controller.signal);
+      const assertion = expect(scan).rejects.toBe(reason);
+      await vi.advanceTimersByTimeAsync(20);
+      if (stage === "pending") controller.abort(reason);
+      await assertion;
+      expect(entries("package_scan_summary")).toMatchObject([{
+        stage: "identity", outcome: "cancelled", count: 0, requestCount: 1, retryCount: 0,
+        requestDurationMs: stage === "headers" ? 0 : 20,
+      }]);
+      if (stage === "pending") {
+        release(new Response(new ReadableStream({ cancel })));
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(entries("package_scan_summary")).toHaveLength(1);
+      expectPrivateValuesAbsent();
+    },
+  );
+
+  it("keeps provider codes and exception names out of scan labels while retaining fixed HTTP evidence", async () => {
+    const response = Response.json({ error: { code: "private_provider_code", message: "private-message" } },
+      { status: 400, headers: { "request-id": "private-request-id" } });
+    await expect(catalogue(new GraphPackagesClient(vi.fn<FetchLike>(async () => response))))
+      .rejects.toMatchObject({ status: 400 });
+    expect(entries("package_provider_read_failed")).toMatchObject([{ errorCode: "graph_http_400", status: 400 }]);
+    expect(entries("package_provider_read_failed")[0]).not.toHaveProperty("reason");
+    expect(entries("package_provider_read_failed")[0]).not.toHaveProperty("providerRequestId");
+    expectPrivateValuesAbsent();
+  });
+
+  it("does not count token retries as physical Graph attempts or Graph throttles", async () => {
+    const diagnostics = new PackageScanDiagnostics("exact");
+    diagnostics.startDetails(1);
+    const fetcher = vi.fn<FetchLike>(async () => Response.json(rawPackage()));
+    const getAccessToken = vi.fn(async () => "private-token").mockRejectedValueOnce(
+      new AppError(429, "token_throttled", "Token throttled.", { retryAfterMs: 0 }));
+    await new GraphPackagesClient(fetcher, packageInventoryReadPolicy).getPackageDetails("private-token", "private-package", {
+      diagnostics, getAccessToken,
+    });
+    diagnostics.completeDetail(true);
+    diagnostics.finish("collected");
+    expect(entries("package_scan_summary")).toMatchObject([{
+      requestCount: 1, retryCount: 0, throttleCount: 0, readIntervalMs: 0,
+    }]);
+    expect(entries("package_provider_pacing_changed")).toEqual([]);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(getAccessToken).toHaveBeenCalledTimes(2);
+    expectPrivateValuesAbsent();
+  });
+
+  it("does not count attempts expired before physical fetch dispatch", async () => {
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      if (ms === 30_000) controller.abort(new DOMException("Request deadline expired.", "TimeoutError"));
+      return controller.signal;
+    });
+    const diagnostics = new PackageScanDiagnostics("exact");
+    diagnostics.startDetails(1);
+    const fetcher = vi.fn<FetchLike>();
+    await expect(new GraphPackagesClient(fetcher, { maxAttempts: 1 }).getPackageDetails("private-token", "private-package", {
+      diagnostics,
+    })).rejects.toMatchObject({ code: "provider_timeout" });
+    diagnostics.finish("failed");
+    expect(entries("package_scan_summary")).toMatchObject([{
+      requestCount: 0, retryCount: 0, requestDurationMs: 0,
+    }]);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("bounds progress logging to one event per 100 checks rather than per-package success logs", () => {
     const diagnostics = new PackageScanDiagnostics("exact");
     diagnostics.startDetails(5_000);
@@ -341,4 +442,44 @@ describe("package scan diagnostics", () => {
     expect(entries("package_scan_progress").at(-1)).toMatchObject({ count: 5_000, totalRecords: 5_000, observedCount: 5_000 });
     expect(vi.mocked(console.log)).toHaveBeenCalledTimes(51);
   });
+
+  it.each((["broad", "exact"] as const).flatMap(mode =>
+    (["collected", "failed", "cancelled", "timed_out"] as const).map(outcome => ({ mode, outcome }))))(
+    "closes $mode-scope diagnostics once on $outcome and ignores late observations", ({ mode, outcome }) => {
+      let elapsed = 0;
+      vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+      const diagnostics = new PackageScanDiagnostics(mode);
+      if (mode === "broad") diagnostics.catalogPage([rawPackage()], 1, false, 25);
+      else {
+        diagnostics.startDetails(100);
+        for (let index = 0; index < 99; index += 1) diagnostics.completeDetail(true);
+      }
+      diagnostics.recordAttempt(mode === "broad" ? "catalog" : "identity", 25, 1, 0);
+      diagnostics.compareDetail(allowlistedPackage(rawPackage()), allowlistedPackage(rawPackage()));
+      elapsed = 25;
+      diagnostics.finish(outcome);
+      const logged = vi.mocked(console.log).mock.calls.length;
+      elapsed = 50_000;
+      diagnostics.recordAttempt("identity", 50_000, 2, 250);
+      diagnostics.recordThrottle("identity");
+      diagnostics.recordWait("identity", "admissionWaitMs", 50_000);
+      diagnostics.recordWait("identity", "retryWaitMs", 50_000);
+      diagnostics.startDetails(200);
+      diagnostics.completeDetail(false);
+      diagnostics.catalogPage([rawPackage()], 2, false, 50_000);
+      diagnostics.compareDetail(allowlistedPackage(rawPackage()), allowlistedPackage(rawPackage()));
+      diagnostics.finish("failed");
+      diagnostics.finish("collected");
+      expect(vi.mocked(console.log)).toHaveBeenCalledTimes(logged);
+      expect(entries("package_scan_summary")).toMatchObject([{
+        stage: mode === "broad" ? "catalog" : "identity", outcome, durationMs: 25,
+        count: mode === "broad" ? 1 : 99, observedCount: mode === "broad" ? 1 : 99,
+        requestCount: 1, retryCount: 0, throttleCount: 0,
+      }]);
+      expect(entries("package_scan_summary")).toHaveLength(1);
+      expect(entries("package_detail_comparison")).toHaveLength(7);
+      expect(entries("package_scan_progress")).toEqual([]);
+      expectPrivateValuesAbsent();
+    },
+  );
 });

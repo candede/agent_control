@@ -80,7 +80,7 @@ describe("adaptive package read pacing", () => {
     const fetcher = vi.fn<FetchLike>(async () => ++attempts <= 8 ? throttled("0") : Response.json(value()));
     const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: wait });
     const read = client.getPackageDetails("token", "package", {
-      signal: new AbortController().signal, retryThrottlingUntilAborted: true,
+      signal: new AbortController().signal, executionDeadlineAt: Date.now() + 60_000, retryThrottlingUntilAborted: true,
     });
     await Promise.all([expect(read).resolves.toMatchObject({ id: "package" }), vi.runAllTimersAsync()]);
     expect(fetcher).toHaveBeenCalledTimes(9);
@@ -104,7 +104,9 @@ describe("adaptive package read pacing", () => {
     const fetcher = vi.fn<FetchLike>(async () => throttled("600"));
     const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: wait });
     const controller = new AbortController();
-    const read = client.getPackageDetails("token", "package", { signal: controller.signal, retryThrottlingUntilAborted: true });
+    const read = client.getPackageDetails("token", "package", {
+      signal: controller.signal, executionDeadlineAt: Date.now() + 3_600_000, retryThrottlingUntilAborted: true,
+    });
     const stopped = expect(read).rejects.toMatchObject({ code: "read_job_cancelled" });
     await vi.advanceTimersByTimeAsync(1_000);
     controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
@@ -141,6 +143,156 @@ describe("adaptive package read pacing", () => {
     release("late");
     await vi.advanceTimersByTimeAsync(0);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("paces physical dispatch after concurrent request preparation finishes", async () => {
+    const starts: number[] = [];
+    const fetcher = vi.fn<FetchLike>(async input => {
+      starts.push(performance.now());
+      return Response.json(value(new URL(input).pathname.split("/").at(-1)));
+    });
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 250, delay: wait,
+    });
+    const beforeRequest = async () => { await wait(Math.max(0, 1_000 - performance.now())); };
+    const reads = Promise.all(["a", "b", "c", "d"].map(id =>
+      client.getPackageDetails("token", id, { beforeRequest })));
+    await Promise.all([expect(reads).resolves.toHaveLength(4), vi.runAllTimersAsync()]);
+    expect(starts).toEqual([1_000, 1_250, 1_500, 1_750]);
+  });
+
+  it("spaces physical dispatch when the first final authority check stalls the elapsed clock", async () => {
+    let transportBudgetCreated = false, stalled = false;
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      if (ms === 30_000) transportBudgetCreated = true;
+      return new AbortController().signal;
+    });
+    const starts: number[] = [];
+    const fetcher = vi.fn<FetchLike>(async input => {
+      starts.push(performance.now());
+      return Response.json(value(new URL(input).pathname.split("/").at(-1)));
+    });
+    const assertCurrent = () => {
+      if (transportBudgetCreated && !stalled) {
+        stalled = true;
+        vi.advanceTimersByTime(1_000);
+      }
+    };
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 250, delay: wait,
+    });
+    const reads = Promise.all(["first", "second"].map(id => client.getPackageDetails("token", id, { assertCurrent })));
+    await Promise.all([expect(reads).resolves.toHaveLength(2), vi.runAllTimersAsync()]);
+    expect(starts[0]).toBe(1_000);
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(250);
+  });
+
+  it("rechecks a shared cooldown extended while request preparation is pending", async () => {
+    const starts: { id: string; at: number }[] = [];
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const id = new URL(input).pathname.split("/").at(-1)!;
+      starts.push({ id, at: performance.now() });
+      if (starts.length === 1) {
+        await wait(500);
+        return throttled("30");
+      }
+      return Response.json(value(id));
+    });
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 250, delay: wait,
+    });
+    const first = client.getPackageDetails("token", "first");
+    await vi.advanceTimersByTimeAsync(0);
+    const second = client.getPackageDetails("token", "second", { beforeRequest: async () => { await wait(1_000); } });
+    await Promise.all([expect(Promise.all([first, second])).resolves.toHaveLength(2), vi.runAllTimersAsync()]);
+    expect(starts.slice(1).every(start => start.at >= 30_500)).toBe(true);
+    expect(starts[2].at - starts[1].at).toBeGreaterThanOrEqual(500);
+  });
+
+  it("renews a token aged by both paced admission and request preparation", async () => {
+    const tokenAges: number[] = [];
+    const fetcher = vi.fn<FetchLike>(async (input, init) => {
+      const id = new URL(input).pathname.split("/").at(-1)!;
+      if (id !== "seed") {
+        const issuedAt = Number(new Headers(init?.headers).get("Authorization")?.split(" ").at(-1));
+        tokenAges.push(performance.now() - issuedAt);
+      }
+      return Response.json(value(id));
+    });
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 20_000, delay: wait,
+    });
+    await client.getPackageDetails("token", "seed");
+    const getAccessToken = vi.fn(async () => String(performance.now()));
+    const read = client.getPackageDetails("token", "package", {
+      getAccessToken, beforeRequest: async () => { await wait(20_000); },
+    });
+    await Promise.all([expect(read).resolves.toMatchObject({ id: "package" }), vi.runAllTimersAsync()]);
+    expect(tokenAges).toEqual([0]);
+    expect(getAccessToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not apply token-service throttling to unrelated physical Graph reads", async () => {
+    const starts: { id: string; at: number }[] = [];
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const id = new URL(input).pathname.split("/").at(-1)!;
+      starts.push({ id, at: performance.now() });
+      return Response.json(value(id));
+    });
+    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: wait });
+    const getAccessToken = vi.fn(async () => "renewed").mockRejectedValueOnce(
+      new AppError(429, "token_throttled", "Token acquisition throttled.", { retryAfterMs: 1_000 }),
+    );
+    const renewing = client.getPackageDetails("token", "renewing", { getAccessToken });
+    await vi.advanceTimersByTimeAsync(0);
+    const healthy = client.getPackageDetails("token", "healthy");
+    await Promise.all([expect(Promise.all([renewing, healthy])).resolves.toHaveLength(2), vi.runAllTimersAsync()]);
+    expect(starts).toEqual([{ id: "healthy", at: 0 }, { id: "renewing", at: 1_000 }]);
+    expect(pacingEvents()).toEqual([]);
+  });
+
+  it("does not impose a separate thirty-second deadline on a valid paced admission wait", async () => {
+    const fetcher = vi.fn<FetchLike>(async input => Response.json(value(new URL(input).pathname.split("/").at(-1))));
+    const client = new GraphPackagesClient(fetcher, { minimumReadIntervalMs: 60_000, delay: wait });
+    await client.getPackageDetails("token", "seed", { signal: new AbortController().signal });
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("Deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const read = client.getPackageDetails("token", "package");
+    await Promise.all([expect(read).resolves.toMatchObject({ id: "package" }), vi.advanceTimersByTimeAsync(60_000)]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases an abandoned admission's queue position at its own deadline", async () => {
+    const starts: { id: string; at: number }[] = [];
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const id = new URL(input).pathname.split("/").at(-1)!;
+      starts.push({ id, at: performance.now() });
+      return Response.json(value(id));
+    });
+    const client = new GraphPackagesClient(fetcher, { minimumReadIntervalMs: 60_000, delay: wait });
+    await client.getPackageDetails("token", "seed", { signal: new AbortController().signal });
+    const deadline = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(deadline.signal);
+    const abandoned = client.getPackageDetails("token", "abandoned");
+    const stopped = expect(abandoned).rejects.toMatchObject({ code: "provider_timeout" });
+    const controller = new AbortController();
+    const completed = vi.fn();
+    const healthy = client.getPackageDetails("token", "healthy", { signal: controller.signal });
+    const observed = healthy.then(completed, error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      deadline.abort(new DOMException("Deadline", "TimeoutError"));
+      await stopped;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(completed).toHaveBeenCalledOnce();
+      expect(starts).toEqual([{ id: "seed", at: 0 }, { id: "healthy", at: 60_000 }]);
+    } finally {
+      controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
+      await observed;
+    }
   });
 
   it("renews tokens that aged in another request's hour-long cooldown while preserving pacing", async () => {

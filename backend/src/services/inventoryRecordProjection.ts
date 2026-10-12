@@ -1,17 +1,19 @@
 import { assertResidualBytes, digest, dataLimitError } from "../db/dataBounds.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
-import { formatAgentAuthoringTool, normalizePackageAuthoringTool } from "../types/copilotPackage.js";
+import { formatAgentAuthoringTool, isDirectoryObjectId, normalizePackageAuthoringTool } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { powerPlatformAuthoringTool } from "../types/powerPlatformInventory.js";
 import { inventoryLimits, type InventoryClassification } from "../types/inventoryRecords.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName, readPackageAgentMetadata, readPackageCustomEngineBotIdentity } from "./packageAgentMetadata.js";
-import { normalizeNativeIdentity } from "./inventoryIdentity.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { buildRecords } from "./inventoryComponent.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 import { unifiedAgentSortKeys, type UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { agentColumnValue, agentManagement, agentRelevanceReasons, agentUserAvailability, matchesAgentView, packageAuthoringTool } from "../types/agentPresentation.js";
 import { validateQuarantineTarget } from "./copilotStudioQuarantine.js";
+import { AppError } from "../errors.js";
+import { compareInventoryTimestamps, inventoryTimestamp } from "./inventoryTimestamp.js";
 
 export type InventoryFact = { kind: string; value: string; payload: Record<string, unknown>;
   text_value?: string | null; number_value?: number | null; boolean_value?: boolean | null };
@@ -26,7 +28,7 @@ export type InventoryRecord = InventoryClassification & {
 };
 export const inventoryMatchKey = (environment: string, value: string) => digest(JSON.stringify([environment, value]));
 export const nativeInventoryKey = (value: PowerPlatformResource) =>
-  digest(JSON.stringify([value.type, normalizeNativeIdentity(value.environmentId ?? ""), normalizeNativeIdentity(value.nativeId)]));
+  digest(JSON.stringify([value.type, normalizeEnvironmentIdentity(value.environmentId ?? ""), normalizeNativeIdentity(value.nativeId)]));
 
 function bounded(record: InventoryRecord) {
   if (record.facts.length > inventoryLimits.factsPerRecord) throw dataLimitError("inventory_facts", inventoryLimits.factsPerRecord, record.facts.length);
@@ -37,11 +39,15 @@ function bounded(record: InventoryRecord) {
 
 export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRecord {
   const retainedFields = ["identityDetailsCollected", "identityRevalidationRequired", "detailFreshness", "controlObservations"] as const;
-  const observation = { ...input };
+  const properties = Object.getOwnPropertyDescriptors(input);
+  if (Object.values(properties).some(property => !Object.hasOwn(property, "value"))) {
+    throw new AppError(502, "provider_schema", "Package observations must contain own data properties.");
+  }
+  const observation = Object.fromEntries(Object.entries(properties).map(([key, property]) => [key, property.value]));
   // Local freshness/control annotations are not omitted provider fields.
   for (const key of retainedFields) delete observation[key];
-  const value = { ...allowlistedPackage(observation), ...Object.fromEntries(
-    retainedFields.filter(key => key in input).map(key => [key, input[key]])) } as CopilotPackageDetail;
+  const value = { ...allowlistedPackage(observation), ...structuredClone(Object.fromEntries(
+    retainedFields.filter(key => Object.hasOwn(input, key)).map(key => [key, input[key]]))) } as CopilotPackageDetail;
   const facts: InventoryFact[] = [];
   const fact = (kind: string, value: string, payload: Record<string, unknown> = {}) => facts.push({ kind, value, payload });
   for (const kind of ["supportedHosts", "elementTypes", "categories"] as const) {
@@ -136,36 +142,89 @@ export function powerPlatformInventoryRecord(value: PowerPlatformResource): Inve
     resource_type: value.type, publisher: null, modified_at: value.details.lastModifiedAt ?? null, residual, facts });
 }
 
-export function restoreInventoryRecord(residual: Record<string, unknown>, facts: readonly InventoryFact[], domain: string) {
+export function restoreInventoryRecord(residual: Record<string, unknown>, inputFacts: readonly InventoryFact[], domain: string) {
   const value = structuredClone(residual);
+  const facts = structuredClone(inputFacts);
+  if (facts.some(fact => !fact || typeof fact.kind !== "string" || typeof fact.value !== "string"
+    || !fact.payload || typeof fact.payload !== "object" || Array.isArray(fact.payload))) {
+    throw new AppError(500, "saved_source_invalid", "Saved inventory child facts are invalid.");
+  }
   if (domain === "packages") {
     for (const kind of ["supportedHosts", "elementTypes", "categories", "allowedUsersAndGroups", "acquireUsersAndGroups"]) {
       const selected = facts.filter(fact => fact.kind === kind);
       if (selected.length || facts.some(fact => fact.kind === "collection" && fact.value === kind)) value[kind] = selected.map(fact => kind.endsWith("UsersAndGroups") ? fact.payload : fact.value);
     }
-    const groups = new Map<string, { elementType: string; elements: { id: string; definition: string }[] }>();
-    for (const fact of facts.filter(fact => fact.kind === "elementGroup")) groups.set(fact.value, { elementType: fact.value, elements: [] });
-    for (const fact of facts.filter(fact => fact.kind === "element")) {
+    const groups: { elementType: string; elements: { id: string; definition: string }[] }[] = [];
+    for (const fact of facts) {
+      if (fact.kind === "elementGroup") {
+        groups.push({ elementType: fact.value, elements: [] });
+        continue;
+      }
+      if (fact.kind !== "element") continue;
       const { elementType, id, definition } = fact.payload as { elementType: string; id: string; definition: string };
-      const group = groups.get(elementType) ?? { elementType, elements: [] };
-      group.elements.push({ id, definition }); groups.set(elementType, group);
+      const group = groups.at(-1);
+      if (!group || group.elementType !== elementType || typeof id !== "string" || typeof definition !== "string") {
+        throw new AppError(500, "saved_source_invalid", "Saved package elements do not have valid source-ordinal parentage.");
+      }
+      group.elements.push({ id, definition });
     }
-    if (groups.size || facts.some(fact => fact.kind === "collection" && fact.value === "elementDetails")) value.elementDetails = [...groups.values()];
+    if (groups.length || facts.some(fact => fact.kind === "collection" && fact.value === "elementDetails")) value.elementDetails = groups;
   } else {
+    if (domain !== "power_platform" || !value.details || typeof value.details !== "object" || Array.isArray(value.details)) {
+      throw new AppError(500, "saved_source_invalid", "Saved native inventory details are invalid.");
+    }
     value.identifiers = facts.filter(fact => fact.kind === "identifier").map(fact => fact.payload);
     const details = value.details as Record<string, unknown>;
-    for (const fact of facts.filter(fact => fact.kind === "collection" && fact.value.startsWith("detail:"))) details[fact.value.slice(7)] = [];
-    for (const fact of facts.filter(fact => fact.kind.startsWith("detail:"))) {
+    let connectorOrdinal: string | undefined;
+    for (const fact of facts) {
+      if (fact.kind === "collection" && fact.value.startsWith("detail:")) {
+        connectorOrdinal = undefined;
+        const key = fact.value.slice(7);
+        if (Object.hasOwn(details, key)) {
+          throw new AppError(500, "saved_source_invalid", "Saved native detail collections have invalid source ordering.");
+        }
+        Object.defineProperty(details, key, { value: [], enumerable: true, configurable: true, writable: true });
+        continue;
+      }
+      if (fact.kind === "connectorOperation") {
+        const ordinal = Number(fact.value);
+        const connector = (details.connectors as { operations?: unknown[] }[] | undefined)?.[ordinal];
+        if (fact.value !== connectorOrdinal || !Number.isSafeInteger(ordinal) || ordinal < 0
+          || fact.value !== String(ordinal) || !Array.isArray(connector?.operations)) {
+          throw new AppError(500, "saved_source_invalid", "Saved native connector operations do not have valid source-ordinal parentage.");
+        }
+        connector.operations.push(fact.payload);
+        continue;
+      }
+      if (!fact.kind.startsWith("detail:")) continue;
       const key = fact.kind.slice(7);
       const values = (details[key] ??= []) as unknown[];
+      if (!Array.isArray(values) || key === "connectors" && (fact.value !== String(values.length)
+        || typeof fact.payload.connectorId !== "string"
+        || fact.payload.operations !== undefined && (!Array.isArray(fact.payload.operations) || fact.payload.operations.length !== 0))) {
+        throw new AppError(500, "saved_source_invalid", "Saved native connectors do not have valid source-ordinal parentage.");
+      }
       values.push(Object.keys(fact.payload).length === 1 && "value" in fact.payload ? fact.payload.value : fact.payload);
-    }
-    for (const fact of facts.filter(fact => fact.kind === "connectorOperation")) {
-      const connector = (details.connectors as { operations: unknown[] }[])[Number(fact.value)];
-      connector.operations.push(fact.payload);
+      connectorOrdinal = key === "connectors" ? fact.value : undefined;
     }
   }
   return value;
+}
+
+export function inventoryQuarantineIdentity(resource: PowerPlatformResource) {
+  const bots = resource.identifiers.filter(value => value.kind === "cds_bot_id")
+    .sort((left, right) => left.value < right.value ? -1 : left.value > right.value ? 1 : 0);
+  const environments = resource.identifiers.filter(value => value.kind === "environment_id");
+  const botIds = new Set(bots.map(value => normalizedGuid(value.value)));
+  const environmentIds = new Set(environments.map(value => normalizedEnvironmentId(value.value)));
+  const environmentId = normalizedEnvironmentId(resource.environmentId);
+  if (resource.type !== "microsoft.copilotstudio/agents" || botIds.size !== 1 || botIds.has(undefined)
+    || environmentIds.size !== 1 || !environmentId || !environmentIds.has(environmentId)) return undefined;
+  try {
+    return validateQuarantineTarget({ botId: bots[0].value, environmentId: resource.environmentId! });
+  } catch {
+    return undefined;
+  }
 }
 
 export function canonicalRecord(id: string, record: UnifiedAgentRecord): InventoryRecord {
@@ -197,29 +256,27 @@ export function canonicalRecord(id: string, record: UnifiedAgentRecord): Invento
   }
   const resource = record.powerPlatformResource;
   if (resource) {
-    const bots = resource.identifiers.filter(value => value.kind === "cds_bot_id");
-    const environments = resource.identifiers.filter(value => value.kind === "environment_id");
-    if (bots.length === 1 && environments.length === 1 && environments[0].value.toLowerCase() === resource.environmentId?.toLowerCase()) {
-      let target;
-      try { target = validateQuarantineTarget({ botId: bots[0].value, environmentId: resource.environmentId! }); } catch { /* Invalid evidence never authorizes control. */ }
-      if (target) facts.push({ kind: "control:quarantine", value: resource.nativeId,
-        payload: { ...target, provenance: resource.provenance["identifiers.cds_bot_id"] ?? null } });
-    }
+    const target = inventoryQuarantineIdentity(resource);
+    if (target) facts.push({ kind: "control:quarantine", value: resource.nativeId,
+      payload: { ...target, provenance: resource.provenance["identifiers.cds_bot_id"] ?? null } });
     for (const native of [resource.nativeId, ...resource.identifiers.map(item => item.value)]) facts.push({ kind: "search", value: native, payload: {} });
     if (resource.createdAt && Number.isFinite(Date.parse(resource.createdAt))) facts.push({ kind: "created", value: resource.createdAt,
       number_value: Date.parse(resource.createdAt), payload: {} });
   }
   for (const [role, id] of Object.entries({ owner: resource?.details.ownerId,
     createdBy: resource?.createdBy, lastModifiedBy: resource?.details.lastModifiedBy })) {
-    if (id) facts.push({ kind: `person:${role}`, value: id.trim().toLowerCase(), payload: {} });
+    if (id) facts.push({ kind: `person:${role}`, value: isDirectoryObjectId(id) ? id.toLowerCase() : id, payload: {} });
   }
   const identityExpirations = record.packages.filter(value => value.detailFreshness?.state === "fresh")
-    .map(value => Date.parse(value.detailFreshness!.expiresAt ?? "")).filter(Number.isFinite);
+    .map(value => inventoryTimestamp(value.detailFreshness!.expiresAt ?? ""));
+  const identityExpiry = identityExpirations.reduce<string | null>((earliest, value) =>
+    earliest === null || compareInventoryTimestamps(value, earliest) < 0 ? value : earliest, null);
   return { identity: id, native_id: id, environment_id: record.environmentId, display_name: record.displayName,
     presence: record.presence, link_state: record.identity.state,
     availability: agentUserAvailability(record), management: agentManagement(record),
-    identity_expires_at: identityExpirations.length ? new Date(Math.min(...identityExpirations)).toISOString() : null,
+    identity_expires_at: identityExpiry,
     sort_key: record.displayName.normalize("NFKC").toLowerCase(), resource_type: null, publisher: null, modified_at: null,
     residual: { identity: { reason: record.identity.reason,
+      ...(record.identity.warnings?.length ? { warnings: structuredClone(record.identity.warnings) } : {}),
       ...(record.identity.invalidMetadata ? { invalidMetadata: true } : {}) } }, facts };
 }

@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { isWritablePackageAccessScope } from "../../../backend/src/types/copilotPackage";
 import type { CopilotPackage, CopilotPackageDetail, PackageAccessTarget, PackageAccessUpdate } from "../api/client";
+import { getInitialAccessScope } from "../accessScope";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { AccessAssignmentEditor } from "./AccessAssignmentModal";
 
@@ -52,22 +54,35 @@ export function AgentAccessManagement({ agent, detail, detailUnavailable = false
       </div>
     </div>
     {accessReadError ? <p role="status">{accessReadError} Access assignment editing is unavailable.</p> : null}
-    {(["availability", "installation"] as const).map(setting => <div key={setting} hidden={target !== setting}>
-      <AccessAssignmentEditor
-        key={`${revision}:${initial ? "detail" : "summary"}:${readOnlyKey}:${reset[setting]}`}
-        initialTarget={setting}
-        initialStatus={setting === "availability" ? initial?.availableTo ?? agent.availableTo : initial?.deployedTo ?? agent.deployedTo}
-        initialPrincipals={setting === "availability" ? initial?.allowedUsersAndGroups : initial?.acquireUsersAndGroups}
-        active={active && !loading && target === setting}
-        readOnly={readOnly}
-        busy={busy}
-        onTargetChange={setTarget}
-        onCancel={() => {
-          if (detail) setInitialDetail(detail);
-          setReset(current => ({ ...current, [setting]: current[setting] + 1 }));
-        }}
-        onSubmit={update => onUpdate(agent, update)}
-      />
-    </div>)}
+    {(["availability", "installation"] as const).map(setting => {
+      const observed = detail ?? initial;
+      const preservedStatus = setting === "availability" ? observed?.deployedTo : observed?.availableTo;
+      const preservedPrincipals = setting === "availability" ? observed?.acquireUsersAndGroups : observed?.allowedUsersAndGroups;
+      const preservationUnavailable = preservedPrincipals !== undefined
+        && getInitialAccessScope(preservedStatus, preservedPrincipals) !== undefined
+        && !isWritablePackageAccessScope(preservedStatus, preservedPrincipals);
+      const unavailableReason = preservationUnavailable
+        ? `${setting === "availability" ? "Availability" : "Installation"} editing is unavailable because Microsoft Graph's collection-only PATCH cannot preserve the saved ${setting === "availability" ? "installation" : "availability"} scope and assignments. Review both access settings.`
+        : undefined;
+      return <div key={setting} hidden={target !== setting}>
+        {!readOnly && unavailableReason ? <p role="status">{unavailableReason}</p> : null}
+        <AccessAssignmentEditor
+          key={`${revision}:${initial ? "detail" : "summary"}:${readOnlyKey}:${reset[setting]}`}
+          initialTarget={setting}
+          initialStatus={setting === "availability" ? initial?.availableTo ?? agent.availableTo : initial?.deployedTo ?? agent.deployedTo}
+          initialPrincipals={setting === "availability" ? initial?.allowedUsersAndGroups : initial?.acquireUsersAndGroups}
+          active={active && !loading && target === setting}
+          readOnly={readOnly}
+          unavailableReason={unavailableReason}
+          busy={busy}
+          onTargetChange={setTarget}
+          onCancel={() => {
+            if (detail) setInitialDetail(detail);
+            setReset(current => ({ ...current, [setting]: current[setting] + 1 }));
+          }}
+          onSubmit={update => onUpdate(agent, update)}
+        />
+      </div>;
+    })}
   </section>;
 }

@@ -323,6 +323,8 @@ export class DataGenerations {
   async publish(lease: GenerationLease, options: {
     validateInputs?: (client: pg.PoolClient) => Promise<void>;
     completeJob?: (client: pg.PoolClient, result: { jobId: string; runId: string | null; rows: number; bytes: number }) => Promise<void>;
+    beforeCommit?: () => void;
+    onCommitted?: (revision: string) => void;
   } = {}) {
     const managed = managedHeartbeats.get(lease.id);
     const heartbeat = managed?.heartbeat;
@@ -331,6 +333,7 @@ export class DataGenerations {
     await heartbeat?.pause();
     heartbeat?.signal.throwIfAborted();
     let publishedRows = 0;
+    let publishedRevision = "";
     const revision = await measurePublication(() => publishedRows>=1000 ? "generation-large" : "generation-bounded",() => this.connections.run(async client => {
       await this.lockSyncRun(client, lease);
       // Domain-owned input reachability is checked in this same transaction.
@@ -351,9 +354,12 @@ export class DataGenerations {
       await client.query("UPDATE data_generations SET state='published',reserved_bytes=byte_count WHERE id=$1", [lease.id]);
       await options.completeJob?.(client, { jobId: row.job_id, runId: row.run_id, rows: row.row_count, bytes: exactCount(row.byte_count) });
       observeDataWork("generation", { rows: row.row_count, bytes: exactCount(row.byte_count) });
-      return result.rows[0].revision as string;
-    }, false, heartbeat?.signal));
-    if (managed) managed.published = true;
+      publishedRevision = result.rows[0].revision as string;
+      return publishedRevision;
+    }, false, heartbeat?.signal, undefined, options.beforeCommit, () => {
+      if (managed) managed.published = true;
+      options.onCommitted?.(publishedRevision);
+    }));
     await heartbeat?.stop();
     return revision;
   }
@@ -389,7 +395,11 @@ export class DataGenerations {
     const managed = { heartbeat, published: false };
     managedHeartbeats.set(lease.id, managed);
     let fencing: Promise<unknown> | undefined;
-    const cancelled = () => { fencing = this.abort(lease, true); void fencing.catch(() => {}); };
+    const cancelled = () => {
+      if (managed.published) return;
+      fencing = this.abort(lease, true);
+      void fencing.catch(() => {});
+    };
     heartbeat.signal.addEventListener("abort", cancelled, { once: true });
     try {
       heartbeat.signal.throwIfAborted();
@@ -400,8 +410,10 @@ export class DataGenerations {
       }
       return result;
     } catch (error) {
-      try { await (fencing ?? this.abort(lease, parent?.aborted)); }
-      catch (failure) { throw new AggregateError([error, failure], "data_work_and_fence_failed"); }
+      if (!managed.published) {
+        try { await (fencing ?? this.abort(lease, parent?.aborted)); }
+        catch (failure) { throw new AggregateError([error, failure], "data_work_and_fence_failed"); }
+      }
       throw error;
     } finally {
       heartbeat.signal.removeEventListener("abort", cancelled);
@@ -417,7 +429,7 @@ export function generationHeartbeat(
   const controller = new AbortController();
   let pending = Promise.resolve();
   let stopped = false;
-  const cancel = () => { stopped = true; clearInterval(timer); controller.abort(parent?.reason ?? new Error("data_cancelled")); };
+  const cancel = () => { stopped = true; clearInterval(timer); controller.abort(parent ? parent.reason : new Error("data_cancelled")); };
   const timer = setInterval(() => {
     if (stopped) return;
     pending = pending.then(async () => {

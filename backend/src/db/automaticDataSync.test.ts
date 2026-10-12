@@ -397,6 +397,35 @@ describe("session-driven automatic sync admission", () => {
     expect(await repository.getRun(scope, first.run!.id)).toMatchObject({ status: "running" });
   });
 
+  it("does not reuse an old run's start to bypass a newly retried source's authorization cooldown", async () => {
+    const scope = owner();
+    const first = await repository.submitDue(scope);
+    for (const source of first.run!.sources) await repository.updateSource(scope, first.run!.id, source.source, {
+      status: source.source === "graph_packages" ? "waiting_authorization" : "succeeded",
+      count: 0, message: "Fixture result.", canRetry: source.source === "graph_packages",
+    });
+    await repository.finishAutomatic(scope, first.run!.id);
+    const signedInAt = Date.now();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await repository.retry(scope, first.run!.id, ["graph_packages"]);
+    const boundary = (await fixture.runtime.query(`SELECT attempt_started_at FROM data_sync_run_sources
+      WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id])).rows[0].attempt_started_at as Date;
+    expect(boundary.getTime()).toBeGreaterThan(signedInAt);
+    await repository.updateSource(scope, first.run!.id, "graph_packages", {
+      status: "waiting_authorization", message: "The renewed session still needs interaction.", canRetry: true,
+    });
+    await repository.finishAutomatic(scope, first.run!.id);
+    expect(await repository.submitDue(scope, signedInAt)).toMatchObject({ created: false, run: { id: first.run!.id } });
+    expect((await fixture.runtime.query(`SELECT attempt_started_at FROM data_sync_run_sources
+      WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id])).rows[0].attempt_started_at).toEqual(boundary);
+    await expect(fixture.runtime.query(`UPDATE data_sync_run_sources SET attempt_started_at=clock_timestamp()
+      WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id])).rejects.toThrow("attempt start is immutable");
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(await repository.submitDue(scope, Date.now())).toMatchObject({
+      created: true, run: { sources: [{ source: "graph_packages", status: "queued" }] },
+    });
+  });
+
   it("allows recovery when an old worker reports its authentication failure after sign-in completes", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);

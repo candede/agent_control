@@ -48,7 +48,7 @@ export function buildRecords(
       if (!row) throw new AppError(500, "link_resolution_invalid", "The package identity resolver returned an unknown Power Platform resource.");
       row.packages.push(packageSummary(detail));
       row.evidence.push(...resolution.evidence);
-      row.packageEvidence.push({ packageId: detail.id, evidence: resolution.evidence });
+      row.packageEvidence.push({ packageId: detail.id, evidence: resolution.evidence.map(copyEvidence).sort(compareEvidence) });
       row.warnings.push(...resolution.warnings ?? []);
       continue;
     }
@@ -57,8 +57,6 @@ export function buildRecords(
     const existing = graphOnly.get(groupKey);
     if (existing) {
       existing.packages.push(packageSummary(detail));
-      Object.defineProperties(existing.observations.packageSnapshots,
-        Object.getOwnPropertyDescriptors(pickPackageSnapshots([detail.id], packageSnapshots)));
       continue;
     }
     graphOnly.set(groupKey, {
@@ -77,6 +75,10 @@ export function buildRecords(
     record.packages.sort((left, right) => ordinal(left.id, right.id));
     record.id = unifiedAgentRecordId({ source: "graph_packages", packageId: record.packages[0].id });
     record.displayName = record.packages[0].displayName.trim() || record.packages[0].id;
+    record.observations.packageSnapshots = pickPackageSnapshots(record.packages.map(value => value.id), packageSnapshots);
+    const primary = resolutions.find(value => value.packageId === record.packages[0].id)!;
+    if (primary.status === "matched") throw new AppError(500, "link_resolution_invalid", "A matched package cannot form a Graph-only record.");
+    record.identity.reason = primary.reason;
   }
   const powerRows = [...resourceRows.values()].map(({ resource, packages: linkedPackages, evidence, packageEvidence, warnings }) => {
     const packagesSorted = linkedPackages.sort((left, right) => ordinal(left.id, right.id));
@@ -91,33 +93,54 @@ export function buildRecords(
       identity: matched
         ? { state: "matched", evidence: uniqueEvidence(evidence),
             packageEvidence: packageEvidence.sort((left, right) => ordinal(left.packageId, right.packageId)), reason: null,
-            ...(warnings.length ? { warnings: [...new Map(warnings.map(warning => [warning.code, warning])).values()] } : {}) }
+            ...(warnings.length ? { warnings: [...new Map(warnings.map(warning => [JSON.stringify([warning.code, warning.message]), warning])).values()]
+              .sort((left, right) => ordinal(left.code, right.code) || ordinal(left.message, right.message)) } : {}) }
         : { state: "unmatched", evidence: [], packageEvidence: [], reason: "No Graph package has a source-declared metadata link to this Power Platform agent." },
       observations: { graphPackages: matched ? packageObservation : null,
         packageSnapshots: pickPackageSnapshots(packagesSorted.map(value => value.id), packageSnapshots), powerPlatform: powerPlatformObservation },
     } satisfies UnifiedAgentRecord;
   });
-  return [...powerRows, ...graphOnly.values()];
+  const records = [...powerRows, ...graphOnly.values()].sort((left, right) => ordinal(left.id, right.id));
+  const bytes = Buffer.byteLength(JSON.stringify(records));
+  if (bytes > dataLimits.batchBytes) throw dataLimitError("inventory_component_bytes", dataLimits.batchBytes, bytes);
+  return records.map(record => structuredClone(record));
 }
 
-function packageSummary(value: CopilotPackageDetail): CopilotPackage {
-  const { longDescription: _longDescription, categories: _categories, sensitivity: _sensitivity,
-    allowedUsersAndGroups: _allowedUsersAndGroups, acquireUsersAndGroups: _acquireUsersAndGroups,
-    elementDetails: _elementDetails, identityDetailsCollected: _identityDetailsCollected,
-    identityRevalidationRequired: _identityRevalidationRequired, ...summary } = value;
-  return summary;
+export function packageSummary(value: CopilotPackage): CopilotPackage {
+  const summary: CopilotPackage = {
+    id: value.id, displayName: value.displayName, isBlocked: value.isBlocked, sourceSystem: value.sourceSystem,
+    authoringTool: value.authoringTool, creatorType: value.creatorType, agentKind: value.agentKind,
+    lifecycle: value.lifecycle, identityConfidence: value.identityConfidence, provenance: value.provenance,
+  };
+  const fields = [
+    "type", "shortDescription", "supportedHosts", "createdDateTime",
+    "lastModifiedDateTime", "publisher", "availableTo", "deployedTo", "elementTypes", "platform",
+    "version", "manifestVersion", "manifestId", "appId", "assetId", "controlObservations", "detailFreshness",
+  ] as const satisfies readonly (keyof CopilotPackage)[];
+  for (const key of fields) if (Object.hasOwn(value, key)) Object.assign(summary, { [key]: value[key] });
+  return structuredClone(summary);
 }
 function uniqueEvidence(values: readonly PackageAgentLinkEvidence[]) {
   const seen = new Set<string>();
-  return values.filter(value => {
-    const key = JSON.stringify([value.kind, value.basis, value.packagePath, value.resourcePath,
-      [...value.elementIds].sort(ordinal), [...value.relatedPackageIds ?? []].sort(ordinal)]);
+  return values.map(copyEvidence).filter(value => {
+    const key = evidenceKey(value);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
-  });
+  }).sort(compareEvidence);
+}
+function copyEvidence(value: PackageAgentLinkEvidence): PackageAgentLinkEvidence {
+  return { kind: value.kind, basis: value.basis, packagePath: value.packagePath, resourcePath: value.resourcePath,
+    elementIds: [...value.elementIds].sort(ordinal),
+    ...(value.relatedPackageIds ? { relatedPackageIds: [...value.relatedPackageIds].sort(ordinal) } : {}) };
+}
+function evidenceKey(value: PackageAgentLinkEvidence) {
+  return JSON.stringify([value.kind, value.basis, value.packagePath, value.resourcePath, value.elementIds, value.relatedPackageIds ?? []]);
+}
+function compareEvidence(left: PackageAgentLinkEvidence, right: PackageAgentLinkEvidence) {
+  return ordinal(evidenceKey(left), evidenceKey(right));
 }
 function ordinal(left: string, right: string) { return left < right ? -1 : left > right ? 1 : 0; }
 function pickPackageSnapshots(ids: readonly string[], observations: Record<string, UnifiedAgentPackageRecordObservation>) {
-  return Object.fromEntries(ids.flatMap(id => observations[id] ? [[id, observations[id]]] : []));
+  return Object.fromEntries(ids.flatMap(id => Object.hasOwn(observations, id) && observations[id] ? [[id, observations[id]]] : []));
 }

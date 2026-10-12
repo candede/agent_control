@@ -17,6 +17,7 @@ type Dependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
   admissions: typeof requireProviderAdmissions;
 };
@@ -29,6 +30,7 @@ export class AgentIdentityResolutionService {
     this.dependencies = { inventory: agentInvestigations, repository: new AgentIdentityRepository(),
       directory: new GraphAgentIdentityClient(), revalidateUser: revalidateAuthenticatedUser,
       delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, ...dependencies };
   }
@@ -37,25 +39,43 @@ export class AgentIdentityResolutionService {
     const signal = AbortSignal.any([AbortSignal.timeout(25_000), ...(abortSignal ? [abortSignal] : [])]);
     const scope = userScope(user);
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-    try {
-      const result = await awaitResolution(signal, () => this.dependencies.observeOperation("graph.agentIdentity.read", user,
-        () => this.resolveCurrent(scope, recordId, signal, validation), { signal }));
-      signal.throwIfAborted();
-      assertAccountSessionValidation(validation);
-      this.dependencies.admissions();
-      return result;
-    } catch (error) { throw resolutionError(error, signal); }
-  }
-
-  private async resolveCurrent(scope: ReturnType<typeof userScope>, recordId: string, signal: AbortSignal,
-    validation: ReturnType<typeof beginAccountSessionValidation>) {
-    const key = `${scope.tenantId}\0${scope.principalId}`;
-    if (this.active.has(key) || this.active.size >= 4) throw new AppError(429, "agent_identity_resolution_busy", "An identity resolution is already running. Retry after it completes.");
+    const validateCapability = this.dependencies.beginOperationValidation("graph.agentIdentity.read",
+      { tenantId: scope.tenantId, homeAccountId: scope.principalId });
     const assertCurrent = () => {
       signal.throwIfAborted();
       assertAccountSessionValidation(validation);
+      validateCapability();
       this.dependencies.admissions();
     };
+    try {
+      assertCurrent();
+      const verified = await awaitResolution(signal, () => this.dependencies.observeOperation("graph.agentIdentity.read", user,
+        () => this.resolveCurrent(scope, recordId, signal, validation, assertCurrent), { signal }));
+      assertCurrent();
+      const final = await awaitResolution(signal, () => commitAccountSessionValidation(validation, () => {
+        assertCurrent();
+        return awaitResolution(signal, () => this.dependencies.inventory.resolve(scope, recordId));
+      }));
+      assertCurrent();
+      if (final.inventoryRevision !== verified.inventoryRevision || JSON.stringify(final.identitySource) !== JSON.stringify(verified.source)) {
+        throw new AppError(409, "agent_identity_source_changed", "The saved agent, candidate or inventory revision changed during resolution. Refresh Agents.");
+      }
+      if (final.context.defender.entraAgentIds.length !== 1 || final.context.defender.entraAgentIds[0] !== verified.identity.objectId
+        || final.context.defender.entraAgentApplicationIds?.length !== 1 || final.context.defender.entraAgentApplicationIds[0] !== verified.identity.applicationId
+        || final.context.defender.resolution?.runtimeProvenance !== verifiedAgentIdentityClientIdProvenance) {
+        throw new AppError(409, "agent_identity_source_changed", "The verified object and client-ID mapping is no longer current. Refresh Agents.");
+      }
+      return final.context;
+    } catch (error) {
+      if (!signal.aborted) assertCurrent();
+      throw resolutionError(error, signal);
+    }
+  }
+
+  private async resolveCurrent(scope: ReturnType<typeof userScope>, recordId: string, signal: AbortSignal,
+    validation: ReturnType<typeof beginAccountSessionValidation>, assertCurrent: () => void) {
+    const key = `${scope.tenantId}\0${scope.principalId}`;
+    if (this.active.has(key) || this.active.size >= 4) throw new AppError(429, "agent_identity_resolution_busy", "An identity resolution is already running. Retry after it completes.");
     const wait = <T>(operation: () => Promise<T>) => awaitResolution(signal, operation);
     const commit = <T>(operation: () => Promise<T>) => wait(() => commitAccountSessionValidation(validation, async () => {
       assertCurrent();
@@ -93,10 +113,9 @@ export class AgentIdentityResolutionService {
         return fresh;
       };
       const fresh = await currentUser();
-      const publicationFence = async () => { assertCurrent(); };
       recordFailure = failure => commit(async () => {
         await sameSource();
-        await this.dependencies.repository.saveFailure(scope, source, failure, publicationFence);
+        await this.dependencies.repository.saveFailure(scope, source, failure, assertCurrent);
       });
       const token = await commit(async () => {
         await sameSource();
@@ -115,22 +134,19 @@ export class AgentIdentityResolutionService {
           await sameSource();
         });
         assertCurrent();
-      }));
+      }, assertCurrent));
+      // A publication/cleanup failure may occur after COMMIT. It must not replace verified evidence.
+      recordFailure = undefined;
       const current = await currentUser();
       await commit(async () => {
         await wait(() => this.dependencies.requireAvailable("graph.agentIdentity.read", current));
         await sameSource();
-        await this.dependencies.repository.save(scope, source, result, publicationFence);
+        await this.dependencies.repository.save(scope, source, result, assertCurrent);
       });
-      const final = await commit(sameSource);
       assertCurrent();
-      if (final.context.defender.entraAgentIds.length !== 1 || final.context.defender.entraAgentIds[0] !== result.objectId
-        || final.context.defender.entraAgentApplicationIds?.length !== 1 || final.context.defender.entraAgentApplicationIds[0] !== result.applicationId
-        || final.context.defender.resolution?.runtimeProvenance !== verifiedAgentIdentityClientIdProvenance) {
-        throw new AppError(409, "agent_identity_source_changed", "The verified object and client-ID mapping is no longer current. Refresh Agents.");
-      }
-      return final.context;
+      return { source, inventoryRevision: initial.inventoryRevision, identity: result };
     } catch (error) {
+      if (!signal.aborted) assertCurrent();
       const surfaced = resolutionError(error, signal);
       const failure = resolutionFailure(surfaced);
       if (failure && recordFailure && !signal.aborted) await recordFailure(failure);

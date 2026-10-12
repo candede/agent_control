@@ -41,7 +41,9 @@ describe("access scope", () => {
     expect(formatAccessScope(status, principals)).toBe(status === "all" ? "All users" : "No users");
   });
 
-  it.each(["unknownFutureValue", "futureStatus"])("preserves principal-based fallback for unknown status %s", status => {
-    expect(getInitialAccessScope(status, [{ resourceType: "user", resourceId: "user-1" }])).toBe("specific");
+  it.each(["unknownFutureValue", "futureStatus"])("does not infer effective access from principals under unknown status %s", status => {
+    const principals = [{ resourceType: "user", resourceId: "user-1" }];
+    expect(getInitialAccessScope(status, principals)).toBeUndefined();
+    expect(formatAccessScope(status, principals)).toBe("Unknown");
   });
 });

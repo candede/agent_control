@@ -29,10 +29,11 @@ describe("workbench routing", () => {
     expect(parseAgentRoute(query.toString())).toMatchObject({ selectionStorage: "session", selectionCount: 5_000, selectedIds: [] });
   });
 
-  it("round trips the exact user modal and leaves invalid identities explicitly invalid", () => {
-    const route = { view: "licenses" as const, detailId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", detailTab: "responsibility" as const, search: "", page: 0 };
+  it.each(["AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "AAAAAAAA-AAAA-7AAA-1AAA-AAAAAAAAAAAA"])(
+    "round trips exact Graph user %s and leaves invalid identities explicitly invalid", detailId => {
+    const route = { view: "licenses" as const, detailId, detailTab: "responsibility" as const, search: "", page: 0 };
     const query = usersRouteSearch(route);
-    expect(query.toString()).toBe("detail=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&tab=responsibility");
+    expect(query.toString()).toBe(`detail=${detailId.toLowerCase()}&tab=responsibility`);
     expect(parseUsersRoute(query.toString())).toMatchObject({ ...route, detailId: route.detailId.toLowerCase() });
     expect(parseUsersRoute("detail=Alice&tab=responsibility")).toMatchObject({ view: "licenses", detailId: "invalid" });
     expect(usersRouteSearch({ ...route, detailId: "Alice" }).get("detail")).toBe("invalid");
@@ -248,15 +249,19 @@ describe("workbench routing", () => {
   });
 
   it("normalizes environment and numeric spellings before constructing inventory state", () => {
-    const state = parseAgentRoute("environment=~string:ENV-A&createdWithinDays=00030");
-    expect(state).toMatchObject({ environmentId: "env-a", createdWithinDays: "30" });
-    const search = agentRouteSearch({ ...state, environmentId: "ENV-A", createdWithinDays: "00030" });
-    expect(search.get("environment")).toBe("~string:env-a");
+    const environmentId = "Default-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const state = parseAgentRoute(`environment=~string:${environmentId}&createdWithinDays=00030`);
+    expect(state).toMatchObject({ environmentId: environmentId.toLowerCase(), createdWithinDays: "30" });
+    const search = agentRouteSearch({ ...state, environmentId, createdWithinDays: "00030" });
+    expect(search.get("environment")).toBe(`~string:${environmentId.toLowerCase()}`);
     expect(search.get("createdWithinDays")).toBe("30");
     expect(parseAgentRoute("q=bad%00search").search).toBe("");
     expect(agentRouteSearch({ ...state, search: "bad\0search" }).has("q")).toBe(false);
     expect(auditRouteSearch({ ...parseAuditRoute(""), search: "bad\0search" }).has("q")).toBe(false);
     expect(usersRouteSearch({ ...parseUsersRoute(""), search: "bad\0search" }).has("q")).toBe(false);
+    const opaque = parseAgentRoute("environment=~string:ENV-A");
+    expect(opaque.environmentId).toBe("ENV-A");
+    expect(agentRouteSearch(opaque).get("environment")).toBe("~string:ENV-A");
   });
 
   it.each([
@@ -366,21 +371,23 @@ describe("workbench routing", () => {
     });
   });
 
-  it("canonicalizes equivalent agent links before detail and quarantine request ownership", () => {
+  it("canonicalizes environment and canonical-agent links without folding opaque native GUIDs for quarantine ownership", () => {
     const canonical = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const native = "power_platform:environment-a:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const upperNative = "power_platform:ENVIRONMENT-A:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const environmentId = "default-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const native = `power_platform:${environmentId}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
+    const upperNative = `power_platform:${environmentId.toUpperCase()}:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA`;
+    const upperResource = `power_platform:${environmentId}:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA`;
     const params = new URLSearchParams({ detail: "agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" });
     for (const id of [native, upperNative, canonical, "agent:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"]) params.append("selectedResource", id);
-    expect(parseAgentRoute(params.toString())).toMatchObject({ detailId: canonical, selectedPowerPlatformIds: [native, canonical] });
+    expect(parseAgentRoute(params.toString())).toMatchObject({ detailId: canonical, selectedPowerPlatformIds: [native, upperResource, canonical] });
     const search = agentRouteSearch({ ...parseAgentRoute(""), detailId: upperNative,
       selectedPowerPlatformIds: [native, upperNative] });
-    expect(search.get("detail")).toBe(native);
-    expect(search.getAll("selectedResource")).toEqual([native]);
+    expect(search.get("detail")).toBe(upperResource);
+    expect(search.getAll("selectedResource")).toEqual([native, upperResource]);
     expect(parseAgentRoute(new URLSearchParams({ detail: "graph_packages:Opaque%2fPackage%252Fvalue" }).toString()).detailId)
       .toBe("graph_packages:Opaque%2FPackage%252Fvalue");
     expect(parseAgentRoute(new URLSearchParams({ detail: "power_platform:ENV-A:Opaque%2fNative" }).toString()).detailId)
-      .toBe("power_platform:env-a:Opaque%2FNative");
+      .toBe("power_platform:ENV-A:Opaque%2FNative");
   });
 
   it("keeps package refresh, controls, and data sync explicitly source-discriminated", () => {

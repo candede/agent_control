@@ -30,14 +30,14 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
   const canLookup = Boolean(canRead && providerActionAllowed(directory, false, now));
   const resource = record.powerPlatformResource;
   const identifiers = {
-    owner: resource?.details.ownerId?.trim(),
-    createdBy: resource?.createdBy?.trim(),
-    lastModifiedBy: resource?.details.lastModifiedBy?.trim(),
+    owner: resource?.details.ownerId,
+    createdBy: resource?.createdBy,
+    lastModifiedBy: resource?.details.lastModifiedBy,
   };
   const scope = JSON.stringify([
     capabilities?.user?.tenantId, capabilities?.user?.homeAccountId, [...roles].sort(),
     record.id, resource?.tenantId, record.observations.powerPlatform?.snapshotId,
-    ...personFields.map(field => identifiers[field]?.toLowerCase()),
+    ...personFields.map(field => isDirectoryObjectId(identifiers[field]) ? identifiers[field]?.toLowerCase() : identifiers[field]),
   ]);
   const fingerprint = JSON.stringify(personFields.map(field => {
     const person = record.people?.[field];
@@ -85,7 +85,8 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
     const id = identifiers[field];
     if (!id) continue;
     const candidate = current?.[field];
-    const person = candidate?.objectId.toLowerCase() === id.toLowerCase() ? candidate : undefined;
+    const person = isDirectoryObjectId(id) && isDirectoryObjectId(candidate?.objectId)
+      && candidate?.objectId.toLowerCase() === id.toLowerCase() ? candidate : undefined;
     people[field] = {
       id, invalidId: !isDirectoryObjectId(id),
       status: person?.status ?? (person ? "resolved" : "unverified"),
@@ -112,6 +113,7 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
         if (signal.aborted || !ownsRequest(requestKey)) return;
         if (Object.entries(response.people ?? {}).some(([field, person]) => !personFields.includes(field as PersonField)
           || !person || !identifiers[field as PersonField]
+          || !isDirectoryObjectId(identifiers[field as PersonField]) || !isDirectoryObjectId(person.objectId)
           || person.objectId.toLowerCase() !== identifiers[field as PersonField]?.toLowerCase())) {
           throw new Error("Directory lookup did not return the requested agent's person identities.");
         }

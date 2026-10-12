@@ -1,7 +1,8 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { streamOfficialReport, type StreamedOfficialReport } from "./officialReportStream.js";
-import type { OfficialUsageMetadata } from "../types/officialReportRecords.js";
+import { officialReportLimits, streamOfficialReport, type StreamedOfficialReport } from "./officialReportStream.js";
+import { normalizeHeader, parseAgentRow, parseUserAgentRow, parseUserRow, reportBase, schemaRegistry } from "./officialReportFields.js";
+import type { OfficialUsageMetadata, OfficialUsageReportKind } from "../types/officialReportRecords.js";
 
 const metadata: OfficialUsageMetadata = {
   reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06", provenance: "operator_asserted" },
@@ -82,6 +83,15 @@ describe("streamOfficialReport normalized field semantics", () => {
       userAgentCsv("2026-07-06").replace("agent-1", `"agent${control}1"`),
     ]) {
       await expect(stream(bytes(csv))).rejects.toMatchObject({ code: "invalid_identifier" });
+    }
+  });
+  it.each(["\t", "\n", "\r", "\r\n"])("rejects embedded controls in report usernames (%j) before staging unreachable identities", async control => {
+    const username = `"User${control}@Example.com"`;
+    for (const csv of [
+      userAgentCsv("2026-07-06").replace("User@Example.com", username),
+      `Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\n${username},User,0,0,`,
+    ]) {
+      await expect(stream(bytes(csv))).rejects.toMatchObject({ status: 400, code: "invalid_identifier" });
     }
   });
   it("preserves embedded tabs in display names", async () => {
@@ -179,9 +189,14 @@ describe("streamOfficialReport normalized field semantics", () => {
       ...metadata, reportingPeriod: { startDate: "2026-06-08", endDate: "2026-07-06", provenance: "operator_asserted" },
     })).rejects.toMatchObject({ code: "invalid_reporting_period" });
     for (const downloadedAt of ["2026-07-08", "2026-02-30T12:00:00Z", "2026-07-08T12:00:00"]) {
-      await expect(stream(bytes(userAgentCsv("2026-07-06")), { ...metadata, downloadedAt })).rejects.toMatchObject({ code: "invalid_metadata" });
+      await expect(stream(bytes(userAgentCsv("2026-07-06")), { ...metadata, downloadedAt })).rejects.toMatchObject({ status: 400, code: "invalid_metadata" });
     }
   });
+  it.each(["2026-07/06", "2026/07-06", "Jul 62026", "6 July2026"])(
+    "rejects malformed date separators rather than silently reinterpreting %s", async date => {
+      await expect(stream(bytes(userAgentCsv(date)))).rejects.toMatchObject({ status: 400, code: "invalid_date" });
+    },
+  );
   it("normalizes header order, CSV quoting, whitespace and row order to the same semantic rows", async () => {
     const conventional = [
       "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)",
@@ -196,5 +211,122 @@ describe("streamOfficialReport normalized field semantics", () => {
     const normalize = (report: StreamedOfficialReport) => [...report.examples].sort((left, right) =>
       ("agentId" in left ? left.agentId : "").localeCompare("agentId" in right ? right.agentId : ""));
     expect(normalize(await stream(bytes(reformatted), metadata))).toEqual(normalize(await stream(bytes(conventional), metadata)));
+  });
+
+  function sourceRecord(kind: OfficialUsageReportKind): Record<string, string> {
+    return Object.fromEntries(schemaRegistry[kind].headers.map(header => [header,
+      header === "agent id" ? "Agent-ID" : header === "username" ? "CaseUser" : header.includes("date") || header.includes("name") || header === "creator type" ? "" : "0"]));
+  }
+  const rowParsers = { agents: parseAgentRow, userAgents: parseUserAgentRow, users: parseUserRow };
+
+  describe("official source field boundaries", () => {
+    it.each(Object.keys(rowParsers) as OfficialUsageReportKind[])("enforces %s field bytes before discarding CSV whitespace", async kind => {
+      const headers = [...schemaRegistry[kind].headers];
+      const record = sourceRecord(kind);
+      const column = headers.findIndex(header => header.includes("name") && header !== "username");
+      const values = headers.map(header => record[header]);
+      const csv = (field: string) => {
+        const row = values.slice();
+        row[column] = field;
+        return `${headers.join(",")}\n${row.join(",")}`;
+      };
+      expect((await stream(bytes(csv(" ".repeat(officialReportLimits.fieldBytes))))).rowCount).toBe(1);
+      for (const field of [
+        " ".repeat(officialReportLimits.fieldBytes + 1),
+        `${" ".repeat(officialReportLimits.fieldBytes)}Name`,
+        `Name${"\t".repeat(officialReportLimits.fieldBytes)}`,
+        `${" ".repeat(officialReportLimits.fieldBytes)}"Name" `,
+        `"Name"${" ".repeat(officialReportLimits.fieldBytes)}`,
+        "\u3000".repeat(Math.ceil(officialReportLimits.fieldBytes / 3)),
+        `Name${"\u00A0".repeat(officialReportLimits.fieldBytes / 2)}`,
+      ]) {
+        await expect(stream(bytes(csv(field)))).rejects.toMatchObject({ status: 400, code: "field_limit_exceeded" });
+      }
+    });
+
+    it("bounds padded first/header/last fields without counting CSV framing or ignored blank lines", async () => {
+      const header = schemaRegistry.users.headers.join(",");
+      for (const csv of [
+        `${" ".repeat(officialReportLimits.fieldBytes)}${header}\n`,
+        `${header}\n${" ".repeat(officialReportLimits.fieldBytes)}User,Name,0,0,`,
+        `${header}\nUser,Name,0,0,${" ".repeat(officialReportLimits.fieldBytes + 1)}`,
+      ]) {
+        await expect(stream(bytes(csv))).rejects.toMatchObject({ status: 400, code: "field_limit_exceeded" });
+      }
+      const csv = `${" ".repeat(officialReportLimits.fieldBytes + 1)}\r\n\uFEFF${header}\r\nUser,"${" ".repeat(officialReportLimits.fieldBytes)}",0,0,\r\n`;
+      expect(await stream(bytes(csv))).toMatchObject({ rowCount: 1, examples: [{ username: "User", displayName: "" }] });
+    });
+
+    it.each(Object.keys(rowParsers) as OfficialUsageReportKind[])("detects reordered normalized %s headers but rejects schema extensions without retaining values", async kind => {
+      const headers = schemaRegistry[kind].headers.map(header => ` ${header.toUpperCase()} `).reverse();
+      const report = await stream(bytes(headers.join(",")));
+      expect(report.kind).toBe(kind);
+      for (const changed of [headers.slice(1), [...headers, "Private-unknown-column"], [...headers, headers[0]]]) {
+        await expect(stream(bytes(changed.join(",")))).rejects.toMatchObject({ status: 400 });
+      }
+      expect(normalizeHeader("\uFEFF Agent ID ")).toBe("agent id");
+      await expect(stream(bytes([...headers, "Private-unknown-column"].join(",")))).rejects.toThrow(
+        "Supplied column values were not retained.",
+      );
+    });
+
+    it.each(Object.keys(rowParsers) as OfficialUsageReportKind[])("keeps blank optional %s text/date distinct from required identities and counts", kind => {
+      const record = sourceRecord(kind), row = rowParsers[kind](record, 0);
+      expect(row.lastActivityDateUtc).toBeUndefined();
+      for (const header of schemaRegistry[kind].headers) {
+        if (header === "agent id" || header === "username") {
+          expect(() => rowParsers[kind]({ ...record, [header]: " \u3000 " }, 0))
+            .toThrowError(expect.objectContaining({ status: 400, code: "missing_required_value" }));
+        } else if (!header.includes("name") && header !== "creator type" && !header.includes("date")) {
+          for (const value of ["", " ", "null", "NULL", "-0", "+1", "01", "1.5", "1e3", "9007199254740992"]) {
+            expect(() => rowParsers[kind]({ ...record, [header]: value }, 0))
+              .toThrowError(expect.objectContaining({ status: 400, code: "invalid_number" }));
+          }
+          expect(() => rowParsers[kind]({ ...record, [header]: "9,007,199,254,740,991" }, 0)).not.toThrow();
+        }
+      }
+    });
+
+    it.each([
+      ["agents", "agent name", 512], ["agents", "creator type", 128],
+      ["userAgents", "username", 512], ["users", "display name", 512],
+    ] as const)("validates %s %s Unicode text and length without compatibility folding", (kind, field, maximum) => {
+      const record = sourceRecord(kind);
+      const value = "Ａ\u0301\u200D🤖".repeat(100).slice(0, maximum);
+      expect(() => rowParsers[kind]({ ...record, [field]: value }, 0)).not.toThrow();
+      expect(() => rowParsers[kind]({ ...record, [field]: "x".repeat(maximum + 1) }, 0))
+        .toThrowError(expect.objectContaining({ status: 400, code: "field_limit_exceeded" }));
+      for (const control of ["\u0000", "\u0085", "\uD800"]) {
+        expect(() => rowParsers[kind]({ ...record, [field]: `Private${control}value` }, 0))
+          .toThrowError(expect.objectContaining({ status: 400, code: "invalid_content" }));
+      }
+    });
+
+    it("reports logical CSV rows after blank lines and multiline text without disclosing cell values", async () => {
+      await expect(stream(bytes(`\n${userAgentCsv("2026-07-06", "Multi\nline")}\n\nagent-2,A,Your org,secret@example.invalid,private-invalid-count,\n`)))
+        .rejects.toMatchObject({ status: 400, code: "invalid_number", message: "Row 3 has an invalid responses sent to users value." });
+    });
+  });
+
+  describe("official metadata validation", () => {
+    it.each([
+      [], new Date("2026-07-08T00:00:00Z"), { reportingPeriod: null }, { sourceAsOf: null },
+      { downloadedAt: "" }, { downloadedAt: 0 }, { downloadedAt: false }, { downloadedAt: null },
+      { reportingPeriod: { provenance: "operator_asserted", startDate: null, endDate: "2026-07-06" } },
+      { sourceAsOf: { provenance: "operator_asserted", value: null } },
+    ])("returns a client validation error for malformed supplied metadata %j", invalid => {
+      expect(() => Reflect.apply(reportBase, undefined, ["users", invalid, []]))
+        .toThrowError(expect.objectContaining({ status: 400, code: "invalid_metadata" }));
+    });
+
+    it("normalizes real offset instants and rejects calendar/timezone rollover with client errors", () => {
+      expect(reportBase("users", { downloadedAt: "2026-07-08T00:15:00+01:00" }, []).downloadedAt)
+        .toBe("2026-07-07T23:15:00.000Z");
+      for (const downloadedAt of ["2026-07-08T24:00:00Z", "2026-07-08T12:60:00Z", "2026-07-08T12:00:60Z",
+        "2026-07-08T12:00:00+14:01", "2026-07-08T12:00:00-15:00", "2026-07-08T12:00:00+00:60"]) {
+        expect(() => reportBase("users", { downloadedAt }, []))
+          .toThrowError(expect.objectContaining({ status: 400, code: "invalid_metadata" }));
+      }
+    });
   });
 });

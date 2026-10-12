@@ -1,4 +1,5 @@
-import { DataExports, type ExportSource } from "./dataExports.js";
+import { isProxy } from "node:util/types";
+import { DataExports, type ExportBuildControl, type ExportSource } from "./dataExports.js";
 import { LargeTenantUsersReports, type ReportReadContext } from "./largeTenantUsersReports.js";
 import { reportExportColumns, type CombinedUser, type ReportAgent, type ReportUser, type ReportRelationship } from "../types/officialReportData.js";
 import type { SelectionIdentity } from "./dataSelections.js";
@@ -6,7 +7,7 @@ import type { AuditActor } from "../types/audit.js";
 import { reportExportAudit } from "./reportExportAudit.js";
 import { AppError } from "../errors.js";
 import { reportUuid } from "../db/officialReportImports.js";
-import type { OfficialReportExportStatus } from "../types/officialReportApi.js";
+import type { OfficialReportExportRequest, OfficialReportExportStatus } from "../types/officialReportApi.js";
 import type pg from "pg";
 import { encodeBatch } from "../db/dataBounds.js";
 import { officialReportCount } from "../db/officialReportBounds.js";
@@ -25,17 +26,8 @@ export class OfficialReportExports {
       clientId ? { tenantId: actor.tenantId, principalId: clientId } : undefined);
     this.engine = new DataExports(reports.database, this.inventory.selections, reportExportAudit);
   }
-  async create(identity: SelectionIdentity, input: { selectionId: string; kind: OfficialExportKind; ids?: readonly string[]; idempotencyKey?: string }) {
-    if (!input || typeof input !== "object" || !Object.hasOwn(reportExportColumns, input.kind) && !Object.hasOwn(inventoryExportColumns, input.kind)) {
-      throw new AppError(400, "invalid_export_kind", "Unsupported dataset export.");
-    }
-    reportUuid(input.selectionId);
-    if (input.idempotencyKey !== undefined) reportUuid(input.idempotencyKey);
-    if (Object.keys(input).some(key => !["selectionId", "kind", "ids", "idempotencyKey"].includes(key)) || input.ids !== undefined && (!Array.isArray(input.ids)
-      || !input.ids.length && Object.hasOwn(inventoryExportColumns, input.kind) || input.ids.length > 5000 || new Set(input.ids).size !== input.ids.length
-      || input.ids.some(id => typeof id !== "string" || !id || id.length > (input.kind === "unified_agents" ? 8192 : 512)))) {
-      throw new AppError(400, "invalid_export_selection", "Use a pinned selection and at most 5000 unique IDs.");
-    }
+  async create(identity: SelectionIdentity, value: unknown, assertCurrent?: () => void) {
+    const input = exportInput(value);
     if (identity.tenantId !== this.actor.tenantId || identity.principalId !== this.actor.homeAccountId) throw AppError.unauthorized();
     const queryHash = Object.hasOwn(inventoryExportColumns, input.kind) ? await this.engine.connections.selectedRead(async client => {
       const { context, selection } = await this.inventory.contextInRead(client, input.selectionId, identity);
@@ -57,21 +49,25 @@ export class OfficialReportExports {
       if (context.endpoint !== input.kind) throw new AppError(400, "export_selection_kind", "Export kind must match the pinned endpoint.");
       return context.queryHash;
     });
-    const ids = input.kind === "unified_agents" && input.ids !== undefined
-      ? await this.inventory.resolveExportReferences(input.selectionId, identity, input.ids) : input.ids;
-    return this.engine.create(identity, { ...input, ids, queryHash, actor: this.actor, filename: `${input.kind.replaceAll("_", "-")}.csv` });
+    const ids = Object.hasOwn(inventoryExportColumns, input.kind) && input.ids !== undefined
+      ? await this.inventory.resolveExportReferences(input.selectionId, identity, input.ids, input.kind as InventoryExportKind) : input.ids;
+    return this.engine.create(identity, { ...input, ids, queryHash, actor: this.actor, filename: `${input.kind.replaceAll("_", "-")}.csv` }, assertCurrent);
   }
-  async build(id: string, identity: SelectionIdentity, kind: OfficialExportKind, signal?: AbortSignal) {
+  async build(id: string, identity: SelectionIdentity, kind: OfficialExportKind, signal?: AbortSignal, control?: ExportBuildControl) {
+    signal?.throwIfAborted();
+    control?.assertCurrent?.();
     await this.engine.connections.selectedRead(async client => {
       const row = (await client.query("SELECT selection_id,kind FROM data_exports WHERE id=$1 AND tenant_id=$2 AND principal_id=$3",
         [reportUuid(id), identity.tenantId, identity.principalId])).rows[0];
       if (!row) throw new AppError(404, "export_not_found", "Export is unavailable.");
       await this.engine.selections.assert(client, row.selection_id, identity, id);
       if (row.kind !== kind || !Object.hasOwn(reportExportColumns, kind) && !Object.hasOwn(inventoryExportColumns, kind)) throw new AppError(400, "invalid_export_kind", "Export schema does not match persisted kind.");
-    });
+    }, { signal, serializationKey: id, beforeCommit: control?.assertCurrent });
+    signal?.throwIfAborted();
+    control?.assertCurrent?.();
     return Object.hasOwn(inventoryExportColumns, kind)
-      ? this.engine.build(id, identity, inventoryExportColumns[kind as InventoryExportKind], inventoryExportSource(this.inventory, identity), signal)
-      : this.engine.build(id, identity, reportExportColumns[kind as keyof typeof reportExportColumns], this.source(identity), signal);
+      ? this.engine.build(id, identity, inventoryExportColumns[kind as InventoryExportKind], inventoryExportSource(this.inventory, identity), signal, control)
+      : this.engine.build(id, identity, reportExportColumns[kind as keyof typeof reportExportColumns], this.source(identity), signal, control);
   }
   async status(id: string, identity: SelectionIdentity): Promise<OfficialReportExportStatus> {
     const status = await this.engine.status(reportUuid(id), identity);
@@ -96,8 +92,8 @@ export class OfficialReportExports {
               const user = row as CombinedUser;
               return { ObjectId: user.directory.objectId, UserPrincipalName: user.directory.userPrincipalName, DisplayName: user.directory.displayName,
                 Company: user.directory.companyName, Department: user.directory.department, PaidFeatureState: user.copilotServiceState,
-                Entitlement: user.entitlement, AgentActivityState: user.agentActivityState, ReportedResponses: user.reportedResponses,
-                ReportedAgentsUsed: user.reportedAgentsUsed, AppLastActivityDate: user.appActivity?.lastActivityDate ?? null,
+                Entitlement: user.entitlement, AgentActivityState: user.agentActivityState, ReportedResponses: unknown(user.reportedResponses),
+                ReportedAgentsUsed: unknown(user.reportedAgentsUsed), AppLastActivityDate: user.appActivity?.lastActivityDate ?? null,
                 DirectoryObservedAt: context.metadata.directory.observedAt, ...common };
             }
             if (exportContext.kind === "official_agents") {
@@ -133,6 +129,49 @@ export class OfficialReportExports {
       }
     };
   }
+}
+
+function exportInput(value: unknown): OfficialReportExportRequest {
+  const invalid = () => new AppError(400, "invalid_export_selection", "Use a pinned selection and at most 5000 unique IDs.");
+  if (isProxy(value)) throw invalid();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AppError(400, "invalid_export_kind", "Unsupported dataset export.");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw invalid();
+  const input: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || !["selectionId", "kind", "ids", "idempotencyKey"].includes(key)) throw invalid();
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property || !Object.hasOwn(property, "value")) throw invalid();
+    input[key] = property.value;
+  }
+  const kind = input.kind;
+  if (!Object.hasOwn(input, "kind") || typeof kind !== "string"
+    || !Object.hasOwn(reportExportColumns, kind) && !Object.hasOwn(inventoryExportColumns, kind)) {
+    throw new AppError(400, "invalid_export_kind", "Unsupported dataset export.");
+  }
+  if (!Object.hasOwn(input, "selectionId")) throw invalid();
+  const selectionId = reportUuid(input.selectionId);
+  const idempotencyKey = input.idempotencyKey === undefined ? undefined : reportUuid(input.idempotencyKey);
+  let ids: string[] | undefined;
+  const explicit = input.ids;
+  if (explicit !== undefined) {
+    if (isProxy(explicit) || !Array.isArray(explicit) || Object.getPrototypeOf(explicit) !== Array.prototype) throw invalid();
+    const length = Object.getOwnPropertyDescriptor(explicit, "length")?.value;
+    if (typeof length !== "number" || !Number.isInteger(length) || length < 0 || length > 5000
+      || !length && Object.hasOwn(inventoryExportColumns, kind) || Reflect.ownKeys(explicit).length !== length + 1) throw invalid();
+    ids = [];
+    for (let index = 0; index < length; index++) {
+      const property = Object.getOwnPropertyDescriptor(explicit, String(index));
+      if (!property || !Object.hasOwn(property, "value")) throw invalid();
+      const id = property.value;
+      if (typeof id !== "string" || !id || /[\0\p{Cs}]/u.test(id) || id.length > (kind === "unified_agents" ? 8192 : 512)) throw invalid();
+      ids.push(id);
+    }
+    if (new Set(ids).size !== ids.length) throw invalid();
+  }
+  return { selectionId, kind: kind as OfficialExportKind, ids, idempotencyKey };
 }
 
 type UserRelationshipCursor = { parent: number; nullRank: number; key: string; id: string };

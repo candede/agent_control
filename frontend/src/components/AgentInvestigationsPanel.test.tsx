@@ -195,6 +195,22 @@ describe("agent investigations", () => {
     expect(screen.queryByText("Verifying the selected agent with Microsoft Graph...")).not.toBeInTheDocument();
   });
 
+  it.each(["invalidated", "replaced"] as const)("does not resolve a %s saved context before observer rerender", async change => {
+    const client = createSavedQueryClient();
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue(unresolved);
+    render(<QueryClientProvider client={client}>{panel()}</QueryClientProvider>);
+    const resolve = await screen.findByRole("button", { name: "Resolve log identity" });
+    const query = client.getQueryCache().find({ queryKey: ["agent-investigation-context"], exact: false })!;
+    act(() => {
+      if (change === "invalidated") void client.invalidateQueries({ queryKey: query.queryKey, refetchType: "none" });
+      else client.setQueryData(query.queryKey, { ...unresolved, defender: { ...unresolved.defender,
+        resolution: { canResolve: false, capabilityId: "graph.agentIdentity.read" } } });
+      fireEvent.click(resolve);
+    });
+    expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+  });
+
   it("surfaces lookup permission failures and supports an explicit retry without falsely unlocking hunts", async () => {
     vi.mocked(getAgentInvestigationContext).mockResolvedValue(unresolved);
     vi.mocked(resolveAgentInvestigationIdentity).mockRejectedValueOnce(new Error("AgentIdentity.Read.All requires administrator consent."));

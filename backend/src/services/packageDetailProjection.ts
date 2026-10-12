@@ -1,5 +1,9 @@
 import type { CopilotPackageDetail, PackageDetailFreshness } from "../types/copilotPackage.js";
+import { normalizePackageStatus } from "../types/copilotPackage.js";
 import { packageControlIdentityChanged } from "./packageControlProjection.js";
+import { compareInventoryTimestamps } from "./inventoryTimestamp.js";
+import { isInventoryTimestamp } from "../types/inventoryTimestamp.js";
+import { normalizedGuid } from "./packageAgentMetadata.js";
 
 export type SavedPackageDetail = {
   package: CopilotPackageDetail | null;
@@ -8,37 +12,53 @@ export type SavedPackageDetail = {
   catalogRevision?: ReturnType<typeof packageDetailRevision> | null;
 };
 
-export function projectPackageDetailAge<T extends CopilotPackageDetail>(value: T, evaluatedAt: number): T {
+export function projectPackageDetailAge<T extends CopilotPackageDetail>(value: T, evaluatedAt: number | string | Date): T {
   const freshness = value.detailFreshness;
-  if (freshness?.state !== "fresh" || Date.parse(freshness.expiresAt ?? "") > evaluatedAt
-    && Date.parse(freshness.observedAt ?? "") <= evaluatedAt) return value;
+  if (freshness?.state !== "fresh") return value;
+  const evaluation = typeof evaluatedAt === "number" ? new Date(evaluatedAt) : evaluatedAt;
+  if (compareInventoryTimestamps(freshness.expiresAt ?? "", evaluation) > 0
+    && compareInventoryTimestamps(freshness.observedAt ?? "", evaluation) <= 0) return value;
   const result = { ...value, detailFreshness: { ...freshness, state: "stale" as const } };
   delete result.identityDetailsCollected;
   return result;
 }
 
 export function packageDetailRevision(value: CopilotPackageDetail) {
-  return [value.lastModifiedDateTime, value.appId, value.manifestId, value.assetId, value.version, value.manifestVersion]
+  return [value.lastModifiedDateTime, value.appId, normalizedGuid(value.manifestId) ?? value.manifestId,
+    value.assetId, value.version, value.manifestVersion]
     .map(marker => marker ?? null);
 }
 
 export function packageDetailRevisionMatches(current: CopilotPackageDetail, detailed: CopilotPackageDetail) {
   const modified = current.lastModifiedDateTime;
-  return Boolean(modified && Number.isFinite(Date.parse(modified))
+  return Boolean(modified && isInventoryTimestamp(modified)
     && packageDetailRevision(current).slice(1).some(marker => typeof marker === "string" && marker.trim())
     && JSON.stringify(packageDetailRevision(current)) === JSON.stringify(packageDetailRevision(detailed)));
 }
 
 function hasCollectedDetails(value: CopilotPackageDetail) {
-  return value.identityDetailsCollected === true || Array.isArray(value.elementDetails) && value.elementDetails.some(detail =>
+  // Expiry and control conflicts withdraw reusable identity, not a completed empty read's provenance.
+  return value.identityDetailsCollected === true
+    || value.detailFreshness?.state !== "missing" && typeof value.detailFreshness?.observedAt === "string"
+      && typeof value.detailFreshness.expiresAt === "string"
+    || Array.isArray(value.elementDetails) && value.elementDetails.some(detail =>
     detail && typeof detail.elementType === "string" && detail.elementType.length > 0 && Array.isArray(detail.elements)
       && detail.elements.some(element => element && typeof element.id === "string" && typeof element.definition === "string"));
+}
+
+export function packageDetailAccessScopesMatch(left: string | undefined, right: string | undefined) {
+  const normalized = normalizePackageStatus(left);
+  return left === right || normalized !== undefined && normalized === normalizePackageStatus(right);
 }
 
 export function projectPackageDetails(current: CopilotPackageDetail, saved: SavedPackageDetail | undefined,
   authoritativeCurrent = false, now = Date.now(), currentReadStartedAt?: number): CopilotPackageDetail {
   if (!saved || saved.package && !hasCollectedDetails(saved.package)) {
-    const result = { ...current, detailFreshness: { state: "missing" as const, observedAt: null, expiresAt: null } };
+    const result: CopilotPackageDetail = {
+      ...current,
+      ...(saved?.package?.identityRevalidationRequired ? { identityRevalidationRequired: true } : {}),
+      detailFreshness: { state: "missing", observedAt: null, expiresAt: null },
+    };
     delete result.elementDetails;
     delete result.identityDetailsCollected;
     return result;
@@ -50,14 +70,17 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     || JSON.stringify(saved.catalogRevision) === JSON.stringify(packageDetailRevision(current));
   const detailed = saved.package && saved.catalogRevision && catalogMatches
     ? { ...current, ...saved.package } : saved.package;
-  const compatible = catalogMatches && detailed && detailed.id === current.id
+  const compatible = saved.package?.detailFreshness?.state !== "invalidated"
+    && catalogMatches && detailed && detailed.id === current.id
     && (authoritativeCurrent || packageDetailRevisionMatches(current, saved.catalogRevision
       ? { ...detailed, lastModifiedDateTime: current.lastModifiedDateTime } : detailed)
       && !packageControlIdentityChanged(detailed, current));
   const state: PackageDetailFreshness["state"] = !compatible ? "invalidated"
-    : Date.parse(saved.expiresAt) > now && Date.parse(saved.observedAt) <= now ? "fresh" : "stale";
+    : compareInventoryTimestamps(saved.expiresAt, new Date(now)) > 0
+      && compareInventoryTimestamps(saved.observedAt, new Date(now)) <= 0 ? "fresh" : "stale";
   const result: CopilotPackageDetail = {
     ...current,
+    ...(saved.package?.identityRevalidationRequired ? { identityRevalidationRequired: true } : {}),
     detailFreshness: { state, observedAt: saved.observedAt, expiresAt: saved.expiresAt },
   };
   if (!compatible) {
@@ -71,16 +94,19 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     delete result[key];
     Object.assign(result, saved.package![key] === undefined ? {} : { [key]: saved.package![key] });
   }
-  const newerCatalog = currentReadStartedAt !== undefined && currentReadStartedAt > Date.parse(saved.observedAt);
-  if (current.availableTo === saved.package!.availableTo && !(newerCatalog && current.allowedUsersAndGroups !== undefined)) {
+  const newerCatalog = currentReadStartedAt !== undefined
+    && compareInventoryTimestamps(new Date(currentReadStartedAt), saved.observedAt) > 0;
+  if (packageDetailAccessScopesMatch(current.availableTo, saved.package!.availableTo)
+    && !(newerCatalog && current.allowedUsersAndGroups !== undefined)) {
     delete result.allowedUsersAndGroups;
     if (saved.package!.allowedUsersAndGroups !== undefined) result.allowedUsersAndGroups = saved.package!.allowedUsersAndGroups;
   }
-  if (current.deployedTo === saved.package!.deployedTo && !(newerCatalog && current.acquireUsersAndGroups !== undefined)) {
+  if (packageDetailAccessScopesMatch(current.deployedTo, saved.package!.deployedTo)
+    && !(newerCatalog && current.acquireUsersAndGroups !== undefined)) {
     delete result.acquireUsersAndGroups;
     if (saved.package!.acquireUsersAndGroups !== undefined) result.acquireUsersAndGroups = saved.package!.acquireUsersAndGroups;
   }
-  if (state === "fresh" && !current.identityRevalidationRequired) result.identityDetailsCollected = true;
+  if (state === "fresh" && !result.identityRevalidationRequired) result.identityDetailsCollected = true;
   else delete result.identityDetailsCollected;
   return result;
 }

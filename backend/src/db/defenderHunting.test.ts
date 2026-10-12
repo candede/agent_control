@@ -251,6 +251,22 @@ describe.sequential("Defender hunting repository", () => {
       providerRowCount: 201, partialReason: "hunting_row_limit", unobservedRange: { startDateTime: filters.startDateTime, endDateTime: filters.endDateTime } });
   });
 
+  it("retains partial qualification history and rows without granting qualified scope", async () => {
+    const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "partial-qualification-reader",
+      resultScope: { kind: "principal", scopeId: "partial-qualification-reader", configurationRevision: null } };
+    const job = await repository.submit(scope, { idempotencyKey: "partial-qualification", filters,
+      qualification: { ...authority, approvedBy: scope.authorizationPrincipalId } });
+    const execution = await repository.begin(scope, job.id);
+    await repository.publish(scope, job.id, execution, result([inventoryRow()], false));
+    const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
+      resultScopes: [scope.resultScope], qualifications: [{ resultScope: scope.resultScope, authority }] };
+    expect(await repository.getJob(readScope, job.id)).toMatchObject({ status: "partial", retainedScopeId: null });
+    expect(await repository.listRows(readScope, job.id)).toMatchObject({ count: 1, job: { status: "partial" } });
+    expect(await repository.listQualificationEvidence(readScope)).toEqual([]);
+    expect(await repository.listRetainedScopes(readScope)).toEqual([]);
+    await expect(repository.requireQualifiedScope(scope, filters, authority)).rejects.toMatchObject({ code: "hunting_scope_unqualified" });
+  });
+
   it("fences cancellation and recovered executions from late publication", async () => {
     const cancelled = await submitAndBegin("cancel");
     await repository.cancel(principalScope, cancelled.job.id);

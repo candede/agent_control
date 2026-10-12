@@ -10,11 +10,13 @@ import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 import { copilotStudioQuarantineJobs, launchCopilotStudioQuarantineJob } from "./copilotStudioQuarantineJobs.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 
 type ControlDependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
   authorityContext: typeof capabilities.quarantineAuthorityContext;
   launch: typeof launchCopilotStudioQuarantineJob;
@@ -24,6 +26,7 @@ const defaultDependencies: ControlDependencies = {
   revalidateUser: revalidateAuthenticatedUser,
   delegatedToken: acquireDelegatedToken,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   authorityContext: capabilities.quarantineAuthorityContext.bind(capabilities),
   launch: launchCopilotStudioQuarantineJob,
@@ -40,8 +43,9 @@ export class CopilotStudioQuarantineControlService {
   async status(user: AuthenticatedUser, snapshotId: string, resourceNativeId: string, force = false) {
     const scope = controlScope(user, "AgentControl.Viewer");
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const assertCurrent = this.providerWorkFence(user, "powerPlatform.quarantine.read", validation);
     const targets = await this.inventory.resolveQuarantineTargets(scope, snapshotId, [resourceNativeId]);
-    const observed = await this.observe(user, targets, force, "powerPlatform.quarantine.read", validation);
+    const observed = await this.observe(user, targets, force, "powerPlatform.quarantine.read", validation, assertCurrent);
     assertAccountSessionValidation(validation);
     return statusView(targets[0], observed[0].directStatus, observed[0].source);
   }
@@ -49,11 +53,12 @@ export class CopilotStudioQuarantineControlService {
   async preview(user: AuthenticatedUser, input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; forceStatus?: boolean }) {
     const scope = controlScope(user, "AgentControl.Admin");
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const assertCurrent = this.providerWorkFence(user, "powerPlatform.quarantine.manage", validation);
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
-    const frozen = (await this.observe(user, targets, Boolean(input.forceStatus), "powerPlatform.quarantine.manage", validation)).map(value => ({ ...value.target, directStatus: value.directStatus }));
-    const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
+    const frozen = (await this.observe(user, targets, Boolean(input.forceStatus), "powerPlatform.quarantine.manage", validation, assertCurrent)).map(value => ({ ...value.target, directStatus: value.directStatus }));
+    const current = await this.authorize(scope, "powerPlatform.quarantine.manage", assertCurrent);
     const authority = await this.dependencies.authorityContext(current);
-    assertAccountSessionValidation(validation);
+    assertCurrent();
     const confirmation = createQuarantineConfirmation({ action: input.action, targets: frozen, actor: userActor(current), authority, requestPath: "/api/quarantine/jobs" });
     return {
       confirmationHash: confirmation.confirmationHash,
@@ -65,31 +70,43 @@ export class CopilotStudioQuarantineControlService {
   async submit(user: AuthenticatedUser, input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; confirmationHash: string; idempotencyKey: string }) {
     const scope = controlScope(user, "AgentControl.Admin");
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const assertCurrent = this.providerWorkFence(user, "powerPlatform.quarantine.manage", validation);
     const existing = await this.repository.existingSubmission(scope, input);
     assertAccountSessionValidation(validation);
     if (existing) {
       if (existing.status === "queued" && !existing.isCanary) {
-        await this.authorize(scope, "powerPlatform.quarantine.manage");
-        await commitAccountSessionValidation(validation, async () => this.dependencies.launch(existing.id, scope));
+        await this.authorize(scope, "powerPlatform.quarantine.manage", assertCurrent);
+        await commitAccountSessionValidation(validation, async () => {
+          assertCurrent();
+          this.dependencies.launch(existing.id, scope);
+        });
       }
       assertAccountSessionValidation(validation);
       return existing;
     }
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
-    const frozen = (await this.observe(user, targets, false, "powerPlatform.quarantine.manage", validation)).map(value => ({ ...value.target, directStatus: value.directStatus }));
-    const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
+    const frozen = (await this.observe(user, targets, false, "powerPlatform.quarantine.manage", validation, assertCurrent)).map(value => ({ ...value.target, directStatus: value.directStatus }));
+    const current = await this.authorize(scope, "powerPlatform.quarantine.manage", assertCurrent);
     const authority = await this.dependencies.authorityContext(current);
-    const job = await commitAccountSessionValidation(validation, () => this.repository.submit(scope, {
-      action: input.action,
-      targets: frozen,
-      actor: userActor(current),
-      authority,
-      requestPath: "/api/quarantine/jobs",
-      idempotencyKey: input.idempotencyKey,
-      confirmationHash: input.confirmationHash,
-    }));
+    assertCurrent();
+    const job = await commitAccountSessionValidation(validation, () => {
+      assertCurrent();
+      return this.repository.submit(scope, {
+        action: input.action,
+        targets: frozen,
+        actor: userActor(current),
+        authority,
+        requestPath: "/api/quarantine/jobs",
+        idempotencyKey: input.idempotencyKey,
+        confirmationHash: input.confirmationHash,
+      }, assertCurrent);
+    });
     if (job.status === "queued" && !job.isCanary) {
-      await commitAccountSessionValidation(validation, async () => this.dependencies.launch(job.id, scope));
+      await this.authorize(scope, "powerPlatform.quarantine.manage", assertCurrent);
+      await commitAccountSessionValidation(validation, async () => {
+        assertCurrent();
+        this.dependencies.launch(job.id, scope);
+      });
     }
     assertAccountSessionValidation(validation);
     return job;
@@ -98,6 +115,7 @@ export class CopilotStudioQuarantineControlService {
   private async observe(
     user: AuthenticatedUser, targets: InventoryQuarantineTarget[], force: boolean, capabilityId: CapabilityId,
     validation: ReturnType<typeof beginAccountSessionValidation>,
+    assertCurrent: () => void,
   ) {
     assertAccountSessionValidation(validation);
     const scope = controlScope(user, capabilityId === "powerPlatform.quarantine.read" ? "AgentControl.Viewer" : "AgentControl.Admin");
@@ -111,36 +129,47 @@ export class CopilotStudioQuarantineControlService {
     }
     if (!missing.length) return results as Array<NonNullable<typeof results[number]>>;
 
+    assertCurrent();
     const observed = await this.dependencies.observeOperation(capabilityId, user, async () => {
-      const current = await this.authorize(scope, capabilityId);
-      assertAccountSessionValidation(validation);
+      await this.authorize(scope, capabilityId, assertCurrent);
       const token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, capabilityId);
       const providerResults: Array<FrozenQuarantineTarget["directStatus"]> = [];
       for (const value of missing) {
-        assertAccountSessionValidation(validation);
-        providerResults.push(await this.provider.getStatus(token, value.target, { correlationId: randomUUID() }));
+        await this.authorize(scope, capabilityId, assertCurrent);
+        providerResults.push(await this.provider.getStatus(token, value.target, { correlationId: randomUUID(), assertCurrent }));
+        assertCurrent();
       }
-      assertAccountSessionValidation(validation);
-      const publishUser = await this.authorize(scope, capabilityId);
-      if (publishUser.homeAccountId !== current.homeAccountId) throw AppError.unauthorized("The quarantine status actor changed before publication.");
+      await this.authorize(scope, capabilityId, assertCurrent);
       await commitAccountSessionValidation(validation, async () => {
         for (const [resultIndex, value] of missing.entries()) {
-          assertAccountSessionValidation(validation);
+          assertCurrent();
           const directStatus = providerResults[resultIndex];
-          await this.repository.recordObservation(scope, value.target, directStatus);
+          await this.repository.recordObservation(scope, value.target, directStatus, assertCurrent);
           results[value.index] = { target: value.target, directStatus, source: "provider" };
         }
       });
       return results as Array<NonNullable<typeof results[number]>>;
     }, { clearOnSuccess: capabilityId === "powerPlatform.quarantine.read" });
-    assertAccountSessionValidation(validation);
+    assertCurrent();
     return observed;
   }
 
-  private async authorize(scope: QuarantineScope, capabilityId: CapabilityId) {
+  private providerWorkFence(user: AuthenticatedUser, capabilityId: CapabilityId, validation: ReturnType<typeof beginAccountSessionValidation>) {
+    const assertAuthority = this.dependencies.beginOperationValidation(capabilityId, user);
+    return () => {
+      assertAccountSessionValidation(validation);
+      assertAuthority();
+      requireProviderAdmissions();
+    };
+  }
+
+  private async authorize(scope: QuarantineScope, capabilityId: CapabilityId, assertCurrent: () => void) {
+    assertCurrent();
     const user = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
+    assertCurrent();
     if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The quarantine status actor changed accounts.");
     await this.dependencies.requireAvailable(capabilityId, user);
+    assertCurrent();
     return user;
   }
 }

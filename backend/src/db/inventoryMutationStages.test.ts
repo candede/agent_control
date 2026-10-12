@@ -245,6 +245,33 @@ describe("record-store mutation staging", () => {
       { action: "block", requestPath, scope: "bulk", targetIds: ["A", "Blocked"] })).rejects.toMatchObject({ code: "idempotency_mismatch" });
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM audit_events WHERE operation_id=$1", [job.id])).rows[0].count).toBe(4);
   });
+  it("submits a large access preview without duplicating its sampled prestates into bounded job metadata", async () => {
+    const scope = newUsageScope(), ids = Array.from({ length: 20 }, (_, index) => `package-${String(index).padStart(2, "0")}`);
+    const principals = Array.from({ length: 80 }, (_, index) => ({
+      resourceType: "user", resourceId: `55555555-5555-4555-8555-${String(index).padStart(12, "0")}`,
+    }));
+    await saveUsageInventory(fixture.runtime, scope, [{ packages: ids, packageFields: {
+      availableTo: "some", deployedTo: "none", allowedUsersAndGroups: principals, acquireUsersAndGroups: [],
+    } }]);
+    const identity = await usageIdentity(fixture.runtime, scope), selectionId = await stages.currentSelection(identity);
+    const intent = { ...usageAudit(scope), action: "update-availability" as const, scope: "bulk" as const,
+      accessUpdate: { target: "availability" as const, mode: "add" as const, scope: "specific" as const, principals: [principals[0]] } };
+    const preview = await stages.preview(identity, selectionId, intent, ids);
+    expect(Buffer.byteLength(JSON.stringify(preview.summary))).toBeGreaterThan(65_536);
+
+    const job = await stages.submit(identity, { ...intent, selectionId, ids, confirmationHash: preview.confirmationHash,
+      idempotencyKey: randomUUID() });
+
+    expect(job).toMatchObject({ status: "queued", total: ids.length, confirmationHash: preview.confirmationHash });
+    const metadata = (await fixture.runtime.query(`SELECT confirmation_summary,
+      octet_length(confirmation_summary::text)::int AS bytes FROM jobs WHERE id=$1`, [job.id])).rows[0];
+    expect(metadata.bytes).toBeLessThanOrEqual(65_536);
+    expect(metadata.confirmation_summary).not.toHaveProperty("targets");
+    const prestates = (await fixture.runtime.query("SELECT prestate FROM job_items WHERE job_id=$1", [job.id])).rows;
+    expect(prestates).toHaveLength(ids.length);
+    expect(prestates.every(row => row.prestate.allowedUsersAndGroups.length === principals.length)).toBe(true);
+    await new JobRepository(fixture.runtime).cancel(job.id, scope);
+  });
   it("selects filtered targets entirely in SQL and refuses exact IDs outside that selection", async () => {
     const { identity, intent } = await setup();
     const root = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2

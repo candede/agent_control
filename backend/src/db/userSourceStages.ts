@@ -1,11 +1,13 @@
 import type pg from "pg";
-import { AppError } from "../errors.js";
+import { isProxy } from "node:util/types";
+import { AppError, errorTelemetry, isApplicationError } from "../errors.js";
 import { dataLimitError, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { DataGenerations, prepareGenerationBatch, type ActivityRecord, type BeginGeneration, type GenerationLease, type RecordKinds } from "./dataGenerations.js";
 import { copilotAppActivityPeriod, type CopilotDirectoryUser } from "../types/copilotUsage.js";
-import { directoryPlanRecord, directorySourceRecord } from "../services/userSourceRecords.js";
-import { parseReportedIdentity } from "../services/userSourceGraphFields.js";
+import { directoryPlanRecord, directorySourceRecord, snapshotUserSourceBatch } from "../services/userSourceRecords.js";
+import { civilDate, parseReportedIdentity } from "../services/userSourceGraphFields.js";
 import type { UserSourceKind } from "../types/userSources.js";
+import { operationalLog } from "../services/telemetry.js";
 
 type GenerationCompletion = NonNullable<NonNullable<Parameters<DataGenerations["publish"]>[1]>["completeJob"]>;
 export type UserSourceCompletion = (client: pg.PoolClient,
@@ -19,58 +21,96 @@ export class UserSourceStages {
   constructor(database: pg.Pool) { this.generations = new DataGenerations(database); }
 
   async execute(input: BeginGeneration, work: (lease: GenerationLease, signal: AbortSignal) => Promise<void>,
-    options: { signal?: AbortSignal; completeJob?: UserSourceCompletion; beforePublish: (signal: AbortSignal) => Promise<void> }) {
+    options: { signal?: AbortSignal; completeJob?: UserSourceCompletion; beforePublish: (signal: AbortSignal) => Promise<void>;
+      beforeCommit?: () => void }) {
     if (!["directory", "app_activity"].includes(input.scope.source) || input.scope.kind !== "principal"
       || input.scope.selector !== "complete" || input.schemaVersion !== 1
       || !["data_sync", "fixture"].includes(input.jobKind)) throw new Error("user_source_scope");
-    if (input.deadlineAt.getTime() - Date.now() > 30 * 60_000) throw dataLimitError("user_source_deadline", 30 * 60_000, input.deadlineAt.getTime() - Date.now());
+    const deadlineAt = input.deadlineAt.getTime();
+    if (!Number.isSafeInteger(deadlineAt)) throw new Error("user_source_deadline");
+    if (deadlineAt - Date.now() > 30 * 60_000) throw dataLimitError("user_source_deadline", 30 * 60_000, deadlineAt - Date.now());
     if (input.jobKind !== "fixture" && !options.completeJob) throw new Error("data_job_completion_required");
+    const deadline = new AbortController();
+    const expire = () => deadline.abort(new AppError(504, "provider_timeout", "User source refresh exceeded its persisted deadline."));
+    const signal = AbortSignal.any([deadline.signal, ...(options.signal ? [options.signal] : [])]);
+    const fence = (providerSignal = signal) => {
+      signal.throwIfAborted();
+      providerSignal.throwIfAborted();
+      if (Date.now() >= deadlineAt) expire();
+      signal.throwIfAborted();
+    };
+    const timer = setTimeout(expire, Math.max(0, deadlineAt - Date.now()));
+    timer.unref();
     const activityPeriod = copilotAppActivityPeriod;
     let owned: GenerationLease | undefined;
+    let publishedResult: { generationId: string; scopeId: string; revision: string } & Awaited<ReturnType<UserSourceStages["counts"]>> | undefined;
     try {
-      return await this.generations.execute(input, async (lease, signal) => {
+      fence();
+      return await this.generations.execute(input, async (lease, providerSignal) => {
         owned = lease;
+        fence(providerSignal);
         await this.generations.connections.run(async client => {
           await this.generations.fence(client, lease);
+          fence(providerSignal);
           await client.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source,report_period) VALUES($1,$2,$3,$4,$5)`,
             [lease.id, lease.scopeId, lease.tenantId, input.scope.source, activityPeriod]);
-        });
-        await work(lease, signal);
-        signal.throwIfAborted();
+        }, false, providerSignal, undefined, () => fence(providerSignal));
+        fence(providerSignal);
+        await work(lease, providerSignal);
+        fence(providerSignal);
         await this.validate(lease);
-        await options.beforePublish(signal);
-        signal.throwIfAborted();
+        fence(providerSignal);
+        await options.beforePublish(providerSignal);
+        fence(providerSignal);
+        const counts = await this.counts(lease);
+        fence(providerSignal);
         const revision = await this.generations.publish(lease, {
+          beforeCommit: () => {
+            fence(providerSignal);
+            options.beforeCommit?.();
+            fence(providerSignal);
+          },
+          onCommitted: revision => { publishedResult = { generationId: lease.id, scopeId: lease.scopeId, revision, ...counts }; },
           completeJob: async (client, result) => {
+            fence(providerSignal);
             await client.query(`UPDATE user_source_attempts SET status='available',message=$2,
               report_refresh_date=(SELECT min(report_refresh_date) FROM app_activity_rows WHERE generation_id=$1)
               WHERE generation_id=$1`, [lease.id, input.scope.source === "directory"
               ? `Checked ${result.rows} directory users; this is not tenant headcount or basic Copilot Chat usage.`
               : `Saved ${result.rows} Microsoft 365 Copilot ${activityPeriod} app activity rows.`]);
+            fence(providerSignal);
             await options.completeJob?.(client, { ...result, source: input.scope.source as UserSourceKind, generationId: lease.id });
+            fence(providerSignal);
           },
         });
-        return { generationId: lease.id, scopeId: lease.scopeId, revision, ...await this.counts(lease) };
-      }, options.signal);
+        return { generationId: lease.id, scopeId: lease.scopeId, revision, ...counts };
+      }, signal);
     } catch (error) {
+      if (publishedResult) {
+        operationalLog("warn", "user_source_publication_cleanup_failed", { source: input.scope.source, ...errorTelemetry(error) });
+        return publishedResult;
+      }
       if (owned) {
         const lease = owned;
+        const applicationError = isApplicationError(error) ? error : undefined;
+        const errorStatus: unknown = applicationError ? Object.getOwnPropertyDescriptor(applicationError, "status")?.value : undefined;
+        const errorCode: unknown = applicationError ? Object.getOwnPropertyDescriptor(applicationError, "code")?.value : undefined;
         const status = options.signal?.aborted ? "cancelled"
-          : error instanceof AppError && error.status === 401 ? "waiting_authorization"
-            : error instanceof AppError && error.status === 403 ? "permission_required" : "failed";
-        const code = error instanceof AppError && /^[a-z][a-z0-9_]{0,127}$/.test(error.code) ? error.code : "user_source_failed";
+          : errorStatus === 401 ? "waiting_authorization"
+            : errorStatus === 403 ? "permission_required" : "failed";
+        const code = typeof errorCode === "string" && /^[a-z][a-z0-9_]{0,127}$/.test(errorCode) ? errorCode : "user_source_failed";
         await this.generations.connections.run(async client => {
           const message = status === "permission_required" ? input.scope.source === "directory"
             ? "Directory requires User.Read.All, LicenseAssignment.Read.All and the corresponding provider role."
             : "App activity requires Reports.Read.All and the corresponding provider role."
             : status === "waiting_authorization" ? "Renew Microsoft authorization and explicitly resume this source."
-              : status === "cancelled" ? "The source refresh was cancelled." : userSourceFailureMessage(error);
+              : status === "cancelled" ? "The source refresh was cancelled." : userSourceFailureMessage(applicationError);
           await client.query(`UPDATE user_source_attempts SET status=$2,error_code=$3,message=$4
             WHERE generation_id=$1 AND status='running'`, [lease.id, status, code, message]);
         }).catch(failure => { throw new AggregateError([error, failure], "user_source_failure_record"); });
       }
       throw error;
-    }
+    } finally { clearTimeout(timer); }
   }
 
   private encoded(rows: readonly unknown[], values: readonly unknown[]) {
@@ -222,6 +262,7 @@ export class UserSourceStages {
   }
 
   async directory(lease: GenerationLease, key: string, users: readonly CopilotDirectoryUser[]) {
+    users = snapshotUserSourceBatch(users);
     this.encoded(users, [lease.id, lease.scopeId, lease.tenantId]);
     const normalized = users.map(directorySourceRecord);
     const unique = new Map<string, number>();
@@ -250,14 +291,19 @@ export class UserSourceStages {
   }
 
   async activity(lease: GenerationLease, key: string, rows: readonly ActivityRecord[]) {
+    rows = snapshotUserSourceBatch(rows);
     for (const row of rows) {
-      if (!["D28", "D30"].includes(row.period) || !row.upn_key || row.upn_key.length > 320 || row.upn_key !== row.upn_key.trim().toLowerCase()
-        || /[\0\r\n]/.test(row.upn_key) || row.report_refresh_date === null) throw new AppError(502, "provider_schema", "Invalid activity identity or period.");
+      if (!row || typeof row !== "object" || Array.isArray(row) || !row.residual
+        || typeof row.residual !== "object" || Array.isArray(row.residual)
+        || !["D28", "D30"].includes(row.period) || typeof row.upn_key !== "string" || !row.upn_key || row.upn_key.length > 512
+        || row.upn_key !== row.upn_key.trim().toLowerCase() || /[\0\r\n\p{Cs}]/u.test(row.upn_key)
+        || typeof row.identity !== "string" || !row.identity || row.identity.length > 512 || /[\0\r\n\p{Cs}]/u.test(row.identity)
+        || row.report_refresh_date === null) throw new AppError(502, "provider_schema", "Invalid activity identity or period.");
       for (const field of ["report_refresh_date", "last_activity_date", "chat_date", "teams_date", "word_date", "excel_date",
         "powerpoint_date", "outlook_date", "onenote_date", "loop_date"] as const) {
         const value = row[field];
-        if (value !== null && (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))
-          || new Date(value).toISOString().slice(0, 10) !== value)) throw new AppError(502, "provider_schema", "Invalid activity date.");
+        if (value !== null && (typeof value !== "string" || !value)) throw new AppError(502, "provider_schema", "Invalid activity date.");
+        civilDate(value, "activity date", field !== "report_refresh_date");
       }
     }
     await this.append(lease, "activity", rows);
@@ -274,7 +320,7 @@ export class UserSourceStages {
       while (true) {
         try { prepareGenerationBatch(lease, rows.slice(offset, offset + size)); break; }
         catch (error) {
-          if (!(error instanceof AppError) || error.code !== "data_batch_bytes" || size === 1) throw error;
+          if (!isApplicationError(error) || Object.getOwnPropertyDescriptor(error, "code")?.value !== "data_batch_bytes" || size === 1) throw error;
           size = Math.max(1, Math.floor(size / 2));
         }
       }
@@ -338,14 +384,16 @@ export class UserSourceStages {
 
 }
 
-function userSourceFailureMessage(error: unknown) {
+function userSourceFailureMessage(error: AppError | undefined) {
   let reason = "The latest source refresh failed.";
-  if (error instanceof AppError && error.code === "report_download_failed") {
-    const status = error.details && typeof error.details === "object" && "httpStatus" in error.details
-      ? error.details.httpStatus : undefined;
+  const code: unknown = error ? Object.getOwnPropertyDescriptor(error, "code")?.value : undefined;
+  if (error && code === "report_download_failed") {
+    const details: unknown = Object.getOwnPropertyDescriptor(error, "details")?.value;
+    const status: unknown = details && typeof details === "object" && !isProxy(details)
+      ? Object.getOwnPropertyDescriptor(details, "httpStatus")?.value : undefined;
     reason = `Microsoft 365 Copilot app activity report download failed${typeof status === "number"
       && Number.isInteger(status) && status >= 400 && status <= 599 ? ` (HTTP ${status})` : ""}. Retry Users sync; if this persists, check Microsoft 365 service health.`;
-  } else if (error instanceof AppError && error.code === "identity_provider_error") {
+  } else if (code === "identity_provider_error") {
     reason = "Microsoft Entra ID could not renew authorization. Retry Users sync; if this persists, review the Entra sign-in logs and application configuration.";
   }
   return `${reason} Any preceding complete source remains retained.`;

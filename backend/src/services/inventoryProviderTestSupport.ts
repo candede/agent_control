@@ -1,4 +1,5 @@
 import { AppError } from "../errors.js";
+import { digest } from "../db/dataBounds.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { GraphPackagesClient, PackageReadOptions } from "./graphPackages.js";
 import type { PowerPlatformResourceQueryClient, ResourceQueryOptions } from "./powerPlatformResourceQuery.js";
@@ -52,7 +53,12 @@ export async function measureNativePages(client: PowerPlatformResourceQueryClien
   types: readonly PowerPlatformResourceType[] = powerPlatformResourceTypes, options: ResourceQueryOptions = {},
   observe: (rows: PowerPlatformResource[], offset: number) => void = () => {}) {
   let observedCount = 0, pages = 0, totalRecords = 0, unknownFieldCount = 0;
-  for await (const page of client.pages(token, types, { ...options, visit: async () => {} })) {
+  const visited = new Set<string>();
+  for await (const page of client.pages(token, types, { ...options, visit: async pageToken => {
+    const key = digest(pageToken);
+    if (visited.has(key)) throw new AppError(502, "provider_continuation", "Repeated synthetic page.");
+    visited.add(key);
+  } })) {
     if (page.records.length > 100 || Buffer.byteLength(JSON.stringify(page.records)) > 1_048_576) {
       throw new Error("native_fixture_page_limit");
     }

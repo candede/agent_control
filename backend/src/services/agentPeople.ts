@@ -19,6 +19,7 @@ type Dependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
+  beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
   admissions: typeof requireProviderAdmissions;
   now: () => Date;
@@ -37,6 +38,7 @@ export class AgentPeopleService {
       repository: new AgentPeopleRepository(database), directory: new DirectoryPrincipalsClient(),
       revalidateUser: revalidateAuthenticatedUser,
       delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, now: () => new Date(), ...dependencies,
     };
@@ -48,7 +50,7 @@ export class AgentPeopleService {
 
   async refreshReferences(user: AuthenticatedUser, signal: AbortSignal, publication: UserSourcePublication,
     options: { incompleteOnly: boolean; useCache?: boolean }) {
-    const context = resolutionContext(user, signal);
+    const context = resolutionContext(user, this.dependencies.beginOperationValidation, signal);
     return awaitResolution(context.signal, async () => {
       assertCurrent(context);
       const generation = await this.generation(context.scope);
@@ -62,15 +64,22 @@ export class AgentPeopleService {
         seen += ids.length;
         if (seen > 100000) throw new AppError(413, "agent_people_limit", "Agent references exceed 100000 identities.");
         const result = await this.resolveCurrent(user, ids, { generation, publication, force: !options.useCache, skipLicensed: true, ...options }, context);
+        assertCurrent(context);
         total.changed ||= result.changed; total.resolved += result.resolved; total.notFound += result.notFound; total.failed += result.failed;
         after = ids.at(-1)!;
       }
+    }).catch(error => {
+      assertCurrent(context);
+      throw error;
     });
   }
 
   async resolve(user: AuthenticatedUser, ids: readonly string[], options: ResolutionOptions & { signal?: AbortSignal }) {
-    const context = resolutionContext(user, options.signal);
-    return awaitResolution(context.signal, () => this.resolveCurrent(user, ids, options, context));
+    const context = resolutionContext(user, this.dependencies.beginOperationValidation, options.signal);
+    return awaitResolution(context.signal, () => this.resolveCurrent(user, ids, options, context)).catch(error => {
+      assertCurrent(context);
+      throw error;
+    });
   }
 
   private async resolveCurrent(user: AuthenticatedUser, ids: readonly string[], options: ResolutionOptions, context: ResolutionContext) {
@@ -93,23 +102,25 @@ export class AgentPeopleService {
     });
     const result = { changed: false, resolved: 0, notFound: 0, failed: 0 };
     if (!pending.length) return result;
-    this.dependencies.admissions();
+    const fence = () => {
+      assertCurrent(context);
+      this.dependencies.admissions();
+    };
+    fence();
     const resolved = await this.dependencies.observeOperation("graph.directory.read", user,
-      reportFailure => this.resolvePending(context, pending, options, result, reportFailure),
-      { signal, clearOnSuccess: result => result.failed === 0 });
-    assertCurrent(context);
-    this.dependencies.admissions();
+      reportFailure => this.resolvePending(context, pending, options, result, reportFailure, fence),
+      { signal, clearOnSuccess: result => result.failed === 0 }).catch(error => {
+      fence();
+      throw error;
+    });
+    fence();
     return resolved;
   }
 
   private async resolvePending(context: ResolutionContext, pending: string[],
     options: { generation: AgentPeopleGeneration; publication?: UserSourcePublication }, result: { changed: boolean; resolved: number; notFound: number; failed: number },
-    reportFailure: (error: unknown) => void) {
+    reportFailure: (error: unknown) => void, fence: () => void) {
     const { scope, signal, validation } = context;
-    const fence = () => {
-      assertCurrent(context);
-      this.dependencies.admissions();
-    };
     const wait = <T>(operation: () => Promise<T>) => awaitResolution(signal, operation);
     fence();
     const freshUser = await wait(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId));
@@ -127,7 +138,7 @@ export class AgentPeopleService {
         fence();
         const checkedAt = this.dependencies.now().toISOString();
         try {
-          const values = await this.dependencies.directory.resolve(token, [{ resourceId: objectId, resourceType: "user" }], signal);
+          const values = await this.dependencies.directory.resolve(token, [{ resourceId: objectId, resourceType: "user" }], signal, fence);
           fence();
           const person = values[0];
           if (values.length !== 1 || person.resourceId.toLowerCase() !== objectId || person.resourceType !== "user"
@@ -172,7 +183,7 @@ export class AgentPeopleService {
         else if (observation.status === "not_found") result.notFound += 1;
         else result.failed += 1;
       }
-      if (offset + 8 < pending.length
+      if ((offset + 8 < pending.length || options.publication !== undefined)
         && observations.some(value => ["provider_throttled", "missing_permission", "unauthorized"].includes(value.errorCode ?? ""))) {
         throw new AppError(503, "agent_people_incomplete", "Agent people sync stopped after a directory authorization or throttling failure. Retry after resolving it.");
       }
@@ -181,16 +192,18 @@ export class AgentPeopleService {
   }
 }
 
-function resolutionContext(user: AuthenticatedUser, abortSignal?: AbortSignal) {
+function resolutionContext(user: AuthenticatedUser, beginOperationValidation: Dependencies["beginOperationValidation"], abortSignal?: AbortSignal) {
   const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(abortSignal ? [abortSignal] : [])]);
   throwIfResolutionAborted(signal);
   const scope = userScope(user);
-  return { signal, scope, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId) };
+  return { signal, scope, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId),
+    validateCapability: beginOperationValidation("graph.directory.read", user) };
 }
 
 function assertCurrent(context: ResolutionContext) {
   throwIfResolutionAborted(context.signal);
   assertAccountSessionValidation(context.validation);
+  context.validateCapability();
 }
 
 async function awaitResolution<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {

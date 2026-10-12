@@ -1,5 +1,5 @@
 import { AppError } from "../errors.js";
-import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import { packageObservationLimits, type CopilotPackageDetail, type PackageElementDetail } from "../types/copilotPackage.js";
 import { operationalLog } from "./telemetry.js";
 
 export type PackageAgentMetadata = {
@@ -32,20 +32,61 @@ export function normalizedSchemaName(value: unknown) {
   return normalizedId(value, schemaNamePattern) ?? normalizedGuid(value);
 }
 
-export function isPackageElementType(value: string, expected: string) {
-  return value.toLowerCase() === expected.toLowerCase();
+export function isPackageElementType(value: unknown, expected: string) {
+  return typeof value === "string" && value.toLowerCase() === expected.toLowerCase();
+}
+
+export function parsePackageIdentityDefinition(definition: string, elementType: string): unknown {
+  if (typeof definition !== "string" || Buffer.byteLength(definition, "utf8") > packageObservationLimits.bytes) {
+    throw new SyntaxError("Package identity definition must be a bounded JSON string.");
+  }
+  const metadata: unknown = JSON.parse(definition);
+  const agentMetadata = isPackageElementType(elementType, "AgentMetadatas");
+  const fields = agentMetadata ? ["SourceIds", "AgentIdentityId"]
+    : isPackageElementType(elementType, "Bots") ? ["botId"]
+      : isPackageElementType(elementType, "CustomEngineCopilots") ? ["type", "id", "botId"] : [];
+  if (!fields.length) return metadata;
+  const frames: Array<{ fields: readonly string[]; keys: Set<string>; property?: string }> = [];
+  let depth = 0;
+  // JSON.parse discards repeated properties. Check only identity-bearing objects,
+  // decoding escaped member names without interpreting unrestricted authoring JSON.
+  for (const match of definition.matchAll(/"(?:[^"\\]|\\.)*"|[{}[\],]/g)) {
+    const token = match[0];
+    const frame = depth <= 2 ? frames.at(-1) : undefined;
+    if (token === "{" || token === "[") {
+      if (++depth > 2) continue;
+      frames.push({
+        fields: token === "[" ? [] : depth === 1 ? fields : agentMetadata && frame?.property === "SourceIds" ? sourceFields : [],
+        keys: new Set<string>(),
+      });
+    } else if (token === "}" || token === "]") {
+      if (depth-- <= 2) frames.pop();
+    } else if (token === ",") {
+      if (frame) frame.property = undefined;
+    } else if (frame) {
+      let next = match.index + token.length;
+      while (/[\t\n\r ]/.test(definition.charAt(next))) next++;
+      if (definition.charAt(next) !== ":") continue;
+      const key: string = JSON.parse(token);
+      frame.property = key;
+      if (!frame.fields.includes(key)) continue;
+      if (frame.keys.has(key)) throw new SyntaxError("Package element contains duplicate identity properties.");
+      frame.keys.add(key);
+    }
+  }
+  return metadata;
 }
 
 export function validatePackageAgentMetadata(definition: string): string {
   let metadata: unknown;
   try {
-    metadata = JSON.parse(definition);
+    metadata = parsePackageIdentityDefinition(definition, "AgentMetadatas");
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     throw new AppError(502, "provider_schema", "Package agent identity metadata is not valid JSON.");
   }
   if (!isRecord(metadata)) throw new AppError(502, "provider_schema", "Package agent identity metadata must be an object.");
-  const projected: Record<string, unknown> = {};
+  const projected: Record<string, unknown> = Object.setPrototypeOf({}, null);
   if (Object.hasOwn(metadata, "SourceIds")) {
     const source = metadata.SourceIds;
     projected.SourceIds = isRecord(source)
@@ -53,7 +94,13 @@ export function validatePackageAgentMetadata(definition: string): string {
       : source;
   }
   if (Object.hasOwn(metadata, "AgentIdentityId")) projected.AgentIdentityId = metadata.AgentIdentityId;
-  const result = JSON.stringify(projected);
+  let result: string;
+  try {
+    result = JSON.stringify(projected);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    throw new AppError(502, "provider_schema", "Package agent identity fields exceed the storage limit.");
+  }
   if (Buffer.byteLength(result, "utf8") > 16_384) {
     throw new AppError(502, "provider_schema", "Package agent identity fields exceed the storage limit.");
   }
@@ -61,14 +108,20 @@ export function validatePackageAgentMetadata(definition: string): string {
 }
 
 export function readPackageAgentMetadata(value: CopilotPackageDetail): PackageAgentMetadataObservation {
-  const groups = value.elementDetails?.filter(group => isPackageElementType(group.elementType, "AgentMetadatas"));
+  let groups: PackageElementDetail[];
+  try {
+    groups = identityElementGroups(value).filter(group => isPackageElementType(group.elementType, "AgentMetadatas"));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return malformedIdentity("invalid_element_details");
+  }
   if (!groups?.length) return {
     status: "unmatched",
-    reason: value.identityDetailsCollected
+    reason: ownValue(value, "identityDetailsCollected") === true
       ? "Package details were collected, but Microsoft Graph did not supply native agent metadata or a corroborated declarative manifest identity."
       : "Agent identity metadata has not been supplied. Refresh package details to check for a source-declared link.",
   };
-  const identity: PackageAgentMetadata = { graphAgentIds: [] };
+  const identity: PackageAgentMetadata = Object.setPrototypeOf({ graphAgentIds: [] }, null);
   const elementIds = new Set<string>();
   let elementCount = 0;
   for (const group of groups) {
@@ -77,29 +130,31 @@ export function readPackageAgentMetadata(value: CopilotPackageDetail): PackageAg
       if (element.id) elementIds.add(element.id);
       let metadata: unknown;
       try {
-        metadata = JSON.parse(element.definition);
+        metadata = parsePackageIdentityDefinition(element.definition, "AgentMetadatas");
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
         return malformedIdentity("invalid_json");
       }
-      if (!isRecord(metadata) || supplied(metadata.SourceIds) && !isRecord(metadata.SourceIds)) {
+      if (!isRecord(metadata)) return malformedIdentity("invalid_source_ids");
+      const sourceIds = ownValue(metadata, "SourceIds");
+      if (supplied(sourceIds) && !isRecord(sourceIds)) {
         return malformedIdentity("invalid_source_ids");
       }
-      const source = isRecord(metadata.SourceIds) ? metadata.SourceIds : {};
+      const source = isRecord(sourceIds) ? sourceIds : {};
       const fields = {
-        environmentId: normalizedEnvironmentId(source.EnvironmentId),
-        cdsBotId: normalizedGuid(source.CdsBotId),
-        schemaName: normalizedSchemaName(source.SchemaName),
-        manifestId: normalizedGuid(source.ManifestId),
-        entraApplicationId: normalizedGuid(source.EntraApplicationId),
+        environmentId: normalizedEnvironmentId(ownValue(source, "EnvironmentId")),
+        cdsBotId: normalizedGuid(ownValue(source, "CdsBotId")),
+        schemaName: normalizedSchemaName(ownValue(source, "SchemaName")),
+        manifestId: normalizedGuid(ownValue(source, "ManifestId")),
+        entraApplicationId: normalizedGuid(ownValue(source, "EntraApplicationId")),
       };
-      const graphAgentId = normalizedGuid(metadata.AgentIdentityId);
-      if (supplied(source.EnvironmentId) && !fields.environmentId
-        || supplied(source.CdsBotId) && !fields.cdsBotId
-        || supplied(source.SchemaName) && !fields.schemaName
-        || supplied(source.ManifestId) && !fields.manifestId
-        || supplied(source.EntraApplicationId) && !fields.entraApplicationId
-        || supplied(metadata.AgentIdentityId) && !graphAgentId) return malformedIdentity("invalid_typed_identity");
+      const graphAgentId = normalizedGuid(ownValue(metadata, "AgentIdentityId"));
+      if (supplied(ownValue(source, "EnvironmentId")) && !fields.environmentId
+        || supplied(ownValue(source, "CdsBotId")) && !fields.cdsBotId
+        || supplied(ownValue(source, "SchemaName")) && !fields.schemaName
+        || supplied(ownValue(source, "ManifestId")) && !fields.manifestId
+        || supplied(ownValue(source, "EntraApplicationId")) && !fields.entraApplicationId
+        || supplied(ownValue(metadata, "AgentIdentityId")) && !graphAgentId) return malformedIdentity("invalid_typed_identity");
       for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
         const next = fields[key];
         if (!next) continue;
@@ -122,17 +177,70 @@ export function readPackageAgentMetadata(value: CopilotPackageDetail): PackageAg
 export function readPackageCustomEngineBotIdentity(value: CopilotPackageDetail): {
   botApplicationId: string; elementIds: string[];
 } | undefined {
-  const botGroups = value.elementDetails?.filter(group => isPackageElementType(group.elementType, "Bots")) ?? [];
-  const engineGroups = value.elementDetails?.filter(group => isPackageElementType(group.elementType, "CustomEngineCopilots")) ?? [];
+  let groups: PackageElementDetail[];
+  try {
+    groups = identityElementGroups(value);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "invalid_element_details" });
+    return undefined;
+  }
+  const botGroups = groups.filter(group => isPackageElementType(group.elementType, "Bots"));
+  const engineGroups = groups.filter(group => isPackageElementType(group.elementType, "CustomEngineCopilots"));
   if (!botGroups.length || !engineGroups.length) return undefined;
+  const applications = readPackageBotApplications(botGroups, engineGroups);
+  if (!applications || applications.engines.size !== 1) return undefined;
+  const botApplicationId = [...applications.engines][0];
+  if (!applications.bots.has(botApplicationId)) {
+    operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "bot_application_disagreement" });
+    return undefined;
+  }
+  return { botApplicationId, elementIds: [...applications.elementIds.get(botApplicationId) ?? []].sort() };
+}
+
+export function packageCustomEngineBotIdentityChanged(current: CopilotPackageDetail, incoming: CopilotPackageDetail) {
+  let nextGroups: PackageElementDetail[];
+  try {
+    nextGroups = identityElementGroups(incoming).filter(group => group.elements.length);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return true;
+  }
+  const botGroups = nextGroups.filter(group => isPackageElementType(group.elementType, "Bots"));
+  const engineGroups = nextGroups.filter(group => isPackageElementType(group.elementType, "CustomEngineCopilots"));
+  if (!botGroups.length && !engineGroups.length) return false;
+  const next = readPackageBotApplications(botGroups, engineGroups);
+  if (!next) return true;
+  let previousGroups: PackageElementDetail[];
+  try {
+    previousGroups = identityElementGroups(current);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return true;
+  }
+  const previous = readPackageBotApplications(
+    previousGroups.filter(group => isPackageElementType(group.elementType, "Bots")),
+    previousGroups.filter(group => isPackageElementType(group.elementType, "CustomEngineCopilots")),
+  );
+  // Compare positive fragments independently; omitted complementary groups are not deletions.
+  if ([...next.bots].some(id => !previous?.bots.has(id))
+    || [...next.engines].some(id => !previous?.engines.has(id))) return true;
+  const previousBot = previous?.engines.size === 1 ? [...previous.engines][0] : undefined;
+  if (!previousBot || !previous?.bots.has(previousBot)) return false;
+  const bots = botGroups.length ? next.bots : previous.bots;
+  const engines = engineGroups.length ? next.engines : previous.engines;
+  return engines.size !== 1 || !engines.has(previousBot) || !bots.has(previousBot);
+}
+
+function readPackageBotApplications(botGroups: PackageElementDetail[], engineGroups: PackageElementDetail[]) {
   const bots = new Set<string>();
   const engines = new Set<string>();
-  const elementIds = new Set<string>();
+  const elementIds = new Map<string, Set<string>>();
   for (const [groups, customEngine] of [[botGroups, false], [engineGroups, true]] as const) {
     for (const element of groups.flatMap(group => group.elements)) {
       let definition: unknown;
       try {
-        definition = JSON.parse(element.definition);
+        definition = parsePackageIdentityDefinition(element.definition, customEngine ? "CustomEngineCopilots" : "Bots");
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
         operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "invalid_bot_application_json" });
@@ -142,23 +250,66 @@ export function readPackageCustomEngineBotIdentity(value: CopilotPackageDetail):
         operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "invalid_bot_application_definition" });
         return undefined;
       }
-      if (customEngine && definition.type !== "bot") continue;
-      const botId = normalizedGuid(customEngine ? definition.id : definition.botId);
-      if (!botId || customEngine && supplied(definition.botId) && normalizedGuid(definition.botId) !== botId) {
+      if (customEngine && ownValue(definition, "type") !== "bot") continue;
+      const botId = normalizedGuid(ownValue(definition, customEngine ? "id" : "botId"));
+      const declaredBotId = ownValue(definition, "botId");
+      if (!botId || customEngine && supplied(declaredBotId) && normalizedGuid(declaredBotId) !== botId) {
         operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "invalid_bot_application_identity" });
         return undefined;
       }
       (customEngine ? engines : bots).add(botId);
-      if (element.id) elementIds.add(element.id);
+      const ids = elementIds.get(botId) ?? new Set<string>();
+      if (element.id) ids.add(element.id);
+      elementIds.set(botId, ids);
     }
   }
-  if (engines.size !== 1) return undefined;
-  const botApplicationId = [...engines][0];
-  if (!bots.has(botApplicationId)) {
-    operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason: "bot_application_disagreement" });
-    return undefined;
+  return { bots, engines, elementIds };
+}
+
+function identityElementGroups(value: CopilotPackageDetail): PackageElementDetail[] {
+  if (!isRecord(value)) throw new SyntaxError("Invalid package identity observation.");
+  for (const key of ["elementDetails", "elementTypes", "manifestId", "identityDetailsCollected", "identityRevalidationRequired", "detailFreshness"]) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (property && !Object.hasOwn(property, "value")) throw new SyntaxError("Package identity evidence must contain data properties.");
   }
-  return { botApplicationId, elementIds: [...elementIds].sort() };
+  const details = ownValue(value, "elementDetails");
+  if (details === undefined || details === null) return [];
+  if (!Array.isArray(details) || details.length > packageObservationLimits.elementGroups) {
+    throw new SyntaxError("Package identity element groups are invalid or oversized.");
+  }
+  let bytes = 0;
+  const groups = Array.from({ length: details.length }, (_, index) => {
+    const input = ownValue(details, String(index));
+    if (!isRecord(input)) throw new SyntaxError("Invalid package identity element group.");
+    const elementType = ownValue(input, "elementType"), elements = ownValue(input, "elements");
+    if (typeof elementType !== "string" || !elementType || elementType.length > 256 || /[\0\uD800-\uDFFF]/u.test(elementType)
+      || !Array.isArray(elements) || elements.length > packageObservationLimits.elementsPerGroup) {
+      throw new SyntaxError("Invalid package identity element group.");
+    }
+    bytes += Buffer.byteLength(elementType, "utf8");
+    return { elementType, elements: Array.from({ length: elements.length }, (_, ordinal) => {
+      const element = ownValue(elements, String(ordinal));
+      if (!isRecord(element)) throw new SyntaxError("Invalid package identity element.");
+      const id = ownValue(element, "id"), definition = ownValue(element, "definition");
+      if (typeof id !== "string" || id.length > 512 || typeof definition !== "string"
+        || /[\0\uD800-\uDFFF]/u.test(id) || /[\0\uD800-\uDFFF]/u.test(definition)
+        || Buffer.byteLength(definition, "utf8") > packageObservationLimits.bytes) {
+        throw new SyntaxError("Invalid package identity element.");
+      }
+      bytes += Buffer.byteLength(id, "utf8") + Buffer.byteLength(definition, "utf8");
+      if (bytes > packageObservationLimits.bytes) throw new SyntaxError("Package identity elements exceed the observation limit.");
+      return { id, definition };
+    }) };
+  });
+  if (Buffer.byteLength(JSON.stringify(groups), "utf8") > packageObservationLimits.bytes) {
+    throw new SyntaxError("Package identity elements exceed the observation limit.");
+  }
+  return groups;
+}
+
+function ownValue(value: object, key: string): unknown {
+  const property = Object.getOwnPropertyDescriptor(value, key);
+  return property && Object.hasOwn(property, "value") ? property.value : undefined;
 }
 
 function malformedIdentity(reason: string): PackageAgentMetadataObservation {

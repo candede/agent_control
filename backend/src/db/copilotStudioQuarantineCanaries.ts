@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import type { InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
+import { quarantineTargetIdentity, sameQuarantineTarget } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole } from "../types/capability.js";
 import { pool, transaction } from "./pool.js";
@@ -30,23 +31,23 @@ export type QuarantineCanaryApproval = ReturnType<typeof projectApproval>;
 export class CopilotStudioQuarantineCanaryRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async createApproved(user: AuthenticatedUser, input: QuarantineCanaryApprovalInput) {
+  async createApproved(user: AuthenticatedUser, input: QuarantineCanaryApprovalInput, beforeCommit?: () => void) {
     requireAdministrator(user);
     validateApprovalInput(input);
     const tenantId = requireTenant(user);
     return transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`quarantine-canary:${tenantId}:${input.target.environmentId}:${input.target.botId}:${input.action}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`quarantine-canary:${tenantId}:${quarantineTargetIdentity(input.target)}:${input.action}`]);
       await client.query(`UPDATE copilot_quarantine_canary_approvals SET status='expired'
-        WHERE tenant_id=$1 AND environment_id=$2 AND bot_id=$3 AND action=$4 AND status='approved'`, [tenantId, input.target.environmentId, input.target.botId, input.action]);
+        WHERE tenant_id=$1 AND lower(environment_id)=lower($2) AND lower(bot_id)=lower($3) AND action=$4 AND status='approved'`, [tenantId, input.target.environmentId, input.target.botId, input.action]);
       const rows = await client.query<CanaryRow>(`INSERT INTO copilot_quarantine_canary_approvals
         (id,tenant_id,approved_by_principal_id,resource_native_id,display_name,snapshot_id,inventory_observed_at,environment_id,bot_id,action,
          prestate,prestate_provider_updated_at,poststate,contract_revision,permission_revision,configuration_revision,auth_mode)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'delegated') RETURNING *`,
       [randomUUID(), tenantId, user.homeAccountId, input.target.resourceNativeId, input.target.displayName, input.target.snapshotId, input.target.inventoryObservedAt,
-        input.target.environmentId, input.target.botId, input.action, input.prestate, input.prestateProviderUpdatedAt, input.poststate,
+        input.target.environmentId.toLowerCase(), input.target.botId.toLowerCase(), input.action, input.prestate, input.prestateProviderUpdatedAt, input.poststate,
         input.authority.contractRevision, input.authority.permissionRevision, input.authority.configurationRevision]);
       return projectApproval(rows.rows[0]);
-    });
+    }, undefined, beforeCommit);
   }
 
   async list(user: AuthenticatedUser, limit = 50) {
@@ -56,7 +57,7 @@ export class CopilotStudioQuarantineCanaryRepository {
     return { value: rows.rows.map(projectApproval) };
   }
 
-  async claimCycle(user: AuthenticatedUser, originalId: string, restorationId: string, authority: QuarantineAuthority) {
+  async claimCycle(user: AuthenticatedUser, originalId: string, restorationId: string, authority: QuarantineAuthority, beforeCommit?: () => void) {
     requireOperator(user);
     const tenantId = requireTenant(user);
     const result = await transaction(this.database, async client => {
@@ -81,7 +82,7 @@ export class CopilotStudioQuarantineCanaryRepository {
         original: projectApproval(claimed.rows.find(row => row.id === ids[0])!),
         restoration: projectApproval(claimed.rows.find(row => row.id === ids[1])!),
       } };
-    });
+    }, undefined, beforeCommit);
     if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The Admin executing the quarantine canary must differ from the approving Admin.");
     if (result.kind === "invalidated") throw new AppError(409, "qualification_invalidated", "The quarantine canary contract, permission, or configuration revision changed.");
     if (result.kind === "mismatch") throw new AppError(409, "canary_cycle_mismatch", "Restoration must be the exact inverse target, action, and semantic state, with its future provider timestamp left unset.");
@@ -98,7 +99,7 @@ export class CopilotStudioQuarantineCanaryRepository {
     return projectApproval(rows.rows[0]);
   }
 
-  async completeCycle(user: AuthenticatedUser, originalId: string, restorationId: string, completion: { status: "qualified" | "failed" | "inconclusive" | "conflict"; errorCode?: string }, authority?: QuarantineAuthority) {
+  async completeCycle(user: AuthenticatedUser, originalId: string, restorationId: string, completion: { status: "qualified" | "failed" | "inconclusive" | "conflict"; errorCode?: string }, authority?: QuarantineAuthority, beforeCommit?: () => void) {
     requireOperator(user);
     const tenantId = requireTenant(user);
     return transaction(this.database, async client => {
@@ -107,7 +108,8 @@ export class CopilotStudioQuarantineCanaryRepository {
         WHERE id=ANY($1::uuid[]) AND tenant_id=$2 AND status='claimed' AND actor_principal_id=$3 ORDER BY id FOR UPDATE`, [ids, tenantId, user.homeAccountId]);
       const original = current.rows.find(row => row.id === ids[0]);
       const restoration = current.rows.find(row => row.id === ids[1]);
-      if (!original || !restoration || !isExactInverse(original, restoration)) throw new AppError(409, "canary_cycle_state", "The paired quarantine canary cannot be completed from its current state.");
+      if (!original || !restoration || original.paired_approval_id !== restoration.id || restoration.paired_approval_id !== original.id
+        || !isExactInverse(original, restoration)) throw new AppError(409, "canary_cycle_state", "The paired quarantine canary cannot be completed from its current state.");
       if (completion.status === "qualified") {
         if (!authority || !authorityMatches(original, authority) || !authorityMatches(restoration, authority)) throw new AppError(409, "qualification_invalidated", "Quarantine authority changed before qualification publication.");
         await requireVerifiedCycleJobs(client, original, restoration);
@@ -115,7 +117,7 @@ export class CopilotStudioQuarantineCanaryRepository {
         await client.query(`INSERT INTO copilot_quarantine_qualifications
           (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,
            contract_revision,permission_revision,configuration_revision,auth_mode)
-          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'delegated')`, [tenantId, original.environment_id, original.bot_id,
+          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'delegated')`, [tenantId, original.environment_id.toLowerCase(), original.bot_id.toLowerCase(),
           original.id, restoration.id, original.job_id, restoration.job_id, original.contract_revision, original.permission_revision, original.configuration_revision]);
       }
       const rows = await client.query<CanaryRow>(`UPDATE copilot_quarantine_canary_approvals SET status=$4,finished_at=clock_timestamp(),
@@ -123,7 +125,7 @@ export class CopilotStudioQuarantineCanaryRepository {
       [ids, tenantId, user.homeAccountId, completion.status, completion.status === "qualified" ? null : safeErrorCode(completion.errorCode)]);
       if (rows.rowCount !== 2) throw new AppError(409, "canary_cycle_state", "The paired quarantine canary was not completed atomically.");
       return { original: projectApproval(rows.rows.find(row => row.id === ids[0])!), restoration: projectApproval(rows.rows.find(row => row.id === ids[1])!) };
-    });
+    }, undefined, beforeCommit);
   }
 
   async recoverInterrupted(tenantId: string) {
@@ -141,7 +143,9 @@ function validateApprovalInput(input: QuarantineCanaryApprovalInput) {
 }
 
 function isExactInverse(original: CanaryRow, restoration: CanaryRow) {
-  return original.resource_native_id === restoration.resource_native_id && original.environment_id === restoration.environment_id && original.bot_id === restoration.bot_id
+  return original.resource_native_id === restoration.resource_native_id
+    && sameQuarantineTarget({ environmentId: original.environment_id, botId: original.bot_id },
+      { environmentId: restoration.environment_id, botId: restoration.bot_id })
     && original.action !== restoration.action && original.prestate === restoration.poststate && original.poststate === restoration.prestate;
 }
 
@@ -160,7 +164,9 @@ async function requireVerifiedCycleJobs(client: pg.PoolClient, original: CanaryR
   [[original.job_id, restoration.job_id], original.tenant_id, original.actor_principal_id]);
   const originalJob = rows.rows.find(row => row.id === original.job_id);
   const restorationJob = rows.rows.find(row => row.id === restoration.job_id);
-  const sameTarget = (row: typeof rows.rows[number] | undefined) => row?.resource_native_id === original.resource_native_id && row.environment_id === original.environment_id && row.bot_id === original.bot_id;
+  const sameTarget = (row: typeof rows.rows[number] | undefined) => row?.resource_native_id === original.resource_native_id
+    && sameQuarantineTarget({ environmentId: row.environment_id, botId: row.bot_id },
+      { environmentId: original.environment_id, botId: original.bot_id });
   if (!originalJob || !restorationJob || !sameTarget(originalJob) || !sameTarget(restorationJob)
     || originalJob.canary_approval_id !== original.id || restorationJob.canary_approval_id !== restoration.id
     || originalJob.action !== original.action || restorationJob.action !== restoration.action

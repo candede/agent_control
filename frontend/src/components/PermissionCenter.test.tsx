@@ -247,7 +247,7 @@ describe("Permissions setup and issues", () => {
       [graph, "Group.Read.All", "Agents > Overview / Manage: resolve groups and search groups for access assignments."],
       [graph, "User.Read.All", "Users / Sync: read users and their Copilot license and service-plan assignments."],
       [graph, "LicenseAssignment.Read.All", "Users / Sync: read the tenant product and service-plan catalog."],
-      [graph, "Reports.Read.All", "Users / Sync: refresh 30-day Microsoft 365 Copilot app activity."],
+      [graph, "Reports.Read.All", "Users / Sync: refresh 28-day Microsoft 365 Copilot app activity."],
       [graph, "AgentIdentity.Read.All", "Agents > Activity: verify a Studio agent's Entra identity for log matching."],
       [graph, "AuditLogsQuery.Read.All", "User details > Purview audit: run user-scoped searches. Agent details > Activity: search saved records."],
       [graph, "ThreatHunting.Read.All", "Agents > Activity: run Defender / Agent 365 log hunts."],

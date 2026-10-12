@@ -1,10 +1,29 @@
+import { isGraphGuid } from "./copilotUsage.js";
+
 export type PackageAccessEntity = {
   resourceId: string;
   resourceType: "user" | "group" | string;
 };
 
-export function isDirectoryObjectId(value: string) {
-  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value);
+export const packageAccessCollectionLimit = 5000;
+export const packageObservationLimits = { bytes: 2_048_000, elementGroups: 50, elementsPerGroup: 100 } as const;
+
+export function isPackageAccessEntity(value: unknown): value is PackageAccessEntity {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const resourceId = Object.getOwnPropertyDescriptor(value, "resourceId")?.value;
+  const resourceType = Object.getOwnPropertyDescriptor(value, "resourceType")?.value;
+  return typeof resourceId === "string" && Boolean(resourceId.trim()) && resourceId.length <= 512
+    && !/[\u0000-\u001F\u007F-\u009F\uD800-\uDFFF]/u.test(resourceId)
+    && typeof resourceType === "string" && /^(user|group)$/i.test(resourceType);
+}
+
+export function isDirectoryObjectId(value: unknown) {
+  return isGraphGuid(value);
+}
+
+export function isPackageId(value: unknown): value is string {
+  return typeof value === "string" && Boolean(value.trim()) && value.length <= 512
+    && value !== "." && value !== ".." && !/[\u0000-\u001F\u007F\uD800-\uDFFF]/u.test(value);
 }
 
 export type PackageAccessTarget = "availability" | "installation";
@@ -36,6 +55,12 @@ export function normalizePackageStatus(value: PackageStatus | undefined): "all" 
     if (packageStatusAliases[status].some(alias => alias === normalized)) return status;
   }
   return undefined;
+}
+
+export function isWritablePackageAccessScope(status: PackageStatus | undefined, principals: readonly PackageAccessEntity[] | undefined) {
+  if (principals === undefined) return false;
+  const scope = normalizePackageStatus(status) ?? (status === undefined && principals.length ? "some" : undefined);
+  return scope === "none" && principals.length === 0 || scope === "some" && principals.length > 0;
 }
 
 export type PackageAccessUpdate =

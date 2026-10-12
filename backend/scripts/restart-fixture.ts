@@ -25,6 +25,7 @@ import { testDatabase } from "./testDatabase.js";
 import { fingerprints } from "./backup.js";
 import { DataGenerations } from "../src/db/dataGenerations.js";
 import { generationInput } from "./largeTenantFixtures.js";
+import { loadOperationalState } from "../src/services/operationalState.js";
 
 const receiptFile=process.argv[3];
 const scope={tenantId:"11111111-1111-4111-8111-111111111111",principalId:"phase01-fixture-principal"};
@@ -179,6 +180,7 @@ if (process.argv[2] === "seed") {
   const runtime=new pg.Pool({...databaseSettings(),database:receipt.database,user:"agentcontrol_app",password:secretValue("APP_PGPASSWORD") ?? "isolated-fixture-password-never-production-01"});
   const repository=new JobRepository(runtime);
   try {
+    await loadOperationalState(runtime);
     await operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",[receipt.job]);
     await repository.recover(scope.tenantId,true);
     assert.equal((await repository.get(receipt.job,scope))?.status,"partial");

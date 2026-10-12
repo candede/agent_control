@@ -1,17 +1,19 @@
 import type pg from "pg";
 import { InventoryGenerations, inventoryAsOf, type InventoryIntent } from "../db/inventoryGenerations.js";
 import type { BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
-import { dataLimitError, dataLimits, encodeBatch } from "../db/dataBounds.js";
-import { GraphPackagesClient, packageInventoryReadPolicy, type PackageReadOptions } from "./graphPackages.js";
+import { dataLimitError, encodeBatch } from "../db/dataBounds.js";
+import { GraphPackagesClient, graphResponseDiagnostics, packageInventoryReadPolicy, packageReadTimeoutMs, type PackageReadOptions } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient, type ResourceQueryOptions } from "./powerPlatformResourceQuery.js";
-import { packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryFact, type InventoryRecord } from "./inventoryRecordProjection.js";
+import { inventoryQuarantineIdentity, packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryFact, type InventoryRecord } from "./inventoryRecordProjection.js";
+import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { PowerPlatformResource, PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
-import { normalizeNativeIdentity } from "./inventoryIdentity.js";
-import { projectPackageDetails, packageDetailRevision } from "./packageDetailProjection.js";
+import { projectPackageDetails, packageDetailRevision, packageDetailAccessScopesMatch } from "./packageDetailProjection.js";
 import { projectPackageControl, type SavedPackageControl } from "./packageControlProjection.js";
 import { readPackageControls } from "../db/packageControls.js";
-import { AppError } from "../errors.js";
+import { AppError, isTimeoutError } from "../errors.js";
+import { compareInventoryTimestamps } from "./inventoryTimestamp.js";
+import { createRefreshExecutionSignal } from "./refreshExecution.js";
 
 export async function storedInventoryRecord(client: pg.PoolClient, generationId: string, identity: string, purpose: "complete" | "canonical" = "complete") {
   return (await storedInventoryRecords(client, [{ generationId, identity }], purpose))[0];
@@ -90,14 +92,42 @@ function carryPackageCollections(record: InventoryRecord, previous: { generation
   record.facts = record.facts.filter(fact => fact.kind === "collection" ? !collections.includes(fact.value) : !kinds.includes(fact.kind));
 }
 
+let sharedPackageGraph: GraphPackagesClient | undefined;
+
 export class StreamedInventory {
   readonly stages: InventoryGenerations;
-  constructor(database: pg.Pool, readonly graph = new GraphPackagesClient(fetch, packageInventoryReadPolicy),
+  constructor(database: pg.Pool, readonly graph = (sharedPackageGraph ??= new GraphPackagesClient(fetch, packageInventoryReadPolicy)),
     readonly powerPlatform = new PowerPlatformResourceQueryClient()) { this.stages = new InventoryGenerations(database); }
+
+  private packageReadOptions(lease: GenerationLease, options: PackageReadOptions, signal: AbortSignal, deadlineAt: Date): PackageReadOptions {
+    return { ...options, signal, executionDeadlineAt: Math.min(options.executionDeadlineAt ?? Infinity, deadlineAt.getTime()), beforeDispatch: async () => {
+      signal.throwIfAborted();
+      options.assertCurrent?.();
+      await options.beforeDispatch?.();
+      signal.throwIfAborted();
+      options.assertCurrent?.();
+      await this.stages.generations.connections.run(client => this.stages.fence(client, lease));
+      signal.throwIfAborted();
+      options.assertCurrent?.();
+    } };
+  }
+
+  private async exactPackageObservation(lease: GenerationLease, token: string, id: string, channel: "exact" | "detail",
+    options: PackageReadOptions) {
+    let value: CopilotPackageDetail;
+    try { value = await this.graph.getPackageDetails(token, id, options); }
+    catch (error) {
+      if (channel !== "exact" || graphResponseDiagnostics(error)?.status !== 404) throw error;
+      await this.exactMissing(lease, id);
+      return false;
+    }
+    await this.packageObservation(lease, value, channel);
+    return true;
+  }
 
   graphCatalog(input: BeginGeneration, token: string, options: Parameters<InventoryGenerations["execute"]>[3] & PackageReadOptions) {
     return this.stages.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async (lease, signal) => {
-      for await (const page of this.graph.catalogPages(token, { ...options, signal, visit: value => this.stages.visit(lease, value) })) {
+      for await (const page of this.graph.catalogPages(token, { ...this.packageReadOptions(lease, options, signal, input.deadlineAt), visit: value => this.stages.visit(lease, value) })) {
         for (let offset = 0; offset < page.records.length; offset += 100) {
           await this.packageObservations(lease, page.records.slice(offset, offset + 100), "catalog");
         }
@@ -111,7 +141,16 @@ export class StreamedInventory {
     const intent: InventoryIntent = { domain: "power_platform", mode: "baseline", channel: "catalog",
       environmentId: options.environmentId, resourceTypes: types, roleScope: options.roleScope };
     return this.stages.execute(input, intent, async (lease, signal) => {
-      for await (const page of this.powerPlatform.pages(token, types, { ...options, signal, expectedTenantId: input.scope.tenantId,
+      for await (const page of this.powerPlatform.pages(token, types, { ...options, signal,
+        executionDeadlineAt: Math.min(options.executionDeadlineAt ?? Infinity, input.deadlineAt.getTime()),
+        beforeRequest: async () => {
+          signal.throwIfAborted();
+          options.assertCurrent?.();
+          await options.beforeRequest?.();
+          await this.stages.generations.connections.run(client => this.stages.fence(client, lease));
+          signal.throwIfAborted();
+          options.assertCurrent?.();
+        }, expectedTenantId: input.scope.tenantId,
         visit: value => this.stages.visit(lease, value) })) {
         await this.stages.appendBounded(lease, page.records.map(powerPlatformInventoryRecord));
         await this.stages.acceptPage(lease, page, page.records.length);
@@ -125,8 +164,7 @@ export class StreamedInventory {
     return this.stages.execute(input, { domain: "packages", mode: "delta", channel: "detail", targets: ids }, async (lease, signal) => {
       // Independent paced job, deliberately not catalog fan-out. Each await backpressures the next exact read.
       for (const id of ids) {
-        const value = await this.graph.getPackageDetails(token, id, { ...options, signal });
-        await this.packageObservation(lease, value, "detail");
+        await this.exactPackageObservation(lease, token, id, "detail", this.packageReadOptions(lease, options, signal, input.deadlineAt));
       }
 
     }, options);
@@ -137,13 +175,7 @@ export class StreamedInventory {
     if (!ids.length || ids.length > 20 || new Set(ids).size !== ids.length) throw new Error("inventory_exact_targets");
     return this.stages.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: ids }, async (lease, signal) => {
       for (const id of ids) {
-        try {
-          const value = await this.graph.getPackageDetails(token, id, { ...options, signal });
-          await this.packageObservation(lease, value, "exact");
-        } catch (error) {
-          if (!(error instanceof AppError) || error.status !== 404) throw error;
-          await this.exactMissing(lease, id);
-        }
+        await this.exactPackageObservation(lease, token, id, "exact", this.packageReadOptions(lease, options, signal, input.deadlineAt));
 
       }
     }, options);
@@ -170,17 +202,43 @@ export class StreamedInventory {
         encodeBatch(targets);
         for (const target of targets) {
           signal.throwIfAborted();
-          try {
-            const value = await this.graph.getPackageDetails(token, target.target_id, { ...options, signal });
-            await this.packageObservation(lease, value, detailOnly ? "detail" : "exact");
-            options.diagnostics?.completeDetail(true);
-          } catch (error) {
-            if (detailOnly || !(error instanceof AppError) || error.status !== 404) throw error;
-            await this.exactMissing(lease, target.target_id);
-            options.diagnostics?.completeDetail(false);
-          }
+          const found = await this.exactPackageObservation(lease, token, target.target_id, detailOnly ? "detail" : "exact",
+            this.packageReadOptions(lease, options, signal, input.deadlineAt));
+          options.diagnostics?.completeDetail(found);
           observedCount++;
-          await options.onProgress?.({ pages: 0, observedCount });
+          if (options.onProgress) {
+            const deadlineAt = Math.min(options.executionDeadlineAt ?? Infinity, input.deadlineAt.getTime());
+            const durationMs = Math.max(0, Math.min(packageReadTimeoutMs, deadlineAt - Date.now()));
+            const phaseDeadline = performance.now() + durationMs;
+            const execution = createRefreshExecutionSignal(signal, durationMs);
+            const assertProgress = () => {
+              execution.signal.throwIfAborted();
+              options.assertCurrent?.();
+              if (Date.now() >= deadlineAt || performance.now() >= phaseDeadline) {
+                throw new DOMException("Package refresh progress deadline expired.", "TimeoutError");
+              }
+            };
+            let interrupt!: () => void;
+            try {
+              assertProgress();
+              const interrupted = new Promise<never>((_, reject) => {
+                interrupt = () => reject(execution.signal.reason);
+                execution.signal.addEventListener("abort", interrupt, { once: true });
+              });
+              await Promise.race([options.onProgress({ pages: 0, observedCount }), interrupted]);
+              assertProgress();
+            } catch (error) {
+              let failure = error;
+              try { assertProgress(); } catch (currentError) { failure = currentError; }
+              if (isTimeoutError(failure) && !signal.aborted && Date.now() < deadlineAt) {
+                throw new AppError(504, "provider_timeout", "Package refresh progress did not finish within 30 seconds.");
+              }
+              throw failure;
+            } finally {
+              if (interrupt) execution.signal.removeEventListener("abort", interrupt);
+              execution.dispose();
+            }
+          }
         }
         ordinal = targets.at(-1)!.ordinal;
       }
@@ -222,10 +280,10 @@ export class StreamedInventory {
           residual: { tenantId: lease.tenantId }, facts: [], deleted: true };
         const previous = (await storedInventoryRecord(client, member.generation_id, target.identity, "canonical"))!;
         const resource = previous.value as PowerPlatformResource;
-        const botIds = resource.identifiers.filter(value => value.kind === "cds_bot_id").map(value => value.value);
-        const sameTarget = resource.environmentId?.toLowerCase() === target.environmentId.toLowerCase()
-          && (botIds.length === 1 ? botIds[0].toLowerCase() === target.botId.toLowerCase()
-            : botIds.length === 0 && normalizeNativeIdentity(resource.nativeId) === target.botId.toLowerCase());
+        const identity = inventoryQuarantineIdentity(resource);
+        const sameTarget = resource.nativeId === target.nativeId && identity
+          && normalizeEnvironmentIdentity(identity.environmentId) === normalizeEnvironmentIdentity(target.environmentId)
+          && normalizeNativeIdentity(identity.botId) === normalizeNativeIdentity(target.botId);
         if (sameTarget && previous.read_started_at <= input.observedAt) resource.details = { ...resource.details, isQuarantined: target.state,
           quarantinedAt: target.state ? target.updatedAt : undefined };
         return { ...carryControlChildren(powerPlatformInventoryRecord(resource), previous), catalog_generation: previous.catalog_generation,
@@ -280,19 +338,22 @@ export class StreamedInventory {
           catalogRevision: packageDetailRevision(catalog) }, false);
         if (result.detailFreshness?.state === "invalidated") carriedCollections = ["categories", "allowedUsersAndGroups", "acquireUsersAndGroups"];
         else {
-          if (catalog.availableTo !== value.availableTo) carriedCollections.push("allowedUsersAndGroups");
-          if (catalog.deployedTo !== value.deployedTo) carriedCollections.push("acquireUsersAndGroups");
+          if (!packageDetailAccessScopesMatch(catalog.availableTo, value.availableTo)) carriedCollections.push("allowedUsersAndGroups");
+          if (!packageDetailAccessScopesMatch(catalog.deployedTo, value.deployedTo)) carriedCollections.push("acquireUsersAndGroups");
         }
       } else if (channel === "catalog") {
         const detail = previous?.value as CopilotPackageDetail | undefined;
-        result = projectPackageDetails(value, detail?.detailFreshness?.observedAt && detail.detailFreshness.expiresAt
+        result = projectPackageDetails({ ...value, ...(detail?.identityRevalidationRequired
+          ? { identityRevalidationRequired: true as const } : {}) }, detail?.detailFreshness?.observedAt && detail.detailFreshness.expiresAt
           ? { package: detail, observedAt: detail.detailFreshness.observedAt, expiresAt: detail.detailFreshness.expiresAt,
             catalogRevision: packageDetailRevision(detail) } : undefined, false, Date.now(), generation.observed_at.getTime());
         if (detail && ["fresh", "stale"].includes(result.detailFreshness?.state ?? "")) {
           carriedCollections = ["categories", "elementDetails"];
-          const newerCatalog = generation.observed_at.getTime() > Date.parse(detail.detailFreshness!.observedAt!);
-          if (value.availableTo === detail.availableTo && !(newerCatalog && value.allowedUsersAndGroups !== undefined)) carriedCollections.push("allowedUsersAndGroups");
-          if (value.deployedTo === detail.deployedTo && !(newerCatalog && value.acquireUsersAndGroups !== undefined)) carriedCollections.push("acquireUsersAndGroups");
+          const newerCatalog = compareInventoryTimestamps(generation.observed_at, detail.detailFreshness!.observedAt!) > 0;
+          if (packageDetailAccessScopesMatch(value.availableTo, detail.availableTo)
+            && !(newerCatalog && value.allowedUsersAndGroups !== undefined)) carriedCollections.push("allowedUsersAndGroups");
+          if (packageDetailAccessScopesMatch(value.deployedTo, detail.deployedTo)
+            && !(newerCatalog && value.acquireUsersAndGroups !== undefined)) carriedCollections.push("acquireUsersAndGroups");
         }
       } else if (channel === "exact") {
         result = projectPackageDetails(value, { package: { ...value, identityDetailsCollected: true },
@@ -312,7 +373,8 @@ export class StreamedInventory {
           .filter(kind => result[kind as "allowedUsersAndGroups" | "acquireUsersAndGroups"] !== undefined));
       } else if (previous) carryPackageCollections(record, previous, carriedCollections);
       return { ...record, catalog_generation: channel === "detail" || channel === "control" ? previous?.catalog_generation ?? null : lease.id,
-        detail_generation: channel === "catalog" || channel === "control" ? previous?.detail_generation ?? null : lease.id,
+        detail_generation: result.detailFreshness?.state === "missing" ? null
+          : channel === "catalog" || channel === "control" ? previous?.detail_generation ?? null : lease.id,
         control_generation: channel === "control" ? lease.id : previous?.control_generation ?? null,
         ...(channel === "detail" || channel === "control" ? { read_started_at: readAt.toISOString() } : {}),
         ...(channel === "control" && previous ? { observed_at: previous.observed_at.toISOString(), expires_at: previous.expires_at.toISOString() } : {}) };

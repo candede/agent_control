@@ -92,6 +92,193 @@ function studioRecord() {
 }
 
 describe("Graph Audit Search selected v1.0 contract", () => {
+  it.each(["get", "create", "list"] as const)("rejects overwritten %s query evidence", async operation => {
+    const text = JSON.stringify(query()).replace('"status":"running"', '"status":"failed","st\\u0061tus":"running"');
+    const fetcher = vi.fn(async () => new Response(operation === "list" ? `{"value":[${text}]}` : text,
+      { status: operation === "create" ? 201 : 200 }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = operation === "create" ? client.createQuery("token", marker, filters)
+      : operation === "list" ? client.listQueries("token") : client.getQuery("token", "provider-1");
+    await expect(pending).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    (text: string) => `{"value":[${text}],"value":[]}`,
+    (text: string) => `{"value":[${text.replace('"organizationId":', '"organizationId":"foreign","organizationId":')}]}`,
+    (text: string) => `{"value":[${text.replace('"OrganizationId":', '"OrganizationId":"foreign","OrganizationId":')}]}`,
+    (text: string) => `{"value":[${text.replace('"isPrompt":true', '"isPrompt":false,"isPrompt":true')}]}`,
+  ])("rejects overwritten records, tenant, and message evidence", async body => {
+    const fetcher = vi.fn(async () => new Response(body(JSON.stringify(record()))));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("keeps query-only and unrelated authoring properties outside audit-record duplicate contexts", async () => {
+    const text = JSON.stringify(record()).slice(0, -1) + ',"status":"first","status":"last",'
+      + '"__proto__":{"ID":"first","ID":"last"},"unknown":{"id":"first","id":"last"}}';
+    const client = new GraphAuditSearchClient({ fetch: async () => new Response(`{"value":[${text}]}`), wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({ complete: true, storedRowCount: 1 });
+  });
+
+  it.each(["get", "create"] as const)("bounds a non-cooperative %s fetch and disposes its late response", async operation => {
+    const pendingFetch = Promise.withResolvers<Response>();
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn(() => pendingFetch.promise);
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 5 });
+    const pending = operation === "create" ? client.createQuery("token", marker, filters) : client.getQuery("token", "provider-1");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await expect(Promise.race([pending, new Promise(resolve => { timer = setTimeout(() => resolve("unbounded fetch"), 200); })]))
+        .rejects.toMatchObject({ code: operation === "create" ? "audit_create_inconclusive" : "provider_error" });
+      expect(fetcher).toHaveBeenCalledOnce();
+      pendingFetch.resolve(new Response(new ReadableStream({ cancel }), { status: operation === "create" ? 201 : 200 }));
+      await setImmediate();
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { clearTimeout(timer); pendingFetch.resolve(response(query())); await pending.catch(() => undefined); }
+  });
+
+  it.each(["resolve", "reject"] as const)("preserves caller cancellation and observes a late fetch %s", async outcome => {
+    const deferred = Promise.withResolvers<Response>();
+    const controller = new AbortController();
+    const reason = new AppError(401, "authorization_expired", "Signed-in authorization changed.");
+    const cancel = vi.fn();
+    const fetcher = vi.fn(() => deferred.promise);
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = client.getQuery("token", "provider-1", { signal: controller.signal });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    if (outcome === "resolve") deferred.resolve(new Response(new ReadableStream({ cancel })));
+    else deferred.reject(new TypeError("late private transport failure"));
+    await setImmediate();
+    expect(cancel).toHaveBeenCalledTimes(outcome === "resolve" ? 1 : 0);
+  });
+
+  it("disposes a response when cancellation follows fetch fulfillment before response delivery", async () => {
+    const deferred = Promise.withResolvers<Response>();
+    const controller = new AbortController();
+    const reason = new AppError(401, "authorization_expired", "Signed-in authorization changed.");
+    const cancel = vi.fn();
+    const fetcher = vi.fn(() => deferred.promise);
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = client.getQuery("token", "provider-1", { signal: controller.signal });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    deferred.resolve(new Response(new ReadableStream({ cancel }, { highWaterMark: 0 })));
+    queueMicrotask(() => controller.abort(reason));
+    await expect(pending).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["get", "create", "records"] as const)("disposes a %s body when cancellation precedes body consumption", async operation => {
+    const controller = new AbortController();
+    const reason = new AppError(401, "authorization_expired", "Signed-in authorization changed.");
+    const cancel = vi.fn();
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }, { highWaterMark: 0 }),
+      { status: operation === "create" ? 201 : 200 }));
+    let returned = false;
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const options = {
+      signal: controller.signal,
+      onResponse: async () => { returned = true; },
+      assertCurrent: () => {
+        if (returned) queueMicrotask(() => queueMicrotask(() => controller.abort(reason)));
+      },
+    };
+    const pending = operation === "create" ? client.createQuery("token", marker, filters, options)
+      : operation === "records" ? client.listRecords("token", "provider-1", tenantId, options)
+        : client.getQuery("token", "provider-1", options);
+    await expect(pending).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a non-cooperative retry wait and retains the received throttle diagnostics", async () => {
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 30_000 ? deadline.signal : timeout(ms));
+    const fetcher = vi.fn(async () => response({ secret: "must-not-leak" }, 429, { "request-id": "request-1", "retry-after": "2" }));
+    const wait = vi.fn(async () => { deadline.abort(new DOMException("logical deadline", "TimeoutError")); await new Promise(() => undefined); });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait, random: () => 0 });
+    try {
+      await expect(client.getQuery("token", "provider-1")).rejects.toMatchObject({
+        status: 429, code: "provider_throttled", retryAfterSeconds: 2,
+        details: { httpStatus: 429, correlationId: "request-1", retryAfterMs: 2000 },
+      });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(wait).toHaveBeenCalledOnce();
+    } finally { spy.mockRestore(); }
+  });
+
+  it("checks initiating authority after admission and before physical dispatch", async () => {
+    let current = true;
+    const failure = new AppError(401, "authorization_expired", "Authority changed after admission.");
+    const fetcher = vi.fn(async () => response(query()));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", "provider-1", {
+      beforeRequest: async () => { queueMicrotask(() => { current = false; }); },
+      assertCurrent: () => { if (!current) throw failure; },
+    })).rejects.toBe(failure);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("checks authority on response-body rejection rather than publishing prior-page partial evidence", async () => {
+    let current = true;
+    const failure = new AppError(401, "authorization_expired", "Authority changed during the body.");
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ value: [record()], "@odata.nextLink": "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next" }))
+      .mockImplementationOnce(async () => new Response(new ReadableStream({
+        pull(stream) { current = false; stream.error(new TypeError("private body failure")); },
+      }, { highWaterMark: 0 })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId, {
+      assertCurrent: () => { if (!current) throw failure; },
+    })).rejects.toBe(failure);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([404, 501])("preserves status %s and safe headers without retrying or exposing its body", async status => {
+    const fetcher = vi.fn(async () => response({ error: { message: "must-not-leak" } }, status,
+      { "request-id": "request-1", "retry-after": "9999999999999999999999999999999999" }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const failure = await client.getQuery("token", "provider-1").catch(error => error);
+    expect(failure).toMatchObject({ status, code: status === 404 ? "provider_not_found" : "provider_error",
+      details: { httpStatus: status, correlationId: "request-1", retryAfterMs: Number.MAX_SAFE_INTEGER } });
+    expect(JSON.stringify(failure)).not.toContain("must-not-leak");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["-1", "1.5", "tomorrow", "Wed, 30 Feb 2026 12:00:00 GMT"])("does not interpret invalid Retry-After %s as an immediate retry", async retryAfter => {
+    const wait = vi.fn(async () => undefined);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(response({}, 429, { "retry-after": retryAfter }))
+      .mockResolvedValueOnce(response(query()));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait, random: () => 0 });
+    await client.getQuery("token", "provider-1");
+    expect(wait).toHaveBeenCalledWith(250, undefined);
+  });
+
+  it.each(["?$skiptoken=next&$filter=changed", "?$skiptoken=next&$skiptoken=other", "?$skiptoken=", "?$skiptoken=%00",
+    "?$skiptoken=next&$skip=0", "?%24skip=0&%24skiptoken=next&%24top=10",
+    "?$skiptoken=next&$top=5001", "?$select=id", "\n?$skiptoken=next"])("rejects an unsafe continuation %s before accepting a bounded result", async suffix => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries";
+    for (const records of [false, true]) {
+      const url = records ? `${base}/provider-1/records` : base;
+      const fetcher = vi.fn(async () => response({ value: [], "@odata.nextLink": `${url}${suffix}` }));
+      const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+      await expect(records ? client.listRecords("token", "provider-1", tenantId) : client.listQueries("token", { maximumPages: 1 }))
+        .rejects.toMatchObject({ code: "invalid_provider_link" });
+      expect(fetcher).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each([
+    record({ id: "wrapper\t1" }), record({ userId: "user\u007f1" }), record({ administrativeUnits: ["unit\n1"] }),
+    recordWithDynamicProperties({ BotId: "bot\u0085id" }), record({ id: "x".repeat(513) }),
+  ])("rejects invalid exact metadata rather than saving a truncated or control-bearing identity", async invalidRecord => {
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [invalidRecord] })), wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
   it("keeps saved Studio bot/environment metadata separate from prefixed runtime IDs and organization/object identifiers", async () => {
     const explicit = studioRecord();
     const missing = studioRecord();
@@ -133,6 +320,38 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     await expect(listClient.listQueries("token")).rejects.toMatchObject({ code: "provider_error" });
     const recordsClient = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [] }, 201)) as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(recordsClient.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_error" });
+  });
+
+  it.each([".", "..", "provider\u0001id", "provider\u0085id"])("rejects unsafe query identity %j before get or records dispatch", async id => {
+    const fetcher = vi.fn(async () => response(query()));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", id)).rejects.toMatchObject({ code: "invalid_provider_query_id" });
+    await expect(client.listRecords("token", id, tenantId)).rejects.toMatchObject({ code: "invalid_provider_query_id" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(["create", "get", "list"] as const)("classifies unsafe %s provider query IDs as provider schema failures", async operation => {
+    for (const id of [".", "..", "provider/child", "provider\u0085id"]) {
+      const value = { ...query(), id };
+      const fetcher = vi.fn(async () => response(operation === "list" ? { value: [value] } : value, operation === "create" ? 201 : 200));
+      const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+      await expect(operation === "create" ? client.createQuery("token", marker, filters)
+        : operation === "get" ? client.getQuery("token", "provider-1") : client.listQueries("token"))
+        .rejects.toMatchObject({ status: 502, code: "provider_schema" });
+      expect(fetcher).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("preserves opaque query IDs exactly through parsing and path encoding", async () => {
+    const id = "Provider%2F+.:MiXeD";
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ ...query(), id }))
+      .mockResolvedValueOnce(response({ value: [] }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", id)).resolves.toMatchObject({ id });
+    await expect(client.listRecords("token", id, tenantId)).resolves.toMatchObject({ complete: true });
+    const url = `https://graph.microsoft.com/v1.0/security/auditLog/queries/${encodeURIComponent(id)}`;
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([url, `${url}/records`]);
   });
 
   it("never retries an ambiguous create", async () => {
@@ -400,9 +619,9 @@ describe("Graph Audit Search selected v1.0 contract", () => {
   it("applies the attempt deadline while consuming a stalled response body", async () => {
     const cancel = vi.fn(async () => undefined);
     const body = new ReadableStream({ pull: () => new Promise(() => undefined), cancel });
-    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => new Response(body, { status: 200 })) as typeof fetch,
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => new Response(body, { status: 200, headers: { "request-id": "body-request-1" } })) as typeof fetch,
       wait: vi.fn(), random: () => 0, requestTimeoutMs: 5 });
-    await expect(client.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_error" });
+    await expect(client.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_error", details: { httpStatus: 200, correlationId: "body-request-1" } });
     expect(cancel).toHaveBeenCalledOnce();
   });
 
@@ -553,6 +772,39 @@ describe("Graph Audit Search selected v1.0 contract", () => {
       complete: !more, byteCount: 8_000_000, pageCount: 4, partialReason: more ? "audit_byte_limit" : null,
     });
     expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ["invalid", "invalid_provider_link"],
+    ["repeated", "provider_schema"],
+  ])("validates a %s continuation on a page that exceeds the aggregate byte limit", async (kind, code) => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records";
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      const nextLink = page < 5 ? `${base}?$skiptoken=${page}`
+        : kind === "repeated" ? `${base}?$skiptoken=4` : `${base}?$skiptoken=next&$filter=changed`;
+      return new Response(JSON.stringify({ value: [], "@odata.nextLink": nextLink }).padEnd(page < 5 ? 1_600_000 : 2_000_000, " "));
+    });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
+  it("preserves only prior pages when a validated page exceeds the aggregate byte limit", async () => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records";
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      return new Response(JSON.stringify({ value: [record({ id: `wrapper-${page}` })],
+        "@odata.nextLink": `${base}?$skiptoken=${page}` }).padEnd(page < 5 ? 1_600_000 : 2_000_000, " "));
+    });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({
+      complete: false, pageCount: 4, providerRowCount: 4, storedRowCount: 1, byteCount: 8_400_000,
+      nextLink: `${base}?$skiptoken=4`, partialReason: "audit_byte_limit",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(5);
   });
 
   it.each(["beforeRequest", "onResponse"] as const)("does not publish partial rows after a local %s failure", async hook => {
@@ -741,6 +993,39 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("detects equivalent repeated continuations despite query encoding or origin casing", async () => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records";
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ value: [], "@odata.nextLink": `${base}?$skiptoken=next&$top=10` }))
+      .mockResolvedValueOnce(response({ value: [], "@odata.nextLink": "https://GRAPH.MICROSOFT.COM:443/v1.0/security/auditLog/queries/provider-1/records?%24top=10&%24skiptoken=next" }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["queries", "records"] as const)("detects equivalent numeric %s continuations at the page limit", async kind => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries";
+    const path = kind === "queries" ? base : `${base}/provider-1/records`;
+    const maximumPages = kind === "queries" ? 2 : 20;
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      const nextLink = page < maximumPages ? `${path}?$skip=${page}&$top=10`
+        : `${path}?%24top=0010&%24skip=0${maximumPages - 1}`;
+      return response({ value: [], "@odata.nextLink": nextLink });
+    });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(kind === "queries" ? client.listQueries("token", { maximumPages }) : client.listRecords("token", "provider-1", tenantId))
+      .rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledTimes(maximumPages);
+  });
+
+  it("rejects a provider query that declares an unrelated resource type", async () => {
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ ...query(), "@odata.type": "#microsoft.graph.directoryObject" })),
+      wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
   it.each([
     ["", "provider_schema"],
     ["not-a-url", "invalid_provider_link"],
@@ -770,6 +1055,15 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("rejects a selector-less restart link after a resumed records page", async () => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records";
+    const fetcher = vi.fn(async () => response({ value: [], "@odata.nextLink": base }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId, { startUrl: `${base}?$skiptoken=resume` }))
+      .rejects.toMatchObject({ code: "invalid_provider_link" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("enforces recent UTC structured filters and blocks injected fields", () => {
     expect(validatePurviewAuditFilters(filters, { now })).toEqual(filters);
     expect(() => validatePurviewAuditFilters({ ...filters, operations: ["BotDelete"] }, { now })).toThrow(/operations/);
@@ -779,5 +1073,14 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(() => validatePurviewAuditFilters({ ...filters, startDateTime: "2026-02-30T11:00:00.000Z" }, { now })).toThrow(/exact UTC timestamp/);
     expect(() => validatePurviewAuditFilters({ ...filters, ipAddresses: ["1.2.3.4' or true"] }, { now })).toThrow(/ipAddresses/);
     expect(() => validatePurviewAuditFilters({ ...filters, objectIds: [7] }, { now })).toThrow(/objectIds/);
+  });
+
+  it("uses the same exact 320-character UPN boundary as user-scoped saved history", () => {
+    const userPrincipalName = `${"a".repeat(304)}@example.invalid`;
+    const selected = validatePurviewAuditFilters({ ...filters, userPrincipalNames: [userPrincipalName] }, { now });
+    expect(createProviderQueryBody(marker, selected).userPrincipalNameFilters).toEqual([userPrincipalName]);
+    for (const invalid of [`a${userPrincipalName}`, "user @example.invalid", "user@example.invalid\t"]) {
+      expect(() => validatePurviewAuditFilters({ ...filters, userPrincipalNames: [invalid] }, { now })).toThrow(/userPrincipalNames/);
+    }
   });
 });

@@ -73,6 +73,13 @@ export const workbenchActions: WorkbenchActionDefinition[] = [
   { id: "defender.export", label: "Export allowlisted Defender results", roles: ["AgentControl.Viewer"], capabilityId: null, nativeTarget: "provider_job_id", preview: "none", confirmation: "none", recovery: "none", method: "GET", route: "/api/hunting/jobs/:id/export.csv", source: "defender" },
 ];
 
+for (const definition of [...workbenchViews, ...workbenchActions]) {
+  Object.freeze(definition.roles);
+  Object.freeze(definition);
+}
+Object.freeze(workbenchViews);
+Object.freeze(workbenchActions);
+
 export function getWorkbenchMetadata(): WorkbenchMetadata {
   return {
     views: workbenchViews.map(view => ({ ...view, roles: [...view.roles] })),

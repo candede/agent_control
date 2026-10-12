@@ -11,6 +11,38 @@ beforeEach(() => { vi.mocked(getInventoryFacets).mockReset(); });
 const props = { selectionId: "selected-fixture", field: "availableTo" as const, label: "Assigned access", allLabel: "Any assignment" };
 
 describe("bounded selected inventory facets", () => {
+  it.each([
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "default-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  ])("uses the saved raw option for equivalent GUID environment identities (%s)", async environmentId => {
+    vi.mocked(getInventoryFacets).mockResolvedValue({ value: [{ value: environmentId, label: "Finance" }], total: 1, nextCursor: null });
+    const onOptionLabel = vi.fn(), onChange = vi.fn();
+    render(<InventoryFacetSelect {...props} field="environmentId" value={environmentId.toUpperCase()}
+      onChange={onChange} onOptionLabel={onOptionLabel} />);
+    expect(await screen.findByRole("option", { name: `Finance (${environmentId})` })).toBeVisible();
+    expect(screen.getByRole("combobox")).toHaveValue(encodeInventoryFacet(environmentId));
+    await waitFor(() => expect(onOptionLabel).toHaveBeenCalledWith(environmentId, "Finance"));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { selected: "Opaque-A", saved: "opaque-a" },
+    { selected: "Équipe-A", saved: "équipe-a" },
+  ])("keeps case-colliding opaque environment options distinct ($selected)", async ({ selected, saved }) => {
+    vi.mocked(getInventoryFacets).mockResolvedValue({ value: [{ value: saved, label: "Finance" }], total: 1, nextCursor: null });
+    const onOptionLabel = vi.fn(), onChange = vi.fn();
+    render(<InventoryFacetSelect {...props} field="environmentId" value={selected}
+      onChange={onChange} onOptionLabel={onOptionLabel} />);
+    expect(await screen.findByRole("option", { name: `Finance (${saved})` })).toBeVisible();
+    const select = screen.getByRole("combobox");
+    expect(select).toHaveValue(encodeInventoryFacet(selected));
+    expect(within(select).getByRole("option", { name: selected })).toBeVisible();
+    expect(onOptionLabel).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
+    await userEvent.setup().selectOptions(select, encodeInventoryFacet(saved));
+    expect(onChange).toHaveBeenCalledWith(saved);
+  });
+
   it("keeps facet search across same-owner selection changes but clears it for a different principal", async () => {
     vi.mocked(getInventoryFacets).mockResolvedValue({ value: [], total: 5001, nextCursor: "next" });
     const { rerender } = render(<InventoryFacetSelect {...props} scopeKey="principal-a" onChange={vi.fn()} />);

@@ -45,6 +45,7 @@ describe("native report-backed exact inventory usage", () => {
     const selected = await inventorySelectionFixture(fixture.runtime, scope);
     const savedUsage = new OfficialAgentUsage(reports, selected.queries);
     const before = (await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))[0];
+    if (!before.context.reportSetId) throw new Error("Expected a report set for reviewed removal.");
     const remove: CandidateAgentUsageMutation = { selectionId: before.context.selectionId, reportSetId: before.context.reportSetId,
       usageRevision: before.context.usageRevision, inventoryRevision: before.context.inventoryRevision, reportAgentId: "Report-A", confirmed: true };
     if (transition === "reconciliation") await fixture.operator.query(`UPDATE inventory_reconciliation SET status='catching_up'
@@ -196,6 +197,18 @@ describe("native report-backed exact inventory usage", () => {
     await mutate(scope, records[1].id, await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "Other" }));
     await expect(usage.users(selection.id, identity, records[0].id, { cursor: page.page.nextCursor! })).rejects.toMatchObject({ code: "invalid_cursor" });
   });
+
+  it.each([{ name: "Ｆｏｏ", search: "foo" }, { name: "J\u030c", search: "\u01f0" }])(
+    "matches normalized agent-user names without rewriting exact identities: $name", async ({ name, search }) => {
+      const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+      await publishUsageReports(fixture.runtime, scope, 10, (kind, text) => kind === "users"
+        ? text.replace("CaseUser,One,1,4", `CaseUser,${name},1,4`) : text);
+      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      const page = await usage.users(selection.id, identity, records[0].id, { search });
+      expect(page.value).toEqual([{ username: "CaseUser", displayName: name, responses: 4 }]);
+      expect(page.counts).toEqual({ total: 2, filtered: 1 });
+    },
+  );
 
   it("uses Agents response/activity authority rather than Users and bridge response totals", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
@@ -351,8 +364,7 @@ describe("strict native association contracts", () => {
       { source: "power_platform" as const, nativeId: text, environmentId: text }]) {
       const value = { ...input(), reportAgentId: text, target };
       expect(officialAgentUsageMutation(value)).toEqual(value);
-      expect(parseRecordId(unifiedAgentRecordId(target))).toEqual(target.source === "power_platform"
-        ? { ...target, environmentId: text.toLowerCase() } : target);
+      expect(parseRecordId(unifiedAgentRecordId(target))).toEqual(target);
     }
     expect(reportQuery("official_agents", { search: text }).search).toBe(text.normalize("NFKC").toLowerCase());
   });
@@ -365,7 +377,7 @@ describe("strict native association contracts", () => {
       expect(() => officialAgentUsageMutation({ ...input(), ...changes })).toThrow();
     }
     expect(() => reportQuery("official_agents", { search: text })).toThrow();
-    expect(() => parseRecordId(`graph:${text}`)).toThrow();
+    expect(() => parseRecordId(`graph_packages:${text}`)).toThrow();
   });
 
   it.each([null, [], {}, { confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { confirmed: undefined },

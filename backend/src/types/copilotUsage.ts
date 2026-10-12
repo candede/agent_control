@@ -2,6 +2,10 @@ export const copilotAppActivityStaleAfterDays = 3;
 export const copilotAppActivityPeriod = "D28";
 export const copilotAppActivityReportVersion = "v2";
 
+export function isGraphGuid(value: unknown): boolean {
+  return typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+}
+
 export function isCopilotAppActivityFresh(reportRefreshDate: string | null, now: Date): boolean {
   if (reportRefreshDate === null) return false;
   const endOfDay = Date.parse(`${reportRefreshDate}T23:59:59.999Z`);

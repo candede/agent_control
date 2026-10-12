@@ -51,7 +51,7 @@ describe("all artifact producer lifecycle contracts", () => {
     await expect(engine.create(identity, { ...input, ids: ["changed"] })).rejects.toMatchObject({ code: "export_idempotency_conflict" });
     await engine.cancel(ids[0], identity);
     await engine.cancel(ids[0], identity);
-    expect(events.map(event => event.status)).toEqual(["started", "failed"]);
+    expect(events.map(event => event.status)).toEqual(["started", "cancelled"]);
     expect(await engine.create(identity, input)).toBe(ids[0]);
     expect((await engine.status(ids[0], identity)).status).toBe("cancelled");
   });
@@ -78,6 +78,6 @@ describe("all artifact producer lifecycle contracts", () => {
     if (mode === "role-loss") await generations.revokePrincipal(identity.tenantId, identity.principalId);
     if (mode === "expiry") await fixture.operator.query("UPDATE data_exports SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [id]);
     await expect(iterator.next()).rejects.toThrow();
-    expect(events.filter(event => event.phase === "download").map(event => event.status)).toEqual(["started", "failed"]);
+    expect(events.filter(event => event.phase === "download").map(event => event.status)).toEqual(["started", mode === "disconnect" ? "cancelled" : "failed"]);
   });
 });

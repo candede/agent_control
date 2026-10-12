@@ -9,6 +9,7 @@ import { nativeInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { DataGenerations } from "./dataGenerations.js";
 import { UserSourcesRepository } from "./userSources.js";
 import { digest } from "./dataBounds.js";
+import { directoryRecord, generationInput } from "../../scripts/largeTenantFixtures.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET ??= "synthetic-exact-people-database-secret-32"; });
 
@@ -106,12 +107,27 @@ describe("agent people persistence", () => {
 
   it("extracts only exact user IDs from current scoped native agents, without syncing all directory users", async () => {
     const scope = newScope();
+    const graphGuid = "ABCDEF01-2345-6789-CDEF-0123456789AB";
     const root = await nativeInventoryFixture(fixture.runtime, scope, [{ nativeId: "agent", environmentId: "environment",
-      identifiers: [], createdBy: id.toUpperCase(), details: { ownerId: secondId, lastModifiedBy: "not-a-user-id" } }]);
-    expect(await repository.referencedIds(scope)).toEqual([id, secondId]);
+      identifiers: [], createdBy: id.toUpperCase(), details: { ownerId: secondId, lastModifiedBy: graphGuid } },
+    { nativeId: "invalid-person", environmentId: "environment", identifiers: [], createdBy: "not-a-user-id", details: {} }]);
+    expect(await repository.referencedIds(scope)).toEqual([id, graphGuid.toLowerCase(), secondId]);
     expect(await repository.referencedIds({ ...scope, principalId: "other" })).toEqual([]);
     await new DataGenerations(fixture.runtime).invalidate(root.scopeId, scope.tenantId);
     expect(await repository.referencedIds(scope)).toEqual([]);
+  });
+
+  it.each(["scope", "session"] as const)("does not exclude people using a directory generation after %s invalidation", async boundary => {
+    const scope = newScope(), generations = new DataGenerations(fixture.runtime);
+    const input = generationInput({ scope: { ...generationInput().scope, ...scope } });
+    const lease = await generations.begin(input);
+    await generations.append(lease, "directory", 0, [directoryRecord(id), directoryRecord(secondId)]);
+    await generations.validate(lease, { rows: 2, children: 0, batches: 1, pages: 0, wireRows: 0 });
+    await generations.publish(lease);
+    expect(await repository.directoryIds(scope, [id.toUpperCase()])).toEqual([id]);
+    if (boundary === "scope") await generations.invalidate(lease.scopeId, scope.tenantId);
+    else await generations.revokePrincipal(scope.tenantId, scope.principalId);
+    expect(await repository.directoryIds(scope, [id, secondId])).toEqual([]);
   });
 
   it("requires the current Users attempt for publication and rejects results after a scoped reset", async () => {

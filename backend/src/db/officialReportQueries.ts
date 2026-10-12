@@ -36,9 +36,10 @@ const unresolvedReports = `EXISTS(SELECT 1 FROM matches WHERE match_count<>1 OR 
       OR EXISTS(SELECT 1 FROM resolved WHERE identity_count>1)`;
 
 function relations(directory: string, reports: string, keyCounts = reportKeyCounts, unresolved: string | null = unresolvedReports, prefix = "") {
+  // Compatibility-folded report keys are not directory aliases.
   return `WITH ${prefix} directory AS MATERIALIZED (${directory}),
   reports AS MATERIALIZED (${reports}), report_users AS (
-    SELECT identity_key,username,
+    SELECT identity_key,username,lower(btrim(username) COLLATE "default") COLLATE "C" AS directory_identity_key,
       max(display_name) FILTER(WHERE kind='users') AS display_name,
       max(responses) FILTER(WHERE kind='users') AS responses,
       max(agents_used) FILTER(WHERE kind='users') AS agents_used,
@@ -56,11 +57,13 @@ function relations(directory: string, reports: string, keyCounts = reportKeyCoun
     ${keyCounts}
   ), ambiguous_directory_identities AS MATERIALIZED (
     SELECT DISTINCT d.identity FROM directory_keys d JOIN directory_key_counts k ON k.identity_key=d.identity_key
-    WHERE k.match_count>1 AND EXISTS(SELECT 1 FROM report_users r WHERE r.identity_key=d.identity_key)
+    WHERE k.match_count>1 AND EXISTS(SELECT 1 FROM report_users r
+      WHERE r.directory_identity_key=d.identity_key)
   ), matches AS (
     SELECT r.*,d.identity,COALESCE(d.match_count,0) AS match_count,
       EXISTS(SELECT 1 FROM ambiguous_directory_identities a WHERE a.identity=d.identity) AS alias_ambiguous
-    FROM report_users r FULL JOIN directory_key_counts d ON r.identity_key=d.identity_key WHERE COALESCE(r.username,'')<>''
+    FROM report_users r FULL JOIN directory_key_counts d
+      ON r.directory_identity_key=d.identity_key WHERE COALESCE(r.username,'')<>''
   ), resolved AS (
     SELECT *,count(*) OVER(PARTITION BY identity) AS identity_count FROM matches WHERE match_count=1 AND user_rows<=1 AND NOT alias_ambiguous
   ), ${unresolved === null ? "" : `combined AS MATERIALIZED (
@@ -97,8 +100,9 @@ export function selectedDirectoryReportRelationsSql(candidate: string, unresolve
       SELECT m.version_id,m.kind FROM official_usage_set_versions m
       WHERE m.tenant_id=$4 AND m.set_id=$5 AND m.kind IN ('users','userAgents')
     ) versions CROSS JOIN LATERAL (
-      SELECT f.* FROM official_usage_row_facts f WHERE f.tenant_id=$4 AND f.kind=versions.kind
-        AND f.identity_key=keys.identity_key
+      SELECT f.* FROM official_usage_row_facts f WHERE f.tenant_id=$4 AND f.kind=versions.kind AND f.kind IN ('users','userAgents')
+        AND left(lower(btrim(f.username) COLLATE "default"),128) COLLATE "C"=left(keys.identity_key,128) COLLATE "C"
+        AND lower(btrim(f.username) COLLATE "default") COLLATE "C"=keys.identity_key
         AND EXISTS(SELECT 1 FROM official_usage_version_rows r WHERE r.version_id=versions.version_id
           AND r.tenant_id=$4 AND r.kind=f.kind AND r.payload_hash=f.payload_hash OFFSET 0)
       OFFSET 0
@@ -119,10 +123,10 @@ export function selectedOfficialReportRelationsSql(kind: "users" | "agents" | "u
     const directory = `SELECT DISTINCT d.* FROM selected_report_keys k CROSS JOIN LATERAL (
       SELECT d.generation_id,d.identity,d.upn,d.upn_key,d.display_name,d.sort_key,d.company,d.department,
         d.account_enabled,d.user_type,d.employee_type,d.service_state,d.plan_count FROM directory_user_rows d
-      WHERE d.generation_id=$1 AND (d.identity=k.identity_key OR d.upn_key=k.identity_key) OFFSET 0
+      WHERE d.generation_id=$1 AND (d.identity=k.directory_identity_key OR d.upn_key=k.directory_identity_key) OFFSET 0
     ) d`;
     return selectedDirectoryReportRelationsSql(directory, null, prefix,
-      "UNION SELECT identity_key FROM selected_report_keys");
+      "UNION SELECT directory_identity_key FROM selected_report_keys");
   }
   const reports = kind === "userAgents"
     ? `SELECT ${reportColumns} FROM selected_report_keys k JOIN official_usage_row_facts f

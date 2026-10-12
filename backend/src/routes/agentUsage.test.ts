@@ -23,7 +23,7 @@ vi.hoisted(() => {
 vi.mock("../services/telemetry.js", async original => ({
   ...await original<typeof import("../services/telemetry.js")>(), operationalLog: vi.fn(),
 }));
-const recordId = "agent:33333333-3333-4333-8333-333333333333", selectionId = "55555555-5555-4555-8555-555555555555";
+const recordId = "agent:33333333-3333-4333-8333-333333333333", selectionId = "abcdefab-5555-4555-8555-abcdefabcdef";
 const base = `/api/agent-inventory/${encodeURIComponent(recordId)}`;
 const identity = { ...selectionIdentity, tenantId: config.tenants[0].tenantId!, principalId: "admin-reader" };
 const context: CandidateAgentUsageContext = { selectionId, reportSetId: null, inventoryRevision: "a".repeat(64), usageRevision: "b".repeat(64),
@@ -99,6 +99,22 @@ afterEach(() => {
 afterAll(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
 
 describe("native Admin reviewed usage routes", () => {
+  it.each(["usage", "usage-users", "usage-associations", "usage-history"])(
+    "normalizes case-equivalent inventory and selection UUIDs for %s", async path => {
+      expect(await request("GET", `/${path}?inventorySelectionId=${selectionId.toUpperCase()}&selectionId=${selectionId}`, undefined, { role: "viewer" }))
+        .toMatchObject({ status: 200 });
+      const calls = path === "usage" ? summaries : path === "usage-users" ? users : path === "usage-associations" ? associations : history;
+      expect(calls.mock.calls[0].slice(0, 2)).toEqual([selectionId, identity]);
+      expect(capture).not.toHaveBeenCalled();
+    },
+  );
+  it("normalizes an uppercase inventory pin before comparing a reviewed removal's selection", async () => {
+    const { target: _target, ...remove } = input();
+    expect(await request("DELETE", `/usage-associations?inventorySelectionId=${selectionId.toUpperCase()}`,
+      { ...remove, selectionId: selectionId.toUpperCase() })).toMatchObject({ status: 200 });
+    expect(mutate).toHaveBeenCalledWith(identity, recordId, remove, expect.anything());
+  });
+
   it.each(["usage", "usage-associations", "usage-users", "usage-history"])("uses the explicit inventory pin for Viewer %s without capturing another report", async path => {
     expect(await request("GET", `/${path}?inventorySelectionId=${selectionId}&selectionId=${selectionId}`, undefined, { role: "viewer" }))
       .toMatchObject({ status: 200 });
@@ -202,6 +218,22 @@ describe("native Admin reviewed usage routes", () => {
     expect(await request("DELETE", "/usage-associations", remove)).toEqual({ status: 200, body: context });
     expect(mutate).toHaveBeenLastCalledWith(identity, recordId, remove, expect.anything());
     expect(candidates).not.toHaveBeenCalled();
+  });
+  it("round-trips explicit null environments and rejects malformed wire shapes before mutation", async () => {
+    const value = { ...input(), target: { source: "power_platform" as const, nativeId: "Opaque/Native-ID", environmentId: null } };
+    expect(await request("POST", "/usage-associations", value)).toMatchObject({ status: 200 });
+    expect(mutate).toHaveBeenLastCalledWith(identity, recordId, value, expect.anything());
+    mutate.mockClear();
+    for (const method of ["POST", "DELETE"]) {
+      for (const body of [null, [], { ...input(), reportSetId: null },
+        { ...input(), target: null }, { ...input(), target: { ...value.target, packageId: "mixed" } },
+        { ...input(), target: JSON.parse('{"source":"graph_packages","packageId":"exact","__proto__":{}}') },
+        JSON.parse(JSON.stringify(input()).replace(/}$/, ',"__proto__":{}}'))]) {
+        expect(await request(method, "/usage-associations", body)).toMatchObject({ status: 400 });
+      }
+    }
+    expect(mutate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
   });
   it.each([{ confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { extra: true }, { reportSetId: "invalid" }, { selectionId: "invalid" },
     { inventoryRevision: "" }, { reportAgentId: "\u0000" }, { target: { source: "canonical", agentId: recordId } },

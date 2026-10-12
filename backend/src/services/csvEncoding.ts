@@ -7,7 +7,8 @@ export type CsvExportBudget = {
 };
 
 export function buildBoundedCsv(columns: readonly string[], rows: Iterable<Record<string, unknown>>, budget: CsvExportBudget) {
-  if (!columns.length || columns.some(column => !/^[A-Za-z][A-Za-z0-9]*$/.test(column))) {
+  if (!columns.length || columns.length > 128 || new Set(columns).size !== columns.length
+    || columns.some(column => !/^[A-Za-z][A-Za-z0-9]{0,127}$/.test(column))) {
     throw new AppError(500, "invalid_export_schema", "The export schema is invalid.");
   }
   const chunks = [Buffer.from(`\uFEFF${columns.join(",")}\r\n`, "utf8")];
@@ -37,8 +38,20 @@ export function buildBoundedCsv(columns: readonly string[], rows: Iterable<Recor
 }
 
 export function csvValue(value: unknown) {
-  const text = value === null || value === undefined ? "" : typeof value === "string" ? value : String(value);
-  if (!text) return "";
-  const safe = /^[=+\-@\t\r\u2212]/u.test(text) ? `'${text}` : text;
+  if (value === null || value === undefined) return "";
+  const text = typeof value === "object" ? exportJson(value) : String(value);
+  // Spreadsheet importers can ignore leading whitespace before interpreting formulas.
+  const safe = /^\s*[=+\-@\t\r\n\u2212]/u.test(text) ? `'${text}` : text;
   return `"${safe.replaceAll('"', '""')}"`;
+}
+
+export function exportJson(value: unknown): string {
+  const text = JSON.stringify(value, (_key, item: unknown) => {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      return Object.fromEntries(Object.keys(item).sort().map(key => [key, (item as Record<string, unknown>)[key]]));
+    }
+    return item;
+  });
+  if (text === undefined) throw new Error("invalid_export_value");
+  return text;
 }

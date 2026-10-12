@@ -3,7 +3,8 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import type { InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
-import { defenderHuntingTemplates, type DefenderHuntingFilters, type DefenderHuntingHistory, type DefenderHuntingJob,
+import { defenderHuntingTemplates, defenderHuntingFieldAvailable, isDefenderHuntingRequestId,
+  type DefenderHuntingFilters, type DefenderHuntingHistory, type DefenderHuntingJob,
   type DefenderHuntingAuthorityBinding, type DefenderHuntingQualificationBinding, type DefenderHuntingQualificationEvidence,
   type DefenderHuntingQueryResult, type DefenderHuntingResultScope, type DefenderHuntingRetainedScope,
   type DefenderHuntingRetainedScopeBinding,
@@ -75,7 +76,7 @@ export class DefenderHuntingRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
   async submit(scope: DefenderHuntingScope, input: { idempotencyKey: string; filters: DefenderHuntingFilters;
-    qualification?: DefenderHuntingQualificationBinding; retainedScope?: DefenderHuntingRetainedScopeBinding }) {
+    qualification?: DefenderHuntingQualificationBinding; retainedScope?: DefenderHuntingRetainedScopeBinding }, publicationFence?: () => void) {
     requireProviderAdmissions();
     validateScope(scope);
     if (typeof input.idempotencyKey !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)) {
@@ -86,6 +87,7 @@ export class DefenderHuntingRepository {
     const targetScopeHash = huntingTargetScopeHash(input.filters);
     const id = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`defender-hunting:${scope.tenantId}`]);
+      publicationFence?.();
       if (input.retainedScope) await requireRetainedScope(client, scope, input.filters, input.retainedScope);
       const existing = await client.query<{ id: string; request_hash: string }>(`SELECT id,request_hash FROM defender_hunting_jobs
         WHERE tenant_id=$1 AND result_scope_kind=$2 AND result_scope_id=$3 AND result_scope_configuration_revision IS NOT DISTINCT FROM $4
@@ -93,6 +95,7 @@ export class DefenderHuntingRepository {
         scope.resultScope.configurationRevision, scope.tokenMode, input.idempotencyKey]);
       if (existing.rows[0]) {
         if (existing.rows[0].request_hash !== hash) throw new AppError(409, "idempotency_mismatch", "This idempotency key belongs to different hunting filters or authority.");
+        publicationFence?.();
         return existing.rows[0].id;
       }
       const unfinished = await client.query<{ principal_count: number; tenant_count: number }>(`SELECT
@@ -110,8 +113,9 @@ export class DefenderHuntingRepository {
         scope.tokenMode, input.filters.templateId, input.idempotencyKey, hash, JSON.stringify(input.filters), randomUUID(), Boolean(qualification),
         qualification?.capabilityId ?? null, qualification?.contractRevision ?? null, qualification?.permissionRevision ?? null,
         qualification?.configurationRevision ?? null, qualification?.approvedBy ?? null, targetScopeHash, input.retainedScope?.id ?? null]);
+      publicationFence?.();
       return jobId;
-    });
+    }, undefined, publicationFence);
     return (await this.getJob(scope, id))!;
   }
 
@@ -166,16 +170,20 @@ export class DefenderHuntingRepository {
     return result.rows.map(projectRetainedScope);
   }
 
-  async revokeRetainedScope(scope: DefenderHuntingReadScope, id: string, tokenMode: DefenderHuntingTokenMode, revokedBy: string) {
+  async revokeRetainedScope(scope: DefenderHuntingReadScope, id: string, tokenMode: DefenderHuntingTokenMode, revokedBy: string,
+    mutationFence?: () => void) {
     if (!revokedBy || revokedBy.length > 256) throw new AppError(403, "scope_mismatch", "Hunting scope revocation requires an exact current actor.");
     const read = retainedScopeWhere(scope, "retained");
-    const result = await this.database.query<RetainedScopeRow>(`UPDATE defender_hunting_retained_scopes retained
+    return transaction(this.database, async client => {
+      mutationFence?.();
+      const result = await client.query<RetainedScopeRow>(`UPDATE defender_hunting_retained_scopes retained
       SET revoked_at=clock_timestamp(),revoked_by=$${read.values.length + 3}
       WHERE retained.id=$${read.values.length + 1} AND retained.token_mode=$${read.values.length + 2}
         AND ${read.sql} AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
       RETURNING retained.*`, [...read.values, id, tokenMode, revokedBy]);
-    if (!result.rows[0]) throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
-    return projectRetainedScope(result.rows[0]);
+      if (!result.rows[0]) throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
+      return projectRetainedScope(result.rows[0]);
+    }, undefined, mutationFence);
   }
 
   async getJob(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
@@ -231,33 +239,44 @@ export class DefenderHuntingRepository {
     return outcome.execution;
   }
 
-  async authorizeProviderRequest(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution) {
+  async authorizeProviderRequest(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, admissionFence?: () => void) {
     await transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution);
+      await requireExecutionRetainedScope(client, job);
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting reached its durable execution deadline.");
       if (job.provider_request_count >= 12) throw new AppError(409, "hunting_provider_request_limit", "Hunting reached its durable provider request limit.");
       await client.query(`UPDATE defender_hunting_jobs SET provider_request_count=provider_request_count+1,
         attempted_at=COALESCE(attempted_at,clock_timestamp()),updated_at=clock_timestamp()
         WHERE id=$1 AND execution_owner=$2 AND execution_version=$3`, [id, execution.owner, execution.version]);
-    });
+      await requireExecutionRetainedScope(client, job);
+      if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting admission exceeded its durable deadline.");
+    }, undefined, admissionFence);
   }
 
-  async recordProviderResponse(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, providerRequestId: string | null) {
-    if (providerRequestId !== null && (providerRequestId.length < 1 || providerRequestId.length > 256 || /[\r\n\0]/.test(providerRequestId))) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid request identifier.");
-    const result = await this.database.query(`UPDATE defender_hunting_jobs SET provider_request_id=COALESCE($10,provider_request_id),updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
-        AND authorization_principal_id=$6 AND token_mode=$7 AND execution_owner=$8 AND execution_version=$9
-        AND status='running' AND NOT cancel_requested RETURNING id`,
-    [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision,
-      scope.authorizationPrincipalId, scope.tokenMode, execution.owner, execution.version, providerRequestId]);
-    if (result.rowCount !== 1) throw executionLost();
+  async recordProviderResponse(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, providerRequestId: string | null,
+    publicationFence?: () => void) {
+    if (providerRequestId !== null && !isDefenderHuntingRequestId(providerRequestId)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid request identifier.");
+    await transaction(this.database, async client => {
+      publicationFence?.();
+      const job = await this.fence(client, scope, id, execution);
+      await requireExecutionRetainedScope(client, job);
+      const result = await client.query(`UPDATE defender_hunting_jobs SET provider_request_id=COALESCE($10,provider_request_id),updated_at=clock_timestamp()
+        WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
+          AND authorization_principal_id=$6 AND token_mode=$7 AND execution_owner=$8 AND execution_version=$9
+          AND status='running' AND NOT cancel_requested RETURNING id`,
+      [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision,
+        scope.authorizationPrincipalId, scope.tokenMode, execution.owner, execution.version, providerRequestId]);
+      if (result.rowCount !== 1) throw executionLost();
+      await requireExecutionRetainedScope(client, job);
+    }, undefined, publicationFence);
   }
 
   async publish(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, result: DefenderHuntingQueryResult,
     publicationFence?: () => void) {
     validatePublicationEnvelope(result);
-    await transaction(this.database, async client => {
+    return transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution);
+      await requireExecutionRetainedScope(client, job);
       publicationFence?.();
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting results arrived after its deadline.");
       validatePublicationRows(result.rows, job.filters, scope.tenantId);
@@ -283,11 +302,11 @@ export class DefenderHuntingRepository {
         [snapshotId, scope.tenantId, scope.resultScope.scopeId, scope.resultScope.kind, scope.resultScope.configurationRevision,
           sourceTable, JSON.stringify(result.rows.map((row, row_ordinal) => ({ row_ordinal, row_data: row }))) ]);
       }
-      await client.query(`UPDATE defender_hunting_jobs SET status=$6,provider_row_count=$7,stored_row_count=$8,byte_count=$9,
+      const updated = await client.query<JobRow>(`UPDATE defender_hunting_jobs SET status=$6,provider_row_count=$7,stored_row_count=$8,byte_count=$9,
         result_complete=$10,no_data=$11,partial_reason=$12,observed_start=$13,observed_end=$14,unobserved_start=$15,unobserved_end=$16,
         error_code=$17,message=$18,finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
         WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
-          AND execution_owner=$19 AND execution_version=$20`,
+          AND execution_owner=$19 AND execution_version=$20 RETURNING *`,
       [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision,
         result.complete ? "succeeded" : "partial", result.providerRowCount, result.storedRowCount, result.byteCount, result.complete,
         result.complete && result.rows.length === 0, result.partialReason, observedStart, observedEnd,
@@ -328,15 +347,17 @@ export class DefenderHuntingRepository {
           JSON.stringify(huntingTargetScope(filters)), job.query_version, job.contract_revision, job.permission_revision,
           job.qualification_configuration_revision, job.approved_by, id, job.created_at, evidence.rows[0].qualified_at]);
         await client.query("UPDATE defender_hunting_jobs SET retained_scope_id=$2 WHERE id=$1", [id, retained.rows[0].id]);
+        updated.rows[0].retained_scope_id = retained.rows[0].id;
       }
+      await requireExecutionRetainedScope(client, job);
       publicationFence?.();
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting publication exceeded its durable deadline.");
-    });
-    return (await this.getJob(scope, id))!;
+      return projectJob({ ...updated.rows[0], snapshot_id: snapshotId });
+    }, undefined, publicationFence);
   }
 
   async markWaitingAuthorization(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution) {
-    const result = await this.database.query(`UPDATE defender_hunting_jobs SET
+    const result = await this.database.query<JobRow>(`UPDATE defender_hunting_jobs AS job SET
       status=CASE WHEN deadline_at<=clock_timestamp() OR activation_count>=4 OR provider_request_count>=12 THEN 'inconclusive' ELSE 'waiting_authorization' END,
       error_code=CASE WHEN deadline_at<=clock_timestamp() THEN 'hunting_job_expired' WHEN activation_count>=4 THEN 'hunting_activation_limit'
         WHEN provider_request_count>=12 THEN 'hunting_provider_request_limit' ELSE 'interaction_required' END,
@@ -345,36 +366,47 @@ export class DefenderHuntingRepository {
       finished_at=CASE WHEN deadline_at<=clock_timestamp() OR activation_count>=4 OR provider_request_count>=12 THEN clock_timestamp() ELSE NULL END,
       execution_owner=NULL,updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
-        AND execution_owner=$6 AND execution_version=$7 AND status='running' AND NOT cancel_requested RETURNING id`,
+        AND execution_owner=$6 AND execution_version=$7 AND status='running' AND NOT cancel_requested
+      RETURNING job.*,${priorSuccessfulJobSelect("job")} AS prior_successful_job_id`,
     [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision, execution.owner, execution.version]);
     if (result.rowCount !== 1) throw executionLost();
-    return this.getJob(scope, id);
+    return projectJob({ ...result.rows[0], snapshot_id: null });
   }
 
   async fail(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, code: string, message: string, inconclusive = false) {
-    await this.fence(this.database as unknown as pg.PoolClient, scope, id, execution);
-    const result = await this.database.query(`UPDATE defender_hunting_jobs SET status=$8,error_code=$9,message=$10,finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
+    await this.fence(this.database, scope, id, execution);
+    const result = await this.database.query<JobRow>(`UPDATE defender_hunting_jobs AS job SET status=$8,error_code=$9,message=$10,finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
       WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
-        AND execution_owner=$6 AND execution_version=$7 AND status='running' RETURNING id`,
+        AND execution_owner=$6 AND execution_version=$7 AND status='running'
+      RETURNING job.*,${priorSuccessfulJobSelect("job")} AS prior_successful_job_id`,
     [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision, execution.owner, execution.version,
       inconclusive ? "inconclusive" : "failed", safeCode(code), message.slice(0, 1024)]);
     if (result.rowCount !== 1) throw executionLost();
-    return this.getJob(scope, id);
+    return projectJob({ ...result.rows[0], snapshot_id: null });
   }
 
-  async cancel(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
-    const read = scopedWhere(toReadScope(scope), "job", !("resultScope" in scope));
-    const result = await this.database.query(`UPDATE defender_hunting_jobs AS job SET status='cancelled',cancel_requested=true,
+  async cancel(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string, mutationFence?: () => void) {
+    return transaction(this.database, async client => {
+      mutationFence?.();
+      const read = await this.requireMutationJob(client, scope, id);
+      mutationFence?.();
+      const result = await client.query<JobRow>(`UPDATE defender_hunting_jobs AS job SET status='cancelled',cancel_requested=true,
       message='Local hunting execution stopped.',finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
-      WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.status IN ('waiting_authorization','running') RETURNING job.id`, [...read.values, id]);
-    if (result.rowCount !== 1) throw new AppError(409, "hunting_job_state", "Only unfinished hunting can be cancelled.");
-    return this.getJob(scope, id);
+      WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.status IN ('waiting_authorization','running')
+      RETURNING job.*,${priorSuccessfulJobSelect("job")} AS prior_successful_job_id`, [...read.values, id]);
+      if (!result.rows[0]) throw new AppError(409, "hunting_job_state", "Only unfinished hunting can be cancelled.");
+      return projectJob({ ...result.rows[0], snapshot_id: null });
+    }, undefined, mutationFence);
   }
 
-  async delete(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
-    const read = scopedWhere(toReadScope(scope), "job", !("resultScope" in scope));
-    const result = await this.database.query(`DELETE FROM defender_hunting_jobs AS job WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.status<>'running' RETURNING job.id`, [...read.values, id]);
-    if (result.rowCount !== 1) throw new AppError(409, "hunting_job_state", "Stop active hunting before deleting its local cache.");
+  async delete(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string, mutationFence?: () => void) {
+    await transaction(this.database, async client => {
+      mutationFence?.();
+      const read = await this.requireMutationJob(client, scope, id);
+      mutationFence?.();
+      const result = await client.query(`DELETE FROM defender_hunting_jobs AS job WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.status<>'running' RETURNING job.id`, [...read.values, id]);
+      if (result.rowCount !== 1) throw new AppError(409, "hunting_job_state", "Stop active hunting before deleting its local cache.");
+    }, undefined, mutationFence);
   }
 
   async listRows(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string, limit = 100, offset = 0): Promise<DefenderHuntingRowPage> {
@@ -393,8 +425,12 @@ export class DefenderHuntingRepository {
     [job.snapshotId, readScope.tenantId, job.resultScope.kind, job.resultScope.scopeId, job.resultScope.configurationRevision, boundedLimit, boundedOffset]);
     if (readScope.entraAgentIds || readScope.entraAgentApplicationIds) validatePublicationRows(rows.rows.map(value => value.row_data), job.filters, readScope.tenantId);
     const associations = await this.resolveAssociations(readScope, rows.rows.map(value => value.row_data));
+    const current = await this.getJob(scope, id);
+    if (!current || current.snapshotId !== job.snapshotId || snapshotResult.rows[0].expires_at <= new Date()) {
+      throw new AppError(404, "not_found", "The current hunting snapshot was not found.");
+    }
     return { value: rows.rows.map((value, index) => ({ ...value.row_data, association: associations[index] })), count: job.storedRowCount,
-      limit: boundedLimit, offset: boundedOffset, job, snapshot: projectSnapshot(snapshotResult.rows[0]) };
+      limit: boundedLimit, offset: boundedOffset, job: current, snapshot: projectSnapshot(snapshotResult.rows[0]) };
   }
 
   async recoverInterrupted() {
@@ -414,6 +450,16 @@ export class DefenderHuntingRepository {
         FROM candidates WHERE job.id=candidates.id`);
       return (terminal.rowCount ?? 0) + (waiting.rowCount ?? 0);
     });
+  }
+
+  private async requireMutationJob(client: Pick<pg.PoolClient, "query">, scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
+    const read = scopedWhere(toReadScope(scope), "job", !("resultScope" in scope));
+    read.values.push(scope.authorizationPrincipalId);
+    read.sql += ` AND job.authorization_principal_id=$${read.values.length}`;
+    const result = await client.query(`SELECT job.id FROM defender_hunting_jobs AS job
+      WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.expires_at>clock_timestamp() FOR UPDATE`, [...read.values, id]);
+    if (result.rowCount !== 1) throw new AppError(404, "not_found", "Hunting job was not found.");
+    return read;
   }
 
   private async resolveAssociations(scope: DefenderHuntingReadScope, rows: DefenderHuntingRow[]) {
@@ -606,7 +652,7 @@ function retainedVisibilityPredicate(scope: DefenderHuntingReadScope, alias: str
       authority.contractRevision, authority.permissionRevision, authority.configurationRevision, scope.authorizationPrincipalId);
     const scopeMatch = `${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1}
       AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2}`;
-    return `(${scopeMatch} AND ((${alias}.is_qualification AND ${alias}.status NOT IN ('succeeded','partial')
+    return `(${scopeMatch} AND ((${alias}.is_qualification AND ${alias}.status<>'succeeded'
       AND ${alias}.authorization_principal_id=$${offset + 7} AND ${alias}.query_version=3
       AND ${alias}.capability_id=$${offset + 3} AND ${alias}.contract_revision=$${offset + 4}
       AND ${alias}.permission_revision=$${offset + 5} AND ${alias}.qualification_configuration_revision=$${offset + 6})
@@ -640,6 +686,16 @@ async function requireRetainedScope(client: Pick<pg.Pool | pg.PoolClient, "query
     scope.resultScope.configurationRevision, scope.tokenMode, authority.capabilityId, filters.templateId, huntingTargetScopeHash(filters),
     JSON.stringify(huntingTargetScope(filters)), authority.contractRevision, authority.permissionRevision, authority.configurationRevision]);
   if (!result.rowCount) throw new AppError(403, "hunting_scope_unqualified", "This exact hunting template, identity target, and approved data scope requires current qualification.");
+}
+
+async function requireExecutionRetainedScope(client: pg.PoolClient, job: JobRow) {
+  if (!job.retained_scope_id) return;
+  const retained = await client.query(`SELECT retained.id FROM defender_hunting_retained_scopes retained
+    JOIN defender_hunting_qualification_evidence evidence ON evidence.qualified_job_id=retained.source_qualification_job_id
+    WHERE retained.id=$1 AND retained.query_version=$2 AND retained.revoked_at IS NULL
+      AND retained.expires_at>clock_timestamp() AND evidence.expires_at>clock_timestamp()
+    FOR SHARE OF retained`, [job.retained_scope_id, job.query_version]);
+  if (!retained.rowCount) throw new AppError(403, "hunting_scope_unqualified", "Hunting retained-scope qualification expired or was revoked before execution.");
 }
 
 function requestHash(scope: DefenderHuntingScope, filters: DefenderHuntingFilters, qualification?: DefenderHuntingQualificationBinding,
@@ -711,6 +767,7 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
     if (!Number.isFinite(timestamp) || timestamp < start || timestamp > end) throw invalidPublication();
     if (row.sourceTable === "AgentsInfo") {
       if (!row.agentId || row.agentId.length > 512 || !isExactStateRecord(row.detailStates, inventoryDetailStateKeys, inventoryDetailStates)
+        || inventoryDetailStateKeys.some(key => (key === "risk") !== (row.detailStates[key] === "not_exposed"))
         || filters.agentIds.length && !filters.agentIds.includes(row.agentId)
         || filters.entraAgentIds?.length && (!row.entraAgentObjectId || !filters.entraAgentIds.includes(row.entraAgentObjectId.toLowerCase()))
         || selectedBlueprintIds.length && (!row.entraBlueprintId || !selectedBlueprintIds.includes(row.entraBlueprintId.toLowerCase()))) throw invalidPublication();
@@ -728,7 +785,15 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
       || selectedActorIds.length && (!row.actorAccountObjectId || !selectedActorIds.includes(row.actorAccountObjectId.toLowerCase()))
       || filters.userObjectId && (row.actionType !== "InvokeAgent" || row.humanActorUserObjectId !== filters.userObjectId)
       || row.rootSpanObserved !== rootSpanObserved || row.spanRole !== (rootSpanObserved ? "root_invoke_agent" : row.parentSpanId ? "child" : "unresolved")
-      || row.contentAvailable !== false || !isExactStateRecord(row.fieldStates, activityFieldStateKeys, activityFieldStates)) throw invalidPublication();
+      || !defenderHuntingFieldAvailable(row.actionType, "humanActorUserObjectId") && row.humanActorUserPrincipalName !== null
+      || !defenderHuntingFieldAvailable(row.actionType, "agentUserObjectId") && row.agentUserPrincipalName !== null
+      || row.contentAvailable !== false || !isExactStateRecord(row.fieldStates, activityFieldStateKeys, activityFieldStates)
+      || activityFieldStateKeys.some(key => {
+        const state = row.fieldStates[key];
+        const value = key === "platformAgentId" ? row.alternatePlatformAgentId : row[key];
+        return (state !== "unavailable") !== defenderHuntingFieldAvailable(row.actionType, key)
+          || (state === "value" ? typeof value !== "string" || value === "" : value !== null);
+      })) throw invalidPublication();
   }
 }
 

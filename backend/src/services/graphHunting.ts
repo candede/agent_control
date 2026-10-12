@@ -1,7 +1,10 @@
 import { AppError } from "../errors.js";
+import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import {
   defenderHuntingTemplateIds,
   defenderHuntingTemplates,
+  defenderHuntingFieldAvailable,
+  isDefenderHuntingRequestId,
   type DefenderAgentActivityRow,
   type DefenderAgentInventoryRow,
   type DefenderHuntingFilters,
@@ -9,7 +12,7 @@ import {
   type DefenderHuntingRow,
   type DefenderHuntingTemplateId,
 } from "../types/defenderHunting.js";
-import { boundedProviderText } from "./providerJson.js";
+import { boundedProviderText, parseProviderContractJson } from "./providerJson.js";
 
 const endpoint = "https://graph.microsoft.com/v1.0/security/runHuntingQuery";
 const maximumAttempts = 3;
@@ -32,7 +35,8 @@ type QueryOptions = {
   correlationId?: string;
   tenantId?: string;
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
-  onResponse?: (providerRequestId: string | null) => Promise<void>;
+  assertCurrent?: () => void;
+  onResponse?: (providerRequestId: string | null, signal: AbortSignal) => Promise<void>;
 };
 
 const defaultDependencies: Dependencies = {
@@ -77,20 +81,37 @@ export class GraphHuntingClient {
     const startedAt = this.now();
     const deadline = AbortSignal.timeout(maximumRequestBudgetMs);
     const querySignal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+    let received: Response | undefined;
     try {
       for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+        options.signal?.throwIfAborted();
+        options.assertCurrent?.();
+        querySignal.throwIfAborted();
         const remainingBudget = maximumRequestBudgetMs - (this.now() - startedAt);
-        if (remainingBudget <= 0) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
-        const timeout = AbortSignal.timeout(Math.max(1, Math.min(this.dependencies.requestTimeoutMs ?? 10_000, remainingBudget)));
+        if (remainingBudget <= 0) throw received && received.status !== 200 ? providerFailure(received, this.now())
+          : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+        const requestTimeoutMs = Math.max(1, Math.min(this.dependencies.requestTimeoutMs ?? 10_000, remainingBudget));
+        const attemptDeadlineAt = this.now() + requestTimeoutMs;
+        const timeout = AbortSignal.timeout(requestTimeoutMs);
         const signal = AbortSignal.any([querySignal, timeout]);
+        const assertDeadline = () => {
+          signal.throwIfAborted();
+          const now = this.now();
+          if (now >= attemptDeadlineAt || now - startedAt >= maximumRequestBudgetMs) {
+            throw received && received.status !== 200 ? providerFailure(received, now)
+              : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.", received && responseDetails(received, now));
+          }
+        };
         let response: Response | undefined;
+        let undeliveredResponse: Response | undefined;
         let retryTransportFailure = false;
+        let consumingResponse = false;
         try {
-          signal.throwIfAborted();
-          await abortable(Promise.resolve(options.beforeRequest?.(signal)), signal);
-          signal.throwIfAborted();
+          await awaitCurrent(() => options.beforeRequest?.(signal), signal, options.assertCurrent);
+          assertDeadline();
+          options.assertCurrent?.();
           retryTransportFailure = true;
-          response = await abortable<Response>(this.dependencies.fetch(endpoint, {
+          const fetching = this.dependencies.fetch(endpoint, {
             method: "POST",
             redirect: "manual",
             signal,
@@ -101,45 +122,72 @@ export class GraphHuntingClient {
               ...(options.correlationId ? { "client-request-id": options.correlationId, "return-client-request-id": "true" } : {}),
             },
             body: JSON.stringify(request),
-          }).then(value => {
-            if (signal.aborted) { disposeResponse(value); throw signal.reason; }
-            return value;
-          }), signal);
+          });
+          void fetching.then(value => {
+            undeliveredResponse = value;
+            if (signal.aborted) disposeResponse(value);
+          }, () => undefined);
+          response = await abortable(fetching, signal);
+          undeliveredResponse = undefined;
+          received = response;
           retryTransportFailure = false;
-          await abortable(Promise.resolve(options.onResponse?.(providerRequestId(response))), signal);
-          signal.throwIfAborted();
+          assertDeadline();
+          options.assertCurrent?.();
+          await awaitCurrent(() => options.onResponse?.(providerRequestId(response!), signal), signal, options.assertCurrent);
+          assertDeadline();
           if (response.status >= 300 && response.status < 400) {
-            throw new AppError(502, "invalid_provider_link", "Microsoft Graph hunting returned an unexpected redirect.");
+            throw new AppError(502, "invalid_provider_link", "Microsoft Graph hunting returned an unexpected redirect.", responseDetails(response, this.now()));
           }
           if (response.status === 200) {
-            const text = await abortable(boundedProviderText(response, maximumResponseBytes, signal), signal);
-            signal.throwIfAborted();
-            return parseHuntingResponse(parseJson(text), filters, options.tenantId, Buffer.byteLength(text));
+            consumingResponse = true;
+            const text = await awaitCurrent(() => boundedProviderText(response!, maximumResponseBytes, signal), signal, options.assertCurrent);
+            assertDeadline();
+            const result = parseHuntingResponse(parseJson(text, filters.templateId), filters, options.tenantId, Buffer.byteLength(text));
+            assertDeadline();
+            options.assertCurrent?.();
+            return result;
           }
-          if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
-            const waitMs = retryDelay(response, attempt, this.dependencies.random());
+          if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500 && response.status < 600)) {
+            const waitMs = retryDelay(response, attempt, this.dependencies.random(), this.now());
             if (waitMs < maximumRequestBudgetMs - (this.now() - startedAt)) {
               disposeResponse(response);
               response = undefined;
-              await abortable(this.dependencies.wait(waitMs, querySignal), querySignal);
+              await this.waitForRetry(waitMs, querySignal, options, received);
               continue;
             }
           }
-          throw providerFailure(response);
+          throw providerFailure(response, this.now());
         } catch (error) {
-          if (signal.aborted) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
-          if (error instanceof AppError || !retryTransportFailure) throw error;
-          if (attempt === maximumAttempts) throw new AppError(502, "provider_error", "Microsoft Graph hunting failed within its bounded retry budget.");
+          if (undeliveredResponse) {
+            received = undeliveredResponse;
+            disposeResponse(undeliveredResponse);
+          }
+          options.signal?.throwIfAborted();
+          options.assertCurrent?.();
+          if (signal.aborted || querySignal.aborted) throw received && received.status !== 200 ? providerFailure(received, this.now())
+            : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.", received && responseDetails(received, this.now()));
+          if (error instanceof AppError) {
+            if (consumingResponse && received) error.details = responseDetails(received, this.now());
+            throw error;
+          }
+          if (!retryTransportFailure) {
+            if (consumingResponse) throw new AppError(502, "provider_error", "Microsoft Graph hunting response consumption failed.", received && responseDetails(received, this.now()));
+            throw error;
+          }
+          if (attempt === maximumAttempts) throw new AppError(502, "provider_error", "Microsoft Graph hunting failed within its bounded retry budget.", received && responseDetails(received, this.now()));
           const waitMs = Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(this.dependencies.random() * 250), 5_000);
-          if (waitMs >= maximumRequestBudgetMs - (this.now() - startedAt)) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget before retry.");
-          await abortable(this.dependencies.wait(waitMs, querySignal), querySignal);
+          if (waitMs >= maximumRequestBudgetMs - (this.now() - startedAt)) throw received && received.status !== 200 ? providerFailure(received, this.now())
+            : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget before retry.");
+          await this.waitForRetry(waitMs, querySignal, options, received);
         } finally {
           if (response) disposeResponse(response);
         }
       }
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
-      if (querySignal.aborted) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+      options.assertCurrent?.();
+      if (querySignal.aborted) throw received && received.status !== 200 ? providerFailure(received, this.now())
+        : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.", received && responseDetails(received, this.now()));
       throw error;
     }
     throw new AppError(502, "provider_error", "Microsoft Graph hunting failed.");
@@ -147,6 +195,19 @@ export class GraphHuntingClient {
 
   private now() {
     return this.dependencies.now?.() ?? Date.now();
+  }
+
+  private async waitForRetry(milliseconds: number, signal: AbortSignal, options: QueryOptions, response?: Response) {
+    try {
+      await awaitCurrent(() => this.dependencies.wait(milliseconds, signal), signal, options.assertCurrent);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      options.assertCurrent?.();
+      if (signal.aborted) throw response && response.status !== 200 ? providerFailure(response, this.now())
+        : new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+      if (error instanceof AppError) throw error;
+      throw new AppError(500, "internal_error", "Hunting retry scheduling failed.");
+    }
   }
 }
 
@@ -172,7 +233,7 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
   if (templateId === "agents_inventory" && operations.length || templateId !== "agents_inventory" && operations.length === 0) {
     throw new AppError(400, "invalid_hunting_filters", "Hunting operations must match the selected fixed template.");
   }
-  const actorObjectIds = stringList(value.actorObjectIds, "actorObjectIds", uuid, 128);
+  const actorObjectIds = stringList(value.actorObjectIds, "actorObjectIds", isDirectoryObjectId, 128);
   if (templateId === "agents_inventory" && actorObjectIds.length) throw new AppError(400, "invalid_hunting_filters", "Actor filters are not available for the inventory template.");
   if (value.userObjectId !== undefined && (typeof value.userObjectId !== "string" || !uuid(value.userObjectId)
     || templateId !== "agent_activity" || operations.length !== 1 || operations[0] !== "InvokeAgent")) {
@@ -183,9 +244,9 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
     startDateTime,
     endDateTime,
     agentIds: stringList(value.agentIds, "agentIds", () => true),
-    ...(value.entraAgentIds !== undefined ? { entraAgentIds: [...new Set(stringList(value.entraAgentIds, "entraAgentIds", uuid, 128).map(id => id.toLowerCase()))].sort() } : {}),
-    ...(value.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...new Set(stringList(value.entraAgentApplicationIds, "entraAgentApplicationIds", uuid, 128).map(id => id.toLowerCase()))].sort() } : {}),
-    blueprintIds: stringList(value.blueprintIds, "blueprintIds", () => true),
+    ...(value.entraAgentIds !== undefined ? { entraAgentIds: [...new Set(stringList(value.entraAgentIds, "entraAgentIds", isDirectoryObjectId, 128).map(id => id.toLowerCase()))].sort() } : {}),
+    ...(value.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...new Set(stringList(value.entraAgentApplicationIds, "entraAgentApplicationIds", isDirectoryObjectId, 128).map(id => id.toLowerCase()))].sort() } : {}),
+    blueprintIds: stringList(value.blueprintIds, "blueprintIds", isDirectoryObjectId, 128),
     actorObjectIds,
     ...(typeof value.userObjectId === "string" ? { userObjectId: value.userObjectId.toLowerCase() } : {}),
     operations,
@@ -363,7 +424,7 @@ function parseInventoryRow(value: Record<string, unknown>): DefenderAgentInvento
       sharing: requiredDetailState(value.SharedWithState, "SharedWithState"),
       permissions: requiredDetailState(value.PermissionsState, "PermissionsState"),
       authentication: requiredDetailState(value.AuthenticationState, "AuthenticationState"),
-      risk: requiredDetailState(value.RiskState, "RiskState"),
+      risk: requiredEnum(value.RiskState, "RiskState", ["not_exposed"] as const),
     },
   };
 }
@@ -377,7 +438,13 @@ function parseActivityRow(value: Record<string, unknown>): DefenderAgentActivity
   const spanId = optionalHex(value.OpId, "OpId", 16);
   const parentSpanId = optionalHex(value.ParentId, "ParentId", 16);
   const errorType = optionalString(value.ErrorType, "ErrorType", 256);
+  const humanActorUserPrincipalName = optionalString(value.HumanUserId, "HumanUserId", 512);
+  const agentUserPrincipalName = optionalString(value.AgentUserId, "AgentUserId", 512);
+  if (!defenderHuntingFieldAvailable(actionType, "humanActorUserObjectId") && humanActorUserPrincipalName !== null) throw schemaError("HumanUserId");
+  if (!defenderHuntingFieldAvailable(actionType, "agentUserObjectId") && agentUserPrincipalName !== null) throw schemaError("AgentUserId");
   const rootSpanObserved = actionType === "InvokeAgent" && operation === "invoke_agent" && spanId !== null && parentSpanId === null;
+  const fieldState = (field: keyof DefenderAgentActivityRow["fieldStates"], column: string, stateColumn = column) =>
+    requiredProjectedFieldState(value[`${stateColumn}State`], `${stateColumn}State`, value[column], defenderHuntingFieldAvailable(actionType, field));
   return {
     projectionVersion: 3,
     sourceTable: "CloudAppEvents",
@@ -406,9 +473,9 @@ function parseActivityRow(value: Record<string, unknown>): DefenderAgentActivity
     sessionIdentity: optionalString(value.SessionIdentity, "SessionIdentity", 512),
     channelName: optionalString(value.ChannelName, "ChannelName", 128),
     humanActorUserObjectId: optionalUuid(value.HumanUserKey, "HumanUserKey"),
-    humanActorUserPrincipalName: optionalString(value.HumanUserId, "HumanUserId", 512),
+    humanActorUserPrincipalName,
     agentUserObjectId: optionalUuid(value.AgentUserKey, "AgentUserKey"),
-    agentUserPrincipalName: optionalString(value.AgentUserId, "AgentUserId", 512),
+    agentUserPrincipalName,
     targetAgentUserObjectId: optionalUuid(value.TargetAgentUserKey, "TargetAgentUserKey"),
     spanId,
     parentSpanId,
@@ -424,16 +491,16 @@ function parseActivityRow(value: Record<string, unknown>): DefenderAgentActivity
     spanRole: rootSpanObserved ? "root_invoke_agent" : parentSpanId ? "child" : "unresolved",
     rootSpanObserved,
     fieldStates: {
-      conversationId: requiredProjectedFieldState(value.ConversationIdState, "ConversationIdState", value.ConversationId),
-      conversationThreadId: requiredProjectedFieldState(value.ThreadIdState, "ThreadIdState", value.ThreadId),
-      channelName: requiredProjectedFieldState(value.ChannelNameState, "ChannelNameState", value.ChannelName),
-      humanActorUserObjectId: requiredProjectedFieldState(value.HumanUserKeyState, "HumanUserKeyState", value.HumanUserKey),
-      agentUserObjectId: requiredProjectedFieldState(value.AgentUserKeyState, "AgentUserKeyState", value.AgentUserKey),
-      targetAgentUserObjectId: requiredProjectedFieldState(value.TargetAgentUserKeyState, "TargetAgentUserKeyState", value.TargetAgentUserKey),
-      completionTime: requiredProjectedFieldState(value.CompletionTimeState, "CompletionTimeState", value.CompletionTime),
-      errorType: requiredProjectedFieldState(value.ErrorTypeState, "ErrorTypeState", value.ErrorType),
-      platformAgentId: requiredProjectedFieldState(value.PlatformAgentIdState, "PlatformAgentIdState", value.PlatformTargetAgentId),
-      platformAgentType: requiredProjectedFieldState(value.PlatformAgentTypeState, "PlatformAgentTypeState", value.PlatformAgentType),
+      conversationId: fieldState("conversationId", "ConversationId"),
+      conversationThreadId: fieldState("conversationThreadId", "ThreadId"),
+      channelName: fieldState("channelName", "ChannelName"),
+      humanActorUserObjectId: fieldState("humanActorUserObjectId", "HumanUserKey"),
+      agentUserObjectId: fieldState("agentUserObjectId", "AgentUserKey"),
+      targetAgentUserObjectId: fieldState("targetAgentUserObjectId", "TargetAgentUserKey"),
+      completionTime: fieldState("completionTime", "CompletionTime"),
+      errorType: fieldState("errorType", "ErrorType"),
+      platformAgentId: fieldState("platformAgentId", "PlatformTargetAgentId", "PlatformAgentId"),
+      platformAgentType: fieldState("platformAgentType", "PlatformAgentType"),
     },
     contentAvailable: false,
   };
@@ -533,7 +600,7 @@ function optionalInstant(value: unknown, name: string) {
 function optionalUuid(value: unknown, name: string) {
   if (value === "" || value === null) return null;
   const text = requiredString(value, name, 128);
-  if (!uuid(text)) throw schemaError(name);
+  if (!isDirectoryObjectId(text)) throw schemaError(name);
   return text.toLowerCase();
 }
 
@@ -554,16 +621,17 @@ function optionalInteger(value: unknown, name: string) {
 }
 
 function requiredDetailState(value: unknown, name: string) {
-  return requiredEnum(value, name, ["not_supplied", "empty", "present_unqualified_shape", "not_exposed"] as const);
+  return requiredEnum(value, name, ["not_supplied", "empty", "present_unqualified_shape"] as const);
 }
 
 function requireProjectionValid(value: unknown) {
   if (value !== "true") throw schemaError("ProjectionValid");
 }
 
-function requiredProjectedFieldState(value: unknown, name: string, projectedValue: unknown) {
+function requiredProjectedFieldState(value: unknown, name: string, projectedValue: unknown, available: boolean) {
   const state = requiredEnum(value, name, ["value", "null", "empty", "unavailable"] as const);
-  if (state === "value" && (projectedValue === null || projectedValue === "")
+  if ((state !== "unavailable") !== available
+    || state === "value" && (projectedValue === null || projectedValue === "")
     || state === "null" && projectedValue !== null && projectedValue !== "" || state === "empty" && projectedValue !== ""
     || state === "unavailable" && projectedValue !== null && projectedValue !== "") throw schemaError(name);
   return state;
@@ -587,16 +655,18 @@ function utcInstant(value: unknown, name: string) {
   return normalized;
 }
 
-function uuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseJson(text: string): unknown {
-  try { return JSON.parse(text); }
+function parseJson(text: string, templateId: DefenderHuntingTemplateId): unknown {
+  try {
+    return parseProviderContractJson(text, {
+      root: { fields: ["@odata.context", "schema", "results"], arrays: { schema: "column", results: "row" } },
+      column: { fields: ["name", "type"] },
+      row: { fields: templateId === "agents_inventory" ? inventoryColumns : activityColumns },
+    }, 3);
+  }
   catch { throw new AppError(502, "provider_schema", "Microsoft Graph returned invalid hunting JSON."); }
 }
 
@@ -612,30 +682,66 @@ function abortable<T>(work: PromiseLike<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+async function awaitCurrent<T>(operation: () => T | PromiseLike<T>, signal: AbortSignal, assertCurrent?: () => void): Promise<T> {
+  signal.throwIfAborted();
+  assertCurrent?.();
+  try {
+    const value = await abortable(Promise.resolve(operation()), signal);
+    signal.throwIfAborted();
+    assertCurrent?.();
+    return value;
+  } catch (error) {
+    assertCurrent?.();
+    signal.throwIfAborted();
+    throw error;
+  }
+}
+
 function schemaError(name: string) {
   return new AppError(502, "provider_schema", `Microsoft Graph returned an invalid hunting ${name} field.`);
 }
 
 function providerRequestId(response: Response) {
   const value = response.headers.get("request-id");
-  return value && value.length <= 256 && !/[\r\n\0]/.test(value) ? value : null;
+  return isDefenderHuntingRequestId(value) ? value : null;
 }
 
-function providerFailure(response: Response) {
-  if (response.status === 429) return new AppError(429, "provider_throttled", "Microsoft Graph hunting is temporarily throttled.");
-  if (response.status === 401 || response.status === 403) return new AppError(response.status, "hunting_access_denied", "Microsoft Graph hunting did not authorize this bounded request; permission, Defender role, data scope, license, and rollout must be checked separately.");
-  return new AppError(502, "provider_error", "Microsoft Graph hunting failed.");
+function providerFailure(response: Response, now: number) {
+  const details = responseDetails(response, now);
+  const status = response.status >= 400 ? response.status : 502;
+  const code = response.status === 429 ? "provider_throttled"
+    : response.status === 401 || response.status === 403 ? "hunting_access_denied" : "provider_error";
+  const message = response.status === 429 ? "Microsoft Graph hunting is temporarily throttled."
+    : response.status === 401 || response.status === 403 ? "Microsoft Graph hunting did not authorize this bounded request; permission, Defender role, data scope, license, and rollout must be checked separately."
+      : "Microsoft Graph hunting failed.";
+  const error = new AppError(status, code, message, details);
+  if (details.retryAfterMs !== undefined && details.retryAfterMs > 0) error.retryAfterSeconds = Math.ceil(details.retryAfterMs / 1000);
+  return error;
 }
 
-function retryDelay(response: Response, attempt: number, random: number) {
+function responseDetails(response: Response, now: number) {
+  const correlationId = providerRequestId(response);
+  const retryAfterMs = retryAfterMilliseconds(response, now);
+  return { httpStatus: response.status, ...(correlationId ? { correlationId } : {}),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
+}
+
+function retryAfterMilliseconds(response: Response, now: number) {
   const retryAfter = response.headers.get("retry-after");
-  if (retryAfter && /^\d+$/.test(retryAfter)) return Math.min(Number(retryAfter) * 1_000, maximumRequestBudgetMs);
-  if (retryAfter) {
-    const date = Date.parse(retryAfter);
-    const serverDate = Date.parse(response.headers.get("date") ?? "");
-    if (Number.isFinite(date) && Number.isFinite(serverDate)) return Math.min(Math.max(0, date - serverDate), maximumRequestBudgetMs);
-  }
-  return Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(random * 250), 5_000);
+  if (retryAfter && /^\d+$/.test(retryAfter)) return Math.min(Number(retryAfter) * 1_000, Number.MAX_SAFE_INTEGER);
+  const retryAt = httpDate(retryAfter);
+  if (retryAt === undefined) return undefined;
+  return Math.max(0, retryAt - (httpDate(response.headers.get("date")) ?? now));
+}
+
+function httpDate(value: string | null) {
+  if (value === null || !/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return undefined;
+  const date = Date.parse(value);
+  return Number.isFinite(date) && new Date(date).toUTCString() === value ? date : undefined;
+}
+
+function retryDelay(response: Response, attempt: number, random: number, now: number) {
+  return retryAfterMilliseconds(response, now) ?? Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(random * 250), 5_000);
 }
 
 function disposeResponse(response: Response) {

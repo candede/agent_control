@@ -32,18 +32,18 @@ export function createInventoryVerification(
 
 export function createUnifiedVerification(
   counts: Pick<UnifiedAgentInventoryVerification, "graphPackageCount" | "powerPlatformAgentCount" | "logicalAgentCount">,
-  checks: Partial<Omit<UnifiedAgentInventoryVerification["checks"], "sourceMemberships">> = {},
+  checks: Partial<UnifiedAgentInventoryVerification["checks"]> = {},
   checkedAt = "2026-09-17T06:00:00.000Z",
   identityCollection?: UnifiedAgentInventoryPage["identityCollection"],
 ): UnifiedAgentInventoryVerification {
   const sourceCount = counts.graphPackageCount + counts.powerPlatformAgentCount;
-  const verifiedChecks = { sourceScopes: true, packageMetadata: true, identityLinks: true, sourceMemberships: true as const, ...checks };
+  const verifiedChecks = { sourceScopes: true, packageMetadata: true, identityLinks: true, sourceMemberships: true, ...checks };
   const invalidPackages = identityCollection?.invalidPackages ?? 0;
   if (identityCollection) {
     verifiedChecks.packageMetadata = identityCollection.pendingPackages === 0 && invalidPackages === 0;
   }
   return {
-    status: !verifiedChecks.sourceScopes || !verifiedChecks.identityLinks || invalidPackages > 0
+    status: !verifiedChecks.sourceScopes || !verifiedChecks.sourceMemberships || !verifiedChecks.identityLinks || invalidPackages > 0
       ? "needs_attention" : !verifiedChecks.packageMetadata ? "details_pending" : "verified",
     scope: "authorized_saved_sources", checkedAt,
     graphPackageCount: counts.graphPackageCount,

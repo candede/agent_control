@@ -8,8 +8,8 @@ import {
   type QuarantineScope,
 } from "../db/copilotStudioQuarantine.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError } from "../errors.js";
-import type { QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
+import { AppError, errorTelemetry } from "../errors.js";
+import type { QuarantineAuthority, QuarantineReconciliationResult } from "../types/copilotStudioQuarantine.js";
 import { capabilities } from "./capabilities.js";
 import { CopilotStudioQuarantineClient, verifyCopilotStudioQuarantineConverged } from "./copilotStudioQuarantine.js";
 import { maintenanceActive } from "./maintenance.js";
@@ -18,7 +18,7 @@ import { operationalLog } from "./telemetry.js";
 import { InventoryRuntime } from "./inventoryRuntime.js";
 
 export type QuarantineAuthorization = { accessToken: string; authority: QuarantineAuthority };
-type QuarantineAuthorizer = (scope: QuarantineScope) => Promise<QuarantineAuthorization>;
+type QuarantineAuthorizer = (scope: QuarantineScope, signal?: AbortSignal) => Promise<QuarantineAuthorization>;
 type QuarantineProvider = Pick<CopilotStudioQuarantineClient, "getStatus" | "setQuarantine">;
 
 export const copilotStudioQuarantineJobs = new CopilotStudioQuarantineRepository();
@@ -67,28 +67,32 @@ export async function runCopilotStudioQuarantineJob(
 ) {
   requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const authorizeJob = async (owner: QuarantineScope) => {
+  const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
+  const assertAuthority = capabilities.beginOperationValidation("powerPlatform.quarantine.manage", principal);
+  const assertCurrent = () => {
     requireProviderAdmissions();
     externalSignal?.throwIfAborted();
     assertAccountSessionValidation(validation);
-    const result = await authorize(owner);
-    requireProviderAdmissions();
-    externalSignal?.throwIfAborted();
-    assertAccountSessionValidation(validation);
+    assertAuthority();
+  };
+  const authorizeJob = async (owner: QuarantineScope, signal = AbortSignal.timeout(executionDeadlineMs)) => {
+    const authorizationSignal = externalSignal ? AbortSignal.any([externalSignal, signal]) : signal;
+    assertCurrent();
+    const result = await interruptibleAuthorization(() => authorize(owner, authorizationSignal), authorizationSignal);
+    assertCurrent();
     return result;
   };
-  if (!await repository.get(scope, id)) throw new AppError(404, "not_found", "Quarantine job was not found.");
-  const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
+  const currentJob = await repository.get(scope, id);
+  if (!currentJob) throw new AppError(404, "not_found", "Quarantine job was not found.");
+  if (resume && currentJob.isCanary) throw new AppError(409, "not_resumable", "Quarantine canary jobs can run only within their original approval-controlled cycle.");
   let authorization: QuarantineAuthorization;
   try {
     authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
       () => authorizeJob(scope), { signal: externalSignal, clearOnSuccess: false });
-    requireProviderAdmissions();
-    externalSignal?.throwIfAborted();
-    assertAccountSessionValidation(validation);
+    assertCurrent();
   }
   catch (error) {
-    await repository.waitForAuthorization(scope, id);
+    await persistFailure(id, "authorization_wait", error, () => repository.waitForAuthorization(scope, id));
     if (externalSignal?.aborted) return;
     throw error;
   }
@@ -96,66 +100,67 @@ export async function runCopilotStudioQuarantineJob(
   if (!lease) return;
   const inventory = new InventoryRuntime(repository.database, async (owner, signal) => {
     signal.throwIfAborted();
-    await authorizeJob(owner);
+    await authorizeJob(owner, signal);
     signal.throwIfAborted();
-  });
+  }, assertCurrent);
+  let executionFailed = false;
   try {
     for (let index = 0; index < 25 && !maintenanceActive() && !externalSignal?.aborted; index += 1) {
       requireProviderAdmissions();
       try {
         authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
           () => authorizeJob(scope), { signal: externalSignal, clearOnSuccess: false });
-        requireProviderAdmissions();
-        externalSignal?.throwIfAborted();
-        assertAccountSessionValidation(validation);
+        assertCurrent();
       }
-      catch {
-        await repository.waitForAuthorization(scope, id);
+      catch (error) {
+        await persistFailure(id, "authorization_wait", error, () => repository.waitForAuthorization(scope, id));
         return;
       }
       const publicationSignal = externalSignal
         ? AbortSignal.any([externalSignal, AbortSignal.timeout(executionDeadlineMs)])
         : AbortSignal.timeout(executionDeadlineMs);
       await inventory.settleControls(scope, publicationSignal);
+      assertCurrent();
+      publicationSignal.throwIfAborted();
       const current = await repository.beginItem(lease);
       if (!current) break;
       const { job, item } = current;
-      const signal = externalSignal ? AbortSignal.any([externalSignal, AbortSignal.timeout(executionDeadlineMs)]) : AbortSignal.timeout(executionDeadlineMs);
+      const itemSignal = externalSignal ? AbortSignal.any([externalSignal, AbortSignal.timeout(executionDeadlineMs)]) : AbortSignal.timeout(executionDeadlineMs);
+      let signal = itemSignal;
       const requireCurrentItem = () => {
         requireProviderAdmissions();
         signal.throwIfAborted();
         assertAccountSessionValidation(validation);
+        assertAuthority();
       };
       const getStatus = async (...args: Parameters<QuarantineProvider["getStatus"]>) => {
         requireCurrentItem();
-        const observed = await provider.getStatus(...args);
+        const observed = await provider.getStatus(args[0], args[1], { ...args[2], assertCurrent: requireCurrentItem });
         requireCurrentItem();
         return observed;
       };
-      let sent = false;
+      let sent = false, finished = false;
       try {
         requireAuthority(job, authorization.authority);
-        await capabilities.observeOperation("powerPlatform.quarantine.manage", principal, () => repository.withTargetLock(lease, item, async () => {
+        await capabilities.observeOperation("powerPlatform.quarantine.manage", principal, () => repository.withTargetLock(lease, item, async lockSignal => {
+          signal = AbortSignal.any([itemSignal, lockSignal]);
           const target = { environmentId: item.environment_id, botId: item.bot_id };
           const options = { correlationId: item.correlation_id!, signal };
           await repository.assertDispatchReady(lease, item, authorization.authority);
           const before = await getStatus(authorization.accessToken, target, options);
           if (before.isBotQuarantined === item.requested_state) {
-            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorizeJob, signal, validation);
+            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem);
+            finished = true;
             return;
           }
           requireFrozenPrestate(item, before);
-          const dispatchAuthorization = await authorizeJob(scope);
+          const dispatchAuthorization = await authorizeJob(scope, signal);
           requireAuthority(job, dispatchAuthorization.authority);
           await repository.assertDispatchReady(lease, item, dispatchAuthorization.authority);
           const immediate = await getStatus(dispatchAuthorization.accessToken, target, options);
           if (immediate.isBotQuarantined === item.requested_state) {
-            signal.throwIfAborted();
-            await commitAccountSessionValidation(validation, async () => {
-              requireProviderAdmissions();
-              signal.throwIfAborted();
-              await repository.finishItem(lease, item, "skipped", { observed: immediate, readbackCount: 1 });
-            });
+            await finishAuthorized(repository, lease, job, item, "skipped", { observed: immediate, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem);
+            finished = true;
             return;
           }
           requireFrozenPrestate(item, immediate);
@@ -163,19 +168,21 @@ export async function runCopilotStudioQuarantineJob(
           await commitAccountSessionValidation(validation, async () => {
             requireProviderAdmissions();
             signal.throwIfAborted();
-            await repository.markSent(lease, item, dispatchAuthorization.authority);
+            await repository.markSent(lease, item, dispatchAuthorization.authority, signal, requireCurrentItem);
           });
           sent = true;
           requireCurrentItem();
           await provider.setQuarantine(dispatchAuthorization.accessToken, target, item.requested_state, options);
           const verified = await verifyCopilotStudioQuarantineConverged({ getStatus }, dispatchAuthorization.accessToken, target, item.requested_state, options);
-          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorizeJob, signal, validation);
-        }), { signal, clearOnSuccess: () => sent });
+          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorizeJob, signal, validation, requireCurrentItem);
+          finished = true;
+        }), { signal: itemSignal, clearOnSuccess: () => sent });
       } catch (caught) {
+        if (finished) throw caught;
         if (caught instanceof AppError && caught.code === "lease_lost") throw caught;
         const error: unknown = signal.aborted ? signal.reason : caught;
         if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error))) {
-          await repository.pauseItemForAuthorization(lease, item);
+          await persistFailure(id, "authorization_pause", error, () => repository.pauseItemForAuthorization(lease, item));
           return;
         }
         if (sent) {
@@ -184,17 +191,29 @@ export async function runCopilotStudioQuarantineJob(
           operationalLog("error", "quarantine_job_stopped", { jobId: id, outcome: "deadline_exceeded" });
         }
         const failure = failureEvidence(error);
-        await repository.finishItem(lease, item, sent ? "inconclusive" : error instanceof AppError && ["cancelled", "shutdown", "maintenance"].includes(error.code) ? "cancelled" : "failed", {
+        const outcome = sent ? "inconclusive" : error instanceof AppError && ["cancelled", "shutdown", "maintenance"].includes(error.code) ? "cancelled" : "failed";
+        const evidence = {
           errorCode: isDeadlineExceeded(error) ? "provider_timeout" : error instanceof AppError ? error.code : "provider_error",
           message: sent ? "Provider write outcome is inconclusive; use GET reconciliation and never replay this item." : "The quarantine item stopped before provider dispatch.",
           ...failure,
-        });
+        };
+        await persistFailure(id, "terminal_item", error, () => failure.observed
+          ? repository.finishItem(lease, item, outcome, evidence, signal, requireCurrentItem)
+          : repository.finishItem(lease, item, outcome, evidence));
         if (isAdmissionFailure(error) || externalSignal?.aborted) return;
       }
     }
+  } catch (error) {
+    executionFailed = true;
+    throw error;
   } finally {
     try { await repository.release(lease); }
-    catch (error) { if (!(error instanceof AppError && error.code === "lease_lost")) throw error; }
+    catch (error) {
+      if (!(error instanceof AppError && error.code === "lease_lost")) {
+        if (!executionFailed) throw error;
+        operationalLog("error", "quarantine_job_cleanup_failed", { jobId: id, stage: "release", outcome: "requires_review", ...errorTelemetry(error) });
+      }
+    }
   }
 }
 
@@ -204,67 +223,75 @@ export async function reconcileCopilotStudioQuarantineJob(
   repository = copilotStudioQuarantineJobs,
   provider: Pick<CopilotStudioQuarantineClient, "getStatus"> = new CopilotStudioQuarantineClient(),
   authorize: QuarantineAuthorizer = authorizeQuarantine,
-) {
+): Promise<QuarantineReconciliationResult> {
   requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const assertAuthority = capabilities.beginOperationValidation("powerPlatform.quarantine.manage",
+    { tenantId: scope.tenantId, homeAccountId: scope.principalId });
+  const assertCurrent = () => {
+    requireProviderAdmissions();
+    assertAccountSessionValidation(validation);
+    assertAuthority();
+  };
   const context = await repository.reconciliationItems(scope, id);
-  assertAccountSessionValidation(validation);
+  assertCurrent();
   if (!context) throw new AppError(404, "not_found", "Quarantine job was not found.");
-  const inventory = new InventoryRuntime(repository.database, async (owner, signal) => {
-    requireProviderAdmissions();
-    signal.throwIfAborted();
-    assertAccountSessionValidation(validation);
-    const authorization = await authorize(owner);
+  const authorizeJob = async (owner: QuarantineScope, signal = AbortSignal.timeout(reconciliationDeadlineMs)) => {
+    assertCurrent();
+    const authorization = await interruptibleAuthorization(() => authorize(owner, signal), signal);
+    assertCurrent();
     requireAuthority(context.job, authorization.authority);
-    assertAccountSessionValidation(validation);
-    requireProviderAdmissions();
+    return authorization;
+  };
+  const inventory = new InventoryRuntime(repository.database, async (owner, signal) => {
+    await authorizeJob(owner, signal);
     signal.throwIfAborted();
-  });
+  }, assertCurrent);
   const errors: Array<{ resourceNativeId: string; message: string }> = [];
   for (const item of context.items) {
     requireProviderAdmissions();
     assertAccountSessionValidation(validation);
+    assertAuthority();
+    let published = false;
     try {
-      const authorization = await authorize(scope);
-      assertAccountSessionValidation(validation);
-      requireAuthority(context.job, authorization.authority);
-      const signal = AbortSignal.timeout(reconciliationDeadlineMs);
-      await inventory.settleControls(scope, signal);
-      await repository.withReconciliationLock(scope, item, async () => {
-        await repository.assertReconciliationTarget(scope, item);
-        requireProviderAdmissions();
-        signal.throwIfAborted();
-        assertAccountSessionValidation(validation);
-        const observed = await provider.getStatus(authorization.accessToken, { environmentId: item.environment_id, botId: item.bot_id }, { correlationId: item.correlation_id ?? randomUUID(), signal });
-        requireProviderAdmissions();
-        assertAccountSessionValidation(validation);
-        const publishAuthorization = await authorize(scope);
-        requireAuthority(context.job, publishAuthorization.authority);
-        signal.throwIfAborted();
-        await commitAccountSessionValidation(validation, async () => {
+      const deadline = AbortSignal.timeout(reconciliationDeadlineMs);
+      const authorization = await authorizeJob(scope, deadline);
+      await inventory.settleControls(scope, deadline);
+      await repository.withReconciliationLock(scope, item, async lockSignal => {
+        const signal = AbortSignal.any([deadline, lockSignal]);
+        const assertPublication = () => {
           requireProviderAdmissions();
           signal.throwIfAborted();
+          assertAccountSessionValidation(validation);
+          assertAuthority();
+        };
+        await repository.assertReconciliationTarget(scope, item);
+        assertPublication();
+        const observed = await provider.getStatus(authorization.accessToken, { environmentId: item.environment_id, botId: item.bot_id },
+          { correlationId: item.correlation_id ?? randomUUID(), signal, assertCurrent: assertPublication });
+        assertPublication();
+        await authorizeJob(scope, signal);
+        signal.throwIfAborted();
+        await commitAccountSessionValidation(validation, async () => {
+          assertPublication();
           if (observed.isBotQuarantined === item.requested_state) {
-            await repository.recordReconciliation(scope, context.job, item, "verified_applied", observed, "Provider GET reconciliation verified that the confirmed quarantine mutation was applied.");
+            await repository.recordReconciliation(scope, context.job, item, "verified_applied", observed, "Provider GET reconciliation verified that the confirmed quarantine mutation was applied.", signal, assertPublication);
           } else if (observed.isBotQuarantined === item.prestate && observed.lastUpdateTimeUtc === item.prestate_provider_updated_at) {
-            await repository.recordReconciliation(scope, context.job, item, "verified_not_applied", observed, "Provider GET reconciliation verified the exact original state and timestamp. A new explicit confirmation is required before retry.");
+            await repository.recordReconciliation(scope, context.job, item, "verified_not_applied", observed, "Provider GET reconciliation verified the exact original state and timestamp. A new explicit confirmation is required before retry.", signal, assertPublication);
           } else {
-            await repository.recordReconciliation(scope, context.job, item, "conflict", observed, "Provider GET reconciliation found an intervening external change. Automatic retry or inversion is prohibited.");
+            await repository.recordReconciliation(scope, context.job, item, "conflict", observed, "Provider GET reconciliation found an intervening external change. Automatic retry or inversion is prohibited.", signal, assertPublication);
           }
         });
+        published = true;
       });
-    } catch {
+    } catch (error) {
+      if (published) throw error;
       errors.push({ resourceNativeId: item.resource_native_id, message: "GET reconciliation could not be completed; no provider state was published." });
     }
   }
-  requireProviderAdmissions();
-  assertAccountSessionValidation(validation);
-  const finalAuthorization = await authorize(scope);
-  assertAccountSessionValidation(validation);
-  requireAuthority(context.job, finalAuthorization.authority);
+  await authorizeJob(scope);
   const current = await repository.get(scope, id);
-  requireProviderAdmissions();
-  assertAccountSessionValidation(validation);
+  assertCurrent();
   if (!current) throw new AppError(404, "not_found", "Quarantine job was not found.");
   return { ...current, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
 }
@@ -300,12 +327,49 @@ export async function drainCopilotStudioQuarantineJobs() {
   if (failure?.status === "rejected") throw failure.reason;
 }
 
-async function authorizeQuarantine(scope: QuarantineScope): Promise<QuarantineAuthorization> {
+async function authorizeQuarantine(scope: QuarantineScope, signal?: AbortSignal): Promise<QuarantineAuthorization> {
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const assertAuthority = capabilities.beginOperationValidation("powerPlatform.quarantine.manage",
+    { tenantId: scope.tenantId, homeAccountId: scope.principalId });
+  const assertCurrent = () => {
+    signal?.throwIfAborted();
+    requireProviderAdmissions();
+    assertAccountSessionValidation(validation);
+    assertAuthority();
+  };
+  assertCurrent();
   const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
+  assertCurrent();
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The quarantine actor no longer matches the signed-in account.");
   await capabilities.requireAvailable("powerPlatform.quarantine.manage", user);
+  assertCurrent();
   const authority = await capabilities.quarantineAuthorityContext(user);
-  return { accessToken: await acquireDelegatedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage"), authority };
+  assertCurrent();
+  const accessToken = await acquireDelegatedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage");
+  assertCurrent();
+  return { accessToken, authority };
+}
+
+async function interruptibleAuthorization<T>(authorize: () => Promise<T>, signal: AbortSignal) {
+  signal.throwIfAborted();
+  let abort!: () => void;
+  const interrupted = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    const authorization = await Promise.race([authorize(), interrupted]);
+    signal.throwIfAborted();
+    return authorization;
+  } finally { signal.removeEventListener("abort", abort); }
+}
+
+async function persistFailure(id: string, stage: string, primaryError: unknown, persist: () => Promise<unknown>) {
+  try { await persist(); }
+  catch (error) {
+    operationalLog("error", "quarantine_job_cleanup_failed", { jobId: id, stage, outcome: "requires_review", ...errorTelemetry(error) });
+    throw primaryError;
+  }
 }
 
 async function finishAuthorized(
@@ -319,15 +383,15 @@ async function finishAuthorized(
   authorize: QuarantineAuthorizer,
   signal: AbortSignal,
   validation: ReturnType<typeof beginAccountSessionValidation>,
+  assertPublication: () => void,
 ) {
-  requireProviderAdmissions();
-  const authorization = await authorize(scope);
+  assertPublication();
+  const authorization = await authorize(scope, signal);
   requireAuthority(job, authorization.authority);
   signal.throwIfAborted();
   await commitAccountSessionValidation(validation, async () => {
-    requireProviderAdmissions();
-    signal.throwIfAborted();
-    await repository.finishItem(lease, item, outcome, evidence);
+    assertPublication();
+    await repository.finishItem(lease, item, outcome, evidence, signal, assertPublication);
   });
 }
 

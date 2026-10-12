@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isProxy } from "node:util/types";
 import { setTimeout as delay } from "node:timers/promises";
 import type pg from "pg";
 import { AppError } from "../errors.js";
@@ -49,14 +50,37 @@ function compatible(rows: readonly pg.QueryResultRow[]) {
     }
   }
 }
-function confirmationInput(input: unknown, hash: string) {
-  if (!input || typeof input !== "object" || Array.isArray(input) || typeof (input as Record<string, unknown>)[hash] !== "string"
-    || !/^[a-f0-9]{64}$/.test((input as Record<string, string>)[hash])) throw new AppError(400, "invalid_import_confirmation", "Review a valid immutable confirmation.");
+function ownIntent(input: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
+  const invalid = () => new AppError(400, "invalid_import_confirmation", "Review a valid immutable confirmation.");
+  if (isProxy(input) || !input || typeof input !== "object" || Array.isArray(input)
+    || Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null) throw invalid();
+  const snapshot: Record<string, unknown> = Object.create(null);
+  for (const key of [...required, ...optional]) {
+    const property = Object.getOwnPropertyDescriptor(input, key);
+    if (!property) {
+      if (required.includes(key)) throw invalid();
+    } else {
+      if (!Object.hasOwn(property, "value")) throw invalid();
+      snapshot[key] = property.value;
+    }
+  }
+  return snapshot;
 }
-function revision(value: unknown) { if (typeof value !== "string" || !/^\d{1,19}$/.test(value)) throw new AppError(400, "invalid_import_confirmation", "Expected a decimal revision."); }
+function confirmationHash(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new AppError(400, "invalid_import_confirmation", "Review a valid immutable confirmation.");
+  }
+  return value;
+}
+function revision(value: unknown): string {
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d{0,18})$/.test(value) || BigInt(value) > 9223372036854775807n) {
+    throw new AppError(400, "invalid_import_confirmation", "Expected a bounded decimal revision.");
+  }
+  return value;
+}
 export function reportUuid(value: unknown): string {
   if (typeof value !== "string" || !/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_identifier", "Expected a UUID.");
-  return value;
+  return value.toLowerCase();
 }
 
 export class OfficialReportImports {
@@ -99,9 +123,12 @@ export class OfficialReportImports {
   }
 
   async open(identity: SelectionIdentity, intent: ReportImportIntent, parent?: AbortSignal) {
-    reportUuid(intent.bundleId);
-    if (intent.correctionOfSetId) reportUuid(intent.correctionOfSetId);
-    if (intent.rejectDuplicateKind !== undefined && typeof intent.rejectDuplicateKind !== "boolean") throw new AppError(400, "invalid_upload_intent", "Duplicate-kind guard must be a boolean.");
+    parent?.throwIfAborted();
+    const supplied = ownIntent(intent, ["bundleId"], ["correctionOfSetId", "rejectDuplicateKind"]);
+    if (supplied.rejectDuplicateKind !== undefined && typeof supplied.rejectDuplicateKind !== "boolean") throw new AppError(400, "invalid_upload_intent", "Duplicate-kind guard must be a boolean.");
+    intent = { bundleId: reportUuid(supplied.bundleId),
+      ...(supplied.correctionOfSetId === undefined ? {} : { correctionOfSetId: reportUuid(supplied.correctionOfSetId) }),
+      rejectDuplicateKind: supplied.rejectDuplicateKind ?? false };
     await this.history.ensure(identity.tenantId);
     const lease: Lease = { id: randomUUID(), owner: randomUUID(), identity };
     await this.connections.run(async client => {
@@ -129,24 +156,40 @@ export class OfficialReportImports {
         VALUES($1,$2,$3,$4,$5,$6,$7,'streaming',clock_timestamp()+interval '60 seconds',clock_timestamp()+interval '30 minutes',clock_timestamp()+interval '30 minutes',$8)`,
       [lease.id, identity.tenantId, identity.principalId, intent.bundleId, intent.correctionOfSetId ?? null, lease.owner, identity.sessionEpoch, intent.rejectDuplicateKind ?? false]);
     }, false, parent);
+    const cancellation = new AbortController();
     const heartbeat = generationHeartbeat(() => this.connections.run(async client => {
       await this.fence(client, lease);
       await client.query("UPDATE official_usage_ingestions SET lease_until=LEAST(deadline_at,clock_timestamp()+interval '60 seconds') WHERE id=$1", [lease.id]);
-    }, true), parent);
+    }, true), parent ? AbortSignal.any([parent, cancellation.signal]) : cancellation.signal);
     let result: StreamedOfficialReport | undefined;
     const cancel = async () => {
+      cancellation.abort(new AppError(400, "upload_cancelled", "Upload cancelled."));
       await heartbeat.stop();
-      await this.cancel(identity, lease.id);
+      try { await this.cancel(identity, lease.id); }
+      catch (error) {
+        operationalLog("error", "official_usage_upload_cleanup_failed");
+        const failure = new AppError(500, "upload_cleanup_failed", "Upload cleanup could not be verified. Inspect owned staging before retrying.");
+        failure.cause = error;
+        throw failure;
+      }
+    };
+    const cancelAfterFailure = async (error: unknown): Promise<never> => {
+      try { await cancel(); }
+      catch (failure) {
+        if (failure instanceof AppError) failure.cause = new AggregateError([error, failure.cause], "official_report_upload_and_cleanup_failed");
+        throw failure;
+      }
+      throw error;
     };
     return {
       id: lease.id, signal: heartbeat.signal,
       receive: async (stream: AsyncIterable<Uint8Array>) => {
         try {
           result = await streamOfficialReport(stream, undefined, heartbeat.signal, {
-            batch: (kind, rows, wireBytes) => this.append(lease, kind, rows, wireBytes),
+            batch: (kind, rows, wireBytes) => this.append(lease, kind, rows, wireBytes, heartbeat.signal),
           });
           return { kind: result.kind, rows: result.rowCount, wireBytes: result.wireBytes };
-        } catch (error) { await cancel(); throw error; }
+        } catch (error) { return cancelAfterFailure(error); }
       },
       finish: async (metadata?: OfficialUsageMetadata) => {
         try {
@@ -173,7 +216,7 @@ export class OfficialReportImports {
           await heartbeat.stop();
           for (const other of replaced) await this.cleanupIngestion(other);
           return await this.preview(identity, finalized.id);
-        } catch (error) { await cancel(); throw error; }
+        } catch (error) { return cancelAfterFailure(error); }
       },
       cancel,
     };
@@ -185,7 +228,7 @@ export class OfficialReportImports {
     return upload.finish(metadata);
   }
 
-  private append(lease: Lease, kind: OfficialUsageReportKind, rows: readonly OfficialRow[], wireBytes: number) {
+  private append(lease: Lease, kind: OfficialUsageReportKind, rows: readonly OfficialRow[], wireBytes: number, signal: AbortSignal) {
     return this.connections.run(async client => {
       await this.tenant(client, lease.identity.tenantId);
       const current = await this.fence(client, lease);
@@ -215,18 +258,18 @@ export class OfficialReportImports {
       }
       await client.query(`UPDATE official_usage_ingestions SET kind=$2,row_count=row_count+$3,stored_bytes=stored_bytes+$4,wire_bytes=$5 WHERE id=$1`,
         [lease.id, kind, rows.length, batch.bytes * 2, wireBytes]);
-    });
+    }, false, signal);
   }
 
   private async finalize(lease: Lease, report: StreamedOfficialReport, metadata: OfficialUsageMetadata | undefined, signal: AbortSignal) {
     const dates = [report.reportingPeriod.startDate, report.reportingPeriod.endDate]
       .filter((date): date is string => date !== null).map(date => ({ lastActivityDateUtc: `${date}T00:00:00.000Z` }));
     const base = reportBase(report.kind, metadata, dates);
-    await this.append(lease, report.kind, [], report.wireBytes);
+    await this.append(lease, report.kind, [], report.wireBytes, signal);
     await this.connections.run(async client => {
       await this.fence(client, lease);
       await client.query("UPDATE official_usage_ingestions SET state='validating',kind=$2,wire_bytes=$3 WHERE id=$1", [lease.id, report.kind, report.wireBytes]);
-    });
+    }, false, signal);
     const { downloadedAt: _downloadedAt, warnings: _warnings, ...contentBase } = base;
     const hash = createHash("sha256").update(JSON.stringify({ kind: report.kind, ...contentBase }));
     let boundary = "", ordinal = -1;
@@ -304,7 +347,9 @@ export class OfficialReportImports {
   }
 
   async bundle(identity: SelectionIdentity, bundleId: string, options: OfficialReportBundleInspection = {}) {
-    reportUuid(bundleId);
+    bundleId = reportUuid(bundleId);
+    const { forDiscard } = ownIntent(options, [], ["forDiscard"]);
+    if (forDiscard !== undefined && typeof forDiscard !== "boolean") throw new AppError(400, "invalid_import_intent", "Bundle cleanup inspection must be a boolean.");
     return this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
       const state = (await client.query("SELECT revision::text FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0];
@@ -316,7 +361,7 @@ export class OfficialReportImports {
           AND i.session_epoch=$4 AND s.expires_at>clock_timestamp() ORDER BY s.kind LIMIT 4`,
       [identity.tenantId, identity.principalId, bundleId, identity.sessionEpoch])).rows;
       if (rows.length > 3) throw unavailable();
-      if (options.forDiscard !== true) compatible(rows);
+      if (forDiscard !== true) compatible(rows);
       const stages = rows.map(row => ({ stagingId: row.id as string, kind: row.kind as OfficialUsageReportKind,
         revision: row.revision as number, contentHash: row.content_hash as string, rowCount: row.row_count as number,
         reconciliation: row.reconciliation as Record<string, unknown> }));
@@ -326,14 +371,13 @@ export class OfficialReportImports {
     });
   }
 
-  acceptBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
+  acceptBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
+    bundleId = reportUuid(bundleId);
+    const supplied = ownIntent(input, ["bundleHash", "expectedActiveRevision"]);
+    input = { bundleHash: confirmationHash(supplied.bundleHash), expectedActiveRevision: revision(supplied.expectedActiveRevision) };
     return settleAcceptance(() => this.acceptReviewedBundle(identity, bundleId, input, signal), signal);
   }
-  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
-    confirmationInput(input, "bundleHash"); revision(input.expectedActiveRevision);
-    if (input.preserveSelection !== undefined && typeof input.preserveSelection !== "boolean") {
-      throw new AppError(400, "invalid_import_intent", "Preserving the report selection must be a boolean.");
-    }
+  private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: { bundleHash: string; expectedActiveRevision: string }, signal?: AbortSignal) {
     const receipt = await this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
       return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at FROM official_usage_bundle_receipts r
@@ -354,8 +398,12 @@ export class OfficialReportImports {
       { bundleId, hash: input.bundleHash, preserveSelection: input.preserveSelection });
   }
   accept(identity: SelectionIdentity, input: ReportAcceptance, signal?: AbortSignal) {
-    confirmationInput(input, "contentHash"); revision(input.expectedActiveRevision);
-    if (!Number.isInteger(input.revision) || input.revision < 1) throw new AppError(400, "invalid_import_confirmation", "Invalid preview revision.");
+    const supplied = ownIntent(input, ["contentHash", "stagingId", "revision", "expectedActiveRevision"]);
+    if (typeof supplied.revision !== "number" || !Number.isSafeInteger(supplied.revision) || supplied.revision < 1 || supplied.revision > 2147483647) {
+      throw new AppError(400, "invalid_import_confirmation", "Invalid preview revision.");
+    }
+    input = { stagingId: reportUuid(supplied.stagingId), revision: supplied.revision,
+      contentHash: confirmationHash(supplied.contentHash), expectedActiveRevision: revision(supplied.expectedActiveRevision) };
     return settleAcceptance(() => this.acceptStages(identity, [input], signal), signal);
   }
 
@@ -621,7 +669,7 @@ export class OfficialReportImports {
   }
 
   async confirmPreview(identity: SelectionIdentity, setId: string, operation: "select" | "delete"): Promise<ReportConfirmation> {
-    reportUuid(setId);
+    setId = reportUuid(setId);
     if (!["select", "delete"].includes(operation)) throw new AppError(400, "invalid_operation", "Unsupported operation.");
     await this.history.ensure(identity.tenantId);
     return this.connections.run(async client => {
@@ -640,9 +688,11 @@ export class OfficialReportImports {
     });
   }
   confirm(identity: SelectionIdentity, input: ReportConfirmation) {
-    confirmationInput(input, "hash"); reportUuid(input.id); reportUuid(input.setId);
-    revision(input.activeRevision); revision(input.historyRevision); revision(input.historyEpoch);
-    if (!["select", "delete"].includes(input.operation)) throw new AppError(400, "invalid_operation", "Unsupported operation.");
+    const supplied = ownIntent(input, ["hash", "id", "setId", "operation", "activeRevision", "historyRevision", "historyEpoch"]);
+    if (supplied.operation !== "select" && supplied.operation !== "delete") throw new AppError(400, "invalid_operation", "Unsupported operation.");
+    input = { id: reportUuid(supplied.id), setId: reportUuid(supplied.setId), operation: supplied.operation,
+      activeRevision: revision(supplied.activeRevision), historyRevision: revision(supplied.historyRevision),
+      historyEpoch: revision(supplied.historyEpoch), hash: confirmationHash(supplied.hash) };
     const { hash: _hash, ...intent } = input;
     if (digest(JSON.stringify({ id: intent.id, setId: intent.setId, operation: intent.operation, activeRevision: intent.activeRevision,
       historyRevision: intent.historyRevision, historyEpoch: intent.historyEpoch, identity })) !== input.hash) throw new AppError(409, "confirmation_mismatch", "The confirmation belongs to another authorization epoch.");
@@ -751,7 +801,8 @@ export class OfficialReportImports {
           CASE WHEN s.kind='users' AND EXISTS(SELECT 1 FROM companions c WHERE c.kind='userAgents' AND c.row_data->>'username'=r.row_data->>'username')
             AND ((r.row_data->>'agentResponsesReceived')::numeric<>(SELECT sum((c.row_data->>'responsesSentToUsers')::numeric) FROM companions c
               WHERE c.kind='userAgents' AND c.row_data->>'username'=r.row_data->>'username')
-            OR (r.row_data->>'numberOfAgentsUsed')::numeric<>(SELECT count(*) FROM companions c WHERE c.kind='userAgents' AND c.row_data->>'username'=r.row_data->>'username'))
+            OR (r.row_data->>'numberOfAgentsUsed')::numeric<>(SELECT count(DISTINCT c.row_data->>'agentId') FROM companions c
+              WHERE c.kind='userAgents' AND c.row_data->>'username'=r.row_data->>'username' AND (c.row_data->>'responsesSentToUsers')::numeric>0))
             THEN 'users_bridge_mismatch'
           WHEN s.kind='agents' AND EXISTS(SELECT 1 FROM companions c WHERE c.kind='userAgents' AND c.row_data->>'agentId'=r.row_data->>'agentId')
             AND (r.row_data->>'responsesSentToUsers')::numeric<>(SELECT sum((c.row_data->>'responsesSentToUsers')::numeric) FROM companions c

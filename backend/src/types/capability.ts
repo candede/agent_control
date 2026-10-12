@@ -1,3 +1,5 @@
+import type { AuditAction } from "./audit.js";
+
 export const appRoles = [
   "AgentControl.Viewer",
   "AgentControl.Admin",
@@ -30,6 +32,10 @@ export const capabilityIds = [
 ] as const;
 
 export type CapabilityId = (typeof capabilityIds)[number];
+
+export function packageMutationCapability(action: AuditAction): "graph.package.block.manage" | "graph.package.access.manage" | "graph.package.reassign.manage" {
+  return action === "block" || action === "unblock" ? "graph.package.block.manage" : action === "reassign" ? "graph.package.reassign.manage" : "graph.package.access.manage";
+}
 
 export type CapabilityCheckProgress = {
   checks: Array<{ capabilityId: CapabilityId; state: "reviewing" | "checking" | "complete" }>;

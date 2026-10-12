@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events";
+import { errorMonitor, EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Request, Response } from "express";
@@ -25,11 +25,87 @@ describe("operational telemetry", () => {
     expect(JSON.parse(log.mock.calls[1][0])).not.toHaveProperty("poolQueue");
   });
 
+  it("contains resource sampling failures without inventing a healthy sample", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process, "memoryUsage").mockImplementationOnce(() => { throw new Error("synthetic memory failure"); });
+    expect(() => observeRuntimeResources({ totalCount: 1, idleCount: 0, waitingCount: 0 })).not.toThrow();
+    expect(log).not.toHaveBeenCalled();
+    observeRuntimeResources({ totalCount: 1, idleCount: 0, waitingCount: 0 });
+    expect(log).toHaveBeenCalledOnce();
+  });
+
   it("retains only bounded allowlisted metadata", () => {
     expect(safeTelemetry({
       requestId: "request-1", status: 429, token: "secret", cookie: "secret",
       source: "official_usage", providerBody: { sensitive: true }, outcome: "failed",
     })).toEqual({ requestId: "request-1", status: 429, source: "official_usage", outcome: "failed" });
+  });
+
+  it("enforces numeric, boolean and finite diagnostic-label contracts", () => {
+    for (const field of ["count", "queriedTypeCount", "page", "attempt", "schemaVersion", "length"]) {
+      for (const value of ["private-value", true, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(safeTelemetry({ [field]: value })).toEqual({});
+      }
+    }
+    for (const field of ["durationMs", "ageMs", "deadlineMs", "retryDelayMs"]) {
+      for (const value of ["private-value", true, -1, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(safeTelemetry({ [field]: value })).toEqual({});
+      }
+    }
+    for (const field of ["hasContinuation", "resultTruncated", "environmentScoped"]) {
+      for (const value of ["private-value", 0, 1]) expect(safeTelemetry({ [field]: value })).toEqual({});
+    }
+    for (const field of ["provider", "source", "stage", "mode", "outcome", "status", "reason", "field", "actualType", "resourceType", "capabilityId", "errorKind"]) {
+      expect(safeTelemetry({ [field]: "private_provider_value" })).toEqual({});
+    }
+    for (const value of [99, 600, -1, 200.5, true]) expect(safeTelemetry({ status: value })).toEqual({});
+    expect(safeTelemetry({
+      status: "waiting_authorization", mode: "POST", source: "directory", actualType: "undefined",
+      reason: "identity_too_long", durationMs: 0.5, count: Number.MAX_SAFE_INTEGER,
+    })).toEqual({
+      status: "waiting_authorization", mode: "POST", source: "directory", actualType: "undefined",
+      reason: "identity_too_long", durationMs: 0.5, count: Number.MAX_SAFE_INTEGER,
+    });
+  });
+
+  it("reads only bounded own data fields without evaluating getters or enumerating provider keys", () => {
+    const getter = vi.fn(() => { throw new Error("private getter failure"); });
+    const fields = Object.create({ jobId: "inherited-job" }, {
+      count: { value: 2, enumerable: true },
+      requestId: { get: getter, enumerable: true },
+      token: { get: getter, enumerable: true },
+      toJSON: { get: getter, enumerable: true },
+    });
+    const proxy = new Proxy(fields, { ownKeys: () => { throw new Error("private enumeration failure"); } });
+    expect(safeTelemetry(fields)).toEqual({ count: 2 });
+    expect(safeTelemetry(proxy)).toEqual({});
+    expect(getter).not.toHaveBeenCalled();
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expect(safeTelemetry(revoked.proxy)).toEqual({});
+  });
+
+  it("does not traverse repeated, cyclic, accessor or coercible metadata values", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const coerce = vi.fn(() => { throw new Error("private coercion failure"); });
+    const value = { toJSON: coerce, toString: coerce };
+    Object.assign(value, { self: value });
+    operationalLog("info", "metadata_sample", {
+      count: value, durationMs: value, requestId: value, token: value, jobId: value, page: 2,
+    });
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ event: "metadata_sample", page: 2 });
+    expect(coerce).not.toHaveBeenCalled();
+  });
+
+  it("contains serialization failures as well as sink failures without replacing business outcomes", async () => {
+    const failure = new Error("original business failure");
+    vi.spyOn(JSON, "stringify").mockImplementationOnce(() => { throw new Error("private serialization failure"); });
+    await expect(withTelemetryContext({ requestId: "request-a" }, async () => {
+      try { throw failure; }
+      finally { operationalLog("error", "work_failed", { errorCode: "internal_error" }); }
+    })).rejects.toBe(failure);
+    vi.spyOn(Date.prototype, "toISOString").mockImplementationOnce(() => { throw new RangeError("invalid clock"); });
+    expect(() => operationalLog("info", "work_succeeded")).not.toThrow();
   });
 
   it("preserves primitive boundary values while excluding unsafe or nonprimitive values", () => {
@@ -123,6 +199,15 @@ describe("operational telemetry", () => {
     expect(log).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["info", "log"], ["warn", "warn"], ["error", "error"],
+  ] as const)("does not propagate a %s log sink failure into application work", (level, method) => {
+    const log = vi.spyOn(console, method).mockImplementation(() => { throw new Error("Synthetic sink failure."); });
+    expect(() => operationalLog(level, "data_lifecycle_metrics", { stage: "export", rows: 10 })).not.toThrow();
+    expect(log).toHaveBeenCalledOnce();
+    expect(() => operationalLog(level, "invalid-event")).toThrow("Telemetry event name is invalid.");
+  });
+
   it("never substitutes a native URL when the route template is unavailable or unsupported", () => {
     for (const path of [undefined, null, 42, ["/inventory/:id"], /^\/inventory\/(.+)$/]) {
       const request = {
@@ -133,6 +218,21 @@ describe("operational telemetry", () => {
     }
     expect(requestRouteTemplate({ originalUrl: "/private-id" } as Request)).toBe("unmatched");
     expect(requestRouteTemplate({ route: { path: "/inventory/:id" } } as Request)).toBe("/inventory/:id");
+  });
+
+  it("does not evaluate route-template or response-local accessors for HTTP evidence", () => {
+    const getter = vi.fn(() => { throw new Error("private HTTP metadata getter"); });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const request = Object.defineProperty({ method: "GET" }, "route", { get: getter }) as Request;
+    expect(requestRouteTemplate(request)).toBe("unmatched");
+    expect(requestRouteTemplate({ route: Object.defineProperty({}, "path", { get: getter }) } as Request)).toBe("unmatched");
+    const locals = Object.defineProperty({ requestId: "request-original" }, "jobId", { get: getter, enumerable: true });
+    const response = Object.assign(new EventEmitter(), { statusCode: 200, locals }) as Response;
+    httpTelemetry(request, response, vi.fn());
+    locals.requestId = "request-mutated";
+    response.emit("finish");
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ requestId: "request-original", route: "unmatched" });
+    expect(getter).not.toHaveBeenCalled();
   });
 
   it("logs denied requests with code-owned route templates, not native paths, bodies or headers", () => {
@@ -209,6 +309,189 @@ describe("operational telemetry", () => {
     expect(entries[1]).toMatchObject({ requestId: "request-a", jobId: "job-a", route: "/inventory/refresh-jobs" });
     expect(entries[2]).not.toHaveProperty("requestId");
     expect(entries[2]).not.toHaveProperty("jobId");
+  });
+
+  it("snapshots context fields without running accessors and supports explicit context clearing", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const fields = { requestId: "request-original", jobId: "job-original" };
+    const getter = vi.fn(() => { throw new Error("private context getter"); });
+    await withTelemetryContext(fields, async () => {
+      fields.jobId = "job-mutated";
+      await Promise.resolve();
+      operationalLog("info", "before_clear");
+      withTelemetryContext(Object.defineProperty({ requestId: undefined, route: "/fixture" }, "jobId", { get: getter }), () => {
+        operationalLog("info", "cleared_context");
+      });
+      operationalLog("info", "restored_context");
+    });
+    const entries = log.mock.calls.map(([entry]) => JSON.parse(entry));
+    expect(entries[0]).toMatchObject({ requestId: "request-original", jobId: "job-original" });
+    expect(entries[1]).toMatchObject({ route: "/fixture" });
+    expect(entries[1]).not.toHaveProperty("requestId");
+    expect(entries[1]).not.toHaveProperty("jobId");
+    expect(entries[2]).toMatchObject({ requestId: "request-original", jobId: "job-original" });
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("does not resurrect inherited correlation when an explicit log field is cleared or rejected", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    withTelemetryContext({ requestId: "request-parent", jobId: "job-parent", route: "/parent" }, () => {
+      operationalLog("info", "uncorrelated_sample", {
+        requestId: undefined, jobId: "private@example.invalid", route: "/private?token=never-log",
+      });
+    });
+    const entry = JSON.parse(log.mock.calls[0][0]);
+    expect(entry).not.toHaveProperty("requestId");
+    expect(entry).not.toHaveProperty("jobId");
+    expect(entry).not.toHaveProperty("route");
+  });
+
+  it("binds HTTP terminal events to their request rather than the emitter's context", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), {
+      statusCode: 200, locals: { requestId: "request-a" },
+    }) as Response;
+    withTelemetryContext({ requestId: "request-parent", jobId: "job-parent", route: "/parent" }, () => {
+      httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, () => {
+        operationalLog("info", "inside_request");
+      });
+    });
+    withTelemetryContext({ requestId: "request-b", jobId: "job-b" }, () => response.emit("finish"));
+    const entries = log.mock.calls.map(([entry]) => JSON.parse(entry));
+    expect(entries[0]).toMatchObject({ requestId: "request-a" });
+    expect(entries[0]).not.toHaveProperty("route");
+    expect(entries[0]).not.toHaveProperty("jobId");
+    expect(entries[1]).toMatchObject({ requestId: "request-a", route: "/fixture" });
+    expect(entries[1]).not.toHaveProperty("jobId");
+    expect(response.listenerCount("close")).toBe(0);
+  });
+
+  it("settles an aborted response only once even if a late finish follows", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), {
+      statusCode: 200, locals: { requestId: "request-a" },
+    }) as Response;
+    httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+    response.emit("close");
+    response.emit("finish");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(log).not.toHaveBeenCalled();
+    expect(response.listenerCount("finish")).toBe(0);
+  });
+
+  it("recognizes a fully written close and releases both terminal listeners", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), {
+      statusCode: 200, writableFinished: true, locals: { requestId: "request-finished" },
+    }) as Response;
+    httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+    response.emit("close");
+    response.emit("finish");
+    expect(log).toHaveBeenCalledOnce();
+    expect(warn).not.toHaveBeenCalled();
+    expect(response.listenerCount("finish")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+  });
+
+  it.each([false, true])("settles response errors without handling them or accepting a late finish (handled: %s)", handled => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), {
+      statusCode: 200, writableFinished: false, locals: { requestId: "request-error", jobId: "job-running" },
+    }) as Response;
+    const failure = new Error("private response failure");
+    const listener = vi.fn();
+    if (handled) response.on("error", listener);
+    httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+    withTelemetryContext({ requestId: "other-request", jobId: "other-job" }, () => {
+      if (handled) expect(() => response.emit("error", failure)).not.toThrow();
+      else expect(() => response.emit("error", failure)).toThrow(failure);
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    response.emit("finish");
+    response.emit("close");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(log).not.toHaveBeenCalled();
+    expect(JSON.parse(warn.mock.calls[0][0])).toMatchObject({
+      event: "http_request_aborted", requestId: "request-error", jobId: "job-running", route: "/fixture",
+    });
+    expect(warn.mock.calls[0][0]).not.toContain("private response failure");
+    expect(response.listenerCount("finish")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+    expect(response.listenerCount(errorMonitor)).toBe(0);
+    expect(listener).toHaveBeenCalledTimes(handled ? 1 : 0);
+    expect(response.listenerCount("error")).toBe(handled ? 1 : 0);
+  });
+
+  it("classifies only numeric HTTP statuses without coercing diagnostic values", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const coerce = vi.fn(() => { throw new Error("private status coercion"); });
+    for (const statusCode of ["503", "failed", true, { [Symbol.toPrimitive]: coerce }]) {
+      const response = Object.assign(new EventEmitter(), { statusCode, locals: {} }) as unknown as Response;
+      httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+      expect(() => response.emit("finish")).not.toThrow();
+    }
+    expect(log).toHaveBeenCalledTimes(4);
+    for (const [entry] of log.mock.calls) {
+      expect(JSON.parse(entry)).toMatchObject({ event: "http_request", level: "info" });
+      expect(JSON.parse(entry)).not.toHaveProperty("status");
+    }
+    expect(coerce).not.toHaveBeenCalled();
+  });
+
+  it.each(["finish", "close"] as const)("contains terminal %s clock failures and releases telemetry listeners", terminal => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), { statusCode: 200, locals: {} }) as Response;
+    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(100)
+      .mockImplementation(() => { throw new Error("private clock failure"); });
+    httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+    expect(() => response.emit(terminal)).not.toThrow();
+    clock.mockRestore();
+    response.emit("finish");
+    response.emit("close");
+    expect(response.listenerCount("finish")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+    expect(response.listenerCount(errorMonitor)).toBe(0);
+    expect([...log.mock.calls, ...warn.mock.calls]).toHaveLength(0);
+  });
+
+  it.each([false, true])("does not let initial response-locals accessors or clock failure stop the request (clock failed: %s)", clockFailed => {
+    const getter = vi.fn(() => { throw new Error("private response locals"); });
+    const response = Object.defineProperty(Object.assign(new EventEmitter(), { statusCode: 200 }), "locals", {
+      get: getter,
+    }) as Response;
+    const request = { method: "GET", route: { path: "/fixture" } } as Request;
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => {
+      if (clockFailed) throw new Error("private clock failure");
+      return 100;
+    });
+    const next = vi.fn();
+    expect(() => httpTelemetry(request, response, next)).not.toThrow();
+    expect(next).toHaveBeenCalledOnce();
+    clock.mockRestore();
+    expect(() => response.emit("finish")).not.toThrow();
+    expect(getter).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledTimes(clockFailed ? 0 : 1);
+    expect(response.listenerCount("finish")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+    expect(response.listenerCount(errorMonitor)).toBe(0);
+  });
+
+  it("keeps completed response errors unhandled without relogging or retaining the monitor", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), { statusCode: 200, locals: {} }) as Response;
+    httpTelemetry({ method: "GET", route: { path: "/fixture" } } as Request, response, vi.fn());
+    response.emit("finish");
+    const failure = new Error("private late transport error");
+    expect(() => response.emit("error", failure)).toThrow(failure);
+    expect(log).toHaveBeenCalledOnce();
+    expect(warn).not.toHaveBeenCalled();
+    expect(response.listenerCount(errorMonitor)).toBe(0);
   });
 
   it("restores the parent context after synchronous throws and asynchronous rejection", async () => {

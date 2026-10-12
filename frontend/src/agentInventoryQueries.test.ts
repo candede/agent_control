@@ -518,6 +518,47 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledOnce();
   });
 
+  it.each(["selection", "detail"] as const)("retains %s evidence until its exact fractional deadline", async boundary => {
+    const result = pageWithPeople(undefined);
+    const expiresAt = "2026-09-20T14:00:00.000000002+02:00";
+    if (boundary === "selection") result.selection.expiresAt = expiresAt;
+    else result.value[0].packages = [{
+      id: "package", displayName: "Package", isBlocked: false, sourceSystem: "graph_packages",
+      authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown",
+      identityConfidence: "exact_native", provenance: {},
+      detailFreshness: { state: "fresh", observedAt: "2026-09-20T11:59:59.999999999Z", expiresAt },
+    }];
+    read.mockResolvedValue(result);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+    expect(queries.getCached("owner", {})).toBe(result);
+    vi.advanceTimersByTime(1);
+    expect(queries.getCached("owner", {})).toBeUndefined();
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+  });
+
+  it("rejects invalid calendar expiry even when Date.parse normalizes it", async () => {
+    read.mockResolvedValue(page("2026-09-31T12:00:00Z"));
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+  });
+
+  it("keeps browser-safe fractional detail expiry independent of raw Date.parse support", async () => {
+    const result = pageWithPeople(undefined);
+    result.value[0].observations.packageSnapshots.package = {
+      id: "catalog", snapshotId: "catalog", scopeKind: "broad", current: true,
+      observedAt: "2026-09-20T11:00:00Z", expiresAt: result.selection.expiresAt,
+      identityDetails: { id: "detail", snapshotId: "detail", current: true,
+        observedAt: "2026-09-20T11:59:59.999999999Z", expiresAt: "2026-09-20T12:00:00.000000002Z" },
+    };
+    const parse = Date.parse;
+    vi.spyOn(Date, "parse").mockImplementation(text =>
+      /\.\d{4,}(?:Z|[+-]\d{2}:\d{2})$/.test(text) ? NaN : parse(text));
+    read.mockResolvedValue(result);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(result);
+    expect(queries.getCached("owner", {})).toBe(result);
+    vi.advanceTimersByTime(1);
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+  });
+
   it("retains only the current and directly adjacent pinned pages, including reverse-cursor aliases", async () => {
     read.mockImplementation(async query => {
       const number = Number(query?.cursor?.split("-").at(-1) ?? 0);

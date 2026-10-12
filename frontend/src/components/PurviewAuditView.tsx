@@ -48,6 +48,10 @@ const readableStatuses = new Set<PurviewAuditJob["status"]>([
   "succeeded",
   "partial",
 ]);
+const cancellableStatuses = new Set<PurviewAuditJob["status"]>([
+  "waiting_authorization",
+  ...activeStatuses,
+]);
 const recordPageSize = 100;
 const historyPageSize = 20;
 const providerAuthorizationErrors = new Set([
@@ -124,7 +128,7 @@ function PurviewAuditSession({ userPrincipalName, agentRecordId, presets, active
   const [pollCycle, setPollCycle] = useState(0);
   const [pollPaused, setPollPaused] = useState(false);
   const pollBudget = useRef<{ deadline: number; attempts: number } | undefined>(undefined);
-  const refreshedQualification = useRef<string | undefined>(undefined);
+  const refreshedLifecycle = useRef<string | undefined>(undefined);
 
   function selectJob(job: PurviewAuditJob | undefined, origin: "history" | "action" = "history") {
     if (job) {
@@ -409,18 +413,19 @@ function PurviewAuditSession({ userPrincipalName, agentRecordId, presets, active
   }, [active, contextCurrent, hasProgressingJobs, historyLoading, pollCycle, pollPaused]);
 
   useEffect(() => {
-    const qualificationJob = qualification?.jobId
+    const lifecycleJob = qualification?.jobId
       ? selected?.id === qualification.jobId ? selected : jobs.find((job) => job.id === qualification.jobId)
-      : undefined;
+      : selectionOrigin.current === "action" && selected?.tokenMode === "delegated"
+        && selected.authorizationPrincipalId === capability.user?.homeAccountId ? selected : undefined;
 
-    if (active && !historyLoading && !busy && qualificationJob?.status === "succeeded" && refreshedQualification.current !== qualificationJob.id) {
-      refreshedQualification.current = qualificationJob.id;
+    if (active && !historyLoading && !busy && lifecycleJob?.status === "succeeded" && refreshedLifecycle.current !== lifecycleJob.id) {
+      refreshedLifecycle.current = lifecycleJob.id;
       const generation = requestGeneration.current;
       void reloadCapability().catch(requestError => {
         if (currentRequest(generation)) setError(errorMessage(requestError));
       });
     }
-  }, [active, busy, historyLoading, jobs, qualification, selected]);
+  }, [active, busy, capability.user?.homeAccountId, historyLoading, jobs, qualification, selected]);
 
   const capabilityId =
     tokenMode === "delegated"
@@ -480,9 +485,11 @@ function PurviewAuditSession({ userPrincipalName, agentRecordId, presets, active
       assertExactJob(exactJob, exactId, userPrincipalName, agentRecordId);
       updateSelectedJob(exactJob);
     }
-    if (currentRequest(generation, action) && draftGeneration.current === draft && qualification?.jobId
-      && [...history.value, ...(exactJob ? [exactJob] : [])].some(job => job.id === qualification.jobId && job.status === "succeeded")) {
-      refreshedQualification.current = qualification.jobId;
+    const lifecycleJobId = qualification?.jobId ?? (selectionOrigin.current === "action" && selectedRef.current?.tokenMode === "delegated"
+      && selectedRef.current.authorizationPrincipalId === capability.user?.homeAccountId ? selectedRef.current.id : undefined);
+    if (currentRequest(generation, action) && draftGeneration.current === draft && lifecycleJobId
+      && [...history.value, ...(exactJob ? [exactJob] : [])].some(job => job.id === lifecycleJobId && job.status === "succeeded")) {
+      refreshedLifecycle.current = lifecycleJobId;
       await capability.reload();
     }
   }
@@ -1057,7 +1064,7 @@ function HistoryTable({
                       <Play aria-hidden="true" />
                     </IconAction>
                   ) : null}
-                  {activeStatuses.has(job.status) ? (
+                  {cancellableStatuses.has(job.status) ? (
                     <IconAction
                       label={`Cancel local polling ${shortId(job.id)}`}
                       title="Stop local polling; remote work may continue"

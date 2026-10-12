@@ -14,6 +14,10 @@ export type DefenderHuntingPartialReason = "hunting_row_limit";
 export type DefenderHuntingFieldState = "value" | "null" | "empty" | "unavailable";
 export type DefenderInventoryDetailState = "not_supplied" | "empty" | "present_unqualified_shape" | "not_exposed";
 
+export function isDefenderHuntingRequestId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+
 export type DefenderHuntingAssociation =
   | { status: "resolved"; sourceSystem: "power_platform" | "graph_packages"; nativeId: string; resourceType: string; environmentId: string | null; matchedKind: "entra_agent_id" }
   | { status: "unresolved"; reason: "no_documented_exact_identifier" | "no_documented_cross_source_relation" | "blueprint_is_parent_not_equivalence" }
@@ -143,6 +147,18 @@ export type DefenderAgentActivityRow = {
 };
 
 export type DefenderHuntingRow = DefenderAgentInventoryRow | DefenderAgentActivityRow;
+
+export function defenderHuntingFieldAvailable(actionType: string, field: keyof DefenderAgentActivityRow["fieldStates"]) {
+  switch (field) {
+    case "conversationThreadId": return actionType === "InferenceCall";
+    case "channelName": return actionType !== "InferenceCall";
+    case "humanActorUserObjectId":
+    case "targetAgentUserObjectId": return actionType === "InvokeAgent";
+    case "agentUserObjectId": return actionType !== "InvokeAgent";
+    case "errorType": return !actionType.startsWith("ExecuteTool");
+    default: return true;
+  }
+}
 
 export type DefenderHuntingQueryResult = {
   rows: DefenderHuntingRow[];

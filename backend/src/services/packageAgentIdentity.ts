@@ -1,6 +1,8 @@
-import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import { isPackageId, type CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { AppError } from "../errors.js";
 import { normalizeNativeIdentity, powerPlatformAgentKey } from "./inventoryIdentity.js";
+import { compareInventoryTimestamps } from "./inventoryTimestamp.js";
 import {
   isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName,
   readPackageAgentMetadata, readPackageCustomEngineBotIdentity, supplied, type PackageAgentMetadata,
@@ -44,6 +46,13 @@ export function resolvePackageAgentLinks(
   packages: readonly CopilotPackageDetail[],
   resources: readonly PowerPlatformResource[],
 ): PackageAgentLinkResolution[] {
+  packages = packages.map(value => {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || !isPackageId(Object.getOwnPropertyDescriptor(value, "id")?.value)) {
+      throw new AppError(500, "saved_source_invalid", "Saved package identity is invalid.");
+    }
+    return Object.create(null, Object.getOwnPropertyDescriptors(value));
+  });
   const candidates = resources.filter(resource =>
     normalizeNativeIdentity(resource.tenantId) === normalizeNativeIdentity(tenantId)
       && resource.type === "microsoft.copilotstudio/agents",
@@ -68,11 +77,16 @@ export function resolvePackageAgentLinks(
     }
   }
   const identities = new Map<string, PackageAgentMetadata>();
+  const manifests = new Map<string, string>();
   const resolutions: PackageAgentLinkResolution[] = packages.map(value => {
-    if (value.identityRevalidationRequired) return {
+    if (Object.getOwnPropertyDescriptor(value, "identityRevalidationRequired")?.value) return {
       packageId: value.id, status: "unmatched",
       reason: "Saved observations reported changed identity evidence. Refresh this package's identity before linking it to a Power Platform agent.",
     };
+    let observation = readPackageAgentMetadata(value);
+    if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
+      return { packageId: value.id, ...observation };
+    }
     if (value.detailFreshness && value.detailFreshness.state !== "fresh") {
       const catalogManifest = value.detailFreshness.state !== "invalidated" && normalizedGuid(value.manifestId)
         && value.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots"))
@@ -86,10 +100,7 @@ export function resolvePackageAgentLinks(
       // Current catalog manifest/type evidence is independent of hourly detail freshness.
       // Never reuse expired detail IDs, environment constraints, or control proof.
       value = { ...value, elementDetails: undefined, identityDetailsCollected: undefined };
-    }
-    const observation = readPackageAgentMetadata(value);
-    if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
-      return { packageId: value.id, ...observation };
+      observation = readPackageAgentMetadata(value);
     }
     const identity = observation.identity;
     if (identity) identities.set(value.id, identity);
@@ -104,6 +115,7 @@ export function resolvePackageAgentLinks(
     if (manifestId && declarativeElements.length > 1) {
       return { packageId: value.id, status: "ambiguous", reason: "The package contains multiple declarative agents; a manifest alone cannot select one native agent." };
     }
+    if (manifestId && !identity?.cdsBotId) manifests.set(value.id, manifestId);
     const grouping = identity?.environmentId && identity.cdsBotId
       ? { key: identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId), environmentId: identity.environmentId }
       : manifestId && !identity?.cdsBotId
@@ -245,12 +257,13 @@ export function resolvePackageAgentLinks(
       ? { packageId: resolution.packageId, status: "conflicting", reason: "Package representations disagree about this agent's native identities or schema name; no link was created." }
       : resolution;
   });
-  return linkCustomEngineRepresentations(packages, identities, validated, candidates);
+  return linkCustomEngineRepresentations(packages, identities, manifests, validated, candidates);
 }
 
 function linkCustomEngineRepresentations(
   packages: readonly CopilotPackageDetail[],
   identities: ReadonlyMap<string, PackageAgentMetadata>,
+  manifests: ReadonlyMap<string, string>,
   resolutions: readonly PackageAgentLinkResolution[],
   resources: readonly PowerPlatformResource[],
 ): PackageAgentLinkResolution[] {
@@ -289,7 +302,14 @@ function linkCustomEngineRepresentations(
       ...nativeIdentities.flatMap(identity => identity.schemaName ?? []),
       ...[...targets].flatMap(target => resourceSchemas.get(target) ?? []),
     ]);
-    if (targets.size > 1 || environments.size > 1 || bots.size > 1 || schemas.size > 1) {
+    const declaredManifests = new Set(members.flatMap(member => manifests.get(member.packageId) ?? []));
+    const manifest = [...declaredManifests][0];
+    // A shared bot application cannot erase a declarative manifest's native/schema claim.
+    const manifestConflict = declaredManifests.size > 1 || manifest !== undefined
+      && ([...bots, ...schemas].some(id => id !== manifest)
+        || matched.some(link => normalizedGuid(link.resource.nativeId) !== manifest
+          || resourceSchemas.get(powerPlatformAgentKey(link.resource.environmentId, link.resource.nativeId)) !== manifest));
+    if (targets.size > 1 || environments.size > 1 || bots.size > 1 || schemas.size > 1 || manifestConflict) {
       for (const member of members) {
         const resolution = result.get(member.packageId)!;
         if (resolution.status === "unmatched" && !resolution.invalidMetadata && !identities.get(member.packageId)?.cdsBotId) {
@@ -302,6 +322,15 @@ function linkCustomEngineRepresentations(
       continue;
     }
     const relatedPackageIds = anchors.map(anchor => anchor.packageId).sort();
+    const environmentId = [...environments][0] ?? null;
+    const sourceGroup = members.flatMap(member => {
+      const candidate = result.get(member.packageId)!;
+      return candidate.status === "unmatched" && identities.get(member.packageId)?.cdsBotId && candidate.grouping ? [candidate.grouping] : [];
+    })[0] ?? {
+      key: manifest ? identityKey(environmentId ?? "", "declarative_manifest", manifest)
+        : identityKey("", "custom_engine_bot_application", botApplicationId),
+      environmentId,
+    };
     for (const member of members) {
       const resolution = result.get(member.packageId)!;
       if (resolution.status !== "unmatched" || resolution.invalidMetadata) continue;
@@ -315,14 +344,10 @@ function linkCustomEngineRepresentations(
             relatedPackageIds,
           }],
         });
-      } else if (!members.some(member => result.get(member.packageId)!.status !== "unmatched")) {
-        const sourceGroup = members.flatMap(member => {
-          const candidate = result.get(member.packageId)!;
-          return candidate.status === "unmatched" && identities.get(member.packageId)?.cdsBotId && candidate.grouping ? [candidate.grouping] : [];
-        })[0];
+      } else if (!matched.length) {
         result.set(member.packageId, {
           ...resolution,
-          grouping: sourceGroup ?? { key: identityKey("", "custom_engine_bot_application", botApplicationId), environmentId: [...environments][0] ?? null },
+          grouping: sourceGroup,
         });
       }
     }
@@ -345,14 +370,13 @@ export function withVerifiedControlIdentities(
   for (const link of links) {
     if (link.status !== "matched" || !link.controlBotId
       || !link.evidence.some(evidence => evidence.kind === "environment_schema_native_id")) continue;
-    const observation = observations[link.packageId];
-    const identityObservation = observation?.identityDetails ?? observation;
-    if (!identityObservation) continue;
-    const observedAt = Date.parse(identityObservation.observedAt);
-    const catalogObservedAt = Date.parse(observation.observedAt);
-    if (!Number.isFinite(observedAt) || observedAt > now || observedAt < now - maximumAgeMs
-      || !Number.isFinite(catalogObservedAt) || catalogObservedAt > now || catalogObservedAt < now - maximumAgeMs
-      || !(Date.parse(identityObservation.expiresAt) > now) || !(Date.parse(observation.expiresAt) > now)) continue;
+    const observation = Object.getOwnPropertyDescriptor(observations, link.packageId)?.value;
+    if (!observation || typeof observation !== "object" || Array.isArray(observation)) continue;
+    const identityDetails = Object.getOwnPropertyDescriptor(observation, "identityDetails");
+    if (identityDetails && !Object.hasOwn(identityDetails, "value")) continue;
+    const identityObservation = identityDetails?.value ?? observation;
+    if (!freshControlObservation(identityObservation, now, maximumAgeMs)
+      || !freshControlObservation(observation, now, maximumAgeMs)) continue;
     verified.set(powerPlatformAgentKey(link.resource.environmentId, link.resource.nativeId), link.controlBotId);
   }
   return resources.map(resource => {
@@ -371,6 +395,22 @@ export function withVerifiedControlIdentities(
       },
     };
   });
+}
+
+function freshControlObservation(observation: { observedAt: string; expiresAt: string }, now: number, maximumAgeMs: number) {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return false;
+  const observedAt = Object.getOwnPropertyDescriptor(observation, "observedAt")?.value;
+  const expiresAt = Object.getOwnPropertyDescriptor(observation, "expiresAt")?.value;
+  if (typeof observedAt !== "string" || typeof expiresAt !== "string") return false;
+  try {
+    const evaluation = new Date(now);
+    return compareInventoryTimestamps(observedAt, evaluation) <= 0
+      && compareInventoryTimestamps(observedAt, new Date(now - maximumAgeMs)) >= 0
+      && compareInventoryTimestamps(expiresAt, evaluation) > 0;
+  } catch (error) {
+    if (!(error instanceof AppError) || error.code !== "saved_source_invalid") throw error;
+    return false;
+  }
 }
 
 function identifierValues(resource: PowerPlatformResource, kind: "entra_agent_id" | "entra_app_id" | "cds_bot_id") {

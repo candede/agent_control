@@ -18,6 +18,7 @@ describe("usage evidence formatting", () => {
     null, undefined, "", "not-a-date", "0", "2026", "2026-02-29", "2026-04-31",
     "2026-02-30T00:00:00Z", "2026-01-01T24:00:00Z", "2026-01-01T12:00:00",
     "2026-01-01T12:00:00+14:01", "2026-01-01T12:00:00+15:00",
+    `2026-01-01T12:00:00.${"1".repeat(108)}Z`,
   ])("does not turn invalid or ambiguous date %s into reported activity", value => {
     expect(usageDate(value)).toBe("Not reported");
   });
@@ -26,6 +27,8 @@ describe("usage evidence formatting", () => {
     ["2026-01-01T00:30:00+02:00", "2025-12-31T22:30:00Z"],
     ["2026-01-01T23:30:00-02:00", "2026-01-02T01:30:00Z"],
     ["2026-01-01T12:00:00.1234567Z", "2026-01-01T12:00:00Z"],
+    ["2026-01-01T12:00:00.1234567891Z", "2026-01-01T12:00:00Z"],
+    [`2026-01-01T12:00:00.${"1".repeat(107)}Z`, "2026-01-01T12:00:00Z"],
     ["1970-01-01", "1970-01-01T00:00:00Z"],
   ])("formats %s using its UTC date", (value, instant) => {
     expect(usageDate(value)).toBe(new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(instant)));

@@ -15,6 +15,7 @@ const capturedAt = new Date("2026-01-01T00:00:00Z");
 function databaseFixture(name: string, superseded = false) {
   const reviews = new Map<string, Array<{ id: string; signature: string; verified: boolean }>>();
   const query = vi.fn(async (sql: string, parameters?: unknown[]) => {
+    if (sql === "COMMIT") return { command: "COMMIT", rows: [], rowCount: 0 };
     if (sql === "SELECT current_database() AS database") {
       return { rows: [{ database: name }], rowCount: 1 };
     }

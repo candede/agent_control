@@ -215,19 +215,22 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
 
   it("uses environment/GUID normalization but never folds opaque IDs or package IDs", async () => {
     const scope = newUsageScope(), nativeId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    const environmentA = `Default-${nativeId}`, environmentB = "Default-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const records = await saveUsageInventory(fixture.runtime, scope, [
-      { packages: [], native: { nativeId, environmentId: "ENV-A" } }, { packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "ENV-B" } },
+      { packages: [], native: { nativeId, environmentId: environmentA.toUpperCase() } },
+      { packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: environmentB.toUpperCase() } },
       { packages: [nativeId] }, { packages: [], native: { nativeId: "Opaque-ID", environmentId: null } }, { packages: [], native: { nativeId: "opaque-id", environmentId: null } },
     ]);
     await publishUsageReports(fixture.runtime, scope);
-    const target = { source: "power_platform" as const, nativeId: nativeId.toUpperCase(), environmentId: "env-a" };
+    const target = { source: "power_platform" as const, nativeId: nativeId.toUpperCase(), environmentId: environmentA.toLowerCase() };
     await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", target));
     await associate(scope, records[3].id, await usageIntent(fixture.runtime, scope, "Report-B", { source: "power_platform", nativeId: "Opaque-ID", environmentId: null }));
     expect((await inventory(scope, records)).map(row => row.responses)).toEqual([10, null, null, 20, null]);
-    const viewer = { ...scope, principalId: "pp-viewer" }, shared = await saveUsageInventory(fixture.runtime, viewer, [{ packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: "env-a" } }]);
+    const viewer = { ...scope, principalId: "pp-viewer" }, shared = await saveUsageInventory(fixture.runtime, viewer,
+      [{ packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: environmentA.toLowerCase() } }]);
     expect((await inventory(viewer, shared))[0]).toMatchObject({ status: "linked", responses: 10 });
     const valid = await usageIntent(fixture.runtime, scope, "Report-Missing", target);
-    await expect(associate(scope, records[0].id, { ...valid, target: { ...target, environmentId: "env-b" } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
+    await expect(associate(scope, records[0].id, { ...valid, target: { ...target, environmentId: environmentB.toLowerCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
     const packageIntent = await usageIntent(fixture.runtime, scope, "Report-Missing", { source: "graph_packages", packageId: nativeId });
     await expect(associate(scope, records[2].id, { ...packageIntent, target: { source: "graph_packages", packageId: nativeId.toUpperCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
   });

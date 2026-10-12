@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { allowlistedPackage } from "./packageObservation.js";
 import { resolvePackageAgentLinks, withVerifiedControlIdentities } from "./packageAgentIdentity.js";
+import { packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord } from "./inventoryRecordProjection.js";
+import { buildRecords } from "./inventoryComponent.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { findUnifiedAgentRecord } from "../../../frontend/src/unifiedAgentIdentity.js";
 
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const cdsBotId = "22222222-2222-4222-8222-222222222222";
@@ -66,6 +70,25 @@ describe("explicit package-to-agent identity", () => {
     expect(resolvePackageAgentLinks("tenant-a", [{ ...value, identityDetailsCollected: true }], [resource()])[0]).toMatchObject({
       status: "unmatched", reason: "Package details were collected, but Microsoft Graph did not supply native agent metadata or a corroborated declarative manifest identity.",
     });
+  });
+
+  it("does not use inherited declarative identity evidence or malformed stale elements for linking", () => {
+    const catalog = allowlistedPackage({ id: "own-package", displayName: "Fixture", isBlocked: false });
+    const inherited = Object.assign(Object.create({
+      manifestId: cdsBotId, elementTypes: ["DeclarativeCopilots"],
+    }), catalog);
+    const native = resource({ details: { schemaName: cdsBotId } });
+    expect(resolvePackageAgentLinks("tenant-a", [inherited], [native])[0].status).toBe("unmatched");
+    const malformed = { ...catalog, manifestId: cdsBotId, elementTypes: ["DeclarativeCopilots"],
+      detailFreshness: { state: "stale" as const, observedAt: null, expiresAt: null } };
+    Object.defineProperty(malformed, "elementDetails", { value: [{ elementType: "DeclarativeCopilots", elements: null }] });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(resolvePackageAgentLinks("tenant-a", [malformed], [native])[0]).toMatchObject({ status: "unmatched", invalidMetadata: true });
+    const accessor = { ...catalog };
+    const getter = vi.fn(() => cdsBotId);
+    Object.defineProperty(accessor, "manifestId", { get: getter });
+    expect(resolvePackageAgentLinks("tenant-a", [accessor], [native])[0]).toMatchObject({ status: "unmatched", invalidMetadata: true });
+    expect(getter).not.toHaveBeenCalled();
   });
 
   it("requires environment, schema name and source-declared CDS identity together for inventory native IDs", () => {
@@ -218,6 +241,80 @@ describe("explicit package-to-agent identity", () => {
     expect(withVerifiedControlIdentities([saved], links, {}, now)[0]).toBe(saved);
   });
 
+  it.each([
+    { packageId: "__proto__", otherPackageId: "constructor" },
+    { packageId: "constructor", otherPackageId: "toString" },
+    { packageId: "Package:Opaque", otherPackageId: "package:opaque" },
+    { packageId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", otherPackageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+    { packageId: "Agent/É🌏", otherPackageId: "Agent/E\u0301🌏" },
+  ])("requires an own fresh control observation for the exact opaque package ID ($packageId)", ({ packageId, otherPackageId }) => {
+    const value = { ...packaged({
+      SourceIds: { EnvironmentId: environmentId, SchemaName: "cr123_agent", CdsBotId: cdsBotId },
+    }), id: packageId };
+    const saved = resource({ identifiers: [{ kind: "environment_id", value: environmentId }], details: { schemaName: "cr123_agent" } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    expect(links[0]).toMatchObject({ packageId, status: "matched", controlBotId: cdsBotId });
+    const now = Date.parse("2026-09-16T12:00:00.000Z");
+    const observation = { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString() };
+    const inherited = Object.create(Object.fromEntries([[packageId, observation]]));
+    const unqualified = withVerifiedControlIdentities([saved], links, inherited, now)[0];
+    expect(unqualified).toBe(saved);
+    expect(powerPlatformInventoryRecord(unqualified).facts.filter(fact => fact.kind === "control:quarantine")).toEqual([]);
+    expect(withVerifiedControlIdentities([saved], links, Object.fromEntries([[otherPackageId, observation]]), now)[0]).toBe(saved);
+    const qualified = withVerifiedControlIdentities([saved], links, Object.fromEntries([[packageId, observation]]), now)[0];
+    expect(qualified.identifiers).toContainEqual({ kind: "cds_bot_id", value: cdsBotId });
+    expect(powerPlatformInventoryRecord(qualified).facts.filter(fact => fact.kind === "control:quarantine"))
+      .toMatchObject([{ payload: { environmentId, botId: cdsBotId } }]);
+    expect(saved.identifiers).toEqual([{ kind: "environment_id", value: environmentId }]);
+  });
+
+  it.each(["catalog", "identity"] as const)(
+    "compares exact control %s observation instants without truncating fractional evidence",
+    source => {
+      const value = packaged({ SourceIds: { EnvironmentId: environmentId, SchemaName: "cr_agent", CdsBotId: cdsBotId } });
+      const saved = resource({ details: { schemaName: "cr_agent" } });
+      const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+      const now = Date.parse("2026-09-16T12:00:00Z");
+      const fresh = { observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-09-16T13:00:00Z" };
+      for (const [changed, expected] of [
+        [{ ...fresh, observedAt: "2026-09-16T12:00:00.000000001Z" }, false],
+        [{ ...fresh, observedAt: "2026-09-16T14:00:00.000000001+02:00" }, false],
+        [{ ...fresh, expiresAt: "2026-09-16T12:00:00.000000001Z" }, true],
+        [{ ...fresh, expiresAt: "2026-09-16T14:00:00.000000001+02:00" }, true],
+        [{ ...fresh, expiresAt: "2026-09-16T12:00:00Z" }, false],
+        [{ ...fresh, observedAt: "2026-09-15T11:59:59.999999999Z" }, false],
+        [{ ...fresh, observedAt: "2026-09-15T12:00:00.000000001Z" }, true],
+        [{ ...fresh, observedAt: "2026-09-16" }, false],
+        [{ ...fresh, observedAt: "2026-02-30T12:00:00Z" }, false],
+      ] as const) {
+        const observation = source === "catalog" ? { ...changed, identityDetails: fresh }
+          : { ...fresh, identityDetails: changed };
+        const qualified = withVerifiedControlIdentities([saved], links, { [value.id]: observation }, now)[0];
+        expect(qualified.identifiers.some(identifier => identifier.kind === "cds_bot_id"), JSON.stringify(changed)).toBe(expected);
+        expect(powerPlatformInventoryRecord(qualified).facts.some(fact => fact.kind === "control:quarantine")).toBe(expected);
+      }
+    },
+  );
+
+  it("requires own timestamp data in each qualifying control observation", () => {
+    const value = packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" } });
+    const saved = resource({ details: { schemaName: "cr_agent" } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    const now = Date.parse("2026-09-16T12:00:00Z");
+    const fresh = { observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-09-16T13:00:00Z" };
+    for (const observation of [
+      Object.create(fresh), { ...fresh, identityDetails: Object.create(fresh) },
+    ]) expect(withVerifiedControlIdentities([saved], links, { [value.id]: observation }, now)[0]).toBe(saved);
+    const getter = vi.fn(() => fresh.observedAt);
+    const accessor = { ...fresh };
+    Object.defineProperty(accessor, "observedAt", { get: getter });
+    expect(withVerifiedControlIdentities([saved], links, { [value.id]: accessor }, now)[0]).toBe(saved);
+    const identityAccessor = { ...fresh };
+    Object.defineProperty(identityAccessor, "identityDetails", { get: () => fresh });
+    expect(withVerifiedControlIdentities([saved], links, { [value.id]: identityAccessor }, now)[0]).toBe(saved);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it("retains many package representations of one exact agent", () => {
     const result = resolvePackageAgentLinks("tenant-a", [packaged(), { ...packaged(), id: "package-b" }], [resource()]);
     expect(result.map(value => value.status)).toEqual(["matched", "matched"]);
@@ -259,6 +356,24 @@ describe("explicit package-to-agent identity", () => {
     expect(resolvePackageAgentLinks("tenant-a", [value], [resource()])[0]).toMatchObject({ status: "unmatched", reason: expect.stringContaining("invalid") });
     expect(log).toHaveBeenCalledOnce();
     expect(JSON.stringify(log.mock.calls)).not.toContain("customer-secret");
+  });
+
+  it("does not link or qualify controls after duplicate saved identity properties erase conflicting evidence", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const value = packaged();
+    value.elementDetails![0].elements[0].definition = `{"SourceIds":{
+      "EnvironmentId":"${environmentId}","CdsBotId":"${otherId}","CdsBotId":"${cdsBotId}","SchemaName":"cr_agent"
+    }}`;
+    const saved = resource({ identifiers: [{ kind: "environment_id", value: environmentId }], details: { schemaName: "cr_agent" } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    expect(links[0]).toMatchObject({ status: "unmatched", invalidMetadata: true });
+    const now = Date.parse("2026-09-16T12:00:00Z");
+    const observation = { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString() };
+    expect(withVerifiedControlIdentities([saved], links, { [value.id]: observation }, now)[0]).toBe(saved);
+    const records = buildRecords([value], [saved], links, null, null);
+    expect(records).toHaveLength(2);
+    const selected = findUnifiedAgentRecord(records, unifiedAgentRecordId({ source: "graph_packages", packageId: value.id }));
+    expect(selected).toMatchObject({ presence: "graph_packages", powerPlatformResource: null, identity: { state: "unmatched" } });
   });
 
   it("resolves the complete 5,000-record inventory without depending on source order", () => {
@@ -491,6 +606,98 @@ describe("explicit package-to-agent identity", () => {
     return value;
   }
 
+  function declarativeCustomEnginePackage(id: string, manifestId = cdsBotId, metadata: unknown = {}) {
+    const value = customEnginePackage(id, metadata);
+    value.manifestId = manifestId;
+    value.elementTypes = ["DeclarativeCopilots", "Bots", "CustomEngineCopilots"];
+    value.elementDetails!.push({ elementType: "DeclarativeCopilots", elements: [{ id: "declarative", definition: "{}" }] });
+    return value;
+  }
+
+  it.each([cdsBotId, otherId])(
+    "does not let a custom-engine bot application override incompatible declarative native/schema proof (%s)",
+    manifestId => {
+      const native = customEnginePackage("native", {
+        SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+      });
+      const declared = declarativeCustomEnginePackage("declared", manifestId);
+      const legacy = customEnginePackage("legacy");
+      const packages = [native, declared, legacy].map(value => {
+        const stored = packageInventoryRecord(value);
+        return restoreInventoryRecord(stored.residual, stored.facts, "packages") as typeof value;
+      });
+      for (const values of [packages, [...packages].reverse()]) {
+        for (const resources of [[], [resource({ details: { schemaName: "cr_agent" } })]]) {
+          const links = resolvePackageAgentLinks("tenant-a", values, resources);
+          expect(links.find(link => link.packageId === native.id)?.status).toBe(resources.length ? "matched" : "unmatched");
+          for (const packageId of [declared.id, legacy.id]) {
+            expect(links.find(link => link.packageId === packageId)).toMatchObject({ status: "ambiguous" });
+            expect(links.find(link => link.packageId === packageId)).not.toHaveProperty("grouping");
+          }
+          const records = buildRecords(values, resources, links, null, null);
+          expect(records).toHaveLength(3);
+          for (const packageId of [declared.id, legacy.id]) {
+            const selected = findUnifiedAgentRecord(records, unifiedAgentRecordId({ source: "graph_packages", packageId }));
+            expect(selected).toMatchObject({ presence: "graph_packages", powerPlatformResource: null, identity: { state: "ambiguous" } });
+            expect(selected?.packages.map(value => value.id)).toEqual([packageId]);
+          }
+        }
+      }
+    },
+  );
+
+  it("retains agreeing declarative and native claims within custom-engine groups without granting alias control", () => {
+    const native = customEnginePackage("native", {
+      SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: cdsBotId },
+    });
+    const declared = declarativeCustomEnginePackage("declared", cdsBotId.toUpperCase());
+    const legacy = customEnginePackage("legacy");
+    const packages = [native, declared, legacy];
+    for (const values of [packages, [...packages].reverse()]) {
+      const resources = [declarativeResource()];
+      const links = resolvePackageAgentLinks("tenant-a", values, resources);
+      expect(links.map(link => link.status)).toEqual(values.map(() => "matched"));
+      expect(links.every(link => !("controlBotId" in link))).toBe(true);
+      expect(buildRecords(values, resources, links, null, null)).toHaveLength(1);
+      const unmatched = resolvePackageAgentLinks("tenant-a", values, []);
+      expect(new Set(unmatched.map(link => link.status === "unmatched" ? link.grouping?.key : undefined)).size).toBe(1);
+    }
+  });
+
+  it("keeps distinct source-only declarative manifests separate despite a shared bot application", () => {
+    const packages = [
+      declarativeCustomEnginePackage("first", cdsBotId),
+      declarativeCustomEnginePackage("second", otherId),
+      customEnginePackage("legacy"),
+    ];
+    for (const values of [packages, [...packages].reverse()]) {
+      const links = resolvePackageAgentLinks("tenant-a", values, []);
+      expect(links.map(link => link.status)).toEqual(values.map(() => "ambiguous"));
+      expect(links.every(link => !("grouping" in link))).toBe(true);
+      expect(buildRecords(values, [], links, null, null)).toHaveLength(3);
+    }
+  });
+
+  it("preserves a unique declarative source-only group when correlating custom-engine aliases", () => {
+    const declared = declarativeCustomEnginePackage("declared", cdsBotId, { SourceIds: { EnvironmentId: environmentId } });
+    const legacy = customEnginePackage("legacy");
+    const external = declarativePackage("external");
+    external.elementDetails!.push(packaged({ SourceIds: { EnvironmentId: environmentId } }).elementDetails![0]);
+    const original = resolvePackageAgentLinks("tenant-a", [declared], [])[0];
+    expect(original).toMatchObject({ status: "unmatched", grouping: { environmentId } });
+    for (const values of [[declared, legacy, external], [external, legacy, declared]]) {
+      const links = resolvePackageAgentLinks("tenant-a", values, []);
+      expect(links).toMatchObject(values.map(value => ({
+        packageId: value.id, status: "unmatched", grouping: original.status === "unmatched" ? original.grouping : undefined,
+      })));
+      const records = buildRecords(values, [], links, null, null);
+      expect(records).toHaveLength(1);
+      for (const value of values) {
+        expect(findUnifiedAgentRecord(records, unifiedAgentRecordId({ source: "graph_packages", packageId: value.id }))).toBe(records[0]);
+      }
+    }
+  });
+
   it("joins legacy and current custom-engine packages through a uniquely proven native agent", () => {
     const native = customEnginePackage("native-package", {
       SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
@@ -505,6 +712,32 @@ describe("explicit package-to-agent identity", () => {
         evidence: [{ kind: "shared_custom_engine_bot_id", relatedPackageIds: [native.id] }],
       });
       expect(links.find(link => link.packageId === legacy.id)).not.toHaveProperty("controlBotId");
+    }
+  });
+
+  it.each(["Bots", "CustomEngineCopilots"])("does not associate a saved alias with duplicate %s identity properties", kind => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const native = customEnginePackage("native", {
+      SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+    });
+    const alias = customEnginePackage("alias");
+    alias.elementDetails!.find(group => group.elementType === kind)!.elements[0].definition = kind === "Bots"
+      ? `{"botId":"${otherId}","botId":"${entraAgentId}"}`
+      : `{"type":"other","type":"bot","id":"${entraAgentId}"}`;
+    const packages = [native, alias].map(value => {
+      const stored = packageInventoryRecord(value);
+      return restoreInventoryRecord(stored.residual, stored.facts, "packages") as typeof value;
+    });
+    const saved = resource({ details: { schemaName: "cr_agent" } });
+    for (const ordered of [packages, [...packages].reverse()]) {
+      const links = resolvePackageAgentLinks("tenant-a", ordered, [saved]);
+      expect(links.find(link => link.packageId === native.id)?.status).toBe("matched");
+      expect(links.find(link => link.packageId === alias.id)).toMatchObject({ status: "unmatched" });
+      const records = buildRecords(ordered, [saved], links, null, null);
+      expect(records).toHaveLength(2);
+      const selected = findUnifiedAgentRecord(records, unifiedAgentRecordId({ source: "graph_packages", packageId: alias.id }));
+      expect(selected).toMatchObject({ presence: "graph_packages", powerPlatformResource: null });
+      expect(selected?.packages.map(value => value.id)).toEqual([alias.id]);
     }
   });
 

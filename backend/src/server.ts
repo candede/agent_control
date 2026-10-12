@@ -3,6 +3,7 @@ import { createApp } from "./app.js";
 import { PackageMutationQualificationRepository } from "./db/packageMutationQualifications.js";
 import { CopilotStudioQuarantineCanaryRepository } from "./db/copilotStudioQuarantineCanaries.js";
 import { pool } from "./db/pool.js";
+import { verifySchema } from "./db/schema.js";
 import { errorTelemetry } from "./errors.js";
 import { bulkJobs, drainBulkJobs } from "./services/bulkJobs.js";
 import { copilotStudioQuarantineJobs, drainCopilotStudioQuarantineJobs } from "./services/copilotStudioQuarantineJobs.js";
@@ -12,28 +13,41 @@ import { dataSync } from "./services/dataSync.js";
 import { packageInventory } from "./services/packageInventory.js";
 import { powerPlatformInventory } from "./services/powerPlatformInventory.js";
 import { purviewAudit } from "./services/purviewAudit.js";
-import { loadOperationalState, readOperationalState } from "./services/operationalState.js";
+import { loadOperationalState } from "./services/operationalState.js";
 import { observeDatabasePool, observeRuntimeResources, operationalLog } from "./services/telemetry.js";
 import { flushDataWorkMetrics } from "./services/dataMetrics.js";
 import { reportRuntime } from "./services/reportExportDispatcher.js";
 import { inventoryRuntime } from "./services/inventoryRuntime.js";
 
 validateRuntimeConfig();
+let shutdownStarted = false;
+await verifySchema(pool);
 const operationalState = await loadOperationalState(pool);
-if (operationalState.mode === "normal") {
-  await powerPlatformInventory.recover();
+startupRecovery: if (operationalState.mode === "normal") {
+  if (!await recoveryAdmissionsOpen()) break startupRecovery;
+  await powerPlatformInventory.recover(recoveryAdmissionsOpen);
+  if (!await recoveryAdmissionsOpen()) break startupRecovery;
   await packageInventory.recover();
-  await dataSync.recover();
+  if (!await recoveryAdmissionsOpen()) break startupRecovery;
+  await dataSync.recover(recoveryAdmissionsOpen);
+  if (!await recoveryAdmissionsOpen()) break startupRecovery;
   await purviewAudit.recover();
-  await defenderHunting.recover();
+  if (!await recoveryAdmissionsOpen()) break startupRecovery;
+  await defenderHunting.recover(recoveryAdmissionsOpen);
   for (const tenant of config.tenants) {
-    while (await bulkJobs.recover(tenant.tenantId, true) > 0) { await new Promise<void>(resolve => setImmediate(resolve)); }
-    while (await copilotStudioQuarantineJobs.recoverInterrupted(tenant.tenantId, true) > 0) {
+    while (await recoveryAdmissionsOpen() && await bulkJobs.recover(tenant.tenantId, true) > 0) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (!await recoveryAdmissionsOpen()) break startupRecovery;
+    while (await recoveryAdmissionsOpen() && await copilotStudioQuarantineJobs.recoverInterrupted(tenant.tenantId, true) > 0) {
       // Finish bounded orphan batches before accepting new jobs in this process.
       await new Promise<void>(resolve => setImmediate(resolve));
     }
+    if (!await recoveryAdmissionsOpen()) break startupRecovery;
     await new PackageMutationQualificationRepository().recoverInterrupted(tenant.tenantId);
+    if (!await recoveryAdmissionsOpen()) break startupRecovery;
     await new CopilotStudioQuarantineCanaryRepository().recoverInterrupted(tenant.tenantId);
+    if (!await recoveryAdmissionsOpen()) break startupRecovery;
   }
 }
 const { app, store } = createApp();
@@ -49,16 +63,19 @@ const poolObservation = setInterval(() => {
 }, 30_000);
 poolObservation.unref();
 
-let shutdownStarted = false;
 let jobRecovery: Promise<void> | undefined;
+async function recoveryAdmissionsOpen() {
+  if (shutdownStarted || maintenanceActive()) return false;
+  const state = await loadOperationalState(pool);
+  return !shutdownStarted && !maintenanceActive() && state.mode === "normal";
+}
 const jobRecoveryTimer = setInterval(() => {
   if (shutdownStarted || maintenanceActive() || jobRecovery) return;
   jobRecovery = (async () => {
-    if ((await readOperationalState(pool)).mode !== "normal") return;
     for (const tenant of config.tenants) {
-      if (shutdownStarted || maintenanceActive()) break;
+      if (!await recoveryAdmissionsOpen()) break;
       await bulkJobs.recover(tenant.tenantId);
-      if (shutdownStarted || maintenanceActive()) break;
+      if (!await recoveryAdmissionsOpen()) break;
       await copilotStudioQuarantineJobs.recoverInterrupted(tenant.tenantId);
     }
   })().catch(error => operationalLog("error", "job_recovery_failed", errorTelemetry(error, "job_recovery_failed")))
@@ -89,6 +106,7 @@ async function shutdown() {
       jobRecovery ?? Promise.resolve(),
     ]);
     const failure = [...syncDrained, ...workersDrained, ...await httpDrained].find(result => result.status === "rejected");
+    flushDataWorkMetrics();
     if (failure?.status === "rejected") throw failure.reason;
     store.close();
     await pool.end();

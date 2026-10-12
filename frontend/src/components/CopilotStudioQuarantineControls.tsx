@@ -13,6 +13,7 @@ import {
   type QuarantineAction,
   type QuarantineJob,
   type QuarantinePreview,
+  type QuarantineReconciliationResult,
   type QuarantineStatusView,
 } from "../api/client";
 import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectableTarget, type QuarantineSelectionSnapshot } from "../quarantineTarget";
@@ -381,7 +382,7 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
     }
   }
 
-  async function updateJob(operation?: (id: string, options: { signal?: AbortSignal }) => Promise<QuarantineJob>, resume = false) {
+  async function updateJob(operation?: "cancel" | "resume" | "reconcile") {
     if (!active || !job || operation && !canManage || busy || statusRead.current || previewRead.current || jobAction.current) return;
     const requestedJobRevision = beginJobRequest(true);
     const controller = new AbortController();
@@ -391,11 +392,24 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
     setBusyKey("job");
     setJobError(undefined);
     try {
-      const next = await (operation ? operation(job.id, { signal: controller.signal }) : getQuarantineJob(job.id, { signal: controller.signal }));
+      const options = { signal: controller.signal };
+      let next: QuarantineJob;
+      let reconciliation: QuarantineReconciliationResult["reconciliation"] | undefined;
+      if (operation === "reconcile") {
+        const result = await reconcileQuarantineJob(job.id, options);
+        next = result;
+        reconciliation = result.reconciliation;
+      } else {
+        next = await (operation === "cancel" ? cancelQuarantineJob(job.id, options)
+          : operation === "resume" ? resumeQuarantineJob(job.id, options) : getQuarantineJob(job.id, options));
+      }
       if (!mounted.current || jobRevision.current !== requestedJobRevision) return;
       storeJob(next);
-      if (resume) setResumedJobId(next.id);
+      if (operation === "resume") setResumedJobId(next.id);
       callbacks.current.onJobChange?.(next);
+      if (reconciliation?.failed) {
+        setJobError(`Reconciliation failed for ${reconciliation.failed} of ${reconciliation.attempted} target${reconciliation.attempted === 1 ? "" : "s"}; no provider state was published for those targets. Refresh job status or retry reconciliation.`);
+      }
     }
     catch (requestError) {
       if (mounted.current && jobRevision.current === requestedJobRevision) {
@@ -420,7 +434,7 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
       <div className="management-card-heading"><h4>Quarantine and restore</h4></div>
       <section className="inventory-detail-section quarantine-control" aria-labelledby="quarantine-control-title">
       <div className="quarantine-control-heading"><div><h3 id="quarantine-control-title">Copilot Studio quarantine</h3></div>
-        <CapabilityGate capability="powerPlatform.quarantine.read" roles={["AgentControl.Viewer"]} compact>
+        <CapabilityGate capability={status ? "powerPlatform.quarantine.read" : undefined} roles={["AgentControl.Viewer"]} compact>
           <button type="button" className="secondary" disabled={Boolean(disabledReason) || busy} onClick={() => void loadStatus(Boolean(status))}><RefreshCw aria-hidden="true" /> {status ? "Recheck direct status" : "Check direct status"}</button>
         </CapabilityGate>
       </div>
@@ -434,7 +448,7 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
       </div> : null}
       {error && !preview && error !== eligibilityReason ? <p className="error-banner" role="alert">{error}</p> : null}
       {jobError ? <p className="error-banner" role="alert">{jobError}</p> : null}
-      {job ? <QuarantineJobStatus job={job} busy={busy} canManage={canManage} onRefresh={() => updateJob()} onCancel={() => updateJob(cancelQuarantineJob)} onResume={() => updateJob(resumeQuarantineJob, true)} onReconcile={() => updateJob(reconcileQuarantineJob)} /> : null}
+      {job ? <QuarantineJobStatus job={job} busy={busy} canManage={canManage} onRefresh={() => updateJob()} onCancel={() => updateJob("cancel")} onResume={() => updateJob("resume")} onReconcile={() => updateJob("reconcile")} /> : null}
       {active && preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} receiptPending={submittedReceipt} error={confirmationError} canSubmit={canSubmit} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
       </section>
     </article>;
@@ -455,7 +469,7 @@ function QuarantineControls({ snapshot, targets, variant, canManage, active = tr
     {jobError ? <p className="error-banner" role="alert">{jobError}</p> : null}
     {!job && jobError && !restoringJob && canManage ? <button type="button" className="secondary"
       onClick={() => setRestoreRevision(current => current + 1)}>Retry quarantine job</button> : null}
-    {job ? <QuarantineJobStatus job={job} busy={busy} canManage={canManage} onRefresh={() => updateJob()} onCancel={() => updateJob(cancelQuarantineJob)} onResume={() => updateJob(resumeQuarantineJob, true)} onReconcile={() => updateJob(reconcileQuarantineJob)} /> : null}
+    {job ? <QuarantineJobStatus job={job} busy={busy} canManage={canManage} onRefresh={() => updateJob()} onCancel={() => updateJob("cancel")} onResume={() => updateJob("resume")} onReconcile={() => updateJob("reconcile")} /> : null}
     {active && preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} receiptPending={submittedReceipt} error={confirmationError} canSubmit={canSubmit} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
   </section>;
 }
@@ -488,6 +502,7 @@ function QuarantineConfirmation({ preview, action, confirmed, busy, receiptPendi
     if (typeof dialog.current?.close === "function") dialog.current.close();
     else { dialog.current?.removeAttribute("open"); onClose(); }
   }
+  const submitButton = <button type="button" className={action === "quarantine" ? "danger" : "primary-link"} disabled={!confirmed || busy || !canSubmit} onClick={() => void onSubmit()}>Confirm {action === "quarantine" ? "quarantine" : "restoration"}</button>;
   return <dialog ref={dialog} className="quarantine-confirmation" aria-busy={busy} aria-labelledby="quarantine-confirmation-title" onClose={event => {
     event.stopPropagation();
     if (event.target === event.currentTarget && dialogMounted.current && !event.currentTarget.open) onClose();
@@ -506,7 +521,9 @@ function QuarantineConfirmation({ preview, action, confirmed, busy, receiptPendi
       <label className="quarantine-confirm-check"><input type="checkbox" checked={confirmed} disabled={!canSubmit || busy} onChange={event => onConfirmed(event.target.checked)} /><span>I confirm this exact frozen target list and understand partial results are not automatically inverted.</span></label>
       {error ? <p className="error-banner" role="alert">{error}</p> : null}
     </div>
-    <footer><button type="button" className="secondary" disabled={busy} onClick={closeDialog}>{receiptPending ? "Close" : "Cancel"}</button><WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className={action === "quarantine" ? "danger" : "primary-link"} disabled={!confirmed || busy || !canSubmit} onClick={() => void onSubmit()}>Confirm {action === "quarantine" ? "quarantine" : "restoration"}</button></WorkbenchActionGate></footer>
+    <footer><button type="button" className="secondary" disabled={busy} onClick={closeDialog}>{receiptPending ? "Close" : "Cancel"}</button>{receiptPending
+      ? <CapabilityGate roles={["AgentControl.Admin"]} compact>{submitButton}</CapabilityGate>
+      : <WorkbenchActionGate actionId="quarantine.change" compact>{submitButton}</WorkbenchActionGate>}</footer>
   </dialog>;
 }
 

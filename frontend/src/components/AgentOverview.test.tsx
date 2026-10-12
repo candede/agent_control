@@ -4,6 +4,7 @@ import * as api from "../api/client";
 import type { CopilotPackage, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { createInventoryVerification } from "../test/inventoryVerification";
+import { buildRecords } from "../../../backend/src/services/inventoryComponent";
 import { AgentOverview } from "./AgentOverview";
 
 const resource: NonNullable<UnifiedAgentRecord["powerPlatformResource"]> = {
@@ -30,6 +31,33 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("purposeful saved agent context", () => {
+  it("labels superseded environment and native configuration evidence even before timestamps expire", () => {
+    const observed = { ...environment.observation, current: false };
+    render(<AgentOverview record={{ ...record, environment: { ...environment, observation: observed },
+      observations: { ...record.observations, powerPlatform: { ...observed, roleScope: "unknown", environmentScope: null,
+        coverage: "unknown", coveredCount: null, observedCount: 1, totalRecords: 1, pageCount: 1, verification: null } } }}
+      peopleState={peopleState} />);
+    expect(screen.getByText("Environment details are out of date. Refresh them in Sync.")).toBeVisible();
+    expect(screen.getByText("Configuration source authority is unavailable or out of date. Refresh inventory in Sync.")).toBeVisible();
+    expect(screen.queryByText("Configuration details have expired. Refresh them in Sync.")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { values: undefined, expected: "Not reported" },
+    { values: [], expected: "None reported" },
+    { values: ["Teams"], expected: "Teams" },
+  ])("distinguishes missing and confirmed-empty package collections ($expected)", ({ values, expected }) => {
+    const selectedPackage: CopilotPackage = {
+      id: "package", displayName: "Package", isBlocked: false, sourceSystem: "graph_packages",
+      authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown",
+      identityConfidence: "exact_native", provenance: {}, ...(values === undefined ? {} : { supportedHosts: values }),
+    };
+    const [observed] = buildRecords([selectedPackage], [], [{ packageId: selectedPackage.id, status: "unmatched", reason: "No saved native link." }], null, null);
+    render(<AgentOverview record={observed} selectedPackage={observed.packages[0]}
+      packageDetail={{ ...selectedPackage, ...(values === undefined ? {} : { categories: values }) }} peopleState={peopleState} />);
+    expect(field("Hosts")).toHaveTextContent(expected);
+    expect(field("Categories")).toHaveTextContent(expected);
+  });
   it("preserves server-counted high-fanout configuration and package totals without embedding children", () => {
     render(<AgentOverview record={{ ...record, packageCount: 6000, packagesComplete: false,
       powerPlatformResource: { ...resource, connectorCounts: { connectors: 400, operations: 9000 },
@@ -287,6 +315,27 @@ describe("purposeful saved agent context", () => {
       ...resource, nativeId: "https://malicious.invalid?sig=secret",
     } }} peopleState={peopleState} />);
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("does not display a case-colliding opaque environment's saved context", () => {
+    render(<AgentOverview record={{ ...record, environmentId: "Environment-A",
+      environment: { ...environment, id: "environment-a" } }} peopleState={peopleState} />);
+    expect(screen.queryByText("Finance production")).not.toBeInTheDocument();
+    expect(screen.getByText("Environment details are unavailable. Check inventory coverage in Sync.")).toBeVisible();
+  });
+
+  it.each([
+    { nativeId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", botId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", equivalent: true },
+    { nativeId: "Opaque-A", botId: "opaque-a", equivalent: false },
+    { nativeId: "Équipe-A", botId: "équipe-a", equivalent: false },
+    { nativeId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAG", botId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaag", equivalent: false },
+  ])("suppresses only equivalent CDS bot identities while preserving raw IDs ($nativeId)", ({ nativeId, botId, equivalent }) => {
+    render(<AgentOverview record={{ ...record, powerPlatformResource: {
+      ...resource, nativeId, identifiers: [{ kind: "cds_bot_id", value: botId }],
+    } }} peopleState={peopleState} />);
+    expect(field("Agent ID")).toHaveTextContent(nativeId);
+    if (equivalent) expect(screen.queryByText("Bot ID", { selector: "dt" })).not.toBeInTheDocument();
+    else expect(field("Bot ID")).toHaveTextContent(botId);
   });
 
   it("organizes meaningful configuration, dates and identifiers without duplication or disclosures", () => {

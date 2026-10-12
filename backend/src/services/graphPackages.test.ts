@@ -61,8 +61,11 @@ describe("GraphPackagesClient", () => {
   });
 
   it("follows opaque continuation links despite changing catalog count hints and empty intermediate pages", async () => {
-    const urls = [buildCopilotAgentsListUrl(), `${buildCopilotAgentsListUrl()}&$skiptoken=second`,
-      `${buildCopilotAgentsListUrl()}&$skiptoken=third`];
+    const urls = [buildCopilotAgentsListUrl(), ...["second", "third"].map(token => {
+      const url = new URL(buildCopilotAgentsListUrl());
+      url.searchParams.set("$skiptoken", token);
+      return url.toString();
+    })];
     let page = 0;
     const fetcher = vi.fn<FetchLike>(async url => {
       expect(String(url)).toBe(urls[page]);
@@ -151,6 +154,36 @@ describe("GraphPackagesClient", () => {
     } finally { timeout.mockRestore(); }
   });
 
+  it("settles a non-cooperative mutation at the shorter caller execution deadline", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const caller = new AbortController();
+    let complete!: (response: Response) => void;
+    const fetcher = vi.fn<FetchLike>(() => new Promise(resolve => { complete = resolve; }));
+    const cancel = vi.fn();
+    try {
+      const result = new GraphPackagesClient(fetcher).blockPackage("token", "P_1", {
+        correlationId: "bounded-write", signal: caller.signal, executionDeadlineAt: Date.now() + 100,
+      });
+      const assertion = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(100);
+      await assertion;
+      expect(caller.signal.aborted).toBe(false);
+      expect(fetcher).toHaveBeenCalledOnce();
+      complete(new Response(new ReadableStream({ cancel })));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      timeout.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not report mutation completion after cancellation wins at response headers", async () => {
     const controller = new AbortController();
     const reason = new AppError(409, "cancelled", "Cancelled");
@@ -215,7 +248,7 @@ describe("GraphPackagesClient", () => {
 
   it("categorizes network failures without exposing their messages or retrying a mutation", async () => {
     const fetcher = vi.fn(async () => { throw new TypeError("private-url private-token"); });
-    const client = new GraphPackagesClient(fetcher, { delay: async () => undefined });
+    const client = new GraphPackagesClient(fetcher, { baseDelayMs: 0, delay: async () => undefined });
     const safeError = {
       status: 502,
       code: "provider_network_error",
@@ -234,7 +267,7 @@ describe("GraphPackagesClient", () => {
         controller.error(new TypeError("terminated private-url private-token"));
       } })))
       .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Agent", isBlocked: false }));
-    await expect(new GraphPackagesClient(fetcher, { delay: async () => undefined }).getPackageDetails("token", "P_1"))
+    await expect(new GraphPackagesClient(fetcher, { baseDelayMs: 0, delay: async () => undefined }).getPackageDetails("token", "P_1"))
       .resolves.toMatchObject({ id: "P_1" });
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
@@ -255,7 +288,7 @@ describe("GraphPackagesClient", () => {
         }))
       .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Agent", isBlocked: false }));
     try {
-      const result = new GraphPackagesClient(fetcher, { delay: async () => undefined }).getPackageDetails("token", "P_1");
+      const result = new GraphPackagesClient(fetcher, { baseDelayMs: 0, delay: async () => undefined }).getPackageDetails("token", "P_1");
       const assertion = expect(result).resolves.toMatchObject({ id: "P_1" });
       await vi.advanceTimersByTimeAsync(30_000);
       await assertion;
@@ -294,9 +327,10 @@ describe("GraphPackagesClient", () => {
         status, headers: { "Retry-After": "120", "request-id": "graph-request-123" },
       }))
       .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Package", isBlocked: false }));
-    const wait = vi.fn(async () => undefined);
+    let waitedMs = 0;
+    const wait = vi.fn(async (ms: number) => { waitedMs += ms; });
     try {
-      const read = new GraphPackagesClient(fetcher, { delay: wait }).getPackageDetails("token", "P_1");
+      const read = new GraphPackagesClient(fetcher, { delay: wait, now: () => performance.now() + waitedMs }).getPackageDetails("token", "P_1");
       const assertion = status === 403
         ? expect(read).rejects.toMatchObject({
           status, code: "graph_error", details: { httpStatus: status, correlationId: "graph-request-123", retryAfterMs: 120_000 },
@@ -305,7 +339,7 @@ describe("GraphPackagesClient", () => {
       await Promise.all([assertion, vi.advanceTimersByTimeAsync(30_000)]);
       expect(cancel).toHaveBeenCalledOnce();
       expect(fetcher).toHaveBeenCalledTimes(status === 403 ? 1 : 2);
-      expect(wait.mock.calls).toEqual(status === 403 ? [] : [[120_000]]);
+      expect(wait.mock.calls.map(([ms]) => ms)).toEqual(status === 403 ? [] : [120_000]);
     } finally {
       timeout.mockRestore();
       vi.clearAllTimers();
@@ -329,7 +363,7 @@ describe("GraphPackagesClient", () => {
       .mockResolvedValueOnce(Response.json({ error: { code: "FailedDependency", message: "too many requests private-token" } }, { status: 424 }))
       .mockResolvedValueOnce(Response.json({ value: [] }));
     const wait = vi.fn(async () => undefined);
-    await expect(new GraphPackagesClient(fetcher, { delay: wait }).checkCatalogAccess("token")).resolves.toBeUndefined();
+    await expect(new GraphPackagesClient(fetcher, { throttleBaseDelayMs: 0, delay: wait }).checkCatalogAccess("token")).resolves.toBeUndefined();
     expect(wait).toHaveBeenCalledOnce();
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
@@ -338,7 +372,7 @@ describe("GraphPackagesClient", () => {
     const fetcher = vi.fn<FetchLike>(async (input) => {
       const url = input.toString();
 
-      if (url.includes("page=2")) {
+      if (new URL(url).searchParams.get("$skiptoken") === "second") {
         return Response.json({
           value: [
             {
@@ -361,7 +395,7 @@ describe("GraphPackagesClient", () => {
           },
         ],
         "@odata.nextLink":
-          `${buildCopilotAgentsListUrl()}&page=2`,
+          `${buildCopilotAgentsListUrl()}&$skiptoken=second`,
       });
     });
 
@@ -400,6 +434,7 @@ describe("GraphPackagesClient", () => {
     const retryDelay = vi.fn(async () => undefined);
     const client = new GraphPackagesClient(fetcher, {
       maxAttempts: 2,
+      baseDelayMs: 0,
       delay: retryDelay,
     });
 
@@ -476,6 +511,96 @@ describe("GraphPackagesClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("preserves initiating authority when a convergence wait rejects", async () => {
+    const reason = new AppError(401, "authorization_expired", "The initiating authorization changed.");
+    let current = true;
+    const client = { getPackageDetails: vi.fn(async () =>
+      allowlistedPackage({ id: "P_1", displayName: "Package", isBlocked: false })) };
+    await expect(verifyPackageMutationConverged(client, "token", "P_1", "block", { kind: "block", isBlocked: true }, {
+      assertCurrent: () => { if (!current) throw reason; },
+      delay: async () => { current = false; throw new Error("Late private wait failure."); },
+    })).rejects.toBe(reason);
+    expect(client.getPackageDetails).toHaveBeenCalledOnce();
+  });
+
+  it("settles a non-cooperative convergence wait at the shared caller execution deadline", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    let rejectWait!: (error: Error) => void;
+    const wait = vi.fn(() => new Promise<never>((_resolve, reject) => { rejectWait = reject; }));
+    const caller = new AbortController();
+    const client = { getPackageDetails: vi.fn(async () =>
+      allowlistedPackage({ id: "P_1", displayName: "Package", isBlocked: false })) };
+    try {
+      const result = verifyPackageMutationConverged(client, "token", "P_1", "block", { kind: "block", isBlocked: true }, {
+        signal: caller.signal, executionDeadlineAt: Date.now() + 100, delay: wait,
+      });
+      const assertion = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(100);
+      await assertion;
+      expect(client.getPackageDetails).toHaveBeenCalledOnce();
+      expect(wait).toHaveBeenCalledOnce();
+      expect(caller.signal.aborted).toBe(false);
+      rejectWait(new Error("Observed late wait failure."));
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      timeout.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["read", "write authorization", "write"] as const)(
+    "preserves initiating authority over a rejected access-update %s", async stage => {
+      const reason = new AppError(401, "authorization_expired", "The initiating authorization changed.");
+      const details = allowlistedPackage({
+        id: "P_1", displayName: "Package", isBlocked: false, availableTo: "none", deployedTo: "none",
+        allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+      });
+      let current = true;
+      const reject = async () => { current = false; throw new Error("Late private provider failure."); };
+      const client = {
+        getPackageDetails: vi.fn(stage === "read" ? reject : async () => details),
+        patchPackageAccess: vi.fn(stage === "write" ? reject : async () => undefined),
+      };
+      const beforeWrite = vi.fn(stage === "write authorization" ? reject : async () => undefined);
+      await expect(updatePackageAccess(client, "token", "P_1", {
+        target: "availability", mode: "replace", scope: "specific",
+        principals: [{ resourceType: "user", resourceId: "user-1" }],
+      }, undefined, beforeWrite, {
+        correlationId: "authority-update", assertCurrent: () => { if (!current) throw reason; },
+      })).rejects.toBe(reason);
+      expect(client.patchPackageAccess).toHaveBeenCalledTimes(stage === "write" ? 1 : 0);
+    },
+  );
+
+  it("does not return a supplied-detail access no-op after its execution deadline expires", async () => {
+    const startedAt = Date.now();
+    let elapsed = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => startedAt + elapsed);
+    const principal = { resourceType: "user", resourceId: "user-1" };
+    const details = allowlistedPackage({
+      id: "P_1", displayName: "Package", isBlocked: false, availableTo: "some",
+      allowedUsersAndGroups: [principal],
+    });
+    Object.defineProperty(details, "allowedUsersAndGroups", {
+      get: () => { elapsed = 101; return [principal]; },
+    });
+    const client = { getPackageDetails: vi.fn(), patchPackageAccess: vi.fn() };
+    try {
+      await expect(updatePackageAccess(client, "token", "P_1", {
+        target: "availability", mode: "replace", scope: "specific", principals: [principal],
+      }, details, undefined, { correlationId: "expired-no-op", executionDeadlineAt: startedAt + 100 }))
+        .rejects.toMatchObject({ name: "TimeoutError" });
+      expect(client.getPackageDetails).not.toHaveBeenCalled();
+      expect(client.patchPackageAccess).not.toHaveBeenCalled();
+    } finally { now.mockRestore(); }
+  });
+
   it("cancels the default convergence timer when readback is aborted", async () => {
     const controller = new AbortController();
     const reason = new AppError(409, "cancelled", "Cancelled");
@@ -493,11 +618,14 @@ describe("GraphPackagesClient", () => {
     const assertion = expect(verification).rejects.toBe(reason);
     try {
       await vi.waitFor(() => expect(timer).toHaveBeenCalledOnce());
-      expect(timer).toHaveBeenCalledWith(500, undefined, { signal: controller.signal });
+      expect(timer).toHaveBeenCalledWith(500, undefined, { signal: expect.any(AbortSignal) });
+      const waitSignal = timer.mock.calls[0][2]?.signal;
+      expect(waitSignal?.aborted).toBe(false);
       const timerAssertion = expect(timer.mock.results[0].value).rejects.toMatchObject({ name: "AbortError" });
       controller.abort(reason);
       await assertion;
       await timerAssertion;
+      expect(waitSignal?.reason).toBe(reason);
       expect(client.getPackageDetails).toHaveBeenCalledOnce();
     } finally {
       controller.abort(reason);
@@ -608,8 +736,8 @@ describe("GraphPackagesClient", () => {
       mode: "replace",
       scope: "specific",
       principals: [
-        { resourceType: "group", resourceId: "GROUP-1" },
-        { resourceType: "user", resourceId: "USER-1" },
+        { resourceType: "GROUP", resourceId: "group-1" },
+        { resourceType: "USER", resourceId: "user-1" },
       ],
     });
 
@@ -780,6 +908,7 @@ describe("GraphPackagesClient", () => {
           id: "P_1",
           displayName: "First",
           isBlocked: false,
+          allowedUsersAndGroups: [],
         });
       }
     }

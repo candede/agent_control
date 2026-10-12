@@ -31,15 +31,17 @@ type JobRow = {
   updated_at: Date;
   finished_at: Date | null;
   snapshot_id: string | null;
+  deadline_at: Date;
+  checked_at: Date;
 };
 const jobColumns = `job.id,job.role_scope,job.environment_scope,job.requested_types,job.status,job.page_count,
   job.observed_count,job.total_records,job.unknown_field_count,job.error_code,job.message,job.created_at,
-  job.attempted_at,job.updated_at,job.finished_at`;
+  job.attempted_at,job.updated_at,job.finished_at,job.deadline_at,clock.checked_at`;
 
 export class PowerPlatformRefreshJobs {
   constructor(readonly database: pg.Pool = pool) {}
 
-  async submit(scope: InventoryDataScope, input: InventoryRefreshInput) {
+  async submit(scope: InventoryDataScope, input: InventoryRefreshInput, assertCurrent?: () => void) {
     requireProviderAdmissions();
     validateScope(scope);
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)) throw new AppError(400, "invalid_idempotency_key", "Idempotency-Key must contain 1-128 letters, digits, underscores or hyphens.");
@@ -47,6 +49,7 @@ export class PowerPlatformRefreshJobs {
     const requestedTypes = validateTypes(input.requestedTypes), environmentScope = validateEnvironment(input.environmentScope);
     const requestHash = queryHash(environmentScope, requestedTypes);
     const id = await transaction(this.database, async client => {
+      assertCurrent?.();
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`power-platform:${scope.tenantId}:${scope.principalId}`]);
       const existing = (await client.query<Pick<JobRow, "id" | "environment_scope" | "requested_types">>(`
         SELECT id,environment_scope,requested_types FROM power_platform_refresh_jobs
@@ -56,7 +59,8 @@ export class PowerPlatformRefreshJobs {
         return existing.id;
       }
       const outstanding = await client.query(`SELECT count(*)::int AS count FROM power_platform_refresh_jobs
-        WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
+        WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running')
+          AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`,
       [scope.tenantId, scope.principalId]);
       if (outstanding.rows[0].count >= 5) throw new AppError(429, "job_limit", "At most five unfinished inventory refresh jobs are allowed per principal.");
       const jobId = randomUUID();
@@ -65,26 +69,39 @@ export class PowerPlatformRefreshJobs {
         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [jobId, scope.tenantId, scope.principalId, input.idempotencyKey,
         requestHash, input.roleScope, environmentScope, JSON.stringify(requestedTypes)]);
       return jobId;
-    });
+    }, undefined, () => { assertCurrent?.(); requireProviderAdmissions(); });
     const job = await this.getJob(scope, id);
+    assertCurrent?.();
     if (!job) throw new AppError(409, "inventory_job_expired", "The inventory refresh expired. Submit a new refresh with a new idempotency key.");
     return job;
   }
 
   async getJob(scope: InventoryDataScope, id: string) {
+    const row = await this.getJobRow(scope, id);
+    return row ? projectJob(row) : undefined;
+  }
+
+  async getJobForExecution(scope: InventoryDataScope, id: string) {
+    const row = await this.getJobRow(scope, id);
+    return row ? { job: projectJob(row), deadlineAt: row.deadline_at } : undefined;
+  }
+
+  private async getJobRow(scope: InventoryDataScope, id: string) {
     validateScope(scope);
-    const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id
+    const { rows } = await this.database.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      SELECT ${jobColumns},snapshot.id AS snapshot_id
       FROM power_platform_refresh_jobs job LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
-      WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.expires_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId]);
-    return rows[0] ? projectJob(rows[0]) : undefined;
+      CROSS JOIN clock WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.expires_at>clock.checked_at`, [id, scope.tenantId, scope.principalId]);
+    return rows[0];
   }
 
   async listJobs(scope: InventoryDataScope, limit = 20): Promise<InventoryRefreshJobList> {
     validateScope(scope);
     const boundedLimit = Math.min(Math.max(limit, 1), 50);
-    const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id
+    const { rows } = await this.database.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      SELECT ${jobColumns},snapshot.id AS snapshot_id
       FROM power_platform_refresh_jobs job LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
-      WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.expires_at>clock_timestamp()
+      CROSS JOIN clock WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.expires_at>clock.checked_at
       ORDER BY job.created_at DESC,job.id DESC LIMIT $3`, [scope.tenantId, scope.principalId, boundedLimit]);
     const summary = await this.database.query<{ last_attempt_at: Date | null; last_success_at: Date | null }>(`SELECT
       (SELECT max(attempted_at) FROM power_platform_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()) AS last_attempt_at,
@@ -101,7 +118,8 @@ export class PowerPlatformRefreshJobs {
 
   async markRunning(scope: InventoryDataScope, id: string) {
     const result = await this.database.query(`UPDATE power_platform_refresh_jobs SET status='running',attempted_at=clock_timestamp(),
-      updated_at=clock_timestamp(),error_code=NULL,message=NULL WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
+      updated_at=clock_timestamp(),error_code=NULL,message=NULL,page_count=0,observed_count=0,total_records=NULL,unknown_field_count=0
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
         AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`,
     [id, scope.tenantId, scope.principalId]);
     return result.rowCount === 1;
@@ -116,12 +134,13 @@ export class PowerPlatformRefreshJobs {
   }
 
   async markWaitingAuthorization(scope: InventoryDataScope, id: string) {
-    await this.database.query(`UPDATE power_platform_refresh_jobs SET
-      status=CASE WHEN expires_at>clock_timestamp() AND deadline_at>clock_timestamp() THEN 'waiting_authorization' ELSE 'failed' END,
-      error_code=CASE WHEN expires_at>clock_timestamp() AND deadline_at>clock_timestamp() THEN 'interaction_required' ELSE 'inventory_job_expired' END,
-      message=CASE WHEN expires_at>clock_timestamp() AND deadline_at>clock_timestamp() THEN 'Current delegated authorization is required.' ELSE 'The inventory refresh deadline expired.' END,
-      finished_at=CASE WHEN expires_at>clock_timestamp() AND deadline_at>clock_timestamp() THEN NULL ELSE clock_timestamp() END,
-      updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running'`,
+    await this.database.query(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      UPDATE power_platform_refresh_jobs SET
+      status=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'waiting_authorization' ELSE 'failed' END,
+      error_code=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'interaction_required' ELSE 'inventory_job_expired' END,
+      message=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'Current delegated authorization is required.' ELSE 'The inventory refresh deadline expired. Start a new refresh.' END,
+      finished_at=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN NULL ELSE clock.checked_at END,
+      updated_at=clock.checked_at FROM clock WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running'`,
     [id, scope.tenantId, scope.principalId]);
     return this.getJob(scope, id);
   }
@@ -134,7 +153,7 @@ export class PowerPlatformRefreshJobs {
         message='Explicit resume with current delegated authorization is required.',updated_at=clock_timestamp()
       FROM candidates WHERE job.id=candidates.id`);
     const expired = await this.database.query(`WITH candidates AS (
-      SELECT id FROM power_platform_refresh_jobs WHERE status='running' AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())
+      SELECT id FROM power_platform_refresh_jobs WHERE status IN ('running','waiting_authorization') AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())
         ORDER BY updated_at,id LIMIT 250 FOR UPDATE SKIP LOCKED)
       UPDATE power_platform_refresh_jobs job SET status='failed',error_code='inventory_job_expired',
         message='The inventory refresh expired before recovery.',finished_at=clock_timestamp(),updated_at=clock_timestamp()
@@ -150,24 +169,32 @@ export class PowerPlatformRefreshJobs {
     return this.getJob(scope, id);
   }
 
-  async cancel(scope: InventoryDataScope, id: string, reason: RefreshCancellationReason = "requested") {
+  async cancel(scope: InventoryDataScope, id: string, reason: RefreshCancellationReason = "requested", assertCurrent?: () => void) {
     validateScope(scope);
     const cancellation = refreshCancellation(reason);
-    await this.database.query(`UPDATE power_platform_refresh_jobs SET status='cancelled',error_code=$4,message=$5,
-      finished_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
-    [id, scope.tenantId, scope.principalId, cancellation.code, cancellation.message]);
+    await transaction(this.database, async client => {
+      assertCurrent?.();
+      await client.query(`UPDATE power_platform_refresh_jobs SET status='cancelled',error_code=$4,message=$5,
+        finished_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
+      [id, scope.tenantId, scope.principalId, cancellation.code, cancellation.message]);
+    }, undefined, assertCurrent);
     return this.getJob(scope, id);
   }
 }
 
 function projectJob(row: JobRow): InventoryRefreshJob {
-  return { id: row.id, status: row.status, roleScope: row.role_scope, environmentScope: row.environment_scope || null,
+  const expired = ["waiting_authorization", "running"].includes(row.status) && row.deadline_at <= row.checked_at;
+  const status = expired ? "failed" : row.status;
+  const errorCode = expired ? "inventory_job_expired" : row.error_code;
+  const message = expired ? "The inventory refresh deadline expired. Start a new refresh; saved data is unchanged." : row.message;
+  return { id: row.id, status, roleScope: row.role_scope, environmentScope: row.environment_scope || null,
     requestedTypes: row.requested_types, pageCount: row.page_count, observedCount: row.observed_count,
     totalRecords: row.total_records, unknownFieldCount: row.unknown_field_count, snapshotId: row.snapshot_id,
-    ...(row.error_code ? { errorCode: row.error_code } : {}), ...(row.message ? { message: row.message } : {}),
+    ...(errorCode ? { errorCode } : {}), ...(message ? { message } : {}),
     createdAt: row.created_at.toISOString(), attemptedAt: row.attempted_at?.toISOString() ?? null,
-    updatedAt: row.updated_at.toISOString(), finishedAt: row.finished_at?.toISOString() ?? null };
+    updatedAt: (expired && row.updated_at < row.deadline_at ? row.deadline_at : row.updated_at).toISOString(),
+    finishedAt: expired ? row.deadline_at.toISOString() : row.finished_at?.toISOString() ?? null };
 }
 function validateScope(scope: InventoryDataScope) {
   if (!scope.tenantId || !scope.principalId) throw new AppError(403, "scope_mismatch", "Inventory requires a tenant and current principal scope.");
@@ -179,7 +206,7 @@ function validateTypes(types: readonly PowerPlatformResourceType[]) {
 }
 function validateEnvironment(value: string | undefined) {
   if (value === undefined || value === "") return "";
-  if (typeof value !== "string" || value.length > 512 || /[\r\n\0]/.test(value)) throw new AppError(400, "invalid_inventory_scope", "Inventory environment scope is invalid.");
+  if (typeof value !== "string" || value.length > 512 || /[\r\n\0\uD800-\uDFFF]/u.test(value)) throw new AppError(400, "invalid_inventory_scope", "Inventory environment scope is invalid.");
   return value;
 }
 function queryHash(environmentScope: string, requestedTypes: readonly PowerPlatformResourceType[]) {

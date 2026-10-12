@@ -26,6 +26,8 @@ import { purviewAuditPresets } from "../types/purviewAudit.js";
 import type { AgentPurviewQuery } from "../types/agentInvestigations.js";
 import { AgentIdentityResolutionService } from "../services/agentIdentityResolution.js";
 import { decodeInventoryFacet } from "../types/inventoryFacets.js";
+import { capabilities } from "../services/capabilities.js";
+import { requireProviderAdmissions } from "../services/operationalState.js";
 
 export function createUnifiedAgentsRouter(database: pg.Pool = pool, dependencies: Partial<{
   inventory: LiveInventory; investigations: Pick<AgentInvestigationsService, "resolve">;
@@ -71,12 +73,15 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview
 }, async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   const { recordId, query } = agentPurviewQuery(request.query);
-  const audit = new AuditLog(requestScope(request), database);
+  const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const audit = new AuditLog(scope, database);
   const event = await audit.startEvent({ operationId: `view-audit-search:${randomUUID()}`, scope: "single", action: "view-audit-search", agentId: recordId,
     actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
   try {
-    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query, agentInvestigations.resolve.bind(agentInvestigations));
-    await audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } });
+    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query, agentInvestigations.resolve.bind(agentInvestigations),
+      result => audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } }).then(() => undefined));
+    assertAccountSessionValidation(validation);
     response.json(result);
   } catch (error) {
     await audit.completeEvent(event.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_read_failed" });
@@ -91,10 +96,13 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
   const input = agentPeopleResolveInput(request.body);
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", request.session.user!);
   const controller = new AbortController();
   const assertCurrent = () => {
     controller.signal.throwIfAborted();
     assertAccountSessionValidation(validation);
+    validateCapability();
+    requireProviderAdmissions();
   };
   const disconnected = () => { if (!response.writableEnded) controller.abort(); };
   response.once("close", disconnected);
@@ -109,12 +117,18 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
     const result = await agentPeople.resolve(request.session.user!, ids, { generation, force: input.force, signal: controller.signal });
     assertCurrent();
     await liveInventory.assertCurrent(scope, record.id, record.revision);
+    assertCurrent();
     const evidence = await savedAgentPeople.read(scope, ids);
+    assertCurrent();
+    await liveInventory.assertCurrent(scope, record.id, record.revision);
     assertCurrent();
     response.json({ people: Object.fromEntries(Object.entries(record.people).flatMap(([role, objectId]) => {
       const person = evidence.get(objectId.toLowerCase());
       return person ? [[role, person]] : [];
     })), changed: result.changed });
+  } catch (error) {
+    assertCurrent();
+    throw error;
   } finally {
     response.off("close", disconnected);
   }

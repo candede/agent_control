@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 import { AppError } from "../errors.js";
-import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
+import { boundedProviderJson, boundedProviderText, parseProviderContractJson } from "./providerJson.js";
 import {
   purviewAuditPresetIds,
   purviewAuditPresets,
@@ -49,6 +49,7 @@ type ClientDependencies = {
 type ProviderRequestOptions = {
   signal?: AbortSignal;
   correlationId?: string;
+  assertCurrent?: () => void;
   beforeRequest?: () => Promise<void>;
   onResponse?: (providerRequestId: string | null) => Promise<void>;
 };
@@ -77,31 +78,36 @@ export class GraphAuditSearchClient {
       body: JSON.stringify(createProviderQueryBody(displayName, filters)),
       signal: options.signal,
       correlationId: options.correlationId,
+      assertCurrent: options.assertCurrent,
       beforeRequest: options.beforeRequest,
       onResponse: options.onResponse,
       retry: false,
       create: true,
     });
     const { response } = attempt;
-    if (response.status !== 201) throw providerFailure(response);
+    if (response.status !== 201) throw providerFailure(response, this.now());
     let value: unknown;
     try {
-      value = await responseJson(response, attempt.signal, options.signal);
+      value = await responseJson(response, attempt.signal, options.signal, options.assertCurrent);
       if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
     } catch (error) {
-      if (isResponseConsumptionFailure(error)) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create response was interrupted and must be reconciled before any new create.");
+      if (isResponseConsumptionFailure(error)) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create response was interrupted and must be reconciled before any new create.", responseDetails(response, this.now()));
       throw error;
     }
-    return parseDirectQuery(value, "create");
+    const query = parseDirectQuery(value, "create");
+    options.assertCurrent?.();
+    return query;
   }
 
   async getQuery(token: string, providerQueryId: string, options: ProviderRequestOptions = {}) {
     const attempt = await this.request(token, queryUrl(providerQueryId), { method: "GET", ...options, retry: true });
     const { response } = attempt;
-    if (response.status !== 200) throw providerFailure(response);
-    const value = await responseJson(response, attempt.signal, options.signal);
+    if (response.status !== 200) throw providerFailure(response, this.now());
+    const value = await responseJson(response, attempt.signal, options.signal, options.assertCurrent);
     if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
-    return parseDirectQuery(value, "get");
+    const query = parseDirectQuery(value, "get");
+    options.assertCurrent?.();
+    return query;
   }
 
   async listQueries(token: string, options: ProviderRequestOptions & { maximumPages?: number } = {}) {
@@ -111,19 +117,21 @@ export class GraphAuditSearchClient {
     const maximumPages = Math.min(Math.max(options.maximumPages ?? 5, 1), 5);
     for (let page = 0; next && page < maximumPages; page += 1) {
       validateGraphUrl(next, queryPath, false);
-      if (seen.has(next)) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search query page link.");
-      seen.add(next);
+      if (seen.has(pageIdentity(next))) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search query page link.");
+      seen.add(pageIdentity(next));
       const attempt = await this.request(token, next, { method: "GET", signal: options.signal, correlationId: options.correlationId,
-        beforeRequest: options.beforeRequest, onResponse: options.onResponse, retry: true });
+        assertCurrent: options.assertCurrent, beforeRequest: options.beforeRequest, onResponse: options.onResponse, retry: true });
       const { response } = attempt;
-      if (response.status !== 200) throw providerFailure(response);
-      const value = await responseJson(response, attempt.signal, options.signal);
+      if (response.status !== 200) throw providerFailure(response, this.now());
+      const value = await responseJson(response, attempt.signal, options.signal, options.assertCurrent);
       if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
       const envelope = parseCollection(value, "query");
       validateNextLink(envelope.nextLink, queryPath, seen);
       result.push(...envelope.value.map(value => parseDirectQuery(value, "list")));
       next = envelope.nextLink;
     }
+    options.signal?.throwIfAborted();
+    options.assertCurrent?.();
     return { value: result, complete: next === null, nextLink: next };
   }
 
@@ -141,28 +149,31 @@ export class GraphAuditSearchClient {
     let unknownFieldCount = 0;
     while (next && pageCount < purviewMaximumRecordPages && providerRowCount < purviewMaximumRecords && byteCount < purviewMaximumResultBytes) {
       validateGraphUrl(next, recordsPath, false);
-      if (seenPages.has(next)) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search records page link.");
-      seenPages.add(next);
+      if (seenPages.has(pageIdentity(next))) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search records page link.");
+      seenPages.add(pageIdentity(next));
       let text: string;
+      let response: Response | undefined;
       try {
         const attempt = await this.request(token, next, { method: "GET", signal: options.signal, correlationId: options.correlationId,
-          beforeRequest: options.beforeRequest, onResponse: options.onResponse, retry: true });
-        const { response } = attempt;
-        if (response.status !== 200) throw providerFailure(response);
-        text = await boundedProviderText(response, maximumResponseBytes, attempt.signal);
+          assertCurrent: options.assertCurrent, beforeRequest: options.beforeRequest, onResponse: options.onResponse, retry: true });
+        response = attempt.response;
+        if (response.status !== 200) throw providerFailure(response, this.now());
+        text = await awaitCurrent(() => boundedProviderText(attempt.response, maximumResponseBytes, attempt.signal), attempt.signal, options.assertCurrent);
         attempt.signal.throwIfAborted();
       } catch (error) {
-        const failure = responseConsumptionError(error, options.signal);
+        if (response) cancelResponse(response);
+        options.assertCurrent?.();
+        const failure = responseConsumptionError(error, options.signal, response);
         const partialReason = safePartialPageReason(failure);
         if (pageCount > 0 && partialReason) return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, false, next, partialReason);
         throw failure;
       }
       byteCount += Buffer.byteLength(text);
+      const envelope = parseCollection(parseJson(text), "record");
+      validateNextLink(envelope.nextLink, recordsPath, seenPages);
       if (byteCount > purviewMaximumResultBytes) {
         return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, false, next, "audit_byte_limit");
       }
-      const envelope = parseCollection(parseJson(text), "record");
-      validateNextLink(envelope.nextLink, recordsPath, seenPages);
       pageCount += 1;
       for (const value of envelope.value) {
         providerRowCount += 1;
@@ -192,6 +203,8 @@ export class GraphAuditSearchClient {
     const partialReason = next === null ? null
       : providerRowCount >= purviewMaximumRecords ? "audit_row_limit"
         : byteCount >= purviewMaximumResultBytes ? "audit_byte_limit" : "audit_page_limit";
+    options.signal?.throwIfAborted();
+    options.assertCurrent?.();
     return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, next === null, next, partialReason);
   }
 
@@ -199,16 +212,23 @@ export class GraphAuditSearchClient {
     validateGraphUrl(url, queryPath);
     const maximumAttempts = options.retry ? 3 : 1;
     const startedAt = this.now();
+    const deadline = AbortSignal.timeout(maximumRequestBudgetMs);
+    const logicalSignal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+    let received: Response | undefined;
     for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      options.signal?.throwIfAborted();
+      options.assertCurrent?.();
       const remainingBudget = maximumRequestBudgetMs - (this.now() - startedAt);
       if (remainingBudget <= 0) throw new AppError(502, "provider_error", "Microsoft Graph Audit Search exhausted its request time budget.");
       const timeout = AbortSignal.timeout(Math.max(1, Math.min(this.dependencies.requestTimeoutMs ?? 10_000, remainingBudget)));
-      const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+      const signal = AbortSignal.any([logicalSignal, timeout]);
+      let undeliveredResponse: Response | undefined;
       try {
         if (signal.aborted) throw signal.reason;
-        await requestCallback(() => options.beforeRequest?.(), signal);
+        await requestCallback(() => options.beforeRequest?.(), signal, options.assertCurrent);
         if (signal.aborted) throw signal.reason;
-        const response = await this.dependencies.fetch(url, {
+        options.assertCurrent?.();
+        const fetching = this.dependencies.fetch(url, {
           method: options.method,
           redirect: "manual",
           signal,
@@ -220,33 +240,47 @@ export class GraphAuditSearchClient {
           },
           body: options.body,
         });
+        void fetching.then(response => {
+          if (signal.aborted) cancelResponse(response);
+          else undeliveredResponse = response;
+        }, () => undefined);
+        const response = await awaitCurrent(() => fetching, signal);
+        undeliveredResponse = undefined;
+        received = response;
         try {
-          await requestCallback(() => options.onResponse?.(responseRequestId(response)), signal);
+          options.assertCurrent?.();
+          await requestCallback(() => options.onResponse?.(responseRequestId(response)), signal, options.assertCurrent);
         } catch (error) {
           cancelResponse(response);
           throw error;
         }
         if (isRedirect(response.status)) {
           cancelResponse(response);
-          throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an unexpected redirect.");
+          throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an unexpected redirect.", responseDetails(response, this.now()));
         }
-        if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
-          const delay = retryDelay(response.headers.get("retry-after"), response.headers.get("date"), attempt, this.dependencies.random());
+        if (attempt < maximumAttempts && [429, 500, 502, 503, 504].includes(response.status)) {
+          const delay = retryDelay(response.headers.get("retry-after"), response.headers.get("date"), attempt, this.dependencies.random(), this.now());
           if (delay >= maximumRequestBudgetMs - (this.now() - startedAt)) {
             cancelResponse(response);
             return { response, signal };
           }
           cancelResponse(response);
-          await this.dependencies.wait(delay, options.signal);
+          await this.waitForRetry(delay, logicalSignal, options, response);
           continue;
         }
         if (response.status !== (options.create ? 201 : 200)) cancelResponse(response);
         return { response, signal };
       } catch (error) {
+        if (undeliveredResponse) {
+          received = undeliveredResponse;
+          cancelResponse(undeliveredResponse);
+        }
         if (options.signal?.aborted) throw options.signal.reason;
+        options.assertCurrent?.();
         if (error instanceof AppError) throw error;
         if (signal.aborted) {
-          if (options.create) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create outcome is unknown and must be reconciled before any new create.");
+          if (received && !received.ok) throw providerFailure(received, this.now());
+          if (options.create) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create outcome is unknown and must be reconciled before any new create.", received && responseDetails(received, this.now()));
           throw new AppError(502, "provider_error", "Microsoft Graph Audit Search exhausted its request time budget.");
         }
         if (options.create) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create outcome is unknown and must be reconciled before any new create.");
@@ -255,7 +289,7 @@ export class GraphAuditSearchClient {
         if (delay >= maximumRequestBudgetMs - (this.now() - startedAt)) {
           throw new AppError(502, "provider_error", "Microsoft Graph Audit Search exhausted its request time budget before retry.");
         }
-        await this.dependencies.wait(delay, options.signal);
+        await this.waitForRetry(delay, logicalSignal, options);
       }
     }
     throw new AppError(502, "provider_error", "Microsoft Graph Audit Search request failed.");
@@ -263,6 +297,19 @@ export class GraphAuditSearchClient {
 
   private now() {
     return this.dependencies.now?.() ?? Date.now();
+  }
+
+  private async waitForRetry(delay: number, signal: AbortSignal, options: ProviderRequestOptions, response?: Response) {
+    try {
+      await awaitCurrent(() => this.dependencies.wait(delay, options.signal), signal, options.assertCurrent);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      options.assertCurrent?.();
+      if (signal.aborted) throw response ? providerFailure(response, this.now())
+        : new AppError(502, "provider_error", "Microsoft Graph Audit Search exhausted its request time budget.");
+      if (error instanceof AppError) throw error;
+      throw new AppError(500, "internal_error", "Audit Search retry scheduling failed.");
+    }
   }
 }
 
@@ -293,7 +340,7 @@ export function validatePurviewAuditFilters(value: unknown, options: { now?: Dat
     operations,
     startDateTime,
     endDateTime,
-    userPrincipalNames: stringList(value.userPrincipalNames, "userPrincipalNames", item => item.includes("@")),
+    userPrincipalNames: stringList(value.userPrincipalNames, "userPrincipalNames", item => item.includes("@") && !/\s/.test(item), 320),
     ipAddresses: stringList(value.ipAddresses, "ipAddresses", item => isIP(item) !== 0),
     objectIds: stringList(value.objectIds, "objectIds", () => true, 512),
     administrativeUnitIds: stringList(value.administrativeUnitIds, "administrativeUnitIds", item => uuid(item)),
@@ -372,20 +419,13 @@ export function providerQueryMatches(query: PurviewProviderQuery, displayName: s
 
 function parseDirectQuery(value: unknown, operation: "create" | "get" | "list"): PurviewProviderQuery {
   if (!isObject(value) || "value" in value) throw new AppError(502, "provider_schema", `Microsoft Graph returned an unsupported ${operation} Audit Search query shape.`);
+  if ("@odata.type" in value && value["@odata.type"] !== "#microsoft.graph.security.auditLogQuery") throw new AppError(502, "provider_schema", "Microsoft Graph returned an unsupported Audit Search query type.");
   if (Object.keys(value).some(key => !queryKeys.has(key))) throw new AppError(502, "provider_schema", "Microsoft Graph returned unknown Audit Search query fields.");
   const status = boundedString(value.status, "status", 64) as PurviewProviderQueryStatus;
   if (!queryStatuses.has(status)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search query status.");
-  if (value.isRecordCountLimitExceeded !== undefined && typeof value.isRecordCountLimitExceeded !== "boolean") {
-    throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search completeness flag.");
-  }
-  const services = value.serviceFilters === undefined ? undefined : responseStringList(value.serviceFilters, "serviceFilters");
-  const service = value.serviceFilter === undefined && services?.length === 1 ? services[0] : boundedString(value.serviceFilter, "serviceFilter", 128);
-  if (services && (services.length !== 1 || services[0] !== service)) {
-    throw new AppError(502, "provider_schema", "Microsoft Graph returned inconsistent Audit Search service filters.");
-  }
-  const keywordFilter = optionalString(value.keywordFilter, 512);
+  if (!validProviderQueryId(value.id)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search query ID.");
   return {
-    id: boundedString(value.id, "id", 512),
+    id: value.id,
     displayName: boundedString(value.displayName, "displayName", 256),
     filterStartDateTime: providerUtcInstant(value.filterStartDateTime, "filterStartDateTime"),
     filterEndDateTime: providerUtcInstant(value.filterEndDateTime, "filterEndDateTime"),
@@ -486,22 +526,43 @@ function parseCollection(value: unknown, kind: "query" | "record") {
   return { value: value.value, nextLink: nextLink ?? null as string | null };
 }
 
-async function responseJson(response: Response, signal?: AbortSignal, cancellationSignal?: AbortSignal) {
+async function responseJson(response: Response, signal: AbortSignal, cancellationSignal?: AbortSignal, assertCurrent?: () => void) {
   try {
-    return await boundedProviderJson<unknown>(response, signal, maximumResponseBytes);
+    return await awaitCurrent(() => boundedProviderJson<unknown>(response, signal, maximumResponseBytes, parseAuditJson), signal, assertCurrent);
   } catch (error) {
-    throw responseConsumptionError(error, cancellationSignal);
+    cancelResponse(response);
+    assertCurrent?.();
+    throw responseConsumptionError(error, cancellationSignal, response);
   }
 }
 
-function responseConsumptionError(error: unknown, cancellationSignal?: AbortSignal) {
+function responseConsumptionError(error: unknown, cancellationSignal?: AbortSignal, response?: Response) {
   if (cancellationSignal?.aborted) return cancellationSignal.reason;
-  return error instanceof AppError ? error
+  const failure = error instanceof AppError ? error
     : new AppError(502, "provider_error", "Microsoft Graph Audit Search response consumption failed within its attempt deadline.");
+  if (response && ["provider_error", "provider_schema", "provider_result_limit"].includes(failure.code)) {
+    failure.details = responseDetails(response, Date.now());
+  }
+  return failure;
+}
+
+function parseAuditJson(text: string, kind: "query" | "record" = "query"): unknown {
+  return parseProviderContractJson(text, {
+    root: {
+      fields: ["@odata.context", "@odata.count", "@odata.nextLink", "value", ...(kind === "query" ? queryKeys : [])],
+      arrays: { value: kind },
+    },
+    query: { fields: [...queryKeys] },
+    record: { fields: [...recordKeys], objects: { auditData: "auditData" } },
+    auditData: { fields: [...auditDataKeys], objects: { dynamicProperties: "dynamicProperties" } },
+    dynamicProperties: { fields: [...dynamicPropertyKeys], objects: { CopilotEventData: "copilotEventData" } },
+    copilotEventData: { fields: [...copilotEventDataKeys], arrays: { Messages: "message" } },
+    message: { fields: ["ID", "isPrompt"] },
+  }, 8);
 }
 
 function parseJson(text: string) {
-  try { return JSON.parse(text) as unknown; }
+  try { return parseAuditJson(text, "record"); }
   catch { throw new AppError(502, "provider_schema", "Microsoft Graph returned invalid JSON."); }
 }
 
@@ -510,47 +571,94 @@ function finishResult(records: PurviewAuditRecord[], pageCount: number, provider
 }
 
 function queryUrl(id: string) {
-  if (!id || id.length > 512 || /[/?#\\\0]/.test(id)) throw new AppError(400, "invalid_provider_query_id", "Audit Search provider query ID is invalid.");
+  if (!validProviderQueryId(id)) throw new AppError(400, "invalid_provider_query_id", "Audit Search provider query ID is invalid.");
   return `${graphOrigin}${queryPath}/${encodeURIComponent(id)}`;
+}
+
+function validProviderQueryId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 512 && id !== "." && id !== ".."
+    && !/[/?#\\\u0000-\u001f\u007f-\u009f]/.test(id);
 }
 
 function validateGraphUrl(value: string, expectedPath: string, allowDescendants = true) {
   const url = URL.parse(value);
   const validPath = url && (url.pathname === expectedPath || allowDescendants && url.pathname.startsWith(`${expectedPath}/`));
-  if (!url || url.origin !== graphOrigin || url.username || url.password || url.hash || !validPath) throw new AppError(502, "invalid_provider_link", "Audit Search provider link is outside the selected Graph v1.0 contract.");
+  if (!url || /[\s\u0000-\u001f\u007f-\u009f]/.test(value) || url.origin !== graphOrigin || url.username || url.password || url.hash || !validPath) throw new AppError(502, "invalid_provider_link", "Audit Search provider link is outside the selected Graph v1.0 contract.");
+  const keys = [...url.searchParams.keys()];
+  if (new Set(keys).size !== keys.length || keys.some(key => !["$skiptoken", "$skip", "$top"].includes(key))
+    || keys.length && keys.filter(key => key === "$skiptoken" || key === "$skip").length !== 1
+    || url.searchParams.has("$skiptoken") && (!url.searchParams.get("$skiptoken") || /[\u0000-\u001f\u007f-\u009f]/.test(url.searchParams.get("$skiptoken")!))
+    || url.searchParams.has("$skip") && !/^\d{1,10}$/.test(url.searchParams.get("$skip")!)
+    || url.searchParams.has("$top") && (!/^\d{1,4}$/.test(url.searchParams.get("$top")!) || Number(url.searchParams.get("$top")) < 1 || Number(url.searchParams.get("$top")) > purviewMaximumRecords)) {
+    throw new AppError(502, "invalid_provider_link", "Audit Search continuation changed the selected query contract.");
+  }
 }
 
 function validateNextLink(value: string | null, expectedPath: string, seen: Set<string>) {
   if (value === null) return;
   validateGraphUrl(value, expectedPath, false);
-  if (seen.has(value)) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search page link.");
+  if (seen.has(pageIdentity(value))) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search page link.");
+  if (new URL(value).searchParams.size === 0) throw new AppError(502, "invalid_provider_link", "Audit Search continuation is missing its paging selector.");
 }
 
-async function requestCallback(callback: () => Promise<void> | undefined, signal: AbortSignal) {
+function pageIdentity(value: string) {
+  const url = new URL(value);
+  for (const key of ["$skip", "$top"]) {
+    if (url.searchParams.has(key)) url.searchParams.set(key, String(Number(url.searchParams.get(key))));
+  }
+  url.searchParams.sort();
+  return url.href;
+}
+
+async function awaitCurrent<T>(operation: () => T | PromiseLike<T>, signal: AbortSignal, assertCurrent?: () => void): Promise<T> {
   signal.throwIfAborted();
+  assertCurrent?.();
   let onAbort = () => {};
   const aborted = new Promise<never>((_resolve, reject) => {
     onAbort = () => reject(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    await Promise.race([callback(), aborted]);
+    const result = await Promise.race([operation(), aborted]);
+    signal.throwIfAborted();
+    assertCurrent?.();
+    return result;
   } catch (error) {
-    if (error instanceof AppError) throw error;
-    throw new AppError(500, "internal_error", "Audit Search request bookkeeping failed.");
+    signal.throwIfAborted();
+    assertCurrent?.();
+    throw error;
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
 }
 
-function retryDelay(retryAfter: string | null, responseDate: string | null, attempt: number, random: number) {
-  if (retryAfter && /^\d+$/.test(retryAfter)) return Math.min(Number(retryAfter) * 1000, 30_000);
-  if (retryAfter) {
-    const retryAt = Date.parse(retryAfter);
-    const responseAt = responseDate === null ? Date.now() : Date.parse(responseDate);
-    if (Number.isFinite(retryAt) && Number.isFinite(responseAt)) return Math.min(Math.max(retryAt - responseAt, 0), 30_000);
+async function requestCallback(callback: () => Promise<void> | undefined, signal: AbortSignal, assertCurrent?: () => void) {
+  try {
+    await awaitCurrent(callback, signal, assertCurrent);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(500, "internal_error", "Audit Search request bookkeeping failed.");
   }
-  return Math.min(250 * 2 ** (attempt - 1) + Math.floor(random * 250), 5_000);
+}
+
+function retryAfterMilliseconds(value: string | null, responseDate: string | null, now: number) {
+  if (value === null) return undefined;
+  value = value.trim();
+  if (/^\d+$/.test(value)) return Math.min(Number(value) * 1000, Number.MAX_SAFE_INTEGER);
+  const retryAt = httpDate(value);
+  if (retryAt === undefined) return undefined;
+  return Math.max(0, retryAt - (httpDate(responseDate) ?? now));
+}
+
+function httpDate(value: string | null) {
+  if (value === null || !/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return undefined;
+  const date = Date.parse(value);
+  return Number.isFinite(date) && new Date(date).toUTCString() === value ? date : undefined;
+}
+
+function retryDelay(retryAfter: string | null, responseDate: string | null, attempt: number, random: number, now = Date.now()) {
+  return retryAfterMilliseconds(retryAfter, responseDate, now)
+    ?? Math.min(250 * 2 ** (attempt - 1) + Math.floor(random * 250), 5_000);
 }
 
 function cancelResponse(response: Response) {
@@ -561,7 +669,7 @@ function cancelResponse(response: Response) {
 
 function responseRequestId(response: Response) {
   const value = response.headers.get("request-id");
-  return value && value.length <= 256 && !/[\r\n\0]/.test(value) ? value : null;
+  return value && /^[A-Za-z0-9-]{1,128}$/.test(value) ? value : null;
 }
 
 function safePartialPageReason(error: unknown): PurviewAuditPartialReason | null {
@@ -582,11 +690,26 @@ function nativeRecordFingerprint(record: PurviewAuditRecord) {
   return JSON.stringify(nativeRecord);
 }
 
-function providerFailure(response: Response) {
-  if (response.status === 401) return new AppError(401, "authorization_expired", "Microsoft Graph Audit Search authorization expired.");
-  if (response.status === 403) return new AppError(403, "provider_denied", "Microsoft Graph denied Audit Search without identifying a permission, Purview role, license, or tenant-support cause.");
-  if (response.status === 429) return new AppError(429, "provider_throttled", "Microsoft Graph throttled Audit Search within its bounded retry budget.");
-  return new AppError(502, "provider_error", `Microsoft Graph Audit Search returned status ${response.status}.`);
+function providerFailure(response: Response, now = Date.now()) {
+  const details = responseDetails(response, now);
+  const status = response.status >= 400 ? response.status : 502;
+  const code = response.status === 401 ? "authorization_expired" : response.status === 403 ? "provider_denied"
+    : response.status === 404 ? "provider_not_found" : response.status === 429 ? "provider_throttled" : "provider_error";
+  const message = response.status === 401 ? "Microsoft Graph Audit Search authorization expired."
+    : response.status === 403 ? "Microsoft Graph denied Audit Search without identifying a permission, Purview role, license, or tenant-support cause."
+      : response.status === 404 ? "Microsoft Graph could not find the selected Audit Search query."
+        : response.status === 429 ? "Microsoft Graph throttled Audit Search within its bounded retry budget."
+          : `Microsoft Graph Audit Search returned status ${response.status}.`;
+  const error = new AppError(status, code, message, details);
+  if (details.retryAfterMs !== undefined && details.retryAfterMs > 0) error.retryAfterSeconds = Math.ceil(details.retryAfterMs / 1000);
+  return error;
+}
+
+function responseDetails(response: Response, now: number) {
+  const correlationId = responseRequestId(response);
+  const retryAfterMs = retryAfterMilliseconds(response.headers.get("retry-after"), response.headers.get("date"), now);
+  return { httpStatus: response.status, ...(correlationId ? { correlationId } : {}),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
 }
 
 function utcInstant(value: unknown, field: string) {
@@ -604,24 +727,25 @@ function providerUtcInstant(value: unknown, field: string) {
 
 function stringList(value: unknown, field: string, validate: (item: string) => boolean, maximumLength = 256, maximumItems = 20) {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > maximumItems || value.some(item => typeof item !== "string" || !item || item.length > maximumLength || /[\r\n\0]/.test(item) || !validate(item))) throw new AppError(400, "invalid_audit_filters", `Audit Search ${field} is invalid.`);
+  if (!Array.isArray(value) || value.length > maximumItems || value.some(item => typeof item !== "string" || !item || item.length > maximumLength || /[\u0000-\u001f\u007f-\u009f]/.test(item) || !validate(item))) throw new AppError(400, "invalid_audit_filters", `Audit Search ${field} is invalid.`);
   if (new Set(value).size !== value.length) throw new AppError(400, "invalid_audit_filters", `Audit Search ${field} contains duplicates.`);
   return [...value].sort(ordinal);
 }
 
 function responseStringList(value: unknown, field: string, maximum = 20) {
-  if (!Array.isArray(value) || value.length > maximum || value.some(item => typeof item !== "string" || !item || item.length > 512)) throw new AppError(502, "provider_schema", `Microsoft Graph returned an invalid ${field}.`);
+  if (!Array.isArray(value) || value.length > maximum || value.some(item => typeof item !== "string" || !item || item.length > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(item))
+    || new Set(value).size !== value.length) throw new AppError(502, "provider_schema", `Microsoft Graph returned an invalid ${field}.`);
   return [...value] as string[];
 }
 
 function boundedString(value: unknown, field: string, maximum: number) {
-  if (typeof value !== "string" || !value || value.length > maximum || /[\r\n\0]/.test(value)) throw new AppError(502, "provider_schema", `Microsoft Graph returned an invalid ${field}.`);
+  if (typeof value !== "string" || !value || value.length > maximum || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw new AppError(502, "provider_schema", `Microsoft Graph returned an invalid ${field}.`);
   return value;
 }
 
 function optionalString(value: unknown, maximum: number): string | null {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || value.length > maximum || /[\r\n\0]/.test(value)) throw new AppError(502, "provider_schema", "Microsoft Graph returned malformed typed audit metadata.");
+  if (typeof value !== "string" || value.length > maximum || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw new AppError(502, "provider_schema", "Microsoft Graph returned malformed typed audit metadata.");
   return value;
 }
 

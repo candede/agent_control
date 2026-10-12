@@ -3,6 +3,7 @@ import { dataAdmissionError, dataLimits } from "./dataBounds.js";
 import { BoundedPool } from "./boundedPool.js";
 import { peakCheckpoint, transactionCheckpoint, transactionResultCheckpoint } from "../services/peakMemory.js";
 import { clientErrorState } from "./clientErrors.js";
+import { dataWorkMetricScope } from "../services/dataMetrics.js";
 
 // All dormant record consumers share this per-pool admission gate. Three
 // foreground clients leave the fourth connection available for short renewals.
@@ -15,14 +16,15 @@ export class DataConnections {
   constructor(readonly database: pg.Pool) {
     if ((database.options.max ?? 4) !== 4) throw new Error("data_pool_budget");
   }
-  async run<T>(work: (client: pg.PoolClient) => Promise<T>, renewal = false, signal?: AbortSignal, serializationKey?: string): Promise<T> {
-    return this.transaction(work, "BEGIN", renewal, signal, undefined, serializationKey);
+  async run<T>(work: (client: pg.PoolClient) => Promise<T>, renewal = false, signal?: AbortSignal, serializationKey?: string,
+    beforeCommit?: () => void, onCommitted?: () => void): Promise<T> {
+    return this.transaction(work, "BEGIN", renewal, signal, undefined, serializationKey, beforeCommit, onCommitted);
   }
   async selectedRead<T>(work: (client: pg.PoolClient) => Promise<T>, options: {
-    signal?: AbortSignal; admissionTenantId?: string; serializationKey?: string;
+    signal?: AbortSignal; admissionTenantId?: string; serializationKey?: string; beforeCommit?: () => void;
   } = {}): Promise<T> {
     try {
-      return await this.transaction(work, "BEGIN ISOLATION LEVEL REPEATABLE READ", false, options.signal, options.admissionTenantId, options.serializationKey);
+      return await this.transaction(work, "BEGIN ISOLATION LEVEL REPEATABLE READ", false, options.signal, options.admissionTenantId, options.serializationKey, options.beforeCommit);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "40001") {
         const conflict = dataAdmissionError("data_read_conflict", 503);
@@ -34,7 +36,7 @@ export class DataConnections {
   }
   private async transaction<T>(
     work: (client: pg.PoolClient) => Promise<T>, begin: string, renewal: boolean, signal?: AbortSignal, admissionTenantId?: string,
-    serializationKey?: string,
+    serializationKey?: string, beforeCommit?: () => void, onCommitted?: () => void,
   ): Promise<T> {
     signal?.throwIfAborted();
     const localAdmission = !renewal && !(this.database instanceof BoundedPool);
@@ -58,7 +60,9 @@ export class DataConnections {
     let clientState: ReturnType<typeof clientErrorState> | undefined,discard: Error | undefined;
     let admissionLocked = false;
     let serializationLocked = false;
+    let committed = false;
     let failure: unknown;
+    const metrics = dataWorkMetricScope();
     try {
       signal?.throwIfAborted();
       client = renewal && this.database instanceof BoundedPool ? await this.database.connectRenewal() : await this.database.connect();
@@ -80,18 +84,24 @@ export class DataConnections {
       await client.query(begin);
       if (begin === "BEGIN ISOLATION LEVEL REPEATABLE READ") selectedReaders.add(client);
       await transactionCheckpoint(client);
-      const value = await work(client);
+      const transactionClient = client;
+      const value = await metrics.run(() => work(transactionClient));
       peakCheckpoint("sql.result");
       signal?.throwIfAborted();
       const measured = await transactionResultCheckpoint(client);
       signal?.throwIfAborted();
       if (clientState.error) throw clientState.error;
-      await client.query("COMMIT");
+      beforeCommit?.();
+      const commit = await client.query("COMMIT");
+      if (commit.command !== "COMMIT") throw new Error("data_transaction_not_committed");
+      committed = true;
+      onCommitted?.();
+      metrics.commit();
       measured?.();
       return value;
     } catch (error) {
       failure = error;
-      if (client) {
+      if (client && !committed) {
         try { await client.query("ROLLBACK"); }
         catch (rollback) {
           discard = rollback instanceof Error ? rollback : new Error("data_connection_unusable",{ cause: rollback });
@@ -101,6 +111,7 @@ export class DataConnections {
       }
       throw error;
     } finally {
+      metrics.discard();
       try {
         if (admissionLocked) {
           const unlocked = await client!.query("SELECT pg_advisory_unlock(hashtextextended($1,147)) AS unlocked", [admissionTenantId]);
@@ -112,13 +123,18 @@ export class DataConnections {
         }
       } catch (error) {
         discard = error instanceof Error ? error : new Error("data_selection_admission_unlock_failed", { cause: error });
-        throw failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+        failure = failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+        throw failure;
       } finally {
         if (client) selectedReaders.delete(client);
-        client?.release(discard ?? clientState?.error);
-        if (localAdmission) {
-          const next = this.queue.shift();
-          if (next) next(); else this.active--;
+        try { client?.release(discard ?? clientState?.error); }
+        catch (error) {
+          throw failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+        } finally {
+          if (localAdmission) {
+            const next = this.queue.shift();
+            if (next) next(); else this.active--;
+          }
         }
       }
     }

@@ -1,3 +1,6 @@
+import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
+
 export const currentSchemaSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
     provider = icu, deterministic = 'false', locale = 'en-US-u-ks-level1'
@@ -389,9 +392,9 @@ CREATE TABLE power_platform_refresh_jobs (
                                                                     AND length(idempotency_key) <= 128)
   , CONSTRAINT power_platform_refresh_jobs_message_check CHECK (length(message) <= 1024)
   , CONSTRAINT power_platform_refresh_jobs_observed_count_check CHECK (observed_count >= 0
-                                                                   AND observed_count <= 5000)
+                                                                   AND observed_count <= ${inventoryLimits.sourceRows})
   , CONSTRAINT power_platform_refresh_jobs_page_count_check CHECK (page_count >= 0
-                                                               AND page_count <= 50)
+                                                               AND page_count <= ${inventoryLimits.pages})
   , CONSTRAINT power_platform_refresh_jobs_principal_id_check CHECK (length(principal_id) >= 1
                                                                  AND length(principal_id) <= 256)
   , CONSTRAINT power_platform_refresh_jobs_request_hash_check CHECK (request_hash ~ CAST('^[a-f0-9]{64}$' AS text))
@@ -410,7 +413,7 @@ CREATE TABLE power_platform_refresh_jobs (
   , CONSTRAINT power_platform_refresh_jobs_tenant_id_check CHECK (length(tenant_id) >= 1
                                                               AND length(tenant_id) <= 128)
   , CONSTRAINT power_platform_refresh_jobs_total_records_check CHECK (total_records >= 0
-                                                                  AND total_records <= 5000)
+                                                                  AND total_records <= ${inventoryLimits.sourceRows})
   , CONSTRAINT power_platform_refresh_jobs_unknown_field_count_check CHECK (unknown_field_count >= 0
                                                                         AND unknown_field_count <= 1000000)
   , CONSTRAINT power_platform_refresh_jobs_pkey PRIMARY KEY (id)
@@ -450,8 +453,8 @@ CREATE TABLE package_refresh_jobs (
                                                              AND length(idempotency_key) <= 128)
   , CONSTRAINT package_refresh_jobs_message_check CHECK (length(message) <= 1024)
   , CONSTRAINT package_refresh_jobs_observed_count_check CHECK (observed_count >= 0
-                                                            AND observed_count <= 5000)
-  , CONSTRAINT package_refresh_jobs_page_count_check CHECK (page_count >= 0 AND page_count <= 100)
+                                                            AND observed_count <= ${inventoryLimits.sourceRows})
+  , CONSTRAINT package_refresh_jobs_page_count_check CHECK (page_count >= 0 AND page_count <= ${inventoryLimits.pages})
   , CONSTRAINT package_refresh_jobs_principal_id_check CHECK (length(principal_id) >= 1
                                                           AND length(principal_id) <= 256)
   , CONSTRAINT package_refresh_jobs_query_hash_check CHECK (query_hash ~ CAST('^[a-f0-9]{64}$' AS text))
@@ -468,7 +471,7 @@ CREATE TABLE package_refresh_jobs (
   , CONSTRAINT package_refresh_jobs_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
                                                                                  , CAST('application' AS text)]))
   , CONSTRAINT package_refresh_jobs_total_records_check CHECK (total_records >= 0
-                                                           AND total_records <= 5000)
+                                                           AND total_records <= ${inventoryLimits.sourceRows})
   , CONSTRAINT package_refresh_jobs_pkey PRIMARY KEY (id)
   , CONSTRAINT package_refresh_jobs_tenant_id_principal_id_token_mode_idem_key UNIQUE (tenant_id, principal_id, token_mode, idempotency_key)
 );
@@ -2140,6 +2143,7 @@ CREATE TABLE data_sync_run_sources (
   , status text NOT NULL
   , job_id uuid
   , attempt integer DEFAULT 1 NOT NULL
+  , attempt_started_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
   , count integer
   , last_success_at timestamp with time zone
   , updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
@@ -2225,16 +2229,14 @@ CREATE TABLE agent_usage_associations (
   , source text NOT NULL
   , native_id text NOT NULL
   , environment_id text NOT NULL
-  , normalized_environment_id text GENERATED ALWAYS AS (CASE
+  , normalized_environment_id text COLLATE pg_catalog."C" GENERATED ALWAYS AS (CASE
                                                           WHEN source = CAST('power_platform' AS text)
-                                                            THEN lower(environment_id)
+                                                            THEN ${normalizeEnvironmentIdentitySql("environment_id")}
                                                           ELSE environment_id
                                                         END) STORED
-  , normalized_native_id text GENERATED ALWAYS AS (CASE
+  , normalized_native_id text COLLATE pg_catalog."C" GENERATED ALWAYS AS (CASE
                                                      WHEN source = CAST('power_platform' AS text)
-                                                      AND length(native_id) = 36
-                                                      AND native_id ~* CAST('^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' AS text)
-                                                       THEN lower(native_id)
+                                                       THEN ${normalizeNativeIdentitySql("native_id")}
                                                      ELSE native_id
                                                    END) STORED
   , basis text DEFAULT CAST('admin_reviewed' AS text) NOT NULL
@@ -2550,7 +2552,7 @@ CREATE TABLE directory_user_rows (
                                                                                       , CAST('suspended' AS text)
                                                                                       , CAST('locked_out' AS text)
                                                                                       , CAST('unknown' AS text)]))
-  , CONSTRAINT directory_user_rows_sort_key_check CHECK (length(sort_key) <= 1024)
+  , CONSTRAINT directory_user_rows_sort_key_check CHECK (length(sort_key) <= 9216)
   , CONSTRAINT directory_user_rows_upn_check CHECK (length(upn) <= 512)
   , CONSTRAINT directory_user_rows_upn_key_check CHECK (length(upn_key) <= 512)
   , CONSTRAINT directory_user_rows_user_type_check CHECK (length(user_type) <= 128)
@@ -3700,13 +3702,12 @@ CREATE VIEW inventory_live_sources
           , r.generation_id AS source_generation_id
           , CASE
               WHEN r.domain = CAST('power_platform' AS text)
-               AND r.native_id ~* CAST('^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$' AS text)
-                THEN lower(r.native_id)
+                THEN ${normalizeNativeIdentitySql("r.native_id")}
               ELSE r.native_id
             END AS normalized_native_id
           , CASE
               WHEN r.domain = CAST('packages' AS text) THEN CAST('' AS text)
-              ELSE COALESCE(lower(r.environment_id), CAST('' AS text))
+              ELSE COALESCE(${normalizeEnvironmentIdentitySql("r.environment_id")}, CAST('' AS text))
             END AS normalized_environment_id
           , CASE
               WHEN r.domain = CAST('packages' AS text) THEN r.generation_id
@@ -4043,6 +4044,11 @@ BEGIN
   IF (NEW.run_id,NEW.tenant_id,NEW.principal_id,NEW.source_id)
     IS DISTINCT FROM (OLD.run_id,OLD.tenant_id,OLD.principal_id,OLD.source_id)
   THEN RAISE EXCEPTION 'data sync source identity is immutable'; END IF;
+  IF NEW.attempt IS DISTINCT FROM OLD.attempt THEN
+    NEW.attempt_started_at:=clock_timestamp();
+  ELSIF NEW.attempt_started_at IS DISTINCT FROM OLD.attempt_started_at THEN
+    RAISE EXCEPTION 'data sync source attempt start is immutable';
+  END IF;
   RETURN NEW;
 END$$;
 
@@ -4144,9 +4150,8 @@ BEGIN
       AND source_generation.state IN ('published','retired') AND source_generation.validated
       AND (NEW.source='graph_packages' AND r.domain='packages' AND r.native_id=NEW.native_id
         OR NEW.source='power_platform' AND r.domain='power_platform' AND r.resource_type='microsoft.copilotstudio/agents'
-          AND coalesce(lower(r.environment_id),'')=lower(NEW.environment_id)
-          AND CASE WHEN r.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
-            THEN lower(r.native_id)=lower(NEW.native_id) ELSE r.native_id=NEW.native_id END)
+          AND coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'')=${normalizeEnvironmentIdentitySql("NEW.environment_id")}
+          AND (${normalizeNativeIdentitySql("r.native_id")})=(${normalizeNativeIdentitySql("NEW.native_id")}))
       AND NOT EXISTS(SELECT 1 FROM public.inventory_reconciliation work WHERE work.scope_id=scope.id
         AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL))
       AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(revision.inputs)
@@ -4828,9 +4833,8 @@ BEGIN
     JOIN public.power_platform_record_rows r ON r.generation_id=member.generation_id AND r.identity=member.identity
     WHERE scope.tenant_id=NEW.tenant_id AND scope.principal_id=NEW.principal_id AND scope.token_mode='delegated'
       AND scope.source='inventory_power_platform' AND r.resource_type='microsoft.copilotstudio/agents'
-      AND lower(r.environment_id)=lower(NEW.environment_id)
-      AND CASE WHEN r.native_id ~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
-        THEN lower(r.native_id)=lower(NEW.resource_native_id) ELSE r.native_id=NEW.resource_native_id END
+      AND (${normalizeEnvironmentIdentitySql("r.environment_id")})=(${normalizeEnvironmentIdentitySql("NEW.environment_id")})
+      AND r.native_id=NEW.resource_native_id
       AND (r.residual->'details'->'isQuarantined' IS DISTINCT FROM to_jsonb(NEW.is_bot_quarantined)
         OR EXISTS(SELECT 1 FROM public.inventory_native_control_pending p WHERE p.scope_id=scope.id AND p.identity=r.identity))
     ORDER BY scope.id,r.identity
@@ -5731,8 +5735,8 @@ CREATE INDEX data_generation_expiry
 CREATE INDEX directory_user_order
   ON directory_user_rows (generation_id
                         , (CAST(sort_key IS NULL AS integer))
-                        , (COALESCE(sort_key, CAST('' AS text)))
-                        , identity COLLATE "C") INCLUDE (upn, display_name, service_state);
+                        , ("left"(COALESCE(sort_key, CAST('' AS text)), 128) COLLATE "C")
+                        , identity COLLATE "C");
 
 CREATE INDEX directory_user_upn
   ON directory_user_rows (generation_id, upn_key, identity);
@@ -5975,10 +5979,10 @@ CREATE INDEX data_generation_active_admission
 
 CREATE INDEX directory_report_name_order
   ON directory_user_rows (generation_id
-                        , (lower(pg_catalog.normalize(COALESCE(NULLIF(display_name
+                        , ("left"(lower(pg_catalog.normalize(COALESCE(NULLIF(display_name
                                                                     , CAST('' AS text))
                                                              , upn)
-                                                    , 'NFKC') COLLATE "default")) COLLATE "C"
+                                                    , 'NFKC') COLLATE "default"), 128) COLLATE "C")
                         , identity COLLATE "C");
 
 CREATE INDEX inventory_reconciliation_tenant_admission
@@ -6007,6 +6011,13 @@ CREATE INDEX official_usage_useragents_name_page
                                      , 128) COLLATE "C")
                              , payload_hash)
   WHERE kind = 'userAgents';
+
+CREATE INDEX official_usage_fact_directory_identity
+  ON official_usage_row_facts (tenant_id
+                             , kind
+                             , ("left"(lower(btrim(username) COLLATE "default"), 128) COLLATE "C")
+                             , payload_hash)
+  WHERE kind IN ('users', 'userAgents');
 
 CREATE INDEX data_generation_tenant_charges
   ON data_generation_charges (tenant_id) INCLUDE (generation_bytes)

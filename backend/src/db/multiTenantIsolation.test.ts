@@ -387,15 +387,15 @@ describe("multi-tenant repositories with overlapping provider and principal iden
       tokenMode: "application", permissionRevision: "a".repeat(64), contractRevision: "b".repeat(64), configurationRevision: 1,
     });
     for (const scope of scopes) {
-      await repository.recordEvidence(key(scope), "available", { source: label(scope) }, 60_000);
-      await repository.recordEvidence({ ...key(scope), contractRevision: `operation-v1:${"b".repeat(64)}` }, "missing_permission", { source: label(scope) }, 60_000);
+      await repository.recordEvidence(key(scope), "available", { source: label(scope) }, 60_000, () => undefined);
+      await repository.recordEvidence({ ...key(scope), contractRevision: `operation-v1:${"b".repeat(64)}` }, "missing_permission", { source: label(scope) }, 60_000, () => undefined);
     }
     for (const scope of scopes) expect((await repository.evidence(key(scope)))?.details).toEqual({ source: label(scope) });
     await repository.invalidatePrincipal(scopes[0].tenantId, scopes[0].principalId);
     expect(await repository.evidence(key(scopes[0]))).toBeUndefined();
     expect(await repository.evidence({ ...key(scopes[0]), contractRevision: `operation-v1:${"b".repeat(64)}` })).toBeUndefined();
     for (const scope of scopes.slice(1)) expect((await repository.evidence(key(scope)))?.details).toEqual({ source: label(scope) });
-    await repository.setApplicationConfiguration(scopes[0].tenantId, key(scopes[0]).capabilityId, true, true, principalId);
+    await repository.setApplicationConfiguration(scopes[0].tenantId, key(scopes[0]).capabilityId, true, true, principalId, () => undefined);
     expect(await repository.configuration(scopes[0].tenantId, key(scopes[0]).capabilityId)).toMatchObject({ enabled: true, sharedDataScope: true });
     expect(await repository.configuration(scopes[1].tenantId, key(scopes[1]).capabilityId)).toMatchObject({ enabled: false, sharedDataScope: false });
     expect(await repository.evidence(key(scopes[2]))).toBeUndefined();

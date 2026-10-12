@@ -355,8 +355,8 @@ describe("typed unified inventory integration", () => {
     let fetches = 0,fetchMs = 0,unclassified = 0;
     const graph = new GraphPackagesClient(async url => {
       const started = performance.now();fetches++;
-      const start = Number(new URL(String(url)).searchParams.get("page") ?? 0), count = Math.min(100, total - start);
-      const next = new URL(String(url)); next.searchParams.set("page", String(start + count));
+      const start = Number(new URL(String(url)).searchParams.get("$skiptoken") ?? 0), count = Math.min(100, total - start);
+      const next = new URL(String(url)); next.searchParams.set("$skiptoken", String(start + count));
       const response = Response.json({ value: Array.from({ length: count }, (_, index) => builderPackage(`scale-${start + index}`, id(start + index))),
         "@odata.count": total, ...(start + count < total ? { "@odata.nextLink": next.toString() } : {}) });
       fetchMs += performance.now()-started;return response;

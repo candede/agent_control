@@ -9,8 +9,16 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage,
     ...inventory.errors.map(item => item.message),
     ...Object.values(inventory.sources).flatMap(source => source.error ? [source.error.message] : []),
   ]);
+  for (const source of Object.values(inventory.sources)) {
+    if (!source.error && source.observation?.current === false) {
+      reasons.add("A selected saved source is stale or no longer authoritative. Refresh it in Data sync.");
+    }
+  }
   if (!inventory.verification.checks.sourceScopes && !reasons.size) {
     reasons.add("Saved source coverage is incomplete. Check source permissions and refresh the affected source in Data sync.");
+  }
+  if (!inventory.verification.checks.sourceMemberships) {
+    reasons.add("Saved source membership accounting is incomplete. Recheck the selected source counts and refresh inventory in Data sync.");
   }
   const pending = inventoryDetailsPending(inventory);
   const invalid = inventory.identityCollection?.invalidPackages ?? 0;

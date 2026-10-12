@@ -1,6 +1,6 @@
 import { hashKey, isCancelledError, QueryClient, type QueryKey } from "@tanstack/react-query";
 import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage, type UnifiedAgentInventoryQuery, type UnifiedAgentInventoryUnavailable } from "./api/client";
-import { acceptSelectedRead, canReuseSelectedRead } from "./selectedRead";
+import { compareInventoryInstants, isInventoryTimestamp } from "../../backend/src/types/inventoryTimestamp";
 
 type InventoryRead = UnifiedAgentInventoryPage | UnifiedAgentInventoryUnavailable;
 type InventoryOutcome = { epoch: number; family?: InventoryFamily } & ({ data: InventoryRead } | { error: unknown });
@@ -37,7 +37,8 @@ export class AgentInventoryQueries {
     const data = saved?.state.data as InventoryRead | undefined;
     if (saved?.state.status === "success" && !saved.state.isInvalidated && data && !("state" in data)
       && (!query.selectionId || data.selection.id === query.selectionId)
-      && canReuseSelectedRead(data.selection)) return data;
+      && Date.now() - saved.state.dataUpdatedAt < cacheMs
+      && compareInventoryInstants(expiry(data), new Date()) > 0) return data;
   }
 
   private removeFamily(family: string) {
@@ -120,7 +121,7 @@ export class AgentInventoryQueries {
     const complete = (outcome: { data: InventoryRead } | { error: unknown }): InventoryOutcome =>
       ({ ...outcome, epoch: this.epoch, family: this.families.get(family) });
     const cached = this.client.getQueryData<InventoryRead>(queryKey);
-    if (recapturing || cached && ("state" in cached || !canReuseSelectedRead(cached.selection))) {
+    if (recapturing || cached && ("state" in cached || compareInventoryInstants(expiry(cached), new Date()) <= 0)) {
       await this.client.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
     }
     if (signal.aborted || !ownsFamily()) throw abortedRead();
@@ -224,9 +225,16 @@ function assertInventoryMetadata(page: UnifiedAgentInventoryPage) {
       ...record.packages.map(value => value.detailFreshness?.expiresAt),
       ...Object.values(record.people ?? {}).map(value => value?.expiresAt),
     ]),
-  ];
-  if (dates.some(value => value != null && (typeof value !== "string" || !Number.isFinite(Date.parse(value))))) {
-    throw new ApiError(502, "invalid_inventory_metadata", "The saved inventory contains malformed observation metadata.");
+  ].filter((value): value is string => typeof value === "string");
+  if (!timestamps.length || timestamps.some(value => !isInventoryTimestamp(value))) {
+    throw new ApiError(500, "invalid_inventory_expiry", "The saved agent inventory contains an invalid expiration timestamp.");
+  }
+  return timestamps.reduce((earliest, value) => compareInventoryInstants(value, earliest) < 0 ? value : earliest);
+}
+
+function assertUnexpired(page: UnifiedAgentInventoryPage) {
+  if (compareInventoryInstants(expiry(page), new Date()) <= 0) {
+    throw new ApiError(409, "inventory_changed", "The saved agent inventory or usage report expired. Reload Agents.");
   }
 }
 

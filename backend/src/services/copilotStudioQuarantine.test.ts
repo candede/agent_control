@@ -19,6 +19,28 @@ const providerStatus = {
 };
 
 describe("CopilotStudioQuarantineClient", () => {
+  it.each([
+    '{"isBotQuarantined":true,"isBotQuarantined":false,"lastUpdateTimeUtc":"2026-09-09T19:00:00Z"}',
+    '{"isBotQuarantined":false,"lastUpdateTimeUtc":"invalid","lastUpdateTimeUtc":"2026-09-09T19:00:00Z"}',
+  ])("rejects overwritten quarantine evidence without retrying reads or writes", async text => {
+    const fetcher = vi.fn(async () => new Response(text));
+    const client = new CopilotStudioQuarantineClient(fetcher);
+    await expect(client.getStatus("token", target)).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(client.setQuarantine("token", target, false, { correlationId: "fixture" }))
+      .rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { status: 403, text: '{"error":{"code":"ordinary","code":"MissingScope"}}', code: "provider_authorization_error" },
+    { status: 503, text: '{"code":"ordinary","code":"FeatureNotAvailable"}', code: "provider_error" },
+  ])("does not use overwritten optional codes to classify HTTP $status", async ({ status, text, code }) => {
+    const fetcher = vi.fn(async () => new Response(text, { status }));
+    const client = new CopilotStudioQuarantineClient(fetcher, { maxAttempts: 1 });
+    await expect(client.getStatus("token", target)).rejects.toMatchObject({ status, code });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("builds only the documented api-version=1 native-ID endpoints", () => {
     expect(buildCopilotStudioQuarantineUrl(target)).toBe(
       "https://api.powerplatform.com/copilotstudio/environments/Default-11111111-1111-4111-8111-111111111111/bots/22222222-2222-4222-8222-222222222222/api/botQuarantine?api-version=1",
@@ -45,8 +67,22 @@ describe("CopilotStudioQuarantineClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("accepts opaque native GUIDs without UUID version or variant restrictions", async () => {
-    const opaqueTarget = { environmentId: "00000000-0000-0000-0000-000000000000", botId: "ffffffff-ffff-ffff-ffff-ffffffffffff" };
+  it.each(["\n", "\r", "\u2028", "\u2029", " ", "\0"].flatMap(suffix =>
+    ["environmentId", "botId"].map(field => ({ suffix, field })),
+  ))("rejects a trailing $suffix in $field before any read or mutation dispatch", async ({ suffix, field }) => {
+    const invalid = { ...target, [field]: target[field as keyof typeof target] + suffix };
+    const fetcher = vi.fn();
+    const client = new CopilotStudioQuarantineClient(fetcher);
+    await expect(client.getStatus("token", invalid)).rejects.toMatchObject({ code: "invalid_quarantine_target" });
+    expect(() => client.setQuarantine("token", invalid, true, { correlationId: "test" }))
+      .toThrow(expect.objectContaining({ code: "invalid_quarantine_target" }));
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { environmentId: "00000000-0000-0000-0000-000000000000", botId: "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    { environmentId: "DEFAULT-ABCDEFAB-1111-1111-1111-111111111111", botId: "ABCDEFAB-FFFF-FFFF-FFFF-FFFFFFFFFFFF" },
+  ])("accepts and source-stamps opaque native GUIDs without changing case: %j", async opaqueTarget => {
     const fetcher = vi.fn(async () => Response.json(providerStatus));
     await expect(new CopilotStudioQuarantineClient(fetcher).getStatus("token", opaqueTarget)).resolves.toMatchObject(opaqueTarget);
     expect(fetcher).toHaveBeenCalledOnce();
@@ -212,10 +248,41 @@ describe("CopilotStudioQuarantineClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it("aborts a stalled provider error body on the request deadline", async () => {
+  it.each([
+    [401, "provider_authorization_error"],
+    [403, "provider_authorization_error"],
+    [404, "quarantine_target_removed"],
+    [405, "classic_bot_unsupported"],
+  ])("preserves received HTTP %s when its error body stalls instead of retrying the denial", async (status, code) => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => undefined), cancel });
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response(body, { status })).mockResolvedValue(Response.json(providerStatus));
+    const client = new CopilotStudioQuarantineClient(fetcher, { delay: async () => undefined }, 10);
+    await expect(client.getStatus("token", target)).rejects.toMatchObject({ status, code });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("retains throttling Retry-After even when its error body stalls", async () => {
     const body = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => undefined) });
-    const client = new CopilotStudioQuarantineClient(async () => new Response(body, { status: 403 }), { maxAttempts: 1 }, 10);
-    await expect(client.getStatus("token", target)).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response(body, { status: 429, headers: { "Retry-After": "4" } }))
+      .mockResolvedValueOnce(Response.json(providerStatus));
+    const retryDelay = vi.fn(async () => undefined);
+    await new CopilotStudioQuarantineClient(fetcher, { delay: retryDelay, maximumDelayMs: 2_000 }, 10).getStatus("token", target);
+    expect(retryDelay).toHaveBeenCalledExactlyOnceWith(2_000);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps caller cancellation authoritative over a received denial with a stalled body", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "Cancelled.");
+    const body = new ReadableStream<Uint8Array>({
+      pull: () => { controller.abort(reason); return new Promise(() => undefined); },
+    });
+    const fetcher = vi.fn(async () => new Response(body, { status: 403 }));
+    await expect(new CopilotStudioQuarantineClient(fetcher).getStatus("token", target, { signal: controller.signal }))
+      .rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it.each([

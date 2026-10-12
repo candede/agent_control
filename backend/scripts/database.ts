@@ -7,6 +7,7 @@ import { OfficialReportHistory } from "../src/db/officialReportHistory.js";
 import { retainRecordData } from "../src/db/dataRetention.js";
 import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
 import { emptyReportStaging, orphanReportVersion } from "../src/db/officialReportRetention.js";
+import { dataWorkMetricScope, flushDataWorkMetrics } from "../src/services/dataMetrics.js";
 
 class DatabaseSchemaError extends Error {
   readonly code = "database_schema_reset_required";
@@ -169,6 +170,8 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
   const client = verifiedClient ?? await database.connect();
   const affected: Record<string, number> = {};
   const slice = new LifecycleSlice(client, Math.min(batchSize, 250), "operator");
+  const metrics = dataWorkMetricScope();
+  let committed = false;
   const remove = async (name: string, table: string, where: string) => {
     affected[name] = await slice.change(name, table, where.replaceAll(`${table}.`, "target."));
   };
@@ -182,7 +185,7 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
       throw new Error("Another retention cleanup owns the database lock.");
     }
     await slice.open();
-    Object.assign(affected, await retainRecordData(client, Math.min(batchSize, 250), slice));
+    Object.assign(affected, await metrics.run(() => retainRecordData(client, Math.min(batchSize, 250), slice)));
     await remove("sessions", "sessions", "expire<clock_timestamp()");
     const expiredJob = "EXISTS(SELECT 1 FROM jobs j WHERE j.id=target.job_id AND j.expires_at<clock_timestamp() AND (j.lease_until IS NULL OR j.lease_until<clock_timestamp()))";
     await remove("jobAttempts", "job_attempts", expiredJob);
@@ -363,16 +366,24 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
           AND identifier.kind='identifier' AND identifier.payload->>'kind'=source_identifiers.identifier_kind
           AND identifier.value=source_identifiers.identifier_value AND generation.state IN ('published','retired')
           AND generation.expires_at>clock_timestamp() AND resource.expires_at>clock_timestamp()))`);
-    await slice.finish();
+    await metrics.run(() => slice.finish());
     const cursor = (await client.query("SELECT cursor FROM data_lifecycle_progress WHERE worker='operator'")).rows[0].cursor;
     const pending = Number(cursor.step ?? 0) !== 0 || Boolean(cursor.tenant);
     if (options.dryRun) await client.query("ROLLBACK");
-    else await client.query("COMMIT");
+    else {
+      const commit = await client.query("COMMIT");
+      if (commit.command !== "COMMIT") throw new Error("data_transaction_not_committed");
+      committed = true;
+      metrics.commit();
+    }
     return { dryRun: Boolean(options.dryRun), batchSize, affected, pending };
   } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
+    if (!committed) {
+      try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
+    }
     throw error;
   } finally {
+    metrics.discard();
     if (!verifiedClient) client.release();
   }
 }
@@ -444,7 +455,7 @@ async function main() {
       await verifySchema(database);
     }
     if (command === "initialize") console.log(JSON.stringify({ event: "database_operator_command", command, outcome: "succeeded", schemaFingerprint }));
-  } finally { await database.end(); }
+  } finally { flushDataWorkMetrics(); await database.end(); }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -1,7 +1,19 @@
 import pg from "pg";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OfficialReportImports } from "./officialReportImports.js";
-import type { SelectionIdentity } from "../services/dataSelections.js";
+import { OfficialReportImports, type ReportConfirmation } from "./officialReportImports.js";
+import { CursorCodec, type SelectionIdentity } from "../services/dataSelections.js";
+import { AppError } from "../errors.js";
+import { operationalLog } from "../services/telemetry.js";
+
+vi.mock("../services/telemetry.js", async original => ({
+  ...await original<typeof import("../services/telemetry.js")>(), operationalLog: vi.fn(),
+}));
+vi.mock("./dataRetention.js", async original => ({
+  ...await original<typeof import("./dataRetention.js")>(),
+  retireUnreferencedReportVersions: vi.fn(async () => undefined),
+  retainDeletedReportRows: vi.fn(async () => undefined),
+}));
 
 const identity: SelectionIdentity = { tenantId: "tenant-import", principalId: "operator-import",
   sessionEpoch: "1", authorizationHash: "admin" };
@@ -26,7 +38,8 @@ function fixture() {
   const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
   const query = vi.fn(async (text: unknown, values?: unknown) => {
     if (typeof text !== "string") throw new Error("Expected SQL.");
-    if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "COMMIT", "ROLLBACK"].includes(text)) return result([]);
+    if (text === "COMMIT") return { ...result([]), command: "COMMIT" };
+    if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK"].includes(text)) return result([]);
     if (text.startsWith("INSERT INTO data_principal_epochs")) return result([]);
     if (text.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "1" }]);
     if (text.startsWith("SELECT revision::text FROM official_usage_state")) return result([{ revision: "4" }]);
@@ -50,6 +63,116 @@ describe("bundle validation and cleanup inspection without a database", () => {
     const { imports } = fixture();
     await expect(imports.bundle(identity, bundleId)).rejects.toMatchObject({ code: "incompatible_bundle" });
     await expect(imports.bundle(identity, bundleId, { forDiscard: false })).rejects.toMatchObject({ code: "incompatible_bundle" });
+  });
+
+  describe("canonical report intent UUIDs without a database", () => {
+    const id = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    function canonicalIntent() {
+      const { imports, stages, query } = fixture();
+      vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
+      vi.spyOn(imports.history, "lock").mockResolvedValue("scope");
+      const invalidate = vi.spyOn(imports.history, "invalidate").mockResolvedValue(undefined);
+      const original = query.getMockImplementation()!;
+      const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
+      const confirmations: unknown[][] = [];
+      let active: string | null = id;
+      query.mockImplementation(async (text, values) => {
+        if (typeof text !== "string") throw new Error("Expected SQL.");
+        const args = values as unknown[] | undefined;
+        if (text.startsWith("SELECT s.*,i.id AS ingestion_id")) return result([]);
+        if (text.includes("FROM official_usage_staging s JOIN official_usage_ingestions")) {
+          expect(String(args?.[2]).toLowerCase()).toBe(id);
+          return result(stages.map(stage => ({ ...stage, source_as_of: null, source_as_of_provenance: "absent" })));
+        }
+        if (text === "BEGIN" || text.startsWith("SELECT pg_advisory_xact_lock")
+          || text.startsWith("INSERT INTO official_usage_state") || text.startsWith("SELECT set_config")
+          || text.startsWith("INSERT INTO official_usage_audit")) return result([]);
+        if (text.startsWith("SELECT active_set_id,revision::text")) return result([{ active_set_id: active, revision: "4" }]);
+        if (text.startsWith("SELECT revision::text,invalidation_epoch::text")) return result([{ revision: "9", invalidation_epoch: "2" }]);
+        if (text.startsWith("SELECT 1 FROM official_usage_sets")) return result([{ exists: true }]);
+        if (text.startsWith("INSERT INTO official_usage_confirmations")) { confirmations.push(args!); return result([]); }
+        if (text.startsWith("SELECT c.id FROM official_usage_confirmations")) {
+          const stored = confirmations.find(row => row[0] === String(args?.[0]).toLowerCase());
+          return result(stored && stored[6] === args?.[6]
+            && String(stored[4]).toLowerCase() === String(args?.[4]).toLowerCase() ? [{ id: stored[0] }] : []);
+        }
+        if (text.startsWith("UPDATE official_usage_sets") || text.startsWith("UPDATE official_usage_confirmations")) return result([]);
+        if (text.startsWith("UPDATE official_usage_state SET active_set_id=NULL")) { active = null; return result([]); }
+        if (text.startsWith("UPDATE official_usage_state SET active_set_id=$2")) { active = String(args?.[1]).toLowerCase(); return result([]); }
+        if (text.startsWith('SELECT active_set_id AS "activeSetId"')) return result([{ activeSetId: active, activeRevision: "5" }]);
+        return original(text, values);
+      });
+      return { imports, query, invalidate };
+    }
+
+    it("produces the same bundle identity and review hash for either UUID spelling", async () => {
+      const { imports } = canonicalIntent();
+      const lower = await imports.bundle(identity, id), upper = await imports.bundle(identity, id.toUpperCase());
+      expect(upper).toEqual(lower);
+      expect(upper.bundleId).toBe(id);
+    });
+
+    it("can accept a canonical review using an uppercase bundle route before canonical validation", async () => {
+      const { imports } = canonicalIntent(), preview = await imports.bundle(identity, id);
+      await expect(imports.acceptBundle(identity, id.toUpperCase(), preview)).rejects.toMatchObject({ code: "staging_unavailable" });
+    });
+
+    it("retains the reviewed bundle hash when its caller changes the input during authorization", async () => {
+      const { imports, query } = canonicalIntent(), preview = await imports.bundle(identity, id);
+      const expectedHash = preview.bundleHash, original = query.getMockImplementation()!;
+      query.mockImplementation(async (text, values) => {
+        if (typeof text === "string" && text.startsWith("SELECT epoch FROM data_principal_epochs")) preview.bundleHash = "f".repeat(64);
+        return original(text, values);
+      });
+      await expect(imports.acceptBundle(identity, id, preview)).rejects.toMatchObject({ code: "staging_unavailable" });
+      const receipt = query.mock.calls.find(([text]) => typeof text === "string" && text.includes("FROM official_usage_bundle_receipts"));
+      expect(receipt?.[1]).toEqual([identity.tenantId, identity.principalId, id, expectedHash, "4"]);
+    });
+
+    it("canonicalizes a confirmed deletion before comparing the active report pointer", async () => {
+      const { imports, invalidate } = canonicalIntent();
+      const preview = await imports.confirmPreview(identity, id.toUpperCase(), "delete");
+      expect(await imports.confirm(identity, preview)).toMatchObject({ activeSetId: null });
+      expect(preview.setId).toBe(id);
+      expect(invalidate).toHaveBeenCalledWith(expect.any(pg.Client), identity.tenantId, id, true);
+    });
+
+    it("freezes confirmation intent before asynchronous authority checks", async () => {
+      const { imports, query, invalidate } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "delete");
+      const original = query.getMockImplementation()!;
+      query.mockImplementation(async (text, values) => {
+        const value = await original(text, values);
+        if (typeof text === "string" && text.startsWith("SELECT c.id FROM official_usage_confirmations")) {
+          input.setId = "fedcbafe-1234-4567-89ab-fedcbafedcba";
+        }
+        return value;
+      });
+      expect(await imports.confirm(identity, input)).toMatchObject({ activeSetId: null });
+      expect(invalidate).toHaveBeenCalledWith(expect.any(pg.Client), identity.tenantId, id, true);
+    });
+
+    it("rejects inherited or accessor confirmation identity without reading it", async () => {
+      const { imports, query } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "select");
+      query.mockClear();
+      const getter = vi.fn(() => id);
+      const accessor = { ...input };
+      Object.defineProperty(accessor, "setId", { enumerable: true, get: getter });
+      for (const value of [Object.create(input), accessor]) {
+        await expect(async () => imports.confirm(identity, value as ReportConfirmation)).rejects.toMatchObject({ status: 400 });
+      }
+      expect(getter).not.toHaveBeenCalled();
+      expect(query).not.toHaveBeenCalled();
+    });
+
+    it.each(["9223372036854775808", "9999999999999999999", "01"])("rejects an unrepresentable or noncanonical revision %s before persistence", async value => {
+      const { imports, query } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "select");
+      query.mockClear();
+      await expect(async () => imports.confirm(identity, { ...input, historyRevision: value }))
+        .rejects.toMatchObject({ status: 400, code: "invalid_import_confirmation" });
+      await expect(async () => imports.acceptBundle(identity, id, { bundleHash: "a".repeat(64), expectedActiveRevision: value }))
+        .rejects.toMatchObject({ status: 400, code: "invalid_import_confirmation" });
+      expect(query).not.toHaveBeenCalled();
+    });
   });
 
   it("lists bounded owned companions for cleanup despite incompatible metadata", async () => {
@@ -88,7 +211,7 @@ describe("atomic staged-import discard without a database", () => {
         commits.push({ state, status });
         // A competing acceptance can acquire these rows as soon as discard releases them.
         if (inspected && state === "ready") state = "accepting";
-        return result([]);
+        return { ...result([]), command: "COMMIT" };
       }
       if (text.startsWith("INSERT INTO data_principal_epochs")) return result([]);
       if (text.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "1" }]);
@@ -132,5 +255,146 @@ describe("atomic staged-import discard without a database", () => {
     expect(commits).toEqual([{ state: "cancelled", status: "cancelled" }]);
     await expect(imports.discard(identity, stagingId)).rejects.toMatchObject({ code: "staging_unavailable" });
     expect(cleanup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("source-contract preview diagnostics without a database", () => {
+  it("compares the Users agents-used metric with distinct positive-response agent identities", async () => {
+    const { imports, stages, query } = fixture();
+    const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
+    query.mockImplementation(async text => {
+      if (typeof text !== "string") throw new Error("Expected SQL.");
+      if (text === "BEGIN ISOLATION LEVEL REPEATABLE READ" || text === "ROLLBACK") return result([]);
+      if (text === "COMMIT") return { ...result([]), command: "COMMIT" };
+      if (text.startsWith("INSERT INTO data_principal_epochs")) return result([]);
+      if (text.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "1" }]);
+      if (text.startsWith("SELECT s.* FROM official_usage_staging")) return result([stages[2]]);
+      if (text.startsWith("WITH companions AS")) {
+        expect(text).toContain("count(DISTINCT c.row_data->>'agentId')");
+        expect(text).toContain("AND (c.row_data->>'responsesSentToUsers')::numeric>0");
+        return text.includes("SELECT count(*)::text AS n FROM diagnostics") ? result([{ n: "0" }]) : result([]);
+      }
+      throw new Error("Unexpected diagnostics query.");
+    });
+    const diagnostics = await imports.diagnostics(identity, stages[2].id, {}, new CursorCodec("synthetic-report-diagnostics-secret"));
+    expect(diagnostics.value).toEqual([]);
+    expect(diagnostics.counts).toEqual({ total: 0, filtered: 0 });
+  });
+});
+
+describe("stream upload cancellation and batch rollback without a database", () => {
+  function ingestion() {
+    const { imports, query } = fixture();
+    const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
+    const ensure = vi.spyOn(imports.history, "ensure").mockResolvedValue("1");
+    const cleanup = vi.spyOn(imports, "cleanupIngestion").mockResolvedValue(0);
+    let state = "streaming";
+    const onInsert = vi.fn();
+    query.mockImplementation(async text => {
+      if (typeof text !== "string") throw new Error("Expected SQL.");
+      if (text === "BEGIN" || text === "ROLLBACK") return result([]);
+      if (text === "COMMIT") return { ...result([]), command: "COMMIT" };
+      if (text.startsWith("INSERT INTO data_principal_epochs")) return result([]);
+      if (text.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "1" }]);
+      if (text.startsWith("SELECT pg_advisory_xact_lock") || text.startsWith("INSERT INTO official_usage_state")) return result([]);
+      if (text.startsWith("SELECT active_set_id,revision::text")) return result([{ active_set_id: null, revision: "1" }]);
+      if (text.startsWith("SELECT count(")) return result([{ n: 0, tenant: 0, actor: 0 }]);
+      if (text.includes("bundle_owner") || text.startsWith("SELECT 1 FROM official_usage_ingestions")) return result([]);
+      if (text.includes("sum(stored_bytes)")) return result([{ tenant: "0", actor: "0", bundle: "0" }]);
+      if (text.startsWith("INSERT INTO official_usage_ingestions")) return result([]);
+      if (text.startsWith("SELECT * FROM official_usage_ingestions")) {
+        return result(state === "streaming" ? [{ bundle_id: bundleId, row_count: 0, kind: null, reject_duplicate_kind: false }] : []);
+      }
+      if (text.startsWith("SELECT id,state,staging_id")) return result([]);
+      if (text.startsWith("INSERT INTO official_usage_ingestion_rows")) { onInsert(); return result([]); }
+      if (text.startsWith("UPDATE official_usage_ingestions SET kind=")) return result([]);
+      if (text.startsWith("UPDATE official_usage_ingestions SET state='cancelled'")) {
+        state = "cancelled"; return result([{ staging_id: null, kind: "users", row_count: 0 }]);
+      }
+      if (text.startsWith("INSERT INTO official_usage_audit")) return result([]);
+      throw new Error("Unexpected streaming query.");
+    });
+    return { imports, query, ensure, cleanup, onInsert };
+  }
+  const csv = "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nuser,Name,1,1,\n";
+
+  it("does not initialize persistence for an already cancelled upload", async () => {
+    const { imports, ensure, query } = ingestion(), controller = new AbortController();
+    const reason = new AppError(408, "upload_deadline", "Upload deadline exceeded.");
+    controller.abort(reason);
+    await expect(imports.open(identity, { bundleId }, controller.signal)).rejects.toBe(reason);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("retains the original upload bundle and duplicate guard when its caller changes the intent", async () => {
+    const { imports, ensure, query } = ingestion();
+    const intent = { bundleId, rejectDuplicateKind: true };
+    ensure.mockImplementationOnce(async () => {
+      intent.bundleId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+      intent.rejectDuplicateKind = false;
+      return "scope";
+    });
+    const upload = await imports.open(identity, intent);
+    try {
+      const insertion = query.mock.calls.find(([text]) => typeof text === "string" && text.startsWith("INSERT INTO official_usage_ingestions"));
+      const values = insertion?.[1] as unknown[];
+      expect(values[3]).toBe(bundleId);
+      expect(values[7]).toBe(true);
+    } finally { await upload.cancel(); }
+  });
+
+  it("rolls back a row batch cancelled after its INSERT instead of committing it", async () => {
+    const { imports, query, cleanup, onInsert } = ingestion(), controller = new AbortController();
+    const reason = new AppError(408, "upload_deadline", "Upload deadline exceeded.");
+    const upload = await imports.open(identity, { bundleId }, controller.signal);
+    query.mockClear();
+    onInsert.mockImplementation(() => controller.abort(reason));
+    await expect(upload.receive(Readable.from([Buffer.from(csv)]))).rejects.toBe(reason);
+    const statements = query.mock.calls.map(([text]) => text);
+    const insertion = statements.findIndex(text => typeof text === "string" && text.startsWith("INSERT INTO official_usage_ingestion_rows"));
+    expect(insertion).toBeGreaterThanOrEqual(0);
+    expect(statements.slice(insertion, statements.indexOf("ROLLBACK") + 1)).not.toContain("COMMIT");
+    expect(statements).toContain("ROLLBACK");
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("maps duplicate-identity insertion failures, rolls back the batch and cleans the ingestion", async () => {
+    const { imports, query, cleanup, onInsert } = ingestion(), upload = await imports.open(identity, { bundleId });
+    query.mockClear();
+    onInsert.mockImplementation(() => { throw Object.assign(new Error("Synthetic duplicate"), { code: "23505" }); });
+    await expect(upload.receive(Readable.from([Buffer.from(csv)]))).rejects.toMatchObject({ status: 400, code: "duplicate_identity" });
+    const statements = query.mock.calls.map(([text]) => text);
+    expect(statements).toContain("ROLLBACK");
+    expect(statements.some(text => typeof text === "string" && text.startsWith("UPDATE official_usage_ingestions SET kind="))).toBe(false);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("explicit cancellation aborts the receiving signal and cannot return a successful parse", async () => {
+    const { imports, cleanup } = ingestion(), upload = await imports.open(identity, { bundleId });
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    async function* input() { yield Buffer.from(csv); entered(); await gate; }
+    const receiving = upload.receive(input()).catch(error => error);
+    await waiting;
+    try {
+      await upload.cancel();
+      expect(upload.signal.aborted).toBe(true);
+      expect(upload.signal.reason).toMatchObject({ status: 400, code: "upload_cancelled" });
+    } finally { release(); }
+    expect(await receiving).toMatchObject({ status: 400, code: "upload_cancelled" });
+    expect(cleanup).toHaveBeenCalled();
+  });
+
+  it("reports an unverified cleanup explicitly and retains the parser and cleanup causes without logging values", async () => {
+    const { imports, cleanup } = ingestion(), upload = await imports.open(identity, { bundleId });
+    const cleanupFailure = new Error("Synthetic cleanup failure");
+    cleanup.mockRejectedValueOnce(cleanupFailure);
+    const error = await upload.receive(Readable.from([Buffer.from([0xc3, 0x28])])).catch(error => error);
+    expect(error).toMatchObject({ status: 500, code: "upload_cleanup_failed" });
+    expect(error.cause).toBeInstanceOf(AggregateError);
+    expect(error.cause.errors).toEqual([expect.objectContaining({ status: 400, code: "invalid_utf8" }), cleanupFailure]);
+    expect(operationalLog).toHaveBeenCalledWith("error", "official_usage_upload_cleanup_failed");
   });
 });

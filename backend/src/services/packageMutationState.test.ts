@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import { createJobConfirmation } from "../db/jobs.js";
 import type { PackageAccessUpdate } from "../types/copilotPackage.js";
 import {
   capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, packageMutationStatesEqual,
@@ -78,7 +79,7 @@ describe("package access scope consistency", () => {
     });
   });
 
-  it.each([undefined, "unknownFutureValue"])("preserves principal-based inference and ambiguity for %s", status => {
+  it.each([undefined, "unknownFutureValue"])("does not infer an explicit unknown scope from stored principals: %s", status => {
     const details = allowlistedPackage({
       id: "package", displayName: "Package", isBlocked: false,
       availableTo: status, deployedTo: status, allowedUsersAndGroups: [], acquireUsersAndGroups: [],
@@ -87,9 +88,13 @@ describe("package access scope consistency", () => {
       "Both package access scopes must be unambiguous",
     );
     const principal = { resourceType: "user", resourceId: "user-1" };
-    expect(capturePackageMutationState({
+    const populated = {
       ...details, allowedUsersAndGroups: [principal], acquireUsersAndGroups: [principal],
-    }, "update-availability")).toMatchObject({ kind: "access", availableTo: "some", deployedTo: "some" });
+    };
+    if (status === undefined) expect(capturePackageMutationState(populated, "update-availability"))
+      .toMatchObject({ kind: "access", availableTo: "some", deployedTo: "some" });
+    else expect(() => capturePackageMutationState(populated, "update-availability"))
+      .toThrow(expect.objectContaining({ code: "ambiguous_access_scope" }));
   });
 });
 
@@ -116,6 +121,135 @@ describe("package access projected state", () => {
     expect(expectedPackageMutationState(before, "update-availability", {
       target: "availability", mode: "replace", scope: "specific", principals: [second],
     })).toEqual({ ...before, allowedUsersAndGroups: [second] });
+  });
+
+  it.each([
+    { target: "other" },
+    { mode: "remove" },
+    { scope: "all" },
+    { principals: [] },
+    { mode: "add", scope: "none", principals: [] },
+    { scope: "none" },
+  ])("rejects malformed durable access intent %j rather than projecting a different write", invalid => {
+    const update = JSON.parse(JSON.stringify({
+      target: "availability", mode: "replace", scope: "specific", principals: [first], ...invalid,
+    }));
+    expect(() => expectedPackageMutationState(before, "update-availability", update))
+      .toThrow(expect.objectContaining({ code: "invalid_access_update" }));
+  });
+
+  it("requires the access target to match the action even during read-only projection", () => {
+    expect(() => expectedPackageMutationState(before, "update-installation", {
+      target: "availability", mode: "replace", scope: "specific", principals: [second],
+    })).toThrow(expect.objectContaining({ code: "mutation_state_mismatch" }));
+  });
+});
+
+describe("durable package mutation state bounds", () => {
+  const actor = { tenantId: "tenant", homeAccountId: "admin", displayName: "Admin", username: "admin@example.invalid" };
+  const principals = Array.from({ length: 1000 }, (_, index) => ({
+    resourceType: "user", resourceId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
+  }));
+  const before: PackageAccessMutationState = {
+    kind: "access", availableTo: "some", deployedTo: "none",
+    allowedUsersAndGroups: principals.slice(0, 500), acquireUsersAndGroups: [],
+  };
+  const input = {
+    action: "update-availability" as const, actor, scope: "bulk" as const, requestPath: "/api/agents/access",
+    targets: [{ id: "package", displayName: "Package", prestate: before }],
+  };
+
+  it("rejects an additive intent whose individually bounded prestate and selection produce an unpersistable poststate", () => {
+    const accessUpdate: PackageAccessUpdate = {
+      target: "availability", mode: "add", scope: "specific", principals: principals.slice(500),
+    };
+    expect(Buffer.byteLength(JSON.stringify(before))).toBeLessThan(65_000);
+    expect(Buffer.byteLength(JSON.stringify(accessUpdate))).toBeLessThan(60_000);
+    expect(Buffer.byteLength(JSON.stringify(expectedPackageMutationState(before, input.action, accessUpdate))))
+      .toBeGreaterThan(65_536);
+    expect(() => createJobConfirmation({ ...input, accessUpdate }))
+      .toThrow(expect.objectContaining({ status: 413, code: "mutation_state_too_large" }));
+  });
+
+  it("accounts for JSONB punctuation rather than admitting a compact JSON prestate above the database limit", () => {
+    const prestate = { ...before, allowedUsersAndGroups: Array.from({ length: 1400 }, (_, index) => ({
+      resourceType: "user", resourceId: `p${index.toString(36)}`,
+    })) };
+    expect(Buffer.byteLength(JSON.stringify(prestate))).toBeLessThan(65_000);
+    expect(() => createJobConfirmation({
+      ...input, targets: [{ ...input.targets[0], prestate }],
+      accessUpdate: { target: "availability", mode: "add", scope: "specific", principals: [prestate.allowedUsersAndGroups[0]] },
+    })).toThrow(expect.objectContaining({ status: 413, code: "mutation_state_too_large" }));
+  });
+
+  it("still admits a bounded additive no-op at the selected-directory limit", () => {
+    const confirmation = createJobConfirmation({
+      ...input, accessUpdate: { target: "availability", mode: "add", scope: "specific", principals: principals.slice(0, 500) },
+    });
+    expect(confirmation.summary.targets[0].requestedState).toEqual(before);
+  });
+});
+
+describe("package access preservation admission", () => {
+  const requested = { resourceType: "user", resourceId: "11111111-1111-4111-8111-111111111111" };
+  const preserved = { resourceType: "group", resourceId: " Exact_Opaque_Group " };
+  const actor = { tenantId: "tenant", homeAccountId: "admin", displayName: "Admin", username: "admin@example.invalid" };
+
+  describe.each(["availability", "installation"] as const)("%s changes", target => {
+    const action = target === "availability" ? "update-availability" : "update-installation";
+    const unselectedScope = target === "availability" ? "deployedTo" : "availableTo";
+    const unselectedCollection = target === "availability" ? "acquireUsersAndGroups" : "allowedUsersAndGroups";
+    const update: PackageAccessUpdate = { target, mode: "replace", scope: "specific", principals: [requested] };
+
+    it.each([
+      { scope: "all", principals: [] },
+      { scope: "deployedToAll", principals: [preserved] },
+      { scope: "deployedToNone", principals: [preserved] },
+      { scope: "some", principals: [] },
+    ])("rejects an untouched $scope scope that the full PATCH cannot preserve", async ({ scope, principals }) => {
+      const details = allowlistedPackage({
+        id: "package", displayName: "Package", isBlocked: false,
+        availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+        [unselectedScope]: scope, [unselectedCollection]: principals,
+      });
+      const before = capturePackageMutationState(details, action);
+      expect.soft(() => createJobConfirmation({
+        action, accessUpdate: update, targets: [{ id: details.id, displayName: details.displayName, prestate: before }],
+        actor, scope: "single", requestPath: "/api/agents/package/access",
+      })).toThrow(expect.objectContaining({ code: "unpreservable_access_scope" }));
+
+      const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 204 }));
+      const beforeWrite = vi.fn(async () => undefined);
+      await expect(updatePackageAccess(new GraphPackagesClient(fetcher), "token", details.id, update, details, beforeWrite))
+        .rejects.toMatchObject({ code: "unpreservable_access_scope" });
+      expect(beforeWrite).not.toHaveBeenCalled();
+      expect(fetcher).not.toHaveBeenCalled();
+
+      // Historical sent jobs still need a projected state for GET-only reconciliation.
+      const expected = expectedPackageMutationState(before, action, update);
+      expect(packageMutationStatesEqual(before, expected)).toBe(false);
+      const applied = { ...details, ...expected };
+      await expect(verifyPackageMutationConverged({ getPackageDetails: async () => applied }, "token", details.id, action, expected))
+        .resolves.toMatchObject({ readbackCount: 1 });
+    });
+
+    it.each(["all", "none", "some"])("allows an exact no-op with an untouched %s scope without sending its collections", async scope => {
+      const details = allowlistedPackage({
+        id: "package", displayName: "Package", isBlocked: false,
+        availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+        [unselectedScope]: scope, [unselectedCollection]: scope === "none" ? [preserved] : [],
+      });
+      const before = capturePackageMutationState(details, action);
+      const noop: PackageAccessUpdate = { target, mode: "replace", scope: "none", principals: [] };
+      expect(createJobConfirmation({
+        action, accessUpdate: noop, targets: [{ id: details.id, displayName: details.displayName, prestate: before }],
+        actor, scope: "single", requestPath: "/api/agents/package/access",
+      }).summary.targets[0].requestedState).toEqual(before);
+      const fetcher = vi.fn<FetchLike>();
+      await expect(updatePackageAccess(new GraphPackagesClient(fetcher), "token", details.id, noop, details))
+        .resolves.toMatchObject({ changed: false });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -150,17 +284,25 @@ describe("package mutation state persistence", () => {
     )).toBe(true);
   });
 
-  it("uses canonical principal identity and ordering without changing the input", () => {
+  it("uses canonical user/group types and ordering without changing exact opaque IDs or the input", () => {
     const reordered: PackageAccessMutationState = {
       ...stored,
       allowedUsersAndGroups: [
-        { resourceId: " USER-1 ", resourceType: " User " },
-        { resourceId: " GROUP-1 ", resourceType: " Group " },
+        { resourceId: "user-1", resourceType: "USER" },
+        { resourceId: "group-1", resourceType: "GROUP" },
       ],
     };
     const original = structuredClone(reordered);
     expect(packageMutationStatesEqual(before, reordered)).toBe(true);
     expect(reordered).toEqual(original);
+    for (const resourceId of ["USER-1", " user-1 "]) {
+      expect(packageMutationStatesEqual(before, {
+        ...reordered, allowedUsersAndGroups: [
+          { resourceId, resourceType: "user" },
+          { resourceId: "group-1", resourceType: "group" },
+        ],
+      })).toBe(false);
+    }
   });
 
   it("preserves hashes already generated for captured states", () => {
@@ -195,9 +337,69 @@ describe("package mutation state persistence", () => {
       ...before,
       allowedUsersAndGroups: [
         { resourceType: "user", resourceId: "user-1" },
-        { resourceType: "USER", resourceId: "USER-1" },
+        { resourceType: "USER", resourceId: "user-1" },
       ],
     })).toThrow("Duplicate package access principals");
+  });
+
+  it.each([
+    { ...before, kind: "unexpected" },
+    { ...before, availableTo: "future" },
+    { ...before, deployedTo: null },
+    { kind: "block", isBlocked: "false" },
+    { kind: "block" },
+  ])("rejects malformed stored mutation state instead of hashing it as authoritative: %j", value => {
+    const state = JSON.parse(JSON.stringify(value));
+    expect(() => packageMutationStateHash(state))
+      .toThrow(expect.objectContaining({ code: "invalid_mutation_state" }));
+    expect(() => packageMutationStatesEqual(before, state))
+      .toThrow(expect.objectContaining({ code: "invalid_mutation_state" }));
+  });
+
+  it("rejects sparse principal collections rather than hashing a null entry", () => {
+    expect(() => packageMutationStateHash({ ...before, allowedUsersAndGroups: new Array(1) }))
+      .toThrow(expect.objectContaining({ code: "invalid_principal" }));
+  });
+
+  it("does not hash inherited or accessor-backed mutation evidence", () => {
+    const getter = vi.fn(() => true);
+    for (const state of [
+      Object.create({ kind: "block", isBlocked: true }),
+      Object.defineProperty({ kind: "block" as const }, "isBlocked", { get: getter }),
+      Object.assign(Object.create({ availableTo: "some" }), {
+        kind: "access", deployedTo: "some", allowedUsersAndGroups: before.allowedUsersAndGroups,
+        acquireUsersAndGroups: before.acquireUsersAndGroups,
+      }),
+    ]) expect(() => packageMutationStateHash(state))
+      .toThrow(expect.objectContaining({ code: "invalid_mutation_state" }));
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("does not capture inherited block state or execute supplied access-scope accessors", () => {
+    expect(() => capturePackageMutationState(Object.create({ isBlocked: true }), "block"))
+      .toThrow(expect.objectContaining({ code: "incomplete_package_block_state" }));
+    const getter = vi.fn(() => "some");
+    const details = {
+      isBlocked: false, deployedTo: "some", allowedUsersAndGroups: before.allowedUsersAndGroups,
+      acquireUsersAndGroups: before.acquireUsersAndGroups,
+    };
+    Object.defineProperty(details, "availableTo", { get: getter });
+    expect(() => capturePackageMutationState(details, "update-availability"))
+      .toThrow(expect.objectContaining({ code: "invalid_mutation_state" }));
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("does not project an inherited or accessor-backed access intent", () => {
+    const update: PackageAccessUpdate = {
+      target: "availability", mode: "replace", scope: "specific", principals: before.allowedUsersAndGroups,
+    };
+    const getter = vi.fn(() => "availability");
+    expect(() => expectedPackageMutationState(before, "update-availability", Object.create(update)))
+      .toThrow(expect.objectContaining({ code: "invalid_access_update" }));
+    Object.defineProperty(update, "target", { get: getter });
+    expect(() => expectedPackageMutationState(before, "update-availability", update))
+      .toThrow(expect.objectContaining({ code: "invalid_access_update" }));
+    expect(getter).not.toHaveBeenCalled();
   });
 
   describe.each(["availability", "installation"] as const)("%s reconciliation state", target => {

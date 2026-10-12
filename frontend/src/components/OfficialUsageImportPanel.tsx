@@ -27,7 +27,10 @@ export function OfficialUsageImportPanel(props: Props) {
   if (capability && !hasRole(capability.user, "AgentControl.Admin")) return <section className="official-usage-import" aria-label="Import CSV reports">
     <div className="usage-import-body"><p role="alert">Current Admin access is required to import reports.</p></div>
     <footer className="usage-import-footer"><button type="button" onClick={props.onCancel}>Back to Sync</button></footer></section>;
-  return <ImportFlow key={JSON.stringify([principal, props.initialStagingId, props.initialBundleId, props.correctionOfSetId])} {...props} />;
+  const initialStagingId = props.initialStagingId?.toLowerCase(), initialBundleId = props.initialBundleId?.toLowerCase(),
+    correctionOfSetId = props.correctionOfSetId?.toLowerCase();
+  return <ImportFlow key={JSON.stringify([principal, initialStagingId, initialBundleId, correctionOfSetId])} {...props}
+    initialStagingId={initialStagingId} initialBundleId={initialBundleId} correctionOfSetId={correctionOfSetId} />;
 }
 function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId, onChanged, onDone, onAddMore, onCancel, onStaged }: Props) {
   const [files, setFiles] = useState<CheckedFile[]>([]), [bundle, setBundle] = useState<OfficialReportBundlePreview>();

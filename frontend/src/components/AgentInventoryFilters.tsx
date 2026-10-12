@@ -7,6 +7,7 @@ import { InventoryFacetSelect } from "./InventoryFacetSelect";
 import { ApiError, getInventoryFacets, type InventoryFacetField } from "../api/client";
 import { encodeInventoryFacet, inventoryFacetLabel, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import { formatPackageType } from "../../../backend/src/types/copilotPackage";
+import { normalizeEnvironmentIdentity } from "../../../backend/src/services/inventoryIdentity";
 
 export type AgentFilterValues = Pick<AgentRouteState,
   "search" | "packageType" | "endUserAccess" | "reportedUsage" | "management" | "relevance" | "platform" | "availability" | "host" | "status"
@@ -14,7 +15,7 @@ export type AgentFilterValues = Pick<AgentRouteState,
 
 type Option = { value: InventoryFacetValue; label: string };
 function environmentFacetKey(value: InventoryFacetValue) {
-  return encodeInventoryFacet(typeof value === "string" ? value.toLowerCase() : value);
+  return encodeInventoryFacet(typeof value === "string" ? normalizeEnvironmentIdentity(value) : value);
 }
 
 type Props = {
@@ -125,7 +126,7 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
     key: "environment", label: "Environment",
     value: environmentLabel?.owner === environmentLabelOwner && environmentLabel.key === environmentKey ? environmentLabel.label
       : options.environments.find(option => typeof option.value === "string" && typeof values.environmentId === "string"
-      && option.value.toLowerCase() === values.environmentId.toLowerCase())?.label ?? inventoryFacetLabel(values.environmentId),
+      && normalizeEnvironmentIdentity(option.value) === normalizeEnvironmentIdentity(values.environmentId))?.label ?? inventoryFacetLabel(values.environmentId),
     remove: () => onChange({ environmentId: undefined }),
   });
   const hasFilters = chips.length > 0 || Boolean(values.search.trim()) || values.packageType !== undefined;

@@ -17,6 +17,7 @@ describe.each(["history", "overview"] as const)("%s query admission", endpoint =
     { order: "DESC" }, { order: "desc; delete" }, { startDate: "" }, { endDate: "" },
     { startDate: "2026-6-01" }, { startDate: "2026-02-29" }, { startDate: "2024-02-30" },
     { endDate: "2026-04-31" }, { startDate: "2026-00-01" }, { startDate: "2026-13-01" },
+    { startDate: "0000-01-01" }, { endDate: "0000-12-31" },
     { endDate: "2026-07-15T00:00:00Z" }, { startDate: "2026-07-16", endDate: "2026-07-15" },
     { scope: "all" }, { scope: ["history", "selected"] }, { creatorType: "Custom" },
   ];

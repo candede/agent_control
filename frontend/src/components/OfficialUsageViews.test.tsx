@@ -305,11 +305,15 @@ describe("focused selected official agent reporting", () => {
   });
 
   it.each([true, false])("distinguishes known empty data from missing report evidence; known=%s", async known => {
-    vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [], counts: { total: 0, filtered: 0 },
-      reports: known ? reports : { ...reports, setId: null, activeSetId: null, lineages: [], availability: "never_imported" } }));
+    const empty = page({ value: [], counts: { total: 0, filtered: 0 },
+      reports: known ? reports : { ...reports, setId: null, activeSetId: null, lineages: [], availability: "never_imported" } });
+    empty.analytics.responses = known ? 0 : null;
+    vi.mocked(api.readReportPage).mockResolvedValue(empty);
     render(<ReportingView />);
     expect(await screen.findByRole("heading", { name: known ? "No reported agents" : "Reports not imported" })).toBeVisible();
-    if (!known) {
+    if (known) {
+      expect(screen.getByText("Responses in this view").closest(".metric")).toHaveTextContent("0");
+    } else {
       expect(screen.getByText("Missing reports are not zero activity.")).toBeVisible();
       expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
@@ -320,9 +324,12 @@ describe("focused selected official agent reporting", () => {
     { total: 10, filtered: 0, heading: "No agents match these filters" },
     { total: 10, filtered: 5, heading: "No agents on this page" },
   ])("describes empty agent rows using server counts: total=$total, filtered=$filtered", async ({ total, filtered, heading }) => {
-    vi.mocked(api.readReportPage).mockResolvedValue(page({ value: [], counts: { total, filtered } }));
+    const selected = page({ value: [], counts: { total, filtered } });
+    selected.analytics.responses = filtered === 0 ? 0 : 120;
+    vi.mocked(api.readReportPage).mockResolvedValue(selected);
     render(<ReportingView />);
     expect(await screen.findByRole("heading", { name: heading })).toBeVisible();
+    expect(screen.getByText("Responses in this view").closest(".metric")).toHaveTextContent(String(selected.analytics.responses));
   });
   it.each([
     { availability: "never_imported", heading: "Reports not imported" },

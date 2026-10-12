@@ -6,6 +6,7 @@ import { verifyInventoryCollectionRewindSchema } from "./inventoryCollectionRewi
 import { verifyInventoryReconciliationAdmissionSchema } from "./inventoryReconciliationAdmissionSchema.js";
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
 import { verifyReportMembershipCountsSchema } from "./reportMembershipCountsSchema.js";
+import { inventoryLimits } from "../types/inventoryRecords.js";
 
 export const schemaSql: string = currentSchemaSql;
 export const schemaFingerprint: string = createHash("sha256").update(schemaSql).digest("hex");
@@ -59,6 +60,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
     ) AS valid`)).rows[0];
   if (!permissions?.valid) throw new Error("Database usage association runtime grants are invalid; operator recovery required.");
   await verifyDataSyncCleanupSchema(database);
+  await verifyDataSyncAttemptSchema(database);
   await verifyDataGenerationSchema(database);
   await verifyUserSourceSchema(database);
   await verifyUserSourceReportSchema(database);
@@ -111,6 +113,22 @@ async function verifyDataSyncCleanupSchema(database: Pick<pg.Pool, "query">) {
     FROM pg_constraint WHERE conrelid='public.data_sync_runs'::regclass
       AND conname='data_sync_cleanup_full_scope' AND contype='c'`, [definition])).rows[0];
   if (row?.valid !== true) throw new Error("Data sync cleanup scope constraint is missing or invalid.");
+}
+
+async function verifyDataSyncAttemptSchema(database: Pick<pg.Pool, "query">) {
+  const row = (await database.query<{ valid: boolean }>(`SELECT
+    EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid='public.data_sync_run_sources'::regclass
+        AND a.attname='attempt_started_at' AND a.atttypid='timestamptz'::regtype AND a.attnotnull AND NOT a.attisdropped
+        AND pg_get_expr(d.adbin,d.adrelid)='clock_timestamp()')
+    AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='public.data_sync_run_sources'::regclass
+      AND tgname='immutable_data_sync_source_identity' AND tgenabled IN ('O','A') AND tgtype=19
+      AND tgfoid=to_regprocedure('public.protect_data_sync_source_identity()'))
+    AND position('NEW.attempt_started_at:=clock_timestamp()' IN
+      pg_get_functiondef('public.protect_data_sync_source_identity()'::regprocedure))>0
+    AND position('data sync source attempt start is immutable' IN
+      pg_get_functiondef('public.protect_data_sync_source_identity()'::regprocedure))>0 AS valid`)).rows[0];
+  if (row?.valid !== true) throw new Error("Data sync attempt boundary schema is missing or invalid.");
 }
 
 async function verifyInventoryPreparedPublicationSchema(database: Pick<pg.Pool,"query">) {
@@ -353,8 +371,18 @@ async function verifyInventoryIdentitySchema(database: Pick<pg.Pool, "query">) {
     NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='agent_identity_cache'::regclass
       AND confrelid=to_regclass('public.power_platform_inventory_snapshots')) AS retired_reference,
     EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='agent_identity_cache'::regclass
-      AND tgname='protect_inventory_identity_cache' AND tgenabled IN ('O','A')) AS live_guard`)).rows[0];
-  if (!["live_sources", "generation_reference", "retired_reference", "live_guard"]
+      AND tgname='protect_inventory_identity_cache' AND tgenabled IN ('O','A')) AS live_guard,
+    (SELECT count(*)=4 FROM pg_attribute WHERE NOT attisdropped AND atttypid='text'::regtype
+      AND attname IN ('normalized_native_id','normalized_environment_id') AND attcollation='"C"'::regcollation
+      AND (attrelid='inventory_live_sources'::regclass
+        OR attrelid='agent_usage_associations'::regclass AND attgenerated='s')) AND
+    EXISTS(SELECT 1 FROM pg_index i
+      JOIN pg_attribute environment ON environment.attrelid=i.indrelid AND environment.attname='normalized_environment_id'
+      JOIN pg_attribute native ON native.attrelid=i.indrelid AND native.attname='normalized_native_id'
+      WHERE i.indexrelid=to_regclass('public.agent_usage_associations_target') AND i.indisvalid AND i.indisready
+        AND i.indkey[3]=environment.attnum AND i.indkey[4]=native.attnum
+        AND i.indcollation[3]='"C"'::regcollation AND i.indcollation[4]='"C"'::regcollation) AS normalized_keys`)).rows[0];
+  if (!["live_sources", "generation_reference", "retired_reference", "live_guard", "normalized_keys"]
     .every(key => row?.[key] === true)) throw new Error("inventory_identity_schema");
 }
 
@@ -382,6 +410,13 @@ async function verifyUserSourceSchema(database: Pick<pg.Pool, "query">) {
     AND (SELECT count(*)=5 FROM pg_trigger WHERE tgname='user_source_fence' AND NOT tgisinternal AND tgenabled IN ('O','A'))
     AND (SELECT count(*)=5 FROM pg_indexes WHERE schemaname='public' AND indexname IN
       ('user_source_attempt_scope','user_source_identity_pending','directory_user_entitlement','directory_user_upn_order','user_source_generation_attempt'))
+    AND EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='directory_user_rows'::regclass
+      AND conname='directory_user_rows_sort_key_check' AND convalidated
+      AND pg_get_constraintdef(oid) LIKE '%length(sort_key) <= 9216%')
+    AND EXISTS(SELECT 1 FROM pg_index i WHERE i.indexrelid=to_regclass('public.directory_user_order')
+      AND i.indisvalid AND i.indisready AND i.indnatts=4 AND i.indnkeyatts=4
+      AND replace(pg_get_indexdef(i.indexrelid),'"','') ILIKE '%left(%sort_key%128)%'
+      AND i.indcollation[2]='pg_catalog."C"'::regcollation)
     AND (SELECT count(*)=jsonb_array_length($2::jsonb) FROM information_schema.columns c
       JOIN jsonb_to_recordset($2::jsonb) expected("table" text,name text,type text,nullable text)
         ON c.table_schema='public' AND c.table_name=expected."table" AND c.column_name=expected.name
@@ -473,15 +508,31 @@ async function verifyInventoryRefreshContractSchema(database: Pick<pg.Pool, "que
     NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='package_refresh_jobs'::regclass
       AND attname='catalog_only' AND NOT attisdropped) AS retired_mode,
     EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='package_refresh_jobs'::regclass
-      AND conname='inventory_refresh_job_mode' AND convalidated) AS bounded_detail_mode`)).rows[0];
-  if (!result?.retired_mode || !result.bounded_detail_mode) throw new Error("inventory_refresh_contract_schema");
+      AND conname='inventory_refresh_job_mode' AND convalidated) AS bounded_detail_mode,
+    NOT EXISTS (
+      SELECT 1 FROM (VALUES ('power_platform_refresh_jobs'),('package_refresh_jobs')) jobs(table_name)
+      CROSS JOIN (VALUES ('observed_count',$1::int),('total_records',$1::int),('page_count',$2::int)) bounds(column_name,maximum)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM pg_constraint c WHERE c.conrelid=to_regclass('public.'||jobs.table_name)
+          AND c.conname=jobs.table_name||'_'||bounds.column_name||'_check' AND c.contype='c' AND c.convalidated
+          AND pg_get_expr(c.conbin,c.conrelid)=format('((%s >= 0) AND (%s <= %s))',bounds.column_name,bounds.column_name,bounds.maximum)
+      )
+    ) AS progress_bounds`, [inventoryLimits.sourceRows, inventoryLimits.pages])).rows[0];
+  if (!["retired_mode", "bounded_detail_mode", "progress_bounds"].every(key => result?.[key] === true)) {
+    throw new Error("inventory_refresh_contract_schema");
+  }
 }
 
 async function verifyOfficialReportSchema(database: Pick<pg.Pool, "query">) {
   const result = await database.query(`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='official_usage_row_facts'
       AND column_name='responses' AND data_type='bigint')
-    AND (SELECT count(*)=5 FROM pg_indexes WHERE schemaname='public' AND indexname IN
-      ('official_usage_fact_identity','official_usage_fact_agent','official_usage_fact_responses','official_usage_history_open','official_usage_history_read'))
+    AND (SELECT count(*)=6 FROM pg_indexes WHERE schemaname='public' AND indexname IN
+      ('official_usage_fact_identity','official_usage_fact_agent','official_usage_fact_responses','official_usage_fact_directory_identity','official_usage_history_open','official_usage_history_read'))
+    AND EXISTS(SELECT 1 FROM pg_index i WHERE i.indexrelid=to_regclass('public.official_usage_fact_directory_identity')
+      AND i.indisvalid AND i.indisready AND i.indnatts=4 AND i.indrelid='official_usage_row_facts'::regclass
+      AND i.indcollation[2]='pg_catalog."C"'::regcollation
+      AND replace(pg_get_expr(i.indexprs,i.indrelid),'"','') ILIKE '%left(lower(btrim(username)%default%128)%'
+      AND pg_get_expr(i.indexprs,i.indrelid) NOT ILIKE '%normalize%')
     AND (SELECT count(*)=4 FROM pg_trigger WHERE tgname IN ('official_history_membership_guard','official_history_state_guard','official_upload_row_guard','official_upload_intent_guard') AND tgenabled IN ('O','A'))
     AND (SELECT count(*)=5 FROM information_schema.tables WHERE table_schema='public' AND table_name IN(
       'official_usage_history_state','official_usage_history_memberships','official_usage_ingestions','official_usage_ingestion_rows','official_usage_read_contexts'))
@@ -521,7 +572,7 @@ async function verifyInventorySummaryAggregateSchema(database: Pick<pg.Pool,"que
 async function verifyUserReportPageSchema(database: Pick<pg.Pool, "query">) {
   const row = (await database.query(`SELECT i.indisvalid AND i.indisready AND i.indnatts=3
     AND i.indrelid='directory_user_rows'::regclass
-    AND replace(pg_get_indexdef(i.indexrelid),'"','') ILIKE '%USING btree (generation_id,%lower(%normalize(%display_name%upn%identity%'
+    AND replace(pg_get_indexdef(i.indexrelid),'"','') ILIKE '%USING btree (generation_id,%left(lower(%normalize(%display_name%upn%128)%identity%'
     AND pg_get_indexdef(i.indexrelid) LIKE '%NFKC%'
     AND i.indcollation[1]='pg_catalog."C"'::regcollation AND i.indcollation[2]='pg_catalog."C"'::regcollation AS valid,
     pg_get_indexdef(i.indexrelid) AS definition

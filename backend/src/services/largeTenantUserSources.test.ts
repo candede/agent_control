@@ -15,6 +15,7 @@ import { parseReportUser } from "./userSourceGraphFields.js";
 import { randomUUID } from "node:crypto";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { SavedAgentPeopleService } from "./savedAgentPeople.js";
+import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-user-source-selected-read-secret"; });
 
@@ -252,6 +253,56 @@ describe("dormant user-source foundation", () => {
     const missing = await repository.capture({ ...identity, tenantId: "other-tenant" }, "delegated");
     expect(await repository.people(missing.id, { ...identity, tenantId: "other-tenant" }, [firstId])).toEqual([]);
     expect((await repository.page(missing.id, { ...identity, tenantId: "other-tenant" })).summary.licensedUsers).toBeNull();
+  });
+
+  it("persists expanded and incompressible directory names with exact prefix-tied source/report pages", async () => {
+    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const stages = new UserSourceStages(fixture.runtime);
+    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const names = ["\ufdfa".repeat(511) + "b", "\ufdfa".repeat(511) + "a",
+      Array.from({ length: 512 }, (_, index) => String.fromCharCode(0x4e00 + index * 7919 % 20992)).join("")];
+    const users = names.map((name, index) => {
+      const user = sourceUser(`00000000-0000-0000-0000-${String(index + 1).padStart(12, "0")}`);
+      user.identity.displayName = name;
+      return user;
+    });
+    await stages.execute(input, async lease => {
+      const key = await stages.query(lease, "discovery", "synthetic:wide-directory-names");
+      await stages.page(lease, key, "synthetic:wide-directory-names", users.length, users.length);
+      await stages.directory(lease, key, users);
+      await stages.finishQuery(lease, key);
+    }, { beforePublish: async () => {} });
+    const source = new UserSourcesRepository(fixture.runtime, "synthetic-wide-directory-cursor-secret");
+    const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-wide-directory-cursor-secret", 30);
+    const expected = [...users].sort((a, b) => Buffer.compare(
+      Buffer.from(a.identity.displayName!.normalize("NFKC").toLowerCase()),
+      Buffer.from(b.identity.displayName!.normalize("NFKC").toLowerCase()),
+    )).map(user => user.identity.objectId);
+    for (const order of ["asc", "desc"] as const) {
+      const selected = await source.capture(identity, "delegated", { sort: "name", order });
+      const combined = await reports.capture(identity, "delegated", "copilot_users", { sort: "name", order });
+      for (const [reader, id] of [[source, selected.id], [reports, combined.id]] as const) {
+        const found: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await reader.page(id, identity, { limit: 1, cursor });
+          expect(page.counts).toEqual({ total: users.length, filtered: users.length });
+          expect(page.value).toHaveLength(1);
+          const row = page.value[0];
+          if (!("directory" in row)) throw new Error("Expected directory facts");
+          found.push(row.directory.objectId);
+          expect(row.directory.displayName).toBe(users.find(user => user.identity.objectId === row.directory.objectId)!.identity.displayName);
+          if (page.page.previousCursor) {
+            const previous = await reader.page(id, identity, { limit: 1, cursor: page.page.previousCursor });
+            expect(previous.value).toMatchObject([{ directory: { objectId: found.at(-2) } }]);
+          }
+          cursor = page.page.nextCursor ?? undefined;
+        } while (cursor);
+        expect(found).toEqual(order === "asc" ? expected : [...expected].reverse());
+      }
+    }
+    await verifySchema(fixture.runtime);
+    expect(stages.maximumParameterBytes).toBeLessThanOrEqual(1_048_576);
   });
 
   it("invalidates both token modes once per cache statement, including direct clear, and forbids moving identities", async () => {

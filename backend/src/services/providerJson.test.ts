@@ -1,7 +1,7 @@
 import { setImmediate } from "node:timers/promises";
 import pg from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { boundedProviderJson, boundedProviderText, ProviderResponseLimitError } from "./providerJson.js";
+import { boundedProviderJson, boundedProviderText, parseProviderContractJson, ProviderResponseLimitError } from "./providerJson.js";
 import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 import { GraphPackagesClient, graphError, type FetchLike } from "./graphPackages.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
@@ -9,6 +9,9 @@ import { allowlistedPackage } from "./packageObservation.js";
 import { UserSourceProvider } from "./userSourceProvider.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
 import { reportHeaders } from "./userSourceGraphFields.js";
+import { observePeakMemory } from "./peakMemory.js";
+import { AppError } from "../errors.js";
+import { GraphAgentIdentityClient } from "./graphAgentIdentity.js";
 
 async function readActivity(fetcher: FetchLike, signal = new AbortController().signal) {
   const database = new pg.Pool({ max: 4 });
@@ -137,6 +140,109 @@ describe("bounded provider observations", () => {
     await expect(boundedProviderJson(new Response(null))).rejects.toMatchObject({ code: "provider_schema" });
   });
 
+  it("preserves cancellation without acquiring or releasing another consumer's reader", async () => {
+    const reason = new DOMException("cancelled", "AbortError");
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const response = new Response(body);
+    const reader = body.getReader();
+    try {
+      await expect(boundedProviderText(response, undefined, AbortSignal.abort(reason))).rejects.toBe(reason);
+      expect(body.locked).toBe(true);
+      expect(cancel).not.toHaveBeenCalled();
+    } finally { reader.releaseLock(); }
+  });
+
+  it("preserves cancellation during reader release before returning text or HTTP diagnostics", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    const response = new Response('{"error":{"code":"Forbidden"}}', { status: 403 });
+    const reader = response.body!.getReader();
+    const release = reader.releaseLock.bind(reader);
+    vi.spyOn(reader, "releaseLock").mockImplementation(() => { release(); controller.abort(reason); });
+    vi.spyOn(response.body!, "getReader").mockReturnValue(reader);
+    await expect(graphError(response, controller.signal)).rejects.toBe(reason);
+    expect(response.body!.locked).toBe(false);
+  });
+
+  it("preserves cancellation during reader release after a transport read failure", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(stream) { stream.error(new TypeError("private transport details")); },
+    }));
+    const reader = response.body!.getReader();
+    const release = reader.releaseLock.bind(reader);
+    vi.spyOn(reader, "releaseLock").mockImplementation(() => { release(); controller.abort(reason); });
+    vi.spyOn(response.body!, "getReader").mockReturnValue(reader);
+    await expect(boundedProviderText(response, undefined, controller.signal)).rejects.toBe(reason);
+    expect(response.body!.locked).toBe(false);
+  });
+
+  it.each([1, 2])("preserves cancellation during parse checkpoint %i", async checkpoint => {
+    const controller = new AbortController();
+    const reason = new DOMException("deadline", "TimeoutError");
+    const parse = vi.fn(JSON.parse);
+    let observed = 0;
+    const dispose = observePeakMemory(() => { if (++observed === checkpoint) controller.abort(reason); });
+    try {
+      await expect(boundedProviderJson(new Response("{}"), controller.signal, undefined, parse)).rejects.toBe(reason);
+      expect(parse).toHaveBeenCalledTimes(checkpoint === 1 ? 0 : 1);
+    } finally { dispose(); }
+  });
+
+  it.each([1, 2])("does not report local checkpoint %i failures as malformed provider JSON", async checkpoint => {
+    const failure = new Error("synthetic observation failure");
+    let observed = 0;
+    const dispose = observePeakMemory(() => { if (++observed === checkpoint) throw failure; });
+    try {
+      await expect(boundedProviderJson(new Response("{}"))).rejects.toBe(failure);
+    } finally { dispose(); }
+  });
+
+  it("keeps cancellation authoritative when a contract parser fails", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    const parse = () => { controller.abort(reason); throw new SyntaxError("private provider fragment"); };
+    await expect(boundedProviderJson(new Response("{}"), controller.signal, undefined, parse)).rejects.toBe(reason);
+  });
+
+  it.each([new Error("local parser failure"), new AppError(502, "provider_result_limit", "Contract limit exceeded.")])(
+    "preserves non-syntax contract parser failure identity: %s", async failure => {
+      await expect(boundedProviderJson(new Response("{}"), undefined, undefined, () => { throw failure; })).rejects.toBe(failure);
+    },
+  );
+
+  it.each([false, true])("copies consumed bytes before a producer reuses its chunk buffer (signal: %s)", async withSignal => {
+    const buffer = new Uint8Array(5);
+    const parts = ['{"v":', "true}"];
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index === parts.length) { controller.close(); return; }
+        buffer.set(new TextEncoder().encode(parts[index++]));
+        controller.enqueue(buffer);
+      },
+    }, { highWaterMark: 0 });
+    await expect(boundedProviderJson(new Response(body), withSignal ? new AbortController().signal : undefined))
+      .resolves.toEqual({ v: true });
+    expect(body.locked).toBe(false);
+  });
+
+  it("reads highly fragmented bodies with empty chunks without changing their byte budget", async () => {
+    const bytes = Buffer.from(JSON.stringify({ value: "é😀".repeat(1000) }));
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index === bytes.length) { controller.close(); return; }
+        controller.enqueue(new Uint8Array(0));
+        controller.enqueue(bytes.subarray(index, ++index));
+      },
+    }, { highWaterMark: 0 });
+    await expect(boundedProviderJson(new Response(body), new AbortController().signal, bytes.length))
+      .resolves.toEqual({ value: "é😀".repeat(1000) });
+  });
+
   it("rejects oversized and malformed payloads", async () => {
     await expect(boundedProviderJson(new Response("x".repeat(2_000_001)))).rejects.toMatchObject({ code: "provider_result_limit" });
     await expect(boundedProviderJson(new Response("{"))).rejects.toMatchObject({ code: "provider_schema" });
@@ -203,6 +309,32 @@ describe("bounded provider observations", () => {
     } finally { cleanup.resolve(); await pending; }
   });
 
+  it.each(["stalled", "rejected"])("releases an aborted reader without waiting for %s cleanup", async mode => {
+    const controller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    const cleanup = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => mode === "stalled" ? cleanup.promise : Promise.reject(new Error("private cleanup details")));
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const pending = boundedProviderText(new Response(body), undefined, controller.signal).catch(error => error);
+    controller.abort(reason);
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(reason);
+      expect(cancel).toHaveBeenCalledExactlyOnceWith(reason);
+      expect(body.locked).toBe(false);
+    } finally { cleanup.resolve(); await pending; }
+  });
+
+  it("keeps cancellation during over-budget cleanup authoritative", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("cancelled", "AbortError");
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) { stream.enqueue(Uint8Array.of(0xff, 0xff)); },
+      cancel() { controller.abort(reason); },
+    });
+    await expect(boundedProviderText(new Response(body), 1, controller.signal)).rejects.toBe(reason);
+    expect(body.locked).toBe(false);
+  });
+
   it.each(["closed", "errored"])("keeps cancellation authoritative when the final read is %s at the same time", async state => {
     const abort = new AbortController();
     const reason = new DOMException("deadline", "TimeoutError");
@@ -251,6 +383,39 @@ describe("bounded provider observations", () => {
     await expect(boundedProviderText(new Response("\uFEFFheader,value"))).resolves.toBe("\uFEFFheader,value");
   });
 
+  describe("contract scanner contexts", () => {
+    const contexts = {
+      root: { fields: ["record", "records"], objects: { record: "record" }, arrays: { records: "record" } },
+      record: { fields: ["id", 'quote"\\key'] },
+    };
+
+    it.each([
+      '{"record":{"id":"first","\\u0069d":"last"}}',
+      '{"records":[0,{"quote\\"\\\\key":"first","quote\\u0022\\u005ckey":"last"}]}',
+    ])("rejects escaped duplicates inside mapped containers: %s", text => {
+      expect(() => parseProviderContractJson(text, contexts, 3)).toThrow(SyntaxError);
+    });
+
+    it("does not reinterpret escaped strings or unknown nested containers as contract members", () => {
+      const text = '{"ignored":{"id":"first","id":"last"},"constructor":{"id":"first","id":"last"},'
+        + '"__proto__":{"id":"first","id":"last"},"toString":"ignored","records":[["unknown",{"id":"first","id":"last"}],'
+        + '{"id":"value with \\"quotes\\", braces } [ and slash \\\\","ignored":{"id":"first","id":"last"}}]}';
+      expect(parseProviderContractJson(text, contexts, 3)).toEqual(JSON.parse(text));
+    });
+
+    it("restores sibling context after skipping deeply nested unknown JSON", () => {
+      const text = `{"ignored":${'{"nested":['.repeat(32)}0${"]}".repeat(32)},`
+        + '"records":[{"id":"first","id":"last"}]}';
+      expect(() => parseProviderContractJson(text, contexts, 3)).toThrow(SyntaxError);
+    });
+
+    it("includes the configured depth without imposing a limit on unknown JSON", () => {
+      const text = '{"records":[{"id":"first","id":"last"}]}';
+      expect(parseProviderContractJson(text, contexts, 2)).toEqual({ records: [{ id: "last" }] });
+      expect(() => parseProviderContractJson(text, contexts, 3)).toThrow(SyntaxError);
+    });
+  });
+
   it("omits unknown package fields with value-free diagnostics", () => {
     const diagnostics = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -274,5 +439,89 @@ describe("bounded provider observations", () => {
     const bounded = vi.fn(async () => new Response("x".repeat(2_000_001)));
     await expect(new DirectoryPrincipalsClient(bounded).resolve("token", [{ resourceId: "11111111-1111-4111-8111-111111111111", resourceType: "user" }])).rejects.toMatchObject({ code: "provider_result_limit" });
     expect(bounded.mock.calls[0]).toBeDefined();
+  });
+
+  it.each([
+    '{"id":"foreign","\\u0069d":"11111111-1111-4111-8111-111111111111","servicePrincipalType":"ServiceIdentity"}',
+    '{"id":"11111111-1111-4111-8111-111111111111","servicePrincipalType":"Application","servicePrincipalType":"ServiceIdentity"}',
+  ])("rejects overwritten typed identity evidence", async text => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response(text));
+    await expect(new GraphAgentIdentityClient(fetcher).resolve("token", "11111111-1111-4111-8111-111111111111",
+      new AbortController().signal, async () => {})).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    '{"value":[{"id":"foreign","id":"11111111-1111-4111-8111-111111111111"}]}',
+    '{"value":[{"id":"11111111-1111-4111-8111-111111111111"}],"value":[]}',
+  ])("rejects overwritten principal search evidence", async text => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response(text));
+    await expect(new DirectoryPrincipalsClient(fetcher).search("token", "fi")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    '{"value":[{"skuId":"foreign"}],"value":[]}',
+    '{"value":[],"@odata.nextLink":"https://other.invalid/collect","@odata.nextLink":null}',
+    '{"value":[{"skuId":"foreign","skuId":"11111111-1111-4111-8111-111111111111","appliesTo":"User","servicePlans":[]}]}',
+    '{"value":[{"skuId":"11111111-1111-4111-8111-111111111111","appliesTo":"User","servicePlans":[{"servicePlanId":"foreign","servicePlanId":"22222222-2222-4222-8222-222222222222"}]}]}',
+  ])("rejects overwritten license catalog evidence before staging", async text => {
+    const database = new pg.Pool({ max: 4 });
+    const stages = new UserSourceStages(database);
+    vi.spyOn(stages, "query").mockResolvedValue("synthetic-directory-query");
+    vi.spyOn(stages, "assertNewPage").mockResolvedValue();
+    const page = vi.spyOn(stages, "page").mockRejectedValue(new Error("Malformed evidence must not be staged."));
+    try {
+      await expect(new UserSourceProvider(async () => new Response(text)).directory(stages, {
+        id: "00000000-0000-4000-8000-000000000001", scopeId: "00000000-0000-4000-8000-000000000002",
+        tenantId: "transport-fixture", owner: "00000000-0000-4000-8000-000000000003", version: 1,
+        epoch: "0", sessionEpoch: "0", expectedRevision: "0", schemaVersion: 1,
+      }, "token", new AbortController().signal)).rejects.toMatchObject({ code: "provider_schema" });
+      expect(page).not.toHaveBeenCalled();
+    } finally { await database.end(); }
+  });
+
+  it.each([
+    (text: string) => text.replace('"id":', '"id":"foreign","id":'),
+    (text: string) => text.replace('"disabledPlans":[]', '"disabledPlans":["foreign"],"disabledPlans":[]'),
+    (text: string) => text.replace('"capabilityStatus":"Enabled"', '"capabilityStatus":"Deleted","capabilityStatus":"Enabled"'),
+  ])("rejects overwritten directory identity and license-plan state before staging", async body => {
+    const skuId = "11111111-1111-4111-8111-111111111111";
+    const planId = "22222222-2222-4222-8222-222222222222";
+    const text = JSON.stringify({ value: [{
+      id: "33333333-3333-4333-8333-333333333333", userPrincipalName: "fixture@example.invalid",
+      assignedLicenses: [{ skuId, disabledPlans: [] }],
+      assignedPlans: [{ servicePlanId: planId, service: "fixture", capabilityStatus: "Enabled" }],
+    }] });
+    const database = new pg.Pool({ max: 4 });
+    const stages = new UserSourceStages(database);
+    vi.spyOn(stages, "query").mockResolvedValue("synthetic-directory-query");
+    vi.spyOn(stages, "assertNewPage").mockResolvedValue();
+    const page = vi.spyOn(stages, "page").mockResolvedValueOnce()
+      .mockRejectedValue(new Error("Malformed directory evidence must not be staged."));
+    vi.spyOn(stages, "finishQuery").mockResolvedValue();
+    vi.spyOn(stages, "skuBatch").mockResolvedValue([{ skuId, servicePlanIds: [planId] }]);
+    const fetcher = vi.fn<FetchLike>().mockResolvedValueOnce(Response.json({ value: [] }))
+      .mockResolvedValueOnce(new Response(body(text)));
+    try {
+      await expect(new UserSourceProvider(fetcher).directory(stages, {
+        id: "00000000-0000-4000-8000-000000000001", scopeId: "00000000-0000-4000-8000-000000000002",
+        tenantId: "transport-fixture", owner: "00000000-0000-4000-8000-000000000003", version: 1,
+        epoch: "0", sessionEpoch: "0", expectedRevision: "0", schemaVersion: 1,
+      }, "token", new AbortController().signal)).rejects.toMatchObject({ code: "provider_schema" });
+      expect(page).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { await database.end(); }
+  });
+
+  it.each([
+    { status: 403, text: '{"error":{"code":"private","code":"Forbidden"}}' },
+    { status: 424, text: '{"error":{"message":"ordinary failure","message":"too many requests"}}' },
+    { status: 429, text: '{"error":{"code":"private","code":"TooManyRequests"}}' },
+  ])("retains HTTP $status but discards ambiguous error-body diagnostics", async ({ status, text }) => {
+    const error = await graphError(new Response(text, { status }));
+    expect(error).toMatchObject({ status, code: "graph_error", details: { httpStatus: status } });
+    expect(error.details).not.toHaveProperty("providerErrorCode");
+    if (status === 429) expect(error.details).toHaveProperty("throttled", true);
+    else expect(error.details).not.toHaveProperty("throttled");
   });
 });

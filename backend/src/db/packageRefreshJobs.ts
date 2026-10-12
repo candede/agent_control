@@ -3,6 +3,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { config } from "../config.js";
 import { dataSyncFailureStatus } from "../types/dataSync.js";
+import { isPackageId } from "../types/copilotPackage.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
 import { packageRefreshExecutionDeadlineMs } from "../services/packageRefreshPolicy.js";
@@ -12,10 +13,12 @@ import { dataConnections } from "./dataConnections.js";
 import { dataLimitError, encodeBatch } from "./dataBounds.js";
 import { InventoryQueries } from "./inventoryQueries.js";
 import { lockPackageInventoryScope } from "./packageControls.js";
+import { normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "./sessions.js";
 
 export type PackageDataScope = { tenantId: string; principalId: string; tokenMode?: "delegated" | "application" };
 const catalogRevisionHashSql = `encode(sha256(convert_to(jsonb_build_array(
-  r.residual->'lastModifiedDateTime',r.residual->'appId',r.residual->'manifestId',
+  r.residual->'lastModifiedDateTime',r.residual->'appId',${normalizeNativeIdentitySql("(r.residual->>'manifestId')")},
   r.residual->'assetId',r.residual->'version',r.residual->'manifestVersion')::text,'UTF8')),'hex')`;
 export type PackageRefreshInput = {
   authorizationPrincipalId: string;
@@ -55,7 +58,8 @@ export class PackageRefreshJobs {
 
   async submitSelected(scope: PackageDataScope, identity: SelectionIdentity, input: {
     selectionId: string; idempotencyKey: string; ids?: readonly string[]; recordIds?: readonly string[];
-  }) {
+  }, assertCurrent?: () => void) {
+    assertCurrent?.();
     requireProviderAdmissions();
     validateScope(scope);
     if (scope.tenantId !== identity.tenantId || scope.principalId !== identity.principalId || scope.tokenMode === "application") {
@@ -79,6 +83,7 @@ export class PackageRefreshJobs {
     const requestHash = hash({ authorizationPrincipalId: identity.principalId, queryHash, tokenMode: "delegated", scopeKind: "exact" });
     const selected = new InventoryQueries(this.database, config.sessionSecret);
     const id = await transaction(this.database, async client => {
+      assertCurrent?.();
       await lockPackageInventoryScope(scope, client);
       const existing = (await client.query(`SELECT id,request_hash FROM package_refresh_jobs
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND idempotency_key=$3`,
@@ -113,13 +118,14 @@ export class PackageRefreshJobs {
         if (ordinal !== total) throw new SelectionError("selection_invalidated");
         return jobId;
       });
-    });
+    }, undefined, assertCurrent);
     const job = await this.getJob(scope, id);
     if (!job) throw new AppError(409, "package_refresh_expired", "The selected refresh expired.");
     return job;
   }
 
-  async submit(scope: PackageDataScope, input: PackageRefreshInput) {
+  async submit(scope: PackageDataScope, input: PackageRefreshInput, assertCurrent?: () => void) {
+    assertCurrent?.();
     requireProviderAdmissions();
     validateScope(scope);
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)) {
@@ -133,6 +139,7 @@ export class PackageRefreshJobs {
     const queryHash = hash({ tokenMode: input.tokenMode, scopeKind, requestedIds });
     const requestHash = hash({ authorizationPrincipalId: input.authorizationPrincipalId, queryHash });
     const id = await transaction(this.database, async client => {
+      assertCurrent?.();
       await lockPackageInventoryScope(scope, client);
       const existing = (await client.query<Pick<JobRow, "id" | "request_hash">>(`SELECT id,request_hash FROM package_refresh_jobs
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND idempotency_key=$4`,
@@ -152,7 +159,7 @@ export class PackageRefreshJobs {
         requestHash, queryHash, scopeKind]);
       await insertRefreshTargets(client, jobId, requestedIds);
       return jobId;
-    });
+    }, undefined, assertCurrent);
     const job = await this.getJob(scope, id);
     if (!job) throw new AppError(409, "package_refresh_expired", "The package refresh is no longer available. Submit a new refresh with a new idempotency key.");
     return job;
@@ -173,8 +180,8 @@ export class PackageRefreshJobs {
         WHERE tenant_id=$1 AND principal_id=$2 AND auto_details AND status IN ('waiting_authorization','running')
           AND deadline_at>clock_timestamp() AND expires_at>clock_timestamp() LIMIT 1`, [scope.tenantId, scope.principalId]);
       if (outstanding.rowCount) return null;
-      const latest = await client.query<Pick<JobRow, "error_code" | "created_at"> & { cooling_down: boolean; requested_ids: string[] }>(`
-        SELECT error_code,created_at,ARRAY(SELECT target_id FROM inventory_refresh_targets
+      const latest = await client.query<Pick<JobRow, "error_code" | "created_at" | "attempted_at"> & { cooling_down: boolean; requested_ids: string[] }>(`
+        SELECT error_code,created_at,attempted_at,ARRAY(SELECT target_id FROM inventory_refresh_targets
           WHERE job_id=package_refresh_jobs.id ORDER BY ordinal LIMIT 20) AS requested_ids,
           status='failed' AND updated_at>clock_timestamp()-interval '1 hour' AS cooling_down
         FROM package_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND auto_details
@@ -182,7 +189,7 @@ export class PackageRefreshJobs {
       const previous = latest.rows[0];
       const failure = dataSyncFailureStatus(previous?.error_code ?? "");
       const renewed = previous?.cooling_down && failure === "waiting_authorization"
-        && signedInAt !== undefined && previous.created_at.getTime() < signedInAt;
+        && signedInAt !== undefined && (previous.attempted_at ?? previous.created_at).getTime() < signedInAt;
       if (previous?.cooling_down && failure !== "failed" && !renewed) return null;
       const due = await client.query<{ native_id: string; catalog_revision_hash: string }>(`
         SELECT r.native_id,${catalogRevisionHashSql} AS catalog_revision_hash
@@ -238,6 +245,8 @@ export class PackageRefreshJobs {
 
   async listJobs(scope: PackageDataScope, authorizationPrincipalId: string, limit = 20) {
     validateScope(scope);
+    const validation = beginAccountSessionValidation(scope.tenantId, authorizationPrincipalId);
+    assertAccountSessionValidation(validation);
     const boundedLimit = Math.min(Math.max(limit, 1), 50);
     const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
       LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
@@ -249,10 +258,8 @@ export class PackageRefreshJobs {
       (SELECT max(g.observed_at) FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
         WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_packages'
           AND g.state='published' AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-          AND g.validated AND EXISTS(SELECT 1 FROM inventory_roots r JOIN inventory_revisions v
-            ON v.scope_id=r.scope_id AND v.revision=r.revision
-            WHERE r.current AND r.scope_id=s.id AND v.generation_id=g.id)) AS last_success_at`,
-    [scope.tenantId, scope.principalId, authorizationPrincipalId]);
+          AND g.expires_at>clock_timestamp()) AS last_success_at`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
+    assertAccountSessionValidation(validation);
     return { value: rows.map(projectJob), lastAttemptAt: summary.rows[0].last_attempt_at?.toISOString() ?? null,
       lastSuccessAt: summary.rows[0].last_success_at?.toISOString() ?? null };
   }
@@ -260,6 +267,8 @@ export class PackageRefreshJobs {
   targets(scope: PackageDataScope, identity: SelectionIdentity, id: string, options: { limit?: number; revision?: string; cursor?: string }) {
     const limit = options.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100 || options.cursor && !options.revision) throw new SelectionError("invalid_cursor");
+    const validation = beginAccountSessionValidation(identity.tenantId, identity.principalId);
+    assertAccountSessionValidation(validation);
     return dataConnections(this.database).selectedRead(async client => {
       const job = (await client.query(`SELECT job.updated_at::text AS revision,job.status FROM package_refresh_jobs job
         JOIN data_principal_epochs p ON p.tenant_id=job.tenant_id AND p.principal_id=job.authorization_principal_id
@@ -290,16 +299,23 @@ export class PackageRefreshJobs {
       return { value, revision: job.revision, counts: { total, filtered: total }, page: { limit,
         nextCursor: !reverse && more || reverse && cursor ? token(value.at(-1), "next") : null,
         previousCursor: reverse && more || !reverse && cursor ? token(value[0], "previous") : null } };
+    }).then(result => {
+      assertAccountSessionValidation(validation);
+      return result;
     });
   }
 
-  async markRunning(scope: PackageDataScope, id: string, autoDetails = false) {
-    const result = await this.database.query(`UPDATE package_refresh_jobs SET status='running',attempted_at=clock_timestamp(),
-      updated_at=clock_timestamp(),error_code=NULL,message=NULL,deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp()
-        AND deadline_at>clock_timestamp() RETURNING id`,
-    [id, scope.tenantId, scope.principalId, autoDetails ? 10 * 60_000 : packageRefreshExecutionDeadlineMs]);
-    return result.rowCount === 1;
+  async markRunning(scope: PackageDataScope, id: string, autoDetails = false, assertCurrent?: () => void) {
+    return transaction(this.database, async client => {
+      assertCurrent?.();
+      const result = await client.query(`UPDATE package_refresh_jobs SET status='running',attempted_at=clock_timestamp(),
+        updated_at=clock_timestamp(),error_code=NULL,message=NULL,page_count=0,observed_count=0,total_records=NULL,
+        deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp()
+          AND deadline_at>clock_timestamp() RETURNING id`,
+      [id, scope.tenantId, scope.principalId, autoDetails ? 10 * 60_000 : packageRefreshExecutionDeadlineMs]);
+      return result.rowCount === 1;
+    }, undefined, assertCurrent);
   }
 
   async recordProgress(scope: PackageDataScope, id: string, pageCount: number, observedCount: number, totalRecords: number | null, message?: string) {
@@ -321,10 +337,13 @@ export class PackageRefreshJobs {
     return this.getJob(scope, id);
   }
 
-  async markFailed(scope: PackageDataScope, id: string, code: string, message: string) {
+  async markFailed(scope: PackageDataScope, id: string, code: string, message: string, claimedRevision?: string) {
+    // Stale admission may compensate its never-started claim, but cannot stop a newer owner.
     await this.database.query(`UPDATE package_refresh_jobs SET status='failed',error_code=$4,message=$5,finished_at=clock_timestamp(),
-      updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting_authorization')`,
-    [id, scope.tenantId, scope.principalId, safeCode(code), message.slice(0, 1024)]);
+      updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting_authorization')
+        AND ($6::text IS NULL OR (auto_details AND status='waiting_authorization' AND attempted_at IS NULL
+          AND updated_at::text=$6))`,
+    [id, scope.tenantId, scope.principalId, safeCode(code), message.slice(0, 1024), claimedRevision ?? null]);
     return this.getJob(scope, id);
   }
 
@@ -388,7 +407,7 @@ function normalizeRequestedIds(values: readonly string[] | undefined) {
   if (!values) return [];
   if (!Array.isArray(values) || values.length > 5000) throw new AppError(400, "invalid_targets", "A package refresh accepts at most 5,000 exact native IDs.");
   const result = [...new Set(values.map(value => {
-    if (typeof value !== "string" || !value.trim() || value.length > 512) throw new AppError(400, "invalid_targets", "Each package target must be a non-empty native ID of at most 512 characters.");
+    if (!isPackageId(value)) throw new AppError(400, "invalid_targets", "Each package target must be an exact bounded native ID without controls or dot path segments.");
     return value;
   }))].sort(ordinal);
   if (!result.length && values.length) throw new AppError(400, "invalid_targets", "Exact package refresh targets cannot be empty.");
