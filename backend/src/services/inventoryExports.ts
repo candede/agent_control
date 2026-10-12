@@ -230,8 +230,8 @@ const boundedResult = `, sized AS (
   SELECT *,row_number() OVER(ORDER BY key COLLATE "C") AS position,
     sum(octet_length(row_to_json(c)::text)) OVER(ORDER BY key COLLATE "C") AS bytes FROM candidates c)
   SELECT coalesce(jsonb_agg(to_jsonb(s)-'bytes'-'position' ORDER BY key COLLATE "C")
-    FILTER(WHERE bytes<=524288 AND position<=250),'[]'::jsonb) AS value,
-    coalesce(bool_or(bytes>524288 OR position>250),false) AS more,
+    FILTER(WHERE bytes<=${dataLimits.batchBytes} AND position<=250),'[]'::jsonb) AS value,
+    coalesce(bool_or(bytes>${dataLimits.batchBytes} OR position>250),false) AS more,
     max(bytes) FILTER(WHERE position=1) AS first_bytes FROM sized s`;
 
 function boundedPage<T extends { key: string }>(row: { value: T[]; more: boolean; first_bytes: string | null }) {

@@ -10,6 +10,37 @@ import { fulfillInventoryPage, inventoryFixtureSelection, isInventorySelectionRe
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("saved usage history retries a technical failure without closing the agent or inventing report links", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.setFixedTime(new Date(layoutTime));
+  let historyReads = 0, summaryReads = 0;
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith("/usage-history")) historyReads++;
+    if (path.endsWith("/usage")) summaryReads++;
+  });
+  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage-history$/.test(url.pathname), route => route.fulfill({
+    status: 503, json: { code: "synthetic_history_unavailable", detail: "Saved usage history is temporarily unavailable." },
+  }), { times: 1 });
+  await page.goto("/agents");
+  await page.getByRole("button", { name: unifiedAgents.value[0].displayName, exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: unifiedAgents.value[0].displayName, exact: true });
+  await dialog.getByRole("tab", { name: "Usage", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Saved usage history is temporarily unavailable.");
+  expect(historyReads).toBe(1);
+  await dialog.getByRole("button", { name: "Retry usage history", exact: true }).click();
+  const trend = dialog.getByRole("region", { name: "Reported usage trend", exact: true });
+  await expect(trend).toBeVisible();
+  await expect(trend).toContainText("No usage reported in saved reports.");
+  await expect(trend.getByRole("table").getByRole("cell", { name: "Not reported", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL(/detailTab=reports/);
+  expect(historyReads).toBe(2);
+  expect(summaryReads).toBe(0);
+  expect(unexpected).toEqual([]);
+});
+
 for (const missing of [false, true]) test(`read-only agent snapshot comparisons and Users discovery with latest usage ${missing ? "missing" : "reported"}`, async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));
@@ -96,7 +127,7 @@ for (const missing of [false, true]) test(`read-only agent snapshot comparisons 
   await chart.locator(".trend-dot").first().click();
   await expect(chart.locator(".trend-dot").first()).toHaveAttribute("r", "5");
   await expect(dialog.getByLabel("CSV report dates")).toHaveCount(0);
-  expect(summaryReads).toBe(1);
+  expect(summaryReads).toBe(0);
   expect(userReads).toHaveLength(0);
   await expect(trend.getByText("Each point represents an uploaded report.", { exact: false })).toBeVisible();
   for (const width of info.project.name === "mobile" ? [320, 360] : [1086, 1440]) {

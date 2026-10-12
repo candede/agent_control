@@ -5,7 +5,7 @@ import { type Server } from "node:http";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { testDatabase, fixturePassword } from "./testDatabase.js";
-import { browserFixtureTestFiles, closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
+import { browserFixtureFilePattern, browserFixtureTestFiles, closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
 import { createApp } from "../src/app.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
@@ -40,6 +40,7 @@ await vi.hoisted(async () => {
     { tenantId: "11111111-1111-1111-1111-111111111111", domains: ["example.invalid"] },
     { tenantId: "33333333-3333-4333-8333-333333333333", domains: ["csv-desktop.example.invalid"] },
     { tenantId: "44444444-4444-4444-8444-444444444444", domains: ["csv-mobile.example.invalid"] },
+    { tenantId: "55555555-5555-4555-8555-555555555555", domains: ["lifecycle.example.invalid"] },
   ].map(profile => ({ ...tenant, ...profile })));
 });
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, { scenario: string; tenantId: string; username: string }>() }));
@@ -102,7 +103,7 @@ beforeAll(async () => {
   pool.options.database = fixture.name; pool.options.user = "agentcontrol_app"; pool.options.password = fixturePassword;
   const repository = new CapabilityRepository(fixture.runtime);
   const applicationDefinition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
-  await repository.setApplicationConfiguration(config.tenants[0].tenantId!, applicationDefinition.id, true, true, "fixture-administrator");
+  await repository.setApplicationConfiguration(config.tenants[0].tenantId!, applicationDefinition.id, true, true, "fixture-administrator", () => undefined);
   const invalidatePrincipal = capabilities.invalidatePrincipal.bind(capabilities);
   vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
     await invalidatePrincipal(user);
@@ -116,7 +117,7 @@ beforeAll(async () => {
       }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", {
         category: scenario === "provider_error" ? "provider_error" : undefined,
         verification: definition.id === "powerPlatform.quarantine.read" ? "token" : "provider",
-      }, scenario === "stale" ? -1000 : 240000);
+      }, scenario === "stale" ? -1000 : 240000, () => undefined);
     }
   });
   vi.spyOn(GraphPackagesClient.prototype, "checkCatalogAccess").mockImplementation(async token => {
@@ -164,8 +165,8 @@ beforeAll(async () => {
   });
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
   reportRuntime(fixture.runtime).start();
-  if (selectedBrowserFiles.includes("savedBackendLifecycle.spec.ts")) {
-    savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator, config.tenants[0].tenantId!);
+  if (!selectedBrowserFiles.length || selectedBrowserFiles.includes("savedBackendLifecycle.spec.ts")) {
+    savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator, config.tenants[3].tenantId!);
     process.env.AGENT_CONTROL_LIFECYCLE_CONTROL = savedLifecycle.origin;
     const automaticRefresh = dataSync.automaticRefresh.bind(dataSync);
     vi.spyOn(dataSync, "automaticRefresh").mockImplementation(async (user, signedInAt) => {
@@ -175,7 +176,14 @@ beforeAll(async () => {
           tenantId: user.tenantId!, principalId: user.homeAccountId,
         }) };
     });
-  } else inventoryRuntime().start();
+    const runtime = inventoryRuntime();
+    const enqueue = runtime.enqueue.bind(runtime);
+    vi.spyOn(runtime, "enqueue").mockImplementation((scope, schedule, signal) => {
+      signal?.throwIfAborted();
+      return scope.principalId.startsWith("fixture-lifecycle-") ? Promise.resolve(false) : enqueue(scope, schedule, signal);
+    });
+  }
+  inventoryRuntime().start();
   const origin = new URL(process.env.FRONTEND_ORIGIN!);
   await new Promise<void>((done, reject) => {
     server = application.app.listen(Number(origin.port || 80), origin.hostname, error => error ? reject(error) : done());
@@ -208,7 +216,7 @@ afterAll(() => closeFixtureResources(
 it("qualifies packaged browser workflows through Chromium and axe", async ({ signal }) => {
   const exitCode = await new Promise<number | null>((done, reject) => {
     const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts",
-      ...selectedBrowserFiles.map(file => `${file.replaceAll(".", "\\.")}$`)], { stdio: "inherit", env: process.env, signal });
+      ...selectedBrowserFiles.map(browserFixtureFilePattern)], { stdio: "inherit", env: process.env, signal });
     child.once("error", reject); child.once("exit", done);
   });
   if (exitCode !== 0) {

@@ -74,6 +74,41 @@ describe("selected saved-data lifecycle", () => {
   const pins = async (id: string) => (await fixture.runtime.query(`SELECT s.source,p.root_kind FROM data_generation_pins p
     JOIN data_scope_epochs s ON s.id=p.scope_id WHERE p.selection_id=$1 ORDER BY s.source`, [id])).rows;
 
+  it.each(["canonical", "packages", "power_platform"] as const)(
+    "keeps the first %s selection readable while background people lookups populate the cache", async domain => {
+      const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
+      const objectId = randomUUID();
+      const native = await nativeInventoryFixture(fixture.runtime, identity, [
+        { nativeId: "native-owned", displayName: "Native owned", identifiers: [],
+          createdBy: objectId, details: { ownerId: objectId } },
+      ]);
+      const graph = await streamedPackageFixture(fixture.runtime, identity, [{ id: "agent-one", displayName: "Agent one", isBlocked: false }]);
+      const canonical = (await reconcileInventoryFixture(fixture.runtime, identity))!;
+      const root = domain === "canonical" ? canonical : domain === "packages" ? graph : native;
+      const selected = await inventory.capture(identity, root.scopeId);
+      expect((await pins(selected.id)).map(row => row.source)).not.toContain("user_sources");
+      expect((await pins(selected.id)).map(row => row.source)).not.toContain("directory");
+
+      await people(identity, objectId);
+      const first = await inventory.page(selected.id, identity);
+      expect(first.counts.total).toBe(domain === "canonical" ? 2 : 1);
+      expect(first.selection.id).toBe(selected.id);
+      expect(await inventory.people(selected.id, identity, [objectId])).toEqual([]);
+      expect(first.value.flatMap(row => Object.values(row.people))).toEqual([]);
+      const facets = await inventory.facets(selected.id, identity, "environmentId");
+      const responsibility = await inventory.responsibility(selected.id, identity);
+
+      await people(identity, objectId, "Updated cached owner");
+      const later = await inventory.page(selected.id, identity);
+      expect(later.value).toEqual(first.value);
+      expect(later.counts).toEqual(first.counts);
+      expect(later.selection.id).toBe(selected.id);
+      expect(await inventory.people(selected.id, identity, [objectId])).toEqual([]);
+      expect(await inventory.facets(selected.id, identity, "environmentId")).toEqual(facets);
+      expect((await inventory.responsibility(selected.id, identity)).people).toEqual(responsibility.people);
+      expect((await inventory.summary(selected.id, identity)).counts).toEqual(first.counts);
+    }, 30_000);
+
   it("keeps optional off-page cache age and activity independent, but bounds person-dependent reads", async () => {
     const { identity, objectId, root, activity } = await subject();
     const deadline = Date.now() + 3000;

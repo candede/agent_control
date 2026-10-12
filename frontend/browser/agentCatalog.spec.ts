@@ -428,8 +428,8 @@ test("party filters, server sorting and remembered columns stay usable and acces
     body: JSON.stringify({ initialCatalogReads, cacheReads }, null, 2), contentType: "application/json",
   });
   const returned = queries.filter(query => !query.has("type"));
-  expect(returned).toHaveLength(initialCatalogReads + 1);
-  expect(returned.at(-1)!.get("selectionId")).not.toBe(returned[0].get("selectionId"));
+  expect(returned).toHaveLength(initialCatalogReads);
+  expect(returned.at(-1)!.get("selectionId")).toBe(returned[0].get("selectionId"));
 
   await table.getByRole("button", { name: "Columns", exact: true }).click();
   const picker = page.getByRole("dialog", { name: "Choose agent columns" });
@@ -827,7 +827,7 @@ test("usage recovers expired inventory and report changes in place, and Reload u
 
   await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage$/.test(url.pathname), route =>
     route.fulfill({ status: 503, json: { code: "temporary_usage_failure", detail: "Temporary saved-data failure." } }), { times: 1 });
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await dialog.getByRole("button", { name: "Reload saved inventory", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("Temporary saved-data failure.");
   const beforeManualReload = new Set(tableSelections).size;
   await dialog.getByRole("button", { name: "Reload usage", exact: true }).click();

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "../../browser/automaticRefreshFixtures";
 import { checkAutomaticRefresh } from "../api/client";
+import { isPublicationRevisions } from "../../../backend/src/types/dataSelection";
+import { inventoryPageMetadata } from "./inventoryVerification";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -52,5 +54,30 @@ describe("automatic refresh browser fixture boundary", () => {
     expect(first.detailJob).toBeNull();
     expect(automaticRefreshFixture().revisions).toEqual(first.revisions);
     expect(Date.parse(first.nextCheckAt)).toBe(Date.now() + 60_000);
+  });
+
+  it("matches the saved inventory publication with a valid default revision vector", () => {
+    const result = automaticRefreshFixture();
+    expect(isPublicationRevisions(result.revisions)).toBe(true);
+    expect(result.revisions).toEqual(inventoryPageMetadata().selection.publicationRevisions);
+  });
+
+  it("hashes synthetic revision labels consistently and changes only the changed source", () => {
+    const labels = { users: "users-1", graph_packages: "packages-1", power_platform: "platform-1" };
+    const first = automaticRefreshFixture(labels).revisions;
+    expect(isPublicationRevisions(first)).toBe(true);
+    expect(automaticRefreshFixture(labels).revisions).toEqual(first);
+    const second = automaticRefreshFixture({ ...labels, users: "users-2" }).revisions;
+    expect(second.users).not.toBe(first.users);
+    expect(second.graph_packages).toBe(first.graph_packages);
+    expect(second.power_platform).toBe(first.power_platform);
+  });
+
+  it("preserves explicitly captured revision hashes without retaining caller-owned state", () => {
+    const revisions = { users: "a".repeat(64), graph_packages: "b".repeat(64), power_platform: "c".repeat(64) };
+    const result = automaticRefreshFixture(revisions);
+    expect(result.revisions).toEqual(revisions);
+    revisions.users = "d".repeat(64);
+    expect(result.revisions.users).toBe("a".repeat(64));
   });
 });

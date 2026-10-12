@@ -44,7 +44,7 @@ for (const outcome of ["running", "failed"] as const) {
       maximumBytes = Math.max(maximumBytes, bytes.length);
       pages.push(JSON.parse(bytes.toString()));
     });
-    await page.goto(fixtureLoginUrl(setup.scenario));
+    await page.goto(fixtureLoginUrl(setup.scenario, "fixture@lifecycle.example.invalid"));
     await page.goto("/agents");
     await expect(page.getByText("Before 0000", { exact: true })).toBeVisible();
     await expect.poll(() => pages.length).toBe(1);
@@ -101,6 +101,16 @@ for (const outcome of ["running", "failed"] as const) {
       people: { owner: { displayName: "Retained person" } } });
     expect(captures).toBe(outcome === "running" ? 6 : 4);
     expect(pageRequests).toBe(captures);
+    await page.getByRole("button", { name: "Retained native", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Retained native", exact: true });
+    const historyResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/usage-history"));
+    await dialog.getByRole("tab", { name: "Usage", exact: true }).click();
+    expect((await historyResponse).ok()).toBe(true);
+    await expect(dialog.getByRole("region", { name: "Reported usage trend", exact: true }))
+      .toContainText("No CSV reports available. Import a complete CSV report in Sync to see usage.");
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
     await control("retire");
     await page.reload();
     await expect(page.getByText("Before 0000", { exact: true })).toHaveCount(0);

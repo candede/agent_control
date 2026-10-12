@@ -20,6 +20,19 @@ import { config } from "../config.js";
 
 const configuredTenants = config.tenants;
 
+function exportChunkBatch(values?: unknown[]) {
+  const bytes = values?.[3], checksums: unknown = values?.[4], ordinal = Number(values?.[2]);
+  if (!Buffer.isBuffer(bytes) || !Array.isArray(checksums) || !bytes.length || bytes.length > 1_048_576
+    || checksums.length !== Math.ceil(bytes.length / 262_144) || !Number.isSafeInteger(ordinal) || ordinal < 0) {
+    throw new Error("Invalid chunk batch.");
+  }
+  return checksums.map((checksum: unknown, offset: number) => {
+    if (typeof checksum !== "string") throw new Error("Invalid chunk checksum.");
+    const chunk = Buffer.from(bytes.subarray(offset * 262_144, (offset + 1) * 262_144));
+    return { ordinal: ordinal + offset, bytes: chunk, byte_count: chunk.length, checksum };
+  });
+}
+
 vi.mock("../db/pool.js", () => ({
   pool: {},
   secretValue: (name: string) => name === "TENANTS_JSON" ? "[]"
@@ -433,16 +446,18 @@ describe("durable CSV encoding", () => {
       if (statement.startsWith("SELECT count(*)::int AS global")) return result([{ global: 0, tenant: 0 }]);
       if (statement.startsWith("SELECT id FROM data_exports")) return result([{ id: "export" }]);
       if (statement.startsWith("INSERT INTO data_export_chunks")) {
-        const bytes = values?.[3];
-        if (!Buffer.isBuffer(bytes) || typeof values?.[5] !== "string") throw new Error("Invalid chunk.");
-        chunks.push({ bytes: Buffer.from(bytes), byte_count: bytes.length, checksum: values[5] });
+        chunks.push(...exportChunkBatch(values));
         return result();
       }
       if (statement.startsWith("UPDATE data_exports SET row_count")) {
         Object.assign(metadata, { row_count: values?.[1], byte_count: values?.[2], chunk_count: values?.[3] });
         return result();
       }
-      if (statement.startsWith("SELECT bytes,byte_count,checksum")) return result([chunks[Number(values?.[1])]]);
+      if (statement.startsWith("SELECT bytes,byte_count,checksum")) {
+        const start = Number(values?.[1]);
+        return result(chunks.slice(start, Number(values?.[2] ?? start + 1))
+          .map((chunk, offset) => ({ ...chunk, ordinal: start + offset })));
+      }
       if (statement.startsWith("SELECT count(*)::int AS chunks")) return result([{
         chunks: chunks.length, bytes: chunks.reduce((sum, chunk) => sum + chunk.byte_count, 0), last: chunks.length - 1,
       }]);
@@ -538,9 +553,7 @@ function lifecycle() {
           return result();
         }
         if (statement.startsWith("INSERT INTO data_export_chunks")) {
-          const bytes = values?.[3];
-          if (!Buffer.isBuffer(bytes) || typeof values?.[5] !== "string") throw new Error("Invalid chunk.");
-          chunks.set(Number(values?.[2]), { bytes: Buffer.from(bytes), byte_count: bytes.length, checksum: values[5] });
+          for (const chunk of exportChunkBatch(values)) chunks.set(chunk.ordinal, chunk);
           return result();
         }
         if (statement.startsWith("UPDATE data_exports SET row_count")) {
@@ -548,8 +561,9 @@ function lifecycle() {
           return result();
         }
         if (statement.startsWith("SELECT bytes,byte_count,checksum")) {
-          const chunk = chunks.get(Number(values?.[1]));
-          return result(chunk ? [chunk] : []);
+          const start = Number(values?.[1]), end = Number(values?.[2] ?? start + 1);
+          return result([...chunks.entries()].filter(([ordinal]) => ordinal >= start && ordinal < end)
+            .sort(([left], [right]) => left - right).map(([ordinal, chunk]) => ({ ...chunk, ordinal })));
         }
         if (statement.startsWith("SELECT count(*)::int AS chunks")) return result([{
           chunks: chunks.size, bytes: [...chunks.values()].reduce((sum, chunk) => sum + chunk.byte_count, 0),
@@ -847,12 +861,12 @@ function inventoryLifecycle() {
         flushDataWorkMetrics();
         const primary = new Error("Synthetic producer failure.");
         await expect(engine.build(id, identity, ["Name"], async function* () {
-          yield [{ Name: "x".repeat(300_000) }];
+          for (let index = 0; index < 4; index++) yield [{ Name: "x".repeat(300_000) }];
           throw primary;
         })).rejects.toBe(primary);
-        expect(chunks.size).toBe(1);
-        expect(metadata).toMatchObject({ status: "failed", row_count: 1, byte_count: 262_144 });
-        expect(flushDataWorkMetrics()).toEqual([{ stage: "export", count: 1, rows: 1, bytes: 262_144 }]);
+        expect(chunks.size).toBe(4);
+        expect(metadata).toMatchObject({ status: "failed", row_count: 4, byte_count: 1_048_576 });
+        expect(flushDataWorkMetrics()).toEqual([{ stage: "export", count: 1, rows: 4, bytes: 1_048_576 }]);
       });
 
       it.each(["chunk", "ready", "renewal"] as const)("rolls back %s if the checked lease expires before COMMIT", async phase => {

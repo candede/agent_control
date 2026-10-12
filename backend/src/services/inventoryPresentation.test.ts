@@ -1063,7 +1063,7 @@ describe("saved inventory exact export selection", () => {
     return { database, inventory, client, identity, context, raw, result };
   }
 
-  it("counts only unexpired canonical memberships, exposing missing targets in the global receipt", async () => {
+  it("counts captured memberships independently of freshness while exposing source-accounting gaps", async () => {
     const { database, inventory, client, context, raw, result } = fixture();
     try {
       Object.assign(raw.freshness.sources[0], { row_count: 2, expected_count: 2 });
@@ -1078,7 +1078,10 @@ describe("saved inventory exact export selection", () => {
         if (sql.startsWith("WITH roots AS")) return result(raw.freshness.sources);
         if (sql.startsWith("SELECT EXISTS")) return result([{ expired: false }]);
         if (sql.startsWith("SELECT count(*) FILTER(WHERE r.domain='packages')")) {
-          expect(sql).toContain("AND c.expires_at>$3");
+          expect(sql).not.toContain("c.expires_at");
+          expect(sql).toContain("m.baseline_id=$1");
+          expect(sql).toContain("m.valid_from_revision<=$2");
+          expect(sql).toContain("(r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3");
           expect(values).toEqual([context.baselineId, context.revision, new Date(observedAt)]);
           return result([raw.verificationCounts]);
         }

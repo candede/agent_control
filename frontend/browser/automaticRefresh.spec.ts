@@ -19,7 +19,8 @@ test("background Users refresh keeps the page stable and interactive with a subt
   updated.value[2] = { ...updated.value[2], reportedResponses: 2, bridgeResponses: 2, reportedAgentsUsed: 1,
     agentActivityState: "active", attention: ["agent_usage_low"] };
   updated.summary = { ...updated.summary, usingAgentsUsers: 3, noAgentActivityUsers: 0 };
-  updated.selection = { ...updated.selection, id: "70000000-0000-4000-8000-000000000001" };
+  updated.selection = { ...updated.selection, id: "70000000-0000-4000-8000-000000000001",
+    publicationRevisions: automaticRefreshFixture({ ...original.selection.publicationRevisions, users: "users-2" }).revisions };
   updated.sources.directory = { ...updated.sources.directory, generationId: "90000000-0000-4000-8000-000000000001", revision: "3" };
   updated.reports = { ...updated.reports, setId: "80000000-0000-4000-8000-000000000001", activeSetId: "80000000-0000-4000-8000-000000000001",
     activeRevision: "5", historyRevision: "36", lineages: updated.reports.lineages.map((lineage, index) => ({
@@ -33,7 +34,7 @@ test("background Users refresh keeps the page stable and interactive with a subt
   await page.route("**/api/data-sync/auto-refresh", route => {
     checks += 1;
     return route.fulfill({ json: {
-      ...automaticRefreshFixture({ users: refreshing ? "users-2" : "users-1", graph_packages: "packages-1", power_platform: "platform-1" }),
+      ...automaticRefreshFixture((refreshing ? updated : original).selection.publicationRevisions),
       nextCheckAt: layoutTime,
     } });
   });
@@ -128,7 +129,8 @@ test("an open agent Overview keeps background pins and stays stable through expl
   await page.route(url => url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check",
     route => route.fulfill({ json: { value: views } }));
   await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
-    ...automaticRefreshFixture({ users: "users-1", graph_packages: `packages-${version}`, power_platform: "platform-1" }),
+    ...automaticRefreshFixture({ ...unifiedAgents.selection.publicationRevisions,
+      graph_packages: version ? `packages-${version}` : unifiedAgents.selection.publicationRevisions.graph_packages }),
     nextCheckAt: layoutTime,
   } }));
   await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route,
@@ -215,7 +217,8 @@ test("an open management draft retains its controls and focus during a slow back
   await page.route(url => url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check",
     route => route.fulfill({ json: { value: views } }));
   await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
-    ...automaticRefreshFixture({ users: "users-1", graph_packages: refreshing ? "packages-2" : "packages-1", power_platform: "platform-1" }),
+    ...automaticRefreshFixture({ ...unifiedAgents.selection.publicationRevisions,
+      graph_packages: refreshing ? "packages-2" : unifiedAgents.selection.publicationRevisions.graph_packages }),
     nextCheckAt: layoutTime,
   } }));
   await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route,
@@ -240,9 +243,9 @@ test("an open management draft retains its controls and focus during a slow back
     const scrollTop = await panel.evaluate(element => element.scrollTop);
     refreshing = true;
     await page.clock.fastForward(60_000);
-    expect(reads).toBe(1);
-    await dialog.getByRole("button", { name: "Reload saved inventory", exact: true }).dispatchEvent("click");
     await expect.poll(() => reads).toBe(2);
+    await dialog.getByRole("button", { name: "Reload saved inventory", exact: true }).dispatchEvent("click");
+    await expect.poll(() => reads).toBe(3);
     await page.clock.runFor(501);
     await expect(none).toBeChecked();
     await expect(apply).toBeFocused();
@@ -260,7 +263,7 @@ test("an open management draft retains its controls and focus during a slow back
   }
 });
 
-test("an open user Overview stays stable while revalidating and requires explicit restart after source changes", async ({ page }, info) => {
+test("an open user Overview stays stable while capturing the newly published source", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.install({ time: new Date(layoutTime) });
   let version = 0;
@@ -268,7 +271,8 @@ test("an open user Overview stays stable while revalidating and requires explici
   let finish: (() => void) | undefined;
   let pending: Promise<void> | undefined;
   await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
-    ...automaticRefreshFixture({ users: `users-${version}`, graph_packages: "packages-1", power_platform: "platform-1" }),
+    ...automaticRefreshFixture({ ...unifiedAgents.selection.publicationRevisions,
+      users: version ? `users-${version}` : unifiedAgents.selection.publicationRevisions.users }),
     nextCheckAt: layoutTime,
   } }));
   await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), async route => {
@@ -276,6 +280,8 @@ test("an open user Overview stays stable while revalidating and requires explici
     if (version) {
       response.value[0].directory.companyName = `Updated organization ${version}`;
       response.selection = { ...response.selection, id: `70000000-0000-4000-8000-${String(version).padStart(12, "0")}` };
+      response.selection.publicationRevisions = automaticRefreshFixture({ ...response.selection.publicationRevisions,
+        users: `users-${version}` }).revisions;
       response.sources.directory = { ...response.sources.directory,
         generationId: `90000000-0000-4000-8000-${String(version).padStart(12, "0")}`, revision: String(version + 2) };
     }
@@ -309,17 +315,14 @@ test("an open user Overview stays stable while revalidating and requires explici
       await expect(dialog.getByRole("button", { name: "Close user details" })).toBeFocused();
       await dialog.screenshot({ path: info.outputPath(`user-overview-background-refresh-${version}.png`) });
 
+      const replacement = page.waitForResponse(response => new URL(response.url()).pathname === "/api/copilot-usage/users");
       finish!();
-      await expect(dialog).toHaveCount(0);
-      await expect(page.getByRole("alert")).toContainText("This selection changed or expired.");
-      await expect(page.getByText(`Updated organization ${version}`, { exact: true })).toHaveCount(0);
+      expect((await replacement).ok()).toBe(true);
       pending = undefined;
       await page.clock.runFor(501);
       expect(reads).toBe(readsBefore + 1);
-      await page.getByRole("button", { name: "Restart selection", exact: true }).click();
-      await expect.poll(() => reads).toBe(readsBefore + 2);
-      await page.getByRole("button", { name: "Ada", exact: true }).click();
       await expect(dialog.getByText(`Updated organization ${version}`, { exact: true })).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
       expect(await dialog.boundingBox()).toEqual(bounds);
       expect(await organization.boundingBox()).toEqual(organizationBounds);
       await expect(dialog.getByRole("button", { name: "Close user details" })).toBeFocused();
@@ -338,7 +341,8 @@ test("minute checks defer unused inventory and do not reload unchanged visible d
   const count = (path: string) => requests.filter(value => value === path).length;
   let version = 1;
   await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
-    ...automaticRefreshFixture({ users: "users-1", graph_packages: `packages-${version}`, power_platform: "platform-1" }),
+    ...automaticRefreshFixture({ ...unifiedAgents.selection.publicationRevisions,
+      graph_packages: version > 1 ? `packages-${version}` : unifiedAgents.selection.publicationRevisions.graph_packages }),
     nextCheckAt: layoutTime,
   } }));
   await page.goto("/users");

@@ -137,6 +137,20 @@ the actor owns the selection while its source remains the authorized application
 owner. A source selection cannot become a canonical selection or change token
 mode. Both browser capture/read sequences abort across a principal revalidation.
 
+Inventory selections pin only dependencies used by their selected projections.
+Ordinary inventory reads use the captured immutable directory generation for
+people labels, not the mutable people cache. Background person lookups therefore
+cannot invalidate the first inventory read, subsequent pages, responsibility
+results or export chunks. Explicit selected-person reads follow the same rule.
+Search and owner/creator ordering do use the people cache: these selections retain
+its revision fence and freshness deadline, and changed dependencies still return
+`409 selection_invalidated` with `reason: "changed"`. Every pinned scope's session
+and ownership authorization is checked before returning dependency-change or
+expiry reasons, including when a different, earlier scope changed. Session and
+ownership rejections do not disclose a dependency reason. Source-completeness expiry is
+evaluated at the selection's captured time, consistently with the other saved
+inventory checks.
+
 `DataConnections.selectedRead` starts `BEGIN ISOLATION LEVEL REPEATABLE READ` on
 the existing bounded pool. `DataSelections.capture`, `directoryPage` and
 `exactDirectory` use this boundary. For domain composition in 02/02A, use
@@ -154,7 +168,36 @@ snapshot without taking downstream revision locks; inventory's reviewed-associat
 fence is acquired when persisting the context, after the scope fences. This avoids
 deadlocks with writers that lock the same scopes before updating associations.
 Inventory capture snapshots its actor and canonical filters before its first await;
-later caller edits cannot change the selected owner, operation reference or facets.
+later caller edits cannot change the selected owner, operation reference, facets,
+people-cache dependency pins or freshness deadline.
+
+Browser verification uses `backend/scripts/browser-fixture.browser.ts`, not a
+generic Vite server. Its isolated synthetic-auth capability setup supplies the
+repository's required publication fences explicitly; this does not make those
+fences optional for runtime callers. The fixture serves and checks the compiled
+frontend, blocks external provider requests, and creates its own test database.
+Build the frontend with `NODE_ENV=production` before running this test-only
+backend harness; inheriting `NODE_ENV=test` bundles development React and its
+Strict Mode effect replay. The full campaign includes the saved-backend lifecycle
+controller as well as explicitly selected lifecycle runs. Its held successor
+publications are owned by that controller, while the ordinary inventory worker
+continues to service the other synthetic principals. Lifecycle scenarios use a
+separate synthetic tenant because report history is tenant-owned; report imports
+elsewhere in the campaign must not contaminate their empty-history assertions.
+Layout fixtures settle
+permission metadata before exposing workbench actions, so request-count assertions
+measure steady-state refresh rather than a legitimate startup authorization
+transition. Separate App regressions retain coverage of early observers and
+changed permission evidence without reloading unchanged saved content.
+Synthetic selection capture returns the complete captured metadata, including
+publication revisions, consistently with subsequent selected reads. Returning
+to an unchanged, unexpired filter reuses its existing selection and page. Focus
+revalidation of pinned agent usage checks report history, not unchanged summaries.
+Explicit browser-file selections match whole filenames at a path boundary, not
+other filenames ending with the same case-insensitive suffix.
+While sorting an existing inventory, its saved-source warnings remain visible
+with the retained rows; initial loading and inventory-scope changes do not show
+warnings from another scope.
 
 `DataConnections.run` remains the ordinary writer/renewal transaction boundary
 (`BEGIN`, unchanged default isolation). `DataSelections.assert` is its low-level
@@ -189,7 +232,27 @@ Canonical allowlisted query values and a root count are persisted, not just thei
 hash. User-source searches normalize with NFKC, lowercase, NFKC again, then trim;
 both raw and canonical search must fit 256 characters, with matching SQL folding.
 Selections expire within ten minutes or the earlier source/freshness transition,
-and explicit epoch invalidation wins. Pages default to 50, maximum 100; exact
+and explicit epoch invalidation wins. Published inventory observation freshness
+is not its read-retention deadline: retained current inventory roots use the same
+bounded thirty-minute dependency pin as their captured inputs. New selections
+can read aged saved publications without extending observation freshness or
+granting current mutation authority. Agent usage summaries, reviewed associations,
+users and report history resolve the same captured memberships even when their
+observation freshness expired before capture. These saved-source queries are used
+only after selection validation; live reads and association mutations retain their
+current, fresh delegated-inventory authority checks.
+Page leases still expire within ten minutes,
+and people-cache freshness transitions still shorten dependent leases.
+Package and native last-success timestamps follow their validated current
+publication, independently of observation freshness and finite job retention.
+Saved environment context likewise remains available from its exact captured
+native root after freshness expiry; its original observation deadline is preserved.
+Verification counts account for every captured source membership, including aged
+publications; detail freshness is evaluated separately at the selected instant.
+Historical browser fixtures keep read-start timestamps consistent with their
+synthetic observations and use the production exact-observation writer, so
+replacement evidence includes the required detail provenance without live reads.
+Pages default to 50, maximum 100; exact
 identity reads accept <=100 IDs. Invalid cursors are HTTP 400; invalidated
 selections are HTTP 409. No cursor draining, full getter or offset API exists.
 The complete page envelope is included in the 1-MiB response ceiling. Selection
@@ -212,14 +275,21 @@ lease/chunk write, then released before yielding. A healthy independent renewal
 cannot invalidate its own repeatable-read row fence. Cancellation, epoch
 invalidation and genuine serialization conflicts still fail closed without
 replay. Inventory producers retain one immutable selected context and summary
-per artifact, not a tenant dataset. Every bounded batch still reauthorizes its
+per artifact, not a tenant dataset. Member and child windows use the existing
+250-row/one-MiB SQL batch budget; the individual export-record ceiling remains
+512 KiB. Every bounded batch still reauthorizes its
 lease and selected roots; the first member/child windows share their parent
 page transaction and further windows use the same bounded read contract.
 They require a transactional audit adapter.
 The adapter records start/success/failure/cancellation semantics; domain-specific audit
 actions and producers belong to 02A/04. CSV formula defenses reuse `csvValue`.
 Ready publication verifies persisted chunks, counts and SHA-256 under source/lease
-fences. Status contains metadata only. Downloads iterate one chunk at a time,
+fences. Persistence and verification batch at most four unchanged 256-KiB chunks
+(one MiB) per transaction, avoiding a selected-root fence round trip for every
+individual chunk without retaining the full artifact. Repeated string cells
+reuse formula-safe CSV encoding only within one producer batch, capped at
+256 KiB of encoded values; objects are never cached. Status contains metadata
+only. Downloads iterate one chunk at a time,
 recheck authorization and source fences, and record failure on disconnect.
 There is no filesystem dependency or full-artifact string/Buffer. The route owner
 must stream with backpressure, abort on disconnect, destroy an already-started

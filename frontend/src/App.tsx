@@ -1636,8 +1636,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ? `Power Platform collected ${formatRefreshTime(new Date(nativeObservation.observedAt))}`
       : "No saved Power Platform observation. Open Sync to collect it."] : []),
   ].join(" · ");
-  const agentInventoryIssueSummary = inventoryUnavailable || agentInventoryPending
-    ? "" : inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
+  const agentInventoryIssueSummary = inventoryUnavailable || agentInventoryPending && !visibleUnifiedAgentPage
+    ? "" : inventoryAttentionReasons(visibleUnifiedAgentPage, unifiedAgentReadError).join(" ");
   const hasActiveAgentFilters =
     packageType !== undefined ||
     endUserAccess !== "all" ||

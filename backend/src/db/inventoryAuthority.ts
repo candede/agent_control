@@ -29,8 +29,7 @@ export function selectedInventorySourcesSql(tenant: string, principal: string, a
     WHERE selected.id=${selection}::uuid AND selected.tenant_id=${tenant} AND selected.principal_id=${principal}
       AND scope.tenant_id=${tenant} AND scope.principal_id=${principal}
       AND scope.source='inventory_canonical' AND scope.token_mode='delegated'
-      AND (${agent}::text IS NULL OR canonical.identity=${agent})
-      AND canonical.expires_at>selected.evaluated_at AND source.expires_at>selected.evaluated_at`;
+      AND (${agent}::text IS NULL OR canonical.identity=${agent})`;
 }
 
 export async function lockInventorySelection(client: pg.PoolClient, identity: SelectionIdentity, selectionId: string) {

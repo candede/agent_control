@@ -8,7 +8,7 @@ export function fixtureLoginUrl(scenario: string, username = "fixture@example.in
     throw new Error("The browser fixture requires a plain HTTP loopback origin.");
   }
   const login = new URL("/api/auth/login", origin);
-  if (!/^fixture@(?:example\.invalid|csv-(?:desktop|mobile)\.example\.invalid)$/.test(username)) throw new Error("Invalid synthetic sign-in identity.");
+  if (!/^fixture@(?:example\.invalid|csv-(?:desktop|mobile)\.example\.invalid|lifecycle\.example\.invalid)$/.test(username)) throw new Error("Invalid synthetic sign-in identity.");
   login.searchParams.set("username", username);
   login.searchParams.set("returnTo", `/permissions?${new URLSearchParams({ fixture: scenario })}`);
   return login.href;

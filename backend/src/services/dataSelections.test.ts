@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DataSelections } from "./dataSelections.js";
+import { DataSelections, SelectionError } from "./dataSelections.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { dataConnections,isSelectedRead } from "../db/dataConnections.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
@@ -325,6 +325,26 @@ describe("SQL pinned reads", () => {
     await selections.invalidate(id, selectionIdentity);
     await expect(selections.directoryPage(id, selectionIdentity, generationId, {})).rejects.toThrow("selection_invalidated");
   });
+  it("checks later scope session authorization before disclosing an earlier scope change", async () => {
+      const generations = new DataGenerations(fixture.runtime);
+      const lease = await generations.begin(generationInput({
+        scope: { ...generationInput().scope, selector: "second-authorization" },
+      }));
+      await generations.validate(lease, { rows: 0, children: 0, batches: 0, pages: 0, wireRows: 0 });
+      await generations.publish(lease);
+      const roots = [
+        { kind: "generation" as const, scopeId, generationId, revision: "1", expiresAt: new Date(Date.now() + 600_000) },
+        { kind: "generation" as const, scopeId: lease.scopeId, generationId: lease.id, revision: "1", expiresAt: new Date(Date.now() + 600_000) },
+      ].sort((left, right) => left.scopeId.localeCompare(right.scopeId));
+      const selected = await selections.capture(selectionIdentity, "/users", { values: {}, allowed: [] }, roots);
+      await fixture.operator.query("UPDATE data_scope_epochs SET epoch=epoch+1 WHERE id=$1", [roots[0].scopeId]);
+      await fixture.operator.query("UPDATE data_scope_epochs SET session_epoch=session_epoch+1 WHERE id=$1", [roots[1].scopeId]);
+      const work = vi.fn(async () => "must not execute");
+      await expect(selections.read(selected.id, selectionIdentity, work)).rejects.toMatchObject({
+        status: 409, code: "selection_invalidated", details: undefined,
+      });
+      expect(work).not.toHaveBeenCalled();
+    });
   it("bounds roots, refuses unavailable future validators and uses earlier expiry", async () => {
     const root = { kind: "generation" as const, scopeId, generationId, revision: "1", expiresAt: new Date(Date.now() + 3600_000) };
     await expect(selections.capture(selectionIdentity, "/users", { values: {}, allowed: [] }, Array(17).fill(root))).rejects.toThrow("data_selection_roots");

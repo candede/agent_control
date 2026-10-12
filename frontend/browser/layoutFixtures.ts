@@ -1,4 +1,4 @@
-import type { Page, Route } from "@playwright/test";
+import { expect, type Page, type Route } from "@playwright/test";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { permissionLayoutRequestKind } from "./permissionFixtures";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
@@ -7,6 +7,7 @@ import { defenderHuntingTemplates } from "../../backend/src/types/defenderHuntin
 import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
 import { responseAnalytics, selectedFixtureQuery, selectedFixtureRead, selectedFixtureReports, selectedFixtureWindow, selectedHistoryPage, selectedLicensedUser, selectedUsersPage } from "../src/test/selectedUsageFixture";
 import { historySet, overviewAgent, reportAgent, reportPage, reportUser } from "../src/test/reportDataFixture";
+import { agentUsageHistoryFixture } from "../src/test/automaticAgentUsageFixture";
 import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, ReportUser } from "../../backend/src/types/officialReportData";
 import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
 import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
@@ -334,14 +335,18 @@ export async function mockLayoutApi(page: Page) {
     [`/api/hunting/jobs/${huntingJob.id}`]: huntingJob, [`/api/hunting/jobs/${huntingJob.id}/rows`]: huntingRows,
     "/api/workbench/jobs": jobs,
   };
-  await page.route(url => isLocalFixtureUrl(url) && url.pathname.startsWith("/api/"), route => {
+  await page.route(url => isLocalFixtureUrl(url) && url.pathname.startsWith("/api/"), async route => {
     const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
+    if (path === "/api/workbench/metadata" && method === "GET") {
+      // Layout cases start with settled permissions; App tests cover startup authorization transitions.
+      await expect(page.getByRole("button", { name: "Permissions", exact: true })).toHaveAttribute("aria-busy", "false");
+    }
     if (["/api/capabilities", "/api/capabilities/check", "/api/capabilities/check-progress"].includes(path)
       && !permissionLayoutRequestKind(method, url)) return unexpectedRequest(route);
     if (path === "/api/agent-inventory/selections") return captureInventorySelection(route, unifiedAgents.selection);
     if (path === "/api/agents/selections") return captureInventorySelection(route, packages.selection);
     if (isAutomaticRefreshRequest(route.request())) {
-      return route.fulfill({ json: automaticRefreshFixture({ users: observedAt, graph_packages: observedAt, power_platform: observedAt }) });
+      return route.fulfill({ json: automaticRefreshFixture(unifiedAgents.selection.publicationRevisions) });
     }
     if (method !== "GET" && !(method === "POST" && path === "/api/capabilities/check")) return unexpectedRequest(route);
     if (path === "/api/agents" && route.request().method() === "GET") {
@@ -356,6 +361,18 @@ export async function mockLayoutApi(page: Page) {
     if (detail) return fulfillInventoryDetail(route, decodeURIComponent(detail[1]));
     const members = /^\/api\/agent-inventory\/([^/]+)\/members$/.exec(path);
     if (members) return fulfillInventoryMembers(route, decodeURIComponent(members[1]));
+    const history = /^\/api\/agent-inventory\/([^/]+)\/usage-history$/.exec(path);
+    if (history) {
+      const recordId = decodeURIComponent(history[1]);
+      if (!unifiedAgents.value.some(record => record.id === recordId)) return unexpectedRequest(route);
+      const selection = inventoryFixtureSelection(route);
+      return route.fulfill({ json: agentUsageHistoryFixture({
+        selectionId: selection.id, reportSetId: layoutReports.setId, reports: layoutReports,
+        inventoryRevision: unifiedAgents.selection.revision, usageRevision: unifiedAgents.usageContext.revision,
+      }, recordId, undefined, {
+        limit: Number(url.searchParams.get("limit") ?? 50), cursor: url.searchParams.get("cursor") ?? undefined,
+      }) });
+    }
     if (path === "/api/agent-inventory/facets") {
       const response = inventoryFacetResponse(route, {
         type: inventoryFacetFixtures.types, platform: inventoryFacetFixtures.platforms,

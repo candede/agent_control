@@ -87,6 +87,63 @@ describe("selection scope-before-domain lock order", () => {
     expect(validate).toHaveBeenCalledWith(expect.any(pg.Client), roots[0], identity, mode === "read" ? undefined : selection.id);
   });
 
+  it.each(["epoch", "session_epoch", "principal_id"] as const)(
+    "reports owned scope changes without exposing authorization failures (%s)", async field => {
+      const { selections, query, validate } = fixture();
+      const original = query.getMockImplementation()!;
+      query.mockImplementation(async (statement, values) => {
+        if (typeof statement === "string" && statement.startsWith("SELECT * FROM data_scope_epochs")) {
+          return result([{ principal_id: identity.principalId, epoch: "1", session_epoch: "0", [field]: "changed" }]);
+        }
+        return original(statement, values);
+      });
+      await expect(selections.read(selection.id, identity, async () => undefined)).rejects.toMatchObject({
+        status: 409, code: "selection_invalidated", details: field === "epoch" ? { reason: "changed" } : undefined,
+      });
+      expect(validate).not.toHaveBeenCalled();
+      expect(query).toHaveBeenCalledWith("ROLLBACK");
+      expect(query.mock.calls.some(([statement]) => statement === "COMMIT")).toBe(false);
+    });
+
+  it("rejects expired pins after authorization fences and before domain validation", async () => {
+    const { selections, query, validate, events } = fixture();
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      const response = await original(statement, values);
+      if (typeof statement === "string" && statement.startsWith("SELECT *,expires_at<=clock_timestamp()")) {
+        return result(response.rows.map(row => ({ ...row, expired: true })));
+      }
+      return response;
+    });
+    await expect(selections.read(selection.id, identity, async () => undefined)).rejects.toMatchObject({
+      status: 409, code: "selection_invalidated", details: { reason: "expired" },
+    });
+    expect(events).toEqual(["scope:a:share", "scope:z:share"]);
+    expect(validate).not.toHaveBeenCalled();
+  });
+
+  it.each((["session_epoch", "principal_id"] as const).flatMap(field =>
+    (["dependency", "expired", "invalidated"] as const).map(failure => ({ field, failure }))))(
+    "does not disclose $failure before a later $field rejection", async ({ field, failure }) => {
+      const { selections, query, validate } = fixture();
+      const original = query.getMockImplementation()!;
+      query.mockImplementation(async (statement, values) => {
+        if (typeof statement === "string" && statement.startsWith("SELECT * FROM data_scope_epochs")) {
+          return result([{ principal_id: identity.principalId, epoch: "1", session_epoch: "0",
+            ...(values?.[0] === "a" ? { epoch: failure === "dependency" ? "2" : "1" } : { [field]: "unauthorized" }) }]);
+        }
+        if (typeof statement === "string" && statement.startsWith("SELECT invalidated_at,expires_at<=clock_timestamp()")) {
+          return result([{ invalidated_at: failure === "invalidated" ? at : null, expired: failure === "expired" }]);
+        }
+        return original(statement, values);
+      });
+      await expect(selections.read(selection.id, identity, async () => "must not execute")).rejects.toMatchObject({
+        code: "selection_invalidated", details: undefined,
+      });
+      expect(validate).not.toHaveBeenCalled();
+      expect(query).toHaveBeenCalledWith("ROLLBACK");
+    });
+
   it("does not apply inventory association invalidation to plain generation exports", async () => {
     const { database, query } = fixture();
     const original = query.getMockImplementation()!;
@@ -104,19 +161,24 @@ describe("selection scope-before-domain lock order", () => {
     expect(validate).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("captures immutable inventory intent with scope-before-association fences (mutated=%s)", async mutated => {
+  it.each([
+    { initialSort: "displayName", mutatedSort: null, sourceExpired: false },
+    { initialSort: "displayName", mutatedSort: "owner", sourceExpired: false },
+    { initialSort: "owner", mutatedSort: "responses", sourceExpired: false },
+    { initialSort: "displayName", mutatedSort: null, sourceExpired: true },
+  ] as const)("captures immutable inventory intent and dependencies ($initialSort to $mutatedSort, sourceExpired=$sourceExpired)", async ({ initialSort, mutatedSort, sourceExpired }) => {
     const { database, client, query, events } = fixture();
     const inventory = new InventoryQueries(database, "synthetic-selection-unit-cursor-secret");
     const suppliedIdentity = { ...identity };
     const suppliedQuery: InventoryQuery = {
-      operationIdPrefix: "REF_CASE", availableTo: { kind: "some-or-all" }, sortBy: "displayName",
+      operationIdPrefix: "REF_CASE", availableTo: { kind: "some-or-all" }, sortBy: initialSort,
     };
     vi.spyOn(inventory.reports.sources, "ensureScope").mockImplementation(async () => {
-      if (mutated) {
+      if (mutatedSort) {
         suppliedIdentity.principalId = "other-principal";
         suppliedQuery.operationIdPrefix = "changed-reference";
         suppliedQuery.availableTo = "changed-facet";
-        suppliedQuery.sortBy = "responses";
+        suppliedQuery.sortBy = mutatedSort;
       }
       return "z";
     });
@@ -136,10 +198,11 @@ describe("selection scope-before-domain lock order", () => {
     });
     query.mockImplementation(async (statement: unknown) => {
       if (typeof statement !== "string") throw new Error("Unexpected query shape");
-      if (statement.startsWith("SELECT r.*,g.expires_at")) return result([{ baseline_id: "baseline", revision: "1", expires_at: expiresAt }]);
+      if (statement.startsWith("SELECT r.*,g.expires_at")) return result([{ baseline_id: "baseline", revision: "1",
+        expires_at: sourceExpired ? new Date(at.getTime() - 1) : expiresAt }]);
       if (statement.startsWith("SELECT epoch FROM data_scope_epochs")) return result([{ epoch: "1" }]);
       if (statement.startsWith("SELECT inputs FROM inventory_revisions")) return result([{ inputs: [] }]);
-      if (statement.startsWith("SELECT least(")) return result([{ expires_at: null }]);
+      if (statement.startsWith("SELECT min(expires_at)")) return result([{ expires_at: null }]);
       if (statement === "SELECT inventory_association_revision($1)::text AS revision") {
         events.push("association");
         return result([{ revision: "7" }]);
@@ -149,13 +212,15 @@ describe("selection scope-before-domain lock order", () => {
     });
     vi.spyOn(inventory.selections, "captureWith").mockImplementation(async (_identity, _endpoint, _query, prepare) => {
       const prepared = await prepare(client, at);
+      expect(prepared.roots.some(root => root.kind === "user_sources")).toBe(initialSort === "owner");
+      expect(prepared.roots.find(root => root.scopeId === "a")?.expiresAt).toEqual(new Date(at.getTime() + 30 * 60_000));
       events.push("scopes");
       await prepared.persist?.(client, selection);
       return selection;
     });
     await inventory.capture(suppliedIdentity, "a", suppliedQuery);
     expect(events).toEqual(["scopes", "association"]);
-    const criteria = { availableTo: "~some-or-all", operationIdPrefix: "REF_CASE", sortBy: "displayName" };
+    const criteria = { availableTo: "~some-or-all", operationIdPrefix: "REF_CASE", sortBy: initialSort };
     expect(inventory.selections.captureWith).toHaveBeenCalledWith(identity, "inventory", {
       values: { inventoryQuery: canonicalQuery(criteria, Object.keys(criteria)), operationIdPrefix: "REF_CASE" },
       allowed: ["inventoryQuery", "operationIdPrefix"],

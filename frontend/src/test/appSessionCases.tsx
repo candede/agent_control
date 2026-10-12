@@ -4400,7 +4400,9 @@ export function sessionAndNavigationCases() {
   });
 
   it("preserves the focused sort control and column choices while a server sort is pending", async () => {
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const savedInventory: UnifiedAgentInventoryPage = { ...unifiedPage, partial: true,
+      errors: [{ source: "power_platform", code: "coverage_unknown", message: "Copilot Studio agent coverage is incomplete." }] };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: savedInventory });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
     transport.fetchMock.mockImplementation(async (input, init) => {
@@ -4415,6 +4417,7 @@ export function sessionAndNavigationCases() {
     await userEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
     await userEvent.keyboard("{Escape}");
     const heading = screen.getByRole("button", { name: "Sort by Hosts" });
+    const attention = screen.getByRole("button", { name: "Inventory needs attention · Open Sync" });
     await userEvent.click(heading);
     await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => {
       const url = selectedInventoryUrl(input);
@@ -4422,6 +4425,8 @@ export function sessionAndNavigationCases() {
     })).toBe(true));
     expect(heading).toBeInTheDocument();
     expect(heading).toHaveFocus();
+    expect(attention).toBeInTheDocument();
+    expect(attention).toHaveAttribute("title", expect.stringContaining("Copilot Studio agent coverage is incomplete."));
     expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeDisabled();
     const exportButton = screen.getByRole("button", { name: "Export agent inventory CSV" });
     expect(exportButton).toBeDisabled();
@@ -4431,12 +4436,13 @@ export function sessionAndNavigationCases() {
     expect(refresh).toHaveTextContent("Updating agent results...");
     expect(refresh.closest(".agent-table-stack")).toBeNull();
     expect(screen.queryByText(/Previous results remain visible/)).not.toBeInTheDocument();
-    await act(async () => pending.resolve(Response.json(unifiedPage)));
+    await act(async () => pending.resolve(Response.json(savedInventory)));
     await waitFor(() => expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeEnabled());
     expect(screen.queryByRole("status", { name: "Updating agent results" })).not.toBeInTheDocument();
     expect(exportButton.parentElement?.querySelector(".agent-refresh-indicator")).toBeEmptyDOMElement();
     expect(screen.getByRole("button", { name: "Sort by Hosts" })).toBe(heading);
     expect(heading).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toBe(attention);
     await userEvent.keyboard("{Enter}");
     await waitFor(() => expect(screen.getByRole("columnheader", { name: "Hosts" })).toHaveAttribute("aria-sort", "descending"));
   });

@@ -1,6 +1,6 @@
 import { Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { browserFixtureTestFiles, closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment } from "./fixtureSupport.js";
+import { browserFixtureFilePattern, browserFixtureTestFiles, closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment } from "./fixtureSupport.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -18,6 +18,17 @@ describe("browser fixture environment", () => {
       if (previous !== undefined) process.env.AGENT_CONTROL_BROWSER_TEST_FILES = previous;
     }
   });
+
+  it.each(["layout.spec.ts", "/repo/frontend/browser/layout.spec.ts", "C:\\repo\\frontend\\browser\\layout.spec.ts"])(
+    "matches the selected browser filename at a path boundary: %s", path => {
+      expect(new RegExp(browserFixtureFilePattern("layout.spec.ts"), "i").test(path)).toBe(true);
+    });
+
+  it.each(["modalLayout.spec.ts", "/repo/frontend/browser/permissionLayout.spec.ts",
+    "C:\\repo\\frontend\\browser\\modalLayout.spec.ts", "/repo/layoutXspecXts", "/repo/layout.spec.ts.backup"])(
+    "does not widen a browser selection to another filename: %s", path => {
+      expect(new RegExp(browserFixtureFilePattern("layout.spec.ts"), "i").test(path)).toBe(false);
+    });
 
   it.each(["", "../agent.spec.ts", "--grep", "agent.spec.ts,agent.spec.ts", "agent.*.spec.ts",
     Array.from({ length: 33 }, (_, index) => `agent${index}.spec.ts`).join(",")])("rejects unsafe or unbounded browser selection: %s", value => {

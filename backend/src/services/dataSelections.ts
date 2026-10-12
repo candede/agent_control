@@ -210,15 +210,19 @@ export class DataSelections {
       FROM data_read_selections s WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND authorization_hash=$4 AND session_epoch=$5`,
     [id, identity.tenantId, identity.principalId, identity.authorizationHash, identity.sessionEpoch, exportId ?? null])).rows[0];
     if (!owned) throw new SelectionError("selection_invalidated");
-    if (owned.invalidated_at) throw new SelectionError("selection_invalidated", "changed");
-    if (owned.expired) throw new SelectionError("selection_invalidated", "expired");
     const pins = (await client.query(`SELECT *,expires_at<=clock_timestamp() AS expired FROM data_generation_pins WHERE selection_id=$1 AND tenant_id=$2 ORDER BY scope_id`, [id, identity.tenantId])).rows;
     if (!pins.length || pins.length > 16) throw new SelectionError("selection_invalidated", "unavailable");
+    let scopeChanged = false;
     for (const pin of pins) {
       const scope = await lockDataScope(client, pin.scope_id, identity.tenantId, isSelectedRead(client) ? "share" : "update");
-      if (scope.epoch !== pin.scope_epoch || scope.session_epoch !== pin.session_epoch
+      if (scope.session_epoch !== pin.session_epoch
         || scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) throw new SelectionError("selection_invalidated");
+      scopeChanged ||= scope.epoch !== pin.scope_epoch;
     }
+    if (owned.invalidated_at) throw new SelectionError("selection_invalidated", "changed");
+    if (owned.expired) throw new SelectionError("selection_invalidated", "expired");
+    if (scopeChanged) throw new SelectionError("selection_invalidated", "changed");
+    if (pins.some(pin => pin.expired)) throw new SelectionError("selection_invalidated", "expired");
     for (const pin of pins) {
       const root: DependencyRoot = pin.root_kind === "tenant_history" || pin.root_kind === "user_sources"
         ? { kind: pin.root_kind, scopeId: pin.scope_id, revision: pin.revision, expiresAt: pin.expires_at }

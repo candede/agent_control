@@ -366,6 +366,7 @@
 .agent-usage-users input { flex: 1; min-width: 150px; }
 .agent-usage-users td { overflow-wrap: anywhere; }
 .agent-usage-users th:first-child { width: 70%; }
+.agent-usage-users th:last-child { white-space: nowrap; }
 .agent-usage-users th:last-child,
 .agent-usage-users td:last-child { text-align: right; }
 .agent-usage-association-list { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }

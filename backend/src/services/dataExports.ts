@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { observeDataWork } from "./dataMetrics.js";
 import { dataConnections } from "../db/dataConnections.js";
-import { dataAdmissionError, dataLimitError, digest, encodeBatch, exactCount } from "../db/dataBounds.js";
+import { dataAdmissionError, dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "../db/dataBounds.js";
 import { generationHeartbeat } from "../db/dataGenerations.js";
 import { DataSelections, type SelectionIdentity } from "./dataSelections.js";
 import { csvValue } from "./csvEncoding.js";
@@ -35,6 +35,7 @@ type ExportBuildLease = ExportLease & {
 };
 type ExportPublication = { validate: () => Promise<() => void>; finish: () => Promise<void | string>; failed: () => void };
 const chunkBytes = 262_144;
+const chunksPerBatch = Math.floor(dataLimits.batchBytes / chunkBytes);
 const builders = new WeakMap<pg.Pool, Map<string, AbortController>>();
 
 export class DataExports {
@@ -206,22 +207,28 @@ export class DataExports {
     heartbeat.signal.addEventListener("abort", aborted, { once: true });
     if (heartbeat.signal.aborted) aborted();
     const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(chunkBytes);
+    const buffer = Buffer.allocUnsafe(dataLimits.batchBytes);
     let buffered = 0;
-    const write = async (chunk: Buffer) => {
+    const write = async (batch: Buffer) => {
       assertBuilding();
-      bytes += chunk.length;
+      bytes += batch.length;
       if (bytes > 1024 ** 3) throw dataLimitError("export_byte_limit", 1024 ** 3, bytes);
+      const checksums = Array.from({ length: Math.ceil(batch.length / chunkBytes) }, (_, index) =>
+        digest(batch.subarray(index * chunkBytes, (index + 1) * chunkBytes)));
       let leaseUntil = 0;
       await this.connections.run(async client => {
         leaseUntil = (await this.fence(client, owned)).lease_until.getTime();
         await client.query(`INSERT INTO data_export_chunks(export_id,tenant_id,ordinal,bytes,byte_count,checksum)
-          VALUES($1,$2,$3,$4,$5,$6)`, [id, identity.tenantId, ordinal, chunk, chunk.length, digest(chunk)]);
-        await client.query("UPDATE data_exports SET row_count=$2,byte_count=$3,chunk_count=$4 WHERE id=$1", [id, rows, bytes, ordinal + 1]);
+          SELECT $1,$2,($3::int+part.ordinal-1)::int,
+            substring($4::bytea FROM (part.ordinal-1)::int*${chunkBytes}+1 FOR ${chunkBytes}),
+            LEAST(${chunkBytes},octet_length($4::bytea)-(part.ordinal-1)*${chunkBytes})::int,part.checksum
+          FROM unnest($5::text[]) WITH ORDINALITY part(checksum,ordinal)`,
+        [id, identity.tenantId, ordinal, batch, checksums]);
+        await client.query("UPDATE data_exports SET row_count=$2,byte_count=$3,chunk_count=$4 WHERE id=$1", [id, rows, bytes, ordinal + checksums.length]);
         observeDataWork("export", { rows, bytes });
       }, false, heartbeat.signal, id, () => assertLease(leaseUntil));
-      hash.update(chunk);
-      ordinal++;
+      hash.update(batch);
+      ordinal += checksums.length;
     };
     const append = async (record: Buffer) => {
       let offset = 0;
@@ -278,27 +285,45 @@ export class DataExports {
       for await (const batch of source(heartbeat.signal, context)) {
         assertBuilding();
         encodeBatch(batch);
+        const encodedCells = new Map<string, string>();
+        let encodedCellBytes = 0;
         for (const row of batch) {
           assertBuilding();
           if (++rows > 2_000_000) throw dataLimitError("export_row_limit", 2_000_000, rows);
-          const record = Buffer.from(`${columns.map(column => csvValue(row[column])).join(",")}\r\n`);
+          const record = Buffer.from(`${columns.map(column => {
+            const value = row[column];
+            if (typeof value !== "string") return csvValue(value);
+            const cached = encodedCells.get(value);
+            if (cached !== undefined) return cached;
+            const encoded = csvValue(value), size = Buffer.byteLength(encoded);
+            if (encodedCellBytes + size <= dataLimits.residualBytes) {
+              encodedCells.set(value, encoded);
+              encodedCellBytes += size;
+            }
+            return encoded;
+          }).join(",")}\r\n`);
           peakCheckpoint("export.encode");
           await append(record);
         }
       }
       if (buffered) await write(buffer.subarray(0, buffered));
       const checksum = hash.digest("hex");
-      // Read back one persisted chunk at a time: no publication based on an
-      // in-memory digest alone, and never aggregate bytea/string content in SQL.
+      // Verify bounded persisted batches, never a full-artifact bytea/string aggregate.
       const verified = createHash("sha256");
       let verifiedBytes = 0;
-      for (let index = 0; index < ordinal; index++) {
-        const chunk = await context.read(async client => {
-          return (await client.query("SELECT bytes,byte_count,checksum FROM data_export_chunks WHERE export_id=$1 AND ordinal=$2", [id, index])).rows[0];
+      for (let index = 0; index < ordinal; index += chunksPerBatch) {
+        const count = Math.min(chunksPerBatch, ordinal - index);
+        const chunks = await context.read(async client => {
+          return (await client.query(`SELECT bytes,byte_count,checksum,ordinal FROM data_export_chunks
+            WHERE export_id=$1 AND ordinal>=$2 AND ordinal<$3 ORDER BY ordinal LIMIT ${chunksPerBatch}`,
+          [id, index, index + count])).rows;
         });
-        if (!chunk || chunk.byte_count !== chunk.bytes.length || digest(chunk.bytes) !== chunk.checksum) throw new Error("export_checksum");
-        verified.update(chunk.bytes);
-        verifiedBytes += chunk.byte_count;
+        if (chunks.length !== count) throw new Error("export_checksum");
+        for (const [offset, chunk] of chunks.entries()) {
+          if (chunk.ordinal !== index + offset || chunk.byte_count !== chunk.bytes.length || digest(chunk.bytes) !== chunk.checksum) throw new Error("export_checksum");
+          verified.update(chunk.bytes);
+          verifiedBytes += chunk.byte_count;
+        }
       }
       if (verified.digest("hex") !== checksum || verifiedBytes !== bytes) throw new Error("export_checksum");
       let leaseUntil = 0;

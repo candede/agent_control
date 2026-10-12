@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DataExports, type ExportAudit } from "./dataExports.js";
 import { DataSelections, canonicalQuery } from "./dataSelections.js";
@@ -6,6 +7,7 @@ import { DataGenerations } from "../db/dataGenerations.js";
 import { retainRecordData } from "../db/dataRetention.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput, selectionIdentity as fixtureIdentity } from "../../scripts/largeTenantFixtures.js";
+import { digest } from "../db/dataBounds.js";
 
 describe("persisted bounded exports", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -70,6 +72,30 @@ describe("persisted bounded exports", () => {
       ["build", "started"], ["build", "succeeded"], ["download", "started"], ["download", "succeeded"],
     ]);
     await expect(fixture.runtime.query("UPDATE data_export_chunks SET checksum=repeat('0',64) WHERE export_id=$1", [id])).rejects.toThrow("permission denied");
+  });
+  it("batches chunk persistence and verification within one MiB without changing artifact bytes or chunk limits", async () => {
+    const id = await create(), value = "x".repeat(65_000);
+    const expected = Buffer.from(`\uFEFFName\r\n${`"${value}"\r\n`.repeat(20)}`);
+    const query = vi.spyOn(pg.Client.prototype, "query");
+    try {
+      await exports.build(id, selectionIdentity, ["Name"], async function* () {
+        for (let index = 0; index < 20; index++) yield [{ Name: value }];
+      });
+      expect(query.mock.calls.filter(([sql]) => String(sql).startsWith("INSERT INTO data_export_chunks"))).toHaveLength(2);
+      expect(query.mock.calls.filter(([sql]) => String(sql).startsWith("SELECT bytes,byte_count,checksum"))).toHaveLength(2);
+    } finally { query.mockRestore(); }
+    expect(await exports.status(id, selectionIdentity)).toMatchObject({ status: "ready", rows: 20, bytes: expected.length });
+    const chunks = (await fixture.runtime.query<{ ordinal: number; byte_count: number }>(
+      "SELECT ordinal,byte_count FROM data_export_chunks WHERE export_id=$1 ORDER BY ordinal", [id])).rows;
+    expect(chunks.map(chunk => chunk.ordinal)).toEqual([0, 1, 2, 3, 4]);
+    expect(chunks.every(chunk => chunk.byte_count <= 262_144)).toBe(true);
+    expect((await fixture.runtime.query("SELECT checksum FROM data_exports WHERE id=$1", [id])).rows[0].checksum).toBe(digest(expected));
+    const downloaded: Buffer[] = [];
+    for await (const chunk of exports.download(id, selectionIdentity, new AbortController().signal)) downloaded.push(chunk);
+    expect(Buffer.concat(downloaded)).toEqual(expected);
+    expect((await eventsFor(id)).map(event => [event.phase, event.status])).toEqual([
+      ["build", "started"], ["build", "succeeded"], ["download", "started"], ["download", "succeeded"],
+    ]);
   });
   it("audits disconnect/failure and never publishes a failed producer", async () => {
     const id = await create();

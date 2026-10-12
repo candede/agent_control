@@ -10,6 +10,7 @@ import { InventoryRuntime } from "../src/services/inventoryRuntime.js";
 import { reportIdentity } from "../src/services/reportIdentity.js";
 import { appRoles } from "../src/types/capability.js";
 import { AppError } from "../src/errors.js";
+import { StreamedInventory } from "../src/services/streamedInventory.js";
 import { generationInput } from "./largeTenantFixtures.js";
 import { inventoryInput, nativeInventoryFixture, packageRecord } from "./inventoryFixtures.js";
 import { fixtureDirectoryUser } from "./userSourceFixture.js";
@@ -18,12 +19,13 @@ import { closeFixtureServer } from "./fixtureSupport.js";
 // Standalone loopback control belongs only to the isolated browser fixture, never createApp.
 export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Pool, tenantId: string) {
   const store = new InventoryGenerations(database);
+  const stream = new StreamedInventory(database);
   const runtime = new InventoryRuntime(database, async () => {});
   const subjects = new Map<string, Awaited<ReturnType<typeof setup>>>();
   async function setup(key: string) {
     const started = performance.now(), principalId = `fixture-lifecycle-${key}`;
     const identity = await reportIdentity(database, { tenantId, homeAccountId: principalId,
-      displayName: "Synthetic account", username: "fixture@example.invalid", roles: [...appRoles],
+      displayName: "Synthetic account", username: "fixture@lifecycle.example.invalid", roles: [...appRoles],
       providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] });
     const deadline = new Date(Date.now() - 86_400_000), observedAt = new Date(deadline.getTime() - 86_400_000);
     const input = (domain: string) => ({ ...inventoryInput(principalId, domain), sessionEpoch: identity.sessionEpoch,
@@ -45,7 +47,8 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
       async lease => {
         for (let offset = 0; offset < 1001; offset += 250) {
           const records = Array.from({ length: Math.min(250, 1001 - offset) }, (_, n) =>
-            packageRecord(offset + n, `Before ${String(offset + n).padStart(4, "0")}`));
+            ({ ...packageRecord(offset + n, `Before ${String(offset + n).padStart(4, "0")}`),
+              read_started_at: observedAt.toISOString() }));
           const token = `synthetic:browser-${offset}`, nextToken = offset + 250 < 1001 ? `synthetic:browser-${offset + 250}` : null;
           await store.visit(lease, token);
           await store.appendBounded(lease, records);
@@ -65,7 +68,7 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
     let failed = false;
     const successor = store.execute({ ...input("packages"), observedAt: new Date(deadline.getTime() - 1) },
       { domain: "packages", mode: "delta", channel: "exact", targets: ["package-000000"] }, async lease => {
-        await store.appendBounded(lease, [packageRecord(0, "After 0000")]);
+        await stream.packageObservation(lease, { id: "package-000000", displayName: "After 0000", isBlocked: false }, "exact");
         entered();
         await waiting;
         if (key.endsWith("failed")) throw new AppError(504, "provider_timeout", "Synthetic failed replacement");

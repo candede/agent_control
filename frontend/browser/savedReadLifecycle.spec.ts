@@ -3,8 +3,12 @@ import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { captureInventorySelection, fulfillInventoryPage } from "./selectedInventoryFixture";
 import { selectedUsersPage } from "../src/test/selectedUsageFixture";
 
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
+});
+
 for (const skewDays of [-365, 365]) {
-  test(`retains authorized Agents and Users through lease end with ${skewDays} days calendar skew`, async ({ page }, info) => {
+  test(`quietly renews authorized Agents and Users with ${skewDays} days calendar skew`, async ({ page }, info) => {
     const serverNow = Date.parse(layoutTime);
     await page.clock.install({ time: new Date(serverNow + skewDays * 86_400_000) });
     const unexpected = await mockLayoutApi(page);
@@ -30,7 +34,7 @@ for (const skewDays of [-365, 365]) {
     await page.route("**/api/copilot-usage/users?*", route => {
       users++;
       const result = selectedUsersPage();
-      result.selection = { ...metadata, id: result.selection.id };
+      result.selection = { ...metadata, id: `70000000-0000-4000-8000-${String(users).padStart(12, "0")}` };
       result.sources.directory = { ...result.sources.directory, state: "stale", expiresAt: old,
         attemptStatus: "failed", message: "Successor failed; retained published directory is readable." };
       return route.fulfill({ json: result });
@@ -41,25 +45,27 @@ for (const skewDays of [-365, 365]) {
     expect(captures).toBe(1);
     expect(pages).toBe(1);
     await page.clock.runFor(10_001);
+    await expect.poll(() => captures).toBe(2);
+    await expect.poll(() => pages).toBe(2);
+    await page.clock.runFor(501);
     await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
-    await expect(page.getByText(/Showing previously loaded saved inventory/)).toBeVisible();
-    await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
-    expect(captures).toBe(1);
-    expect(pages).toBe(1);
-    await page.screenshot({ path: info.outputPath("historical-agents.png") });
+    await expect(page.getByText(/Showing previously loaded saved inventory/)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await page.screenshot({ path: info.outputPath("renewed-agents.png") });
     await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Users", exact: true }).click();
     await expect(page.getByRole("button", { name: "Ada", exact: true })).toBeVisible();
     await page.clock.runFor(10_001);
+    await expect.poll(() => users).toBe(2);
+    await page.clock.runFor(501);
     await expect(page.getByRole("button", { name: "Ada", exact: true })).toBeVisible();
-    await expect(page.getByText(/Showing previously loaded saved data/)).toBeVisible();
-    await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-    expect(users).toBe(1);
-    await page.screenshot({ path: info.outputPath("historical-users.png") });
+    await expect(page.getByText(/Showing previously loaded saved data/)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    await page.screenshot({ path: info.outputPath("renewed-users.png") });
     await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Agents", exact: true }).click();
     await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
-    expect(captures).toBe(2);
-    expect(pages).toBe(2);
+    expect(captures).toBe(3);
+    expect(pages).toBe(3);
     expect(unexpected).toEqual([]);
   });
 }
@@ -88,6 +94,7 @@ for (const mode of ["active", "idle"] as const) {
     await page.goto("/agents");
     await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
     await expect.poll(() => observers).toBe(1);
+    await page.clock.runFor(501);
     if (mode === "idle") await page.evaluate(() => {
       Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
       document.dispatchEvent(new Event("visibilitychange"));
@@ -95,21 +102,28 @@ for (const mode of ["active", "idle"] as const) {
     for (let minute = 0; minute < 45; minute++) {
       await page.clock.runFor(60_000);
       await expect.poll(() => observers).toBe(mode === "idle" ? 1 : minute + 2);
-      expect(captures).toBe(1);
-      expect(pages).toBe(1);
+      const expectedCaptures = mode === "idle" ? 1 : Math.floor((minute + 1) / 10) + 1;
+      await expect.poll(() => captures).toBe(expectedCaptures);
+      await expect.poll(() => pages).toBe(expectedCaptures);
+      await page.clock.runFor(1);
     }
     await expect(page.getByText("Service desk assistant", { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
-    await expect(page.getByText(/Showing previously loaded saved inventory/)).toBeVisible();
     if (mode === "idle") {
+      await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+      await expect(page.getByRole("status").filter({ hasText: "Refreshing saved inventory..." })).toBeAttached();
       await page.evaluate(() => {
         Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
         document.dispatchEvent(new Event("visibilitychange"));
       });
       await expect.poll(() => observers).toBe(2);
+      await expect.poll(() => captures).toBe(2);
+      await expect.poll(() => pages).toBe(2);
+      await page.clock.runFor(501);
     }
-    expect(captures).toBe(1);
-    expect(pages).toBe(1);
+    await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await expect(page.getByText(/Showing previously loaded saved inventory/)).toHaveCount(0);
+    expect(captures).toBe(mode === "idle" ? 2 : 5);
+    expect(pages).toBe(captures);
     expect(unexpected).toEqual([]);
     await info.attach("accelerated-session-counts", { body: JSON.stringify({ mode, elapsed: 2_700_000,
       captures, pages, observers }), contentType: "application/json" });

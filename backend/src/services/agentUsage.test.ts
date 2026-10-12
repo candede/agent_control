@@ -38,6 +38,49 @@ async function count(scope: AgentUsageScope) {
 }
 
 describe("native report-backed exact inventory usage", () => {
+  it.each(["graph_packages", "power_platform"] as const)(
+    "keeps reviewed %s usage readable in a newly captured aged inventory without granting mutation authority", async source => {
+      const scope = newUsageScope();
+      const target = source === "graph_packages" ? { source, packageId: "Package-A" }
+        : { source, nativeId: "Native-A", environmentId: "env-a" };
+      const records = await saveUsageInventory(fixture.runtime, scope, [source === "graph_packages"
+        ? { packages: ["Package-A"] } : { packages: [], native: { nativeId: "Native-A", environmentId: "env-a" } }],
+      { expiresAt: new Date(Date.now() + 3000) });
+      const accepted = await publishUsageReports(fixture.runtime, scope);
+      await mutate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", target));
+      await awaitUsageInventoryExpiry(fixture.runtime, scope);
+
+      const selected = await inventorySelectionFixture(fixture.runtime, scope);
+      const savedUsage = new OfficialAgentUsage(reports, selected.queries);
+      const table = inventoryPresentation(selected.raw);
+      expect(table.value[0].usage).toMatchObject({ status: "linked", responses: 10, activeUsers: 2, associationCount: 1 });
+      const [summary] = await savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]);
+      expect(summary).toMatchObject({ status: "linked", responses: 10, activeUsers: 2, associationCount: 1 });
+      const associations = await savedUsage.associations(selected.selection.id, selected.identity, records[0].id, {});
+      expect(associations.value).toMatchObject([{ reportAgentId: "Report-A", basis: "reviewed", target }]);
+      const users = await savedUsage.users(selected.selection.id, selected.identity, records[0].id, { limit: 1 });
+      expect(users.counts).toEqual({ total: 2, filtered: 2 });
+      expect(users.value).toHaveLength(1);
+      const next = await savedUsage.users(selected.selection.id, selected.identity, records[0].id, { limit: 1, cursor: users.page.nextCursor! });
+      expect(new Set([...users.value, ...next.value].map(row => row.username)).size).toBe(2);
+      const history = await savedUsage.history(selected.selection.id, selected.identity, records[0].id, {});
+      expect(history.value).toMatchObject([{ setId: accepted.setId, status: "linked", responses: 10, associationCount: 1 }]);
+      expect(history.latestReported?.setId).toBe(accepted.setId);
+
+      const remove: CandidateAgentUsageMutation = { selectionId: summary.context.selectionId, reportSetId: accepted.setId,
+        usageRevision: summary.context.usageRevision, inventoryRevision: summary.context.inventoryRevision,
+        reportAgentId: "Report-A", confirmed: true };
+      await expect(savedUsage.mutate(selected.identity, records[0].id, remove, usageAudit(scope).actor))
+        .rejects.toMatchObject({ code: "agent_not_found" });
+      expect(await count(scope)).toBe(1);
+      await expect(savedUsage.history(selected.selection.id, { ...selected.identity, principalId: "foreign-viewer" }, records[0].id, {}))
+        .rejects.toMatchObject({ code: "selection_invalidated" });
+      await deleteUsageSet(fixture.runtime, scope, accepted.setId);
+      await expect(savedUsage.summaries(selected.selection.id, selected.identity, [records[0].id]))
+        .rejects.toMatchObject({ code: "selection_invalidated" });
+    }, 15_000,
+  );
+
   it.each(["reconciliation", "source-refresh"] as const)("keeps table, metrics and users on the same saved selection during %s without enabling writes", async transition => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }]);
     await publishUsageReports(fixture.runtime, scope);

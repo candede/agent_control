@@ -153,6 +153,7 @@ export class InventoryQueries {
 
   async capture(identity: SelectionIdentity, scopeId: string, query: InventoryQuery = {}, tokenMode: "delegated" | "application" = "delegated") {
     identity = { ...identity };
+    query = { ...query };
     if (query.sortBy && !unifiedAgentSortKeys.includes(query.sortBy) || query.sortDirection && !["asc", "desc"].includes(query.sortDirection)
       || query.createdWithinDays !== undefined && (!Number.isInteger(query.createdWithinDays) || query.createdWithinDays < 0)) throw new SelectionError("invalid_cursor");
     const criteria = inventoryCriteria(query.availableTo === undefined ? query : { ...query, availableTo: encodeInventoryFacet(query.availableTo) });
@@ -168,11 +169,13 @@ export class InventoryQueries {
       [scopeId, identity.tenantId, this.sourceOwners(identity), tokenMode])).rows[0];
       if (!root) throw new SelectionError("selection_invalidated");
       const data = await this.reports.currentInventoryData(client, identity, at);
-      const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
       const pinUntil = new Date(at.getTime() + 30 * 60_000);
-      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: root.expires_at },
-        await this.reports.history.root(client, identity.tenantId, at),
-        { kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) }];
+      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: pinUntil },
+        await this.reports.history.root(client, identity.tenantId, at)];
+      if (needsPeopleCache(query)) {
+        const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
+        roots.push({ kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) });
+      }
       const inputs = (await client.query("SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$2", [scopeId, root.revision])).rows[0]?.inputs ?? [];
       for (const input of inputs) roots.push({ kind: "inventory_delta", scopeId: input.scopeId, generationId: input.baselineId,
         revision: input.revision, expiresAt: pinUntil });
@@ -724,8 +727,8 @@ export class InventoryQueries {
       WHERE input.kind='microsoft.powerplatform/environments' AND r.resource_type=input.kind
         AND lower(r.native_id)=lower(selected.environment_id)
         AND (${normalizeEnvironmentIdentitySql("r.native_id")})=(${normalizeEnvironmentIdentitySql("selected.environment_id")})
-        AND r.expires_at>$5 ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
-    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId, context.data.evaluatedAt])).rows;
+        ORDER BY r.observed_at DESC,r.identity COLLATE "C" LIMIT 2) candidates WHERE matches=1
+    ) environment LIMIT 100`, [context.baselineId, context.revision, ids, context.scopeId])).rows;
     encodeBatch(rows);
     for (const row of rows) environments.set(row.identity, row.value);
     return { people, environments };
@@ -814,7 +817,7 @@ export class InventoryQueries {
       WHERE a.domain<>'canonical' ORDER BY s.source,
         CASE WHEN EXISTS(SELECT 1 FROM native_roots selected WHERE selected.scope_id=root.scope_id
           AND selected.kind='microsoft.copilotstudio/agents') THEN 0 ELSE 1 END,s.selector LIMIT 16`,
-    [context.scopeId, context.revision, context.baselineId])).rows;
+    [context.scopeId, context.revision, context.baselineId, context.data.evaluatedAt])).rows;
     const expiredIdentity = (await client.query(`SELECT EXISTS(${pendingInventoryIdentityExpirySql}) AS expired`, [context.scopeId])).rows[0].expired;
     const state = !current || current.baseline_id !== context.baselineId || current.revision !== context.revision ? "stale"
       : current.status === "running" ? "reconciling" : expiredIdentity || sources.some(source => !source.current) ? "catching_up" : current.status ?? "idle";
@@ -838,7 +841,7 @@ export class InventoryQueries {
       FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
       JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
       JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
-      WHERE ${inventoryAsOf()} AND c.expires_at>$3`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
+      WHERE ${inventoryAsOf()}`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
     if (cacheable && !cached) {
       peakCheckpoint("response.serialize");
       const serialized = JSON.stringify({ row,verificationCounts }); peakCheckpoint("response.serialize");
@@ -1116,7 +1119,7 @@ export class InventoryQueries {
     const requested = userSourceObjectIds(objectIds);
     return this.read(id, identity, (client, context) => userSourcePeopleInRead(client, { ...identity, tokenMode: "delegated" },
       context.data.metadata.directory.generationId ? { generationId: context.data.metadata.directory.generationId,
-        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, requested, context.data.evaluatedAt));
+        observedAt: new Date(context.data.metadata.directory.observedAt!) } : null, requested, context.data.evaluatedAt, needsPeopleCache(context.query)));
   }
 
   responsibility(id: string, identity: SelectionIdentity, options: AgentResponsibilityQuery = {}) {

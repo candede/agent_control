@@ -127,7 +127,7 @@ describe("selected active users without paid Copilot", () => {
     expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
     if (outcome === "denied") {
       await act(async () => pending.reject(new ApiError(403, "forbidden", "User access withdrawn")));
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
       expect(screen.getByRole("alert")).toHaveTextContent("User access withdrawn");
     } else {
       details(ada, directory(), replacement);

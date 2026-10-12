@@ -17,6 +17,7 @@ import { AppError } from "../errors.js";
 import { withQueries } from "../../scripts/lifecycleEvidence.js";
 import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
 
 describe("published inventory reachability independent of freshness", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -90,6 +91,7 @@ describe("published inventory reachability independent of freshness", () => {
       const canonical = (await runtime.reconciliation.runNext(input(identity, "canonical", deadline), async () => {}))!;
       const selected = await inventory.capture(identity, canonical.scopeId);
       const first = await inventory.page(selected.id, identity);
+      expect(inventoryPresentation(first).counts).toEqual(first.counts);
       const packageAgent = first.value.find(row => row.displayName === "Before 0")!;
       const live = new LiveInventory(fixture.runtime);
       await expect(live.record(identity, `agent:${packageAgent.id}`)).resolves.toBeDefined();
@@ -113,6 +115,7 @@ describe("published inventory reachability independent of freshness", () => {
             expect(page.value.map(row => row.displayName)).toEqual(first.value.map(row => row.displayName));
             expect(page.counts).toEqual(first.counts);
             expect(page.summary).toEqual(first.summary);
+            expect(inventoryPresentation(page).counts).toEqual(first.counts);
           });
         }
         await after(deadline);

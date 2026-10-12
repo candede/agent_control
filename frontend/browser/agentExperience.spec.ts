@@ -7,7 +7,7 @@ import { fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventory
 
 const usageFixtureSetId = selectedFixtureReports.setId!;
 async function mockUnavailableAgentUsage(page: Page) {
-  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage$/.test(url.pathname), route => route.fulfill({
+  await page.route(url => /^\/api\/agent-inventory\/[^/]+\/usage(?:-history)?$/.test(url.pathname), route => route.fulfill({
     status: 503, json: { code: "synthetic_usage_unavailable", detail: "Report data is unavailable. Restart usage to try again." },
   }));
 }
@@ -75,7 +75,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await page.screenshot({ path: info.outputPath("agent-overview.png") });
   await dialog.getByRole("tab", { name: "Usage" }).click();
   await expect(dialog.getByRole("alert")).toContainText("Report data is unavailable. Restart usage to try again.");
-  await expect(dialog.getByRole("button", { name: "Reload usage" })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "Retry usage history" })).toBeEnabled();
   await expect(dialog.getByText(/Missing usage data does not mean zero usage/)).toHaveCount(0);
   await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);
   await expect(dialog.getByLabel("Selected agent report metrics")).toHaveCount(0);
@@ -101,7 +101,9 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(dialog.getByRole("link", { name: "Search tenant interactions" })).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: "View management audit" })).toHaveCount(0);
   await expect(dialog.getByText("No saved activity is linked to this agent.")).toHaveCount(0);
-  await expect(dialog.getByRole("region", { name: "Defender log coverage and setup" })).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "Hunting authorization pending" }))
+    .toContainText("Delegated authorization is not ready");
+  await expect(dialog.getByRole("button", { name: "Run hunt", exact: true })).toBeDisabled();
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: info.outputPath("agent-activity.png") });
@@ -184,7 +186,7 @@ for (const state of ["missing", "unavailable"] as const) {
     const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
     await dialog.getByRole("tab", { name: "Usage" }).click();
     await expect(dialog.getByRole("alert")).toContainText("Report data is unavailable. Restart usage to try again.");
-    await expect(dialog.getByRole("button", { name: "Reload usage" })).toBeEnabled();
+    await expect(dialog.getByRole("button", { name: "Retry usage history" })).toBeEnabled();
     await expect(dialog.getByRole("link", { name: "Open usage reports" })).toHaveCount(0);
     await expect(dialog.getByRole("alert")).toHaveCount(1);
     await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);
@@ -198,8 +200,8 @@ test("fresh activity links keep their search, page and snapshot separate from ot
   await mockUsageReports(page, unexpected);
   const history = selectedHistoryPage([], null);
   await page.route("**/api/official-usage/history*", route => route.fulfill({ json: history }));
-  const activityUrl = `/users?view=activity&q=Emery&snapshot=${usageFixtureSetId}&page=2`;
-  await page.goto(activityUrl);
+  const activityUrl = `/users?view=activity&q=Emery&snapshot=${usageFixtureSetId}`;
+  await page.goto(`${activityUrl}&page=2`);
   await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Emery");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");

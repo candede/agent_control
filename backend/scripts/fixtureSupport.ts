@@ -10,6 +10,10 @@ export function browserFixtureTestFiles(value = process.env.AGENT_CONTROL_BROWSE
   return files;
 }
 
+export function browserFixtureFilePattern(file: string) {
+  return `(?:^|[/\\\\])${file.replaceAll(".", "\\.")}$`;
+}
+
 export function configureBrowserFixtureEnvironment(env: NodeJS.ProcessEnv = process.env) {
   if (env.AGENT_CONTROL_FIXTURE_MODE !== "browser" || env.NODE_ENV !== "test") {
     throw new Error("This fixture requires its isolated browser test entry point.");
