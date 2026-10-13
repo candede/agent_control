@@ -14,6 +14,6 @@ and Python package registries are not permitted and may trigger Microsoft Defend
 
 # Delegation and questions
 
-- Use GPT-6 Astra with `xhigh` reasoning effort for every subagent.
+- Use GPT-6.1 Sol (`gpt-6.1-sol`) with `xhigh` reasoning effort for every subagent.
 - If a user question is necessary, stop and wait for the actual answer. Autopilot
   mode or an unavailable question tool is not permission to assume consent.
