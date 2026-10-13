@@ -18,7 +18,31 @@ The confirmed product contract is:
 - Saved data is the default. Refresh, directory enrichment, live investigation, and provider work require explicit tool calls; ordinary saved reads must remain provider-free.
 - Expose all authorized agent/user/usage information through typed tools, including full available About descriptions and configuration metadata. No arbitrary SQL, arbitrary HTTP/KQL, raw diagnostic archives, secrets, or new transcript collection.
 - Trends are constrained by actual report windows, source semantics, coverage, and history. Missing data is unknown, not zero. Descriptions support LLM inferences; inferred use cases are not authoritative stored classifications.
-- Deliver local Compose and Azure production hosting. Preserve the current Node App Service; add a separate MCP container service.
+- Deliver Compose hosting and validated Azure hosting/deployment tooling. Both live releases in this campaign target the existing `seha` Compose project on the current host. Preserve Azure's Node App Service topology and support a separate MCP container App Service; a future live Azure rollout requires its own authorization.
+
+## Approach verdict and target runtime flow
+
+**Verdict: simplify deployment and evidence handling; retain the thin-service architecture.** The user confirmed that the one live production environment is `seha`, running Docker Compose on the current host, and approved using it for both releases while retaining Azure tooling. Remove mandatory Azure provisioning, registry publication, Key Vault setup, and cloud migration from this campaign's production critical path. This decision selects the planning boundary; it is not live-action approval.
+
+Current flow: browser sign-in -> verified session/roles -> existing API route -> saved selections or explicit provider operation -> API-owned result/job/audit -> web display. Existing browser refresh/permission/recovery behavior remains unchanged; saved API reads themselves remain provider-free.
+
+Target flow: external client sign-in -> tenant-bound MCP OAuth connection -> audience-correct delegated API credential -> the same canonical API operation used by the browser -> API-owned selections/provider dispatch/jobs/audit -> bounded typed tool result -> client reasoning or scheduling. The client owns interactive confirmation; API receipts bind exact current targets, not human approval. API expiry/restart pauses work for same-principal reauthorization; uncertain writes reconcile before resend. Report/source gaps remain unknown, and pagination cannot silently change selections.
+
+We would choose this flow without the existing plan: a separate Python service is needed for FastMCP protocol/OAuth, but direct provider/database access in that service would duplicate the API's authorization, calculations, durable jobs, and audit. An in-process Node-only MCP implementation would discard the explicit FastMCP requirement. No extra queue, business database, scheduler, attribution registry, generic proxy, or reusable evaluation platform is needed.
+
+The operational tradeoff is that Compose production inherits the current host's availability and needs explicitly approved HTTPS reachability for remote OAuth clients; Azure tooling is not evidence of a live cloud deployment. One MCP instance plus encrypted OAuth state is necessary for connection continuity, not a reason to add Redis/autoscale. Dormant authentication foundation/activation, the audit schema/writer change, read/control contracts, web-wide qualification, each production release, real-client onboarding, and aggregate recovery/capacity proof are separately useful boundaries. Keep the sixteen prompts; remove duplicated artifacts and rediscovery within them, not these boundaries.
+
+### Representative acceptance cases
+
+These are self-contained proof cases, not quotations of unspecified historical "three examples". 01 freezes exact synthetic inputs/expected IDs and source selections; 04/04A own API behavior, 06/07 tools, 09 client evaluation, and 04C/12 live proof.
+
+| Case | Input -> useful outcome | Required failure/edge proof |
+| --- | --- | --- |
+| A - Person and agent evidence | Exact authorized username -> separately enumerate used, created, and owned agents across all pages -> retrieve complete available About/configuration and source-backed usage | Native/guest/private scope, duplicate labels, concealed/unresolved users, unknown descriptions, and selection invalidation cannot become guessed matches or empty success |
+| B - Champions and trends | Company/department -> existing top-three eligible champion ranking -> their exact agent relationships and complete descriptions -> compare retained report snapshots honestly | Non-champions' department agents are not substituted; overlapping/unequal/undated periods, source discrepancies and missing counts remain explicit |
+| C - Exact controls in both client modes | Explicit bounded creation-time/platform filter or description-based client reasoning -> exact eligible IDs/current preview -> interactive confirmation or externally scheduled no-pause submission -> poll item verification | Freeze one creation cutoff across pages; unknown dates/platforms are not inferred. Changed/expired receipts, concurrent prestate changes, partial children, revoked grants, duplicates and sent-unknown writes have explicit outcomes |
+
+Use synthetic fixtures with more than one page, both control providers and both action directions. No real department-wide mutation is authorized by these examples. Volume/output/deadline and host-resource measurements are implementation-time obligations, not results of this plan review.
 
 ## Two-part rollout and user acceptance
 
@@ -39,7 +63,7 @@ If manual testing finds a regression, repair it in its Part 1 owner, run focused
 
 This is one repository, `candede/agent_control`. Resolve paths from its root, not a machine-specific absolute path. Implicated roots are `backend/`, `frontend/`, new `mcp/`, `infra/`, `scripts/`, `docs/`, and root build/deployment configuration.
 
-Read current [repository instructions](../../AGENTS.md), [security model](../../docs/security-model.md), [usage semantics](../../docs/official-usage-import.md), [local deployment](../../deploy-local.ps1), and [Azure deployment](../../docs/azure-production-deployment.md). The drafting baseline was revision `044e53e1`; recheck current code and scoped status at execution time. Historical roadmap/completion files are evidence, not permission to restore superseded roles, canary gates, or deployment targets.
+Read current [repository instructions](../../AGENTS.md), [security model](../../docs/security-model.md), [usage semantics](../../docs/official-usage-import.md), [local deployment](../../deploy-local.ps1), [local operations](../../docs/operations.md), and [Azure deployment](../../docs/azure-production-deployment.md). The drafting baseline was revision `044e53e1`; recheck current code and scoped status at execution time. Historical roadmap/completion files are evidence, not permission to restore superseded roles, canary gates, reset rights, or resource approvals.
 
 The current API is session/Origin/CSRF-based. Provider token acquisition and user revalidation assume MSAL browser-account cache entries. This campaign must address both request authentication and asynchronous service/worker authorization, not merely install a JWT middleware.
 
@@ -56,11 +80,21 @@ The current API is session/Origin/CSRF-based. Provider token acquisition and use
 9. **Reads:** preserve native/canonical/report-only distinctions, exact source associations, selection/cursor revisions, full available descriptions, user licensing/service-plan facts, field provenance, report metadata, partial coverage, and invalidation. Champions-only queries cannot substitute the adoption group's department-wide agent list. Official usage remains imported-report authority; explicit refresh cannot manufacture new CSV reports from Graph.
 10. **Controls:** phase 04A owns the shared canonical preview/execute/status adapter, receipts, provider routing, and frontend controls; 07 only adds MCP adapters. Never mutate by display name, inferred use case, ambiguous association, or report-only identity. Existing server-issued previews remain target-consistency receipts for both interactive and scheduled execution. Preserve existing explicit package versus Studio operation effects through the Part 1 cutover.
 11. **Confirmation:** without a new approval gate, the server cannot prove human confirmation or authenticate a caller's claim that a task is scheduled. The same execution tool is usable by both workflows. Client recipes/evaluations enforce the interactive conversation requirement; never add a `scheduled=true` authorization bypass.
-12. **Hosting:** start with one non-root MCP instance and encrypted file-backed OAuth state on a dedicated persistent mount. No Redis, separate application-data database, autoscaling, or second queue. Azure uses a separate Linux custom-container App Service with immutable image digest; reuse the existing plan only after capacity/cost approval. Streaming, callbacks, persistence, key rotation, and restart recovery must be measured.
-13. **Release containment:** use existing operational admission plus a deployment-owned server tool allowlist, implemented in 05 and configured in 10. An omitted tool must be unavailable to direct `tools/call`, not merely hidden in a client's UI. The complete configured catalog is the normal product; this narrow release control is not per-task business approval and cannot override API authorization.
+12. **Hosting:** start with one non-root MCP instance and encrypted file-backed OAuth state on a dedicated persistent mount in `seha` Compose. No Redis, separate application-data database, autoscaling, or second queue. Pin local source content and built image IDs in release receipts. Azure tooling supports a separate Linux custom-container App Service with immutable image digest; plan reuse still requires capacity/cost approval. Streaming, callbacks, persistence, key rotation, and restart recovery must be measured on the deployed host.
+13. **Release containment:** use existing operational admission plus a deployment-owned server tool allowlist, implemented in 05 and configured in local tooling by 08 (Azure tooling by 10). An omitted tool must be unavailable to direct `tools/call`, not merely hidden in a client's UI. The complete configured catalog is the normal product; this narrow release control is not per-task business approval and cannot override API authorization.
 14. **Audit origin:** phase 03A owns the non-secret origin descriptor, schema/projection/job propagation, audit API/filter/export contracts, and frontend display. Phase 05 captures MCP protocol/client context; 06/07 transmit it without becoming audit writers. Origin is authenticated API provenance, never an authorization input or a replacement for provider `source` metadata.
 
 Phase 01 pins the supported FastMCP/MSAL behavior with dated primary sources. If a library limitation disproves the stated token flow, the parent selects one supported audience-correct flow and updates this contract and all consumers before proceeding; never create parallel speculative authentication paths.
+
+01 owns one canonical operation/requirement map in `docs/mcp-integration.md`; implementation owners update their rows and 04B adds complete web coverage/manual checks to that same map. 09 owns one synthetic client corpus. 04B/11 reuse existing qualification entry points and record evidence in their completion records; do not introduce a second map, release framework, or duplicate runner. Reuse valid Part 1 proof/artifacts unless changed content invalidates them.
+
+### Schema and principal continuity
+
+The current schema verifier accepts only the exact compiled fingerprint; existing `start` does not migrate an incompatible database. 01 captures the actual pre-campaign source/schema fingerprint and non-secret private-data key contract. Each schema-changing owner (02 only if necessary, 03A, 04, 04A) supplies a narrow immutable forward upgrade with its exact input/output fingerprint, runtime grants, fresh-init parity and focused tests. 03A composes the ordered chain as later owners extend it; 04C wires and proves the entire deployed-baseline-to-release chain in existing deployment tooling. This is a bounded upgrade for known fingerprints, not a generic migration platform or permission to reset an unknown schema.
+
+Before a live upgrade, drain admissions/workers, retain a protected checkpoint, verify the exact starting schema, and prevent the old runtime from writing after the upgrade. Apply upgrades in dependency order, then verify the final schema/grants before opening the new runtime. Interrupted/resumed execution must recognize committed steps without replaying writes or bypassing verification. An unknown production starting fingerprint requires an explicit forward repair in its owner, not `-DbReset`, marker editing or restoration of an old writer.
+
+Saved private scope currently uses MSAL `homeAccountId`, not merely token `oid`. 01 must prove native and guest browser/bearer key equivalence against supported SDK/token-exchange evidence. 02 implements that proven mapping, never email/name matching or a guessed `oid.tid`. If the evidence requires a non-secret identity-key change, 02 owns its bounded transactional conversion and all data/session/selection/job consumers; unresolved mappings keep affected bearer admission closed while the browser remains available. Do not add a speculative identity registry or change keys simply because authentication transport changes.
 
 ## Shared API and audit-origin contract
 
@@ -84,7 +118,7 @@ Old rows and already-running pre-upgrade jobs remain `unknown` unless original t
 
 ## Ordered manifest
 
-| Step | Executable prompt | Direct prerequisites | Required completion record |
+| Step | Executable prompt / outcome owner | Direct prerequisites | Required completion record |
 | --- | --- | --- | --- |
 | 01 | [Contracts and feasibility](01-contracts-and-feasibility.md) | None | `completions/01-contracts-and-feasibility.md` |
 | 02 | [Dormant API identity and credentials](02-api-auth-foundation.md) | 01 | `completions/02-api-auth-foundation.md` |
@@ -93,15 +127,15 @@ Old rows and already-running pre-upgrade jobs remain `unknown` unless original t
 | 04 | [Complete API read and analysis contracts](04-api-read-contracts.md) | 01, 03, 03A | `completions/04-api-read-contracts.md` |
 | 04A | [Shared API controls and web consumers](04A-api-agent-controls.md) | 01, 03, 03A, 04 | `completions/04A-api-agent-controls.md` |
 | 04B | [Complete web cutover and regression qualification](04B-webapp-cutover-and-qualification.md) | 01, 03, 03A, 04, 04A | `completions/04B-webapp-cutover-and-qualification.md` |
-| 04C | [API/web production release and manual-test handoff](04C-api-webapp-production-release.md) | 04B | `completions/04C-api-webapp-production-release.md` |
+| 04C | [seha API/web production release and manual-test handoff](04C-api-webapp-production-release.md) | 04B | `completions/04C-api-webapp-production-release.md` |
 | 05 | [FastMCP service and Entra authentication](05-fastmcp-service-and-auth.md) | 01, 03, 03A, 04C; explicit Part 1 acceptance | `completions/05-fastmcp-service-and-auth.md` |
 | 06 | [Inventory, people, usage, and investigation tools](06-mcp-read-tools.md) | 04, 05 | `completions/06-mcp-read-tools.md` |
 | 07 | [Thin MCP block/unblock tools](07-mcp-agent-controls.md) | 03A, 04A, 05, 06 | `completions/07-mcp-agent-controls.md` |
-| 08 | [Local container and lifecycle integration](08-local-container-integration.md) | 05, 06, 07 | `completions/08-local-container-integration.md` |
+| 08 | [Local container and lifecycle integration](08-local-container-integration.md) | 04C, 05, 06, 07 | `completions/08-local-container-integration.md` |
 | 09 | [Client onboarding and prompt evaluations](09-client-workflows-and-evaluation.md) | 06, 07, 08 | `completions/09-client-workflows-and-evaluation.md` |
-| 10 | [Azure infrastructure and deployment automation](10-azure-deployment-integration.md) | 03, 04C, 05, 08, 09 | `completions/10-azure-deployment-integration.md` |
+| 10 | [Validated Azure hosting/deployment tooling](10-azure-deployment-integration.md) | 03, 04C, 05, 08, 09 | `completions/10-azure-deployment-integration.md` |
 | 11 | [Release, recovery, and capacity qualification](11-release-qualification.md) | 01, 02, 03, 03A, 04, 04A, 04B, 04C, 05, 06, 07, 08, 09, 10 | `completions/11-release-qualification.md` |
-| 12 | [Production deployment and live hardening](12-production-convergence.md) | 10, 11 | `completions/12-production-convergence.md` |
+| 12 | [seha MCP deployment and live hardening](12-production-convergence.md) | 04C, 08, 10, 11 | `completions/12-production-convergence.md` |
 
 The exact manifest has sixteen prompts. Execute Part 1 sequentially: 01, 02, 03, 03A, 04, 04A, 04B, 04C; stop for user acceptance. After explicit acceptance/authorization, execute Part 2 sequentially: 05, 06, 07, 08, 09, 10, 11, 12. Preserve the lettered phases and existing filenames. README, supporting documentation, and completion/acceptance records are not executable phases. A single-phase invocation implements only that phase. 04C owns the first production release; 12 owns the second. Full MCP convergence remains unfinished until 12, but Part 1 is independently deployed and tested without MCP.
 
@@ -118,7 +152,7 @@ The exact manifest has sixteen prompts. Execute Part 1 sequentially: 01, 02, 03,
 | Interactive confirmation and autonomous scheduling | Client workflows 09; shared tools 07 | Interactive pause and scheduled no-pause transcripts; no API policy engine | 12 |
 | Explicit refresh and investigations | API authentication 03; full web consumers 04B; adapters 06 | Provider-free saved reads, explicit dispatch, cancellation, permission errors | Web 04C; MCP 12 |
 | OAuth persistence and credential recovery | 05; mounts/lifecycle 08 and 10 | Restart, key rotation, revoked connection, worker authorization pause/resume | 11, 12 |
-| Local/Azure delivery and portal preservation | API/web release tooling 04C; MCP extension 08/10 | Deployment mocks, Compose cold/restart tests, browser/API regressions, first release without MCP | 04C, 12 |
+| Compose production, Azure tooling, and portal preservation | API/web local release tooling 04C; MCP local extension 08; Azure tooling 10 | Deployment mocks, Compose cold/restart tests, browser/API regressions, first release without MCP; Azure live gaps remain distinct | seha 04C, 12; future Azure rollout separately authorized |
 | Client interoperability, capacity, errors, and audit | 09, 11 | Synthetic prompt corpus, real-client attempts, fixed limits, redacted evidence | 12 |
 
 ## Bounded execution and validation contract
@@ -132,6 +166,7 @@ The exact manifest has sixteen prompts. Execute Part 1 sequentially: 01, 02, 03,
 - Use existing Node/Vitest, PowerShell deployment tests, Compose isolation, and browser harnesses. Add pytest only for the new Python service in Part 2 and only after its manifest is created. Phase prompts name focused selectors; aggregate API/web regressions belong to 04B and complete API/MCP qualification to 11.
 - Every phase updates directly related docs and traces all affected roots. A root may remain unchanged only after a recorded impact check. No unrelated refactoring, commits, pushes, branches, production resets, or broad cleanup.
 - Parity tests use identical principal/source/input/prestate with independent synthetic mutation fixtures; do not mutate the same live target twice to pretend to compare outcomes. Audit tests separately verify that channel/client differences are retained without changing business results.
+- Use the existing isolated test entry points in [operations](../../docs/operations.md#synthetic-lifecycle-qualification): `pwsh ./scripts/large-tenant-tests.ps1 -Suite inventory-integration` for affected DB contracts, `-Suite lifecycle-read-contract` for selection/identity/retention, and `-Suite cutover-browser-contract -BrowserFiles savedBackendLifecycle.spec.ts,savedReadLifecycle.spec.ts,inventoryAcceptance.spec.ts,cacheNavigation.spec.ts` for affected browser flows. 01 records the exact focused Node/PowerShell commands; 05 records the Python environment and type/static commands. Do not point tests, restore drills or lifecycle fixtures at `seha`'s database, ports or volume.
 
 ## Package feeds, workers, and questions
 
@@ -143,14 +178,21 @@ If a necessary question is asked, stop and wait for the actual answer. No autopi
 
 ## Always-Deploy Production Contract
 
-Each part requires its own production deployment, live observation, and fix-forward handling, not a test-only readiness artifact. 04C releases API/web only; 12 adds MCP after the explicit user acceptance boundary. **Creating this plan authorizes no live action.** Execution may touch production only after the operator explicitly identifies and approves the exact target and bounded changes through the deployment target/approval contract. Part 1 approval never authorizes Part 2 MCP resources/exposure. Historical campaigns' `seha` targets or reset permissions do not carry into this campaign.
+Each part requires its own production deployment, live observation, and fix-forward handling, not a test-only readiness artifact. 04C releases API/web only; 12 adds MCP after the explicit user acceptance boundary. **Editing this plan authorizes no live action.** The approved planning target is the current host's Docker Compose project **`seha`**, not an Azure migration and not a hardcoded customer tenant. API behavior remains independent of the configured tenant. Each MCP instance retains its configured tenant/authority binding; no tenant-specific special case or audience widening is introduced.
+
+The bounded production target is repository-root `compose.yaml` through [deploy-local.ps1](../../deploy-local.ps1), `-Project seha`, state `.local/seha/`, network `seha_default`, existing `app`/`postgres` services and `seha_data` volume. Resolve the existing non-secret origin/port, settings identity and Docker labels through `New-LocalContext`/current receipts; do not assume default ports or replace saved settings/secrets. Part 2 may add only the `mcp` service, its image, dedicated `seha_mcp_oauth` volume and approved key/configuration references. 08 owns these local contracts; 12 verifies their exact effective identities before deployment.
+
+04C and 12 obtain separate explicit approvals for their pinned release, maintenance/upgrade actions, resource ceilings and provider-canary targets. Part 1 approval never authorizes Part 2 resources/exposure. Preserve production data, volumes, secrets, sessions and unrelated host projects; no `-DbReset`, project destruction, broad cleanup, schema-marker forgery or secret regeneration. Historical `seha` receipts may identify the installation but confer no reset/mutation rights. Tests use separate uniquely named disposable projects. No Azure resource creation, registry publication, Key Vault changes, Entra grant changes or new public ingress/tunnel is authorized by this boundary.
+
+Remote clients require an operator-approved HTTPS origin/ingress and exact callbacks. Reuse an approved route if one exists; otherwise obtain separate bounded ingress approval and implement it through the owning deployment contract. Never expose a loopback listener, loosen redirect/proxy validation, or provision a third-party tunnel to make a check pass. Without authorized remote reachability, deploy safe local paths and keep remote-client proof open/contained, not falsely supported.
 
 - Attempt every applicable local, fixture, client/model, disposable deployment, browser, recovery, and capacity check. Repair reproducible defects; preserve every true result.
 - Residual non-passing preproduction evidence alone does not veto deployment. For each residual record affected scope, containment, telemetry/canary, alert threshold, named operating owner, and exact fix-forward trigger.
 - Never weaken authentication, authorization, source isolation, or provider-write validation to make deployment succeed. Deploy code, observability, and unaffected paths with only affected unsafe routes/tool exposure closed through operational admission or the server tool allowlist. Withholding a client UI entry alone is not containment. This release containment is not a new customer approval-policy engine.
-- 04C expresses API/web admission, checkpointed schema upgrade, and exact artifact receipt using existing deployment tooling without MCP; 10 extends that accepted contract for MCP route/tool containment. Do not invent ad hoc production flags during either release or resurrect alternate/legacy writers.
-- Verify production identity, approved resource IDs, Entra registrations, callbacks, consent, current health, and strongest available backup/checkpoint. Unknown recovery evidence stays unknown.
+- 04C expresses API/web admission, checkpointed schema upgrade, and exact artifact receipt using existing local deployment tooling without MCP; 08 extends that accepted contract for MCP route/tool containment, and 10 reuses it for Azure tooling. Do not invent ad hoc production flags during either release or resurrect alternate/legacy writers.
+- Verify current host/context, exact Compose project/service/network/volume/image identities, non-secret configuration binding, Entra registrations/callbacks/consent, current health, and strongest available backup/checkpoint. Unknown recovery evidence stays unknown.
 - Qualify the exact deployed revision using isolated synthetic namespaces and explicitly approved disposable provider targets. Never block a real department/company as a canary. Restore approved canary prestate and verify readback.
+- 01 defines qualification data/identity isolation and 04C/12 verify it before any live test write: use an explicitly approved test tenant/principal/provider environment, prove its data boundary, and retain ordinary authentication. No production fixture-auth mode, synthetic import into a customer report set, shared/latest-report selection change, reset or global synthetic sync. If isolated live data is unavailable, use approved read-only saved-data canaries and isolated protocol fixtures, deploy safe paths, and retain the unproven live case with containment/owner/fix-forward action.
 - Observe existing web/API workflows in 04C and critical MCP workflows plus unrelated portal/API health in 12. Production feedback drives containment, root fix, focused validation, redeployment, and repeat canary.
 - Cleanup failures remain owned cost/security incidents, not a reason to cancel safe deployment or hide a failure.
 - Missing explicit target approval or literal inability to execute required production control-plane actions leaves the campaign open as `deployment_pending`, with the exact resumable action. It must not close as test-only success.
@@ -159,7 +201,7 @@ Each part requires its own production deployment, live observation, and fix-forw
 
 ## Completion and resuming
 
-Do not create fictional completion records during planning. Each worker writes the exact manifest path after implementation with requirements, changed files, contracts, decisions, root impact checks, test commands/results, environment evidence, residuals, and next-phase preconditions.
+Do not create fictional completion records during planning. Each worker writes only its exact manifest completion path after implementation, following the applicable implement-folder step-worker contract: implemented/deleted behavior; schema/API/payload/state contracts; autonomous decisions and rationale; changed files grouped by root; impact evidence for every root, including roots unchanged; exact focused/aggregate commands, environments and result/case counts; authorized environment actions; residual scope/containment/signal/numeric threshold/owner/fix-forward trigger; and observable next-phase preconditions. Distinguish `complete`, `complete_with_risk`, `deployment_pending`, `production_hardening_pending` and `awaiting_user_acceptance` from individual check statuses. A README policy is not another implementation owner.
 
 The parent maintains `completions/IMPLEMENTATION_CAMPAIGN.md` when execution begins, with the sixteen-step manifest, part membership, prompt SHA-256 hashes, dependency/status ledger, current revision, separate release target references without secrets, and Part 1 acceptance state. Changed prompts require revalidation of affected completed phases. Keep one implementation phase active at a time. Preserve both production receipts; never overwrite Part 1 evidence with Part 2 qualification.
 

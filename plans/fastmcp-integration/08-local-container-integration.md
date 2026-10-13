@@ -2,11 +2,11 @@
 
 ## Mission
 
-Deliver a reproducible non-root MCP image and integrate it into the existing Compose/local setup, checks, restart, and recovery workflows without disrupting the API/frontend/database.
+Deliver a reproducible non-root MCP image and extend the already released `seha` Compose deployment/setup/check/restart/recovery contracts, without disrupting the API/frontend/database. This phase implements and tests tooling in isolated projects; 12 performs the live release.
 
 ## Prerequisites
 
-Read [README](README.md), [05](05-fastmcp-service-and-auth.md), [06](06-mcp-read-tools.md), [07](07-mcp-agent-controls.md), and their completion records. Inspect status and current deployment tooling before edits.
+Read [README](README.md), [04C](04C-api-webapp-production-release.md), [05](05-fastmcp-service-and-auth.md), [06](06-mcp-read-tools.md), [07](07-mcp-agent-controls.md), and their completion records. Inspect the accepted `seha` release/approval boundary, status and current deployment tooling before edits.
 
 ## Read first
 
@@ -17,15 +17,15 @@ Read [README](README.md), [05](05-fastmcp-service-and-auth.md), [06](06-mcp-read
 ## Required implementation
 
 1. Add a dedicated MCP Dockerfile with runtime/test stages, pinned Python/dependencies, approved feed configuration, non-root user, minimal runtime contents, deterministic lock installation, and no build-time credentials in layers.
-2. Add the Compose MCP service using the internal API address, dedicated loopback port, least-privilege secret mounts, encrypted OAuth state volume, read-only runtime except that mount/tmp, dropped capabilities, resource/log limits, and health/readiness.
+2. Add the Compose `mcp` service using the internal API address, dedicated loopback port, least-privilege secret mounts, encrypted `mcp_oauth` volume (effective `seha_mcp_oauth` in production), read-only runtime except that mount/tmp, dropped capabilities, resource/log limits, and health/readiness. Keep the existing `seha_data` volume untouched and no-MCP projects valid.
 3. Keep browser API origin and MCP public OAuth base URL separate from internal service addresses. Validate exact callback/proxy/public URLs; do not relax portal Origin checks or trust arbitrary forwarded headers.
 4. Extend local setup/edit-config to collect MCP non-secret settings and secure secret references only when MCP is explicitly configured. Preserve existing installation behavior when it is absent; omitted optional integration is not an error or a shadow implementation.
-5. Wire image build/start/stop/check/restart into the existing scripts rather than a competing deployment system. Starting MCP must not synchronize data or mutate agents. Existing projects/ports/volume names remain isolated.
+5. Wire image build/start/stop/check/restart, pinned source/image IDs, separate release approval and resumable receipt into the existing scripts rather than a competing deployment system. Configure 05's server tool allowlist locally and record effective exposure; omitted tools must fail direct invocation. Starting MCP must not synchronize data or mutate agents. Existing projects/ports/volumes remain isolated; verify exact labels before any lifecycle action.
 6. Add reproducible API/MCP integration fixtures to existing isolated Compose test conventions. Tests must not contact real tenants/provider endpoints unless separately approved.
 7. Verify OAuth storage ownership, at-rest encryption, persistence, bounds, key/secret rotation behavior, shutdown draining, API restart authorization pause, and explicit same-user job recovery. Never persist API provider tokens to achieve restart continuity.
-8. Document local MCP endpoint, registration/callback configuration, connection onboarding, status/reauthentication, backups of MCP keys/state, and targeted cleanup. Destroy only named disposable test resources; no reset of existing user projects/databases.
+8. Document local MCP endpoint, exact registration/callback/public-origin configuration, connection onboarding, status/reauthentication, protected backups of keys/state and targeted cleanup. Implement bounded trust/routing configuration for an explicitly approved existing HTTPS ingress, if available; new ingress/public exposure requires separate operator approval under README. No automatically created tunnels or public ports. Destroy only exact named disposable test resources; never reset `seha` or existing user projects/databases.
 9. Keep Node/npm Docker registry settings and Python feed/lock settings aligned. Audit every dependency build stage/install hook for public-index bypasses.
-10. Reuse the checkpointed audit/job/schema upgrade and no-MCP local path already released in 04C; extend them only for MCP integration. Test both already-upgraded Part 1 installations and fresh/exact-prior-schema installations, preserving historical unknown rows and avoiding double upgrade/reset. Prove the accepted web app operates with MCP stopped, and API/MCP restart preserves origin without persisting API provider credentials.
+10. Reuse the checkpointed audit/job/schema upgrade and no-MCP local path already released in 04C; extend only for MCP integration. Test already-upgraded Part 1, fresh and known-baseline installations through the same chain, preserving historical unknown rows and avoiding double upgrade/reset. Prove the accepted web app works with MCP stopped and API/MCP restart preserves origin without persisting API provider credentials. Measure fixed host/container capacity and choose concrete startup/streaming/observation thresholds for 11/12; unknown results stay unknown.
 
 ## Scope guard
 
@@ -46,7 +46,7 @@ Apply README's Always-Deploy and accepted-Part-2 contracts. Docker/host/tool una
 
 ## Completion record
 
-Write `completions/08-local-container-integration.md`: image/Compose/settings/secret contracts, exact local commands, restart/persistence/effective-feed proof, root impacts, checks, cleanup outcomes, and Azure mount/resource requirements.
+Write `completions/08-local-container-integration.md` under README's completion contract: image/Compose/settings/secret/allowlist/ingress contracts, exact preflight/build/deploy/resume/backup commands for 12, runtime identities/resource ceilings, restart/persistence/effective-feed proof, root impacts, checks, cleanup outcomes, and separate Azure tooling requirements.
 
 ## Done and handoff
 
