@@ -135,6 +135,8 @@ export type PackageDetailFreshness = {
 };
 
 export type CopilotPackage = {
+  savedSource?: { scopeId: string; identity: string };
+  identityRevalidationRequired?: true;
   id: string;
   displayName: string;
   type?: string;

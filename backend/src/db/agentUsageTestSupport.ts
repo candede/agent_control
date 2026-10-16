@@ -5,6 +5,7 @@ import type { AgentUsageTarget } from "../types/agentUsageTarget.js";
 import type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
 import type { OfficialUsageReportKind } from "../types/officialReportRecords.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import type { InventoryIdentifier } from "../types/powerPlatformInventory.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { unifiedAgentRecordId, type UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { OfficialAgentUsage } from "../services/officialAgentUsage.js";
@@ -30,14 +31,15 @@ export const usageAudit = (scope: AgentUsageScope) => ({
   actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "fixture@example.invalid", displayName: "Fixture" },
   requestPath: "/fixture/usage-associations",
 });
-export type UsageGroup = { packages: string[]; native?: { nativeId: string; environmentId: string | null; createdBy?: string };
+export type UsageGroup = { packages: string[]; canonicalId?: string; native?: { nativeId: string; environmentId: string | null; createdBy?: string; createdAt?: string | null;
+  ownerId?: string; lastModifiedBy?: string; description?: string; identifiers?: InventoryIdentifier[]; agentKind?: string };
   packageFields?: Partial<Omit<CopilotPackageDetail, "id">> };
 const agentType = "microsoft.copilotstudio/agents" as const;
 
 export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageScope,
   groups: UsageGroup[] = [{ packages: ["Package-A", "Package-B"] }, { packages: ["Package-C"] }],
   options: { expiresAt?: Date } = {}) {
-  if (groups.length > 100 || groups.reduce((count, group) => count + group.packages.length + Number(Boolean(group.native)), 0) > 250) {
+  if (groups.length > 250 || groups.reduce((count, group) => count + group.packages.length + Number(Boolean(group.native)), 0) > 250) {
     throw new Error("Grouped usage inventory accepts only small synthetic fixtures.");
   }
   const packages = new Map(groups.flatMap(group => group.packages.map(id => [id,
@@ -45,9 +47,11 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
   const native = groups.flatMap(group => group.native ? [group.native] : []);
   const resources = native.map(value => ({
     sourceSystem: "power_platform" as const, nativeId: value.nativeId, environmentId: value.environmentId, tenantId: scope.tenantId,
-    type: agentType, displayName: "Inventory native agent", creatorType: "unknown" as const, agentKind: "agent",
-    location: null, createdAt: null, createdBy: value.createdBy ?? null, lastPublishedAt: null, authoringTool: null,
-    lifecycle: "published" as const, identityConfidence: "exact_native" as const, identifiers: [], provenance: {}, details: {}, unknownFieldCount: 0,
+    type: agentType, displayName: "Inventory native agent", creatorType: "unknown" as const, agentKind: value.agentKind ?? "agent",
+    location: null, createdAt: value.createdAt ?? null, createdBy: value.createdBy ?? null, lastPublishedAt: null, authoringTool: null,
+    lifecycle: "published" as const, identityConfidence: "exact_native" as const, identifiers: value.identifiers ?? [], provenance: {},
+    details: { ...value.ownerId ? { ownerId: value.ownerId } : {}, ...value.lastModifiedBy ? { lastModifiedBy: value.lastModifiedBy } : {},
+      ...value.description !== undefined ? { description: value.description } : {} }, unknownFieldCount: 0,
   } satisfies PowerPlatformResource));
   const stages = new InventoryGenerations(database);
   const observedAt = new Date(Date.now() - 60_000), expiresAt = options.expiresAt ?? new Date(Date.now() + 600_000);
@@ -120,7 +124,7 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
     pending_inputs=NULL,status='running' WHERE scope_id=$1`, [queue.scopeId, input.jobId, input.deadlineAt]);
   await stages.execute(input, { domain: "canonical", mode: "baseline", channel: "canonical" }, async lease => {
     for (const candidate of candidates) {
-      const id = survivors.get(candidate.index) ?? randomUUID();
+      const id = survivors.get(candidate.index) ?? groups[candidate.index].canonicalId ?? randomUUID();
       candidate.record.id = `agent:${id}`;
       await database.query("INSERT INTO inventory_canonical_ids(id,scope_id,tenant_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
         [id, queue.scopeId, scope.tenantId]);

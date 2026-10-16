@@ -7,7 +7,7 @@ import { inventoryLimits, type InventoryDomain, type InventoryPage, type Invento
 import type { InventoryRecord } from "../services/inventoryRecordProjection.js";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 
-export const inventoryTables = { packages: "package_record_rows", power_platform: "power_platform_record_rows", canonical: "unified_agent_rows" } as const;
+const inventoryTables = { packages: "package_record_rows", power_platform: "power_platform_record_rows", canonical: "unified_agent_rows" } as const;
 export type InventoryIntent = {
   domain: InventoryDomain; mode: "baseline" | "delta" | "compact";
   channel: "catalog" | "exact" | "detail" | "control" | "canonical";

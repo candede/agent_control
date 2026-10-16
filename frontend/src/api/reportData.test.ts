@@ -1,11 +1,16 @@
 // @vitest-environment node
 import { afterEach, expect, it, vi } from "vitest";
 import { ApiError, request } from "./client";
-import { cancelReportExport, createReportExport, mutateAgentReportAssociation, normalizeReportSearch, previewReportBundle, reportExportStatus, stageReport } from "./reportData";
+import { cancelReportExport, createReportExport, mutateAgentReportAssociation, normalizeReportSearch, previewReportBundle, reportExportStatus, stageReport,
+  readAgentReportHistory } from "./reportData";
 import type { CandidateAgentUsageMutation } from "../../../backend/src/types/officialReportApi";
 
 vi.mock("./client", async original => ({ ...await original<typeof import("./client")>(), request: vi.fn() }));
 afterEach(() => { vi.useRealTimers(); vi.mocked(request).mockReset(); });
+it("uses canonical pinned agent history routes with paired history windows", async () => {
+  await readAgentReportHistory("agent:exact", { selectionId: "inventory-selection", inventorySelectionId: "inventory-selection", compareFromSetId: "from", compareToSetId: "to" });
+  expect(request).toHaveBeenLastCalledWith("/api/agent-inventory/agent%3Aexact/usage-history?selectionId=inventory-selection&inventorySelectionId=inventory-selection&compareFromSetId=from&compareToSetId=to", { signal: undefined });
+});
 
 it("omits absent upload metadata but retains explicit blank assertions for server validation", async () => {
   const file = new File(["CSV"], "users.csv", { type: "text/csv" }), signal = new AbortController().signal;

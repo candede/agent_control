@@ -35,12 +35,13 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
   const scope = options.scope ?? { tenantId: `selected-${randomUUID()}`, principalId: randomUUID() };
   const store = new InventoryGenerations(database);
   const identity = { ...selectionIdentity, ...scope, sessionEpoch: await store.generations.sessionEpoch(scope.tenantId, scope.principalId) };
-  async function publish(domain: "packages" | "power_platform", records: InventoryRecord[]) {
+  async function publish(domain: "packages" | "power_platform", records: InventoryRecord[], channel: "catalog" | "detail" = "catalog") {
     const input = { ...inventoryInput(scope.principalId, domain), sessionEpoch: identity.sessionEpoch,
       ...(options.observedAt ? { observedAt: options.observedAt } : {}),
       ...(options.expiresAt ? { expiresAt: options.expiresAt } : {}) };
     input.scope.tenantId = scope.tenantId;
-    const intent = { domain, mode: "baseline" as const, channel: "catalog" as const,
+    const intent = { domain, mode: channel === "detail" ? "delta" as const : "baseline" as const, channel,
+      ...(channel === "detail" ? { targets: records.map(record => record.native_id) } : {}),
       ...(domain === "power_platform" ? { resourceTypes: options.resourceTypes ?? [...powerPlatformResourceTypes],
         roleScope: options.roleScope ?? "full", ...(options.environmentId ? { environmentId: options.environmentId } : {}) } : {}) };
     input.scope.selector = inventorySelector(intent);
@@ -55,7 +56,9 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
       }
     }, { authorize: async () => {} });
   }
-  const packages = options.omitPackages ? undefined : await publish("packages", (options.packages ?? []).map(packageInventoryRecord));
+  let packages = options.omitPackages ? undefined : await publish("packages", (options.packages ?? []).map(packageInventoryRecord));
+  const details = (options.packages ?? []).filter(value => value.detailFreshness && value.detailFreshness.state !== "missing");
+  if (packages && details.length) packages = await publish("packages", details.map(packageInventoryRecord), "detail");
   const resources = options.omitResources ? undefined : await publish("power_platform",
     (options.resources ?? []).map(value => powerPlatformInventoryRecord({ ...value, tenantId: scope.tenantId })));
   if (options.directory) await publishFixtureDirectory(database, identity, options.directory);

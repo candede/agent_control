@@ -33,6 +33,10 @@ pwsh ./deploy-local.ps1 check
 The check includes frontend lint, type checking, tests, and production builds.
 No host Node.js installation is required.
 
+When validating source locally, `npm run check:unused` at the repository root
+runs the configured Knip dead-code/dependency check. It complements tests and
+does not establish live browser or provider behavior.
+
 ## Main user flows
 
 - **Agents**: browse inventory, inspect details and usage, manage package access,
@@ -43,6 +47,11 @@ No host Node.js installation is required.
 - **Audit**: review administrative actions made through Agent Control.
 - **Permissions**: check app roles, Microsoft roles, API permissions, consent,
   licensing, and provider access.
+
+Initial read-only sync starts automatically after sign-in while visible and
+online. Permissions is recovery guidance after an actual failure, not a setup
+approval step. Purview/Defender searches run explicitly under current real
+authorization; configured application reads need no prior qualification query.
 
 Sync history keeps its Outcome filter beside Refresh history. During automatic
 or manual history reads, the refresh icon animates without adding a visible

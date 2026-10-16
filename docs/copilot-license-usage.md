@@ -2,9 +2,8 @@
 
 > **Current implementation:** source collection, saved report composition,
 > APIs, UI and exports use the record-backed contracts documented in
-> [Record-data foundation](record-data-foundation.md#current-user-source-foundation).
-> The retired whole-source snapshot reader/writer is not an alternate runtime
-> path. Saved reads do not issue background provider requests.
+> [Saved-data architecture](data-architecture.md#official-reports-and-user-evidence).
+> Saved reads do not issue background provider requests.
 
 `GET /api/copilot-usage/users` is a read-only Viewer/Admin view of saved tenant/principal-private **Microsoft 365 Copilot entitlement evidence** and app activity. Its `value` array contains one selection-scoped page, with `page`, `counts`, `summary`, `sources` and `reports` metadata. The saved directory retains the full product-filtered discovery cohort plus exactly verified active report identities, including users with inactive or unverified paid features; these are not all Copilot-licensed users. The paid-user dashboard requests `cohort=licensed`, and licensed-user labels and adoption counts require verified active paid features. User rows contain scalar `copilotServiceState`, `servicePlanCount` and `entitlement` evidence; complete service plans are independently paged through `/api/copilot-usage/users/:objectId/service-plans` under the same selection. The API joins these saved sources to the selected imported official Copilot Agents usage set without calling Microsoft Graph. First-use setup and explicit user-source sync perform the bounded delegated Graph reads. A new usage import is reflected on the next saved-data read without another provider scan; newly reported identities remain license-unknown until Users sync verifies them. One user's delegated source is never shared with another principal.
 
@@ -122,7 +121,6 @@ For geo-restricted frontends, use the source notices and checked-directory progr
 
 - `user_source_refresh_failed`: independent `directory` or `app_activity` source, normalized `errorCode` and error kind/status. Directory examples include `provider_count_mismatch` for incomplete or changing totals, `provider_schema` for conflicting evidence or malformed fields, `provider_response_size_limit` for oversized pages, and `data_generation_rows` for the distinct-user limit.
 - `report_download_retry` / `report_download_failed`: app-report download HTTP status and retry attempt, without a signed download URL.
-- Catalog/page/inventory success events from the retired snapshot reader are not emitted by the current record-backed provider; their absence is not proof that collection skipped those steps.
 
 These events contain no raw provider bodies, user identities or tokens. A successful HTTP request alone does not prove a complete license inventory: sources can independently be unavailable. Do not attach a live-process debugger or extract session tokens to investigate; use normal authenticated saved-data reads and aggregate diagnostics. Catalogs remain bounded at **200 pages/1,000 rows**. Product discovery allows **1,000 pages** of up to 100 requested users; exact report-identity verification has a separate **6,000-page** budget for batches of at most 20 identities and continuation allowance. Both phases share a **100,000 distinct directory-user** bound and a **5,000,000 wire-row** bound that also charges duplicate observations. Directory responses retain their dedicated **16 MiB per-response bound**; catalog and other generic JSON reads retain the **2,000,000-byte** default. Directory users and service plans are stored as separate typed rows, not a whole-source JSONB snapshot or a shared service-plan-array encoding. SQL writes are bounded at **250 rows and 1 MiB of encoded parameters** per batch, within the source's **8 GiB generation reservation**. Each user retains its complete feature state, labels, capability status and assignment evidence; the bounded timestamp residual preserves submillisecond precision that the typed database timestamp cannot fully represent. Oversized or conflicting evidence fails without replacing the preceding complete generation. Row bounds, timeouts, cancellation, authorization, duplicate checks and Graph-count reconciliation remain enforced. No migration or saved-data reset is required to enforce these validation rules.
 
@@ -214,7 +212,7 @@ rows remain usable until replacement data is published. Missing or expired
 sources, incomplete coverage and failed/unauthorized attempts remain explicit.
 Sync and the expandable source details retain collection progress.
 
-Canonical links use `/users?view=activity`; old `view=matrix` links are still accepted and preserve exact agent, search, page and snapshot values. New links emit `view=activity`. Users owns licensing and reported-user activity; Agents owns current agent usage. Collection belongs to **Sync**, and manual imports to **Sync > Import reports** (`/sync?reports=import`); history and selection belong to **Sync > Manage reports** (`/sync?reports=manage`). Exact retained source links open its read-only snapshot inspector (`/sync?reports=snapshot&snapshot=ID`), not a standalone Official usage page. Old Official usage bookmarks migrate without deleting source data. Connection recovery belongs to **Permissions**. Users has no duplicate generic body or modal links to these pages. Timestamped event investigation is separately available through **Audit** in the top navigation under the existing `AuditLogsQuery.Read.All` prerequisites; audit metadata is not an official usage counter and does not expose prompt/response content.
+Canonical activity links use `/users?view=activity` and preserve exact agent/search/snapshot values with selection-bound cursors. Users owns licensing/reported-user activity; Agents owns current agent usage. Collection/import belong to **Sync**; retained reports use `/sync?reports=manage`, and an exact read-only snapshot uses `/sync?reports=snapshot&snapshot=ID`. Provider-event investigation is explicit through user/agent Logs with its real permission requirements; the top-level **Audit** is administrative actions, not usage or prompt/response content.
 
 ## Agent responsibility in user details
 
@@ -226,11 +224,11 @@ Responsibility pages retain the exact selection ID, revision, evaluation time an
 
 Collection coverage comes only from the saved source metadata. Missing owner, creator or last-modifier fields do not make a successfully collected inventory partial, and Graph-only agents are not required to provide Power Platform relationships. Reported roles remain available independently; malformed identity references are counted separately and never guessed into user relationships.
 
-Agent-person links open `/users?detail=<exact-object-id>&tab=responsibility`. Old `view=responsibility&person=<object-id>` bookmarks open the same modal without restoring the retired cohort. Exact saved Power Platform references and the private saved people cache preserve access to responsibility for people outside both rosters. The modal reads their saved directory profile independently of the displayed cohort; when that profile is absent, responsibility remains available while profile, license and usage details are explicitly unavailable. Unresolved or concealed report identities are never matched by name. This does not change license candidate collection, paid-feature metrics, observed-use counts, report filters or CSV exports. Browsing the modal does not query a provider or initiate a directory sync.
+Agent-person links use `/users?detail=<exact-object-id>&tab=responsibility`. Exact saved Power Platform references and the private people cache preserve responsibility for people outside both rosters. Their saved profile is read independently; missing profile/licensing/usage remains explicit without hiding known responsibility. Unresolved/concealed report identities are never matched by name. Browsing makes no provider call or directory sync and does not change paid-feature or report metrics.
 
 ## Current combined-query contract
 
 The runtime user/report SQL, source/null semantics, paged children and export
-schemas are documented in [Official reports foundation](official-reports-foundation.md)
+schemas are documented in [Saved-data architecture](data-architecture.md#official-reports-and-user-evidence)
 and implemented by the current record-backed provider, selected-read services
 and frontend consumers.

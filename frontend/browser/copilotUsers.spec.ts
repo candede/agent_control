@@ -471,7 +471,7 @@ test("effectively licensed users lead with useful data and support ranked employ
   await expect(page.getByRole("button", { name: "Concealed report user", exact: true })).toHaveCount(0);
   await expect(page.getByText("Microsoft 365 admin center Copilot Agents usage exports")).not.toBeVisible();
   await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
-  await expect(page.locator(".capability-health")).toHaveAccessibleDescription(/^Permissions: \d+ issues?$/);
+  await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
   await expect(page.locator(".capability-health")).not.toContainText("provider-verified");
   if (info.project.name === "desktop") {
     const bounds = await table.boundingBox();
@@ -490,7 +490,9 @@ test("effectively licensed users lead with useful data and support ranked employ
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const detail = page.getByRole("dialog", { name: "Ada", exact: true });
   await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
-  await expect(detail.getByRole("cell", { name: "Researcher synthetic-researcher", exact: true })).toBeVisible();
+  const researcher = detail.getByRole("button", { name: "Open agent Researcher", exact: true });
+  await expect(researcher).toBeVisible();
+  await expect(researcher.locator("..")).toContainText("synthetic-researcher");
   await expect(detail.getByText("Microsoft", { exact: true })).toBeVisible();
   await expect(detail.getByText("Outlook", { exact: true })).toBeVisible();
   await expect(detail.getByRole("link")).toHaveCount(0);
@@ -547,7 +549,8 @@ test("paid user filters stay concise, accessible and server-paged with exact org
   const activity = filters.getByRole("combobox", { name: "Activity", exact: true });
   const threshold = filters.getByRole("spinbutton", { name: "Low-response threshold", exact: true });
   const sort = filters.getByRole("combobox", { name: "Sort", exact: true });
-  await expect(company).toBeFocused();
+  await expect(filters.locator("select:focus, input:focus")).toHaveCount(1);
+  await expect(filters.locator("select:focus, input:focus")).not.toHaveAttribute("aria-disabled", "true");
   await expect(trigger).toHaveAttribute("aria-expanded", "true");
   expect(await table.boundingBox()).toEqual(tableBefore);
   const bounds = await filters.boundingBox();
@@ -1099,7 +1102,7 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
   expect(unexpected).toEqual([]);
 });
 
-test("legacy matrix links open activity and filtered CSV exports pin the displayed report", async ({ page }, info) => {
+test("activity links and filtered CSV exports pin the displayed report", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.addInitScript(() => { URL.createObjectURL = () => { throw new Error("Report downloads must not create client-side blobs"); }; });
   const source = selectedCohortData();
@@ -1138,7 +1141,7 @@ test("legacy matrix links open activity and filtered CSV exports pin the display
     metadataBytes.push(Buffer.byteLength(body));
     return route.fulfill({ contentType: "application/json", body });
   });
-  await page.goto(`/users?view=matrix&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}&q=Emer`);
+  await page.goto(`/users?view=activity&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}&q=Emer`);
   const table = page.getByRole("region", { name: "Reported user activity", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("combobox", { name: "User cohort", exact: true })).toHaveValue("activity");

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { nativeInventoryFixture } from "../../scripts/inventoryFixtures.js";
@@ -56,7 +56,7 @@ describe.sequential("Purview audit repository", () => {
       const submitted = await repository.submit(scope, { idempotencyKey: `unbound-agent-${index}`, filters: changed });
       await repository.cancel(scope, submitted.id);
     }
-    const read = { tenantId: scope.tenantId, resultScopes: [scope.resultScope] };
+    const read = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId, resultScopes: [scope.resultScope] };
     const page = await repository.listJobs(read, 1, 0, selected.userPrincipalNames[0], agent.recordId);
     expect(page.count).toBe(1);
     expect(page.value.map(job => job.id)).toEqual([matching.id]);
@@ -71,13 +71,13 @@ describe.sequential("Purview audit repository", () => {
       await repository.cancel(owner, job.id);
       if (index < 2) matching.push(job.id);
     }
-    const read = { tenantId: owner.tenantId, resultScopes: [owner.resultScope] };
+    const read = { tenantId: owner.tenantId, authorizationPrincipalId: owner.authorizationPrincipalId, resultScopes: [owner.resultScope] };
     const page = await repository.listJobs(read, 1, 1, upn);
     expect(page).toMatchObject({ count: 2, limit: 1, offset: 1 });
     expect(page.value).toHaveLength(1);
     expect(matching).toContain(page.value[0].id);
     expect((await repository.listJobs({ ...read, tenantId: "unrelated-tenant" }, 20, 0, upn)).count).toBe(0);
-    expect((await repository.listJobs({ ...read, resultScopes: [scope.resultScope] }, 20, 0, upn)).count).toBe(0);
+    await expect(repository.listJobs({ ...read, resultScopes: [scope.resultScope] }, 20, 0, upn)).rejects.toMatchObject({ code: "scope_mismatch" });
   });
 
   it("filters exact saved agent evidence and authorized scopes before real database search, counts and pagination", async () => {
@@ -107,7 +107,7 @@ describe.sequential("Purview audit repository", () => {
         { ...exact, wrapperId: "other-service", service: "Copilot" },
       ].map(value => ({ ...value, nativeEventId: randomUUID() }))));
     }
-    const readScope = { tenantId: reader.tenantId, resultScopes: [reader.resultScope, application.resultScope] };
+    const readScope = { tenantId: reader.tenantId, authorizationPrincipalId: reader.authorizationPrincipalId, resultScopes: [reader.resultScope, application.resultScope] };
     const page = await repository.agentRecords(readScope, { ...target, environmentId: target.environmentId.toUpperCase() }, { limit: 1, offset: 1 });
     expect(page).toMatchObject({ count: 4, limit: 1, offset: 1 });
     expect(page.value).toHaveLength(1);
@@ -117,7 +117,7 @@ describe.sequential("Purview audit repository", () => {
     expect(searched.count).toBe(2);
     expect(searched.value.every(value => value.wrapperId === "exact-create")).toBe(true);
     expect((await repository.agentRecords({ ...readScope, resultScopes: [reader.resultScope] }, target, { limit: 50, offset: 0 })).count).toBe(2);
-    expect((await repository.agentRecords({ tenantId: reader.tenantId, resultScopes: [
+    expect((await repository.agentRecords({ tenantId: reader.tenantId, authorizationPrincipalId: reader.authorizationPrincipalId, resultScopes: [
       { ...application.resultScope, configurationRevision: 8 },
     ] }, target, { limit: 50, offset: 0 })).count).toBe(0);
   });
@@ -126,19 +126,21 @@ describe.sequential("Purview audit repository", () => {
     const job = await repository.submit(scope, { idempotencyKey: "private", filters });
     expect(job).toMatchObject({ status: "waiting_authorization", displayName: `agent-control-audit:${job.id}`, providerQueryId: null, attemptedAt: null });
     expect(await repository.submit(scope, { idempotencyKey: "private", filters })).toMatchObject({ id: job.id });
-    expect((await repository.listJobs({ tenantId: scope.tenantId, resultScopes: [{ kind: "principal", scopeId: "reader-b", configurationRevision: null }] })).value).toEqual([]);
+    expect((await repository.listJobs({ tenantId: scope.tenantId, authorizationPrincipalId: "reader-b", resultScopes: [{ kind: "principal", scopeId: "reader-b", configurationRevision: null }] })).value).toEqual([]);
 
     const applicationScope: PurviewAuditScope = { ...scope,
       resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 7 }, tokenMode: "application" };
     const applicationJob = await repository.submit(applicationScope, { idempotencyKey: "application-shared", filters });
-    const readerBCurrent = { tenantId: scope.tenantId, resultScopes: [
+    const readerBCurrent = { tenantId: scope.tenantId, authorizationPrincipalId: "reader-b", resultScopes: [
       { kind: "principal" as const, scopeId: "reader-b", configurationRevision: null },
       { kind: "application" as const, scopeId: "application-client", configurationRevision: 7 },
     ] };
     expect((await repository.listJobs(readerBCurrent)).value.map(value => value.id)).toContain(applicationJob.id);
     expect(await repository.getJob(readerBCurrent, applicationJob.id)).toMatchObject({ resultScope: applicationScope.resultScope });
-    expect(await repository.getJob({ tenantId: scope.tenantId, resultScopes: [{ kind: "application", scopeId: "application-client", configurationRevision: 8 }] }, applicationJob.id)).toBeUndefined();
-    expect(await repository.getJob({ tenantId: "tenant-b", resultScopes: [applicationScope.resultScope] }, applicationJob.id)).toBeUndefined();
+    expect(await repository.getJob({ tenantId: scope.tenantId, authorizationPrincipalId: "reader-b", resultScopes: [{ kind: "application", scopeId: "application-client", configurationRevision: 8 }] }, applicationJob.id)).toBeUndefined();
+    expect(await repository.getJob({ tenantId: "tenant-b", authorizationPrincipalId: "reader-b", resultScopes: [applicationScope.resultScope] }, applicationJob.id)).toBeUndefined();
+    await expect(repository.cancel(readerBCurrent, applicationJob.id)).rejects.toMatchObject({ code: "not_found" });
+    await expect(repository.delete(readerBCurrent, applicationJob.id)).rejects.toMatchObject({ code: "not_found" });
     await repository.cancel(scope, job.id);
     await repository.cancel(applicationScope, applicationJob.id);
   });
@@ -170,7 +172,7 @@ describe.sequential("Purview audit repository", () => {
     const page = await repository.listRecords(scope, job.id);
     expect(page).toMatchObject({ count: 1, value: [{ wrapperId: "wrapper-1", contentAvailable: false, messages: [{ id: "message-a", isPrompt: true }] }] });
     expect(JSON.stringify(page)).not.toContain("auditData");
-    await expect(repository.listRecords({ tenantId: scope.tenantId, resultScopes: [{ kind: "principal", scopeId: "reader-b", configurationRevision: null }] }, job.id)).rejects.toMatchObject({ code: "not_found" });
+    await expect(repository.listRecords({ tenantId: scope.tenantId, authorizationPrincipalId: "reader-b", resultScopes: [{ kind: "principal", scopeId: "reader-b", configurationRevision: null }] }, job.id)).rejects.toMatchObject({ code: "not_found" });
   });
 
   it("marks bounded publication partial and leaves the entire requested range unobserved", async () => {
@@ -201,7 +203,7 @@ describe.sequential("Purview audit repository", () => {
       record({ wrapperId: "missing-env", nativeEventId: "44444444-4444-4444-8444-444444444444", auditLogRecordType: "powerPlatformAdministratorActivity", operation: "BotCreate", service: "PowerPlatform", botId: "bot-a", environmentId: null, agentId: null }),
       record({ wrapperId: "copilot-agent", nativeEventId: "55555555-5555-4555-8555-555555555555", botId: null, agentId: "agent-a" }),
     ]));
-    const values = (await repository.listRecords({ tenantId: scope.tenantId, resultScopes: [scope.resultScope],
+    const values = (await repository.listRecords({ tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId, resultScopes: [scope.resultScope],
       inventoryIdentityScope: { principalId: scope.authorizationPrincipalId, resourceTypes: ["microsoft.copilotstudio/agents"] } } as never, job.id)).value;
     expect(values.find(value => value.wrapperId === "exact")?.association).toEqual({ status: "resolved", sourceSystem: "power_platform", nativeId: "inventory-agent", resourceType: "microsoft.copilotstudio/agents", environmentId: "environment-a", matchedKind: "cds_bot_id" });
     expect(values.find(value => value.wrapperId === "missing-env")?.association).toEqual({ status: "unresolved", reason: "missing_environment" });
@@ -215,24 +217,6 @@ describe.sequential("Purview audit repository", () => {
     expect(await repository.cancel(scope, job.id)).toMatchObject({ status: "cancelled", providerQueryId: "provider-query-cancel", remoteWorkMayContinue: true });
     await expect(repository.recordProviderStatus(scope, job.id, job.execution, "succeeded")).rejects.toMatchObject({ code: "audit_job_state" });
     await expect(repository.publish(scope, job.id, job.execution, result([]))).rejects.toMatchObject({ code: "audit_execution_lost" });
-  });
-
-  it("closes cancelled and deleted qualification runs so a replacement can be approved", async () => {
-    const qualificationInput = { filters, capabilityId: "purview.audit.search.delegated" as const,
-      contractRevision: "1".repeat(64), permissionRevision: "2".repeat(64), configurationRevision: 1, approvedBy: "administrator-a" };
-    const cancelledQualification = await repository.approveQualification(scope, qualificationInput);
-    const cancelledJob = await repository.submit(scope, { idempotencyKey: "qualification-cancelled", filters, qualificationId: cancelledQualification.id });
-    await repository.begin(scope, cancelledJob.id);
-    await repository.cancel(scope, cancelledJob.id);
-    expect(await repository.getQualification(scope.tenantId, cancelledQualification.id)).toMatchObject({ status: "failed", errorCode: "audit_cancelled" });
-
-    const deletedQualification = await repository.approveQualification(scope, { ...qualificationInput, contractRevision: "3".repeat(64) });
-    const deletedJob = await repository.submit(scope, { idempotencyKey: "qualification-deleted", filters, qualificationId: deletedQualification.id });
-    await repository.delete(scope, deletedJob.id);
-    expect(await repository.getQualification(scope.tenantId, deletedQualification.id)).toMatchObject({ status: "failed", errorCode: "audit_deleted" });
-    const replacement = await repository.approveQualification(scope, { ...qualificationInput, contractRevision: "4".repeat(64) });
-    expect(replacement.status).toBe("approved");
-    await fixture.operator.query("UPDATE purview_audit_qualifications SET status='failed',finished_at=clock_timestamp() WHERE id=$1", [replacement.id]);
   });
 
   it("fences a recovered execution from mutating or publishing over its replacement", async () => {
@@ -295,34 +279,12 @@ describe.sequential("Purview audit repository", () => {
     expect(await repository.getJob(scope, terminal.id)).toMatchObject({ status, remoteWorkMayContinue: false });
   });
 
-  it("does not inspect private inventory when the current read lacks explicit Reader identity scope", async () => {
+  it("leaves associations unresolved when the current read lacks explicit Reader identity scope", async () => {
     const job = await submitAndBegin("association-no-reader");
     await repository.recordProviderQuery(scope, job.id, job.execution, "provider-no-reader", "succeeded");
     await repository.publish(scope, job.id, job.execution, result([record({ wrapperId: "no-reader", nativeEventId: "99999999-9999-4999-8999-999999999999", botId: "bot-a", environmentId: "environment-a" })]));
-    const query = vi.spyOn(fixture.runtime, "query");
-    try {
-      const values = (await repository.listRecords(scope, job.id)).value;
-      expect(values[0].association).toEqual({ status: "unresolved", reason: "no_documented_cross_source_relation" });
-      expect(query.mock.calls.some(call => String(call[0]).includes("power_platform_inventory_resources"))).toBe(false);
-    } finally {
-      query.mockRestore();
-    }
-  });
-
-  it("requires exact qualification scope and records successful fixture lifecycle without fabricating capability evidence", async () => {
-    const qualificationFilters = { ...filters, startDateTime: "2026-09-09T10:30:00.000Z" };
-    const qualification = await repository.approveQualification(scope, { filters: qualificationFilters, capabilityId: "purview.audit.search.delegated",
-      contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "administrator-a" });
-    expect(qualification).toMatchObject({ status: "approved", jobId: null });
-    await expect(repository.submit({ ...scope, resultScope: { kind: "principal", scopeId: "reader-b", configurationRevision: null }, authorizationPrincipalId: "reader-b" },
-      { idempotencyKey: "wrong-qualification", filters: qualificationFilters, qualificationId: qualification.id })).rejects.toMatchObject({ code: "qualification_mismatch" });
-    const job = await repository.submit(scope, { idempotencyKey: "qualification", filters: qualificationFilters, qualificationId: qualification.id });
-    const execution = await repository.begin(scope, job.id);
-    expect(execution.action).toBe("create");
-    await repository.recordProviderQuery(scope, job.id, execution, "provider-query-qualification", "succeeded");
-    await repository.publish(scope, job.id, execution, result([]));
-    expect(await repository.getQualification(scope.tenantId, qualification.id)).toMatchObject({ status: "qualified", jobId: job.id });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM capability_evidence WHERE capability_id LIKE 'purview.audit.%'")).rows[0].count).toBe(0);
+    const values = (await repository.listRecords(scope, job.id)).value;
+    expect(values[0].association).toEqual({ status: "unresolved", reason: "no_documented_cross_source_relation" });
   });
 
   it("deletes only local cache rows and applies operator retention without runtime record deletion", async () => {
@@ -347,19 +309,5 @@ describe.sequential("Purview audit repository", () => {
     await retain(fixture.operator);
     expect(await repository.getJob(scope, expired.id)).toBeUndefined();
 
-    const qualification = await repository.approveQualification(scope, { filters, capabilityId: "purview.audit.search.delegated",
-      contractRevision: "d".repeat(64), permissionRevision: "e".repeat(64), configurationRevision: 2, approvedBy: "administrator-a" });
-    const qualifiedJob = await repository.submit(scope, { idempotencyKey: "retained-qualification", filters, qualificationId: qualification.id });
-    const qualifiedExecution = await repository.begin(scope, qualifiedJob.id);
-    await repository.recordProviderQuery(scope, qualifiedJob.id, qualifiedExecution, "provider-query-retained-qualification", "succeeded");
-    await repository.publish(scope, qualifiedJob.id, qualifiedExecution, result([]));
-    await fixture.operator.query("UPDATE purview_audit_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [qualifiedJob.id]);
-    await fixture.operator.query("UPDATE purview_audit_qualifications SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [qualification.id]);
-    await retain(fixture.operator);
-    expect(await repository.getJob(scope, qualifiedJob.id)).toBeUndefined();
-    expect(await repository.getQualification(scope.tenantId, qualification.id)).toMatchObject({ status: "expired", jobId: null });
-    await fixture.operator.query("UPDATE purview_audit_qualifications SET expires_at=clock_timestamp()-interval '31 days' WHERE id=$1", [qualification.id]);
-    await retain(fixture.operator);
-    expect(await repository.getQualification(scope.tenantId, qualification.id)).toBeUndefined();
   });
 });

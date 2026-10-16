@@ -199,6 +199,12 @@ export class PackageRefreshJobs {
         && signedInAt !== undefined && (previous.attempted_at ?? previous.created_at).getTime() < signedInAt;
       if (previous?.cooling_down && failure !== "failed" && !renewed) return null;
       const due = await client.query<{ native_id: string; catalog_revision_hash: string }>(`
+        WITH recent_detail_attempts AS MATERIALIZED (
+          SELECT DISTINCT t.target_id,t.catalog_revision_hash
+          FROM package_refresh_jobs attempted JOIN inventory_refresh_targets t ON t.job_id=attempted.id
+          WHERE attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details
+            AND attempted.updated_at>clock_timestamp()-interval '1 hour'
+        )
         SELECT r.native_id,${catalogRevisionHashSql} AS catalog_revision_hash
         FROM data_scope_epochs s JOIN inventory_roots root ON root.scope_id=s.id AND root.current
         JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision
@@ -206,11 +212,13 @@ export class PackageRefreshJobs {
         JOIN inventory_memberships m ON m.baseline_id=root.baseline_id AND m.valid_from_revision<=root.revision
           AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
         JOIN package_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
+        LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id
+          AND attempted.catalog_revision_hash=${catalogRevisionHashSql}
         WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='inventory_packages'
           AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()
           AND r.expires_at>clock_timestamp()
           AND ${detailPendingSql}
-          AND (r.native_id=ANY($3::text[]) OR ${detailUnattemptedSql})
+          AND (r.native_id=ANY($3::text[]) OR attempted.target_id IS NULL)
         ORDER BY CASE WHEN r.detail_generation IS NULL OR r.residual->'detailFreshness'->>'state' IN ('missing','invalidated')
           THEN 0 ELSE 1 END,r.native_id COLLATE "C" LIMIT 20`,
       [scope.tenantId, scope.principalId, renewed ? previous.requested_ids : []]);

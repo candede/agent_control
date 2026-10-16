@@ -10,6 +10,7 @@ import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 import { CapabilityContext } from "../capabilityContext";
 import { AgentConnectorOperations, SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../../../backend/src/services/inventoryIdentity";
+import { SavedAgentAbout } from "./SavedAgentAbout";
 
 const connectorPageSize = 10;
 type Property = { label: string; value: ReactNode; wide?: boolean; hint?: string };
@@ -43,6 +44,7 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
   const description = packageDetail?.longDescription?.trim() || metadata?.shortDescription?.trim()
     ? getAgentDescription(metadata ?? {}) : "";
   const descriptionHtml = useMemo(() => getSanitizedDescriptionHtml(description), [description]);
+  const aboutSource = metadata?.savedSource ?? resource?.savedSource;
   const connectors = resource?.details.connectors;
   const connectorCount = resource?.details.distinctPowerPlatformConnectors;
   const operationCount = resource?.details.distinctPowerPlatformConnectorsOperations;
@@ -145,10 +147,13 @@ export function AgentOverview({ record, selectionId, selectedPackage, packageDet
     {packageCount > 1 ? <p className="agent-insight-note">Status and admin availability summarize all {packageCount.toLocaleString()} published versions.</p> : null}
     {missingName ? <p className="agent-insight-note">Agent name not reported; showing its resource ID.</p> : null}
     <section className="agent-overview-information" aria-label="Agent information">
-      {description || information.length || dates.length ? <section className="agent-overview-section" aria-label="About">
+      {description || aboutSource || information.length || dates.length ? <section className="agent-overview-section" aria-label="About">
         <h3>About</h3>
-        {descriptionHtml ? <div className="agent-overview-description rich-description" aria-label="Agent description" dangerouslySetInnerHTML={{ __html: descriptionHtml }} />
-          : description ? <p className="agent-overview-description">{description}</p> : null}
+        {selectionId && aboutSource ? <SavedAgentAbout key={`${selectionId}:${record.id}:${aboutSource.identity}`}
+          selectionId={selectionId} recordId={record.id} source={aboutSource} native={!metadata?.savedSource}
+          nativeSource={metadata?.savedSource ? resource?.savedSource : undefined} onInvalidated={onInvalidated} />
+          : descriptionHtml ? <div className="agent-overview-description rich-description" aria-label="Agent description" dangerouslySetInnerHTML={{ __html: descriptionHtml }} />
+            : description ? <p className="agent-overview-description">{description}</p> : null}
         <Properties values={information} />
         {dates.length ? <div className="agent-overview-dates"><Properties values={dates} /></div> : null}
       </section> : null}

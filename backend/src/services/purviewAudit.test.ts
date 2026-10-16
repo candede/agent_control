@@ -3,7 +3,7 @@ import type { PurviewAuditRepository } from "../db/purviewAudit.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditResult, PurviewProviderQuery } from "../types/purviewAudit.js";
+import type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditResult, PurviewProviderQuery } from "../types/purviewAudit.js";
 import { GraphAuditSearchClient, createProviderQueryBody } from "./graphAuditSearch.js";
 import { PurviewAuditService } from "./purviewAudit.js";
 import type { CapabilityService } from "./capabilities.js";
@@ -34,8 +34,7 @@ function job(overrides: Partial<PurviewAuditJob> = {}): PurviewAuditJob {
     resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, tokenMode: "delegated", status: "waiting_authorization", filters,
     displayName: "agent-control-audit:11111111-1111-4111-8111-111111111111", providerQueryId: null, providerStatus: null,
     localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: null, projectionVersion: 1, providerRequestCount: 0, activationCount: 0,
-    pageCount: 0, providerRowCount: 0, storedRowCount: 0, byteCount: 0, unknownFieldCount: 0, pageComplete: false, observedRange: null, unobservedRange: null,
-    qualificationId: null, cancelRequested: false, createdAt: new Date().toISOString(), attemptedAt: null, updatedAt: new Date().toISOString(), finishedAt: null,
+    pageCount: 0, providerRowCount: 0, storedRowCount: 0, byteCount: 0, unknownFieldCount: 0, pageComplete: false, observedRange: null, unobservedRange: null, cancelRequested: false, createdAt: new Date().toISOString(), attemptedAt: null, updatedAt: new Date().toISOString(), finishedAt: null,
     expiresAt: new Date(Date.now() + 60_000).toISOString(), canResume: true, remoteWorkMayContinue: false, ...overrides };
 }
 
@@ -67,7 +66,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     }),
     authorizeProviderRequest: vi.fn<PurviewAuditRepository["authorizeProviderRequest"]>(async () => undefined),
     recordProviderResponse: vi.fn<PurviewAuditRepository["recordProviderResponse"]>(async () => undefined),
-    recoverInterrupted: vi.fn(async () => 0), getQualification: vi.fn<PurviewAuditRepository["getQualification"]>(async () => undefined), submit: vi.fn(), approveQualification: vi.fn(),
+    recoverInterrupted: vi.fn(async () => 0), submit: vi.fn(),
     listJobs: vi.fn<PurviewAuditRepository["listJobs"]>(async () => ({ value: [current], count: 1, limit: 20, offset: 0 })),
     listRecords: vi.fn(async () => ({ value: [], count: 0, limit: 100, offset: 0, job: current })),
     agentRecords: vi.fn(async () => ({ value: [], count: 0, limit: 25, offset: 50 })),
@@ -83,11 +82,10 @@ function setup(overrides: Record<string, unknown> = {}) {
   const dependencies = {
     observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     delegatedToken: vi.fn(async () => "token"), applicationToken: vi.fn(async () => "application-token"), revalidateUser: vi.fn(async () => user),
-    requireAvailable: vi.fn(async () => ({ authorized: true })), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 1 })),
+    requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 1 })),
     beginOperationValidation: vi.fn(() => () => undefined),
     applicationIdentity: () => undefined,
-    qualificationContext: vi.fn(async () => ({ capabilityId: "purview.audit.search.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
-    recordQualificationEvidence: vi.fn(async (..._args: Parameters<CapabilityService["recordAuditQualificationEvidence"]>) => ({ authorized: true })), createQuery: vi.fn(async () => query("running")), getQuery: vi.fn(async () => query("succeeded")),
+    recordProviderEvidence: vi.fn(async (..._args: Parameters<CapabilityService["recordAuditProviderEvidence"]>) => ({ authorized: true })), createQuery: vi.fn(async () => query("running")), getQuery: vi.fn(async () => query("succeeded")),
     listQueries: vi.fn(async () => ({ value: [query("running")], complete: true, nextLink: null })), listRecords: vi.fn(async () => ({ records: [], pageCount: 1, providerRowCount: 0, storedRowCount: 0, byteCount: 2, unknownFieldCount: 0, complete: true, nextLink: null, partialReason: null })),
     wait: vi.fn(async () => undefined), random: () => 0,
     ...overrides,
@@ -98,27 +96,22 @@ function setup(overrides: Record<string, unknown> = {}) {
 describe("Purview audit worker", () => {
   beforeEach(async () => {
     await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "normal",
     }] }) });
   });
 
-  it.each(["submit", "approve"] as const)("does not let a replacement session adopt an initiating %s request", async action => {
-    const fixture = setup();
+  it("does not let a replacement session adopt an initiating submission request", async () => {
+    const fixture = setup({ applicationIdentity: () => "application-client" });
     const replaceSession = async () => {
       await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
-      return { capabilityId: "purview.audit.search.delegated" as const, contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1, authorized: true };
+      return { enabled: true, sharedDataScope: true, revision: 1 };
     };
-    if (action === "submit") fixture.dependencies.requireAvailable.mockImplementationOnce(replaceSession);
-    else fixture.dependencies.qualificationContext.mockImplementationOnce(replaceSession);
-    await expect(action === "submit"
-      ? fixture.service.submit(user, { tokenMode: "delegated", filters, idempotencyKey: "stale-submission" })
-      : fixture.service.approveQualification(user, { tokenMode: "delegated", filters })).rejects.toMatchObject({ status: 401 });
+    fixture.dependencies.requireApplicationDataScope.mockImplementationOnce(replaceSession);
+    await expect(fixture.service.submit(user, { tokenMode: "application", filters, idempotencyKey: "stale-submission" })).rejects.toMatchObject({ status: 401 });
     expect(fixture.repository.submit).not.toHaveBeenCalled();
-    expect(fixture.repository.approveQualification).not.toHaveBeenCalled();
   });
 
-  it.each(["submit", "approve"] as const)("fences an initiating %s request at persistence commit", async action => {
+  it("fences an initiating submission request at persistence commit", async () => {
     let current = true;
     const failure = new AppError(401, "authorization_expired", "Capability configuration changed during persistence.");
     const fixture = setup({ beginOperationValidation: vi.fn(() => () => { if (!current) throw failure; }) });
@@ -128,10 +121,7 @@ describe("Purview audit worker", () => {
       throw new Error("Stale persistence must not commit.");
     };
     fixture.repository.submit.mockImplementationOnce(persist);
-    fixture.repository.approveQualification.mockImplementationOnce(persist);
-    await expect(action === "submit"
-      ? fixture.service.submit(user, { tokenMode: "delegated", filters, idempotencyKey: "fenced-submission" })
-      : fixture.service.approveQualification(user, { tokenMode: "delegated", filters })).rejects.toBe(failure);
+    await expect(fixture.service.submit(user, { tokenMode: "delegated", filters, idempotencyKey: "fenced-submission" })).rejects.toBe(failure);
     expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
   });
 
@@ -164,27 +154,15 @@ describe("Purview audit worker", () => {
     const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
       throw new AppError(503, "maintenance", "Provider admissions are closed.");
     });
-    const fixture = setup({ requireAvailable: vi.fn(async () => { throw new Error("Saved commands must not check provider readiness."); }) });
+    const fixture = setup();
     try {
       await fixture.service[action](user, job().id);
       expect(fixture.repository[action]).toHaveBeenCalledWith(expect.anything(), job().id, expect.any(Function));
-      expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
       expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
     } finally { admission.mockRestore(); }
   });
 
-  it("does not let a replacement session adopt an initiating qualification request", async () => {
-    const fixture = setup();
-    fixture.repository.getQualification.mockImplementationOnce(async () => {
-      await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
-      return undefined;
-    });
-    await expect(fixture.service.startQualification(user, "33333333-3333-4333-8333-333333333333")).rejects.toMatchObject({ status: 401 });
-    expect(fixture.repository.begin).not.toHaveBeenCalled();
-    expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
-  });
-
-  it("withholds prior-page results and qualification when a later record envelope overwrites contract evidence", async () => {
+  it("withholds prior-page results when a later record envelope overwrites contract evidence", async () => {
     const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-a/records?$skiptoken=next";
     const fetcher = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(Response.json({ value: [], "@odata.nextLink": nextLink }))
@@ -199,7 +177,7 @@ describe("Purview audit worker", () => {
       expect(fetcher).toHaveBeenCalledTimes(2);
       expect(fixture.repository.authorizeProviderRequest).toHaveBeenCalledTimes(2);
       expect(fixture.repository.publish).not.toHaveBeenCalled();
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalledWith(
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalledWith(
         expect.anything(), expect.anything(), "available", expect.anything(), expect.anything(), expect.anything(),
       );
     } finally { await fixture.service.drain(); }
@@ -221,7 +199,7 @@ describe("Purview audit worker", () => {
       ));
       expect(fetcher).toHaveBeenCalledOnce();
       expect(fixture.current()).toMatchObject({ status: "partial", pageComplete: false });
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
       expect(fixture.repository.fail).not.toHaveBeenCalled();
     } finally { await fixture.service.drain(); }
   });
@@ -251,7 +229,7 @@ describe("Purview audit worker", () => {
         expect(fetch).toHaveBeenCalledTimes(action === "records" ? 1 : 0);
         expect(fixture.repository.publish).not.toHaveBeenCalled();
         expect(fixture.repository.fail).not.toHaveBeenCalled();
-        expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+        expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
       } finally {
         await fixture.service.drain();
         admission.mockRestore();
@@ -259,7 +237,7 @@ describe("Purview audit worker", () => {
     },
   );
 
-  it.each(["maintenance", "provider_requalification_required"])(
+  it.each(["maintenance"])(
     "fences Audit Search resume and publication when admissions close: %s", async code => {
       for (const stage of ["start", "activation", "authorization", "collection"]) {
         const fixture = setup();
@@ -292,7 +270,7 @@ describe("Purview audit worker", () => {
           if (stage !== "collection") expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
           expect(fixture.repository.publish).not.toHaveBeenCalled();
           expect(fixture.repository.fail).not.toHaveBeenCalled();
-          expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+          expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
           await expect(fixture.service.get(user, job().id)).resolves.toMatchObject({ id: job().id });
         } finally {
           await fixture.service.drain();
@@ -391,7 +369,7 @@ describe("Purview audit worker", () => {
         await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
         expect(fixture.current()).toMatchObject({ status: "failed", errorCode: "internal_error" });
         expect(fixture.repository.publish).not.toHaveBeenCalled();
-        expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
+        expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
           "purview.audit.search.delegated", user, "provider_error", { category: "internal_error", providerRequestId: null }, undefined, expect.any(AbortSignal),
         );
       } finally { stalled.resolve(); }
@@ -410,7 +388,7 @@ describe("Purview audit worker", () => {
     }), target, { limit: 25, offset: 50, search: "actor" });
     expect(agentContext).toHaveBeenCalledTimes(2);
     for (const provider of [fixture.dependencies.createQuery, fixture.dependencies.getQuery, fixture.dependencies.listRecords,
-      fixture.dependencies.delegatedToken, fixture.dependencies.applicationToken, fixture.dependencies.requireAvailable]) {
+      fixture.dependencies.delegatedToken, fixture.dependencies.applicationToken]) {
       expect(provider).not.toHaveBeenCalled();
     }
     await expect(fixture.service.agentRecords({ ...user, roles: [] }, recordId, { limit: 25, offset: 0 })).rejects.toMatchObject({ status: 403 });
@@ -481,7 +459,7 @@ describe("Purview audit worker", () => {
       persistence.resolve();
       await revoked;
       await vi.waitFor(() => expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
       expect(fixture.current().status).toBe("waiting_authorization");
     } finally {
       persistence.resolve();
@@ -507,7 +485,7 @@ describe("Purview audit worker", () => {
       await fixture.service.start(user, job().id, "delegated");
       await vi.waitFor(() => expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
       expect(fixture.current().status).toBe("waiting_authorization");
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
     } finally { current = true; await fixture.service.drain(); }
   });
 
@@ -523,7 +501,7 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
   });
 
-  it("withholds agent Purview results if the authorized application retained scope changes during the read", async () => {
+  it("withholds agent Purview results if the configured application scope changes during the read", async () => {
     const recordId = "agent:11111111-1111-4111-8111-111111111111";
     let revision = 1;
     const fixture = setup({
@@ -552,6 +530,39 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
   });
 
+  it.each(["submit"] as const)("binds %s to server-resolved saved bot/environment/application identities", async action => {
+    const recordId = "agent:11111111-1111-4111-8111-111111111111";
+    const target = { botId: "22222222-2222-4222-8222-222222222222", environmentId: "saved-environment",
+      applicationId: "33333333-3333-4333-8333-333333333333" };
+    const agentContext = vi.fn(async () => ({ context: { recordId }, purviewTarget: target }));
+    const fixture = setup({ agentContext });
+    await fixture.service[action](user, { tokenMode: "delegated", filters, agentRecordId: recordId, idempotencyKey: "bound-agent" });
+    const method = fixture.repository.submit;
+    expect(agentContext).toHaveBeenCalledExactlyOnceWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, recordId);
+    expect(method).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ authorizationPrincipalId: user.homeAccountId }),
+      expect.objectContaining({ filters: { ...filters, agent: { recordId, ...target } } }), expect.any(Function));
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
+  });
+
+  it.each(["submit"] as const)("rejects caller-injected agent identities before %s persistence", async action => {
+    const fixture = setup();
+    await expect(fixture.service[action](user, { tokenMode: "delegated", agentRecordId: "agent:11111111-1111-4111-8111-111111111111",
+      filters: { ...filters, agent: { recordId: "untrusted", botId: "untrusted", environmentId: "untrusted" } },
+      idempotencyKey: "untrusted-agent" })).rejects.toMatchObject({ status: 400, code: "invalid_audit_filters" });
+    expect(fixture.repository.submit).not.toHaveBeenCalled();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
+  it("keeps exact agent/user history intersection in the existing provider-free repository read", async () => {
+    const fixture = setup();
+    const recordId = "agent:11111111-1111-4111-8111-111111111111";
+    await fixture.service.list(user, 20, 40, user.username, recordId);
+    expect(fixture.repository.listJobs).toHaveBeenCalledExactlyOnceWith(expect.anything(), 20, 40, user.username, recordId);
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
+  });
+
   it("returns a durable job promptly and completes create, poll, records and publication in the background", async () => {
     const fixture = setup();
     await expect(fixture.service.start(user, job().id, "delegated")).resolves.toMatchObject({ id: job().id });
@@ -561,7 +572,7 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.listRecords).toHaveBeenCalledOnce();
     expect(fixture.current().providerStatus).toBe("succeeded");
     expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "purview.audit.search.delegated");
-    expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
+    expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
       "purview.audit.search.delegated",
       user,
       "available",
@@ -572,36 +583,45 @@ describe("Purview audit worker", () => {
   });
 
   it.each(["create", "reconcile"] as const)(
-    "verifies the delegated single-query GET before qualifying an immediately successful %s", async action => {
+    "verifies the delegated single-query GET before publishing an immediately successful %s", async action => {
       const fixture = setup({
         createQuery: vi.fn(async () => query("succeeded")),
         listQueries: vi.fn(async () => ({ value: [query("succeeded")], complete: true, nextLink: null })),
       });
       fixture.setCurrent(job({ attemptedAt: action === "reconcile" ? new Date().toISOString() : null }));
       await fixture.service.start(user, job().id, "delegated");
-      await vi.waitFor(() => expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledOnce());
       await fixture.service.drain();
       expect(fixture.dependencies.getQuery).toHaveBeenCalledOnce();
       expect(fixture.repository.recordProviderStatus).toHaveBeenCalledWith(
         expect.anything(), job().id, expect.anything(), "succeeded",
       );
-      expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
+      expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
         "purview.audit.search.delegated", user, "available", expect.anything(), undefined, expect.any(AbortSignal),
       );
     },
   );
 
-  it("does not qualify an immediately completed delegated query when its single-query GET is denied", async () => {
+  it.each((["delegated", "application"] as const).flatMap(tokenMode => [401, 403].map(status => ({ tokenMode, status }))))(
+    "records $tokenMode provider HTTP $status rather than inventing local sign-in expiry", async ({ tokenMode, status }) => {
     const fixture = setup({
-      createQuery: vi.fn(async () => query("succeeded")),
-      getQuery: vi.fn(async () => { throw new AppError(403, "provider_denied", "Single-query GET was denied."); }),
+      applicationIdentity: () => "application-client",
+      createQuery: vi.fn(async () => query("running")),
+      getQuery: vi.fn(async () => { throw new AppError(status, "provider_denied", "Single-query GET was denied."); }),
     });
-    await fixture.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
+    if (tokenMode === "application") fixture.setCurrent(job({
+      tokenMode, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
+    }));
+    await fixture.service.start(user, job().id, tokenMode);
+    await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
     await fixture.service.drain();
     expect(fixture.dependencies.listRecords).not.toHaveBeenCalled();
     expect(fixture.repository.publish).not.toHaveBeenCalled();
-    expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+    expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
+      `purview.audit.search.${tokenMode}`, user, "provider_error",
+      { category: "provider_denied", providerRequestId: null }, tokenMode === "application" ? 1 : undefined, expect.any(AbortSignal),
+    );
+    expect(fixture.repository.markWaitingAuthorization).not.toHaveBeenCalled();
   });
 
   it("keeps a completed provider query resumable when final publication authorization times out", async () => {
@@ -622,7 +642,7 @@ describe("Purview audit worker", () => {
       expect(fixture.current()).toMatchObject({ status: "waiting_authorization", providerQueryId: "provider-a", providerStatus: "succeeded" });
       expect(fixture.repository.fail).not.toHaveBeenCalled();
       expect(fixture.repository.publish).not.toHaveBeenCalled();
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
       releaseUser(user);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(fixture.repository.publish).not.toHaveBeenCalled();
@@ -665,7 +685,7 @@ describe("Purview audit worker", () => {
       await fixture.service.start(user, job().id, "delegated");
       await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledWith(expect.anything(), job().id, expect.anything(), partial, expect.any(Function)));
       expect(fixture.current()).toMatchObject({ status: "partial", pageComplete: false });
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
       expect(fixture.dependencies.revalidateUser).toHaveBeenCalledTimes(2);
       expect(fixture.repository.markWaitingAuthorization).not.toHaveBeenCalled();
     } finally {
@@ -685,6 +705,17 @@ describe("Purview audit worker", () => {
     release("token");
     await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
     await fixture.service.drain();
+  });
+
+  it.each(["cancel", "delete"] as const)("lets shared application readers view results but rejects their %s", async action => {
+    const fixture = setup({ applicationIdentity: () => "application-client" });
+    const sharedJob = job({ tokenMode: "application", resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 } });
+    fixture.setCurrent(sharedJob);
+    const reader = { ...user, homeAccountId: "other-reader" };
+    await expect(fixture.service.get(reader, sharedJob.id)).resolves.toEqual(sharedJob);
+    await expect(fixture.service[action](reader, sharedJob.id)).rejects.toMatchObject({ code: "not_found" });
+    expect(fixture.repository[action]).not.toHaveBeenCalled();
+    expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
   });
 
   it("registers a held repository lookup before drain and fences its late completion", async () => {
@@ -841,7 +872,7 @@ describe("Purview audit worker", () => {
       await draining;
     }
     expect(drained).toBe(true);
-    expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+    expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
   });
 
   it.each(["available", "provider_error"] as const)(
@@ -853,16 +884,16 @@ describe("Purview audit worker", () => {
           if (status === "provider_error") throw new AppError(502, "provider_error", "Provider unavailable.");
           return query("succeeded");
         }),
-        recordQualificationEvidence: vi.fn(async () => { await evidence; return { authorized: true }; }),
+        recordProviderEvidence: vi.fn(async () => { await evidence; return { authorized: true }; }),
       });
       await fixture.service.start(user, job().id, "delegated");
-      await vi.waitFor(() => expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledOnce());
       let drained = false;
       const draining = fixture.service.drain().then(() => { drained = true; });
       try {
         await new Promise<void>(resolve => setImmediate(resolve));
         expect(drained).toBe(false);
-        expect(fixture.dependencies.recordQualificationEvidence.mock.calls[0][5]?.aborted).toBe(true);
+        expect(fixture.dependencies.recordProviderEvidence.mock.calls[0][5]?.aborted).toBe(true);
       } finally {
         releaseEvidence();
         await draining;
@@ -885,7 +916,7 @@ describe("Purview audit worker", () => {
       releasePublication(fixture.current());
       await revocation;
       await new Promise<void>(resolve => setImmediate(resolve));
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
     } finally {
       releasePublication(fixture.current());
       await revocation;
@@ -907,7 +938,7 @@ describe("Purview audit worker", () => {
     await new Promise<void>(resolve => setImmediate(resolve));
     await fixture.service.drain();
     expect(fixture.repository.fail).toHaveBeenCalledOnce();
-    expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
+    expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
   });
 
   it("releases an activation when its deadline races with reservation handoff", async () => {
@@ -1152,198 +1183,14 @@ describe("Purview audit worker", () => {
     expect(fixture.repository.publish).not.toHaveBeenCalled();
   });
 
-  it("publishes qualification evidence only after the approved complete lifecycle", async () => {
-    const qualification: PurviewAuditQualification = { id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, filters,
-      status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-      configurationRevision: 1, approvedBy: user.homeAccountId, approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id };
-    const fixture = setup();
-    fixture.setCurrent(job({ qualificationId: qualification.id }));
-    fixture.repository.getQualification.mockResolvedValue(qualification);
-    await fixture.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith("purview.audit.search.delegated", user, "available", expect.anything(), 1, expect.any(AbortSignal)));
-    expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
-  });
-
-  it.each(["context", "admission", "publication"] as const)(
-    "withholds qualification work when approval expires during %s", async stage => {
-      const now = Date.now();
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(now);
-      const qualification: PurviewAuditQualification = {
-        id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-        authorizationPrincipalId: user.homeAccountId, resultScope: job().resultScope, filters, status: "approved",
-        contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-        approvedBy: user.homeAccountId, approvedAt: new Date(now).toISOString(), expiresAt: new Date(now + 1_000).toISOString(), jobId: job().id,
-      };
-      const fetcher = vi.fn<typeof fetch>(async () => Response.json(query("succeeded"), { status: 201 }));
-      const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
-      const fixture = setup(stage === "admission" ? { createQuery: client.createQuery.bind(client) } : {});
-      fixture.setCurrent(job({ qualificationId: qualification.id }));
-      fixture.repository.getQualification.mockResolvedValue(qualification);
-      if (stage === "context") fixture.dependencies.qualificationContext.mockImplementationOnce(async () => {
-        vi.setSystemTime(now + 1_000);
-        return { capabilityId: qualification.capabilityId, contractRevision: qualification.contractRevision,
-          permissionRevision: qualification.permissionRevision, configurationRevision: 1 };
-      });
-      if (stage === "admission") fixture.repository.authorizeProviderRequest.mockImplementationOnce(async () => {
-        vi.setSystemTime(now + 1_000);
-      });
-      if (stage === "publication") fixture.repository.publish.mockImplementationOnce(async (_scope, _id, _execution, _result, assertCurrent) => {
-        vi.setSystemTime(now + 1_000);
-        assertCurrent?.();
-        throw new Error("Expired approval must not publish or qualify.");
-      });
-      try {
-        await fixture.service.start(user, job().id, "delegated");
-        await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledWith(
-          expect.anything(), job().id, expect.anything(), "qualification_expired",
-          expect.stringContaining("Approve a new bounded qualification"), true, expect.any(Function),
-        ));
-        expect(fixture.current().status).toBe("inconclusive");
-        if (stage === "context") expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
-        if (stage === "admission") expect(fetcher).not.toHaveBeenCalled();
-        expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
-        expect(fixture.repository.markWaitingAuthorization).not.toHaveBeenCalled();
-      } finally { await fixture.service.drain(); vi.useRealTimers(); }
-    },
-  );
-
-  it.each(["available", "provider_error"] as const)(
-    "carries qualification expiry into an already-started %s evidence write", async status => {
-      const now = Date.now();
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(now);
-      const expiry = new AbortController();
-      const timeout = AbortSignal.timeout.bind(AbortSignal);
-      const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds =>
-        milliseconds === 1_000 ? expiry.signal : timeout(milliseconds));
-      const qualification: PurviewAuditQualification = {
-        id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-        authorizationPrincipalId: user.homeAccountId, resultScope: job().resultScope, filters, status: "approved",
-        contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-        approvedBy: user.homeAccountId, approvedAt: new Date(now).toISOString(), expiresAt: new Date(now + 1_000).toISOString(), jobId: job().id,
-      };
-      const fixture = setup({
-        createQuery: vi.fn(async () => {
-          if (status === "provider_error") throw new AppError(502, "provider_error", "Provider unavailable.");
-          return query("succeeded");
-        }),
-        recordQualificationEvidence: vi.fn(async (...args: Parameters<CapabilityService["recordAuditQualificationEvidence"]>) => {
-          await Promise.resolve();
-          expiry.abort(new DOMException("Qualification approval expired.", "TimeoutError"));
-          args[5]?.throwIfAborted();
-          throw new Error("Expired evidence must not commit.");
-        }),
-      });
-      fixture.setCurrent(job({ qualificationId: qualification.id }));
-      fixture.repository.getQualification.mockResolvedValue(qualification);
-      try {
-        await fixture.service.start(user, job().id, "delegated");
-        await vi.waitFor(() => expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledOnce());
-        const evidence = fixture.dependencies.recordQualificationEvidence.mock.results[0].value;
-        await expect(evidence).rejects.toMatchObject({ name: "TimeoutError" });
-        await fixture.service.drain();
-        expect(fixture.dependencies.recordQualificationEvidence.mock.calls[0][5]?.aborted).toBe(true);
-      } finally { await fixture.service.drain(); timeoutSpy.mockRestore(); vi.useRealTimers(); }
-    },
-  );
-
-  it.each(["database", "execution-loss", "session-revocation", "capability-revocation", "caller-cancellation"] as const)(
-    "preserves %s handling during qualification-expiry failure persistence", async mode => {
-      const now = Date.now();
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(now);
-      const expiry = new AbortController();
-      const timeout = AbortSignal.timeout.bind(AbortSignal);
-      const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds =>
-        milliseconds === 1_000 ? expiry.signal : timeout(milliseconds));
-      const qualification: PurviewAuditQualification = {
-        id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-        authorizationPrincipalId: user.homeAccountId, resultScope: job().resultScope, filters, status: "approved",
-        contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-        approvedBy: user.homeAccountId, approvedAt: new Date(now).toISOString(), expiresAt: new Date(now + 1_000).toISOString(), jobId: job().id,
-      };
-      const failure = mode === "execution-loss"
-        ? new AppError(409, "audit_execution_lost", "Failure persistence no longer owns this activation.")
-        : new Error("Qualification failure persistence did not commit.");
-      const capabilityFailure = new AppError(403, "capability_unavailable", "Capability changed during failure persistence.");
-      let capabilityCurrent = true;
-      const fixture = setup({
-        delegatedToken: vi.fn(() => new Promise<string>(() => undefined)),
-        beginOperationValidation: vi.fn(() => () => { if (!capabilityCurrent) throw capabilityFailure; }),
-      });
-      fixture.setCurrent(job({ qualificationId: qualification.id }));
-      fixture.repository.getQualification.mockResolvedValue(qualification);
-      const persistence = Promise.withResolvers<void>();
-      fixture.repository.fail.mockImplementationOnce(async (_scope, _id, _execution, _code, _message, _inconclusive, assertCurrent) => {
-        assertCurrent?.();
-        await persistence.promise;
-        assertCurrent?.();
-        throw failure;
-      });
-      let operation: Promise<void> | undefined;
-      try {
-        await fixture.service.start(user, job().id, "delegated");
-        operation = fixture.service["active"].get(job().id)!.operation;
-        const execution = await fixture.repository.begin.mock.results[0].value;
-        await vi.waitFor(() => expect(fixture.dependencies.delegatedToken).toHaveBeenCalledOnce());
-        vi.setSystemTime(now + 1_000);
-        expiry.abort(new DOMException("Qualification approval expired.", "TimeoutError"));
-        await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledWith(
-          expect.anything(), job().id, execution, "qualification_expired",
-          expect.stringContaining("Approve a new bounded qualification"), true, expect.any(Function),
-        ));
-        expect(fixture.repository.fail.mock.calls[0][2]).toBe(execution);
-        expect(fixture.repository.markWaitingAuthorization).not.toHaveBeenCalled();
-        if (mode === "session-revocation") {
-          await revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined);
-        } else if (mode === "capability-revocation") {
-          capabilityCurrent = false;
-        } else if (mode === "caller-cancellation") {
-          await expect(fixture.service.cancel(user, job().id)).resolves.toMatchObject({ status: "cancelled" });
-        }
-        persistence.resolve();
-        if (mode === "database") await expect(operation).rejects.toBe(failure);
-        else await expect(operation).resolves.toBeUndefined();
-        if (mode === "database" || mode === "execution-loss") {
-          expect(fixture.repository.markWaitingAuthorization).not.toHaveBeenCalled();
-          expect(fixture.current().status).toBe("reconciling_create");
-        } else {
-          expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledWith(expect.anything(), job().id, execution);
-          expect(fixture.repository.markWaitingAuthorization.mock.calls[0][2]).toBe(execution);
-          expect(fixture.current().status).toBe(mode === "caller-cancellation" ? "cancelled" : "waiting_authorization");
-        }
-        expect(fixture.repository.publish).not.toHaveBeenCalled();
-        expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
-        expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
-      } finally {
-        persistence.resolve();
-        await operation?.catch(() => undefined);
-        capabilityCurrent = true;
-        await fixture.service.drain();
-        if (mode === "session-revocation") await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
-        timeoutSpy.mockRestore();
-        vi.useRealTimers();
-      }
-    },
-  );
-
   it.each((["create", "reconcile"] as const).flatMap(action =>
     (["failed", "cancelled", "unknownFutureValue"] as const).map(status => ({ action, status })),
-  ))("preserves a terminal $status query during qualification $action", async ({ action, status }) => {
-    const qualification: PurviewAuditQualification = {
-      id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null },
-      filters, status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-      approvedBy: user.homeAccountId, approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id,
-    };
+  ))("preserves a terminal $status query during $action", async ({ action, status }) => {
     const fixture = setup({
       createQuery: vi.fn(async () => query(status)),
       listQueries: vi.fn(async () => ({ value: [query(status)], complete: true, nextLink: null })),
     });
-    fixture.setCurrent(job({ qualificationId: qualification.id, attemptedAt: action === "reconcile" ? new Date().toISOString() : null }));
-    fixture.repository.getQualification.mockResolvedValue(qualification);
+    fixture.setCurrent(job({ attemptedAt: action === "reconcile" ? new Date().toISOString() : null }));
     try {
       await fixture.service.start(user, job().id, "delegated");
       await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledWith(
@@ -1353,94 +1200,11 @@ describe("Purview audit worker", () => {
       expect(fixture.dependencies.getQuery).not.toHaveBeenCalled();
       expect(fixture.dependencies.listRecords).not.toHaveBeenCalled();
       expect(fixture.repository.publish).not.toHaveBeenCalled();
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalledWith(
+      expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalledWith(
         expect.anything(), expect.anything(), "available", expect.anything(), expect.anything(), expect.any(AbortSignal),
       );
     } finally {
       await fixture.service.drain();
-    }
-  });
-
-  it.each(["available", "provider_error"] as const)("binds application %s evidence to its approved configuration", async status => {
-    const admin: AuthenticatedUser = { ...user, roles: ["AgentControl.Admin"] };
-    const qualification: PurviewAuditQualification = {
-      id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.application", tokenMode: "application",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 7 },
-      filters, status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 7,
-      approvedBy: user.homeAccountId, approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id,
-    };
-    const fixture = setup({
-      applicationIdentity: () => "application-client",
-      revalidateUser: vi.fn(async () => admin),
-      requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 7 })),
-      qualificationContext: vi.fn(async () => ({ capabilityId: qualification.capabilityId, contractRevision: qualification.contractRevision,
-        permissionRevision: qualification.permissionRevision, configurationRevision: 7 })),
-      createQuery: vi.fn(async () => {
-        if (status === "provider_error") throw new AppError(502, "provider_error", "Provider unavailable");
-        return query("succeeded");
-      }),
-    });
-    fixture.setCurrent(job({ tokenMode: "application", resultScope: qualification.resultScope, qualificationId: qualification.id }));
-    fixture.repository.getQualification.mockResolvedValue(qualification);
-    await fixture.service.start(admin, job().id, "application");
-    await vi.waitFor(() => expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledOnce());
-    await fixture.service.drain();
-    expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
-      qualification.capabilityId, admin, status, expect.any(Object), 7, expect.any(AbortSignal),
-    );
-  });
-
-  it("requires current Viewer authority at qualification dispatch and publication", async () => {
-    const qualification: PurviewAuditQualification = { id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, filters,
-      status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
-      approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id };
-    const dispatch = setup({ revalidateUser: vi.fn(async () => ({ ...user, roles: [] })) });
-    dispatch.setCurrent(job({ qualificationId: qualification.id }));
-    dispatch.repository.getQualification.mockResolvedValue(qualification);
-    await dispatch.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(dispatch.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
-    expect(dispatch.dependencies.createQuery).not.toHaveBeenCalled();
-
-    const publication = setup({ revalidateUser: vi.fn()
-      .mockResolvedValueOnce(user)
-      .mockResolvedValueOnce({ ...user, roles: [] }) });
-    publication.setCurrent(job({ qualificationId: qualification.id }));
-    publication.repository.getQualification.mockResolvedValue(qualification);
-    await publication.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(publication.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
-    expect(publication.repository.publish).not.toHaveBeenCalled();
-    expect(publication.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
-  });
-
-  it("returns an already-qualified terminal job without renewing capability evidence", async () => {
-    const qualification: PurviewAuditQualification = { id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, filters,
-      status: "qualified", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
-      approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id };
-    const fixture = setup();
-    fixture.setCurrent(job({ status: "succeeded", qualificationId: qualification.id, canResume: false, finishedAt: new Date().toISOString() }));
-    fixture.repository.getQualification.mockResolvedValue(qualification);
-    await expect(fixture.service.startQualification(user, qualification.id)).resolves.toMatchObject({ status: "succeeded" });
-    expect(fixture.repository.begin).not.toHaveBeenCalled();
-    expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
-  });
-
-  it.each(["succeeded", "running"] as const)("counts the mandatory qualification GET within the poll limit: %s", async status => {
-    const qualification: PurviewAuditQualification = { id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, filters,
-      status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
-      approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id };
-    const fixture = setup({ createQuery: vi.fn(async () => query("succeeded")), getQuery: vi.fn(async () => query(status)) });
-    fixture.setCurrent(job({ qualificationId: qualification.id }));
-    fixture.repository.getQualification.mockResolvedValue(qualification);
-    await fixture.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(status === "succeeded" ? fixture.repository.publish : fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
-    await fixture.service.drain();
-    expect(fixture.dependencies.getQuery).toHaveBeenCalledTimes(status === "succeeded" ? 1 : 6);
-    if (status === "running") {
-      expect(fixture.repository.publish).not.toHaveBeenCalled();
-      expect(fixture.dependencies.recordQualificationEvidence).not.toHaveBeenCalled();
     }
   });
 
@@ -1478,35 +1242,12 @@ describe("Purview audit worker", () => {
   });
 
   it("reads authorized saved jobs and records without requiring live provider availability", async () => {
-    const fixture = setup({ requireAvailable: vi.fn(async () => { throw new Error("must not be called"); }) });
+    const fixture = setup();
     await expect(fixture.service.get(user, job().id)).resolves.toMatchObject({ id: job().id });
     await expect(fixture.service.list(user)).resolves.toMatchObject({ count: 1 });
     await expect(fixture.service.records(user, job().id)).resolves.toMatchObject({ count: 0 });
-    expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
-  });
-
-  it("allows Viewer delegated qualification and reserves application qualification for Admin", async () => {
-    const fixture = setup();
-    await expect(fixture.service.approveQualification({ ...user, roles: [] }, { tokenMode: "delegated", filters })).rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(fixture.service.approveQualification(user, { tokenMode: "delegated", filters })).resolves.toBeUndefined();
-    expect(fixture.repository.approveQualification).toHaveBeenCalledOnce();
-
-    const application = setup({
-      applicationIdentity: () => "application-client",
-      qualificationContext: vi.fn(async () => ({ capabilityId: "purview.audit.search.application" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
-    });
-    await expect(application.service.approveQualification(user, { tokenMode: "application", filters }))
-      .rejects.toMatchObject({ code: "missing_internal_role" });
-    const admin: AuthenticatedUser = { ...user, roles: ["AgentControl.Admin"] };
-    await expect(application.service.approveQualification(admin, { tokenMode: "application", filters })).resolves.toBeUndefined();
-
-    const qualification: PurviewAuditQualification = {
-      id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.application", tokenMode: "application",
-      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 }, filters,
-      status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-      approvedBy: user.homeAccountId, approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: null,
-    };
-    application.repository.getQualification.mockResolvedValue(qualification);
-    await expect(application.service.startQualification(user, qualification.id)).rejects.toMatchObject({ code: "missing_internal_role" });
+    expect(fixture.dependencies.createQuery).not.toHaveBeenCalled();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(fixture.dependencies.applicationToken).not.toHaveBeenCalled();
   });
 });

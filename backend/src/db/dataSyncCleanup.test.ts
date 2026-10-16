@@ -180,16 +180,15 @@ describe("clean full data sync admission", () => {
     expect(await repository.listRuns(scope)).toEqual([]);
   });
 
-  it("does not clear data when hourly admission is full", async () => {
+  it("does not let completed run history block an explicitly requested clean sync", async () => {
     const scope = newScope();
     await seedSnapshots(scope);
-    const before = await scopedSnapshots(scope);
     await fixture.operator.query(`INSERT INTO data_sync_runs(id,tenant_id,principal_id,mode,source_ids,request_hash,status)
       SELECT gen_random_uuid(),$1,$2,'incremental','["users"]',repeat('a',64),'completed' FROM generate_series(1,20)`,
     [scope.tenantId, scope.principalId]);
-    await expect(repository.submit(scope, cleanInput)).rejects.toMatchObject({ code: "data_sync_admission_full" });
-    expect(await scopedSnapshots(scope)).toEqual(before);
-    expect(await repository.listRuns(scope)).toHaveLength(20);
+    expect(await repository.submit(scope, cleanInput)).toMatchObject({ created: true });
+    expect(await scopedSnapshots(scope)).toMatchObject({ inventoryRoots: [], inventoryRecords: [] });
+    expect(await repository.listRuns(scope, 30)).toHaveLength(21);
   });
 
   it.each(["packages", "inventory"] as const)("rejects unfinished %s refreshes before any deletion", async provider => {

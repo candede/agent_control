@@ -1,4 +1,5 @@
 import type { CopilotAppActivity, CopilotDirectoryIdentity, CopilotServicePlan, CopilotServiceSummaryState } from "./copilotUsage.js";
+import type { SelectedRead } from "./dataSelection.js";
 
 // Candidate contracts only. Official report metrics are composed by 02A.
 export type UserSourceKind = "directory" | "app_activity";
@@ -39,11 +40,10 @@ export type UserSourceFacts = {
   appActivity: CopilotAppActivity | null;
   activityState: NonNullable<UserSourceFilter["activity"]>;
 };
-export type UserSourceSelection = import("./dataSelection.js").SelectedRead;
 export type UserSourcePage<T> = {
   value: T[];
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
-  selection: UserSourceSelection;
+  selection: SelectedRead;
   counts: { total: number; filtered: number };
 };
 export type UserSourceSummary = {

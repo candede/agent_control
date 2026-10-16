@@ -1,4 +1,4 @@
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { PowerPlatformRefreshJobs, type InventoryDataScope, type InventoryRefreshInput } from "../db/powerPlatformRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
@@ -16,8 +16,8 @@ import { StreamedInventory } from "./streamedInventory.js";
 import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
 
 type InventoryRefreshDependencies = {
-  delegatedToken: typeof acquireDelegatedToken;
-  revalidateUser: typeof revalidateAuthenticatedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
+  revalidateUser: typeof revalidateAuthorizedUser;
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
@@ -25,8 +25,8 @@ type InventoryRefreshDependencies = {
 };
 
 const defaultDependencies: InventoryRefreshDependencies = {
-  delegatedToken: acquireDelegatedToken,
-  revalidateUser: revalidateAuthenticatedUser,
+  delegatedToken: acquireAuthorizedToken,
+  revalidateUser: revalidateAuthorizedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
@@ -413,7 +413,7 @@ function requireSamePrincipal(scope: InventoryDataScope, user: AuthenticatedUser
 
 function isAuthorizationFailure(error: unknown) {
   return error instanceof AppError && (dataSyncFailureStatus(error.code, error.status) === "waiting_authorization"
-    || ["maintenance", "provider_requalification_required"].includes(error.code));
+    || error.code === "maintenance");
 }
 
 function failureCode(error: unknown) {

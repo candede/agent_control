@@ -1,4 +1,4 @@
-import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { findTenantConfiguration } from "../config.js";
 import { PurviewAuditRepository, type PurviewAuditExecution, type PurviewAuditReadScope, type PurviewAuditScope } from "../db/purviewAudit.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
@@ -16,16 +16,14 @@ import { requireProviderAdmissions } from "./operationalState.js";
 
 type CapabilityId = "purview.audit.search.delegated" | "purview.audit.search.application";
 type AuditDependencies = {
-  delegatedToken: typeof acquireDelegatedToken;
+  delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  requireAvailable: typeof capabilities.requireAvailable;
+  revalidateUser: typeof revalidateAuthorizedUser;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
   applicationIdentity: (tenantId: string) => string | undefined;
-  qualificationContext: typeof capabilities.auditQualificationContext;
-  recordQualificationEvidence: typeof capabilities.recordAuditQualificationEvidence;
+  recordProviderEvidence: typeof capabilities.recordAuditProviderEvidence;
   createQuery: GraphAuditSearchClient["createQuery"];
   getQuery: GraphAuditSearchClient["getQuery"];
   listQueries: GraphAuditSearchClient["listQueries"];
@@ -37,16 +35,14 @@ type AuditDependencies = {
 
 const graphAudit = new GraphAuditSearchClient();
 const defaultDependencies: AuditDependencies = {
-  delegatedToken: acquireDelegatedToken,
+  delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
-  revalidateUser: revalidateAuthenticatedUser,
-  requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  revalidateUser: revalidateAuthorizedUser,
   beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
   applicationIdentity: tenantId => findTenantConfiguration(tenantId)?.clientId,
-  qualificationContext: capabilities.auditQualificationContext.bind(capabilities),
-  recordQualificationEvidence: capabilities.recordAuditQualificationEvidence.bind(capabilities),
+  recordProviderEvidence: capabilities.recordAuditProviderEvidence.bind(capabilities),
   createQuery: graphAudit.createQuery.bind(graphAudit),
   getQuery: graphAudit.getQuery.bind(graphAudit),
   listQueries: graphAudit.listQueries.bind(graphAudit),
@@ -90,63 +86,11 @@ export class PurviewAuditService {
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
       : undefined;
-    await this.dependencies.requireAvailable(capabilityId, user);
     return commitAccountSessionValidation(authority.validation, async () => {
       assertCurrent();
       return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)),
         { idempotencyKey: input.idempotencyKey, filters }, assertCurrent);
     });
-  }
-
-  async approveQualification(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; agentRecordId?: unknown }) {
-    requireQualificationRole(user, input.tokenMode);
-    requireProviderAdmissions();
-    const authority = this.initiatingAuthority(user, [input.tokenMode]);
-    const assertCurrent = () => { authority.assertCurrent(); requireProviderAdmissions(); requireQualificationRole(user, input.tokenMode); };
-    const filters = await this.bindFilters(user, input.filters, input.agentRecordId, true);
-    assertCurrent();
-    const capabilityId = capabilityForMode(input.tokenMode);
-    const applicationConfiguration = input.tokenMode === "application"
-      ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
-      : undefined;
-    const context = await this.dependencies.qualificationContext(capabilityId, user);
-    return commitAccountSessionValidation(authority.validation, async () => {
-      assertCurrent();
-      return this.repository.approveQualification(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)),
-        { filters, ...context, approvedBy: user.homeAccountId }, assertCurrent);
-    });
-  }
-
-  async startQualification(user: AuthenticatedUser, qualificationId: string) {
-    requireViewer(user);
-    const authority = this.initiatingAuthority(user, ["delegated", "application"]);
-    if (!user.tenantId) throw AppError.unauthorized();
-    const qualification = await this.repository.getQualification(user.tenantId, qualificationId);
-    authority.assertCurrent();
-    if (!qualification || qualification.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Audit Search qualification was not found.");
-    requireQualificationRole(user, qualification.tokenMode);
-    if (!resultScopeMatches(qualification.resultScope, await this.resultScopeForMode(user, qualification.tokenMode))) {
-      throw new AppError(404, "not_found", "Audit Search qualification was not found.");
-    }
-    const context = await this.dependencies.qualificationContext(qualification.capabilityId, user);
-    authority.assertCurrent();
-    if (qualification.contractRevision !== context.contractRevision || qualification.permissionRevision !== context.permissionRevision || qualification.configurationRevision !== context.configurationRevision) {
-      throw new AppError(409, "qualification_superseded", "Audit Search permission, contract, or configuration changed after approval.");
-    }
-    if (qualification.jobId) {
-      const job = await this.repository.getJob(await this.readScope(user), qualification.jobId);
-      authority.assertCurrent();
-      if (!job) throw new AppError(404, "not_found", "Audit Search qualification job was not found.");
-      return job.status === "waiting_authorization" ? this.start(user, job.id, qualification.tokenMode) : job;
-    }
-    const assertCurrent = () => { authority.assertCurrent(); requireProviderAdmissions(); requireQualificationRole(user, qualification.tokenMode); };
-    const job = await commitAccountSessionValidation(authority.validation, async () => {
-      assertCurrent();
-      return this.repository.submit(scopeFromResult(user, qualification.tokenMode, qualification.resultScope),
-        { idempotencyKey: `qualification_${qualification.id.replaceAll("-", "")}`, filters: qualification.filters, qualificationId }, assertCurrent);
-    });
-    authority.assertCurrent();
-    return this.start(user, job.id, qualification.tokenMode);
   }
 
   start(user: AuthenticatedUser, id: string, tokenMode: PurviewAuditTokenMode): Promise<PurviewAuditJob> {
@@ -191,9 +135,6 @@ export class PurviewAuditService {
     if (!current || current.authorizationPrincipalId !== user.homeAccountId || current.tokenMode !== tokenMode) throw new AppError(404, "not_found", "Audit Search job was not found.");
     if (current.status !== "waiting_authorization") return { job: current };
     const scope = scopeFromResult(user, tokenMode, current.resultScope);
-    const qualification = current.qualificationId
-      ? await abortable(this.repository.getQualification(actor.tenantId, current.qualificationId), signal)
-      : undefined;
     signal.throwIfAborted();
     authority.assertCurrent();
     // Activation owns a database write; cancellation must join it and its release.
@@ -208,7 +149,7 @@ export class PurviewAuditService {
       }
       throw error;
     }
-    return { job: activation.job, run: () => this.run(actor, scope, activation.job, qualification, activation.action, activation, signal, cancellationSignal, authority) };
+    return { job: activation.job, run: () => this.run(actor, scope, activation.job, activation.action, activation, signal, cancellationSignal, authority) };
   }
 
   private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: PurviewAuditTokenMode) {
@@ -241,18 +182,18 @@ export class PurviewAuditService {
     return this.repository.listRecords(await this.readScope(user), id, limit, offset);
   }
 
-  private async bindFilters(user: AuthenticatedUser, input: unknown, recordId: unknown, qualification = false) {
+  private async bindFilters(user: AuthenticatedUser, input: unknown, recordId: unknown) {
     if (input && typeof input === "object" && "agent" in input) {
       throw new AppError(400, "invalid_audit_filters", "Agent audit identities are selected from the saved agent, not supplied by the caller.");
     }
-    if (recordId === undefined) return validatePurviewAuditFilters(input, { qualification });
-    if (!input || typeof input !== "object" || Array.isArray(input)) return validatePurviewAuditFilters(input, { qualification });
+    if (recordId === undefined) return validatePurviewAuditFilters(input);
+    if (!input || typeof input !== "object" || Array.isArray(input)) return validatePurviewAuditFilters(input);
     const resolve = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations);
     const current = await resolve(actorScope(user), investigationRecordId(recordId));
     if (!current.purviewTarget) throw new AppError(409, "agent_investigation_unavailable", current.context.purview.reason!);
     const { botId, environmentId, applicationId } = current.purviewTarget;
     return validatePurviewAuditFilters({ ...input, agent: { recordId: current.context.recordId, botId, environmentId,
-      ...("presetId" in input && input.presetId === "copilot_interactions" && applicationId ? { applicationId } : {}) } }, { qualification });
+      ...("presetId" in input && input.presetId === "copilot_interactions" && applicationId ? { applicationId } : {}) } });
   }
 
   async relatedInventoryRecords(user: AuthenticatedUser, target: { environmentId: string; botId: string }, limit = 20) {
@@ -297,7 +238,8 @@ export class PurviewAuditService {
     id = id.toLowerCase();
     const readScope = await this.readScope(user);
     authority.assertCurrent();
-    if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
+    const current = await this.repository.getJob(readScope, id);
+    if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Audit Search job was not found.");
     const job = await commitAccountSessionValidation(authority.validation, () => {
       authority.assertCurrent();
       return this.repository.cancel(readScope, id, authority.assertCurrent);
@@ -312,7 +254,8 @@ export class PurviewAuditService {
     id = id.toLowerCase();
     const readScope = await this.readScope(user);
     authority.assertCurrent();
-    if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
+    const current = await this.repository.getJob(readScope, id);
+    if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Audit Search job was not found.");
     await commitAccountSessionValidation(authority.validation, () => {
       authority.assertCurrent();
       return this.repository.delete(readScope, id, authority.assertCurrent);
@@ -345,39 +288,27 @@ export class PurviewAuditService {
     actor: { tenantId: string; principalId: string },
     scope: PurviewAuditScope,
     current: NonNullable<Awaited<ReturnType<PurviewAuditRepository["getJob"]>>>,
-    qualification: Awaited<ReturnType<PurviewAuditRepository["getQualification"]>>,
     action: "create" | "reconcile" | "poll",
     execution: PurviewAuditExecution,
     signal: AbortSignal,
     cancellationSignal: AbortSignal,
     authority: AuditAuthority,
   ) {
-    let qualificationDeadline: AbortSignal | undefined;
-    const assertCurrent = () => {
-      authority.assertCurrent();
-      if (qualification) requireUnexpiredQualification(qualification);
-    };
+    const assertCurrent = authority.assertCurrent;
     let authorizationSignal = signal;
     try {
       const validation = authority.validation;
       assertCurrent();
-      if (qualification) {
-        qualificationDeadline = AbortSignal.timeout(Math.max(1, Date.parse(qualification.expiresAt) - Date.now()));
-        signal = AbortSignal.any([signal, qualificationDeadline]);
-        authorizationSignal = signal;
-      }
-      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal, current.filters);
+      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, signal, current.filters);
       const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
         : this.dependencies.applicationToken(actor.tenantId, capabilityId), signal), { signal, clearOnSuccess: false });
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
-      if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
         signal.throwIfAborted();
         assertCurrent();
         requireSamePrincipal(actor, freshUser);
-        if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
-        else requireViewer(freshUser);
+        requireViewer(freshUser);
       }), signal);
       const providerOptions = {
         signal,
@@ -416,7 +347,7 @@ export class PurviewAuditService {
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
 
-      let lifecyclePollRequired = Boolean((qualification || scope.tokenMode === "delegated") && action !== "poll");
+      let lifecyclePollRequired = scope.tokenMode === "delegated" && action !== "poll";
       while (query.status !== "succeeded" || lifecyclePollRequired) {
         if (["failed", "cancelled", "unknownFutureValue"].includes(query.status)) throw new AppError(502, "provider_query_failed", `Microsoft Graph Audit Search ended with status ${query.status}.`);
         if (pollCount >= maximumPollsPerActivation) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
@@ -445,30 +376,28 @@ export class PurviewAuditService {
         result.complete = false;
         result.partialReason = "audit_activation_timeout";
       }
-      const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000), ...(qualificationDeadline ? [qualificationDeadline] : [])]);
+      const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
       authorizationSignal = publicationSignal;
       const publicationValidation = authority.validation;
-      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal, current.filters);
+      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, publicationSignal, current.filters);
       const job = await commitAccountSessionValidation(publicationValidation, async () => {
         publicationSignal.throwIfAborted();
         assertCurrent();
         requireSamePrincipal(actor, publicationUser);
-        if (qualification) requireQualificationRole(publicationUser, scope.tokenMode);
-        else requireViewer(publicationUser);
+        requireViewer(publicationUser);
         return this.repository.publish(scope, current.id, execution, result, () => {
           publicationSignal.throwIfAborted();
           assertCurrent();
         });
       });
-      const evidenceCapabilityId = qualification?.capabilityId ??
-        (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
-      if (evidenceCapabilityId && job.status === "succeeded") {
+      const evidenceCapabilityId = capabilityForMode(scope.tokenMode);
+      if (job.status === "succeeded") {
         try {
           await commitAccountSessionValidation(publicationValidation, async () => {
             publicationSignal.throwIfAborted();
             assertCurrent();
-            await this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available",
-              { providerRequestId: job.providerRequestId }, qualification?.configurationRevision, publicationSignal);
+            await this.dependencies.recordProviderEvidence(evidenceCapabilityId, publicationUser, "available",
+              { providerRequestId: job.providerRequestId }, scope.resultScope.configurationRevision ?? undefined, publicationSignal);
           });
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_success" });
@@ -477,20 +406,18 @@ export class PurviewAuditService {
     } catch (error) {
       try { assertCurrent(); } catch (authorityError) { error = authorityError; }
       if (error instanceof AppError && error.code === "audit_execution_lost") return;
-      const qualificationExpired = error instanceof AppError && error.code === "qualification_expired";
-      if (!qualificationExpired && (signal.aborted || authorizationSignal.aborted || isAuthorizationFailure(error))) {
+      if (signal.aborted || authorizationSignal.aborted || isAuthorizationFailure(error)) {
         await this.repository.markWaitingAuthorization(scope, current.id, execution);
         return;
       }
-      const inconclusive = qualificationExpired || error instanceof AppError && ["audit_create_inconclusive", "provider_schema", "provider_error", "invalid_provider_link", "audit_provider_request_limit", "audit_job_expired"].includes(error.code);
-      const failureSignal = qualificationExpired ? cancellationSignal : signal;
+      const inconclusive = error instanceof AppError && ["audit_create_inconclusive", "provider_schema", "provider_error", "invalid_provider_link", "audit_provider_request_limit", "audit_job_expired"].includes(error.code);
+      const failureSignal = signal;
       let job: PurviewAuditJob | undefined;
       try {
         job = await this.repository.fail(scope, current.id, execution, error instanceof AppError ? error.code : "provider_error", safeFailureMessage(error), inconclusive,
           () => {
             failureSignal.throwIfAborted();
-            if (qualificationExpired) authority.assertCurrent();
-            else assertCurrent();
+            assertCurrent();
           });
       } catch (publicationError) {
         if (failureSignal.aborted || isAuthorizationFailure(publicationError)) {
@@ -499,28 +426,23 @@ export class PurviewAuditService {
         }
         throw publicationError;
       }
-      if (qualificationExpired) return;
-      const evidenceCapabilityId = qualification?.capabilityId ??
-        (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
-      if (evidenceCapabilityId) {
-        try {
-          const evidenceSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000), ...(qualificationDeadline ? [qualificationDeadline] : [])]);
+      const evidenceCapabilityId = capabilityForMode(scope.tokenMode);
+      try {
+        const evidenceSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
+        evidenceSignal.throwIfAborted();
+        const evidenceValidation = authority.validation;
+        const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), evidenceSignal);
+        await commitAccountSessionValidation(evidenceValidation, async () => {
           evidenceSignal.throwIfAborted();
-          const evidenceValidation = authority.validation;
-          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), evidenceSignal);
-          await commitAccountSessionValidation(evidenceValidation, async () => {
-            evidenceSignal.throwIfAborted();
-            assertCurrent();
-            requireSamePrincipal(actor, evidenceUser);
-            if (qualification) requireQualificationRole(evidenceUser, scope.tokenMode);
-            else requireViewer(evidenceUser);
-            await this.dependencies.recordQualificationEvidence(evidenceCapabilityId, evidenceUser, qualificationEvidenceStatus(error), {
-              category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
-            }, qualification?.configurationRevision, evidenceSignal);
-          });
-        } catch {
-          operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_failure" });
-        }
+          assertCurrent();
+          requireSamePrincipal(actor, evidenceUser);
+          requireViewer(evidenceUser);
+          await this.dependencies.recordProviderEvidence(evidenceCapabilityId, evidenceUser, providerEvidenceStatus(error), {
+            category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
+          }, scope.resultScope.configurationRevision ?? undefined, evidenceSignal);
+        });
+      } catch {
+        operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_failure" });
       }
     }
   }
@@ -528,7 +450,6 @@ export class PurviewAuditService {
   private async validateCurrentAuthority(
     actor: { tenantId: string; principalId: string },
     scope: PurviewAuditScope,
-    qualification: Awaited<ReturnType<PurviewAuditRepository["getQualification"]>>,
     signal: AbortSignal,
     filters: PurviewAuditFilters,
   ) {
@@ -538,12 +459,9 @@ export class PurviewAuditService {
     signal.throwIfAborted();
     requireProviderAdmissions();
     requireSamePrincipal(actor, freshUser);
-    if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
-    else requireViewer(freshUser);
+    requireViewer(freshUser);
     const capabilityId = capabilityForMode(scope.tokenMode);
     if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
-    if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
-    else await abortable(this.dependencies.requireAvailable(capabilityId, freshUser), signal);
     await this.validateAgentTarget(freshUser, filters, signal);
     signal.throwIfAborted();
     requireProviderAdmissions();
@@ -594,19 +512,6 @@ export class PurviewAuditService {
     return undefined;
   }
 
-  private async validateCurrentQualification(qualification: NonNullable<Awaited<ReturnType<PurviewAuditRepository["getQualification"]>>>, user: AuthenticatedUser, signal?: AbortSignal) {
-    if (!qualification || !["approved", "running"].includes(qualification.status) || qualification.authorizationPrincipalId !== user.homeAccountId
-      || !resultScopeMatches(qualification.resultScope, await this.resultScopeForMode(user, qualification.tokenMode, signal))) {
-      throw new AppError(409, "qualification_mismatch", "Audit Search qualification is not current for this principal.");
-    }
-    requireUnexpiredQualification(qualification);
-    const current = await abortable(this.dependencies.qualificationContext(qualification.capabilityId, user), signal);
-    requireUnexpiredQualification(qualification);
-    if (qualification.contractRevision !== current.contractRevision || qualification.permissionRevision !== current.permissionRevision || qualification.configurationRevision !== current.configurationRevision) {
-      throw new AppError(409, "qualification_superseded", "Audit Search qualification no longer matches current permission, contract, and configuration revisions.");
-    }
-  }
-
   private async resultScopeForMode(user: AuthenticatedUser, tokenMode: PurviewAuditTokenMode, signal?: AbortSignal) {
     if (tokenMode === "delegated") return scopeFor(user, tokenMode).resultScope;
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityForMode(tokenMode), user), signal);
@@ -621,7 +526,7 @@ export class PurviewAuditService {
     } catch (error) {
       if (!(error instanceof AppError && error.code === "not_configured")) throw error;
     }
-    return { tenantId: user.tenantId, resultScopes,
+    return { tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId, resultScopes,
       ...(hasAppRole(user.roles, "AgentControl.Viewer") ? { inventoryIdentityScope: {
         principalId: user.homeAccountId, resourceTypes: [...powerPlatformResourceTypes],
       } } : {}) };
@@ -643,7 +548,7 @@ export const purviewAudit = new PurviewAuditService();
 
 function requireBoundQuery(query: PurviewProviderQuery, job: { displayName: string; filters: Parameters<typeof providerQueryMatches>[2] }, providerQueryId?: string) {
   if (providerQueryId !== undefined && query.id !== providerQueryId || !providerQueryMatches(query, job.displayName, job.filters)) {
-    throw new AppError(502, "provider_schema", "Microsoft Graph returned an Audit Search query outside the durable approved identity and filters.");
+    throw new AppError(502, "provider_schema", "Microsoft Graph returned an Audit Search query outside the submitted identity and filters.");
   }
 }
 
@@ -680,35 +585,22 @@ function requireViewer(user: AuthenticatedUser) {
   if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Audit Search requires the Viewer role.");
 }
 
-function requireQualificationRole(user: AuthenticatedUser, tokenMode: PurviewAuditTokenMode) {
-  requireViewer(user);
-  if (tokenMode === "application" && !hasAppRole(user.roles, "AgentControl.Admin")) {
-    throw new AppError(403, "missing_internal_role", "Application Audit Search qualification approval requires the Admin role.");
-  }
-}
-
 function requireSamePrincipal(scope: { tenantId: string; principalId: string }, user: AuthenticatedUser) {
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The signed-in account changed during Audit Search.");
 }
 
-function requireUnexpiredQualification(qualification: { expiresAt: string }) {
-  if (!(Date.parse(qualification.expiresAt) > Date.now())) {
-    throw new AppError(409, "qualification_expired", "Audit Search qualification approval expired. Approve a new bounded qualification.");
-  }
-}
-
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "provider_denied", "missing_internal_role", "capability_unavailable", "capability_invalidation_failed", "not_configured", "application_scope_changed", "qualification_mismatch", "qualification_superseded", "maintenance", "provider_requalification_required"].includes(error.code));
+  return error instanceof AppError && (error.status === 401 && error.code !== "provider_denied" || ["interaction_required", "authorization_expired", "missing_internal_role", "capability_unavailable", "capability_invalidation_failed", "not_configured", "application_scope_changed", "maintenance"].includes(error.code));
 }
 
-function qualificationEvidenceStatus(error: unknown): CapabilityStatus {
+function providerEvidenceStatus(error: unknown): CapabilityStatus {
   if (error instanceof AppError && error.code === "missing_permission") return "missing_permission";
   if (error instanceof AppError && error.code === "unsupported") return "unsupported";
   return "provider_error";
 }
 
 function safeFailureMessage(error: unknown) {
-  if (error instanceof AppError && ["provider_error", "provider_not_found", "provider_schema", "provider_result_limit", "provider_query_failed", "provider_denied", "invalid_provider_link", "audit_create_ambiguous", "qualification_expired"].includes(error.code)) return error.message.slice(0, 1024);
+  if (error instanceof AppError && ["provider_error", "provider_not_found", "provider_schema", "provider_result_limit", "provider_query_failed", "provider_denied", "invalid_provider_link", "audit_create_ambiguous"].includes(error.code)) return error.message.slice(0, 1024);
   return "Audit Search stopped before complete minimized result publication.";
 }
 

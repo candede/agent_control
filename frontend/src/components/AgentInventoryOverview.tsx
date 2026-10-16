@@ -24,7 +24,7 @@ export function AgentInventoryScopes({ inventory, value, onChange, loading = fal
       className="agent-inventory-scope" aria-pressed={value === option.value}
       aria-label={option.label} title={option.description} onClick={() => onChange(option.value)}>
       <span>{option.value === "catalog" ? "Microsoft 365 catalog" : "Power Platform"}{option.value === "power_platform_only" ? <small>Additional</small> : null}</span>
-      <strong>{loading && !inventory ? <span className="skeleton-block skeleton-count" aria-label="Loading count" /> : usageCount(scopeCount(inventory, option.value))}</strong>
+      <strong>{loading && !inventory ? <span className="skeleton-block skeleton-count" aria-hidden="true" /> : usageCount(scopeCount(inventory, option.value))}</strong>
     </button>)}
   </div>;
 }
@@ -99,7 +99,7 @@ function Metric({ label, value, hint, selected, onClick, loading = false }: {
   label: string; value: number | null; hint: string; selected?: boolean; onClick?: () => void; loading?: boolean;
 }) {
   const content = <><span title={label}>{label}</span><strong>{loading
-    ? <span className="skeleton-block skeleton-count" aria-label="Loading count" /> : usageCount(value)}</strong><small title={hint}>{hint}</small></>;
+    ? <span className="skeleton-block skeleton-count" aria-hidden="true" /> : usageCount(value)}</strong><small title={hint}>{hint}</small></>;
   return onClick
     ? <button type="button" className="metric agent-overview-filter" aria-label={`Show ${label.toLowerCase()}`}
       aria-pressed={selected} disabled={value === null} onClick={onClick}>{content}</button>

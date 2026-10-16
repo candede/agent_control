@@ -121,8 +121,8 @@ describe("data sync persistence integration", () => {
       expect((await restoredRepository.getRun(scope, run.id))?.sources.find(source => source.source === "users")).toMatchObject({
         status: "waiting_authorization", canRetry: true,
       });
-      expect((await restored.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({
-        mode: "maintenance", provider_work_enabled: false,
+      expect((await restored.query("SELECT mode FROM operational_state")).rows[0]).toEqual({
+        mode: "maintenance",
       });
       expect((await current.runtime.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(1);
       expect((await restored.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(0);

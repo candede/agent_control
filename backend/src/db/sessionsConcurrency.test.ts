@@ -1,7 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
-import { activateAccountSession, beginAccountSessionValidation, commitAccountSessionValidation, revokeAccountSessionMutations } from "./sessions.js";
+import { activateAccountSession, authorizeAccountBearer, beginAccountSessionValidation, commitAccountSessionValidation, revokeAccountSessionMutations } from "./sessions.js";
 
 describe("concurrent account role validation", () => {
+  it("does not revive a revoked generation or supersede valid independent bearer peers", async () => {
+    const before = beginAccountSessionValidation("tenant", "bearer-recovery");
+    const cutoff = Date.now();
+    await revokeAccountSessionMutations("tenant", "bearer-recovery", async () => undefined);
+    await expect(authorizeAccountBearer("tenant", "bearer-recovery", cutoff, async () => undefined)).rejects.toMatchObject({ code: "unauthorized" });
+    const validations = await Promise.all([
+      authorizeAccountBearer("tenant", "bearer-recovery", cutoff + 2000, async value => value),
+      authorizeAccountBearer("tenant", "bearer-recovery", cutoff + 2000, async value => value),
+    ]);
+    await expect(commitAccountSessionValidation(before, async () => undefined)).rejects.toMatchObject({ code: "unauthorized" });
+    for (const value of validations) await expect(commitAccountSessionValidation(value, async () => "current")).resolves.toBe("current");
+  });
   it("allows concurrent valid refreshes without treating another refresh as logout", async () => {
     const first = beginAccountSessionValidation("tenant", "concurrent-refresh");
     const second = beginAccountSessionValidation("tenant", "concurrent-refresh");

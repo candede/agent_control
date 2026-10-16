@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import type pg from "pg";
 import { randomUUID } from "node:crypto";
@@ -56,7 +57,7 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/investigations/resolv
   const controller = new AbortController();
   const abort = () => { controller.abort(); };
   response.once("close", abort);
-  try { response.json(await agentIdentityResolution.resolve(request.session.user!, recordId, controller.signal)); }
+  try { response.json(await agentIdentityResolution.resolve(requestUser(request), recordId, controller.signal)); }
   finally { response.removeListener("close", abort); }
 });
 
@@ -77,9 +78,9 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   const audit = new AuditLog(scope, database);
   const event = await audit.startEvent({ operationId: `view-audit-search:${randomUUID()}`, scope: "single", action: "view-audit-search", agentId: recordId,
-    actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
+    actor: requestUser(request), requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
   try {
-    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query, agentInvestigations.resolve.bind(agentInvestigations),
+    const result = await purviewAudit.agentRecords(requestUser(request), recordId, query, agentInvestigations.resolve.bind(agentInvestigations),
       result => audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } }).then(() => undefined));
     assertAccountSessionValidation(validation);
     response.json(result);
@@ -96,7 +97,7 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
   const input = agentPeopleResolveInput(request.body);
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", request.session.user!);
+  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", requestUser(request));
   const controller = new AbortController();
   const assertCurrent = () => {
     controller.signal.throwIfAborted();
@@ -114,7 +115,7 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
     assertCurrent();
     const ids = Object.values(record.people)
       .filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id));
-    const result = await agentPeople.resolve(request.session.user!, ids, { generation, force: input.force, signal: controller.signal });
+    const result = await agentPeople.resolve(requestUser(request), ids, { generation, force: input.force, signal: controller.signal });
     assertCurrent();
     await liveInventory.assertCurrent(scope, record.id, record.revision);
     assertCurrent();

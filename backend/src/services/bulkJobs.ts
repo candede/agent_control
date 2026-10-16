@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { JobRepository, type Lease } from "../db/jobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
@@ -78,8 +78,14 @@ export async function runBulkJob(
 ) {
   requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const jobSummary = await repository.get(id, scope);
-  assertAccountSessionValidation(validation);
+  let jobSummary: Awaited<ReturnType<typeof repository.get>>;
+  try {
+    jobSummary = await repository.get(id, scope);
+    assertAccountSessionValidation(validation);
+  } catch (error) {
+    if (error instanceof AppError && error.status === 401) await repository.waitForAuthorization(id, scope);
+    throw error;
+  }
   if (!jobSummary) throw new AppError(404, "not_found", "Job was not found.");
   if (jobSummary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "The delegated worker cannot execute an application-mode job.");
   if (jobSummary.isCanary && (resume || authorize === authorizeDelegatedJob)) {
@@ -218,6 +224,13 @@ export async function runBulkJob(
           finished = true;
           requireCurrentItem();
         }), { signal: itemSignal, clearOnSuccess: () => sent });
+        // The final item has no following beginItem to publish its readback.
+        // Flush outside the provider target lock, under the same captured authority.
+        if (finished) await repository.settleInventoryControls(lease, item.id, itemSignal, async () => {
+          requireCurrentItem();
+          await authorizeJob(scope, job.capability, itemSignal);
+          requireCurrentItem();
+        }, requireCurrentItem);
       } catch (caught) {
         if (finished) throw caught;
         if (caught instanceof AppError && caught.code === "lease_lost") throw caught;
@@ -343,6 +356,10 @@ export async function reconcileBulkJob(
   await currentPackageAuthorization(() => authorize(scope, "graph.package.read.delegated"), assertCurrent);
   assertAccountSessionValidation(validation);
   validateCapability();
+  const publicationSignal = AbortSignal.timeout(reconciliationDeadlineMs);
+  await repository.settleControlPublications(scope, publicationSignal, async () => {
+    await currentPackageAuthorization(() => authorize(scope, "graph.package.read.delegated"), assertCurrent, publicationSignal);
+  }, assertCurrent);
   const current = await repository.get(id, scope);
   requireProviderAdmissions();
   assertAccountSessionValidation(validation);
@@ -357,18 +374,18 @@ async function releaseIfOwned(repository: BulkJobExecutionRepository, lease: Lea
 }
 
 async function authorizeDelegatedJob(scope: DataScope, capabilityId: CapabilityId) {
-  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
+  const user = await revalidateAuthorizedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The job initiator no longer matches the signed-in account.");
   await capabilities.requireAvailable(capabilityId, user);
-  return acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
+  return acquireAuthorizedToken(scope.tenantId, scope.principalId, capabilityId);
 }
 
 async function authorizeReconciliation(scope: DataScope, capabilityId: CapabilityId) {
-  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
+  const user = await revalidateAuthorizedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The reconciliation actor no longer matches the signed-in account.");
   if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to reconcile package mutations.");
   await capabilities.requireAvailable(capabilityId, user);
-  return acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
+  return acquireAuthorizedToken(scope.tenantId, scope.principalId, capabilityId);
 }
 
 async function finishAuthorized(
@@ -433,11 +450,11 @@ async function currentPackageAuthorization(
 }
 
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && ["interaction_required", "authorization_expired", "missing_permission", "missing_internal_role", "capability_unavailable", "unauthorized", "invalid_token_mode"].includes(error.code);
+  return error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "missing_permission", "missing_internal_role", "capability_unavailable", "unauthorized", "invalid_token_mode"].includes(error.code));
 }
 
 function isAdmissionFailure(error: unknown) {
-  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
+  return error instanceof AppError && error.code === "maintenance";
 }
 
 function isDeadlineExceeded(error: unknown) {

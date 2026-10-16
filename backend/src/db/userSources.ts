@@ -68,18 +68,22 @@ export function userSourceFactsSql(selected = false) {
   return `WITH activity_keys AS MATERIALIZED (
       SELECT upn_key,count(*) AS matches,min(identity) AS identity FROM app_activity_rows
       WHERE generation_id=$2 GROUP BY upn_key
-    ), directory_aliases AS (
-      SELECT identity AS key FROM directory_user_rows WHERE generation_id=$1
-      UNION ALL SELECT upn_key FROM directory_user_rows
+    ), directory_aliases AS MATERIALIZED (
+      SELECT identity,identity AS key FROM directory_user_rows WHERE generation_id=$1
+      UNION ALL SELECT identity,upn_key FROM directory_user_rows
       WHERE generation_id=$1 AND upn_key IS NOT NULL AND upn_key IS DISTINCT FROM identity
     ), directory_keys AS MATERIALIZED (
       SELECT key,count(*) AS matches FROM directory_aliases GROUP BY key
+    ), activity_matches AS MATERIALIZED (
+      SELECT aliases.identity AS directory_identity,min(activity.identity) AS activity_identity
+      FROM directory_aliases aliases
+      JOIN activity_keys activity ON activity.upn_key=aliases.key
+      JOIN directory_keys directory ON directory.key=aliases.key
+      GROUP BY aliases.identity
+      HAVING sum(activity.matches)=1 AND bool_and(directory.matches=1)
     ) ${projection} FROM directory_user_rows d
-    LEFT JOIN activity_keys own ON own.upn_key=d.identity
-    LEFT JOIN activity_keys upn ON upn.upn_key=d.upn_key AND d.upn_key IS DISTINCT FROM d.identity
-    LEFT JOIN directory_keys matched ON matched.key=COALESCE(own.upn_key,upn.upn_key)
-    LEFT JOIN app_activity_rows a ON a.generation_id=$2 AND a.identity=COALESCE(own.identity,upn.identity)
-      AND COALESCE(own.matches,0)+COALESCE(upn.matches,0)=1 AND matched.matches=1
+    LEFT JOIN activity_matches matched ON matched.directory_identity=d.identity
+    LEFT JOIN app_activity_rows a ON a.generation_id=$2 AND a.identity=matched.activity_identity
     WHERE d.generation_id=$1`;
 }
 

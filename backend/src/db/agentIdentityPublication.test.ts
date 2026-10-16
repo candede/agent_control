@@ -46,12 +46,59 @@ function fixture(currentSource = 1, inserted = 1, finalSource = 1, failure = fal
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe("identity publication privilege and source fences", () => {
+  it("returns only the current verified object/client mapping from a resolved cache row", async () => {
+    const { repository, read, connect } = fixture();
+    const checkedAt = new Date(), expiresAt = new Date(Date.now() + 60_000);
+    read.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{
+      candidate_id: mapping.objectId, application_id: mapping.applicationId, checked_at: checkedAt, expires_at: expiresAt,
+      fresh: true, outcome: "resolved", runtime_status: "available", runtime_provenance: verifiedAgentIdentityClientIdProvenance,
+      last_error_code: null,
+    }] });
+    await expect(repository.readState(scope, source)).resolves.toEqual({
+      status: "resolved", checkedAt: checkedAt.toISOString(), expiresAt: expiresAt.toISOString(),
+      value: { ...mapping, checkedAt: checkedAt.toISOString(), expiresAt: expiresAt.toISOString() },
+    });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { application_id: null },
+    { application_id: "44444444-4444-4444-8444-444444444444" },
+    { runtime_status: "unverified" },
+    { runtime_provenance: null },
+    { runtime_provenance: "unverified" },
+  ])("rejects a resolved row without exact typed client-ID provenance: %j", async change => {
+    const { repository, read, connect } = fixture();
+    read.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{
+      candidate_id: mapping.objectId, application_id: mapping.applicationId, checked_at: new Date(),
+      expires_at: new Date(Date.now() + 60_000), fresh: true, outcome: "resolved",
+      runtime_status: "available", runtime_provenance: verifiedAgentIdentityClientIdProvenance, last_error_code: null,
+      ...change,
+    }] });
+    await expect(repository.readState(scope, source)).rejects.toMatchObject({ code: "invalid_agent_identity_cache" });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it.each(["expired", "authorization_required", "not_found", "provider_error", "setup_required"] as const)(
+    "never returns candidate IDs as verified mappings for %s cache state", async status => {
+      const { repository, read } = fixture();
+      read.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{
+        candidate_id: mapping.objectId, application_id: null, checked_at: new Date(),
+        expires_at: new Date(Date.now() + 60_000), fresh: status !== "expired",
+        outcome: status === "expired" ? "resolved" : status, runtime_status: "unverified",
+        runtime_provenance: null, last_error_code: "fixture_error",
+      }] });
+      const state = await repository.readState(scope, source);
+      expect(state).toMatchObject({ status, lastErrorCode: "fixture_error" });
+      expect(state.value).toBeUndefined();
+    },
+  );
+
   it("rejects an all-zero internal snapshot before cache reads, invalidation or publication", async () => {
     const { repository, query, read, connect } = fixture();
     const invalid = { ...source, snapshotId: "00000000-0000-0000-0000-000000000000" };
     const fence = vi.fn(async () => {});
     for (const operation of [
-      () => repository.read(scope, invalid),
       () => repository.readState(scope, invalid),
       () => repository.invalidate(scope, invalid),
       () => repository.save(scope, invalid, mapping, fence),

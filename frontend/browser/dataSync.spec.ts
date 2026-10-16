@@ -209,10 +209,11 @@ test("first-sync status failure and permission recovery stay visible outside Syn
   await expect(notice.getByRole("link", { name: "Sign in again" })).toHaveCount(2);
   expect((await new AxeBuilder({ page }).include(".first-sync-dialog").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("first-sync-recovery.png") });
-  await notice.getByRole("button", { name: "View sync details" }).click();
-  await expect(page).toHaveURL(/\/sync$/);
+  await expect(notice.getByRole("button", { name: "View sync details" })).toHaveCount(0);
+  await notice.getByRole("button", { name: "Review permissions" }).click();
+  await expect(page).toHaveURL(/\/permissions$/);
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.getByRole("region", { name: "Data sync", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
   expect(fixture.starts).toEqual([]);
   expect(fixture.unexpected).toEqual([]);
 });
@@ -279,7 +280,7 @@ test("Sync status, run details and history remain live beyond thirty minutes wit
 test("first-sync setup is visible on Agents and the responsive Sync page continues live progress in the background", async ({ page }, info) => {
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
-  const fixture = await mockSync(page, initial);
+  const fixture = await mockSync(page, initial, [], { automaticInitial: true });
   await page.goto("/agents");
   const navigation = page.getByRole("navigation", { name: "Primary views" });
   const syncButton = primarySync(page);
@@ -288,7 +289,7 @@ test("first-sync setup is visible on Agents and the responsive Sync page continu
   await expect(page).toHaveURL(/\/agents$/);
   await expect(panel).toHaveCount(0);
   const firstSync = page.getByRole("dialog");
-  await expect(firstSync.getByRole("heading", { name: "Set up your workspace" })).toBeVisible();
+  await expect(firstSync.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
   await expect(firstSync.getByRole("list", { name: "First sync sources" }).getByRole("listitem")).toHaveCount(3);
   await expect(firstSync.getByText(/several minutes/)).toBeVisible();
   expect((await new AxeBuilder({ page }).include(".first-sync-dialog").analyze()).violations).toEqual([]);
@@ -305,15 +306,16 @@ test("first-sync setup is visible on Agents and the responsive Sync page continu
   await expect(page.locator(".bulk-panel, .selection-summary, .data-sync-toggle")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.style.overflow)).toBe("hidden");
   expect(fixture.starts).toEqual([]);
-  await firstSync.getByRole("button", { name: "View sync details" }).click();
+  expect(fixture.automaticStarts).toHaveLength(1);
+  await expect(firstSync.getByRole("button")).toHaveCount(0);
+  await page.goto("/sync");
   await expect(page).toHaveURL(/\/sync$/);
   await expect(syncButton).toHaveAttribute("aria-current", "page");
-  await expect(panel.getByRole("button", { name: "Start initial sync", exact: true })).toBeEnabled();
+  await expect(panel.getByRole("button", { name: "Start initial sync", exact: true })).toBeDisabled();
   await expect(page.getByText("View diagnostics", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Agent inventory sources" })).toBeHidden();
   await expect(page.getByRole("heading", { name: "Sync history" })).toBeVisible();
   await page.screenshot({ path: info.outputPath("sync-setup.png") });
-  await panel.getByRole("button", { name: "Start initial sync", exact: true }).click();
   await expect(panel.getByText("Syncing graph packages, power platform", { exact: true })).toBeVisible();
   await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
   await expect(panel.getByRole("progressbar")).toHaveAttribute("max", "3");
@@ -321,7 +323,7 @@ test("first-sync setup is visible on Agents and the responsive Sync page continu
   await expect(panel.getByText("2,451", { exact: true })).toBeVisible();
   await expect(panel.getByText("Reading the next page of Graph packages.")).toBeVisible();
   await expect(panel.getByText(/Sync continues when you switch tabs/)).toBeVisible();
-  expect(fixture.starts).toEqual([{ mode: "initial" }]);
+  expect(fixture.starts).toEqual([]);
   await expectAccessibleSyncPage(page);
   await page.screenshot({ path: info.outputPath("sync-progress.png") });
   await expect(panel.getByRole("button", { name: /Close data sync|Continue in app/ })).toHaveCount(0);
@@ -356,7 +358,7 @@ test("first-sync setup is visible on Agents and the responsive Sync page continu
   await expect(reports.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
   await expect(panel.getByRole("button", { name: "Add CSV reports" })).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
-  await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
+  await expect(panel.getByText("4 of 4 sync steps complete", { exact: true })).toBeVisible();
   await expect(reports.getByText("Reports available", { exact: true })).toBeVisible();
   await expect(reports.getByText("Observed activity dates (UTC)", { exact: true })).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-01']")).toHaveCount(1);
@@ -388,7 +390,8 @@ test("first-sync setup is visible on Agents and the responsive Sync page continu
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(reports.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
-  expect(fixture.starts).toHaveLength(1);
+  expect(fixture.starts).toHaveLength(0);
+  expect(fixture.automaticStarts).toHaveLength(1);
   expect(fixture.unexpected).toEqual([]);
   expect(errors).toEqual([]);
 });
@@ -451,7 +454,7 @@ test("current sync has an aligned, keyboard-accessible cancellation footer with 
     finishCancellation();
   }
   await expect(panel.getByText("Sync cancelled", { exact: true })).toBeVisible();
-  await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
+  await expect(panel.getByText("4 of 4 sync steps complete", { exact: true })).toBeVisible();
   await expect(footer).toHaveCount(0);
   expect(requests).toBe(1);
   expect(fixture.unexpected).toEqual([]);
@@ -465,7 +468,7 @@ test("a completed saved run opens without setup and progress clutter", async ({ 
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
   await expect(primarySync(page)).not.toContainText("Setup needed");
   await expect(panel.getByText("Sync complete", { exact: true })).toBeVisible();
-  await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
+  await expect(panel.getByText("4 of 4 sync steps complete", { exact: true })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Graph packages" })).toBeVisible();
   await expect(panel.getByText(/Verify saved inventory below/)).toHaveCount(0);
   await expect(panel.getByRole("progressbar")).toHaveCount(0);
@@ -523,8 +526,11 @@ for (const attempts of ["completed", "mixed"] as const) {
       ];
       for (const column of columns) {
         const cells = workspace.locator(`.data-sync-source ${column}`);
-        await expect(cells).toHaveCount(3);
-        const starts = await cells.evaluateAll(elements => elements.map(element => element.getBoundingClientRect().left));
+        await expect(cells).toHaveCount(4);
+        const starts = await cells.evaluateAll((elements, rightAligned) => elements.map(element => {
+          const bounds = element.getBoundingClientRect();
+          return rightAligned ? bounds.right : bounds.left;
+        }), column === ".data-sync-source-actions button");
         expect(Math.max(...starts) - Math.min(...starts), `${column} at ${width}px`).toBeLessThanOrEqual(1);
       }
       const fitsViewport = await workspace.evaluate(element => {
@@ -618,14 +624,14 @@ test("direct Sync navigation keeps diagnostics optional and history restricted t
 });
 
 test("a running sync survives back, forward, and reload without starting another run", async ({ page }) => {
-  const fixture = await mockSync(page, initial);
+  const fixture = await mockSync(page, initial, [], { automaticInitial: true });
   await page.goto("/users");
   await expect(primarySync(page)).toContainText("Setup needed");
   await expect(page).toHaveURL(/\/users$/);
   await expect(page.getByRole("region", { name: "Data sync", exact: true })).toHaveCount(0);
-  await page.getByRole("dialog").getByRole("button", { name: "View sync details" }).click();
+  await expect(page.getByRole("dialog", { name: "Your first sync is in progress" })).toBeVisible();
+  await page.goto("/sync");
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
-  await panel.getByRole("button", { name: "Start initial sync", exact: true }).click();
   await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Users", exact: true }).click();
   await expect(page).toHaveURL(/\/users$/);
@@ -651,7 +657,8 @@ test("a running sync survives back, forward, and reload without starting another
   await expect(panel.getByText("Reading the next page of Graph packages.")).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
-  expect(fixture.starts).toEqual([{ mode: "initial" }]);
+  expect(fixture.starts).toEqual([]);
+  expect(fixture.automaticStarts).toHaveLength(1);
   expect(fixture.unexpected).toEqual([]);
 });
 
@@ -671,13 +678,13 @@ test("Users navigation stays read-only and Sync retains the explicit users-only 
   await expect(panel.getByRole("article", { name: "Graph packages" })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Graph packages" }).getByText("42", { exact: true })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Power Platform" })).toBeVisible();
-  await expect(panel.getByText("3 of 3 sources synced")).toBeVisible();
+  await expect(panel.getByText("4 of 4 sync steps complete")).toBeVisible();
   await expect(panel.getByRole("progressbar")).toHaveAttribute("max", "1");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(fixture.starts).toEqual([{ mode: "incremental", sources: ["users"] }]);
   fixture.finish();
   await expect(panel.getByText("Sync complete", { exact: true })).toBeVisible();
-  await expect(panel.getByText("3 of 3 sources synced")).toBeVisible();
+  await expect(panel.getByText("4 of 4 sync steps complete")).toBeVisible();
   await expect(panel.getByText(/1 of 1/)).toHaveCount(0);
   expect(fixture.unexpected).toEqual([]);
 });
@@ -700,7 +707,7 @@ for (const status of ["partial", "cancelled"] as const) {
     await page.goto("/sync");
     const panel = page.getByRole("region", { name: "Data sync", exact: true });
     const workspace = panel.getByRole("region", { name: "Workspace data", exact: true });
-    await expect(workspace.getByText("3 of 3 sources synced")).toBeVisible();
+    await expect(workspace.getByText("4 of 4 sync steps complete")).toBeVisible();
     await expect(panel.getByRole("button", { name: /retry|resume/i })).toHaveCount(0);
     await panel.getByRole("button", { name: "View run details" }).click();
     const details = page.getByRole("dialog", { name: "Sync run details" });
@@ -730,8 +737,7 @@ for (const status of ["partial", "cancelled"] as const) {
   });
 }
 
-for (const entryPath of ["/sync", "/agents"]) {
-  test(`retained run links from ${entryPath} resolve to the exact Sync page across reload and history`, async ({ page }) => {
+test("canonical retained run links resolve to the exact Sync page across reload and history", async ({ page }) => {
     const latest = completedState();
     const retained: DataSyncRun = {
       ...latest.run!,
@@ -743,7 +749,7 @@ for (const entryPath of ["/sync", "/agents"]) {
         : source),
     };
     const fixture = await mockSync(page, latest, [retained]);
-    await page.goto(`${entryPath}?syncRun=${retained.id}`);
+    await page.goto(`/sync?syncRun=${retained.id}`);
     await expect(page).toHaveURL(`/sync?syncRun=${retained.id}`);
     const panel = page.getByRole("region", { name: "Data sync", exact: true });
     await expect(primarySync(page)).toHaveAttribute("aria-current", "page");
@@ -764,8 +770,7 @@ for (const entryPath of ["/sync", "/agents"]) {
     expect(fixture.reads).toContain(`/api/data-sync/runs/${retained.id}`);
     expect(fixture.starts).toEqual([]);
     expect(fixture.unexpected).toEqual([]);
-  });
-}
+});
 
 test("one chronological sync history combines runs and refreshes, filters outcomes and preserves exact detail links", async ({ page }, info) => {
   const state = completedState();
@@ -776,7 +781,7 @@ test("one chronological sync history combines runs and refreshes, filters outcom
       id: retained.id, source: "data-sync", label: "Retained initial sync", target: "4 saved sources",
       status: "completed", total: 4, completed: 4, partial: false,
       startedAt: retained.startedAt, completedAt: retained.completedAt, syncSources: retained.sources.map(source => source.source),
-      updatedAt: retained.updatedAt, href: `/agents?syncRun=${retained.id}`,
+      updatedAt: retained.updatedAt, href: `/sync?syncRun=${retained.id}`,
     }, {
       id: "history-package", source: "package-refresh", label: "Graph package refresh", target: "Current principal Graph package catalog",
       status: "succeeded", total: 120, completed: 120, partial: false,

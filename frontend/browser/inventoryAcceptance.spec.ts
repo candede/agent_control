@@ -12,7 +12,13 @@ test(`reloading handshakes ${order}, publication changed=${changed}, without red
   await page.clock.setFixedTime(new Date(layoutTime));
   let inventoryReads = 0, automaticReads = 0, captures = 0;
   let automaticReady: Promise<void>, inventoryReady: Promise<void>, replacementReady: Promise<void>;
+  // Admit metadata after the independent permission catalog has reached its initial check.
+  let permissionReady: Promise<unknown>;
   let releaseAutomatic!: () => void, releaseInventory!: () => void, releaseReplacement!: () => void;
+  await page.route("**/api/workbench/metadata", async route => {
+    await permissionReady;
+    await route.fallback();
+  });
   await page.route(url => url.pathname === "/api/data-sync/auto-refresh", async route => {
     automaticReads++;
     await automaticReady;
@@ -34,6 +40,8 @@ test(`reloading handshakes ${order}, publication changed=${changed}, without red
     automaticReady = new Promise(resolve => { releaseAutomatic = resolve; });
     inventoryReady = new Promise(resolve => { releaseInventory = resolve; });
     replacementReady = new Promise(resolve => { releaseReplacement = resolve; });
+    permissionReady = page.waitForRequest(request => new URL(request.url()).pathname === "/api/capabilities/check"
+      && request.method() === "POST");
     try {
       if (visit === 0) await page.goto("/agents?usage=used&sort=responses&direction=desc");
       else await page.reload();
@@ -58,9 +66,9 @@ test(`reloading handshakes ${order}, publication changed=${changed}, without red
       }
       await expect(page.getByRole("alert")).toHaveCount(0);
       await expect(page.getByText(/No saved package catalog observation|The request was cancelled/)).toHaveCount(0);
-      // A completed unchanged fixture truthfully reports its missing optional
-      // Power Platform source; a pending replacement must not flash that state.
-      if (changed) await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
+      // A published page keeps its truthful source limitation during replacement.
+      // Observer-first loading has no published page from which to show one.
+      if (changed && order === "observer-first") await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toHaveCount(0);
       else await expect(page.getByRole("button", { name: "Inventory needs attention · Open Sync" })).toBeVisible();
       if (visit === 2) await page.screenshot({ path: info.outputPath("reload-pending.png") });
       releaseReplacement();
@@ -188,12 +196,16 @@ test("already-stale optional identity stays readable with stale diagnostics and 
     identityDetails: { id: "detail", snapshotId: "detail", current: false,
       observedAt: "2026-09-12T08:00:00Z", expiresAt: detailExpiry },
   } };
+  const identityCollection = { checkedPackages: 0, pendingPackages: 1, pendingDetails: { missing: 0, stale: 1, invalidated: 0 } };
+  const verification = createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 },
+    { packageMetadata: false }, layoutTime);
   await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route, {
-    ...unifiedAgents, value: [record],
-    identityCollection: { checkedPackages: 0, pendingPackages: 1, pendingDetails: { missing: 0, stale: 1, invalidated: 0 } },
-    verification: createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 },
-      { packageMetadata: false }, layoutTime),
+    ...unifiedAgents, value: [record], identityCollection, verification,
   }));
+  await page.route(url => url.pathname === "/api/agent-inventory/health", route => route.fulfill({ json: {
+    freshness: unifiedAgents.freshness, summary: unifiedAgents.summary, identityCollection, verification,
+    sources: unifiedAgents.sources, partial: unifiedAgents.partial, errors: unifiedAgents.errors,
+  } }));
   await page.goto("/agents");
   await expect(page.getByRole("checkbox", { name: `Select ${record.displayName}` })).toBeVisible();
   await expect(page.getByText(/current saved agent inventory could not be loaded/)).toHaveCount(0);

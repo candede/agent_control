@@ -20,9 +20,11 @@ const mocks = vi.hoisted(() => ({
   applicationScope: vi.fn(),
 }));
 
-vi.mock("../config.js", () => ({ getTenantConfiguration: (tenantId: string) => ({
-  tenantId, clientId: tenantId === "tenant" ? "application" : "other-application",
-}) }));
+vi.mock("../config.js", async original => {
+  const tenant = (tenantId: string) => ({ tenantId, clientId: tenantId === "tenant" ? "application" : "other-application",
+    clientSecret: "synthetic", domains: ["example.invalid"] });
+  return { ...await original<typeof import("../config.js")>(), getTenantConfiguration: tenant, findTenantConfiguration: tenant };
+});
 vi.mock("../middleware/auth.js", () => ({
   requestScope: (request: Request) => ({ tenantId: request.session.user!.tenantId, principalId: request.session.accountId }),
 }));
@@ -66,7 +68,8 @@ const inventoryJob = {
 async function jobs(currentUser = user): Promise<WorkbenchJobsResponse> {
   const handler = mocks.handlers.get("get /workbench/jobs");
   if (!handler) throw new Error("Workbench jobs handler was not registered.");
-  const request = { session: { user: currentUser, accountId: currentUser.homeAccountId } } as Request;
+  const request = { session: { user: currentUser, accountId: currentUser.homeAccountId, tenantId: currentUser.tenantId,
+    clientId: currentUser.tenantId === "tenant" ? "application" : "other-application" } } as Request;
   const json = vi.fn<(body: WorkbenchJobsResponse) => Response>().mockReturnThis();
   const response = { locals: { requestId: "request-1" }, json } as Partial<Response>;
   await handler(request, response as Response, error => { if (error) throw error; });

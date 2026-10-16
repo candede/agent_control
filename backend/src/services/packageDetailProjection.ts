@@ -29,7 +29,7 @@ export function packageDetailRevision(value: CopilotPackageDetail) {
     .map(marker => marker ?? null);
 }
 
-export function packageDetailRevisionMatches(current: CopilotPackageDetail, detailed: CopilotPackageDetail) {
+function packageDetailRevisionMatches(current: CopilotPackageDetail, detailed: CopilotPackageDetail) {
   const modified = current.lastModifiedDateTime;
   return Boolean(modified && isInventoryTimestamp(modified)
     && packageDetailRevision(current).slice(1).some(marker => typeof marker === "string" && marker.trim())
@@ -40,10 +40,7 @@ function hasCollectedDetails(value: CopilotPackageDetail) {
   // Expiry and control conflicts withdraw reusable identity, not a completed empty read's provenance.
   return value.identityDetailsCollected === true
     || value.detailFreshness?.state !== "missing" && typeof value.detailFreshness?.observedAt === "string"
-      && typeof value.detailFreshness.expiresAt === "string"
-    || Array.isArray(value.elementDetails) && value.elementDetails.some(detail =>
-    detail && typeof detail.elementType === "string" && detail.elementType.length > 0 && Array.isArray(detail.elements)
-      && detail.elements.some(element => element && typeof element.id === "string" && typeof element.definition === "string"));
+      && typeof value.detailFreshness.expiresAt === "string";
 }
 
 export function packageDetailAccessScopesMatch(left: string | undefined, right: string | undefined) {
@@ -105,7 +102,7 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     for (const field of Object.keys(result.provenance)) {
       if (field === "ownerId" || field === "agentIdentityId" || field.startsWith("providerUsage.")) delete result.provenance[field];
     }
-    for (const [field, provenance] of Object.entries(saved.package!.provenance)) {
+    for (const [field, provenance] of Object.entries(saved.package!.provenance ?? {})) {
       if (field === "ownerId" || field === "agentIdentityId" || field.startsWith("providerUsage.")) result.provenance[field] = provenance;
     }
   }

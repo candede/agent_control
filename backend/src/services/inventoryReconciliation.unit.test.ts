@@ -3,6 +3,7 @@ import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
 import type { InventoryRoot } from "../types/inventoryRecords.js";
+import { dataLimits } from "../db/dataBounds.js";
 import { InventoryReconciliation } from "./inventoryReconciliation.js";
 import { packageInventoryRecord, type InventoryRecord } from "./inventoryRecordProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
@@ -153,7 +154,12 @@ describe("bounded isolated reconciliation without a database", () => {
     const records = Array.from({ length: 40 }, (_, index) => packageInventoryRecord(allowlistedPackage({
       id: `package-${String(index).padStart(3, "0")}`, displayName: `Package ${index}`, isBlocked: false,
       supportedHosts: Array.from({ length: 100 }, (_, host) => `${host}:${"x".repeat(240)}`),
+      elementDetails: [{ elementType: "Bots", elements: Array.from({ length: 100 }, (_, element) => ({
+        id: `${index}-${element}`, definition: JSON.stringify({ description: "x".repeat(4000) }),
+      })) }],
     })));
+    expect(records.reduce((bytes, record) => bytes + Buffer.byteLength(JSON.stringify(record.facts)), 0))
+      .toBeGreaterThan(dataLimits.agentDefinitionWorkBytes);
     expect(records.every(record => !record.facts.some(fact => fact.kind.startsWith("match:")))).toBe(true);
     const f = fixture(records);
     await expect(f.reconciliation.runNext(f.input, async () => {})).resolves.toMatchObject({ inserted: records.length });
@@ -171,12 +177,13 @@ describe("bounded isolated reconciliation without a database", () => {
   it("still rejects an individually oversized component without staging partial results", async () => {
     const record = packageInventoryRecord(allowlistedPackage({
       id: "oversized", displayName: "Oversized identity work", isBlocked: false,
-      elementDetails: Array.from({ length: 3 }, (_, group) => ({
-        elementType: "Bots", elements: Array.from({ length: 100 }, (_, element) => ({
-          id: `${group}-${element}`, definition: JSON.stringify({ description: "x".repeat(4000) }),
-        })),
-      })),
     }));
+    // Exercise the stored-row work fence independently of the earlier provider-observation limit.
+    record.facts.push({ kind: "element", value: "0", payload: {
+      elementType: "Bots", id: "oversized-element",
+      definition: JSON.stringify({ description: "x".repeat(dataLimits.agentDefinitionWorkBytes) }),
+    } });
+    expect(Buffer.byteLength(JSON.stringify(record.facts))).toBeGreaterThan(dataLimits.agentDefinitionWorkBytes);
     const f = fixture([record]);
     await expect(f.reconciliation.runNext(f.input, async () => {})).rejects.toMatchObject({ code: "inventory_record_work_bytes" });
     expect(f.append).not.toHaveBeenCalled();

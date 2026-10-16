@@ -9,9 +9,8 @@ export type {
   PackageAccessMutationMode, PackageAccessUpdate,
 } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
-export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
-import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
-import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
+import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
+import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
 import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, PackageDetailSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 import type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
 export type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
@@ -20,25 +19,24 @@ import type { WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/
 import { parseWorkbenchMetadataJson, workbenchMetadataMaximumBytes } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentInventoryUnavailable, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
 import { encodeInventoryFacet, inventoryFacetFields, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
-import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
+import type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
 export type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
 import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 export type { AgentResponsibilityPage } from "../../../backend/src/types/agentResponsibility";
 import type { AgentUsageAuditAction, AuditActor, InventoryExportAction } from "../../../backend/src/types/audit";
-export type { InventorySourceAwareDetail, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
+export type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
-export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
+export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
   UnifiedAgentInventoryUnavailable,
-  UnifiedAgentInventoryVerification,
   UnifiedAgentRecord,
   UnifiedAgentPowerPlatformObservation,
 } from "../../../backend/src/types/unifiedAgents";
-export type { CopilotServicePlan, CopilotServiceSummaryState } from "../../../backend/src/types/copilotUsage";
+export type { CopilotServiceSummaryState } from "../../../backend/src/types/copilotUsage";
 export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
-export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
+export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, PackageDetailSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 export { automaticDataSyncSourceIds, dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
@@ -178,6 +176,7 @@ export type BulkJobStatus = "queued" | "running" | "waiting_authorization" | "su
 
 type BulkActionJobBase = {
   id: string;
+  origin?: AuditOriginV1;
   isCanary?: true;
   status: BulkJobStatus;
   cancelRequested?: true;
@@ -227,9 +226,9 @@ type ReassignAuditAction = "reassign";
 export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
 type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
 type HuntingReadAction = "view-hunting" | "export-hunting";
-type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
+type HuntingLifecycleAction = "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting";
 type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
-export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AgentUsageAuditAction | "export-administrative-audit";
+export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AgentUsageAuditAction | "export-administrative-audit" | "resume-control" | "cancel-control" | "reconcile-control";
 
 type PackageMutationState = Record<string, unknown>;
 
@@ -265,6 +264,7 @@ type AuditScope = "single" | "bulk";
 
 export type AuditStatus = "requested" | "started" | "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
 
+import type { AuditOriginV1, OriginFilters } from "../../../backend/src/types/actionOrigin";
 type AuditEventBase = {
   id: string;
   operationId: string;
@@ -279,6 +279,7 @@ type AuditEventBase = {
   errorCode?: string;
   requestPath: string;
   metadata?: Record<string, unknown>;
+  origin?: AuditOriginV1;
 };
 
 export type AuditEvent = AuditEventBase &
@@ -287,7 +288,7 @@ export type AuditEvent = AuditEventBase &
     | { action: Exclude<LocalAuditAction, BlockAuditAction>; targetBlockedState?: never }
   );
 
-export type AuditEventsQuery = {
+export type AuditEventsQuery = OriginFilters & {
   limit?: number;
   offset?: number;
   agentId?: string;
@@ -341,7 +342,7 @@ export class ApiError extends Error {
   }
 
   get authenticationExpired() {
-    return this.status === 401 && ["unauthorized", "session_invalidated"].includes(this.code);
+    return this.status === 401 && ["unauthorized", "session_invalidated", "authorization_required", "authorization_stale"].includes(this.code);
   }
 }
 
@@ -582,6 +583,14 @@ export function getInventorySections(selectionId: string, recordId: string, memb
     `/api/agent-inventory/${encodeURIComponent(recordId)}/sections?${params}`, { signal: options.signal });
 }
 
+export function getAgentAbout(selectionId: string, recordId: string, source: { scopeId: string; identity: string },
+  field: "long" | "native" | "short", options: { cursor?: string; signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams({ selectionId, sourceScopeId: source.scopeId, sourceIdentity: source.identity, field });
+  if (options.cursor) params.set("cursor", options.cursor);
+  return request<import("../../../backend/src/types/savedReadContracts").AgentAboutPage>(
+    `/api/agent-inventory/${encodeURIComponent(recordId)}/about?${params}`, { signal: options.signal });
+}
+
 export function getAgentResponsibility(query: AgentResponsibilityQuery = {}, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== "") params.set(key, String(value));
@@ -793,7 +802,7 @@ export function cancelDataSyncRun(id: string, options: { signal?: AbortSignal } 
 
 export type PurviewAuditCatalog = {
   presets: Array<{ id: PurviewAuditFilters["presetId"]; label: string; service: string; recordTypes: string[]; operations: string[] }>;
-  limits: { maximumWindowHours: number; qualificationWindowHours: number; maximumPages: number; maximumRows: number; maximumBytes: number; pollsPerActivation: number;
+  limits: { maximumWindowHours: number; maximumPages: number; maximumRows: number; maximumBytes: number; pollsPerActivation: number;
     providerRequests: number; activations: number };
   evidenceNotice: string;
   contentNotice: string;
@@ -838,23 +847,13 @@ export function deletePurviewAuditSearch(id: string, options: { signal?: AbortSi
   });
 }
 
-export function approvePurviewAuditQualification(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal; agentRecordId?: string } = {}) {
-  return request<PurviewAuditQualification>("/api/audit-search/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters, agentRecordId: options.agentRecordId }), signal: options.signal });
-}
-
-export function startPurviewAuditQualification(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<PurviewAuditJob>(`/api/audit-search/qualifications/${encodeURIComponent(id)}/start`, { method: "POST", signal: options.signal });
-}
-
 export async function downloadPurviewAuditCsv(id: string, options: { signal?: AbortSignal } = {}) {
   return requestBlob(`/api/audit-search/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
 export type DefenderHuntingCatalog = {
   templates: Array<{ id: DefenderHuntingFilters["templateId"]; label: string; sourceTable: "AgentsInfo" | "CloudAppEvents"; operations: string[] }>;
-  qualifications: DefenderHuntingQualificationEvidence[];
-  retainedScopes: DefenderHuntingRetainedScope[];
-  limits: { maximumWindowHours: number; qualificationWindowHours: number; maximumRows: number; maximumBytes: number; providerRequests: number; activations: number };
+  limits: { maximumWindowHours: number; maximumRows: number; maximumBytes: number; providerRequests: number; activations: number };
   scopeNotice: string;
   contentNotice: string;
   readinessNotice: string;
@@ -872,13 +871,6 @@ export function resolveAgentInvestigationIdentity(recordId: string, options: { s
   return request<AgentInvestigationContext>("/api/agent-inventory/investigations/resolve", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ recordId }), signal: options.signal,
   });
-}
-
-export function getAgentPurviewRecords(recordId: string, query: { limit: number; offset: number; search?: string; operation?: string }, options: { signal?: AbortSignal } = {}) {
-  const params = new URLSearchParams({ recordId, limit: String(query.limit), offset: String(query.offset) });
-  if (query.search) params.set("search", query.search);
-  if (query.operation) params.set("operation", query.operation);
-  return request<AgentPurviewRecordPage>(`/api/agent-inventory/investigations/purview?${params}`, { signal: options.signal });
 }
 
 function agentHuntingUrl(path: string, options: AgentHuntingOptions) {
@@ -926,20 +918,6 @@ export function cancelDefenderHunt(id: string, options: AgentHuntingOptions = {}
 
 export function deleteDefenderHunt(id: string, options: AgentHuntingOptions = {}) {
   return request<void>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}`, options), { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal });
-}
-
-export function approveDefenderHuntingQualification(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: AgentHuntingOptions = {}) {
-  return request<DefenderHuntingJob>(agentHuntingUrl("/api/hunting/qualifications", options), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters: huntingSubmissionFilters(filters, options) }), signal: options.signal });
-}
-
-export function startDefenderHuntingQualification(id: string, options: AgentHuntingOptions = {}) {
-  return request<DefenderHuntingJob>(agentHuntingUrl(`/api/hunting/qualifications/${encodeURIComponent(id)}/start`, options), { method: "POST", signal: options.signal });
-}
-
-export function revokeDefenderHuntingRetainedScope(id: string, options: AgentHuntingOptions = {}) {
-  return request<DefenderHuntingRetainedScope>(agentHuntingUrl(`/api/hunting/retained-scopes/${encodeURIComponent(id)}/revoke`, options), {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal,
-  });
 }
 
 export async function downloadDefenderHuntingCsv(id: string, options: AgentHuntingOptions = {}) {
@@ -1163,6 +1141,10 @@ export async function getAuditEvents(
 
   if (query.search) {
     searchParams.set("search", query.search);
+  }
+
+  for (const key of ["originChannel", "originIntegrationClientId", "originClientId", "originCallingAgentId"] as const) {
+    if (query[key]) searchParams.set(key, query[key]);
   }
 
   const queryString = searchParams.toString();

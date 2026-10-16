@@ -192,7 +192,7 @@ function mutationConfirmation(operation: "block" | "unblock" | "update-availabil
 function capability(id: CapabilityId, status: CapabilityView["decision"]["status"]): CapabilityView {
   const definition = capabilityDefinitions.find(item => item.id === id)!;
   return {
-    definition,
+    enabled: true, definition,
     decision: {
       capabilityId: id,
       status,
@@ -208,7 +208,7 @@ function capability(id: CapabilityId, status: CapabilityView["decision"]["status
 
 function onDemandCapability(id: CapabilityId): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(item => item.id === id)!,
+    enabled: true, definition: capabilityDefinitions.find(item => item.id === id)!,
     decision: { capabilityId: id, status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] },
   };
 }

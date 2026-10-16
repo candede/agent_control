@@ -116,7 +116,7 @@ const user: SessionUser = {
 
 function capabilities(): CapabilityView[] {
   return capabilityDefinitions.filter(item => ["graph.package.block.manage", "graph.package.access.manage"].includes(item.id)).map(definition => ({
-    definition,
+    enabled: true, definition,
     decision: {
       capabilityId: definition.id, status: "available", authorized: true, fresh: true,
       verification: "on_demand", previewQualification: "not_required", remediation: [],

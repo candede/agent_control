@@ -49,6 +49,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
     ["appActivity", ["active", "inactive", "unknown"]], ["reportActivity", ["all", "recent", "inactive", "no-activity"]],
     ["cohort", ["all", "zero", "low", "review", "licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"]],
     ["licenseCohort", ["active_without_paid"]], ["order", ["asc", "desc"]],
+    ["adoptionChamps", ["with", "without"]], ["adoptionAgents", ["with", "without"]],
   ] as const) if (query[key] !== undefined && !(values as readonly unknown[]).includes(query[key])) throw new SelectionError("invalid_cursor");
   if (query.responsesOnly !== undefined && typeof query.responsesOnly !== "boolean") throw new SelectionError("invalid_cursor");
   for (const key of ["startDate", "endDate"] as const) {
@@ -67,6 +68,9 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
   if (query.search !== undefined) query.search = reportSearch(query.search);
   // A accepted filter must be meaningful on the chosen endpoint, never ignored.
   const organization = ["company", "department", "entitlement", "serviceState", "appActivity", "cohort", "licenseCohort"];
+  if (endpoint !== "adoption" && ("adoptionChamps" in input || "adoptionAgents" in input)) throw new SelectionError("invalid_cursor");
+  if (endpoint === "adoption" && ["entitlement", "serviceState", "appActivity", "cohort", "licenseCohort", "creatorType",
+    "agentId", "username", "responsesOnly", "reportActivity", "startDate", "endDate"].some(key => key in input)) throw new SelectionError("invalid_cursor");
   if (!["copilot_users", "official_users", "adoption"].includes(endpoint) && organization.some(key => key in input)
     || endpoint === "official_users" && ("appActivity" in input || ["licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"].includes(input.cohort ?? ""))
     || endpoint !== "overview" && "scope" in input

@@ -513,7 +513,7 @@ describe("Graph Audit Search selected v1.0 contract", () => {
 
   it.each(["stalled", "rejected"].flatMap(mode => ["get", "create"].map(operation => ({ mode, operation }))))(
     "preserves rejected $operation outcomes without waiting for $mode cleanup", async ({ mode, operation }) => {
-      for (const [status, code] of [[302, "invalid_provider_link"], [401, "authorization_expired"], [403, "provider_denied"], [429, "provider_throttled"]] as const) {
+      for (const [status, code] of [[302, "invalid_provider_link"], [401, "provider_denied"], [403, "provider_denied"], [429, "provider_throttled"]] as const) {
         const cleanup = Promise.withResolvers<void>();
         const cancel = vi.fn(() => mode === "stalled" ? cleanup.promise : Promise.reject(new Error("cleanup failed")));
         const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), { status, headers: { "retry-after": "60" } }));
@@ -954,7 +954,7 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     const authClient = new GraphAuditSearchClient({ fetch: vi.fn()
       .mockResolvedValueOnce(response({ value: [record()], "@odata.nextLink": authLink }))
       .mockResolvedValueOnce(response({}, 401)) as typeof fetch, wait: vi.fn(), random: () => 0 });
-    await expect(authClient.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "authorization_expired" });
+    await expect(authClient.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_denied" });
 
     const schemaLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=schema";
     const schemaClient = new GraphAuditSearchClient({ fetch: vi.fn()

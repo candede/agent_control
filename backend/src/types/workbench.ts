@@ -9,7 +9,7 @@ export const workbenchViewIds = [
   "permissions",
 ] as const;
 
-export type WorkbenchViewId = (typeof workbenchViewIds)[number];
+type WorkbenchViewId = (typeof workbenchViewIds)[number];
 
 export type WorkbenchViewDefinition = {
   id: WorkbenchViewId;

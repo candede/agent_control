@@ -5,6 +5,55 @@ import { browserFixtureTestFiles } from "./fixtureSupport.js";
 const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
 
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "deployment-current") return [
+    ["run", "test", "--workspace", "backend", "--", "scripts/databasePreflight.test.ts", "scripts/database.test.ts",
+      "scripts/databaseReset.test.ts", "scripts/backup.test.ts", "src/db/auditOriginSchema.test.ts", "src/db/agentControlReceiptsSchema.test.ts",
+      "src/db/schema.test.ts", "scripts/largeTenantFixture.test.ts", "src/routes/mcpContractFeasibility.test.ts",
+      "src/db/sessions.test.ts", "src/db/dataGenerations.test.ts", "src/routes/mcpApiAuth.test.ts",
+      "src/routes/sharedAgentControls.test.ts", "src/routes/mcpReadContracts.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "shared-agent-controls") return [
+    ["run", "test", "--workspace", "backend", "--", "src/routes/sharedAgentControls.test.ts",
+      "src/db/agentControlReceiptsSchema.test.ts", "src/db/auditOriginSchema.test.ts",
+      "src/db/inventoryMutationStages.test.ts", "src/db/jobs.test.ts", "src/db/jobs.unit.test.ts",
+      "src/db/copilotStudioQuarantine.test.ts", "src/services/bulkJobs.test.ts", "src/services/copilotStudioQuarantineJobs.unit.test.ts",
+      "src/services/copilotStudioQuarantineJobs.test.ts", "src/services/inventoryRuntime.test.ts", "src/db/schema.test.ts",
+      "src/services/copilotStudioQuarantineControl.test.ts", "src/routes/actionOrigin.test.ts",
+      "src/services/auditOrigin.test.ts", "src/routes/auditOriginHttp.test.ts", "src/services/auditLog.test.ts",
+      "src/routes/mcpApiAuth.test.ts", "src/routes/packageCanaryAuthorization.test.ts",
+      "src/routes/mcpContractFeasibility.test.ts", "scripts/backup.test.ts", "scripts/database.test.ts",
+      "scripts/largeTenantFixture.test.ts", "src/db/sessions.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+    ["run", "test", "--workspace", "frontend", "--", "src/api/client.test.ts", "src/components/PackageManagement.test.tsx",
+      "src/components/BulkActions.test.tsx", "src/components/CopilotStudioQuarantineControls.test.tsx",
+      "src/components/BulkJobItems.test.tsx"],
+    ["run", "build", "--workspace", "frontend"],
+    ["run", "lint", "--workspace", "frontend"],
+  ];
+  if (suite === "mcp-read-contracts") return [
+    ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/auditOriginHttp.test.ts",
+      "src/services/packageDetailProjection.test.ts", "src/services/packageObservation.test.ts", "src/services/packageAgentMetadata.test.ts",
+      "src/services/inventoryExports.test.ts",
+      "src/db/inventoryGenerations.test.ts", "src/services/inventoryReconciliation.test.ts", "src/db/packageInventoryUnifiedSource.test.ts",
+      "src/services/largeTenantUserSources.test.ts", "src/services/largeTenantUsersReports.test.ts", "src/services/adoptionGroups.test.ts",
+      "src/services/agentUsageHistory.test.ts", "src/db/officialUsageHistorySelection.test.ts", "src/routes/largeTenantInventory.test.ts",
+      "src/db/schema.test.ts", "src/db/auditOriginSchema.test.ts", "src/db/sessions.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "audit-origin") return [
+    ["run", "test", "--workspace", "backend", "--", "src/db/auditOriginSchema.test.ts", "src/services/auditOrigin.test.ts", "src/routes/auditOriginHttp.test.ts",
+      "src/services/auditLog.test.ts", "src/db/jobs.test.ts", "src/db/copilotStudioQuarantine.test.ts",
+      "src/db/inventoryMutationStages.test.ts", "src/db/dataRetention.test.ts", "src/db/sessions.test.ts",
+      "src/services/dataExports.test.ts", "src/services/reportExportAudit.test.ts", "src/db/officialReportImports.unit.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "auth-recovery") return [
+    ["run", "test", "--workspace", "backend", "--", "src/routes/mcpApiAuth.test.ts",
+      "src/db/sessions.test.ts", "src/db/dataGenerations.test.ts", "src/db/schema.test.ts",
+      "scripts/database.test.ts", "scripts/backup.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
   if (suite === "production-frontend") return [
     ["run", "test", "--workspace", "frontend"],
   ];
@@ -525,6 +574,26 @@ export function fixtureCommands(suite: string): string[][] {
       "src/db/sessionsConcurrency.test.ts", "scripts/largeTenantFixture.test.ts",
       "scripts/databasePreflight.test.ts", "scripts/databaseReset.test.ts"],
     ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "webapp-regressions") return [
+    ["run", "test", "--workspace", "backend", "--", "src/app.test.ts", "src/routes/dataPages.test.ts",
+      "src/services/bulkJobs.unit.test.ts", "src/server.test.ts", "src/services/agentInvestigations.test.ts",
+      "src/db/officialUsageImports.test.ts", "src/db/automaticDataSync.test.ts", "src/services/unifiedAgents.test.ts",
+      "src/db/defenderHunting.test.ts", "src/services/savedAgentPeople.test.ts", "src/db/dataSync.test.ts",
+      "src/db/agentInvestigations.test.ts", "src/db/inventoryRefreshContractSchema.test.ts",
+      "src/db/inventoryResponsibility.unit.test.ts", "src/db/lifecycleAcceptance.test.ts",
+      "src/db/packageInventory.test.ts", "src/db/purviewAuditFailures.test.ts",
+      "src/routes/dataExportLifecycle.unit.test.ts", "src/routes/defenderHunting.unit.test.ts",
+      "src/routes/inventory.test.ts", "src/routes/officialUsageCsv.test.ts", "src/routes/officialUsageImports.test.ts",
+      "src/routes/packageDetailSync.test.ts", "src/routes/policy.test.ts", "src/routes/quarantineJobReads.test.ts",
+      "src/services/automaticRefreshIntegration.test.ts", "src/services/dataExportLifecycle.test.ts",
+      "src/services/inventoryReconciliation.unit.test.ts", "src/services/unifiedAgentsSnapshot.test.ts",
+      "src/routes/agentInvestigationHttp.test.ts", "src/services/purviewAudit.test.ts", "src/db/purviewAudit.test.ts"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "webapp-qualification") return [
+    ...fixtureCommands("all"),
+    ["run", "typecheck", "--workspace", "frontend"],
   ];
   if (suite === "all") return [
     ["run", "test", "--workspace", "backend"], ["run", "test", "--workspace", "frontend"],

@@ -194,7 +194,10 @@ describe.sequential("PostgreSQL initialization and role boundary", () => {
       VALUES ('tenant','principal','principal','graph.package.read.delegated','https://graph.microsoft.com','global','delegated','permission-revision','contract-revision',1,'unknown',clock_timestamp()+interval '5 minutes')`);
     expect((await runtime.query("SELECT count(*)::int AS count FROM capability_evidence")).rows[0].count).toBe(1);
     await expect(runtime.query("ALTER TABLE capability_evidence ADD COLUMN forbidden text")).rejects.toThrow();
-    expect((await runtime.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({mode:"normal",provider_work_enabled:true});
+    expect((await runtime.query("SELECT mode FROM operational_state")).rows[0]).toEqual({mode:"normal"});
+    expect((await runtime.query(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='operational_state' ORDER BY ordinal_position`)).rows.map(row => row.column_name))
+      .toEqual(["singleton", "mode", "updated_at"]);
     for (const sql of ["UPDATE operational_state SET mode='maintenance'", "DELETE FROM operational_state", "TRUNCATE operational_state"]) {
       await expect(runtime.query(sql)).rejects.toThrow();
     }

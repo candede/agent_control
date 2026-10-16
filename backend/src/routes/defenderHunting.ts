@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { AppError, errorTelemetry } from "../errors.js";
@@ -19,40 +20,19 @@ defenderHuntingRouter.use((_request, response, next) => { response.setHeader("Ca
 
 policyRoute(defenderHuntingRouter, "get", "/hunting/catalog", { access: "authenticated", dataClass: "hunting_metadata", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   await publishHuntingJson(request, response, async () => ({ templates: Object.entries(defenderHuntingTemplates).map(([id, value]) => ({ id, ...value })),
-    ...await defenderHunting.catalog(request.session.user!, huntingTarget(request)),
-    limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
+    limits: { maximumWindowHours: 168, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
     scopeNotice: "Microsoft Graph selects the Defender hunting scope. Agent Control neither accepts workspaceId nor promises requested-workspace isolation.",
     contentNotice: "Input/output messages and tool arguments or results are not retained or reconstructed. An observed root span does not prove complete telemetry or admin-center ingestion; child-only spans do not establish a root.",
     readinessNotice: "A successful empty response is no_data, not proof of complete tenant coverage. Check license, Defender RBAC/data-source scope, Microsoft 365 activities connectivity and table rollout separately.",
-    retentionNotice: "Provider qualification expires after 24 hours. Exact retained-scope approval and minimized local jobs expire after 30 days; revocation or current configuration change hides saved data immediately.",
+    retentionNotice: "Minimized local jobs expire after 30 days. Application results remain visible only within the current configured shared scope; delegated results remain principal-private.",
     defenderPortalUrl: "https://security.microsoft.com/v2/advanced-hunting",
   }));
-});
-
-policyRoute(defenderHuntingRouter, "post", "/hunting/qualifications", { access: "authenticated", dataClass: "hunting_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  const mode = tokenMode(request.body?.tokenMode);
-  await publishHuntingJson(request, response, () => auditedLifecycle(request, "approve-hunting", "qualification", mode,
-    () => defenderHunting.approveQualification(request.session.user!, {
-      tokenMode: mode, filters: request.body?.filters, ...huntingTarget(request),
-    })), 201);
-});
-
-policyRoute(defenderHuntingRouter, "post", "/hunting/qualifications/:id/start", { access: "authenticated", dataClass: "hunting_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  const id = uuid(request.params.id);
-  await publishHuntingJson(request, response, () => auditedLifecycle(request, "qualify-hunting", id, undefined, () => startQualificationOrWaiting(request, id)), 202);
-});
-
-policyRoute(defenderHuntingRouter, "post", "/hunting/retained-scopes/:id/revoke", { access: "authenticated", dataClass: "hunting_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  const id = uuid(request.params.id);
-  confirmExactId(request.body, id, "retained hunting scope");
-  await publishHuntingJson(request, response, () => auditedLifecycle(request, "revoke-hunting-scope", id, undefined,
-    () => defenderHunting.revokeRetainedScope(request.session.user!, id, huntingTarget(request))));
 });
 
 policyRoute(defenderHuntingRouter, "post", "/hunting/jobs", { access: "authenticated", dataClass: "private_hunting_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const mode = tokenMode(request.body?.tokenMode);
   await publishHuntingJson(request, response, () => auditedLifecycle(request, "submit-hunting", "submission", mode, async () => {
-    const job = await defenderHunting.submit(request.session.user!, {
+    const job = await defenderHunting.submit(requestUser(request), {
       tokenMode: mode, filters: request.body?.filters, ...huntingTarget(request),
       idempotencyKey: request.get("Idempotency-Key") ?? randomUUID(),
     });
@@ -61,56 +41,56 @@ policyRoute(defenderHuntingRouter, "post", "/hunting/jobs", { access: "authentic
 });
 
 policyRoute(defenderHuntingRouter, "get", "/hunting/jobs", { access: "authenticated", dataClass: "private_hunting_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  await publishHuntingJson(request, response, () => defenderHunting.list(request.session.user!,
+  await publishHuntingJson(request, response, () => defenderHunting.list(requestUser(request),
     positiveInteger(first(request.query.limit), 20, 50), positiveInteger(first(request.query.offset), 0, 100_000, true),
     huntingTarget(request)));
 });
 
 policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id", { access: "authenticated", dataClass: "private_hunting_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  await publishHuntingJson(request, response, () => defenderHunting.get(request.session.user!, uuid(request.params.id), huntingTarget(request)));
+  await publishHuntingJson(request, response, () => defenderHunting.get(requestUser(request), uuid(request.params.id), huntingTarget(request)));
 });
 
 policyRoute(defenderHuntingRouter, "post", "/hunting/jobs/:id/resume", { access: "authenticated", dataClass: "private_hunting_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = uuid(request.params.id);
-  await publishHuntingJson(request, response, async () => {
-    const job = await defenderHunting.get(request.session.user!, id, huntingTarget(request));
+  await publishHuntingJson(request, response, () => auditedLifecycle(request, "resume-control", id, undefined, async () => {
+    const job = await defenderHunting.get(requestUser(request), id, huntingTarget(request));
     return startOrWaiting(request, id, job.tokenMode);
-  }, 202);
+  }), 202);
 });
 
 policyRoute(defenderHuntingRouter, "post", "/hunting/jobs/:id/cancel", { access: "authenticated", dataClass: "private_hunting_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = uuid(request.params.id);
   await publishHuntingJson(request, response, () => auditedLifecycle(request, "cancel-hunting", id, undefined,
-    () => defenderHunting.cancel(request.session.user!, id, huntingTarget(request))));
+    () => defenderHunting.cancel(requestUser(request), id, huntingTarget(request))));
 });
 
 policyRoute(defenderHuntingRouter, "delete", "/hunting/jobs/:id", { access: "authenticated", dataClass: "private_hunting_cache", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = uuid(request.params.id);
   confirmLocalDelete(request.body, id);
-  const assertCurrent = defenderHunting.beginReadValidation(request.session.user!);
+  const assertCurrent = defenderHunting.beginReadValidation(requestUser(request));
   assertCurrent();
   await auditedLifecycle(request, "delete-hunting", id, undefined,
-    () => defenderHunting.delete(request.session.user!, id, huntingTarget(request)));
+    () => defenderHunting.delete(requestUser(request), id, huntingTarget(request)));
   assertCurrent();
   response.status(204).end();
 });
 
 policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id/rows", { access: "authenticated", dataClass: "private_hunting", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const id = uuid(request.params.id);
-  await publishHuntingJson(request, response, () => auditedRead(request, id, "view-hunting", () => defenderHunting.rows(request.session.user!, id,
+  await publishHuntingJson(request, response, () => auditedRead(request, id, "view-hunting", () => defenderHunting.rows(requestUser(request), id,
     positiveInteger(first(request.query.limit), 100, 200), positiveInteger(first(request.query.offset), 0, 100_000, true), huntingTarget(request))));
 });
 
-policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id/export.csv", { access: "authenticated", dataClass: "private_hunting_export", roles: ["AgentControl.Viewer"] }, async (request, response) => {
+policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id/export.csv", { browserOnly: true, access: "authenticated", dataClass: "private_hunting_export", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const deadlineAt = Date.now() + 15_000;
   const id = uuid(request.params.id);
   const scope = requestScope(request);
   const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
   const capabilityAssertions = (["defender.hunting.delegated", "defender.hunting.application"] as const)
-    .map(capabilityId => capabilities.beginOperationValidation(capabilityId, request.session.user!));
+    .map(capabilityId => capabilities.beginOperationValidation(capabilityId, requestUser(request)));
   const validatePublication = async () => {
     const assertSession = await validateSession(async () => {
-      await defenderHunting.get(request.session.user!, id, huntingTarget(request));
+      await defenderHunting.get(requestUser(request), id, huntingTarget(request));
     });
     const assertCurrent = () => {
       assertSession();
@@ -121,10 +101,10 @@ policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id/export.csv", { acce
   };
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({ operationId: `export-hunting:${id}:${randomUUID()}`, scope: "single", action: "export-hunting", agentId: id,
-    actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_defender_hunting" } });
+    actor: requestUser(request), requestPath: request.path, metadata: { source: "microsoft_defender_hunting" } });
   try {
       await validatePublication();
-      const result = await defenderHunting.rows(request.session.user!, id, 200, 0, huntingTarget(request));
+      const result = await defenderHunting.rows(requestUser(request), id, 200, 0, huntingTarget(request));
     if (result.count > 200 || result.value.length !== result.count) throw new AppError(413, "export_row_limit", "The Defender export exceeds the 200 row source limit.");
     const columns = ["jobId", "tenantId", "tokenMode", "resultScopeKind", "resultScopeId", "queryVersion", "templateId", "sourceTable",
       "requestedStartDateTime", "requestedEndDateTime", "observedStartDateTime", "observedEndDateTime", "observationTime", "complete", "noData",
@@ -172,15 +152,15 @@ function exportRow(result: Awaited<ReturnType<typeof defenderHunting.rows>>, ten
 
 async function auditedRead<T extends { count: number }>(request: Request, jobId: string, action: "view-hunting" | "export-hunting", operation: () => Promise<T>) {
   const scope = requestScope(request);
-  const assertCurrent = defenderHunting.beginReadValidation(request.session.user!);
+  const assertCurrent = defenderHunting.beginReadValidation(requestUser(request));
   assertCurrent();
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({ operationId: `${action}:${jobId}:${randomUUID()}`, scope: "single", action, agentId: jobId,
-    actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_defender_hunting" } });
+    actor: requestUser(request), requestPath: request.path, metadata: { source: "microsoft_defender_hunting" } });
   try {
     const result = await operation();
     await audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_defender_hunting", resultingCount: result.count } });
-    await defenderHunting.get(request.session.user!, jobId, huntingTarget(request));
+    await defenderHunting.get(requestUser(request), jobId, huntingTarget(request));
     assertCurrent();
     return result;
   } catch (error) {
@@ -190,12 +170,12 @@ async function auditedRead<T extends { count: number }>(request: Request, jobId:
   }
 }
 
-async function auditedLifecycle<T>(request: Request, action: "approve-hunting" | "qualify-hunting" | "submit-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope", target: string,
+async function auditedLifecycle<T>(request: Request, action: "submit-hunting" | "cancel-hunting" | "delete-hunting" | "resume-control", target: string,
   mode: DefenderHuntingTokenMode | undefined, operation: () => Promise<T>) {
   const scope = requestScope(request);
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({ operationId: `${action}:${target}:${randomUUID()}`, scope: "single", action, agentId: target,
-    actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_defender_hunting", ...(mode ? { mode } : {}) } });
+    actor: requestUser(request), requestPath: request.path, metadata: { source: "microsoft_defender_hunting", ...(mode ? { mode } : {}) } });
   try {
     const result = await operation();
     await audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_defender_hunting", ...(mode ? { mode } : {}) } });
@@ -208,7 +188,7 @@ async function auditedLifecycle<T>(request: Request, action: "approve-hunting" |
 }
 
 async function publishHuntingJson<T>(request: Request, response: Response, operation: () => Promise<T>, status = 200) {
-  const assertCurrent = defenderHunting.beginReadValidation(request.session.user!);
+  const assertCurrent = defenderHunting.beginReadValidation(requestUser(request));
   assertCurrent();
   const result = await operation();
   assertCurrent();
@@ -216,17 +196,9 @@ async function publishHuntingJson<T>(request: Request, response: Response, opera
 }
 
 async function startOrWaiting(request: Request, id: string, mode: DefenderHuntingTokenMode) {
-  try { return await defenderHunting.start(request.session.user!, id, mode, huntingTarget(request)); }
+  try { return await defenderHunting.start(requestUser(request), id, mode, huntingTarget(request)); }
   catch (error) {
-    if (error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired"].includes(error.code))) return defenderHunting.get(request.session.user!, id, huntingTarget(request));
-    throw error;
-  }
-}
-
-async function startQualificationOrWaiting(request: Request, id: string) {
-  try { return await defenderHunting.startQualification(request.session.user!, id, huntingTarget(request)); }
-  catch (error) {
-    if (error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired"].includes(error.code))) return defenderHunting.get(request.session.user!, id, huntingTarget(request));
+    if (error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired"].includes(error.code))) return defenderHunting.get(requestUser(request), id, huntingTarget(request));
     throw error;
   }
 }

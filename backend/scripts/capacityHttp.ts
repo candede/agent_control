@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Server } from "node:http";
 import session from "express-session";
 import type pg from "pg";
@@ -13,9 +14,10 @@ import { OfficialReportExports } from "../src/services/officialReportExports.js"
 import { fixtureTenant } from "./capacityProvider.js";
 import type { InventoryRoot } from "../src/types/inventoryRecords.js";
 import type { CapacityTelemetry } from "./capacityTelemetry.js";
+import { capacityInitialSync } from "./capacityRuntime.js";
 
 export async function capacityHttp(database: pg.Pool, telemetry: CapacityTelemetry, root: InventoryRoot | undefined,
-  principal: string, browserOnly: boolean | "bootstrap" = false) {
+  principal: string, browserOnly: boolean | "bootstrap" | "web" = false) {
   assert.equal(process.env.AGENT_CONTROL_ISOLATED_TESTS, "1");
   assert.equal(process.env.PGHOST, "test-postgres");
   assert.equal(database,pool,"The complete app and capacity workers must share the same four-connection pool.");
@@ -23,9 +25,10 @@ export async function capacityHttp(database: pg.Pool, telemetry: CapacityTelemet
   const user = { tenantId: fixtureTenant, homeAccountId: principal, username: "capacity@example.invalid",
     displayName: "Synthetic capacity", roles: ["AgentControl.Admin"] };
   assert.equal(config.tenants[0].tenantId, fixtureTenant);
+  const signedInAt = Date.now();
   const sessionData = {
     cookie: new session.Cookie({ maxAge: 8*3600_000 }), tenantId: fixtureTenant, accountId: principal,
-    clientId: config.tenants[0].clientId, rolesValidatedAt: Date.now(), csrfToken: "capacity-synthetic-csrf", user,
+    clientId: config.tenants[0].clientId, signedInAt, rolesValidatedAt: signedInAt, csrfToken: "capacity-synthetic-csrf", user,
   };
   await new Promise<void>((resolve,reject) => application.store.set(id, sessionData, error => error ? reject(error) : resolve()));
   let renewal: Promise<void> | undefined;
@@ -77,11 +80,29 @@ export async function capacityHttp(database: pg.Pool, telemetry: CapacityTelemet
       return { routes,browserPlatform,database: String(database.options.database),user: database.options.user,
         poolMaximum: database.options.max,sharedApplicationPool: database===pool };
     }
-    if (browserOnly) return { browser: await dispatch("browser") };
-    assert.ok(root);
+    let initialSync;
+    if (browserOnly) {
+      initialSync = await capacityInitialSync(database,user,100_000);
+      telemetry.write({ event: "capacity-real-initial-sync",result: initialSync });
+      const deadline = AbortSignal.timeout(30*60_000);
+      for (;;) {
+        const response = await fetch("http://127.0.0.1:8081/api/agent-inventory/selections",{
+          method: "POST",headers: { cookie,origin: "http://test-db:8081","content-type": "application/json",
+            "x-csrf-token": sessionData.csrfToken },body: JSON.stringify({ query: {} }),signal: deadline,
+        });
+        assert.ok(response.status===200 || response.status===201);
+        const selection = await response.json();
+        if (response.status===201) break;
+        assert.equal(selection.state,"preparing",JSON.stringify(selection));
+        await delay(1500,undefined,{ signal: deadline });
+      }
+      if (browserOnly===true) return { initialSync,browser: await dispatch("browser") };
+    }
+    assert.ok(root || browserOnly==="web");
     const readers = await dispatch("readers");
     const identity = await reportIdentity(database,user);
-    const selected = await new InventoryQueries(database,config.sessionSecret).capture(identity,root.scopeId);
+    const selected = root ? await new InventoryQueries(database,config.sessionSecret).capture(identity,root.scopeId)
+      : { id: readers.warmup.selectionId };
     const engine = new OfficialReportExports(new LargeTenantUsersReports(database,config.sessionSecret,35),user,config.sessionSecret);
     const exportId = await engine.create(identity,{ selectionId: selected.id,kind: "graph_packages" });
     await engine.build(exportId,identity,"graph_packages");
@@ -90,7 +111,8 @@ export async function capacityHttp(database: pg.Pool, telemetry: CapacityTelemet
     assert.equal(download.checksum,expected.checksum); assert.equal(download.bytes,Number(expected.byte_count));
     await engine.engine.cancel(exportId,identity);
     assert.equal(readers.requests,1008); assert.equal(readers.failures,0);
-    return { readers,download,transport: "Real authenticated Express routes; 12 clients and slow/disconnected downloads in the separately capped controller." };
+    return { readers,download,...(browserOnly==="web" ? { initialSync,browser: await dispatch("browser") } : {}),
+      transport: "Real authenticated Express routes; 12 clients and slow/disconnected downloads in the separately capped controller." };
   } finally {
     clearInterval(issuer);
     clearInterval(issuerGuard);

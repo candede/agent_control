@@ -4,7 +4,7 @@ import { capabilityDefinitions } from "../../../backend/src/services/capabilityR
 import { getCurrentUser, type CapabilityCheckProgress, type CapabilityView } from "../api/client";
 import { PermissionCheckProgress } from "./PermissionCheckProgress";
 
-const views: CapabilityView[] = capabilityDefinitions.map(definition => ({ definition, decision: {
+const views: CapabilityView[] = capabilityDefinitions.map(definition => ({ enabled: true, definition, decision: {
   capabilityId: definition.id, status: "unknown", authorized: false, fresh: false, previewQualification: "not_required", remediation: [],
 } }));
 const activeCheck = { id: 1, retryFailed: true };

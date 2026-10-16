@@ -4,7 +4,7 @@ import { config, resolveTenantForUsername } from "../config.js";
 import { pool } from "../db/pool.js";
 import { activateAccountSession, getValidatedSessionIdentity, revokeAccountSessionMutations, revokeAccountSessions } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, consumeAuthFlow, storeAuthFlow } from "../auth/flows.js";
+import { adminManagedPermissionsMessage, assertLoginAuthFlow, consumeAuthFlow, storeAuthFlow } from "../auth/flows.js";
 import {
   createAuthFlow,
   createAuthorizationUrl,
@@ -55,10 +55,6 @@ policyRoute(authRouter, "get", "/auth/login", { access: "public", dataClass: "id
   } catch (error) {
     next(error);
   }
-});
-
-policyRoute(authRouter, "post", "/auth/consent", { access: "authenticated", dataClass: "identity", roles: ["AgentControl.Viewer"], csrf: true }, (_request, _response, next) => {
-  next(adminManagedPermissionsError());
 });
 
 policyRoute(authRouter, "get", "/auth/callback", { access: "public", dataClass: "identity" }, async (request, response, next) => {
@@ -116,7 +112,7 @@ policyRoute(authRouter, "get", "/auth/callback", { access: "public", dataClass: 
   }
 });
 
-policyRoute(authRouter, "post", "/auth/logout", { access: "authenticated", dataClass: "identity", csrf: true }, async (request, response, next) => {
+policyRoute(authRouter, "post", "/auth/logout", { access: "authenticated", browserOnly: true, dataClass: "identity", csrf: true }, async (request, response, next) => {
   try {
     const identity = getValidatedSessionIdentity(request.session);
     if (!identity) throw AppError.unauthorized();
@@ -155,7 +151,7 @@ async function revokePrincipalAuthorization(tenantId: string, accountId: string,
   if (failure?.status === "rejected") throw failure.reason;
 }
 
-policyRoute(authRouter, "get", "/me", { access: "authenticated", dataClass: "identity" }, (request, response) => {
+policyRoute(authRouter, "get", "/me", { access: "authenticated", browserOnly: true, dataClass: "identity" }, (request, response) => {
   response.json({ user: request.session.user, csrfToken: request.session.csrfToken, roleAssignmentRequired: request.session.user!.roles.length === 0 });
 });
 

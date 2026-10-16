@@ -1,4 +1,4 @@
-import { useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Search, X } from "lucide-react";
 import type { AdoptionGroup, AdoptionPage } from "../../../backend/src/types/adoption";
 import { normalizeReportSearch } from "../api/reportData";
@@ -22,6 +22,14 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
   const search = useRef<HTMLInputElement>(null);
   const searchId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
+  const normalizedSearch = normalizeReportSearch(route.search);
+  const [settledSearch, setSettledSearch] = useState(normalizedSearch);
+  const searchPending = settledSearch !== normalizedSearch;
+  useEffect(() => {
+    if (!searchPending) return;
+    const timer = window.setTimeout(() => setSettledSearch(normalizedSearch), 300);
+    return () => window.clearTimeout(timer);
+  }, [normalizedSearch, searchPending]);
   const fields = [{ key: "company", label: "Company" }, { key: "department", label: "Department" }] as const;
   const evidenceFilters = [
     { key: "adoptionChamps", label: "Copilot Champs", with: "With Copilot Champs", without: "Without Copilot Champs" },
@@ -41,12 +49,13 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
     trigger.current?.focus();
   }
   const read = useReportPage<AdoptionGroup, AdoptionPage>("copilot-usage/adoption", {
-    search: normalizeReportSearch(route.search) || undefined, setId: route.reportSetId, limit: 5,
+    search: normalizedSearch || undefined, setId: route.reportSetId, limit: 5,
     company: route.company, department: route.department, adoptionChamps: route.adoptionChamps, adoptionAgents: route.adoptionAgents,
-  }, revision);
+  }, revision, !searchPending);
+  const loading = searchPending || read.loading;
   const data = read.data;
   return <div className="adoption-view">
-    <div className="agent-overview-metrics" role="group" aria-label="Adoption summary" aria-busy={read.loading}>
+    <div className="agent-overview-metrics" role="group" aria-label="Adoption summary" aria-busy={loading}>
       {([
         ["Groups", data?.counts.filtered, "Company / department"],
         ["People", data?.summary.people, "In matching groups"],
@@ -68,7 +77,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
         </div>
         <div className="agent-query-summary">
           <span className="agent-match-count" role="status" aria-label="Matching groups" aria-atomic="true">
-            <strong>{read.loading ? "Updating..." : data ? data.counts.filtered.toLocaleString() : "Unavailable"}</strong>{" "}
+            <strong>{loading ? "Updating..." : data ? data.counts.filtered.toLocaleString() : "Unavailable"}</strong>{" "}
             <span>{data?.counts.filtered === 1 ? "matching group" : "matching groups"}</span>
           </span>
           {hasFilters ? <button type="button" className="clear-filters-button" onClick={clearFilters}>Clear filters</button> : null}
@@ -98,7 +107,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
         </button>)}
       </div> : null}
     </section>
-    <ReportReadStatus read={read} quietLoading />
+    <ReportReadStatus read={{ ...read, loading }} quietLoading />
     {data?.directory.state !== undefined && data.directory.state !== "available"
       ? <p role="status" className="reported-users-note">Group membership uses {data.directory.state} saved directory data. Refresh Users in Sync.</p> : null}
     {data && !data.inventoryAvailable ? <p role="status" className="reported-users-note">Agent inventory is unavailable. Refresh Agents in Sync to populate group agents.</p> : null}
@@ -126,7 +135,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
               if (read.isCurrentData(true)) onOpenAgent(agent.id);
             }}>{agent.name}</button> : <strong>{agent.name}</strong>}
               {agent.type ? <small>{agent.type.replace("Microsoft 365 Copilot Agent Builder", "Agent Builder")}</small> : null}</div>
-            <p>{getAdoptionDescriptionPreview(agent.description) || "Description unavailable"}</p>
+            <p aria-label="Saved description preview">{getAdoptionDescriptionPreview(agent.description) || "Description unavailable"}</p>
           </li>)}</ul>
           {!group.agents.length ? <p className="adoption-empty">No organization-built agents found.</p> : null}
         </div>

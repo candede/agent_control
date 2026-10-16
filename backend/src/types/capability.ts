@@ -69,7 +69,7 @@ export type CapabilityStatus =
   | "provider_error"
   | "unknown";
 export type TokenMode = "delegated" | "application" | "local";
-export type DataClass =
+type DataClass =
   | "inventory"
   | "package_control"
   | "directory"
@@ -98,7 +98,7 @@ export type CapabilityDefinition = {
   internalRoles: AppRole[];
   consentGroup?: string;
   probe: {
-    kind: "provider_read" | "live_qualification" | "local_policy" | "on_demand" | "not_registered";
+    kind: "provider_read" | "local_policy" | "on_demand" | "not_registered";
     adapterRegistered: boolean;
     description: string;
   };
@@ -109,7 +109,7 @@ export type CapabilityDecision = {
   status: CapabilityStatus;
   authorized: boolean;
   fresh: boolean;
-  verification?: "local" | "token" | "provider" | "qualification" | "on_demand";
+  verification?: "local" | "token" | "provider" | "on_demand";
   checkedAt?: string;
   expiresAt?: string;
   lastSuccessAt?: string;
@@ -130,7 +130,7 @@ export type CapabilityView = {
   decision: CapabilityDecision;
   // Recent real operation failures do not change the authorization decision.
   operationFailure?: CapabilityOperationFailure;
-  enabled?: boolean;
+  enabled: boolean;
   configuration?: {
     enabled: boolean;
     sharedDataScope: boolean;

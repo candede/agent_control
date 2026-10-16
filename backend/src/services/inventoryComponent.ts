@@ -33,7 +33,9 @@ export function buildRecords(
     if (resourceRows.has(key)) {
       throw new AppError(500, "saved_source_invalid", "Saved Power Platform agent inventory contains a duplicate exact environment and native identity.");
     }
-    resourceRows.set(key, { resource, packages: [], evidence: [], packageEvidence: [], warnings: [] });
+    const summary = { ...resource, details: { ...resource.details } };
+    if (Buffer.byteLength(summary.details.description ?? "") > 16384) delete summary.details.description;
+    resourceRows.set(key, { resource: summary, packages: [], evidence: [], packageEvidence: [], warnings: [] });
   }
   const packageById = new Map(packages.map(value => [value.id, value]));
   if (packageById.size !== packages.length) throw new AppError(500, "saved_source_invalid", "Saved Graph inventory contains duplicate package identities.");
@@ -116,8 +118,10 @@ export function packageSummary(value: CopilotPackage): CopilotPackage {
     "type", "shortDescription", "supportedHosts", "createdDateTime",
     "lastModifiedDateTime", "publisher", "availableTo", "deployedTo", "elementTypes", "platform",
     "version", "manifestVersion", "manifestId", "appId", "assetId", "ownerId", "agentIdentityId", "providerUsage", "controlObservations", "detailFreshness",
+    "identityRevalidationRequired", "savedSource",
   ] as const satisfies readonly (keyof CopilotPackage)[];
-  for (const key of fields) if (Object.hasOwn(value, key)) Object.assign(summary, { [key]: value[key] });
+  for (const key of fields) if (Object.hasOwn(value, key)
+    && !(key === "shortDescription" && Buffer.byteLength(value.shortDescription ?? "") > 16384)) Object.assign(summary, { [key]: value[key] });
   return structuredClone(summary);
 }
 function uniqueEvidence(values: readonly PackageAgentLinkEvidence[]) {

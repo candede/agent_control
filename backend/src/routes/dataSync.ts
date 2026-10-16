@@ -1,3 +1,4 @@
+import { requestUser, requestAuthenticatedAt } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
@@ -16,7 +17,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
     requestScope(request);
     if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Package detail status does not accept query parameters.");
     response.setHeader("Cache-Control", "no-store");
-    response.json(await details.detailSyncState(request.session.user!));
+    response.json(await details.detailSyncState(requestUser(request)));
   });
   for (const action of ["start", "cancel"] as const) {
     policyRoute(router, "post", `/data-sync/package-details/${action}`, {
@@ -27,12 +28,12 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
       if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Package detail controls do not accept query parameters.");
       response.setHeader("Cache-Control", "no-store");
       response.status(action === "start" ? 202 : 200).json(action === "start"
-        ? await details.startDetailSync(request.session.user!, request.session.signedInAt)
-        : await details.cancelDetailSync(request.session.user!));
+        ? await details.startDetailSync(requestUser(request), requestAuthenticatedAt(request))
+        : await details.cancelDetailSync(requestUser(request)));
     });
   }
 
-  policyRoute(router, "post", "/data-sync/auto-refresh", {
+  policyRoute(router, "post", "/data-sync/auto-refresh", { browserOnly: true,
     access: "authenticated",
     dataClass: "private_data_sync_job",
     roles: ["AgentControl.Viewer"],
@@ -42,7 +43,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
     requireEmptyBody(request.body, "Automatic refresh does not accept options.");
     if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Automatic refresh does not accept query parameters.");
     response.setHeader("Cache-Control", "no-store");
-    response.json(await service.automaticRefresh(request.session.user!, request.session.signedInAt));
+    response.json(await service.automaticRefresh(requestUser(request), requestAuthenticatedAt(request)));
   });
 
   policyRoute(router, "get", "/data-sync/state", {
@@ -53,7 +54,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
     requestScope(request);
     if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Data sync state does not accept query parameters.");
     response.setHeader("Cache-Control", "no-store");
-    response.json(await service.state(request.session.user!));
+    response.json(await service.state(requestUser(request)));
   });
 
   policyRoute(router, "post", "/data-sync/runs", {
@@ -63,7 +64,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
     csrf: true,
   }, async (request, response) => {
     requestScope(request);
-    const run = await service.start(request.session.user!, parseStartDataSyncInput(request.body));
+    const run = await service.start(requestUser(request), parseStartDataSyncInput(request.body));
     response.locals.jobId = run.id;
     response.status(202).json(run);
   });
@@ -89,7 +90,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
   }, async (request, response) => {
     requestScope(request);
     const input = parseRetryDataSyncInput(request.body);
-    const run = await service.retry(request.session.user!, parseRunId(firstPathValue(request.params.id)), input.sources);
+    const run = await service.retry(requestUser(request), parseRunId(firstPathValue(request.params.id)), input.sources);
     response.locals.jobId = run.id;
     response.status(202).json(run);
   });
@@ -102,7 +103,7 @@ export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "g
   }, async (request, response) => {
     requestScope(request);
     requireEmptyBody(request.body, "Data sync cancellation does not accept a request body.");
-    const run = await service.cancel(request.session.user!, parseRunId(firstPathValue(request.params.id)));
+    const run = await service.cancel(requestUser(request), parseRunId(firstPathValue(request.params.id)));
     response.locals.jobId = run.id;
     response.json(run);
   });

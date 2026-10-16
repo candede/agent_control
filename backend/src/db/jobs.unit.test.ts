@@ -9,7 +9,7 @@ import { loadOperationalState } from "../services/operationalState.js";
 
 beforeEach(async () => {
   await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
 });
 afterEach(() => vi.restoreAllMocks());
@@ -48,7 +48,8 @@ function fixture() {
       expect(_values).toEqual([scope.tenantId, scope.principalId]);
       return result([{ epoch: "0" }]);
     }
-    if (statement.startsWith("SELECT * FROM jobs")) return result([job]);
+    if (statement.startsWith("SELECT * FROM jobs") || statement.startsWith("SELECT job.* FROM jobs")) return result([job]);
+    if (statement.startsWith("INSERT INTO audit_events")) return result();
     if (statement.startsWith("SELECT 1 FROM job_items item JOIN jobs")) return result([{ id: item.id }]);
     if (statement.startsWith("UPDATE job_items SET status=")) return result([{ id: item.id }]);
     if (statement.startsWith("UPDATE job_attempts") || statement.startsWith("UPDATE jobs")
@@ -128,10 +129,13 @@ describe("package mutation persistence boundaries without a database", () => {
   it.each([false, true])("fences repository resume without confusing exact package IDs with canary paths (canary: %s)", async canary => {
     const f = fixture();
     const path = canary ? `/api/agents/mutation-canaries/${f.job.id}/execute/original` : "/api/agents/mutation-canaries/block";
-    vi.mocked(f.database.query).mockImplementation(async (statement, values) => {
+    const normalQuery = f.query.getMockImplementation()!;
+    f.query.mockImplementation(async (statement, values) => {
       const sql = String(statement);
+      if (!sql.startsWith("UPDATE jobs SET status='running',lease_owner")) return normalQuery(statement, values);
       return f.result(sql.includes("AND (NOT $5 OR request_path !~ $6)") && new RegExp(String(values?.[5])).test(path) ? [] : [f.job]);
     });
+    vi.spyOn(AuditLog.prototype, "completeEvent").mockResolvedValue({ id: "resume-event" } as never);
     const result = await f.repository.claim(f.job.id, f.scope, f.lease.owner, true);
     if (canary) expect(result).toBeUndefined();
     else expect(result).toMatchObject({ jobId: f.job.id });

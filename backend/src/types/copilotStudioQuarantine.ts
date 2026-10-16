@@ -80,6 +80,7 @@ export type QuarantineItemStatus = "queued" | "running" | "succeeded" | "failed"
 export type QuarantineReconciliationStatus = "not_required" | "required" | "verified_applied" | "verified_not_applied" | "conflict";
 
 export type QuarantineJob = {
+  origin?: import("./actionOrigin.js").AuditOriginV1;
   id: string;
   action: QuarantineAction;
   status: QuarantineJobStatus;

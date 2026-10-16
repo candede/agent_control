@@ -8,7 +8,7 @@ import { isTransientPermissionCheck, permissionIssue, permissionIssues } from ".
 const now = Date.parse("2026-09-24T00:00:00Z");
 function fixture(status: CapabilityStatus = "missing_permission", id: CapabilityId = "graph.package.read.delegated"): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(definition => definition.id === id)!,
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
     decision: {
       capabilityId: id, status, authorized: status === "available", fresh: true,
       checkedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60000).toISOString(),
@@ -57,7 +57,7 @@ describe("actual permission issues", () => {
     view.definition = capabilityDefinitions.find(definition => definition.id === "defender.hunting.application")!;
     view.decision.capabilityId = view.definition.id;
     expect(permissionIssue({ ...view, enabled: false }, now)).toBeUndefined();
-    expect(permissionIssue({ ...view, configuration: { enabled: false, sharedDataScope: false, revision: 1 } }, now)).toBeUndefined();
+    expect(permissionIssue({ ...view, enabled: false, configuration: { enabled: false, sharedDataScope: false, revision: 1 } }, now)).toBeUndefined();
     expect(permissionIssue({ ...view, enabled: true }, now)?.name).toBe("App-only Defender logs");
   });
   it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)("keeps an unused or successfully admitted %s read silent and actionable", id => {

@@ -30,7 +30,7 @@ const target = {
 
 function onDemandDecision(): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!,
+    enabled: true, definition: capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!,
     decision: {
       capabilityId: "powerPlatform.quarantine.manage", status: "available", authorized: true, fresh: true,
       verification: "on_demand", previewQualification: "not_required", remediation: [],

@@ -2,7 +2,8 @@ import type { ComponentProps, ReactNode } from "react";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { powerPlatformResourceTypes, type InventoryRefreshJob, type UnifiedAgentInventoryPage } from "../api/client";
+import type { InventoryRefreshJob, UnifiedAgentInventoryPage } from "../api/client";
+import { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import { AgentSyncTools } from "./AgentSyncTools";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "../test/inventoryVerification";
 import { mockNativeDialogs } from "../test/dialog";
@@ -131,6 +132,7 @@ describe("AgentSyncTools", () => {
     const freshness = within(screen.getByLabelText("Package detail freshness"));
     expect(freshness.getByText("Not yet collected").nextElementSibling).toHaveTextContent(/^0$/);
     expect(freshness.getByText("Previously collected, expired").nextElementSibling).toHaveTextContent(/^549$/);
+    expect(freshness.getByText("Invalidated, refresh needed").nextElementSibling).toHaveTextContent(/^0$/);
     expect(screen.getByText(/Repeating a successful read does not guarantee a match/)).toBeVisible();
   });
 

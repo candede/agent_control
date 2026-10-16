@@ -18,10 +18,12 @@ import { lockInventorySelection, lockInventorySources } from "./inventoryAuthori
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { lifecycleLimits } from "./lifecycleSlice.js";
 import { clientErrorState } from "./clientErrors.js";
+import { initiatingOrigin, parseStoredOrigin, lifecycleActor, initiatingActor } from "../services/actionOrigin.js";
+import type { AuditOriginV1 } from "../types/actionOrigin.js";
 
-export type JobStatus = "queued" | "running" | "waiting_authorization" | "succeeded" | "failed" | "cancelled" | "partial";
+type JobStatus = "queued" | "running" | "waiting_authorization" | "succeeded" | "failed" | "cancelled" | "partial";
 export type ItemOutcome = "succeeded" | "failed" | "cancelled" | "inconclusive" | "skipped";
-export type FrozenMutationTarget = { id: string; displayName: string; prestate: PackageMutationState };
+type FrozenMutationTarget = { id: string; displayName: string; prestate: PackageMutationState };
 export type JobIntentInput = { action: AuditAction; targets: FrozenMutationTarget[]; accessUpdate?: PackageAccessUpdate; reassignUserId?: string; actor: AuditActor; requestPath: string; scope: AuditScope };
 export type MutationConfirmationSummary = {
   risk: true;
@@ -45,6 +47,7 @@ export type JobRow = {
   id: string; tenant_id: string; principal_id: string; token_mode: "delegated" | "application"; capability: CapabilityId; action: AuditAction;
   access_update: PackageAccessUpdate | null; reassign_user_id: string | null; request_hash: string; confirmation_hash: string | null; confirmation_summary: Omit<MutationConfirmationSummary, "targets"> | null; confirmed_at: Date | null; status: JobStatus; scope: AuditScope;
   actor_username: string; actor_name: string; request_path: string; cancel_requested: boolean;
+  origin?: AuditOriginV1;
   lease_owner: string | null; lease_version: number; lease_until: Date | null; attempts: number;
   created_at: Date; updated_at: Date;
   result_revision: string;
@@ -66,7 +69,7 @@ type JobMetadataRow = Omit<JobRow, "confirmation_summary"> & {
 };
 const jobMetadataSql = `SELECT job.id,job.token_mode,job.capability,job.action,job.access_update,job.reassign_user_id,
   job.status,job.confirmation_hash,job.confirmation_summary-'targets' AS confirmation_summary,job.confirmed_at,
-  job.cancel_requested,job.created_at,job.updated_at,job.result_revision,job.request_path,
+  job.cancel_requested,job.created_at,job.updated_at,job.result_revision,job.request_path,job.origin,
   job.attempts<10 AND job.deadline_at>clock_timestamp() AS within_budget,
   (SELECT display_name FROM job_items WHERE job_id=job.id AND status='running' ORDER BY ordinal LIMIT 1) AS current_agent_name,
   counts.value AS counts FROM jobs job
@@ -89,7 +92,7 @@ function jobMetadata(job: JobMetadataRow) {
     : job.action === "reassign" ? { action: job.action, reassignUserId: job.reassign_user_id }
       : { action: job.action, targetBlockedState: job.action === "block" };
   const isCanary = packageCanaryPath.test(job.request_path);
-  return { id: job.id, capabilityId: job.capability, tokenMode: job.token_mode, status: job.status,
+  return { id: job.id, origin: parseStoredOrigin(job.origin), capabilityId: job.capability, tokenMode: job.token_mode, status: job.status,
     ...(isCanary ? { isCanary: true as const } : {}),
     ...(job.cancel_requested ? { cancelRequested: true as const } : {}),
     confirmationHash: job.confirmation_hash, confirmation: job.confirmation_summary, confirmedAt: job.confirmed_at?.toISOString() ?? null,
@@ -147,6 +150,7 @@ export class JobRepository {
     const confirmation = createJobConfirmation(input);
     if (!/^[a-f0-9]{64}$/.test(input.confirmationHash) || input.confirmationHash !== confirmation.confirmationHash) throw new AppError(409, "confirmation_mismatch", "The confirmed package selection or current state changed. Review and confirm the mutation again.");
     const { prepared, requestHash, summary } = confirmation;
+    const origin = initiatingOrigin(input.actor);
     const jobId = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${scope.tenantId}:${scope.principalId}`]);
       const capabilityId = packageMutationCapability(prepared.action);
@@ -158,8 +162,8 @@ export class JobRepository {
       const outstanding = await client.query("SELECT count(*)::int AS count FROM jobs WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('queued','running','waiting_authorization')", [scope.tenantId, scope.principalId]);
       if (outstanding.rows[0].count >= 5) throw new AppError(429, "job_limit", "At most five unfinished jobs are allowed per principal.");
       const id = randomUUID();
-      await client.query(`INSERT INTO jobs (id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope)
-        VALUES ($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15)`, [id, scope.tenantId, scope.principalId, capabilityId, prepared.action, requestHash, input.idempotencyKey, prepared.accessUpdate ?? null, input.confirmationHash, jobConfirmationMetadata(summary), prepared.reassignUserId ?? null, prepared.actor.displayName.slice(0,256), prepared.actor.username.slice(0,256), prepared.requestPath.slice(0,1024), prepared.scope]);
+      await client.query(`INSERT INTO jobs (id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope,origin)
+        VALUES ($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15,$16)`, [id, scope.tenantId, scope.principalId, capabilityId, prepared.action, requestHash, input.idempotencyKey, prepared.accessUpdate ?? null, input.confirmationHash, jobConfirmationMetadata(summary), prepared.reassignUserId ?? null, prepared.actor.displayName.slice(0,256), prepared.actor.username.slice(0,256), prepared.requestPath.slice(0,1024), prepared.scope, origin]);
       for (let offset = 0; offset < prepared.targets.length;) {
         let size = Math.min(250, prepared.targets.length - offset);
         let targets = prepared.targets.slice(offset, offset + size);
@@ -181,6 +185,7 @@ export class JobRepository {
         agentId: target.id,
         agentDisplayName: target.displayName,
         actor: prepared.actor,
+        origin,
         requestPath: prepared.requestPath,
         message: "Package mutation requested and confirmed; provider dispatch has not started.",
         metadata: { confirmationHash: input.confirmationHash, targetSelectionHash: summary.targetSelectionHash, prestateHash: target.prestateHash, verification: "pending_dispatch" },
@@ -232,6 +237,7 @@ export class JobRepository {
     const assertLive = () => assertCurrentMutationTargets(client, identity, stageId, stage.target_count);
     await assertLive();
     const intent = stage.intent, scope = { tenantId: identity.tenantId, principalId: identity.principalId };
+    const actor = initiatingActor(intent.actor), origin = initiatingOrigin(actor);
     if (intent.actor.tenantId !== scope.tenantId || intent.actor.homeAccountId !== scope.principalId) throw new AppError(403, "scope_mismatch", "Mutation actor changed.");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${scope.tenantId}:${scope.principalId}`]);
     const capability = packageMutationCapability(intent.action);
@@ -250,11 +256,11 @@ export class JobRepository {
     }
     const id = randomUUID();
     await client.query(`INSERT INTO jobs(id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,
-      access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope)
-      VALUES($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15)`,
+      access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope,origin)
+      VALUES($1,$2,$3,'delegated',$4,$5,$6,$7,$8,$9,$10,clock_timestamp(),$11,$12,$13,$14,$15,$16)`,
     [id, scope.tenantId, scope.principalId, capability, intent.action, stage.request_hash, input.idempotencyKey,
       intent.accessUpdate ?? null, input.confirmationHash, jobConfirmationMetadata(stage.summary), intent.reassignUserId ?? null,
-      intent.actor.displayName.slice(0, 256), intent.actor.username.slice(0, 256), input.requestPath.slice(0, 1024), intent.scope]);
+      actor.displayName.slice(0, 256), actor.username.slice(0, 256), input.requestPath.slice(0, 1024), intent.scope, origin]);
     let ordinal = -1, inserted = 0;
     for (;;) {
       const targets = (await client.query<{ ordinal: number; target_id: string; display_name: string; prestate_hash: string }>(`
@@ -273,7 +279,7 @@ export class JobRepository {
         operationId: id, scope: intent.scope,
         ...(intent.action === "block" || intent.action === "unblock"
           ? { action: intent.action, targetBlockedState: intent.action === "block" } : { action: intent.action }),
-        agentId: target.target_id, agentDisplayName: target.display_name, actor: intent.actor, requestPath: input.requestPath,
+        agentId: target.target_id, agentDisplayName: target.display_name,         actor, origin, requestPath: input.requestPath,
         message: "Package mutation requested and confirmed; provider dispatch has not started.",
         metadata: { confirmationHash: input.confirmationHash, targetSelectionHash: stage.summary.targetSelectionHash,
           prestateHash: target.prestate_hash, verification: "pending_dispatch" },
@@ -283,7 +289,7 @@ export class JobRepository {
     }
     if (inserted !== stage.target_count) throw new AppError(409, "confirmation_mismatch", "The staged target set changed before submission.");
     await assertLive();
-    await client.query("UPDATE inventory_mutation_stages SET job_id=$2 WHERE id=$1", [stageId, id]);
+    await client.query("UPDATE inventory_mutation_stages SET job_id=$2,origin=$3 WHERE id=$1", [stageId, id, origin]);
     return id;
   }
 
@@ -343,14 +349,27 @@ export class JobRepository {
 
   async claim(id: string, scope: DataScope, owner: string, authorizedResume = false): Promise<Lease | undefined> {
     requireProviderAdmissions();
-    const result = await this.database.query<JobRow>(`UPDATE jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
+    return transaction(this.database, async client => {
+    const result = await client.query<JobRow>(`UPDATE jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
       lease_until=clock_timestamp()+interval '120 seconds',attempts=attempts+1,updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND cancel_requested=false AND attempts<10 AND deadline_at>clock_timestamp()
       AND (lease_until IS NULL OR lease_until<clock_timestamp())
       AND (status='queued' OR ($5 AND status IN ('waiting_authorization','partial')))
       AND (NOT $5 OR request_path !~ $6)
       AND EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='queued') RETURNING *`, [id, scope.tenantId, scope.principalId, owner, authorizedResume, packageCanaryPathPattern]);
+    if (authorizedResume && result.rows[0]) await this.lifecycle(client, result.rows[0], "resume-control");
     return result.rows[0] ? { jobId: id, scope, owner, version: result.rows[0].lease_version } : undefined;
+    });
+  }
+
+  private async lifecycle(client: pg.PoolClient, job: JobRow, action: "resume-control" | "cancel-control" | "reconcile-control") {
+    const scope = { tenantId: job.tenant_id, principalId: job.principal_id }, log = new AuditLog(scope, client);
+    const actor = lifecycleActor({ tenantId: job.tenant_id, homeAccountId: job.principal_id,
+      username: job.actor_username, displayName: job.actor_name });
+    const receipt = await log.startEvent({ operationId: job.id, action, scope: job.scope, agentId: job.id, actor,
+      origin: initiatingOrigin(actor), requestPath: `/api/agents/bulk-jobs/${job.id}/${action.split("-")[0]}`,
+      metadata: { jobId: job.id, phase: "lifecycle" } });
+    await log.completeEvent(receipt.id, { status: "succeeded" });
   }
 
   private async fence(client: pg.PoolClient, lease: Lease) {
@@ -380,7 +399,7 @@ export class JobRepository {
       await new AuditLog(lease.scope, client).startEvent({ id: `${item.id}:${lease.version}`, operationId: job.id, scope: job.scope,
         ...(job.action === "block" || job.action === "unblock" ? { action: job.action, targetBlockedState: job.action === "block" } : { action: job.action }),
         agentId: item.target_id, agentDisplayName: item.display_name,
-        actor: { tenantId: job.tenant_id, homeAccountId: job.principal_id, username: job.actor_username, displayName: job.actor_name }, requestPath: job.request_path, metadata: { leaseVersion: lease.version, correlationId, prestateHash: item.prestate_hash } });
+        actor: { tenantId: job.tenant_id, homeAccountId: job.principal_id, username: job.actor_username, displayName: job.actor_name }, origin: parseStoredOrigin(job.origin), requestPath: job.request_path, metadata: { leaseVersion: lease.version, correlationId, prestateHash: item.prestate_hash } });
       return { item: running.rows[0], job, inventoryGeneration: await readPackageInventoryGeneration(lease.scope, client) };
     });
   }
@@ -388,11 +407,17 @@ export class JobRepository {
   async settleInventoryControls(lease: Lease, itemId: string, signal: AbortSignal, authorize: () => Promise<void>, assertCurrent?: () => void) {
     assertCurrent?.();
     if ((await this.database.query(`SELECT 1 FROM job_items item JOIN jobs job ON job.id=item.job_id
-      WHERE item.id=$1 AND job.id=$2 AND job.tenant_id=$3 AND job.principal_id=$4 AND item.source_generation_id IS NOT NULL`,
+      WHERE item.id=$1 AND job.id=$2 AND job.tenant_id=$3 AND job.principal_id=$4`,
     [itemId, lease.jobId, lease.scope.tenantId, lease.scope.principalId])).rowCount) {
-      await new InventoryRuntime(this.database, authorize, assertCurrent).settleControls(lease.scope, signal);
+      await this.settleControlPublications(lease.scope, signal, authorize, assertCurrent);
     }
     assertCurrent?.();
+  }
+
+  async settleControlPublications(scope: DataScope, signal: AbortSignal, authorize: () => Promise<void>, assertCurrent: () => void = () => {}) {
+    assertCurrent();
+    await new InventoryRuntime(this.database, authorize, assertCurrent).settleControls(scope, signal);
+    assertCurrent();
   }
 
   async markSent(lease: Lease, itemId: string, observedPrestateHash: string, signal?: AbortSignal, assertCurrent?: () => void) {
@@ -537,6 +562,8 @@ export class JobRepository {
         metadata: { poststateHash, reconciliationStatus: status, verification: "provider_reconciliation", ...(snapshotId ? { snapshotId } : {}) },
       });
       await this.aggregate(client, item.rows[0].job_id);
+      const job = (await client.query<JobRow>("SELECT * FROM jobs WHERE id=$1", [item.rows[0].job_id])).rows[0];
+      await this.lifecycle(client, job, "reconcile-control");
     }, signal, assertCurrent);
   }
 
@@ -562,11 +589,12 @@ export class JobRepository {
 
   async cancel(id: string, scope: DataScope) {
     await transaction(this.database, async client => {
-      const job = await client.query("UPDATE jobs SET cancel_requested=true WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('queued','running','waiting_authorization','partial') RETURNING id", [id, scope.tenantId, scope.principalId]);
+      const job = await client.query<JobRow>("UPDATE jobs SET cancel_requested=true WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('queued','running','waiting_authorization','partial') RETURNING *", [id, scope.tenantId, scope.principalId]);
       if (!job.rowCount) return;
       await client.query("UPDATE job_items SET status='cancelled',updated_at=clock_timestamp() WHERE job_id=$1 AND status='queued'", [id]);
       const running = await client.query("SELECT 1 FROM job_items WHERE job_id=$1 AND status='running'", [id]);
       if (!running.rowCount) await this.aggregate(client, id);
+      await this.lifecycle(client, job.rows[0], "cancel-control");
     });
     return this.get(id, scope);
   }

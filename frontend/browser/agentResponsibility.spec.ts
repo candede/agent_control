@@ -88,7 +88,7 @@ async function fixture(page: Page, records = [record]) {
 
 test.afterEach(async ({ page }) => page.unrouteAll({ behavior: "wait" }));
 
-test("agent to exact responsible user outside paid/report cohorts and back to current canonical Overview", async ({ page }, info) => {
+test("exact responsible users retain their context while opening current canonical agent Overview", async ({ page }, info) => {
   const evidence = await fixture(page);
   await page.goto("/agents?inventory=power_platform_only");
   await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
@@ -109,11 +109,14 @@ test("agent to exact responsible user outside paid/report cohorts and back to cu
   expect(await user.getByRole("tabpanel").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await user.screenshot({ path: info.outputPath("exact-user-responsibility.png") });
   await page.getByRole("button", { name: "Open agent Responsibility review agent", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "Responsibility review agent" })).toBeVisible();
-  await expect(page).toHaveURL(/\/agents\?.*detail=agent%3Abbbbbbbb/);
-  await expect(page.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute("aria-selected", "true");
-  await page.goBack();
+  const agent = page.getByRole("dialog", { name: "Responsibility review agent" });
+  await expect(agent).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/users\\?detail=${owner}&tab=responsibility`));
+  await expect(agent.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("Escape");
+  await expect(agent).toHaveCount(0);
   await expect(user.getByText("responsible.only@example.invalid", { exact: true })).toBeVisible();
+  await expect(user.getByRole("tab", {name:"Responsibility",exact:true})).toHaveAttribute("aria-selected", "true");
   expect(evidence.writes).toEqual(["/api/capabilities/check"]);
   expect(evidence.unexpected).toEqual([]);
 });
@@ -251,7 +254,11 @@ test("unavailable sources and removed canonical agents fail explicitly rather th
     route => route.fulfill({ status: 404, json: { code: "record_not_found", detail: "The exact agent is not available in the current saved inventory." } }));
   await page.getByRole("button", { name: "Open agent Responsibility review agent" }).click();
   await expect(page.getByRole("alert").filter({ hasText: "The exact agent is not available in the current saved inventory." })).toBeVisible();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const unavailable = page.getByRole("dialog", {name:"Agent details",exact:true});
+  await expect(unavailable).toBeVisible();
+  await expect(unavailable.getByRole("button", {name:"Retry agent details",exact:true})).toBeVisible();
+  await unavailable.getByRole("button", {name:"Close agent details",exact:true}).click();
+  await expect(page.getByRole("dialog", {name:"Same name",exact:true})).toBeVisible();
   expect(evidence.writes.every(path => path === "/api/capabilities/check")).toBe(true);
   expect(evidence.unexpected).toEqual([]);
 });

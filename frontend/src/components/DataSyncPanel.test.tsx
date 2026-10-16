@@ -102,6 +102,13 @@ function syncState(overrides: Partial<DataSyncState> = {}): DataSyncState {
   };
 }
 
+function automaticStatus(overrides: Partial<AutomaticRefreshStatus> = {}): AutomaticRefreshStatus {
+  return {
+    paused: true, online: true, visible: true, enabled: true, phase: "ready", checking: false,
+    message: undefined, checkedAt: undefined, setPaused: vi.fn(), ...overrides,
+  };
+}
+
 function automaticSources(): DataSyncSourceStatus[] {
   return sourceIds.filter(id => id !== "usage_reports").map(id => source(id, "succeeded", {
     count: id === "users" ? 3_988 : id === "graph_packages" ? 1_216 : 1_549,
@@ -249,10 +256,9 @@ describe("DataSyncPanel", () => {
     await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("error"));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start initial sync" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
-    expect(api.openPermissions).toHaveBeenCalledOnce();
-    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
-    expect(onOpenSync).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /Review permissions|View sync details/ })).not.toBeInTheDocument();
+    expect(api.openPermissions).not.toHaveBeenCalled();
+    expect(onOpenSync).not.toHaveBeenCalled();
     api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false }));
     await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
     await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready"));
@@ -378,7 +384,7 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
   });
 
-  it("blocks first-sync setup outside Sync without starting duplicate work and allows recovery navigation", async () => {
+  it("keeps first-sync setup focused on automatic collection without redundant actions", async () => {
     api.getState.mockResolvedValue(syncState());
     const onSetupStatusChange = vi.fn();
     const overflow = document.body.style.overflow;
@@ -399,8 +405,10 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(api.start).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
-    expect(onOpenSync).toHaveBeenCalledOnce();
+    expect(within(dialog).queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByText("Your first sync starts automatically.")).toBeVisible();
+    expect(onOpenSync).not.toHaveBeenCalled();
+    expect(api.openPermissions).not.toHaveBeenCalled();
 
     await act(async () => { view.rerenderPanel({ active: true }); });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -454,7 +462,7 @@ describe("DataSyncPanel", () => {
     api.getState.mockRejectedValueOnce(new ApiError(503, "unavailable", "Status endpoint unavailable.", { requestId: "sync-status-request" }));
     expect(await screen.findByRole("alert", {}, { timeout: 2_000 })).toHaveTextContent("Status endpoint unavailable.");
     expect(screen.getByRole("alert")).toHaveTextContent("Progress below is the last reported status.");
-    expect(screen.getByRole("button", { name: "View sync details" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /View sync details|Review permissions/ })).not.toBeInTheDocument();
     api.getState.mockResolvedValue(syncState());
     await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
     expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
@@ -466,9 +474,9 @@ describe("DataSyncPanel", () => {
     api.getState.mockResolvedValueOnce(syncState())
       .mockResolvedValue(syncState({ run: run("running", [source("users", "running")]) }));
     api.start.mockRejectedValue(new Error("The start response was lost."));
-    renderPanel({ active: false, onOpenSync: vi.fn() });
+    renderPanel({ active: false, onOpenSync: vi.fn(), automaticRefresh: automaticStatus() });
 
-    await userEvent.click(await screen.findByRole("button", { name: "Start initial sync" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Retry sync" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Your first sync is in progress" });
     expect(within(dialog).getByRole("alert")).toHaveTextContent("The start response was lost.");
@@ -481,11 +489,11 @@ describe("DataSyncPanel", () => {
   it("allows a first-sync command retry after fresh status confirms no running work", async () => {
     api.getState.mockResolvedValue(syncState());
     api.start.mockRejectedValueOnce(new Error("Initial sync was not admitted."));
-    renderPanel({ active: false, onOpenSync: vi.fn() });
-    await userEvent.click(await screen.findByRole("button", { name: "Start initial sync" }));
+    renderPanel({ active: false, onOpenSync: vi.fn(), automaticRefresh: automaticStatus() });
+    await userEvent.click(await screen.findByRole("button", { name: "Retry sync" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Initial sync was not admitted.");
-    const retry = screen.getByRole("button", { name: "Start initial sync" });
+    const retry = screen.getByRole("button", { name: "Retry sync" });
     await waitFor(() => expect(retry).toBeEnabled());
     expect(api.getState).toHaveBeenCalledTimes(2);
     expect(screen.getByRole("alert")).not.toHaveTextContent("last reported");
@@ -507,8 +515,8 @@ describe("DataSyncPanel", () => {
   it("holds first-sync admission through pending and failed status revalidation", async () => {
     const ref = createRef<DataSyncPanelHandle>();
     api.getState.mockResolvedValueOnce(syncState());
-    renderPanel({ ref, active: false, onOpenSync: vi.fn() });
-    const start = await screen.findByRole("button", { name: "Start initial sync" });
+    renderPanel({ ref, active: false, onOpenSync: vi.fn(), automaticRefresh: automaticStatus() });
+    const start = await screen.findByRole("button", { name: "Retry sync" });
     expect(start).toBeEnabled();
     let rejectState!: (cause: Error) => void;
     api.getState.mockReturnValueOnce(new Promise<DataSyncState>((_, reject) => { rejectState = reject; }));
@@ -570,8 +578,8 @@ describe("DataSyncPanel", () => {
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
     expect(api.openPermissions).toHaveBeenCalledOnce();
-    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
-    expect(onOpenSync).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "View sync details" })).not.toBeInTheDocument();
+    expect(onOpenSync).not.toHaveBeenCalled();
     expect(api.start).not.toHaveBeenCalled();
   });
 
@@ -606,8 +614,12 @@ describe("DataSyncPanel", () => {
       if (phase === "sign_in_required") {
         expect(screen.getByRole("link", { name: "Sign in again" })).toHaveAttribute("href", "/api/auth/login");
       }
-      await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
-      expect(api.openPermissions).toHaveBeenCalledOnce();
+      if (phase === "permission_required") {
+        await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
+        expect(api.openPermissions).toHaveBeenCalledOnce();
+      } else {
+        expect(screen.queryByRole("button", { name: "Review permissions" })).not.toBeInTheDocument();
+      }
       expect(api.start).not.toHaveBeenCalled();
     },
   );
@@ -674,9 +686,39 @@ describe("DataSyncPanel", () => {
     } });
     expect(await screen.findByText(new RegExp(message))).toBeVisible();
     expect(screen.queryByRole("heading", { name: "Your first sync is in progress" })).not.toBeInTheDocument();
-    const start = screen.getByRole("button", { name: "Start initial sync" });
-    if (disabled) expect(start).toBeDisabled();
-    else expect(start).toBeEnabled();
+    const retry = screen.queryByRole("button", { name: "Retry sync" });
+    if (paused) {
+      expect(retry).not.toBeNull();
+      if (disabled) expect(retry).toBeDisabled();
+      else expect(retry).toBeEnabled();
+    } else expect(retry).toBeNull();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("shows the automatic admission failure without asking for unrelated permissions", async () => {
+    api.getState.mockResolvedValue(syncState());
+    renderPanel({ active: false, onOpenSync: vi.fn(), automaticRefresh: automaticStatus({
+      paused: false, phase: "backoff",
+      message: "Provider work remains disabled. Request sync-admission-1.",
+    }) });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Provider work remains disabled. Request sync-admission-1.");
+    expect(screen.getByRole("heading", { name: "First sync needs attention" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry sync" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /Review permissions|View sync details|Start initial sync/ })).not.toBeInTheDocument();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("can cancel a waiting first sync in place without opening another page", async () => {
+    const waiting = run("waiting", [source("users", "waiting_authorization")]);
+    api.getState.mockResolvedValueOnce(syncState({ run: waiting }))
+      .mockResolvedValue(syncState({ run: run("cancelled", [source("users", "cancelled")]) }));
+    api.cancel.mockResolvedValue(run("cancelled", [source("users", "cancelled")]));
+    const onOpenSync = vi.fn();
+    renderPanel({ active: false, onOpenSync });
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel sync" }));
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith(waiting.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(await screen.findByRole("button", { name: "Retry incomplete sources" })).toBeEnabled();
+    expect(onOpenSync).not.toHaveBeenCalled();
     expect(api.start).not.toHaveBeenCalled();
   });
 

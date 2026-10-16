@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { Server } from "node:http";
-import session from "express-session";
+import session, { type SessionData } from "express-session";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { inventoryInput, packageRecord } from "../../scripts/inventoryFixtures.js";
@@ -32,6 +32,10 @@ import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestiga
 import { dataConnections } from "../db/dataConnections.js";
 import { InventoryMutationStages } from "../db/inventoryMutationStages.js";
 import pg from "pg";
+import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
+import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
+import { withAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 
 function forbidAuthorityWrites(database: pg.Pool) {
   const clients = new Map<pg.PoolClient, () => void>();
@@ -48,9 +52,6 @@ function forbidAuthorityWrites(database: pg.Pool) {
         && /'(?:user_sources|official_history)','complete'/.test(text) && /DO NOTHING RETURNING id\s*$/.test(text);
       if (writes.length && !observerPin) {
         throw new Error("Inventory GET attempted to mutate source, canonical, control, or job authority");
-      }
-      if (/\b(?:power_platform_inventory_(?:snapshots|resources)|unified_agents|unified_agent_sources|package_detail_cache)\b/i.test(text)) {
-        throw new Error("Inventory GET attempted a removed whole-inventory read");
       }
       return Reflect.apply(original, client, args);
     }) as typeof client.query);
@@ -78,6 +79,7 @@ vi.hoisted(() => {
 describe("inventory HTTP selected-read boundary", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
   let application: ReturnType<typeof createApp>, server: Server, base: string, cookie: string;
+  let initiatingAuthority: DelegatedCredentialSource;
   const principalId = randomUUID();
   const widePublisher = "界".repeat(4096);
   beforeAll(async () => {
@@ -109,13 +111,16 @@ describe("inventory HTTP selected-read boundary", () => {
     application = createApp(fixture.runtime);
     const id = randomUUID();
     const signature = createHmac("sha256", config.sessionSecret).update(id).digest("base64").replace(/=+$/g, "");
-    await new Promise<void>((resolve, reject) => application.store.set(id, {
+    const storedSession: SessionData = {
       cookie: new session.Cookie({ maxAge: 600_000 }),
       tenantId: config.tenants[0].tenantId, accountId: principalId, clientId: config.tenants[0].clientId,
-      rolesValidatedAt: Date.now(), csrfToken: "inventory-csrf",
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "inventory-csrf",
       user: { tenantId: config.tenants[0].tenantId, homeAccountId: principalId,
         username: "inventory@example.invalid", displayName: "Inventory", roles: ["AgentControl.Admin"] },
-    }, error => error ? reject(error) : resolve()));
+    };
+    await new Promise<void>((resolve, reject) => application.store.set(id, storedSession, error => error ? reject(error) : resolve()));
+    const epochs = new DataGenerations(fixture.runtime);
+    initiatingAuthority = createBrowserCredentials(await browserRequestPrincipal(storedSession, null, epochs), epochs);
     cookie = `agent-control.sid=${encodeURIComponent(`s:${id}.${signature}`)}`;
     server = await new Promise<Server>(resolve => {
       const value = application.app.listen(0, "127.0.0.1", () => resolve(value));
@@ -172,7 +177,7 @@ describe("inventory HTTP selected-read boundary", () => {
     await new Promise<void>((resolve, reject) => application.store.set(sessionId, {
       cookie: new session.Cookie({ maxAge: 600_000 }),
       tenantId: config.tenants[0].tenantId, accountId: freshPrincipal, clientId: config.tenants[0].clientId,
-      rolesValidatedAt: Date.now(), csrfToken: "fresh-inventory-csrf",
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "fresh-inventory-csrf",
       user: { tenantId: config.tenants[0].tenantId, homeAccountId: freshPrincipal,
         username: "fresh@example.invalid", displayName: "Fresh viewer", roles: ["AgentControl.Viewer"] },
     }, error => error ? reject(error) : resolve()));
@@ -570,6 +575,7 @@ describe("inventory HTTP selected-read boundary", () => {
     const before = await fetch(`${base}/agent-inventory?limit=50`, { headers: { cookie } }).then(response => response.json());
     expect(before.counts.total).toBe(102);
     const runtime = new InventoryRuntime(fixture.runtime, async () => {});
+    await withAuthority(initiatingAuthority, () => runtime.enqueue(scope, false));
     await runtime.pass();
     await runtime.drain();
     const after = await fetch(`${base}/agent-inventory?limit=50`, { headers: { cookie } }).then(response => response.json());
@@ -662,6 +668,7 @@ describe("inventory HTTP selected-read boundary", () => {
       await stages.acceptPage(lease, { token: "responsibility", nextToken: null, records, rawCount: records.length, expectedCount: records.length, page: 1 }, records.length);
     }, { authorize: async () => {} });
     const runtime = new InventoryRuntime(fixture.runtime, async () => {});
+    await withAuthority(initiatingAuthority, () => runtime.enqueue({ tenantId: input.scope.tenantId, principalId }, false));
     await runtime.pass();
     await runtime.drain();
     for (const [objectId, displayName] of [[a, "Same"], [b, "Same"], [c, "Zülü＃"], [d, "Zero responsibility"]]) {
@@ -842,7 +849,7 @@ describe("inventory HTTP selected-read boundary", () => {
     const sid = randomUUID(), signature = createHmac("sha256", config.sessionSecret).update(sid).digest("base64").replace(/=+$/g, "");
     await new Promise<void>((resolve, reject) => application.store.set(sid, {
       cookie: new session.Cookie({ maxAge: 600_000 }), user, tenantId: user.tenantId, accountId: owner,
-      clientId: config.tenants[0].clientId, rolesValidatedAt: Date.now(), csrfToken: "large-inventory-csrf",
+      clientId: config.tenants[0].clientId, signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "large-inventory-csrf",
     }, error => error ? reject(error) : resolve()));
     const largeCookie = `agent-control.sid=${encodeURIComponent(`s:${sid}.${signature}`)}`;
     const read = async (path: string) => {

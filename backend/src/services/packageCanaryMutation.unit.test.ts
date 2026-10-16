@@ -28,7 +28,7 @@ const administrator = {
 beforeEach(async () => {
   vi.mocked(transaction).mockReset().mockRejectedValue(new Error("Unit tests must not access a database."));
   await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
 });
 afterEach(() => vi.restoreAllMocks());

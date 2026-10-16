@@ -30,7 +30,7 @@ vi.mock("./ReportPageControls", async original => {
 });
 vi.mock("../api/reportData", async original => ({
   ...await original<typeof import("../api/reportData")>(), readAgentReportSummary: vi.fn(), readAgentReportHistory: vi.fn(), readAgentReportAssociations: vi.fn(),
-  readAgentReportCandidates: vi.fn(), mutateAgentReportAssociation: vi.fn(), readReportDetail: vi.fn(), readReportPage: vi.fn(),
+  mutateAgentReportAssociation: vi.fn(), readReportDetail: vi.fn(), readReportPage: vi.fn(),
 }));
 const context = { selectionId, reportSetId: reports.setId, usageRevision: "b".repeat(64), inventoryRevision: "c".repeat(64), reports };
 const record: UnifiedAgentRecord = {
@@ -916,7 +916,7 @@ describe("restored agent usage and users", () => {
     expect(screen.queryByRole("region", { name: "Report provenance" })).not.toBeInTheDocument();
     expect(screen.queryByText(/snapshot exact-snapshot|Reported agent identities|exact_package_id/)).not.toBeInTheDocument();
     expect(screen.getByText("Reviewed report links").closest("details")).not.toHaveAttribute("open");
-    expect(api.readReportDetail).not.toHaveBeenCalled(); expect(api.readAgentReportCandidates).not.toHaveBeenCalled();
+    expect(api.readReportDetail).not.toHaveBeenCalled();
     expect(api.readReportPage).toHaveBeenCalledExactlyOnceWith(`agent-inventory/${encodeURIComponent(record.id)}/usage-users`,
       expect.objectContaining({ selectionId, limit: 25 }), expect.any(AbortSignal));
   });
@@ -931,7 +931,7 @@ describe("restored agent usage and users", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(onReloadInventory).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
-    expect(api.readReportPage).not.toHaveBeenCalled(); expect(api.readAgentReportCandidates).not.toHaveBeenCalled();
+    expect(api.readReportPage).not.toHaveBeenCalled();
   });
   it.each(["never_imported", "deleted"] as const)("explains a %s CSV report without offering a reload that cannot supply it", async availability => {
     const noReport = { ...reports, setId: null, activeSetId: null, availability, lineages: [] };

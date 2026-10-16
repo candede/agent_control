@@ -20,6 +20,7 @@ import { peakCheckpoint } from "../services/peakMemory.js";
 import { normalizeEnvironmentIdentity } from "../services/inventoryIdentity.js";
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 import { isPublicationRevisions } from "../types/dataSelection.js";
+import type { AgentAboutPage } from "../types/savedReadContracts.js";
 
 export type InventoryQuery = Omit<UnifiedAgentInventoryQuery, "limit" | "selectionId" | "cursor">;
 const queryFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
@@ -58,7 +59,8 @@ type PageOptions = { limit?: number; cursor?: string; recordId?: string; expecte
   exportKind?: "unified_agents" | "graph_packages" | "power_platform_agents" };
 
 export function inventoryPackageResidualSql(alias: "member" | "r") {
-  return `CASE WHEN ${alias}.domain='packages' THEN ${alias}.residual||coalesce((
+  return `CASE WHEN ${alias}.domain='packages' THEN ${alias}.residual
+    ||jsonb_build_object('savedSource',jsonb_build_object('scopeId',${alias}.scope_id,'identity',${alias}.identity))||coalesce((
     SELECT jsonb_object_agg(collection.value,coalesce((
       SELECT jsonb_agg(item.value ORDER BY item.ordinal) FROM inventory_facts item
       WHERE item.generation_id=${alias}.generation_id AND item.identity=${alias}.identity AND item.kind=collection.value
@@ -422,8 +424,17 @@ export class InventoryQueries {
     return this.read(id, identity, (client, context) => this.resolveExportReferencesInRead(client, context, references, kind));
   }
 
-  async resolveExportReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[],
+  resolveExportReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[],
     kind: NonNullable<PageOptions["exportKind"]>) {
+    return this.resolveReferencesInRead(client, context, references, kind, "explicit");
+  }
+
+  resolveControlReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[]) {
+    return this.resolveReferencesInRead(client, context, references, "unified_agents", "filtered");
+  }
+
+  private async resolveReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[],
+    kind: NonNullable<PageOptions["exportKind"]>, membership: "explicit" | "filtered") {
     if (!references.length || references.length > 5000) throw new AppError(400, "invalid_export_selection", "Select 1–5000 exact references.");
     if (kind === "unified_agents" ? context.source !== "inventory_canonical" || context.tokenMode !== "delegated"
       : context.source !== "inventory_canonical" && context.source !== (kind === "graph_packages" ? "inventory_packages" : "inventory_power_platform")) {
@@ -443,12 +454,15 @@ export class InventoryQueries {
           environment: target.source === "power_platform" ? target.environmentId ?? "" : "" };
       });
       const { sql, values } = this.relation(context);
+      const sources = membership === "filtered"
+        ? `(SELECT source.* FROM sources source JOIN facts f ON f.identity=source.canonical_id
+            WHERE ${this.filter(context.query, values)})` : "sources";
       values.push(encodeBatch(requested).json);
       const result = await client.query(`${sql}
           SELECT r.ordinal,min(s.canonical_id) AS id,count(DISTINCT s.canonical_id)::int AS count,
             count(DISTINCT (s.generation_id,s.identity)) FILTER(WHERE s.identity IS NOT NULL)::int AS source_count
           FROM jsonb_to_recordset($${values.length}::jsonb) r(ordinal integer,source text,native text,environment text)
-          LEFT JOIN sources s ON r.source='canonical' AND s.canonical_id=r.native OR r.source=s.source AND (
+          LEFT JOIN ${sources} s ON r.source='canonical' AND s.canonical_id=r.native OR r.source=s.source AND (
             r.source='graph_packages' AND s.native_id=r.native OR r.source='power_platform'
             AND s.resource_type='microsoft.copilotstudio/agents'
             AND CASE WHEN r.environment IS NULL THEN s.native_id=r.native
@@ -1080,6 +1094,47 @@ export class InventoryQueries {
       return { value: rows.slice(0, limit).map(({ kind, total }) => ({ kind, total })),
         nextCursor: cursor.next(rows.length > limit ? rows[limit - 1].kind : undefined) };
     });
+  }
+
+  about(id: string, identity: SelectionIdentity, recordId: string, options: {
+    sourceScopeId: string; sourceIdentity: string; field: AgentAboutPage["field"]; cursor?: string;
+  }): Promise<AgentAboutPage> {
+    return this.read(id, identity, async (client, context, selection) => {
+      const cursor = this.continuation(id, identity, selection, "about",
+        [recordId, options.sourceScopeId, options.sourceIdentity, options.field], options.cursor);
+      const offset = cursor.after === undefined ? 0 : Number(cursor.after);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > dataLimits.agentDefinitionBytes) throw new SelectionError("invalid_cursor");
+      const rows = (await client.query(`WITH selected AS (
+        SELECT r.* FROM inventory_memberships m JOIN unified_agent_memberships s
+          ON s.generation_id=m.generation_id AND s.identity=m.identity
+        JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
+        WHERE ${inventoryAsOf()} AND m.identity=$3 AND s.source_scope_id=$4 AND s.source_identity=$5
+      ), text AS (
+        SELECT generation_id,identity,domain,observed_at,
+          residual->'provenance'->(CASE $6 WHEN 'long' THEN 'longDescription' WHEN 'short' THEN 'shortDescription' ELSE 'description' END) AS provenance,coalesce((
+          SELECT string_agg(f.payload->>'text','' ORDER BY f.ordinal) FROM inventory_facts f
+          WHERE f.generation_id=selected.generation_id AND f.identity=selected.identity AND f.kind='about:'||$6
+        ),CASE $6 WHEN 'long' THEN residual->>'longDescription' WHEN 'short' THEN residual->>'shortDescription'
+          ELSE residual->'details'->>'description' END) AS value FROM selected
+      ) SELECT generation_id,identity,domain,observed_at,provenance,octet_length(value)::text AS total_bytes,length(value) AS characters,
+        substring(value FROM $7::int+1 FOR 16384) AS segment FROM text LIMIT 2`,
+      [context.baselineId, context.revision, recordId, options.sourceScopeId, options.sourceIdentity, options.field, offset])).rows;
+      if (!rows.length) throw new AppError(404, "inventory_record_not_found", "This source is absent from the pinned inventory.");
+      if (rows.length !== 1) throw new AppError(409, "inventory_identity_ambiguous", "The selected About source is ambiguous.");
+      const row = rows[0], available = row.segment !== null;
+      if (offset > (row.characters ?? 0) || offset > 0 && !available) throw new SelectionError("invalid_cursor");
+      return { recordId: `agent:${recordId}`, sourceScopeId: options.sourceScopeId, sourceIdentity: options.sourceIdentity,
+        generationId: row.generation_id, field: options.field, state: available ? "available" : "missing",
+        source: row.domain === "packages" ? "graph_packages" : "power_platform", observedAt: new Date(row.observed_at).toISOString(),
+        provenance: { path: typeof row.provenance?.path === "string" ? row.provenance.path : null,
+          maturity: ["ga", "preview", "observed"].includes(row.provenance?.maturity) ? row.provenance.maturity : "unknown" },
+        text: row.segment, totalBytes: row.total_bytes === null ? 0 : exactCount(row.total_bytes),
+        returnedBytes: row.segment === null ? 0 : Buffer.byteLength(row.segment),
+        nextCursor: cursor.next(available && offset + 16384 < row.characters ? offset + 16384 : undefined),
+        selection: { id, revision: String(selection.revision), evaluatedAt: new Date(selection.evaluated_at as Date).toISOString(),
+          expiresAt: new Date(selection.expires_at as Date).toISOString(), validatedAt: new Date(selection.validated_at as Date).toISOString(),
+          publicationRevisions: context.data.publicationRevisions } };
+    }, 524288);
   }
 
   children(id: string, identity: SelectionIdentity, recordId: string, options: {

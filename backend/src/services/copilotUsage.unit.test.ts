@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { acquireDelegatedToken } from "../auth/msal.js";
+import type { acquireAuthorizedToken } from "../auth/msal.js";
 import { requireUserPublication } from "../db/dataSync.js";
 import { DataGenerations } from "../db/dataGenerations.js";
+import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
 import { pool } from "../db/pool.js";
 import { activateAccountSession, assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
@@ -32,6 +33,10 @@ vi.mock("./reportIdentity.js", () => ({
   reportIdentity: vi.fn(async (_database, user: AuthenticatedUser) => ({
     tenantId: user.tenantId!, principalId: user.homeAccountId, sessionEpoch: 0, authorizationHash: "synthetic",
   })),
+}));
+vi.mock("../db/officialReportStatus.js", async original => ({
+  ...await original<typeof import("../db/officialReportStatus.js")>(),
+  directoryNeedsReportRefresh: vi.fn(async () => false),
 }));
 vi.mock("../db/dataSync.js", async original => ({
   ...await original<typeof import("../db/dataSync.js")>(),
@@ -76,7 +81,7 @@ function fixture(denied: UserSourceKind, status: "waiting_authorization" | "perm
   });
   const assertAuthority = vi.fn(() => undefined);
   const beginOperationValidation = vi.fn<(capability: CapabilityId, user: AuthenticatedUser) => () => void>(() => assertAuthority);
-  const revalidateUser = vi.fn(async () => user), delegatedToken = vi.fn<typeof acquireDelegatedToken>(async () => "synthetic-token");
+  const revalidateUser = vi.fn(async () => user), delegatedToken = vi.fn<typeof acquireAuthorizedToken>(async () => "synthetic-token");
   const service = new CopilotUsageService(pool, {
     provider, admissions: () => undefined,
     revalidateUser, delegatedToken, requireAvailable: async () => undefined,
@@ -90,6 +95,7 @@ function fixture(denied: UserSourceKind, status: "waiting_authorization" | "perm
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.mocked(directoryNeedsReportRefresh).mockReset().mockResolvedValue(false);
   vi.mocked(requireUserPublication).mockReset();
   vi.mocked(requireUserPublication).mockResolvedValue(undefined);
   observeTransactionResult(undefined);
@@ -964,10 +970,39 @@ describe("Users provider HTTP failure boundaries", () => {
 });
 
 describe("automatic Users source cadence", () => {
+  it.each([true, false])("refreshes a fresh directory for a changed report without recollecting fresh activity or repeating acknowledged work, automatic: %s", async automatic => {
+    const f = fixture("app_activity", "failed", 16);
+    for (const source of Object.values(f.sources)) {
+      Object.assign(source, { attemptStatus: "available", observedAt: now.toISOString(), attemptedAt: now.toISOString() });
+    }
+    vi.mocked(directoryNeedsReportRefresh).mockResolvedValueOnce(true);
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic, incompleteOnly: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual(["directory"]);
+    expect(directoryNeedsReportRefresh).toHaveBeenCalledWith(pool, { tenantId: user.tenantId, principalId: user.homeAccountId });
+    f.refresh.mockClear();
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic, incompleteOnly: true });
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a failed report-context check instead of treating the directory as current", async () => {
+    const f = fixture("app_activity", "failed", 16), failure = new Error("Report context unavailable.");
+    vi.mocked(directoryNeedsReportRefresh).mockRejectedValueOnce(failure);
+    await expect(f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true })).rejects.toBe(failure);
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+
+  it("fences cancellation while checking whether a report changed", async () => {
+    const f = fixture("app_activity", "failed", 16), controller = new AbortController(), reason = new Error("Cancelled.");
+    vi.mocked(directoryNeedsReportRefresh).mockImplementationOnce(async () => { controller.abort(reason); return true; });
+    await expect(f.service.refreshUsers(user, controller.signal, { publication: f.publication, automatic: true })).rejects.toBe(reason);
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+
   it.each((["directory", "app_activity"] as const).flatMap(source =>
     (["waiting_authorization", "permission_required"] as const).map(status => ({ source, status })),
-  ))("keeps a mixed $source $status failure cooling down while refreshing the healthy source", async ({ source, status }) => {
+  ))("keeps a mixed $source $status failure cooling down despite a changed report while refreshing the healthy source", async ({ source, status }) => {
     const f = fixture(source, status, 16);
+    vi.mocked(directoryNeedsReportRefresh).mockResolvedValue(true);
     expect(await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true }))
       .toMatchObject({ status: "partial" });
     expect(f.refresh.mock.calls.map(([, input]) => input.scope.source))

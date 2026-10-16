@@ -465,6 +465,21 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(calls + 2);
   });
 
+  it.each(["maintenance"])("preserves the %s admission error and retries automatically after reopening", async code => {
+    check.mockRejectedValueOnce(new ApiError(503, code, "Provider collection is disabled for this deployment.", {
+      requestId: "initial-sync-request",
+    }));
+    const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
+    await settle();
+    expect(hook.result.current.phase).toBe("backoff");
+    expect(hook.result.current.message).toContain("Provider collection is disabled for this deployment. Request initial-sync-request.");
+    expect(hook.result.current.message).not.toContain("Permissions");
+    await advance(60_000);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(hook.result.current.phase).toBe("ready");
+    expect(hook.result.current.message).toBeUndefined();
+  });
+
   it("does not bypass backoff on visibility or connectivity return", async () => {
     check.mockRejectedValue(new Error("transport"));
     renderHook(useAutomaticRefresh, { initialProps: options() });

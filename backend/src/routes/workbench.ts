@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import { getTenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
@@ -76,7 +77,7 @@ function sourceJobDates(job: { createdAt: string; attemptedAt: string | null; fi
   };
 }
 
-policyRoute(workbenchRouter, "get", "/workbench/metadata", {
+policyRoute(workbenchRouter, "get", "/workbench/metadata", { browserOnly: true,
   access: "authenticated",
   dataClass: "operational_metadata",
   roles: ["AgentControl.Viewer"],
@@ -89,7 +90,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
   dataClass: "operational_metadata",
   roles: ["AgentControl.Viewer"],
 }, async (request, response) => {
-  const user = request.session.user!;
+  const user = requestUser(request);
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   assertAccountSessionValidation(validation);

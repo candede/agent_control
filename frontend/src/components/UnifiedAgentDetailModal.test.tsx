@@ -165,7 +165,7 @@ function capabilities(): CapabilityView[] {
   return capabilityDefinitions.filter(item => [
     "graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage",
   ].includes(item.id)).map(definition => ({
-    definition,
+    enabled: true, definition,
     decision: {
       capabilityId: definition.id, status: "available", authorized: true, fresh: true,
       verification: "on_demand", previewQualification: "not_required", remediation: [],
@@ -175,7 +175,7 @@ function capabilities(): CapabilityView[] {
 
 function capabilitiesWithDirectory(): CapabilityView[] {
   return [...capabilities(), {
-    definition: capabilityDefinitions.find(definition => definition.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === "graph.directory.read")!,
     decision: {
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],
@@ -608,7 +608,6 @@ beforeEach(() => {
     latestReportSetId: reportContext.reportSetId, latestReported: null,
     counts: { total: 0, filtered: 0 }, page: { limit: 50, nextCursor: null, previousCursor: null },
   }));
-  vi.spyOn(reportApi, "readAgentReportCandidates");
   vi.spyOn(reportApi, "mutateAgentReportAssociation").mockResolvedValue(reportContext);
   vi.spyOn(reportApi, "readReportDetail").mockResolvedValue({
     value: reportAgent(1, { agentId: automaticUsagePackageId, agentName: automaticUsageReportName, activeUsers: 7 }),
@@ -631,7 +630,6 @@ describe("UnifiedAgentDetailModal", () => {
     const dialog = await screen.findByRole("dialog", { name: "Researcher" });
     expect(reportApi.readReportDetail).not.toHaveBeenCalled();
     expect(reportApi.readReportPage).not.toHaveBeenCalled();
-    expect(reportApi.readAgentReportCandidates).not.toHaveBeenCalled();
     expect(within(dialog).queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
     expect(within(dialog).queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("Tenant adoption snapshot")).not.toBeInTheDocument();
@@ -696,17 +694,17 @@ describe("UnifiedAgentDetailModal", () => {
   });
 
   it.each([
-    ["identities", "identities", "Overview"], ["package", "identities", "Overview"], ["power-platform", "identities", "Overview"],
+    ["identities", "identities", "Overview"],
     ["reports", "reports", "Usage"], ["users", "users", "Users"], ["audit-security", "audit-security", "Activity"], ["controls", "controls", "Manage"],
-  ])("resolves the legacy %s route to the %s panel under the %s label", (activeTab, panel, name) => {
+  ])("resolves the current %s route to the %s panel under the %s label", (activeTab, panel, name) => {
     renderDetail({ activeTab });
     expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name })).toHaveAttribute("id", `unified-agent-tab-${panel}`);
     expect(screen.getByRole("tabpanel", { name })).toHaveAttribute("id", `unified-agent-panel-${panel}`);
   });
 
-  it("opens useful overview information directly for a legacy package detail route", () => {
-    const { props } = renderDetail({ activeTab: "package" });
+  it("opens useful overview information directly for an agent detail route", () => {
+    const { props } = renderDetail({ activeTab: "identities" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
     expect(screen.queryByRole("button", { name: /Package details for|Details & services|Viewing details/ })).not.toBeInTheDocument();
@@ -1961,7 +1959,6 @@ describe("UnifiedAgentDetailModal", () => {
 
   it("loads automatically matched agent users only on the Users tab without setup, candidates or writes", async () => {
     reportUsage();
-    const candidates = vi.mocked(reportApi.readAgentReportCandidates);
     const mutation = vi.mocked(reportApi.mutateAgentReportAssociation);
     const { update } = renderDetail({
       usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64), onUsageChanged: vi.fn(),
@@ -1988,7 +1985,6 @@ describe("UnifiedAgentDetailModal", () => {
     expect(within(usage).queryByRole("button", { name: /association|candidate|setup/i })).not.toBeInTheDocument();
     expect(reportApi.readReportPage).toHaveBeenCalledExactlyOnceWith(`agent-inventory/${encodeURIComponent(record.id)}/usage-users`,
       expect.objectContaining({ selectionId, limit: 25, search: undefined }), expect.any(AbortSignal));
-    expect(candidates).not.toHaveBeenCalled();
     expect(mutation).not.toHaveBeenCalled();
     expect(reportApi.readReportDetail).not.toHaveBeenCalled();
     update({ usageContext: { ...automaticUsageContext, reports: { ...reports, setId: "other-snapshot" } } });

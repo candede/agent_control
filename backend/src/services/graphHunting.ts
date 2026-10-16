@@ -19,8 +19,7 @@ const maximumAttempts = 3;
 const maximumRequestBudgetMs = 30_000;
 const maximumResponseBytes = 2_000_000;
 const maximumStoredRows = 200;
-export const defenderHuntingMaximumWindowMs = 7 * 24 * 60 * 60 * 1000;
-export const defenderHuntingQualificationMaximumWindowMs = 60 * 60 * 1000;
+const defenderHuntingMaximumWindowMs = 7 * 24 * 60 * 60 * 1000;
 
 type Dependencies = {
   fetch: typeof fetch;
@@ -211,7 +210,7 @@ export class GraphHuntingClient {
   }
 }
 
-export function validateDefenderHuntingFilters(value: unknown, options: { now?: Date; qualification?: boolean } = {}): DefenderHuntingFilters {
+export function validateDefenderHuntingFilters(value: unknown, options: { now?: Date } = {}): DefenderHuntingFilters {
   if (!isObject(value)) throw new AppError(400, "invalid_hunting_filters", "Hunting filters must be a structured object.");
   const allowedKeys = new Set(["templateId", "startDateTime", "endDateTime", "agentIds", "entraAgentIds", "entraAgentApplicationIds", "blueprintIds", "actorObjectIds", "userObjectId", "operations"]);
   if (Object.keys(value).some(key => !allowedKeys.has(key))) throw new AppError(400, "invalid_hunting_filters", "Hunting filters contain an unsupported field.");
@@ -224,7 +223,7 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
   const start = Date.parse(startDateTime);
   const end = Date.parse(endDateTime);
   const now = (options.now ?? new Date()).getTime();
-  const maximumWindowMs = options.qualification ? defenderHuntingQualificationMaximumWindowMs : defenderHuntingMaximumWindowMs;
+  const maximumWindowMs = defenderHuntingMaximumWindowMs;
   if (end <= start || end - start > maximumWindowMs || end > now + 5 * 60 * 1000 || start < now - 30 * 24 * 60 * 60 * 1000) {
     throw new AppError(400, "invalid_hunting_range", `Hunting requires a recent UTC range no longer than ${maximumWindowMs / 3_600_000} hour(s).`);
   }

@@ -129,21 +129,14 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const hunting = new DefenderHuntingRepository(fixture.runtime);
   const huntingScope: DefenderHuntingScope = { tenantId:"fixture-tenant",authorizationPrincipalId:"fixture-principal",
     resultScope:{kind:"principal",scopeId:"fixture-principal",configurationRevision:null},tokenMode:"delegated" };
-  const huntingAuthority={capabilityId:"defender.hunting.delegated" as const,contractRevision:"a".repeat(64),permissionRevision:"b".repeat(64),configurationRevision:1};
   const publishHunt = async (key: string, agentId: string) => {
     const filters: DefenderHuntingFilters={templateId:"agents_inventory",startDateTime:"2026-09-09T10:00:00.000Z",
       endDateTime:"2026-09-09T11:00:00.000Z",agentIds:[agentId],blueprintIds:[],actorObjectIds:[],operations:[]};
-    const qualification=await hunting.submit(huntingScope,{idempotencyKey:`${key}-qualification`,filters,
-      qualification:{...huntingAuthority,approvedBy:"fixture-administrator"}});
-    const qualificationExecution=await hunting.begin(huntingScope,qualification.id);
-    await hunting.publish(huntingScope,qualification.id,qualificationExecution,{rows:[huntingInventoryRow(agentId)],providerRowCount:1,
-      storedRowCount:1,byteCount:1024,complete:true,partialReason:null});
-    const retainedScope=await hunting.requireQualifiedScope(huntingScope,filters,huntingAuthority);
-    const job=await hunting.submit(huntingScope,{idempotencyKey:key,filters,retainedScope});
+    const job=await hunting.submit(huntingScope,{idempotencyKey:key,filters});
     const execution=await hunting.begin(huntingScope,job.id);
     await hunting.publish(huntingScope,job.id,execution,{rows:[huntingInventoryRow(agentId)],providerRowCount:1,
       storedRowCount:1,byteCount:1024,complete:true,partialReason:null});
-    return {jobId:job.id,retainedScopeId:retainedScope.id};
+    return {jobId:job.id};
   };
   const historicalHunt=await publishHunt("restore-historical","historical-agent");
   const currentHunt=await publishHunt("restore-current","current-agent");
@@ -153,10 +146,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const purviewFilters: PurviewAuditFilters={presetId:"copilot_interactions",operations:["CopilotInteraction"],
     startDateTime:"2026-09-09T10:00:00.000Z",endDateTime:"2026-09-09T11:00:00.000Z",userPrincipalNames:[],
     ipAddresses:[],objectIds:[],administrativeUnitIds:[]};
-  const purviewQualification=await purview.approveQualification(purviewScope,{filters:purviewFilters,
-    capabilityId:"purview.audit.search.delegated",contractRevision:"a".repeat(64),permissionRevision:"b".repeat(64),
-    configurationRevision:1,approvedBy:"fixture-administrator"});
-  const purviewJob=await purview.submit(purviewScope,{idempotencyKey:"restore-purview",filters:purviewFilters,qualificationId:purviewQualification.id});
+  const purviewJob=await purview.submit(purviewScope,{idempotencyKey:"restore-purview",filters:purviewFilters});
   await purview.begin(purviewScope,purviewJob.id);
   const uncertainJob=randomUUID();
   await fixture.operator.query(`INSERT INTO jobs(id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,actor_name,actor_username,request_path,scope,status,lease_owner,lease_until)
@@ -188,7 +178,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const laterCorrection = await acceptBundle(laterCorrectedOriginal.setId, laterCorrectionScope);
   await usage.confirm(laterCorrectionScope,await usage.confirmPreview(laterCorrectionScope,laterCorrection.setId,"delete"));
   await usage.confirm(usageScope,await usage.confirmPreview(usageScope,historicalReports.setId,"delete"));
-  await fixture.operator.query("UPDATE defender_hunting_retained_scopes SET revoked_at=clock_timestamp(),revoked_by='current-review' WHERE id=$1",[historicalHunt.retainedScopeId]);
+  await fixture.operator.query("DELETE FROM defender_hunting_jobs WHERE id=$1",[historicalHunt.jobId]);
   const currentAfterReviewChanges=await fingerprints(fixture.operator);
   expect(await restore(fixture.operator,filename,target)).toEqual(before);
   expect(await fingerprints(fixture.operator)).toEqual(currentAfterReviewChanges);
@@ -200,11 +190,13 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     const restoredStore = new InventoryGenerations(restoredRuntime);
     expect((await restoredStore.gcMetadata(inventoryRoot.scopeId, inventoryRoot.tenantId)).exactHeads).toBe(1);
     expect((await restoredRuntime.query("SELECT identity FROM inventory_exact_heads WHERE scope_id=$1", [inventoryRoot.scopeId])).rows).toEqual([]);
-    const state = await restoredRuntime.query("SELECT mode,provider_work_enabled,deletion_reviewed_at,access_reviewed_at FROM operational_state");
-    expect(state.rows[0]).toMatchObject({ mode: "maintenance", provider_work_enabled: false });
-    expect(state.rows[0].deletion_reviewed_at).toBeTruthy();
-    expect(state.rows[0].access_reviewed_at).toBeTruthy();
+    const state = await restoredRuntime.query("SELECT mode FROM operational_state");
+    expect(state.rows).toEqual([{ mode: "maintenance" }]);
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM sessions")).rows[0].count).toBe(0);
+    const restoredFence = (await restoredRuntime.query(`SELECT count(*)::int AS principals,
+      count(*) FILTER(WHERE bearer_issued_after<=0)::int AS unfenced FROM data_principal_epochs`)).rows[0];
+    expect(restoredFence.principals).toBeGreaterThan(0);
+    expect(restoredFence.unfenced).toBe(0);
     expect((await restoredRuntime.query("SELECT status,error_code FROM job_items WHERE job_id=$1",[uncertainJob])).rows[0]).toEqual({status:"inconclusive",error_code:"restored_uncertain_write"});
     expect((await restoredRuntime.query("SELECT status,lease_owner,lease_until FROM jobs WHERE id=$1",[uncertainJob])).rows[0]).toEqual({status:"partial",lease_owner:null,lease_until:null});
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1",
@@ -232,7 +224,6 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     const restoredHunting=new DefenderHuntingRepository(restoredRuntime);
     expect(await restoredHunting.getJob(huntingScope,historicalHunt.jobId)).toBeUndefined();
     expect(await restoredHunting.getJob(huntingScope,currentHunt.jobId)).toBeTruthy();
-    expect((await restoredOperator.query("SELECT count(*)::int AS count FROM purview_audit_qualifications")).rows[0].count).toBe(0);
     expect((await restoredOperator.query("SELECT execution_owner FROM purview_audit_jobs WHERE id=$1",[purviewJob.id])).rows[0].execution_owner).toBeNull();
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM audit_events")).rows[0].count).toBe(1);
     await expect(restoredRuntime.query("DELETE FROM operational_state")).rejects.toThrow();
@@ -241,9 +232,9 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     await unavailableCurrent.end();
     expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0].mode).toBe("maintenance");
     await usage.confirm(usageScope,await usage.confirmPreview(usageScope,currentReports.setId,"delete"));
-    await fixture.operator.query("UPDATE defender_hunting_retained_scopes SET revoked_at=clock_timestamp(),revoked_by='current-review' WHERE id=$1",[currentHunt.retainedScopeId]);
-    expect(await reopenRestoredDatabase(fixture.operator,target)).toEqual({mode:"normal",providerWorkEnabled:false});
-    expect((await restoredOperator.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0]).toEqual({mode:"normal",provider_work_enabled:false});
+    await fixture.operator.query("DELETE FROM defender_hunting_jobs WHERE id=$1",[currentHunt.jobId]);
+    expect(await reopenRestoredDatabase(fixture.operator,target)).toEqual({mode:"normal",providerWorkEnabled:true});
+    expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0]).toEqual({mode:"normal"});
     await expect(restoredReader.page(restoredUsers.id,restoredIdentity)).rejects.toMatchObject({code:"selection_invalidated"});
     const reopenedUsers=await restoredReader.capture(restoredIdentity,"delegated","official_users");
     expect((await restoredReader.page(reopenedUsers.id,restoredIdentity)).value).toEqual([]);

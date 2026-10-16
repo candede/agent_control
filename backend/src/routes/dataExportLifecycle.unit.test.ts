@@ -21,6 +21,9 @@ vi.mock("./policy.js", () => ({
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: (name: string) => name === "TENANTS_JSON" ? "[]"
   : name === "SESSION_SECRET" ? "synthetic-durable-export-session-secret" : undefined }));
 vi.mock("../middleware/auth.js", () => ({ requestScope: () => ({ tenantId: "tenant", principalId: "principal" }) }));
+vi.mock("../middleware/requestAuthentication.js", () => ({
+  requestUser: (request: Request) => request.session.user,
+}));
 vi.mock("../services/officialReportExports.js", () => ({
   OfficialReportExports: class {
     engine = mocks.engine;

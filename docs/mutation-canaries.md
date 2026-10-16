@@ -4,6 +4,14 @@ Agent Control package and quarantine changes do not require a canary. An
 authorized Admin can perform a supported change after reviewing the exact target
 and confirmation.
 
+The shared generic `/api/agent-controls/preview` and `/execute` handlers have the
+same rule for both browser and approved delegated API callers. Their receipt is
+target-consistency evidence, not a new canary or human-approval prerequisite.
+Generic Studio quarantine and explicit Studio-package blocking remain distinct
+effects. Ordinary child jobs retain the existing lease/prestate/readback and
+uncertain-write reconciliation fences; the optional approval-bound canary
+lifecycle below is not an ordinary job or generic retry mechanism.
+
 Canaries are optional production validation exercises for organizations that
 require separate approval and verified restoration.
 

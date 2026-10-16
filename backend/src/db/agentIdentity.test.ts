@@ -111,17 +111,17 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
   it("persists the verified child object/client identity and isolates every source/account binding", async () => {
     const f = await saved();
     await repository.save(f.scope, f.source, mapping, fence);
-    expect(await repository.read(f.scope, f.source)).toMatchObject(mapping);
-    expect(await repository.read({ ...f.scope, principalId: randomUUID() }, f.source)).toBeNull();
-    expect(await repository.read({ ...f.scope, tenantId: randomUUID() }, f.source)).toBeNull();
+    expect((await repository.readState(f.scope, f.source)).value).toMatchObject(mapping);
+    expect(await repository.readState({ ...f.scope, principalId: randomUUID() }, f.source)).toEqual({ status: "missing" });
+    expect(await repository.readState({ ...f.scope, tenantId: randomUUID() }, f.source)).toEqual({ status: "missing" });
     for (const change of [{ recordId: `agent:${randomUUID()}` }, { snapshotId: randomUUID() }, { nativeId: "different" },
       { environmentId: "other" }, { candidateId: otherId }, { sourceRevision: "b".repeat(64) }]) {
-      expect(await repository.read(f.scope, { ...f.source, ...change })).toBeNull();
+      expect(await repository.readState(f.scope, { ...f.source, ...change })).toEqual({ status: "missing" });
     }
     await repository.invalidate({ ...f.scope, principalId: randomUUID() }, f.source);
-    expect(await repository.read(f.scope, f.source)).not.toBeNull();
+    expect((await repository.readState(f.scope, f.source)).value).toMatchObject(mapping);
     await repository.invalidate(f.scope, f.source);
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
   });
 
   it("publishes with runtime grants while forbidding source identity and provenance mutations", async () => {
@@ -136,7 +136,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     await expect(fixture.runtime.query("DELETE FROM power_platform_record_rows WHERE generation_id=$1", [f.source.snapshotId]))
       .rejects.toThrow("inventory_content_pinned");
     await repository.save(f.scope, f.source, mapping, fence);
-    expect(await repository.read(f.scope, f.source)).toMatchObject(mapping);
+    expect((await repository.readState(f.scope, f.source)).value).toMatchObject(mapping);
   });
 
   it("holds current source and clear-data locks through the final authorization fence", async () => {
@@ -163,9 +163,9 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
       finally { competing.release(); await publication; }
     }
     expect(await publication).toEqual([{ status: "fulfilled", value: undefined }]);
-    expect(await repository.read(f.scope, f.source)).toMatchObject(mapping);
+    expect((await repository.readState(f.scope, f.source)).value).toMatchObject(mapping);
     await new DataSyncRepository(fixture.runtime).submit(f.scope, { mode: "full", clearSavedData: true });
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
     await expect(repository.save(f.scope, f.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
   });
 
@@ -178,7 +178,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     await expect(fixture.runtime.query(`UPDATE agent_identity_cache SET runtime_provenance=NULL
       WHERE tenant_id=$1 AND principal_id=$2`, [f.scope.tenantId, f.scope.principalId]))
       .rejects.toThrow("agent_identity_cache_client_id_provenance");
-    expect(await repository.read(f.scope, f.source)).toMatchObject(mapping);
+    expect((await repository.readState(f.scope, f.source)).value).toMatchObject(mapping);
   });
 
   it("persists bounded source-scoped failure outcomes without ever returning candidate IDs as verified", async () => {
@@ -190,7 +190,6 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
       const result = await repository.readState(f.scope, f.source);
       expect(result).toMatchObject({ status, lastErrorCode: "fixture_error" });
       expect(result.value).toBeUndefined();
-      expect(await repository.read(f.scope, f.source)).toBeNull();
       expect(Date.parse(result.expiresAt!) - Date.parse(result.checkedAt!)).toBe(300_000);
       expect(await repository.readState({ ...f.scope, principalId: randomUUID() }, f.source)).toEqual({ status: "missing" });
       expect(await repository.readState(f.scope, { ...f.source, sourceRevision: "b".repeat(64) })).toEqual({ status: "missing" });
@@ -205,18 +204,17 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
   it("bounds TTL to one hour and current source expiry and excludes expired mappings before retention", async () => {
     const f = await saved();
     await repository.save(f.scope, f.source, mapping, fence);
-    const value = (await repository.read(f.scope, f.source))!;
+    const value = (await repository.readState(f.scope, f.source)).value!;
     expect(Date.parse(value.expiresAt) - Date.parse(value.checkedAt)).toBe(3_600_000);
     const short = await saved(randomUUID(), { expiresAt: new Date(Date.now() + 600_000) });
     await repository.save(short.scope, short.source, mapping, fence);
-    const shorter = (await repository.read(short.scope, short.source))!;
+    const shorter = (await repository.readState(short.scope, short.source)).value!;
     expect(Date.parse(shorter.expiresAt) - Date.parse(shorter.checkedAt)).toBeLessThanOrEqual(600_000);
     const authority = (await fixture.runtime.query(`SELECT authority_expires_at FROM inventory_live_sources
       WHERE tenant_id=$1 AND principal_id=$2 LIMIT 1`, [short.scope.tenantId, short.scope.principalId])).rows[0];
     expect(Date.parse(shorter.expiresAt)).toBe(authority.authority_expires_at.getTime());
     await fixture.operator.query(`UPDATE agent_identity_cache SET checked_at=clock_timestamp()-interval '1 hour',
       expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1`, [f.scope.tenantId]);
-    expect(await repository.read(f.scope, f.source)).toBeNull();
     expect(await repository.readState(f.scope, f.source)).toMatchObject({ status: "expired" });
     await retain(fixture.operator);
     expect((await fixture.operator.query("SELECT count(*)::int AS count FROM agent_identity_cache WHERE tenant_id=$1", [f.scope.tenantId])).rows[0].count).toBe(0);
@@ -227,14 +225,14 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     await repository.save(f.scope, f.source, mapping, fence);
     await nativeInventoryFixture(fixture.runtime, f.scope, [identityResource(f.scope.tenantId, "native-agent", otherId)]);
     await reconcileInventoryFixture(fixture.runtime, f.scope);
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
     await expect(repository.save(f.scope, f.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
     const changed = await new LiveInventory(fixture.runtime).record(f.scope, f.source.recordId);
     await expect(repository.save(f.scope, { ...f.source, snapshotId: changed.native!.observation.snapshotId,
       sourceRevision: changed.revision }, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
     await nativeInventoryFixture(fixture.runtime, f.scope, [{ ...identityResource(f.scope.tenantId), provenance: {} }]);
     await reconcileInventoryFixture(fixture.runtime, f.scope);
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
     await expect(repository.save(f.scope, f.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
     const unproved = await new LiveInventory(fixture.runtime).record(f.scope, f.source.recordId);
     await expect(repository.save(f.scope, { ...f.source, snapshotId: unproved.native!.observation.snapshotId,
@@ -243,7 +241,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     await repository.save(current.scope, current.source, mapping, fence);
     await nativeInventoryFixture(fixture.runtime, current.scope, [identityResource(current.scope.tenantId)]);
     await reconcileInventoryFixture(fixture.runtime, current.scope);
-    expect(await repository.read(current.scope, current.source)).toBeNull();
+    expect(await repository.readState(current.scope, current.source)).toEqual({ status: "missing" });
     await expect(repository.save(current.scope, current.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
     for (const value of [{ ...mapping, objectId: otherId }, { ...mapping, applicationId: otherId },
       { ...mapping, applicationId: "00000000-0000-0000-0000-000000000000" }]) {
@@ -257,9 +255,9 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     await repository.save(f.scope, f.source, mapping, fence);
     await repository.save(other.scope, other.source, mapping, fence);
     await new DataSyncRepository(fixture.runtime).submit(f.scope, { mode: "full", clearSavedData: true });
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
     await expect(repository.save(f.scope, f.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
-    expect(await repository.read(other.scope, other.source)).not.toBeNull();
+    expect((await repository.readState(other.scope, other.source)).value).toMatchObject(mapping);
     expect((await fixture.runtime.query(`SELECT confdeltype FROM pg_constraint
       WHERE conrelid='agent_identity_cache'::regclass AND conname='agent_identity_cache_generation'`)).rows).toEqual([{ confdeltype: "c" }]);
     await new DataSyncRepository(fixture.runtime).submit(other.scope, { mode: "full", clearSavedData: true });
@@ -270,7 +268,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     const f = await saved();
     const guarded = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("session changed"));
     await expect(repository.save(f.scope, f.source, mapping, guarded)).rejects.toThrow("session changed");
-    expect(await repository.read(f.scope, f.source)).toBeNull();
+    expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
   });
 
 });
@@ -287,7 +285,7 @@ describe("identity cache exact capacity with current typed sources", () => {
   it("rejects target 1,001 while permitting an exact in-place refresh at account capacity", async () => {
     const existing = await f.target(0), additional = await f.target(1000);
     await repository.save(f.scope, existing.source, existing.mapping, fence);
-    expect(await repository.read(f.scope, existing.source)).toMatchObject(existing.mapping);
+    expect((await repository.readState(f.scope, existing.source)).value).toMatchObject(existing.mapping);
     await expect(repository.save(f.scope, additional.source, additional.mapping, fence))
       .rejects.toMatchObject({ code: "agent_identity_cache_limit" });
   });

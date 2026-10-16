@@ -28,6 +28,30 @@ import type pg from "pg";
 import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
 
 describe("fixed-budget capacity instrumentation and workload", () => {
+  it("loads real operational state and keeps synthetic session issuance immutable across role renewals", () => {
+    const runtime = readFileSync(new URL("./large-tenant-capacity.ts", import.meta.url), "utf8");
+    const http = readFileSync(new URL("./capacityHttp.ts", import.meta.url), "utf8");
+    expect(runtime).toContain("await loadOperationalState(database)");
+    expect(runtime.indexOf("await loadOperationalState(database)")).toBeLessThan(
+      runtime.indexOf("outcome.appBootstrap = await capacityHttp("));
+    expect(http).toContain("const signedInAt = Date.now()");
+    expect(http).toContain("signedInAt, rolesValidatedAt: signedInAt");
+    expect(http).toContain("{ ...sessionData,rolesValidatedAt: Date.now() }");
+    expect(http).not.toContain("signedInAt: Date.now()");
+  });
+  it("paces real concurrent HTTP readers and runs genuine source orchestration before the full UI", () => {
+    const http = readFileSync(new URL("./capacityHttp.ts",import.meta.url),"utf8");
+    const load = readFileSync(new URL("./capacityHttpLoad.ts",import.meta.url),"utf8");
+    const runtime = readFileSync(new URL("./capacityRuntime.ts",import.meta.url),"utf8");
+    const workload = readFileSync(new URL("./capacityWorkloads.ts",import.meta.url),"utf8");
+    expect(load).toContain("await delay(1500,undefined,{ signal })");
+    expect(load).not.toContain("clearAdmissionForTest");
+    expect(http.indexOf("await capacityInitialSync(database,user,100_000)")).toBeLessThan(http.indexOf('browser: await dispatch("browser")'));
+    expect(runtime).toContain('await sync.start(user,{ mode: "initial" })');
+    expect(runtime).toContain('assert.equal(state.onboardingRequired,false');
+    expect(runtime).not.toContain("recordSuccessMarker(");
+    expect(workload).toContain('error.code === "provider_result_limit"');
+  });
   it("rotates only expired invalidated capacity selections, never an early fence or another error",() => {
     expect(capacitySelectionExpired({ code: "selection_invalidated" },new Date(1000),1000)).toBe(true);
     expect(capacitySelectionExpired({ code: "selection_invalidated" },new Date(1001),1000)).toBe(false);
@@ -38,7 +62,7 @@ describe("fixed-budget capacity instrumentation and workload", () => {
   it("grants native secure-context APIs only to the isolated browser fixture's exact internal origin",() => {
     expect(capacityBrowserOrigin).toBe("http://test-db:8081");
     expect(capacityBrowserLaunchOptions({ AGENT_CONTROL_ISOLATED_TESTS: "1" })).toEqual({
-      headless: true,args: ["--disable-dev-shm-usage","--unsafely-treat-insecure-origin-as-secure=http://test-db:8081"],
+      headless: true,channel: "chromium",args: ["--disable-dev-shm-usage","--unsafely-treat-insecure-origin-as-secure=http://test-db:8081"],
     });
     expect(() => capacityBrowserLaunchOptions({})).toThrow("capacity_browser_requires_isolated_fixture");
     expect(() => capacityBrowserLaunchOptions({ AGENT_CONTROL_ISOLATED_TESTS: "0" })).toThrow("capacity_browser_requires_isolated_fixture");

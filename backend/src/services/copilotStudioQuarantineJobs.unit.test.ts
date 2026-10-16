@@ -196,7 +196,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
       const { repository, provider } = fixture();
       const user: AuthenticatedUser = { tenantId: scope.tenantId, homeAccountId: scope.principalId,
         displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
-      vi.spyOn(msal, "revalidateAuthenticatedUser").mockImplementation(async () => {
+      vi.spyOn(msal, "revalidateAuthorizedUser").mockImplementation(async () => {
         if (stage === "revalidation") await replaceSession();
         return user;
       });
@@ -208,7 +208,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
         if (stage === "authority") await replaceSession();
         return authority;
       });
-      const token = vi.spyOn(msal, "acquireDelegatedToken").mockResolvedValue("fixture");
+      const token = vi.spyOn(msal, "acquireAuthorizedToken").mockResolvedValue("fixture");
 
       await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider))
         .rejects.toMatchObject({ code: "unauthorized" });
@@ -245,6 +245,40 @@ describe("quarantine execution session and cancellation boundaries", () => {
     expect(settleControls).toHaveBeenCalledWith(scope, expect.any(AbortSignal));
   });
 
+  it("revalidates a concurrent publication gap before the first send without duplicating a writer",async()=>{
+    const f=fixture();
+    vi.mocked(f.repository.assertDispatchReady).mockRejectedValueOnce(new AppError(409,"quarantine_target_unavailable","Concurrent canonical publication."));
+    await runCopilotStudioQuarantineJob(jobId,scope,false,f.repository,f.provider,f.authorize);
+    expect(f.provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(f.repository.markSent).toHaveBeenCalledOnce();
+    expect(f.repository.finishItem).toHaveBeenCalledWith(expect.anything(),expect.anything(),"succeeded",expect.anything(),expect.anything(),expect.anything());
+  });
+  it("bounds revalidation of a genuinely removed native target and never sends",async()=>{
+    const f=fixture();
+    vi.mocked(f.repository.assertDispatchReady).mockRejectedValue(new AppError(409,"quarantine_target_unavailable","Removed native target."));
+    await runCopilotStudioQuarantineJob(jobId,scope,false,f.repository,f.provider,f.authorize);
+    expect(f.repository.assertDispatchReady).toHaveBeenCalledTimes(3);
+    expect(f.provider.setQuarantine).not.toHaveBeenCalled();
+    expect(f.repository.markSent).not.toHaveBeenCalled();
+    expect(f.repository.finishItem).toHaveBeenCalledWith(expect.anything(),expect.anything(),"failed",expect.objectContaining({errorCode:"quarantine_target_unavailable"}));
+  });
+  it("never revalidates or replays a target error after its one-shot send fence",async()=>{
+    const f=fixture();
+    f.provider.setQuarantine.mockRejectedValue(new AppError(409,"quarantine_target_unavailable","Synthetic error after send."));
+    await runCopilotStudioQuarantineJob(jobId,scope,false,f.repository,f.provider,f.authorize);
+    expect(f.provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(f.repository.markSent).toHaveBeenCalledOnce();
+    expect(f.repository.finishItem).toHaveBeenCalledWith(expect.anything(),expect.anything(),"inconclusive",expect.objectContaining({errorCode:"quarantine_target_unavailable"}));
+  });
+  it("retries only verified evidence persistence after a concurrent canonical publication gap, never the sent writer",async()=>{
+    const f=fixture();
+    vi.mocked(f.repository.finishItem).mockRejectedValueOnce(new AppError(409,"quarantine_target_unavailable","Concurrent canonical publication before evidence commit."));
+    await runCopilotStudioQuarantineJob(jobId,scope,false,f.repository,f.provider,f.authorize);
+    expect(f.repository.finishItem).toHaveBeenCalledTimes(2);
+    expect(f.repository.finishItem).toHaveBeenLastCalledWith(expect.anything(),expect.anything(),"succeeded",expect.anything(),expect.anything(),expect.anything());
+    expect(f.provider.setQuarantine).toHaveBeenCalledOnce();
+    expect(f.repository.markSent).toHaveBeenCalledOnce();
+  });
   it("keeps provider dispatch closed when pending inventory controls cannot settle", async () => {
     const { repository, provider, authorize } = fixture();
     settleControls.mockRejectedValueOnce(new Error("inventory control publication failed"));
@@ -259,7 +293,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
     "does not begin an item after %s changes while inventory controls settle", async boundary => {
       const { repository, provider, authorize } = fixture();
       const failure = new AppError(boundary === "admissions" ? 503 : 401,
-        boundary === "admissions" ? "provider_requalification_required" : "unauthorized", "Authority changed.");
+        boundary === "admissions" ? "maintenance" : "unauthorized", "Authority changed.");
       let invalidated = false;
       vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
         if (boundary === "capability" && invalidated) throw failure;
@@ -310,7 +344,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
       vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
         if (invalidated) throw failure;
       });
-      vi.spyOn(msal, "revalidateAuthenticatedUser").mockImplementation(async () => {
+      vi.spyOn(msal, "revalidateAuthorizedUser").mockImplementation(async () => {
         if (boundary === "revalidation") invalidated = true;
         return { tenantId: scope.tenantId, homeAccountId: scope.principalId,
           displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
@@ -323,7 +357,7 @@ describe("quarantine execution session and cancellation boundaries", () => {
         if (boundary === "authority") invalidated = true;
         return authority;
       });
-      const token = vi.spyOn(msal, "acquireDelegatedToken").mockResolvedValue("fixture");
+      const token = vi.spyOn(msal, "acquireAuthorizedToken").mockResolvedValue("fixture");
       await expect(runCopilotStudioQuarantineJob(jobId, scope, false, repository, provider)).rejects.toBe(failure);
       expect(token).not.toHaveBeenCalled();
       expect(repository.claim).not.toHaveBeenCalled();

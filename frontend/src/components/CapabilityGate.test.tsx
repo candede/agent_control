@@ -15,7 +15,8 @@ const user: SessionUser = {
 
 function available(id: CapabilityId = "graph.package.read.delegated", now = Date.now()): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(definition => definition.id === id)!,
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
+    ...(id.endsWith(".application") ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
     decision: {
       capabilityId: id, status: "available", authorized: true, fresh: true, verification: "provider",
       checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
@@ -158,7 +159,7 @@ describe("CapabilityGate", () => {
     expect(value.reload).not.toHaveBeenCalled();
   });
 
-  it("does not describe application qualification as an automatic check or its retry", () => {
+  it("does not describe application authorization as an automatic delegated check", () => {
     const unknown = available("graph.package.read.application");
     unknown.decision = { capabilityId: unknown.definition.id, status: "unknown", authorized: false,
       fresh: false, previewQualification: "unqualified", remediation: [] };
@@ -170,9 +171,9 @@ describe("CapabilityGate", () => {
     expect(screen.getByText("Loading capability status.")).toBeVisible();
     view.rerender(content({ ...value, pending: true }));
     expect(screen.queryByText("Checking capability status.")).not.toBeInTheDocument();
-    expect(screen.getByText(/explicitly approved bounded application-scope/)).toBeVisible();
+    expect(screen.getByText(/Microsoft validates the configured application identity when it runs/)).toBeVisible();
     view.rerender(content({ ...value, error: "Permission checks failed. Use Check status to retry." }));
-    expect(screen.getByText(/explicitly approved bounded application-scope.*Permission checks failed/)).toBeVisible();
+    expect(screen.getByText(/Microsoft validates the configured application identity when it runs.*Permission checks failed/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
   });
 

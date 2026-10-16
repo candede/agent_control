@@ -171,10 +171,10 @@ test("filtered results keep Clear filters inline and show the matching total wit
       expect((await toolbar.boundingBox())!.height, "Selecting a category adds no toolbar row").toBeCloseTo(initialHeight, 1);
       if (viewport.width >= 768) {
         const controls = await Promise.all([search, category, clear, toolbar.getByRole("button", { name: "Filters", exact: true }),
-          toolbar.getByRole("button", { name: "Columns", exact: true })].map(control => control.boundingBox()));
+          ...(viewport.width > 900 ? [toolbar.getByRole("button", { name: "Columns", exact: true })] : [])].map(control => control.boundingBox()));
         expect(Math.max(...controls.map(box => box!.y)) - Math.min(...controls.map(box => box!.y)),
           "Clear filters shares the main control row").toBeLessThanOrEqual(1);
-        expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(64);
+        expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(viewport.width > 900 ? 64 : 110);
       }
     }
     await expect(page.getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
@@ -293,10 +293,16 @@ test("one compact toolbar opens accessible detailed filters without moving the t
         const controls = await Promise.all([
           filters.getByRole("searchbox", { name: "Search", exact: true }),
           filters.getByRole("combobox", { name: "Show agents", exact: true }),
-          trigger, toolbar.getByRole("button", { name: "Columns", exact: true }),
+          trigger, ...(viewport.width > 900 ? [toolbar.getByRole("button", { name: "Columns", exact: true })] : []),
         ].map(control => control.boundingBox()));
         expect(Math.max(...controls.map(box => box!.y)) - Math.min(...controls.map(box => box!.y))).toBeLessThanOrEqual(1);
-        expect((await toolbar.boundingBox())!.height, "The whole toolbar remains one compact row").toBeLessThanOrEqual(64);
+        expect((await toolbar.boundingBox())!.height, "Only medium viewports wrap bulk and column controls")
+          .toBeLessThanOrEqual(viewport.width > 900 ? 64 : 110);
+        if (viewport.width <= 900) {
+          const columns = await toolbar.getByRole("button", { name: "Columns", exact: true }).boundingBox();
+          expect(columns!.y, "Wrapped controls cannot intercept the query row")
+            .toBeGreaterThanOrEqual(Math.max(...controls.map(box => box!.y + box!.height)));
+        }
       }
       await page.screenshot({ path: info.outputPath(`agents-toolbar-${viewport.width}.png`), fullPage: true });
       await trigger.focus();

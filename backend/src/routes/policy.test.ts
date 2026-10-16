@@ -8,12 +8,14 @@ describe("route policy declarations", () => {
   it("covers every application route and requires CSRF on unsafe authenticated methods", () => {
     createApp({ options: { max: 4 } } as never, "artifacts/not-used");
     const expected = [
-      "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}", "GET /security",
-      "GET /auth/login", "POST /auth/login", "POST /auth/consent", "GET /auth/callback", "POST /auth/logout", "GET /me",
+      "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}",
+      "GET /auth/login", "POST /auth/login", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
       "GET /agent-inventory", "GET /agent-inventory/summary", "GET /agent-inventory/facets", "POST /agent-inventory/selections",
       "GET /agent-inventory/health",
+      "GET /agent-inventory/:recordId/about",
+      "POST /agent-controls/preview", "POST /agent-controls/execute", "GET /agent-controls/:receiptId",
       "POST /agents/selections", "GET /agents/:id/detail",
       "POST /agents/mutation-selection", "POST /agents/refresh-selection",
       "GET /agent-inventory/:recordId/detail", "GET /agent-inventory/:recordId/members",
@@ -35,6 +37,7 @@ describe("route policy declarations", () => {
       "POST /quarantine/canary-approvals", "GET /quarantine/canary-approvals", "POST /quarantine/canary-approvals/:id/execute",
       "GET /copilot-usage/users", "GET /copilot-usage/users/facets", "GET /copilot-usage/users/unresolved-identities",
       "GET /copilot-usage/adoption", "GET /copilot-usage/adoption/facets",
+      "GET /copilot-usage/adoption/champions", "GET /copilot-usage/users/resolve", "GET /copilot-usage/users/:objectId/agent-relationships",
       "GET /copilot-usage/users/:objectId", "GET /copilot-usage/users/:objectId/service-plans", "GET /copilot-usage/users/:objectId/agents",
       "GET /official-usage/users/:username", "GET /official-usage/users/:username/directory", "GET /official-usage/users/:username/service-plans",
       "GET /official-usage/aggregate", "GET /official-usage/aggregate/facets", "GET /official-usage/users", "GET /official-usage/users/facets",
@@ -49,13 +52,12 @@ describe("route policy declarations", () => {
       "GET /agent-inventory/:recordId/usage-history",
       "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
       "POST /data-exports", "GET /data-exports/:id", "DELETE /data-exports/:id", "GET /data-exports/:id/download",
-      "GET /audit-search/catalog", "POST /audit-search/qualifications", "POST /audit-search/qualifications/:id/start",
+      "GET /audit-search/catalog",
       "POST /audit-search/jobs", "GET /audit-search/jobs", "GET /audit-search/jobs/:id", "POST /audit-search/jobs/:id/resume",
       "POST /audit-search/jobs/:id/cancel", "DELETE /audit-search/jobs/:id", "GET /audit-search/jobs/:id/records", "GET /audit-search/jobs/:id/export.csv",
-      "GET /hunting/catalog", "POST /hunting/qualifications", "POST /hunting/qualifications/:id/start",
+      "GET /hunting/catalog",
       "POST /hunting/jobs", "GET /hunting/jobs", "GET /hunting/jobs/:id", "POST /hunting/jobs/:id/resume",
       "POST /hunting/jobs/:id/cancel", "DELETE /hunting/jobs/:id", "GET /hunting/jobs/:id/rows", "GET /hunting/jobs/:id/export.csv",
-      "POST /hunting/retained-scopes/:id/revoke",
     ];
     expect([...declaredRoutePolicies.keys()].sort()).toEqual(expected.sort());
     for (const [key, policy] of declaredRoutePolicies) {
@@ -71,10 +73,7 @@ describe("route policy declarations", () => {
     });
   });
 
-  it("keeps the retired consent endpoint session-, Viewer- and CSRF-protected without a provider capability", () => {
-    expect(declaredRoutePolicies.get("POST /auth/consent")).toEqual({
-      access: "authenticated", dataClass: "identity", roles: ["AgentControl.Viewer"], csrf: true,
-    });
+  it("keeps login and its callback public", () => {
     expect(declaredRoutePolicies.get("GET /auth/login")).toEqual({ access: "public", dataClass: "identity" });
     expect(declaredRoutePolicies.get("POST /auth/login")).toEqual({ access: "public", dataClass: "identity" });
     expect(declaredRoutePolicies.get("GET /auth/callback")).toEqual({ access: "public", dataClass: "identity" });

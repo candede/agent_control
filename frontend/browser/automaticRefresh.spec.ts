@@ -13,7 +13,7 @@ test.beforeEach(async ({ page }) => {
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
 test("background Users refresh keeps the page stable and interactive with a subtle corner indicator", async ({ page }, info) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   const original = selectedUsersPage(), updated = selectedUsersPage();
   updated.value[2] = { ...updated.value[2], reportedResponses: 2, bridgeResponses: 2, reportedAgentsUsed: 1,
@@ -110,7 +110,7 @@ test("background Users refresh keeps the page stable and interactive with a subt
 });
 
 test("an open agent Overview keeps background pins and stays stable through explicit saved reloads", async ({ page }, info) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   const item = unifiedAgents.value[0].packages[0];
   const descriptions = [
@@ -191,7 +191,7 @@ test("an open agent Overview keeps background pins and stays stable through expl
 });
 
 test("an open management draft retains its controls and focus during a slow background detail read", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   const item = unifiedAgents.value[0].packages[0];
   const detail: CopilotPackageDetail = { ...item, availableTo: "some", allowedUsersAndGroups: [] };
@@ -264,7 +264,7 @@ test("an open management draft retains its controls and focus during a slow back
 });
 
 test("an open user Overview stays stable while capturing the newly published source", async ({ page }, info) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   let version = 0;
   let reads = 0;
@@ -334,7 +334,7 @@ test("an open user Overview stays stable while capturing the newly published sou
 });
 
 test("minute checks defer unused inventory and do not reload unchanged visible data", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   const requests: string[] = [];
   page.on("request", request => requests.push(new URL(request.url()).pathname));
@@ -371,7 +371,7 @@ test("minute checks defer unused inventory and do not reload unchanged visible d
 });
 
 test("the icon disappears after login requests settle even while automatic sync continues", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   let checks = 0;
   let finish!: () => void;
@@ -415,7 +415,7 @@ test("the icon disappears after login requests settle even while automatic sync 
 });
 
 test("recovered automatic sync stays free of the stale sign-in warning across subsequent minute checks", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   let result: AutomaticRefreshResult = {
     ...automaticRefreshFixture(),
@@ -458,7 +458,7 @@ test("recovered automatic sync stays free of the stale sign-in warning across su
 });
 
 test("detail permission failures offer permission review instead of another sign-in", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
     ...automaticRefreshFixture(),
     detailJob: { id: "denied-detail", status: "failed", errorCode: "missing_permission", updatedAt: layoutTime },
@@ -472,7 +472,7 @@ test("detail permission failures offer permission review instead of another sign
 });
 
 test("keeps automatic checks running on other pages without rendering the banner", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install();
   let checks = 0;
   await page.route("**/api/data-sync/auto-refresh", route => {
@@ -497,7 +497,7 @@ test("keeps automatic checks running on other pages without rendering the banner
 });
 
 test("opening Sync from inventory attention immediately shows its cause without a diagnostics dialog", async ({ page }) => {
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.goto("/agents");
   await page.getByRole("button", { name: "Inventory needs attention · Open Sync" }).click();
   const health = page.getByRole("region", { name: "Inventory health", exact: true });

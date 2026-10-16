@@ -45,30 +45,36 @@ function result(rows: Array<DefenderAgentInventoryRow | DefenderAgentActivityRow
 }
 
 async function submitAndBegin(key: string, scope = principalScope, selectedFilters = filters) {
-  const retainedScope = await qualifyScope(`${key}-qualification`, scope, selectedFilters);
-  const job = await repository.submit(scope, { idempotencyKey: key, filters: selectedFilters, retainedScope });
+  const job = await repository.submit(scope, { idempotencyKey: key, filters: selectedFilters });
   return { job, execution: await repository.begin(scope, job.id) };
 }
 
-async function qualifyScope(key: string, scope = principalScope, selectedFilters = filters) {
-  const selectedAuthority = { ...authority, capabilityId: scope.tokenMode === "delegated" ? "defender.hunting.delegated" as const : "defender.hunting.application" as const,
-    configurationRevision: scope.resultScope.configurationRevision ?? authority.configurationRevision };
-  const job = await repository.submit(scope, { idempotencyKey: key, filters: selectedFilters,
-    qualification: { ...selectedAuthority, approvedBy: "administrator" } });
-  const execution = await repository.begin(scope, job.id);
-  const qualificationRow = selectedFilters.templateId === "agents_inventory"
-    ? inventoryRow({ agentId: selectedFilters.agentIds[0] ?? "defender-agent", entraBlueprintId: selectedFilters.blueprintIds[0] ?? null })
-    : activityRow({ actionType: selectedFilters.operations[0] ?? "InvokeAgent",
-      operation: selectedFilters.operations[0]?.startsWith("ExecuteTool") ? "execute_tool" : selectedFilters.operations[0] === "InferenceCall" ? "chat" : "invoke_agent",
-      targetAgentId: selectedFilters.agentIds[0] ?? null, targetAgentBlueprintId: selectedFilters.blueprintIds[0] ?? null,
-      actorAccountObjectId: selectedFilters.actorObjectIds[0] ?? null,
-      spanRole: selectedFilters.operations[0] === "InvokeAgent" ? "root_invoke_agent" : "unresolved",
-      rootSpanObserved: selectedFilters.operations[0] === "InvokeAgent" });
-  await repository.publish(scope, job.id, execution, result([qualificationRow]));
-  return repository.requireQualifiedScope(scope, selectedFilters, selectedAuthority);
-}
-
 describe.sequential("Defender hunting repository", () => {
+  it("publishes ordinary application results and preserves tenant/configuration sharing boundaries", async () => {
+    const scope: DefenderHuntingScope = {
+      tenantId: "ordinary-app-tenant", authorizationPrincipalId: "requesting-viewer",
+      resultScope: { kind: "application", scopeId: "configured-client", configurationRevision: 2 },
+      tokenMode: "application",
+    };
+    const job = await repository.submit(scope, { idempotencyKey: "ordinary-application", filters });
+    expect(job).toMatchObject({ status: "waiting_authorization", tokenMode: "application", resultScope: scope.resultScope });
+    const execution = await repository.begin(scope, job.id);
+    const published = await repository.publish(scope, job.id, execution, result([inventoryRow()]));
+    expect(published.status).toBe("succeeded");
+    const shared = { tenantId: scope.tenantId, authorizationPrincipalId: "another-viewer",
+      resultScopes: [scope.resultScope], };
+    expect((await repository.listJobs(shared, 20, 0)).value.map(value => value.id)).toEqual([job.id]);
+    expect((await repository.listRows(shared, job.id, 100, 0)).value).toHaveLength(1);
+    await expect(repository.cancel(shared, job.id)).rejects.toMatchObject({ status: 404, code: "not_found" });
+    for (const forbidden of [
+      { ...shared, tenantId: "another-tenant" },
+      { ...shared, resultScopes: [{ ...scope.resultScope, configurationRevision: 3 }] },
+      { ...shared, resultScopes: [{ ...scope.resultScope, scopeId: "another-client" }] },
+    ]) {
+      expect((await repository.listJobs(forbidden, 20, 0)).count).toBe(0);
+      expect(await repository.getJob(forbidden, job.id)).toBeUndefined();
+    }
+  });
   it("filters human scope before counts and denies other-human job access even on the same agent", async () => {
     const owner: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "human-history-reader",
       resultScope: { kind: "principal", scopeId: "human-history-reader", configurationRevision: null } };
@@ -78,14 +84,15 @@ describe.sequential("Defender hunting repository", () => {
       agentIds: [], entraAgentApplicationIds: [applicationId], userObjectId };
     const matching = await repository.submit(owner, { idempotencyKey: "human-match", filters: selected });
     const other = await repository.submit(owner, { idempotencyKey: "human-other", filters: { ...selected, userObjectId: applicationId } });
-    await repository.submit(owner, { idempotencyKey: "human-broad", filters: { ...selected, userObjectId: undefined } });
+    const broad = await repository.submit(owner, { idempotencyKey: "human-broad", filters: { ...selected, userObjectId: undefined } });
     const read = { tenantId: owner.tenantId, authorizationPrincipalId: owner.authorizationPrincipalId,
-      resultScopes: [owner.resultScope], qualifications: [], userObjectId, entraAgentApplicationIds: [applicationId] };
+      resultScopes: [owner.resultScope], userObjectId, entraAgentApplicationIds: [applicationId] };
     const page = await repository.listJobs(read, 1, 0);
     expect(page.count).toBe(1);
     expect(page.value.map(job => job.id)).toEqual([matching.id]);
     expect(await repository.getJob(read, other.id)).toBeUndefined();
-    await expect(repository.cancel(read, other.id)).rejects.toMatchObject({ code: "hunting_job_state" });
+    await expect(repository.cancel(read, other.id)).rejects.toMatchObject({ status: 404, code: "not_found" });
+    for (const job of [matching, other, broad]) await repository.cancel(owner, job.id);
   });
   it("isolates typed agent history before real database counts, pagination and lifecycle access", async () => {
     const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "agent-history-reader",
@@ -99,12 +106,12 @@ describe.sequential("Defender hunting repository", () => {
     const activity = await repository.submit(scope, { idempotencyKey: "agent-activity", filters: runtimeFilters });
     const tools = await repository.submit(scope, { idempotencyKey: "agent-tools",
       filters: { ...runtimeFilters, templateId: "agent_tools", operations: ["ExecuteToolBySDK"] } });
-    await repository.submit(scope, { idempotencyKey: "other-agent",
+    const other = await repository.submit(scope, { idempotencyKey: "other-agent",
       filters: { ...runtimeFilters, entraAgentApplicationIds: [otherIdentity] } });
-    await repository.submit(scope, { idempotencyKey: "legacy-mistyped-agent",
+    const legacy = await repository.submit(scope, { idempotencyKey: "legacy-mistyped-agent",
       filters: { ...runtimeFilters, entraAgentApplicationIds: [], entraAgentIds: [identity] } });
     const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-      resultScopes: [scope.resultScope], qualifications: [], entraAgentIds: [], entraAgentApplicationIds: [identity] };
+      resultScopes: [scope.resultScope], entraAgentIds: [], entraAgentApplicationIds: [identity] };
     const page = await repository.listJobs(readScope, 1, 1);
     expect(page).toMatchObject({ count: 2, limit: 1, offset: 1 });
     expect(page.value).toHaveLength(1);
@@ -112,18 +119,19 @@ describe.sequential("Defender hunting repository", () => {
     expect(await repository.listJobs({ ...readScope, entraAgentIds: [identity], entraAgentApplicationIds: [] }))
       .toMatchObject({ count: 1, value: [{ id: inventory.id }] });
     expect(await repository.getJob(readScope, inventory.id)).toBeUndefined();
-    await expect(repository.cancel(readScope, inventory.id)).rejects.toMatchObject({ code: "hunting_job_state" });
+    await expect(repository.cancel(readScope, inventory.id)).rejects.toMatchObject({ status: 404, code: "not_found" });
     expect(await repository.cancel(readScope, activity.id)).toMatchObject({ status: "cancelled" });
     expect((await repository.listJobs({ ...readScope, tenantId: "different-tenant" })).count).toBe(0);
     expect((await repository.listJobs({ ...readScope, authorizationPrincipalId: "different-reader",
       resultScopes: [{ kind: "principal", scopeId: "different-reader", configurationRevision: null }] })).count).toBe(0);
+    for (const job of [inventory, tools, other, legacy]) await repository.cancel(scope, job.id);
   });
 
-  it("accepts bounded ordinary delegated jobs without weakening application retained scope", async () => {
+  it("accepts ordinary delegated and application jobs directly", async () => {
     const delegated = await repository.submit(principalScope, { idempotencyKey: "ordinary-delegated", filters });
-    expect(delegated).toMatchObject({ tokenMode: "delegated", qualification: null, retainedScopeId: null });
+    expect(delegated).toMatchObject({ tokenMode: "delegated", });
     const readScope = { tenantId: principalScope.tenantId, authorizationPrincipalId: principalScope.authorizationPrincipalId,
-      resultScopes: [principalScope.resultScope], qualifications: [] };
+      resultScopes: [principalScope.resultScope], };
     await expect(repository.getJob(readScope, delegated.id)).resolves.toMatchObject({ id: delegated.id });
     await expect(repository.listJobs(readScope)).resolves.toMatchObject({ value: expect.arrayContaining([expect.objectContaining({ id: delegated.id })]) });
     const applicationScope: DefenderHuntingScope = {
@@ -132,52 +140,10 @@ describe.sequential("Defender hunting repository", () => {
       resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
       tokenMode: "application",
     };
-    await expect(repository.submit(applicationScope, { idempotencyKey: "ordinary-application", filters }))
-      .rejects.toMatchObject({ code: "invalid_qualification" });
-  });
-
-  it("qualifies only one exact bounded template and target scope", async () => {
-    const qualifiedFilters = filters;
-    const qualified = await repository.submit(principalScope, { idempotencyKey: "qualified-scope", filters: qualifiedFilters,
-      qualification: { ...authority, approvedBy: "administrator" } });
-    const execution = await repository.begin(principalScope, qualified.id);
-    await repository.publish(principalScope, qualified.id, execution, result([inventoryRow()]));
-    await expect(repository.requireQualifiedScope(principalScope, qualifiedFilters, authority)).resolves.toMatchObject({
-      id: expect.any(String), authority,
-    });
-    await expect(repository.requireQualifiedScope(principalScope, { ...qualifiedFilters, templateId: "agent_activity", operations: ["InvokeAgent"] }, authority))
-      .rejects.toMatchObject({ code: "hunting_scope_unqualified" });
-    await expect(repository.submit(principalScope, { idempotencyKey: "unbounded-qualification", filters: { ...filters, agentIds: [] },
-      qualification: { ...authority, approvedBy: "administrator" } })).rejects.toMatchObject({ code: "invalid_qualification" });
-  });
-
-  it("cannot publish old application qualification evidence across a configuration update race", async () => {
-    const applicationScope: DefenderHuntingScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a",
-      resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 }, tokenMode: "application" };
-    const qualifiedFilters = { ...filters, agentIds: ["defender-agent"] };
-    await fixture.operator.query(`INSERT INTO capability_configuration
-      (tenant_id,capability_id,enabled,shared_data_scope,updated_by) VALUES('tenant-a','defender.hunting.application',true,true,'administrator')`);
-    const job = await repository.submit(applicationScope, { idempotencyKey: "application-configuration-race", filters: qualifiedFilters,
-      qualification: { capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-        configurationRevision: 1, approvedBy: "administrator" } });
-    const execution = await repository.begin(applicationScope, job.id);
-    const configurationWriter = await fixture.operator.connect();
-    try {
-      await configurationWriter.query("BEGIN");
-      await configurationWriter.query(`UPDATE capability_configuration SET revision=2,updated_at=clock_timestamp()
-        WHERE tenant_id='tenant-a' AND capability_id='defender.hunting.application'`);
-      const publication = repository.publish(applicationScope, job.id, execution, result([inventoryRow()]));
-      await vi.waitFor(async () => expect(Number((await fixture.operator.query<{ count: string }>(`SELECT count(*) AS count FROM pg_stat_activity
-        WHERE datname=current_database() AND cardinality(pg_blocking_pids(pid))>0`)).rows[0].count)).toBeGreaterThan(0));
-      await configurationWriter.query("COMMIT");
-      await expect(publication).rejects.toMatchObject({ code: "qualification_superseded" });
-    } finally {
-      await configurationWriter.query("ROLLBACK").catch(() => undefined);
-      configurationWriter.release();
-    }
-    expect((await fixture.operator.query("SELECT id FROM defender_hunting_qualification_evidence WHERE qualified_job_id=$1", [job.id])).rowCount).toBe(0);
-    expect(await repository.getJob(applicationScope, job.id)).toMatchObject({ status: "running", snapshotId: null });
-    await repository.cancel(applicationScope, job.id);
+    const application = await repository.submit(applicationScope, { idempotencyKey: "ordinary-application", filters });
+    expect(application).toMatchObject({ tokenMode: "application", });
+    await repository.cancel(applicationScope, application.id);
+    await repository.cancel(principalScope, delegated.id);
   });
 
   it("rejects foreign tenant, mixed source, and arbitrary extra retained fields at publication", async () => {
@@ -213,15 +179,13 @@ describe.sequential("Defender hunting repository", () => {
   });
 
   it("keeps delegated snapshots private and shares only the exact current application scope", async () => {
-    const delegatedRetained = await qualifyScope("private-qualification");
-    const delegated = await repository.submit(principalScope, { idempotencyKey: "private", filters, retainedScope: delegatedRetained });
+    const delegated = await repository.submit(principalScope, { idempotencyKey: "private", filters, });
     expect(await repository.getJob({ tenantId: "tenant-a", authorizationPrincipalId: "security-b", resultScopes: [{ kind: "principal", scopeId: "security-b", configurationRevision: null }] }, delegated.id)).toBeUndefined();
     const applicationScope: DefenderHuntingScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a",
       resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 3 }, tokenMode: "application" };
     await fixture.operator.query(`UPDATE capability_configuration SET revision=3,updated_at=clock_timestamp()
       WHERE tenant_id='tenant-a' AND capability_id='defender.hunting.application'`);
-    const applicationRetained = await qualifyScope("shared-qualification", applicationScope);
-    const application = await repository.submit(applicationScope, { idempotencyKey: "shared", filters, retainedScope: applicationRetained });
+    const application = await repository.submit(applicationScope, { idempotencyKey: "shared", filters, });
     expect(await repository.getJob(applicationScope, application.id)).toMatchObject({ id: application.id });
     expect(await repository.getJob({ ...applicationScope, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 4 } }, application.id)).toBeUndefined();
     await repository.cancel(principalScope, delegated.id);
@@ -251,22 +215,6 @@ describe.sequential("Defender hunting repository", () => {
       providerRowCount: 201, partialReason: "hunting_row_limit", unobservedRange: { startDateTime: filters.startDateTime, endDateTime: filters.endDateTime } });
   });
 
-  it("retains partial qualification history and rows without granting qualified scope", async () => {
-    const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "partial-qualification-reader",
-      resultScope: { kind: "principal", scopeId: "partial-qualification-reader", configurationRevision: null } };
-    const job = await repository.submit(scope, { idempotencyKey: "partial-qualification", filters,
-      qualification: { ...authority, approvedBy: scope.authorizationPrincipalId } });
-    const execution = await repository.begin(scope, job.id);
-    await repository.publish(scope, job.id, execution, result([inventoryRow()], false));
-    const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-      resultScopes: [scope.resultScope], qualifications: [{ resultScope: scope.resultScope, authority }] };
-    expect(await repository.getJob(readScope, job.id)).toMatchObject({ status: "partial", retainedScopeId: null });
-    expect(await repository.listRows(readScope, job.id)).toMatchObject({ count: 1, job: { status: "partial" } });
-    expect(await repository.listQualificationEvidence(readScope)).toEqual([]);
-    expect(await repository.listRetainedScopes(readScope)).toEqual([]);
-    await expect(repository.requireQualifiedScope(scope, filters, authority)).rejects.toMatchObject({ code: "hunting_scope_unqualified" });
-  });
-
   it("fences cancellation and recovered executions from late publication", async () => {
     const cancelled = await submitAndBegin("cancel");
     await repository.cancel(principalScope, cancelled.job.id);
@@ -280,8 +228,7 @@ describe.sequential("Defender hunting repository", () => {
   });
 
   it("terminalizes exhausted waiting work so it cannot consume unfinished capacity", async () => {
-    const retainedScope = await qualifyScope("expired-waiting-qualification");
-    const expired = await repository.submit(principalScope, { idempotencyKey: "expired-waiting", filters, retainedScope });
+    const expired = await repository.submit(principalScope, { idempotencyKey: "expired-waiting", filters });
     await fixture.operator.query("UPDATE defender_hunting_jobs SET deadline_at=clock_timestamp()-interval '1 second' WHERE id=$1", [expired.id]);
     await expect(repository.begin(principalScope, expired.id)).rejects.toMatchObject({ code: "hunting_job_expired" });
     expect(await repository.getJob(principalScope, expired.id)).toMatchObject({ status: "inconclusive", errorCode: "hunting_job_expired", canResume: false });
@@ -309,17 +256,15 @@ describe.sequential("Defender hunting repository", () => {
       ] }]);
     const exact = await submitAndBegin("exact-association", principalScope, { ...filters, agentIds: ["defender-agent"] });
     await repository.publish(principalScope, exact.job.id, exact.execution, result([inventoryRow()]));
-    const readScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a", resultScopes: [principalScope.resultScope], qualifications: [{ resultScope: principalScope.resultScope,
-      authority: { capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 } }], inventoryIdentityScope: {
+    const readScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a", resultScopes: [principalScope.resultScope], inventoryIdentityScope: {
       principalId: "security-a", resourceTypes: ["microsoft.copilotstudio/agents" as const] } };
     expect((await repository.listRows(readScope, exact.job.id)).value[0].association).toMatchObject({ status: "unresolved", reason: "blueprint_is_parent_not_equivalence" });
 
     const activityFilters: DefenderHuntingFilters = { ...filters, templateId: "agent_activity", operations: ["InvokeAgent"],
       agentIds: [], blueprintIds: ["22222222-2222-4222-8222-222222222222"] };
-    const activityQualification = await repository.submit(principalScope, { idempotencyKey: "blueprint-qualification", filters: activityFilters,
-      qualification: { capabilityId: "defender.hunting.delegated", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "administrator" } });
-    const activityQualificationExecution = await repository.begin(principalScope, activityQualification.id);
-    await repository.publish(principalScope, activityQualification.id, activityQualificationExecution,
+    const activity = await repository.submit(principalScope, { idempotencyKey: "blueprint-activity", filters: activityFilters });
+    const activityExecution = await repository.begin(principalScope, activity.id);
+    await repository.publish(principalScope, activity.id, activityExecution,
       result([activityRow({ targetAgentBlueprintId: "22222222-2222-4222-8222-222222222222" })]));
     const child = await submitAndBegin("blueprint-child", principalScope, activityFilters);
     await repository.publish(principalScope, child.job.id, child.execution, result([activityRow({

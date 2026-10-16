@@ -181,9 +181,8 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
       expect(await jobs.claimDueDetails(owner, owner.principalId, signedInAt)).toBeNull();
     }
   });
-  it("uses restricted native target storage rather than a second package-detail cache", async () => {
+  it("protects bounded refresh target storage with runtime privileges", async () => {
     await verifySchema(fixture.runtime);
-    expect((await fixture.runtime.query("SELECT to_regclass('package_detail_cache') AS obsolete")).rows[0].obsolete).toBeNull();
     await expect(fixture.runtime.query("TRUNCATE inventory_refresh_targets")).rejects.toThrow();
   });
   it("returns only retained authorized automatic detail history in every state", async () => {
@@ -366,7 +365,6 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     const owner = scope(), input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const, idempotencyKey: randomUUID() };
     const broad = await jobs.submit(owner, input);
     expect(broad).toMatchObject({ scopeKind: "broad", targetCount: 0 });
-    expect(broad).not.toHaveProperty("catalogOnly");
     await expect(jobs.submit(owner, { ...input, requestedIds: ["one"] })).rejects.toMatchObject({ code: "idempotency_mismatch" });
   });
 });

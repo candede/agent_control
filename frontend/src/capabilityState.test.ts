@@ -2,15 +2,42 @@
 import { describe, expect, it } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import type { CapabilityId, CapabilityStatus, CapabilityView } from "./api/client";
-import { capabilityExplanation, currentOperationFailure, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
+import { capabilityExplanation, currentOperationFailure, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, queryReadAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
 
 function view(status: CapabilityStatus): CapabilityView {
-  return { definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
+  return { enabled: true, definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
 }
 
 const onDemandIds = capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id);
 
 describe("capability UX decisions", () => {
+  it.each(["purview.audit.search.delegated", "purview.audit.search.application", "defender.hunting.delegated", "defender.hunting.application"] as const)(
+    "keeps %s retryable without admitting a disabled or unshared application", id => {
+      const candidate = view("unknown");
+      candidate.definition = capabilityDefinitions.find(definition => definition.id === id)!;
+      candidate.decision.capabilityId = id;
+      if (candidate.definition.mode === "application") candidate.configuration = { enabled: true, sharedDataScope: true, revision: 1 };
+      for (const status of ["unknown", "provider_error", "missing_permission", "missing_role"] as const) {
+        candidate.decision = { ...candidate.decision, status, authorized: false, fresh: false, expiresAt: new Date(0).toISOString() };
+        expect(queryReadAllowed(candidate)).toBe(true);
+      }
+      candidate.enabled = false;
+      expect(queryReadAllowed(candidate)).toBe(false);
+      candidate.enabled = true;
+      if (candidate.configuration) {
+        candidate.configuration.sharedDataScope = false;
+        expect(queryReadAllowed(candidate)).toBe(false);
+      }
+      candidate.definition = { ...candidate.definition, probe: { ...candidate.definition.probe, adapterRegistered: false } };
+      expect(queryReadAllowed(candidate)).toBe(false);
+    },
+  );
+  it("does not use query retry admission for mutation controls or absent capabilities", () => {
+    const mutation = view("available");
+    mutation.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.block.manage")!;
+    expect(queryReadAllowed(mutation)).toBe(false);
+    expect(queryReadAllowed(undefined)).toBe(false);
+  });
   it("expires operation failures without mutating the admission decision", () => {
     const now = Date.now();
     const candidate = view("available");
@@ -37,7 +64,7 @@ describe("capability UX decisions", () => {
   });
 
   it.each(["interaction_required", "authorization_expired"])("keeps application %s recovery separate from user sign-in", category => {
-    const application = view("unknown");
+    const application = view("available");
     application.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
     application.decision.capabilityId = application.definition.id;
     application.decision.evidence = { category };
@@ -47,7 +74,7 @@ describe("capability UX decisions", () => {
 
   function onDemandView(id: CapabilityId): CapabilityView {
     return {
-      definition: capabilityDefinitions.find(definition => definition.id === id)!,
+      enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
       decision: {
         capabilityId: id, status: "available", authorized: true, fresh: true, verification: "on_demand",
         previewQualification: "not_required", remediation: [],
@@ -56,7 +83,7 @@ describe("capability UX decisions", () => {
   }
 
   it.each(["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"] as const)(
-    "allows on-demand %s without claiming token, provider, or qualification evidence", id => {
+    "allows on-demand %s without claiming token or provider evidence", id => {
       const ready = onDemandView(id);
       expect(providerActionAllowed(ready)).toBe(true);
       expect(providerActionAllowed(ready, true)).toBe(true);
@@ -89,7 +116,6 @@ describe("capability UX decisions", () => {
     { verification: "local" },
     { verification: "token" },
     { verification: "provider" },
-    { verification: "qualification" },
     { previewQualification: "unqualified" },
     { previewQualification: "qualified" },
     { checkedAt: new Date(0).toISOString() },
@@ -201,6 +227,7 @@ describe("capability UX decisions", () => {
       const candidate = view("available");
       candidate.definition = capabilityDefinitions.find(definition => definition.id === id)!;
       candidate.decision = { ...candidate.decision, capabilityId: id, verification };
+      if (candidate.definition.mode === "application") candidate.configuration = { enabled: true, sharedDataScope: true, revision: 1 };
       if (candidate.definition.mode === "local") {
         candidate.decision.fresh = false;
         candidate.decision.checkedAt = undefined;
@@ -276,7 +303,7 @@ describe("capability UX decisions", () => {
     expect(capabilityExplanation(unclassified)).toContain("verification level was not reported");
   });
   it.each(["not_required", "unqualified", "qualified"] as const)(
-    "does not require a separate write qualification for current authorization: %s", previewQualification => {
+    "does not turn optional mutation diagnostics into a write-approval gate: %s", previewQualification => {
       for (const id of ["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"] as const) {
         const authorized = view("available");
         authorized.definition = capabilityDefinitions.find(definition => definition.id === id)!;
@@ -287,7 +314,8 @@ describe("capability UX decisions", () => {
           expect(evidenceIsFresh(authorized)).toBe(true);
           expect(providerActionAllowed(authorized, true)).toBe(true);
           expect(currentVerification(authorized)).toBe(verification);
-          expect(operationAccessLabel(authorized)).toBe("Microsoft validates permission when the operation is requested");
+          expect(operationAccessLabel(authorized)).toBe(verification === "provider"
+            ? "Bounded provider operation succeeded" : "Microsoft validates permission when the operation is requested");
         }
         authorized.decision.expiresAt = new Date(0).toISOString();
         expect(providerActionAllowed(authorized, true)).toBe(false);
@@ -304,7 +332,7 @@ describe("capability UX decisions", () => {
     expired.decision.evidence = { category: "authorization_expired" };
     expect(capabilityExplanation(expired)).toContain("Sign in again");
   });
-  it("keeps unregistered package reassignment disabled regardless of historical qualification", () => {
+  it("keeps unregistered package reassignment disabled regardless of diagnostic evidence", () => {
     const definition = capabilityDefinitions.find(item => item.id === "graph.package.reassign.manage")!;
     const unsupported = view("available");
     unsupported.definition = definition;
@@ -323,7 +351,7 @@ describe("capability UX decisions", () => {
   });
   it.each(Object.keys(statusLabels).filter(status => status !== "available") as CapabilityStatus[])(
     "does not turn %s provenance or historical success into current verification", status => {
-      for (const verification of ["provider", "token", "local", "qualification", "on_demand"] as const) {
+      for (const verification of ["provider", "token", "local", "on_demand"] as const) {
         const failed = view(status);
         failed.decision.verification = verification;
         failed.decision.lastSuccessAt = new Date(Date.now() - 30_000).toISOString();
@@ -347,10 +375,10 @@ describe("capability UX decisions", () => {
         candidate.enabled = false;
         expect(providerActionAllowed(candidate)).toBe(false);
       }
-      for (const verification of ["provider", "token", "qualification"] as const) {
+      for (const verification of ["provider", "token"] as const) {
         candidate.decision.verification = verification;
         expect(currentVerification(candidate)).toBeUndefined();
-        expect(capabilityExplanation(candidate)).not.toMatch(/Token acquired|request succeeded|qualification is valid/);
+        expect(capabilityExplanation(candidate)).not.toMatch(/Token acquired|request succeeded/);
       }
     },
   );
@@ -383,57 +411,44 @@ describe("capability UX decisions", () => {
     expect(capabilityExplanation(quarantine)).toContain("provider role, license, and operation access have not been verified");
     expect(operationAccessLabel(quarantine)).toBe("No separate operation check");
   });
-  it("does not label legacy qualification provenance as current provider verification", () => {
-    const qualified = view("available");
-    qualified.definition = capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!;
-    qualified.decision.capabilityId = qualified.definition.id;
-    qualified.decision.previewQualification = "qualified";
-    qualified.decision.verification = "qualification";
-    expect(currentVerification(qualified)).toBeUndefined();
-    expect(capabilityExplanation(qualified)).toContain("current verification evidence is missing or inconsistent");
-    expect(operationAccessLabel(qualified)).toBe("Microsoft validates permission when the operation is requested");
-    qualified.decision.status = "provider_error";
-    qualified.decision.authorized = false;
-    expect(providerActionAllowed(qualified, true)).toBe(false);
-    expect(currentVerification(qualified)).toBeUndefined();
-    expect(evidenceIsStale(qualified)).toBe(false);
-  });
-  it("does not mistake expired legacy qualification evidence for on-demand readiness", () => {
-    const qualified = view("available");
-    qualified.definition = capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!;
-    qualified.decision.capabilityId = qualified.definition.id;
-    qualified.decision.previewQualification = "qualified";
-    qualified.decision.verification = "qualification";
-    qualified.decision.expiresAt = new Date(0).toISOString();
-    expect(capabilityExplanation(qualified)).toContain("Evidence is stale");
-    expect(currentVerification(qualified)).toBeUndefined();
-    expect(providerActionAllowed(qualified, true)).toBe(false);
-  });
   it("distinguishes token readiness from a successful bounded provider operation", () => {
     const operation = view("available");
     operation.definition = capabilityDefinitions.find(item => item.id === "defender.hunting.delegated")!;
     operation.decision.capabilityId = operation.definition.id;
     operation.decision.verification = "token";
-    expect(operationAccessLabel(operation)).toBe("Provider access is checked by an explicit bounded operation; no separate pre-approval required");
+    expect(operationAccessLabel(operation)).toBe("Microsoft validates permission when the operation is requested");
     operation.decision.verification = "provider";
     expect(operationAccessLabel(operation)).toBe("Bounded provider operation succeeded");
     operation.decision.status = "preview_disabled";
     operation.decision.authorized = false;
-    expect(capabilityExplanation(operation)).toContain("explicit bounded operation; no separate pre-approval required");
+    expect(capabilityExplanation(operation)).toContain("not currently available");
     expect(capabilityExplanation(operation)).not.toContain("writes");
   });
   it.each(["purview.audit.search.application", "defender.hunting.application"])(
-    "does not promise automatic operation qualification for %s", capabilityId => {
-      const application = view("unknown");
+    "requests %s directly without claiming prior provider verification", capabilityId => {
+      const application = view("available");
       application.definition = capabilityDefinitions.find(item => item.id === capabilityId)!;
+      application.decision.capabilityId = application.definition.id;
+      application.configuration = { enabled: true, sharedDataScope: true, revision: 1 };
       application.decision.checkedAt = undefined;
-      expect(operationAccessLabel(application)).toBe("Requires an explicitly approved bounded application-scope operation");
-      expect(capabilityExplanation(application)).toContain("An Admin must explicitly approve");
-      expect(capabilityExplanation(application)).toContain("automatic refresh does not run it");
+      application.decision.expiresAt = undefined;
+      application.decision.verification = "on_demand";
+      application.decision.previewQualification = "not_required";
+      expect(operationAccessLabel(application)).toBe("Microsoft validates permission when the operation is requested");
+      expect(capabilityExplanation(application)).toContain("Microsoft validates application permissions and provider roles on the actual operation");
+      expect(providerActionAllowed(application)).toBe(true);
+      expect(currentVerification(application)).toBe("on_demand");
       application.decision.checkedAt = new Date(0).toISOString();
-      application.decision.expiresAt = new Date(0).toISOString();
-      expect(capabilityExplanation(application)).toContain("evidence is stale");
-      expect(capabilityExplanation(application)).toContain("explicitly approve a new bounded application-scope operation");
+      application.decision.expiresAt = new Date(60_000).toISOString();
+      application.decision.verification = "token";
+      expect(capabilityExplanation(application)).toContain("Evidence is stale");
+      expect(capabilityExplanation(application)).toContain("Request the operation from its feature");
+      expect(providerActionAllowed(application)).toBe(true);
+      for (const configuration of [{ enabled: false, sharedDataScope: true }, { enabled: true, sharedDataScope: false }]) {
+        application.enabled = configuration.enabled;
+        application.configuration = { ...configuration, revision: 1 };
+        expect(providerActionAllowed(application)).toBe(false);
+      }
     },
   );
   it.each([
@@ -445,7 +460,7 @@ describe("capability UX decisions", () => {
     candidate.decision.capabilityId = id;
     candidate.decision.checkedAt = undefined;
     expect(capabilityExplanation(candidate)).not.toMatch(/Automatic safe checks run/);
-    expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+    expect(capabilityExplanation(candidate)).toMatch(/operation|read from the dashboard/);
 
     candidate.decision.checkedAt = new Date(0).toISOString();
     candidate.decision.expiresAt = new Date(0).toISOString();
@@ -453,7 +468,7 @@ describe("capability UX decisions", () => {
       candidate.decision.status = status;
       candidate.decision.authorized = status === "available";
       expect(capabilityExplanation(candidate)).not.toMatch(/use Check status to retry/i);
-      expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+      expect(capabilityExplanation(candidate)).toMatch(/operation|read from the dashboard/);
     }
 
     candidate.decision.status = "provider_error";
@@ -461,7 +476,7 @@ describe("capability UX decisions", () => {
     for (const category of ["provider_timeout", "provider_network_error"]) {
       candidate.decision.evidence = { category, phase: "provider_read", timeoutMs: 30_000 };
       expect(capabilityExplanation(candidate)).not.toMatch(/use Check status to retry/i);
-      expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+      expect(capabilityExplanation(candidate)).toMatch(/operation|read from the dashboard/);
     }
   });
 });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { allowlistedPackage } from "./packageObservation.js";
 import { parsePackageIdentityDefinition, readPackageAgentMetadata, readPackageCustomEngineBotIdentity, validatePackageAgentMetadata } from "./packageAgentMetadata.js";
+import { dataLimits } from "../db/dataBounds.js";
 
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const botId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -212,7 +213,7 @@ describe("bounded package identity projection", () => {
     expect(readPackageCustomEngineBotIdentity(value)).toEqual({ botApplicationId: botId, elementIds: ["bot", "engine"] });
     const wide = input("{}");
     wide.elementDetails = [
-      { elementType: "DeclarativeCopilots", elements: Array.from({ length: 3 }, () => ({ id: "wide", definition: "x".repeat(1_000_000) })) },
+      { elementType: "DeclarativeCopilots", elements: Array.from({ length: 5 }, () => ({ id: "wide", definition: "x".repeat(3_500_000) })) },
       metadata.elementDetails[0],
     ];
     expect(() => allowlistedPackage(wide)).toThrow(expect.objectContaining({ code: "provider_result_limit" }));
@@ -268,7 +269,7 @@ describe("bounded package identity projection", () => {
 
   it("bounds definition bytes and deeply nested projected identity values without leaking native exceptions", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const definition = JSON.stringify({ AuthoringDefinition: "😀".repeat(512_001), SourceIds: sourceIds });
+    const definition = JSON.stringify({ AuthoringDefinition: "😀".repeat(dataLimits.agentDefinitionBytes / 4 + 1), SourceIds: sourceIds });
     expect(() => parsePackageIdentityDefinition(definition, "AgentMetadatas")).toThrow(SyntaxError);
     expect(readPackageAgentMetadata(input(definition))).toMatchObject({ status: "unmatched", invalidMetadata: true });
     const deep = `{"SourceIds":{"EnvironmentId":${"[".repeat(10_000)}null${"]".repeat(10_000)}}}`;

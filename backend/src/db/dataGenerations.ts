@@ -7,7 +7,7 @@ import { dataConnections } from "./dataConnections.js";
 import { admitGeneration } from "./generationAdmission.js";
 import type { CopilotServicePlan, CopilotServiceState, CopilotServiceSummaryState } from "../types/copilotUsage.js";
 
-export type DataScope = {
+type DataScope = {
   tenantId: string; kind: "tenant" | "principal"; principalId: string | null;
   tokenMode: "tenant" | "delegated" | "application"; source: string; selector: string;
 };
@@ -136,11 +136,24 @@ export class DataGenerations {
     return this.connections.run(client => this.principalEpoch(client, tenant, principal, "share"));
   }
 
+  bearerAuthority(tenant: string, principal: string) {
+    return this.connections.run(async client => {
+      await client.query("INSERT INTO data_principal_epochs(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING", [tenant, principal]);
+      const row = (await client.query<{ epoch: string; issuedAfter: string }>(`
+        SELECT epoch,bearer_issued_after AS "issuedAfter" FROM data_principal_epochs
+        WHERE tenant_id=$1 AND principal_id=$2 FOR SHARE`, [tenant, principal])).rows[0];
+      if (!row) throw new Error("data_principal_missing");
+      return row;
+    });
+  }
+
   revokePrincipal(tenant: string, principal: string) {
     return this.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
       await this.principalEpoch(client, tenant, principal);
-      const epoch = (await client.query(`UPDATE data_principal_epochs SET epoch=epoch+1 WHERE tenant_id=$1 AND principal_id=$2 RETURNING epoch`, [tenant, principal])).rows[0].epoch;
+      const epoch = (await client.query(`UPDATE data_principal_epochs SET epoch=epoch+1,
+        bearer_issued_after=GREATEST(bearer_issued_after,$3::bigint,ceil(extract(epoch FROM clock_timestamp())*1000)::bigint)
+        WHERE tenant_id=$1 AND principal_id=$2 RETURNING epoch`, [tenant, principal, Date.now()])).rows[0].epoch;
       let after: string | null = null;
       for (;;) {
         const scopes: { id: string }[] = (await client.query<{ id: string }>(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2

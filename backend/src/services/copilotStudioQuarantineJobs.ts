@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import {
   CopilotStudioQuarantineRepository,
   type QuarantineItemRow,
@@ -17,7 +17,7 @@ import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
 import { InventoryRuntime } from "./inventoryRuntime.js";
 
-export type QuarantineAuthorization = { accessToken: string; authority: QuarantineAuthority };
+type QuarantineAuthorization = { accessToken: string; authority: QuarantineAuthority };
 type QuarantineAuthorizer = (scope: QuarantineScope, signal?: AbortSignal) => Promise<QuarantineAuthorization>;
 type QuarantineProvider = Pick<CopilotStudioQuarantineClient, "getStatus" | "setQuarantine">;
 
@@ -36,7 +36,9 @@ export function launchCopilotStudioQuarantineJob(id: string, scope: QuarantineSc
   const controller = new AbortController();
   const operation = runCopilotStudioQuarantineJob(id, scope, resume, copilotStudioQuarantineJobs, new CopilotStudioQuarantineClient(), authorizeQuarantine, controller.signal)
     .finally(() => active.delete(operation));
-  void operation.catch(() => operationalLog("error", "quarantine_job_stopped", { jobId: id, outcome: "requires_review" }));
+  void operation.catch(error => operationalLog("error", "quarantine_job_stopped", {
+    jobId: id, outcome: "requires_review", ...errorTelemetry(error),
+  }));
   active.set(operation, { jobId: id.toLowerCase(), scope, controller });
 }
 
@@ -142,14 +144,14 @@ export async function runCopilotStudioQuarantineJob(
       let sent = false, finished = false;
       try {
         requireAuthority(job, authorization.authority);
-        await capabilities.observeOperation("powerPlatform.quarantine.manage", principal, () => repository.withTargetLock(lease, item, async lockSignal => {
+        const executeItem = () => capabilities.observeOperation("powerPlatform.quarantine.manage", principal, () => repository.withTargetLock(lease, item, async lockSignal => {
           signal = AbortSignal.any([itemSignal, lockSignal]);
           const target = { environmentId: item.environment_id, botId: item.bot_id };
           const options = { correlationId: item.correlation_id!, signal };
           await repository.assertDispatchReady(lease, item, authorization.authority);
           const before = await getStatus(authorization.accessToken, target, options);
           if (before.isBotQuarantined === item.requested_state) {
-            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem);
+            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem, inventory);
             finished = true;
             return;
           }
@@ -159,7 +161,7 @@ export async function runCopilotStudioQuarantineJob(
           await repository.assertDispatchReady(lease, item, dispatchAuthorization.authority);
           const immediate = await getStatus(dispatchAuthorization.accessToken, target, options);
           if (immediate.isBotQuarantined === item.requested_state) {
-            await finishAuthorized(repository, lease, job, item, "skipped", { observed: immediate, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem);
+            await finishAuthorized(repository, lease, job, item, "skipped", { observed: immediate, readbackCount: 1 }, scope, authorizeJob, signal, validation, requireCurrentItem, inventory);
             finished = true;
             return;
           }
@@ -174,9 +176,20 @@ export async function runCopilotStudioQuarantineJob(
           requireCurrentItem();
           await provider.setQuarantine(dispatchAuthorization.accessToken, target, item.requested_state, options);
           const verified = await verifyCopilotStudioQuarantineConverged({ getStatus }, dispatchAuthorization.accessToken, target, item.requested_state, options);
-          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorizeJob, signal, validation, requireCurrentItem);
+          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorizeJob, signal, validation, requireCurrentItem, inventory);
           finished = true;
         }), { signal: itemSignal, clearOnSuccess: () => sent });
+        for (let publicationAttempt = 0; ; publicationAttempt++) {
+          try {
+            await executeItem();
+            break;
+          } catch (error) {
+            if (sent || publicationAttempt >= 2 || !(error instanceof AppError) || error.code !== "quarantine_target_unavailable") throw error;
+            requireCurrentItem();
+            await inventory.settleControls(scope, itemSignal);
+            requireCurrentItem();
+          }
+        }
       } catch (caught) {
         if (finished) throw caught;
         if (caught instanceof AppError && caught.code === "lease_lost") throw caught;
@@ -290,6 +303,8 @@ export async function reconcileCopilotStudioQuarantineJob(
     }
   }
   await authorizeJob(scope);
+  await inventory.settleControls(scope, AbortSignal.timeout(reconciliationDeadlineMs));
+  assertCurrent();
   const current = await repository.get(scope, id);
   assertCurrent();
   if (!current) throw new AppError(404, "not_found", "Quarantine job was not found.");
@@ -338,14 +353,14 @@ async function authorizeQuarantine(scope: QuarantineScope, signal?: AbortSignal)
     assertAuthority();
   };
   assertCurrent();
-  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
+  const user = await revalidateAuthorizedUser(scope.tenantId, scope.principalId);
   assertCurrent();
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The quarantine actor no longer matches the signed-in account.");
   await capabilities.requireAvailable("powerPlatform.quarantine.manage", user);
   assertCurrent();
   const authority = await capabilities.quarantineAuthorityContext(user);
   assertCurrent();
-  const accessToken = await acquireDelegatedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage");
+  const accessToken = await acquireAuthorizedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage");
   assertCurrent();
   return { accessToken, authority };
 }
@@ -384,15 +399,24 @@ async function finishAuthorized(
   signal: AbortSignal,
   validation: ReturnType<typeof beginAccountSessionValidation>,
   assertPublication: () => void,
+  inventory: InventoryRuntime,
 ) {
-  assertPublication();
-  const authorization = await authorize(scope, signal);
-  requireAuthority(job, authorization.authority);
-  signal.throwIfAborted();
-  await commitAccountSessionValidation(validation, async () => {
+  for (let publicationAttempt = 0; ; publicationAttempt++) {
     assertPublication();
-    await repository.finishItem(lease, item, outcome, evidence, signal, assertPublication);
-  });
+    const authorization = await authorize(scope, signal);
+    requireAuthority(job, authorization.authority);
+    signal.throwIfAborted();
+    try {
+      await commitAccountSessionValidation(validation, async () => {
+        assertPublication();
+        await repository.finishItem(lease, item, outcome, evidence, signal, assertPublication);
+      });
+      return;
+    } catch (error) {
+      if (publicationAttempt >= 2 || !(error instanceof AppError) || error.code !== "quarantine_target_unavailable") throw error;
+      await inventory.settleControls(scope, signal);
+    }
+  }
 }
 
 function requireAuthority(job: QuarantineJobRow, authority: QuarantineAuthority) {
@@ -427,7 +451,7 @@ function isAuthorizationFailure(error: unknown) {
 }
 
 function isAdmissionFailure(error: unknown) {
-  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
+  return error instanceof AppError && error.code === "maintenance";
 }
 
 function isDeadlineExceeded(error: unknown) {

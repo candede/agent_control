@@ -23,7 +23,7 @@ describe("capability documentation artifacts", () => {
   });
 
   it("documents every required permission and links the current capability/source registry", () => {
-    const inventory = readRepositoryFile("docs/provider-contract-inventory-2026-09-08.md");
+    const inventory = readRepositoryFile("docs/provider-contracts.md");
 
     expect(inventory).toContain("](../backend/src/services/capabilityRegistry.ts)");
     for (const permission of new Set(capabilityDefinitions.flatMap(definition => definition.permissions))) {
@@ -32,7 +32,7 @@ describe("capability documentation artifacts", () => {
   });
 
   it("documents the current Copilot report endpoint and activity window", () => {
-    const inventory = readRepositoryFile("docs/provider-contract-inventory-2026-09-08.md");
+    const inventory = readRepositoryFile("docs/provider-contracts.md");
     const row = inventory.split("\n").find(line => line.startsWith("| `reports.copilotUsage.read` |"));
     const activityDescription = readRepositoryFile("docs/copilot-license-usage.md").split("\n")
       .find(line => line.startsWith("Imported response counts and last activity"));

@@ -102,7 +102,7 @@ test("inventory pagination has spaced secondary controls and responsive first/la
 
 test("default columns group identity, usage and access and preserve saved selections until reset", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
-  const defaults = ["Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions"];
+  const defaults = ["Select agents", "Agent", "Publisher", "Built with", "Responses", "Admin availability", "Status", "Actions"];
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.getByRole("columnheader")).toHaveText(defaults);
@@ -213,7 +213,7 @@ test("Graph package categories use provider values and combine with independent 
   expect(unexpected).toEqual([]);
 });
 
-test("repository cards filter actual end-user access and keep report dates in the overview", async ({ page }, info) => {
+test("repository cards filter saved admin availability and keep report dates in the overview", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   const records = unifiedAgents.value.map((record, index): UnifiedAgentRecord => ({
     ...record,
@@ -242,11 +242,11 @@ test("repository cards filter actual end-user access and keep report dates in th
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(overview.getByText("Agents in catalog").locator("..")).toContainText("3");
-  await expect(overview.getByText("Available to end users").locator("..")).toContainText("1");
+  await expect(overview.getByText("Admin-permitted agents").locator("..")).toContainText("1");
   await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill(records[1].displayName);
   await expect(table.getByRole("row")).toHaveCount(2);
-  await overview.getByRole("button", { name: "Show available to end users", exact: true }).click();
+  await overview.getByRole("button", { name: "Show admin-permitted agents", exact: true }).click();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue(records[1].displayName);
   await expect(page).toHaveURL(/access=available/);
   await expect.poll(() => queries.at(-1)?.get("endUserAccess")).toBe("available");
@@ -259,11 +259,11 @@ test("repository cards filter actual end-user access and keep report dates in th
   await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
   await expect(table.getByRole("row")).toHaveCount(2);
   await page.getByRole("button", { name: "Filters, 1 active", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "End-user access", exact: true })).toHaveValue("available");
-  await page.getByRole("combobox", { name: "End-user access", exact: true }).selectOption("unavailable");
+  await expect(page.getByRole("combobox", { name: "Admin availability", exact: true })).toHaveValue("available");
+  await page.getByRole("combobox", { name: "Admin availability", exact: true }).selectOption("unavailable");
   await expect(table.getByRole("button", { name: records[1].displayName, exact: true })).toBeVisible();
   await expect(table.getByRole("cell", { name: "Not available", exact: true })).toBeVisible();
-  await page.getByRole("combobox", { name: "End-user access", exact: true }).selectOption("unknown");
+  await page.getByRole("combobox", { name: "Admin availability", exact: true }).selectOption("unknown");
   await expect(table.getByRole("button", { name: records[2].displayName, exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await overview.getByRole("button", { name: "Show agents in catalog", exact: true }).click();

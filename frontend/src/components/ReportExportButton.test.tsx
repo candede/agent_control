@@ -8,6 +8,26 @@ vi.mock("../api/reportData", () => ({ createReportExport: vi.fn(), reportExportS
   reportExportDownload: (id: string) => `/api/data-exports/${id}/download` }));
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+it("stops polling authorization-wait work and explicitly resumes the same saved intent and idempotency key", async () => {
+  vi.useFakeTimers();
+  vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });
+  const queued = { id: "artifact", status: "queued" as const, rows: 0, bytes: 0,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), error: "authorization_required", limit: null, observed: null };
+  vi.mocked(reportExportStatus).mockResolvedValue(queued);
+  render(<ReportExportButton selectionId="selected" kind="official_users" label="Export" />);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export" })); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(screen.getByRole("alert")).toHaveTextContent("paused for authorization");
+  await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+  expect(reportExportStatus).toHaveBeenCalledOnce();
+  vi.mocked(reportExportStatus).mockResolvedValue({ ...queued, status: "ready", error: null });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Authorize and resume export" })); });
+  expect(createReportExport).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(createReportExport).mock.calls[1][0]).toEqual(vi.mocked(createReportExport).mock.calls[0][0]);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(screen.getByRole("link", { name: "Download CSV" })).toBeInTheDocument();
+});
+
 it("retains the same pending export when only the selection UUID spelling changes", async () => {
   vi.useFakeTimers();
   vi.mocked(createReportExport).mockResolvedValue({ id: "artifact" });

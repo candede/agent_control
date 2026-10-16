@@ -100,7 +100,8 @@ test("saved environment, distinct responsibilities and configured operations sta
   await expect(field("Operation configured by \\(ID\\)")).toContainText(creator);
   await expect(field("Operation configured by \\(ID\\)")).toBeVisible();
   await expect(dialog.locator("details:visible, summary:visible")).toHaveCount(0);
-  await expect(dialog.getByText(/Flow relationships|Invoked flows|source evidence|Technical details/)).toHaveCount(0);
+  await expect(dialog.getByText(/Flow relationships|Invoked flows|source evidence/)).toHaveCount(0);
+  await expect(dialog.getByRole("region", { name: "Technical details", exact: true })).toBeVisible();
   await expect(dialog.getByRole("link", { name: /admin center|Copilot Studio/ })).toHaveCount(0);
   await expect(dialog.getByText("Configuration", { exact: true })).toHaveCount(1);
   await expect(field("Agent ID")).toContainText(record.powerPlatformResource!.nativeId);
@@ -128,7 +129,7 @@ test("sparse Graph-only metadata omits irrelevant environment, responsibility an
   }
   await expect(dialog.getByText(/No environment|Flow relationships|Invoked flows|No configured connectors/)).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: /admin center|Copilot Studio/ })).toHaveCount(0);
-  await expect(dialog.getByText("Package ID").locator("..")).toContainText(pkg.id);
+  await expect(dialog.locator("dt:visible").filter({ hasText: /^Package ID$/ }).locator("..")).toContainText(pkg.id);
   await expect(dialog.locator("details:visible, summary:visible")).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await dialog.locator(".inventory-detail-section").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);

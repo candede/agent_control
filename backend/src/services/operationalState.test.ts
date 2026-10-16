@@ -7,10 +7,6 @@ vi.mock("node:fs", () => ({ lstatSync: stat }));
 
 const normalRow = {
   mode: "normal",
-  provider_work_enabled: true,
-  restored_from_at: null,
-  deletion_reviewed_at: null,
-  access_reviewed_at: null,
 };
 let state: typeof import("./operationalState.js");
 let maintenance: typeof import("./maintenance.js");
@@ -44,32 +40,19 @@ describe("operational state", () => {
     expect(state.providerWorkEnabled()).toBe(true);
   });
 
-  it("reads the singleton and serializes nullable restoration review timestamps", async () => {
+  it("reads only the current operational mode", async () => {
     expect(await state.readOperationalState()).toEqual({
-      mode: "normal", providerWorkEnabled: true, restoredFromAt: null,
-      deletionReviewedAt: null, accessReviewedAt: null,
+      mode: "normal", providerWorkEnabled: true,
     });
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM operational_state WHERE singleton=true"));
-    query.mockResolvedValueOnce({ rowCount: 1, rows: [{
-      ...normalRow, provider_work_enabled: false,
-      restored_from_at: new Date("2026-09-20T10:00:00Z"),
-      deletion_reviewed_at: new Date("2026-09-20T11:00:00Z"),
-      access_reviewed_at: new Date("2026-09-20T12:00:00Z"),
-    }] });
-    expect(await state.readOperationalState()).toEqual({
-      mode: "normal", providerWorkEnabled: false, restoredFromAt: "2026-09-20T10:00:00.000Z",
-      deletionReviewedAt: "2026-09-20T11:00:00.000Z", accessReviewedAt: "2026-09-20T12:00:00.000Z",
-    });
+    expect(query).toHaveBeenCalledExactlyOnceWith("SELECT mode FROM operational_state WHERE singleton=true");
   });
 
   it.each([
-    { mode: "normal", enabled: true, code: null },
-    { mode: "normal", enabled: false, code: "provider_requalification_required" },
-    { mode: "maintenance", enabled: true, code: "maintenance" },
-    { mode: "maintenance", enabled: false, code: "maintenance" },
-  ])("aligns loaded $mode / provider-enabled $enabled status with admissions", async ({ mode, enabled, code }) => {
-    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow, mode, provider_work_enabled: enabled }] });
-    expect(await state.loadOperationalState()).toMatchObject({ mode, providerWorkEnabled: enabled });
+    { mode: "normal", code: null },
+    { mode: "maintenance", code: "maintenance" },
+  ])("aligns loaded $mode status with admissions", async ({ mode, code }) => {
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow, mode }] });
+    expect(await state.loadOperationalState()).toMatchObject({ mode, providerWorkEnabled: mode === "normal" });
     expect(state.providerWorkEnabled()).toBe(code === null);
     if (code) {
       expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ status: 503, code }));
@@ -79,12 +62,12 @@ describe("operational state", () => {
   });
 
   it("does not change the loaded admission gate on a diagnostic read", async () => {
-    query.mockResolvedValue({ rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: false }] });
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow, mode: "maintenance" }] });
     await state.loadOperationalState();
     query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow }] });
     expect(await state.readOperationalState()).toMatchObject({ providerWorkEnabled: true });
     expect(state.providerWorkEnabled()).toBe(false);
-    expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ code: "provider_requalification_required" }));
+    expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ code: "maintenance" }));
   });
 
   it.each([
@@ -94,17 +77,7 @@ describe("operational state", () => {
     { label: "unknown count", rowCount: null, rows: [normalRow] },
     { label: "mode", rowCount: 1, rows: [{ ...normalRow, mode: "NORMAL" }] },
     { label: "null mode", rowCount: 1, rows: [{ ...normalRow, mode: null }] },
-    { label: "truthy boolean string", rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: "false" }] },
-    { label: "numeric boolean", rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: 1 }] },
-    { label: "null boolean", rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: null }] },
-    { label: "missing boolean", rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: undefined }] },
     { label: "null row", rowCount: 1, rows: [null] },
-    ...["restored_from_at", "deletion_reviewed_at", "access_reviewed_at"].flatMap(field =>
-      [undefined, "2026-09-20T10:00:00Z", new Date(NaN), Infinity].map(value => ({
-        label: `invalid ${field} ${String(value)}`, rowCount: 1,
-        rows: [{ ...normalRow, [field]: value }],
-      })),
-    ),
   ])("rejects $label and closes an open gate until valid recovery", async result => {
     await state.loadOperationalState();
     query.mockResolvedValueOnce(result);
@@ -117,27 +90,13 @@ describe("operational state", () => {
     expect(state.providerWorkEnabled()).toBe(true);
   });
 
-  it.each([1, 2, 3, 4, 5, 6])("rejects incomplete restoration review evidence (presence mask %s)", async mask => {
-    const date = new Date("2026-09-20T10:00:00Z");
-    query.mockResolvedValueOnce({ rowCount: 1, rows: [{
-      ...normalRow, restored_from_at: mask & 1 ? date : null,
-      deletion_reviewed_at: mask & 2 ? date : null, access_reviewed_at: mask & 4 ? date : null,
-    }] });
-    await expect(state.loadOperationalState()).rejects.toThrow("Operational state restoration review is incomplete.");
-    expect(state.providerWorkEnabled()).toBe(false);
-  });
-
-  it("detaches the cached state from database rows, timestamps, and every returned snapshot", async () => {
-    const date = new Date("2026-09-20T10:00:00Z");
-    const row = { ...normalRow, restored_from_at: date, deletion_reviewed_at: date, access_reviewed_at: date };
+  it("detaches the cached state from database rows and every returned snapshot", async () => {
+    const row = { ...normalRow };
     query.mockResolvedValueOnce({ rowCount: 1, rows: [row] });
     const loaded = await state.loadOperationalState();
     row.mode = "maintenance";
-    row.provider_work_enabled = false;
-    date.setTime(NaN);
     loaded.mode = "maintenance";
     loaded.providerWorkEnabled = false;
-    loaded.restoredFromAt = null;
     expect(state.providerWorkEnabled()).toBe(true);
     expect(() => state.requireProviderAdmissions()).not.toThrow();
     const diagnostic = await state.readOperationalState();
@@ -171,14 +130,14 @@ describe("operational state", () => {
   });
 
   it("does not expose the admission gate through the returned state object", async () => {
-    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow, provider_work_enabled: false }] });
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ ...normalRow, mode: "maintenance" }] });
     const loaded = await state.loadOperationalState();
     loaded.providerWorkEnabled = true;
     expect(state.providerWorkEnabled()).toBe(false);
-    expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ code: "provider_requalification_required" }));
+    expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ code: "maintenance" }));
   });
 
-  it.each(["maintenance", "requalification", "read failure"])("does not let an older load reopen a newer %s fence", async closure => {
+  it.each(["maintenance", "read failure"])("does not let an older load reopen a newer %s fence", async closure => {
     const older = Promise.withResolvers<{ rowCount: number; rows: typeof normalRow[] }>();
     query.mockReturnValueOnce(older.promise);
     const pending = state.loadOperationalState();
@@ -187,8 +146,7 @@ describe("operational state", () => {
       await expect(state.loadOperationalState()).rejects.toThrow("Read failed");
     } else {
       query.mockResolvedValueOnce({ rowCount: 1, rows: [{
-        ...normalRow, mode: closure === "maintenance" ? "maintenance" : "normal",
-        provider_work_enabled: closure !== "requalification",
+        ...normalRow, mode: "maintenance",
       }] });
       await state.loadOperationalState();
     }
@@ -196,7 +154,7 @@ describe("operational state", () => {
     await pending;
     expect(state.providerWorkEnabled()).toBe(false);
     expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({
-      code: closure === "requalification" ? "provider_requalification_required" : "maintenance",
+      code: "maintenance",
     }));
   });
 
@@ -211,7 +169,7 @@ describe("operational state", () => {
     expect(state.providerWorkEnabled()).toBe(true);
   });
 
-  it.each(["maintenance", "requalification", "read failure"])("honors a completed %s fence while a newer load remains pending", async closure => {
+  it.each(["maintenance", "read failure"])("honors a completed %s fence while a newer load remains pending", async closure => {
     await state.loadOperationalState();
     const first = Promise.withResolvers<{ rowCount: number; rows: typeof normalRow[] }>();
     const next = Promise.withResolvers<{ rowCount: number; rows: typeof normalRow[] }>();
@@ -223,14 +181,13 @@ describe("operational state", () => {
       await rejected;
     } else {
       first.resolve({ rowCount: 1, rows: [{
-        ...normalRow, mode: closure === "maintenance" ? "maintenance" : "normal",
-        provider_work_enabled: closure !== "requalification",
+        ...normalRow, mode: "maintenance",
       }] });
       await loadingFirst;
     }
     expect(state.providerWorkEnabled()).toBe(false);
     expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({
-      code: closure === "requalification" ? "provider_requalification_required" : "maintenance",
+      code: "maintenance",
     }));
     next.resolve({ rowCount: 1, rows: [{ ...normalRow }] });
     await loadingNext;

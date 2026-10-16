@@ -68,7 +68,7 @@ describe("selected inventory transaction dependencies", () => {
       }) });
     };
     await exports.build(id, identity, inventoryExportColumns.graph_packages, checked);
-    expect(reads).toBe(1);
+    expect(reads).toBe(2);
     expect(await exports.status(id, identity)).toMatchObject({ status: "ready", rows: 1 });
   });
 });

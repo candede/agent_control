@@ -6,6 +6,8 @@ import { schemaSql, schemaFingerprint, verifySchema } from "./schema.js";
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 import { inventoryLimits } from "../types/inventoryRecords.js";
+import { currentSchemaSql } from "./currentSchema.js";
+import { backupTableKeys } from "../../scripts/backupInventory.js";
 
 function markerRows() {
   return [{ singleton: true, fingerprint: schemaFingerprint, initialized: true }];
@@ -14,7 +16,7 @@ function markerRows() {
 const usageContract = {
   associations: "agent_usage_associations", revision: "agent_usage_state", triggers: 3, cascade: true,
 };
-const cutoverContract = { snapshots: null, sources: null, fact_index: null, actor: true, acceptance: true, collection: true, collection_guard: true, guards: 6 };
+const reportScopeContract = { actor: true, acceptance: true, collection: true, collection_guard: true, guards: 6 };
 const environmentIndex = "CREATE INDEX inventory_environment_lookup ON public.power_platform_record_rows USING btree (lower(native_id), generation_id, identity) WHERE (resource_type = 'microsoft.powerplatform/environments'::text)";
 const inventoryGrants = { update: false, truncate: false, scoped: true, reader: true, precedence: true };
 
@@ -31,26 +33,25 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "user report periods", rows: [{ periods: true, immutable: true }] },
     { name: "inventory classification", rows: [{ columns: true, constraints: true, fence: true }] },
     { name: "official reports", rows: [{ valid: true }] },
-    { name: "users/reports cutover", rows: [cutoverContract] },
+    { name: "users/reports", rows: [reportScopeContract] },
     { name: "inventory tables", rows: Array.from({ length: 21 }, () => ({ relation: "inventory_roots" })) },
     { name: "inventory payload", rows: [{ valid: true }] },
     { name: "inventory guards", rows: [{ count: 14 }] },
     { name: "inventory indexes", rows: [{ count: 11 }] },
     { name: "inventory grants", rows: [inventoryGrants] },
     { name: "job pages", rows: [{ revision: true, triggers: 3 }] },
-    { name: "refresh targets", rows: [{ targets: true, target_job: true, retired_arrays: true,
-      detail_metadata: true, retired_triggers: true, permissions: true }] },
-    { name: "inventory authority", rows: [{ current_memberships: true, retired_registry: true, application_fence: true }] },
-    { name: "live identity", rows: [{ live_sources: true, generation_reference: true, retired_reference: true, live_guard: true, normalized_keys: true }] },
+    { name: "refresh targets", rows: [{ targets: true, target_job: true, detail_metadata: true, permissions: true }] },
+    { name: "inventory authority", rows: [{ current_memberships: true, application_fence: true }] },
+    { name: "live identity", rows: [{ live_sources: true, generation_reference: true, live_guard: true, normalized_keys: true }] },
     { name: "control queue", rows: [{ valid: true }] },
     { name: "mutation stages", rows: [{ valid: true }] },
     { name: "native control", rows: [{ valid: true }] },
     { name: "clear", rows: [{ definition: "inventory_native_control_pending published_sequence=pending_sequence generation_id=NULL,revision=revision+1" }] },
     { name: "selection criteria", rows: [{ present: 1 }] },
     { name: "observer", rows: [{ counter: true, guards: 3 }] },
-    { name: "inventory cutover", rows: [{ retired: true, controls: true, clear: true, functions: true }] },
+    { name: "inventory controls", rows: [{ controls: true }] },
     { name: "provider metadata", rows: Array.from({ length: 3 }, () => ({ data_type: "integer", is_nullable: "NO" })) },
-    { name: "refresh contract", rows: [{ retired_mode: true, bounded_detail_mode: true, progress_bounds: true }] },
+    { name: "refresh contract", rows: [{ bounded_detail_mode: true, progress_bounds: true }] },
     { name: "identity lookup", rows: [{ exact_identity: true, identifier_index: true }] },
     { name: "query context", rows: [{ present: 1 }] },
     { name: "attempt fence", rows: [{ present: 1 }] },
@@ -81,6 +82,25 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     ...Array.from({ length: 9 },(_,index) => ({ name: `reference rewind trigger ${index}`,rows: [{ valid: true }] })),
     { name: "set-based child insert fences",rows: Array.from({ length: 2 },() => ({ inserted: true,immutable: true,callable: false })) },
     { name: "report membership counts",rows: [{ columns: true,keyed: true,scoped: true,protected: true,maintained: true,callable: false }] },
+    { name: "principal bearer fence", rows: [{ valid: true }] },
+    { name: "audit origin canonical unknown", rows: [{ definition: "'fixture-canonical-unknown'::jsonb" }] },
+    { name: "audit origin contract", rows: [{ valid: true }] },
+    { name: "audit origin indexes", rows: [
+      { name: "audit_events_origin_channel", table: "audit_events", method: "btree", unique: false, predicate: null,
+        keys: 5, attributes: 5, options: "0 0 0 3 0", expression: "(origin ->> 'channel'::text)",
+        fields: ["tenant_id", "principal_id", null, "started_at", "event_id"] },
+      { name: "copilot_quarantine_audit_origin_channel", table: "copilot_quarantine_audit", method: "btree", unique: false, predicate: null,
+        keys: 4, attributes: 4, options: "0 0 0 3", expression: "(origin ->> 'channel'::text)",
+        fields: ["tenant_id", "principal_id", null, "observed_at"] },
+    ] },
+    ...["audit_origin_valid", "protect_action_origin", "protect_audit_event_origin", "protect_inventory_mutation_stage"].map(name => ({
+      name: `audit origin exact ${name}`, rows: [{
+        prosrc: currentSchemaSql.match(new RegExp(`CREATE FUNCTION ${name}\\([\\s\\S]*?AS \\$\\$([\\s\\S]*?)\\$\\$;`))![1],
+        prosecdef: false, proconfig: ["search_path=pg_catalog, public"],
+        provolatile: name === "audit_origin_valid" ? "i" : "v", proparallel: name === "audit_origin_valid" ? "s" : "u",
+      }],
+    })),
+    { name: "agent control receipts", rows: [{ valid: true }] },
   ];
 }
 
@@ -98,7 +118,10 @@ function resultsBefore(name: string) {
 }
 
 describe("current schema source contracts", () => {
-  const topLevel = schemaSql.replace(/\$\$[\s\S]*?\$\$/g, "");
+  const topLevel = currentSchemaSql.replace(/\$\$[\s\S]*?\$\$/g, "");
+  it("uses one current schema constructor without historical schema exports", () => {
+    expect(schemaSql).toBe(currentSchemaSql);
+  });
   it("validates read-only sharing recipient facts in the current schema without a migration chain", () => {
     expect(topLevel).toContain("CONSTRAINT inventory_facts_shared_principal_check");
     expect(topLevel).toContain("kind <> 'sharedWithUsersAndGroups'");
@@ -109,30 +132,33 @@ describe("current schema source contracts", () => {
     expect(schemaSql).toContain("CREATE FUNCTION inventory_maker_sharing_valid(sharing jsonb)");
   });
 
-  it("exports only the current schema, its exact SHA-256 fingerprint and verification", () => {
+  it("exports only the strict current verifier and schema identity", () => {
     expect(Object.keys(schema).sort()).toEqual(["schemaFingerprint", "schemaSql", "verifySchema"]);
     expect(schemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(schemaFingerprint).toBe(createHash("sha256").update(schemaSql).digest("hex"));
     expect(schemaFingerprint).not.toBe(createHash("sha256").update(schemaSql + "\n").digest("hex"));
   });
+  it("rejects a missing schema marker without querying application data", async () => {
+    const database = databaseWithResults();
+    await expect(schema.verifySchema(database)).rejects.toThrow();
+    expect(database.query).toHaveBeenCalledTimes(1);
+  });
 
-  it("constructs the final objects once without upgrades, backfills or preservation branches", () => {
-    for (const [kind, count] of [["TABLE", 106], ["VIEW", 3], ["FUNCTION", 76], ["TRIGGER", 99], ["COLLATION", 2]] as const) {
+  it("constructs the exact current objects once", () => {
+    for (const [kind, count] of [["TABLE", 104], ["VIEW", 3], ["FUNCTION", 80], ["TRIGGER", 107], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
     }
-    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(158);
+    const tables = [...topLevel.matchAll(/^CREATE TABLE ([a-z_]+)/gm)].map(match => match[1]).sort();
+    expect(tables).toEqual(Object.keys(backupTableKeys).sort());
+    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(157);
     const alterations = topLevel.split(";").map(statement => statement.trim()).filter(statement => /^ALTER /i.test(statement));
-    expect(alterations).toHaveLength(94);
+    expect(alterations).toHaveLength(90);
     for (const statement of alterations) {
       expect(statement).toMatch(/^ALTER TABLE [a-z0-9_]+ ADD CONSTRAINT [a-z0-9_]+ FOREIGN KEY /);
     }
     expect(topLevel).not.toMatch(/^(?:DROP|RENAME|UPDATE|DELETE|TRUNCATE|DO)\b|CREATE OR REPLACE|IF NOT EXISTS/im);
-    expect(schemaSql).not.toMatch(/schema_migrations|fresh_application_database_required|legacy_audit_imports|legacy_source_id|legacy_content_hash/);
-    expect(schemaSql).not.toMatch(/CREATE TABLE (?:copilot_usage_snapshots|copilot_usage_source_state|unified_agents|unified_agent_sources|package_detail_cache|power_platform_inventory_snapshots|power_platform_inventory_resources)\b/);
-    expect(schemaSql).not.toContain("official_usage_untyped_facts");
-    expect(schemaSql).not.toContain("typed_version");
     expect(schemaSql).not.toMatch(/COLLATE public\s*,/);
     expect(topLevel).not.toMatch(/^(?:SET|SELECT|CREATE SCHEMA|\\restrict|\\unrestrict)\b/m);
     expect(schemaSql).toContain("official_usage_typed_fact CHECK");
@@ -167,12 +193,10 @@ describe("current schema source contracts", () => {
     expect(cleanup).toContain("mode = CAST('full' AS text)");
     expect(cleanup).toContain('["users", "graph_packages", "power_platform"]');
     expect(cleanup).toContain("jsonb_array_length(source_ids) = 3");
-    expect(cleanup).not.toContain("usage_reports");
-    expect(cleanup).not.toContain("= 4");
   });
 
   it.each(["power_platform_refresh_jobs", "package_refresh_jobs"])(
-    "persists provider-admitted progress and completion beyond the retired limits in %s", table => {
+    "persists provider progress within the configured bounds in %s", table => {
       const definition = schemaSql.match(new RegExp(`CREATE TABLE ${table} \\([\\s\\S]*?\\n\\);`))?.[0];
       expect(definition).toBeDefined();
       for (const [column, admitted, ceiling] of [
@@ -308,14 +332,13 @@ describe("schema verification without a database", () => {
     });
 
   it.each([
-    undefined, { snapshots: "copilot_usage_snapshots" }, { sources: "copilot_usage_source_state" },
-    { fact_index: "official_usage_row_facts_observed" },
+    undefined,
     { actor: false }, { acceptance: false }, { collection: false }, { collection_guard: false }, { guards: 5 },
-  ])("rejects incomplete cutover structures: %j", async override => {
-    const previous = resultsBefore("users/reports cutover");
+  ])("rejects incomplete current report structures: %j", async override => {
+    const previous = resultsBefore("users/reports");
     const database = databaseWithResults(...previous,
-      override === undefined ? [] : [{ ...cutoverContract, ...override }]);
-    await expect(verifySchema(database)).rejects.toThrow("users_reports_cutover_schema_required");
+      override === undefined ? [] : [{ ...reportScopeContract, ...override }]);
+    await expect(verifySchema(database)).rejects.toThrow("users_reports_schema_invalid");
     expect(database.query).toHaveBeenCalledTimes(previous.length + 1);
   });
 
@@ -371,7 +394,7 @@ describe("schema verification without a database", () => {
       await expect(verifySchema(database)).rejects.toThrow("inventory_schema_privileges");
     });
 
-  it.each(["refresh targets", "refresh contract", "inventory authority", "live identity", "inventory cutover", "inventory classification"])(
+  it.each(["refresh targets", "refresh contract", "inventory authority", "live identity", "inventory controls", "inventory classification"])(
     "requires every named inventory contract flag at %s", async stage => {
     const row = schemaResults().find(result => result.name === stage)!.rows[0] as Record<string, boolean>;
     for (const key of Object.keys(row)) for (const missing of [false, true]) {

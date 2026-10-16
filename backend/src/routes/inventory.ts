@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import type pg from "pg";
 import { randomUUID } from "node:crypto";
@@ -17,13 +18,13 @@ export const inventoryRouter = Router();
 const refreshJobs = new PowerPlatformRefreshJobs();
 
 policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
-  const job = await powerPlatformInventory.submit(request.session.user!, {
+  const job = await powerPlatformInventory.submit(requestUser(request), {
     idempotencyKey: request.get("Idempotency-Key") ?? randomUUID(),
     environmentScope: optionalText(request.body?.environmentId, 512),
     requestedTypes: parseTypes(request.body?.types),
   });
   response.locals.jobId = job.id;
-  const current = job.status === "waiting_authorization" ? await startOrWaiting(request.session.user!, job.id) : job;
+  const current = job.status === "waiting_authorization" ? await startOrWaiting(requestUser(request), job.id) : job;
   response.status(202).json(current);
 });
 
@@ -42,18 +43,18 @@ policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs", { access: "authen
 policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const id = jobId(request.params.id);
   response.locals.jobId = id;
-  response.json(await powerPlatformInventory.get(request.session.user!, id));
+  response.json(await powerPlatformInventory.get(requestUser(request), id));
 });
 
 policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/resume", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
   const id = jobId(request.params.id);
   response.locals.jobId = id;
-  response.status(202).json(await startOrWaiting(request.session.user!, id));
+  response.status(202).json(await startOrWaiting(requestUser(request), id));
 });
 policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/cancel", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = jobId(request.params.id);
   response.locals.jobId = id;
-  response.json(await powerPlatformInventory.cancel(request.session.user!, id));
+  response.json(await powerPlatformInventory.cancel(requestUser(request), id));
 });
 
 export function createInventoryReadRouter(database: pg.Pool) {
@@ -69,12 +70,12 @@ policyRoute(router, "get", "/inventory/resources/:nativeId/related", {
   const exact = await inventoryRepository.getResource(requestScope(request), snapshotId, "microsoft.copilotstudio/agents", environmentId, exactNativeId(request.params.nativeId));
   const identifierValues = (kind: string) => exact.resource.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value);
   const botIds = identifierValues("cds_bot_id");
-  const hasSecurityRole = hasAppRole(request.session.user!.roles, "AgentControl.Viewer");
+  const hasSecurityRole = hasAppRole(requestUser(request).roles, "AgentControl.Viewer");
   const audit: InventorySourceAwareDetail["audit"] = !hasSecurityRole
     ? { status: "unauthorized", reason: "Viewer is required; no audit lookup or count was performed." }
     : !exact.resource.environmentId || botIds.length !== 1
       ? { status: "unmatched", reason: "No single exact CDS bot ID plus environment association is available." }
-      : await sourceResult(() => purviewAudit.relatedInventoryRecords(request.session.user!, { environmentId: exact.resource.environmentId!, botId: botIds[0] }));
+      : await sourceResult(() => purviewAudit.relatedInventoryRecords(requestUser(request), { environmentId: exact.resource.environmentId!, botId: botIds[0] }));
   const security: InventorySourceAwareDetail["security"] = !hasSecurityRole
     ? { status: "unauthorized", reason: "Viewer is required; no Defender lookup or count was performed." }
     : { status: "unmatched", reason: "Saved Entra agent metadata does not establish the enterprise-application object ID required for a Defender inventory association." };

@@ -9,6 +9,10 @@ const mocks = vi.hoisted(() => ({
   state: vi.fn(), start: vi.fn(), cancel: vi.fn(),
 }));
 vi.mock("../middleware/auth.js", () => ({ requestScope: vi.fn() }));
+vi.mock("../middleware/requestAuthentication.js", () => ({
+  requestUser: (request: Request) => request.session.user,
+  requestAuthenticatedAt: (request: Request) => request.session.signedInAt,
+}));
 vi.mock("../services/dataSync.js", () => ({ dataSync: {} }));
 vi.mock("../services/packageInventory.js", () => ({ packageInventory: {} }));
 vi.mock("./policy.js", () => ({

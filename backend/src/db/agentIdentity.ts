@@ -7,18 +7,18 @@ import { dataConnections } from "./dataConnections.js";
 import { lockDataScope } from "./dataGenerations.js";
 import { parseUnifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { verifiedAgentIdentityClientIdProvenance, type AgentIdentityCacheStatus, type AgentIdentityResolutionOutcome,
-  type AgentIdentityRuntimeProvenance, type AgentIdentityRuntimeStatus, type VerifiedAgentIdentityIds } from "../types/agentInvestigations.js";
+  type AgentIdentityRuntimeProvenance, type VerifiedAgentIdentityIds } from "../types/agentInvestigations.js";
 
 export type AgentIdentitySource = {
   recordId: string; snapshotId: string; nativeId: string; environmentId: string; candidateId: string; sourceRevision: string;
 };
-export type VerifiedAgentIdentity = {
-  objectId: string; applicationId: string | null; checkedAt: string; expiresAt: string;
-  runtimeStatus?: AgentIdentityRuntimeStatus; runtimeProvenance?: AgentIdentityRuntimeProvenance;
+type VerifiedAgentIdentity = VerifiedAgentIdentityIds & {
+  checkedAt: string; expiresAt: string;
 };
-export type AgentIdentityCacheState = {
-  status: AgentIdentityCacheStatus; value?: VerifiedAgentIdentity; checkedAt?: string; expiresAt?: string; lastErrorCode?: string;
-};
+export type AgentIdentityCacheState = (
+  | { status: "resolved"; value: VerifiedAgentIdentity }
+  | { status: Exclude<AgentIdentityCacheStatus, "resolved">; value?: undefined }
+) & { checkedAt?: string; expiresAt?: string; lastErrorCode?: string };
 export type AgentIdentityFailure = { status: Exclude<AgentIdentityResolutionOutcome, "resolved">; code: string };
 
 const sourceWhere = `membership.tenant_id=$1 AND membership.principal_id=$2 AND membership.source='power_platform'
@@ -46,16 +46,12 @@ const sourceJoin = `FROM inventory_live_sources membership
 export class AgentIdentityRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async read(scope: PackageDataScope, source: AgentIdentitySource): Promise<VerifiedAgentIdentity | null> {
-    return (await this.readState(scope, source)).value ?? null;
-  }
-
   async readState(scope: PackageDataScope, source: AgentIdentitySource,
     database: Pick<pg.Pool, "query"> = this.database): Promise<AgentIdentityCacheState> {
     const parameters = sourceParameters(scope, source);
     const { rows } = await database.query<{
       candidate_id: string; application_id: string | null; checked_at: Date; expires_at: Date; fresh: boolean;
-      outcome: AgentIdentityResolutionOutcome; runtime_status: AgentIdentityRuntimeStatus; last_error_code: string | null;
+      outcome: AgentIdentityResolutionOutcome; runtime_status: "available" | "unverified"; last_error_code: string | null;
       runtime_provenance: AgentIdentityRuntimeProvenance | null;
     }>(`
       SELECT cache.candidate_id,cache.application_id,cache.checked_at,cache.expires_at,
@@ -66,17 +62,18 @@ export class AgentIdentityRepository {
     [...parameters, source.recordId, source.sourceRevision]);
     const value = rows[0];
     if (!value) return { status: "missing" };
-    if (value.fresh && value.outcome === "resolved" && (value.application_id !== value.candidate_id
-      || value.runtime_status !== "available" || value.runtime_provenance !== verifiedAgentIdentityClientIdProvenance)) {
+    const dates = { checkedAt: value.checked_at.toISOString(), expiresAt: value.expires_at.toISOString() };
+    const metadata = { ...dates, ...(value.last_error_code ? { lastErrorCode: value.last_error_code } : {}) };
+    if (!value.fresh) return { status: "expired", ...metadata };
+    if (value.outcome !== "resolved") return { status: value.outcome, ...metadata };
+    if (value.application_id !== value.candidate_id
+      || value.runtime_status !== "available" || value.runtime_provenance !== verifiedAgentIdentityClientIdProvenance) {
       throw new AppError(409, "invalid_agent_identity_cache", "The saved mapping lacks verified Entra agent identity client-ID provenance.");
     }
-    const dates = { checkedAt: value.checked_at.toISOString(), expiresAt: value.expires_at.toISOString() };
-    return { status: value.fresh ? value.outcome : "expired", ...dates,
-      ...(value.last_error_code ? { lastErrorCode: value.last_error_code } : {}),
-      ...(value.fresh && value.outcome === "resolved" ? { value: {
-        objectId: value.candidate_id, applicationId: value.application_id, runtimeStatus: value.runtime_status,
-        runtimeProvenance: value.runtime_provenance ?? undefined, ...dates,
-      } } : {}) };
+    return { status: "resolved", ...metadata, value: {
+      objectId: value.candidate_id, applicationId: value.candidate_id, runtimeStatus: "available",
+      runtimeProvenance: value.runtime_provenance, ...dates,
+    } };
   }
 
   async invalidate(scope: PackageDataScope, source: AgentIdentitySource) {
@@ -107,7 +104,7 @@ export class AgentIdentityRepository {
   }
 
   private async write(scope: PackageDataScope, source: AgentIdentitySource, value: {
-    applicationId: string | null; runtimeStatus: AgentIdentityRuntimeStatus; runtimeProvenance: AgentIdentityRuntimeProvenance | null;
+    applicationId: string | null; runtimeStatus: "available" | "unverified"; runtimeProvenance: AgentIdentityRuntimeProvenance | null;
     outcome: AgentIdentityResolutionOutcome; errorCode: string | null; ttlMs: number;
   }, fence: () => void) {
     const parameters = sourceParameters(scope, source);

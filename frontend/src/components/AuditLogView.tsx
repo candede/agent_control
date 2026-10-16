@@ -30,6 +30,7 @@ import { WorkbenchActionGate } from "../workbenchActionContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
 import { auditDefaultPageSize, auditMaximumSearchLength, auditMetadata } from "../../../backend/src/types/audit";
+import { unknownOrigin, type AuditOriginV1, type AttributionField } from "../../../backend/src/types/actionOrigin";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
@@ -49,13 +50,10 @@ const auditActionLabels: Record<LocalAuditAction, string> = {
   "export-audit-search": "Export provider audit",
   "view-hunting": "View Defender hunting",
   "export-hunting": "Export Defender hunting",
-  "approve-hunting": "Approve Defender hunting qualification",
-  "qualify-hunting": "Run Defender hunting qualification",
   "submit-hunting": "Submit Defender hunt",
   "query-hunting": "Query Defender hunting",
   "cancel-hunting": "Cancel Defender hunt",
   "delete-hunting": "Delete Defender hunt",
-  "revoke-hunting-scope": "Revoke saved Defender scope",
   "export-agent-inventory": "Export agent inventory",
   "export-package-inventory": "Export package inventory",
   "export-power-platform-inventory": "Export Power Platform inventory",
@@ -64,6 +62,9 @@ const auditActionLabels: Record<LocalAuditAction, string> = {
   "export-administrative-audit": "Export administrative audit",
   "associate-agent-usage": "Associate agent usage",
   "remove-agent-usage-association": "Remove usage association",
+  "resume-control": "Resume control",
+  "cancel-control": "Cancel control",
+  "reconcile-control": "Reconcile control",
 };
 
 export function AuditLogView({ agents }: AuditLogViewProps) {
@@ -96,7 +97,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
     <section className="audit-source-view" aria-label="Audit evidence">
       <header>
         <h2>Local control audit</h2>
-        <p>Actions taken from this app, including blocking and unblocking agents. For provider records, open an individual agent or user in Agents or Users.</p>
+        <p>Actions accepted by the API, including web and integration controls. Origin describes the caller, not the managed target or provider. For provider records, open an individual agent or user in Agents or Users.</p>
       </header>
       <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} />
     </section>
@@ -128,7 +129,11 @@ function LocalAuditLogView({
     action: actionFilter === "all" ? undefined : actionFilter,
     status: statusFilter === "all" ? undefined : statusFilter,
     search: deferredQuery.trim() || undefined,
-  }), [actionFilter, deferredQuery, pageIndex, statusFilter]);
+    originChannel: !route.originChannel || route.originChannel === "all" ? undefined : route.originChannel,
+    originIntegrationClientId: route.originIntegrationClientId,
+    originClientId: route.originClientId,
+    originCallingAgentId: route.originCallingAgentId,
+  }), [actionFilter, deferredQuery, pageIndex, statusFilter, route.originChannel, route.originIntegrationClientId, route.originClientId, route.originCallingAgentId]);
   const queryClient = useSavedQueryClient();
   const queryKey = ["audit-events", auditQuery, refreshToken];
   const auditRead = useQuery({
@@ -171,7 +176,7 @@ function LocalAuditLogView({
     onRouteChange({ ...route, page });
   });
 
-  function updateRoute(next: Partial<Pick<AuditRouteState, "search" | "action" | "status" | "page">>) {
+  function updateRoute(next: Partial<AuditRouteState>) {
     onRouteChange({ ...route, ...next });
   }
 
@@ -196,13 +201,15 @@ function LocalAuditLogView({
     (event) => event.status === "skipped",
   ).length;
   const hasActiveAuditFilters =
-    query.trim().length > 0 || actionFilter !== "all" || statusFilter !== "all";
+    query.trim().length > 0 || actionFilter !== "all" || statusFilter !== "all"
+    || Boolean(route.originChannel && route.originChannel !== "all" || route.originClientId || route.originCallingAgentId || route.originIntegrationClientId);
   const totalPages = Math.min(Math.max(Math.ceil(totalCount / auditPageSize), 1), maximumAuditPageIndex + 1);
   const pageStart = totalCount === 0 ? 0 : pageIndex * auditPageSize + 1;
   const pageEnd = Math.min((pageIndex + 1) * auditPageSize, totalCount);
 
   function handleClearAuditFilters() {
-    onRouteChange({ ...route, search: "", action: "all", status: "all", page: 0 });
+    onRouteChange({ ...route, search: "", action: "all", status: "all", page: 0, originChannel: "all",
+      originClientId: undefined, originCallingAgentId: undefined, originIntegrationClientId: undefined });
   }
 
   function handleRefreshAuditLog() {
@@ -304,6 +311,19 @@ function LocalAuditLogView({
             <option value="cancelled">Cancelled</option>
           </select>
         </label>
+        <label>
+          <span>Origin</span>
+          <select value={route.originChannel ?? "all"} onChange={event => updateRoute({ originChannel: event.target.value as AuditRouteState["originChannel"], page: 0 })}>
+            <option value="all">All origins</option>
+            <option value="webapp">Web app</option>
+            <option value="mcp">MCP integration</option>
+            <option value="unknown">Unknown / historical</option>
+          </select>
+        </label>
+        {(["originIntegrationClientId", "originClientId", "originCallingAgentId"] as const).map((field, index) => <label key={field}>
+          <span>{["Integration client ID", "Calling client ID", "Calling agent ID"][index]}</span>
+          <input value={route[field] ?? ""} maxLength={256} onChange={event => updateRoute({ [field]: event.target.value || undefined, page: 0 })} />
+        </label>)}
         <div className="filter-actions" aria-label="Audit actions">
           <button
             type="button"
@@ -415,6 +435,7 @@ function AuditTable({
             <th scope="col">Result</th>
             <th scope="col">Details</th>
             <th scope="col">By</th>
+            <th scope="col">Origin</th>
             <th scope="col">Action group</th>
           </tr>
         </thead>
@@ -455,6 +476,12 @@ function AuditTable({
                   <div className="agent-description">
                     {event.actor.username}
                   </div>
+                </td>
+                <td className="audit-origin-cell">
+                  <strong>{originChannelLabel(event.origin ?? unknownOrigin)}</strong>
+                  <div className="agent-description">Client: {event.origin?.client.name.value ?? "Unknown"}</div>
+                  <div className="agent-description">Calling agent: {event.origin?.callingAgent.name.value ?? "Unknown"}</div>
+                  <button type="button" className="text-button" onClick={() => onViewDetails(event)} aria-label={`View origin details for ${event.id}`}>Origin details</button>
                 </td>
                 <td>
                   <div className="audit-group-label">
@@ -658,6 +685,20 @@ function AuditDetailsModal({
           </button>
         </div>
 
+        <section aria-label="Action origin" className="audit-origin-details">
+          <h3>Origin: {originChannelLabel(event.origin ?? unknownOrigin)}</h3>
+          <p>The verified administrator remains the actor. Calling-agent labels describe the caller, not the target Agent. Reported labels are not verified identities.</p>
+          <dl>
+            <dt>Integration application (authenticated when known)</dt><dd>{event.origin?.integrationClientId ?? "Unknown"}</dd>
+            <OriginField label="Calling client ID" field={(event.origin ?? unknownOrigin).client.id} />
+            <OriginField label="Calling client name" field={(event.origin ?? unknownOrigin).client.name} />
+            <OriginField label="Calling client version" field={(event.origin ?? unknownOrigin).client.version} />
+            <OriginField label="Calling agent ID" field={(event.origin ?? unknownOrigin).callingAgent.id} />
+            <OriginField label="Calling agent name" field={(event.origin ?? unknownOrigin).callingAgent.name} />
+            <dt>API request reference</dt><dd>{event.origin?.requestId ?? "Unknown"}</dd>
+            <dt>MCP call reference</dt><dd>{event.origin?.mcpCallId ?? "Unknown"}</dd>
+          </dl>
+        </section>
         <section className="audit-details-log">
           {hasAuditDetails(event) ? (
             <pre ref={detailsLog} tabIndex={0} aria-label="Recorded audit details">{formatAuditDetailsMessage(event)}</pre>
@@ -668,6 +709,13 @@ function AuditDetailsModal({
       </section>
     </div>
   );
+}
+
+function OriginField({ label, field }: { label: string; field: AttributionField }) {
+  return <><dt>{label}</dt><dd>{field.value ?? "Unknown"} <span>({field.evidence})</span></dd></>;
+}
+function originChannelLabel(origin: AuditOriginV1) {
+  return origin.channel === "webapp" ? "Web app" : origin.channel === "mcp" ? "MCP integration" : "Unknown / historical";
 }
 
 function AuditMetric({ label, value }: { label: string; value: number | null }) {

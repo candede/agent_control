@@ -5,12 +5,12 @@ import type { InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { defenderHuntingTemplates, defenderHuntingFieldAvailable, isDefenderHuntingRequestId,
   type DefenderHuntingFilters, type DefenderHuntingHistory, type DefenderHuntingJob,
-  type DefenderHuntingAuthorityBinding, type DefenderHuntingQualificationBinding, type DefenderHuntingQualificationEvidence,
-  type DefenderHuntingQueryResult, type DefenderHuntingResultScope, type DefenderHuntingRetainedScope,
-  type DefenderHuntingRetainedScopeBinding,
+  type DefenderHuntingQueryResult, type DefenderHuntingResultScope,
   type DefenderHuntingRow, type DefenderHuntingRowPage, type DefenderHuntingSnapshot, type DefenderHuntingTokenMode } from "../types/defenderHunting.js";
 import { InventoryIdentityQueries, type InventoryIdentityReadScope } from "./inventoryIdentityQueries.js";
 import { pool, transaction } from "./pool.js";
+import { currentActionOrigin, parseStoredOrigin, initiatingOrigin } from "../services/actionOrigin.js";
+import type { AuditActor } from "../types/audit.js";
 
 export type DefenderHuntingScope = {
   tenantId: string;
@@ -23,7 +23,6 @@ export type DefenderHuntingReadScope = {
   tenantId: string;
   authorizationPrincipalId: string;
   resultScopes: DefenderHuntingResultScope[];
-  qualifications?: Array<{ resultScope: DefenderHuntingResultScope; authority: DefenderHuntingAuthorityBinding }>;
   inventoryIdentityScope?: InventoryIdentityReadScope;
   entraAgentIds?: string[];
   entraAgentApplicationIds?: string[];
@@ -33,16 +32,14 @@ export type DefenderHuntingReadScope = {
 export type DefenderHuntingExecution = { owner: string; version: number };
 
 type JobRow = {
+  origin?: unknown; initiating_actor?: AuditActor | null;
   id: string; authorization_principal_id: string; result_scope_id: string; result_scope_kind: DefenderHuntingResultScope["kind"];
   result_scope_configuration_revision: string | null; token_mode: DefenderHuntingTokenMode; status: DefenderHuntingJob["status"];
-  filters: DefenderHuntingFilters; query_version: 3; retained_scope_id: string | null; local_request_id: string; provider_request_id: string | null;
+  filters: DefenderHuntingFilters; query_version: 3; local_request_id: string; provider_request_id: string | null;
   provider_request_count: number; activation_count: number; execution_version: string; execution_owner: string | null;
   provider_row_count: number; stored_row_count: number; byte_count: number; result_complete: boolean; no_data: boolean;
   partial_reason: DefenderHuntingJob["partialReason"]; observed_start: Date | null; observed_end: Date | null;
-  unobserved_start: Date | null; unobserved_end: Date | null; is_qualification: boolean;
-  capability_id: DefenderHuntingQualificationBinding["capabilityId"] | null; contract_revision: string | null;
-  permission_revision: string | null; qualification_configuration_revision: string | null; approved_by: string | null;
-  target_scope_hash: string | null;
+  unobserved_start: Date | null; unobserved_end: Date | null;
   error_code: string | null; message: string | null; cancel_requested: boolean; created_at: Date; attempted_at: Date | null;
   updated_at: Date; finished_at: Date | null; deadline_at: Date; expires_at: Date; snapshot_id: string | null;
   prior_successful_job_id?: string | null;
@@ -56,39 +53,25 @@ type SnapshotRow = {
   partial_reason: DefenderHuntingSnapshot["partialReason"]; provider_row_count: number; stored_row_count: number; byte_count: number; expires_at: Date;
 };
 
-type QualificationEvidenceRow = {
-  capability_id: DefenderHuntingAuthorityBinding["capabilityId"]; template_id: DefenderHuntingQualificationEvidence["templateId"];
-  target_scope_hash: string; approved_scope: DefenderHuntingQualificationEvidence["approvedScope"];
-  contract_revision: string; permission_revision: string; configuration_revision: string; approved_by: string;
-  query_version: 3; qualified_at: Date; expires_at: Date;
-};
-
-type RetainedScopeRow = {
-  id: string; result_scope_id: string; result_scope_kind: DefenderHuntingResultScope["kind"];
-  result_scope_configuration_revision: string | null; token_mode: DefenderHuntingTokenMode;
-  capability_id: DefenderHuntingAuthorityBinding["capabilityId"]; template_id: DefenderHuntingRetainedScope["templateId"];
-  target_scope_hash: string; approved_scope: DefenderHuntingRetainedScope["approvedScope"]; query_version: 3;
-  contract_revision: string; permission_revision: string; configuration_revision: string; approved_by: string;
-  source_qualification_job_id: string; approved_at: Date; qualified_at: Date; expires_at: Date; revoked_at: Date | null;
-};
-
 export class DefenderHuntingRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
   async submit(scope: DefenderHuntingScope, input: { idempotencyKey: string; filters: DefenderHuntingFilters;
-    qualification?: DefenderHuntingQualificationBinding; retainedScope?: DefenderHuntingRetainedScopeBinding }, publicationFence?: () => void) {
+    actor?: AuditActor }, publicationFence?: () => void) {
     requireProviderAdmissions();
     validateScope(scope);
+    if (input.actor) {
+      if (input.actor.tenantId !== scope.tenantId || input.actor.homeAccountId !== scope.authorizationPrincipalId) throw new AppError(400, "invalid_audit_actor", "Audit actor must match the hunting owner.");
+      initiatingOrigin(input.actor);
+    }
     if (typeof input.idempotencyKey !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)) {
       throw new AppError(400, "invalid_idempotency_key", "Idempotency-Key must contain 1-128 letters, digits, underscores or hyphens.");
     }
-    validateSubmissionBinding(scope, input.filters, input.qualification, input.retainedScope);
-    const hash = requestHash(scope, input.filters, input.qualification, input.retainedScope);
+    const hash = requestHash(scope, input.filters);
     const targetScopeHash = huntingTargetScopeHash(input.filters);
     const id = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`defender-hunting:${scope.tenantId}`]);
       publicationFence?.();
-      if (input.retainedScope) await requireRetainedScope(client, scope, input.filters, input.retainedScope);
       const existing = await client.query<{ id: string; request_hash: string }>(`SELECT id,request_hash FROM defender_hunting_jobs
         WHERE tenant_id=$1 AND result_scope_kind=$2 AND result_scope_id=$3 AND result_scope_configuration_revision IS NOT DISTINCT FROM $4
           AND token_mode=$5 AND idempotency_key=$6`, [scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId,
@@ -104,90 +87,22 @@ export class DefenderHuntingRepository {
       [scope.tenantId, scope.authorizationPrincipalId]);
       if (unfinished.rows[0].principal_count >= 5 || unfinished.rows[0].tenant_count >= 10) throw new AppError(429, "job_limit", "The bounded hunting unfinished-job limit was reached.");
       const jobId = randomUUID();
-      const qualification = input.qualification;
       await client.query(`INSERT INTO defender_hunting_jobs
         (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,template_id,idempotency_key,request_hash,filters,local_request_id,
-          is_qualification,capability_id,contract_revision,permission_revision,qualification_configuration_revision,approved_by,target_scope_hash,query_version,retained_scope_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,3,$20)`,
+          target_scope_hash,query_version,origin,initiating_actor)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,3,$14::jsonb,$15::jsonb)`,
       [jobId, scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId, scope.resultScope.kind, scope.resultScope.configurationRevision,
-        scope.tokenMode, input.filters.templateId, input.idempotencyKey, hash, JSON.stringify(input.filters), randomUUID(), Boolean(qualification),
-        qualification?.capabilityId ?? null, qualification?.contractRevision ?? null, qualification?.permissionRevision ?? null,
-        qualification?.configurationRevision ?? null, qualification?.approvedBy ?? null, targetScopeHash, input.retainedScope?.id ?? null]);
+        scope.tokenMode, input.filters.templateId, input.idempotencyKey, hash, JSON.stringify(input.filters), randomUUID(), targetScopeHash,
+        JSON.stringify(currentActionOrigin()), input.actor ? JSON.stringify({ tenantId: input.actor.tenantId, homeAccountId: input.actor.homeAccountId,
+          username: input.actor.username, displayName: input.actor.displayName }) : null]);
       publicationFence?.();
       return jobId;
     }, undefined, publicationFence);
     return (await this.getJob(scope, id))!;
   }
 
-  async requireQualifiedScope(scope: DefenderHuntingScope, filters: DefenderHuntingFilters, authority: DefenderHuntingAuthorityBinding,
-    retainedScopeId?: string | null): Promise<DefenderHuntingRetainedScopeBinding> {
-    validateScope(scope);
-    validateAuthority(scope, authority);
-    const result = await this.database.query<{ id: string }>(`SELECT retained.id FROM defender_hunting_qualification_evidence evidence
-      JOIN defender_hunting_jobs qualification_job ON qualification_job.id=evidence.qualified_job_id AND qualification_job.query_version=3
-      JOIN defender_hunting_retained_scopes retained ON retained.source_qualification_job_id=evidence.qualified_job_id
-      WHERE evidence.tenant_id=$1 AND evidence.authorization_principal_id=$2 AND evidence.result_scope_kind=$3
-        AND evidence.result_scope_id=$4 AND evidence.result_scope_configuration_revision IS NOT DISTINCT FROM $5
-        AND evidence.token_mode=$6 AND evidence.capability_id=$7 AND evidence.template_id=$8 AND evidence.target_scope_hash=$9
-        AND evidence.contract_revision=$10 AND evidence.permission_revision=$11 AND evidence.configuration_revision=$12
-        AND evidence.expires_at>clock_timestamp()
-        AND retained.tenant_id=evidence.tenant_id AND retained.authorization_principal_id=evidence.authorization_principal_id
-        AND retained.result_scope_kind=evidence.result_scope_kind AND retained.result_scope_id=evidence.result_scope_id
-        AND retained.result_scope_configuration_revision IS NOT DISTINCT FROM evidence.result_scope_configuration_revision
-        AND retained.token_mode=evidence.token_mode AND retained.capability_id=evidence.capability_id
-        AND retained.template_id=evidence.template_id AND retained.target_scope_hash=evidence.target_scope_hash
-        AND retained.contract_revision=evidence.contract_revision AND retained.permission_revision=evidence.permission_revision
-        AND retained.configuration_revision=evidence.configuration_revision AND retained.query_version=qualification_job.query_version
-        AND retained.approved_scope=$13::jsonb AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
-        AND ($14::uuid IS NULL OR retained.id=$14::uuid) LIMIT 1`, [scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.kind,
-      scope.resultScope.scopeId, scope.resultScope.configurationRevision, scope.tokenMode, authority.capabilityId, filters.templateId,
-      huntingTargetScopeHash(filters), authority.contractRevision, authority.permissionRevision, authority.configurationRevision,
-      JSON.stringify(huntingTargetScope(filters)), retainedScopeId ?? null]);
-    if (!result.rowCount) throw new AppError(403, "hunting_scope_unqualified", "This exact hunting template, identity target, and approved data scope requires current qualification.");
-    return { id: result.rows[0].id, authority };
-  }
-
-  async listQualificationEvidence(scope: DefenderHuntingReadScope): Promise<DefenderHuntingQualificationEvidence[]> {
-    const read = qualificationWhere(scope);
-    const result = await this.database.query<QualificationEvidenceRow>(`SELECT evidence.*,qualification_job.query_version
-      FROM defender_hunting_qualification_evidence evidence
-      JOIN defender_hunting_jobs qualification_job ON qualification_job.id=evidence.qualified_job_id
-      JOIN defender_hunting_retained_scopes retained ON retained.id=qualification_job.retained_scope_id
-      WHERE ${read.sql} AND qualification_job.query_version=3 AND retained.source_qualification_job_id=evidence.qualified_job_id
-        AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp() AND evidence.expires_at>clock_timestamp()
-      ORDER BY evidence.qualified_at DESC,evidence.id DESC`, read.values);
-    return result.rows.map(row => ({ capabilityId: row.capability_id, templateId: row.template_id, targetScopeHash: row.target_scope_hash,
-      approvedScope: row.approved_scope, contractRevision: row.contract_revision, permissionRevision: row.permission_revision,
-      configurationRevision: Number(row.configuration_revision), queryVersion: row.query_version, approvedBy: row.approved_by,
-      qualifiedAt: row.qualified_at.toISOString(), expiresAt: row.expires_at.toISOString() }));
-  }
-
-  async listRetainedScopes(scope: DefenderHuntingReadScope): Promise<DefenderHuntingRetainedScope[]> {
-    const read = retainedScopeWhere(scope, "retained");
-    const result = await this.database.query<RetainedScopeRow>(`SELECT retained.* FROM defender_hunting_retained_scopes retained
-      WHERE ${read.sql} AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
-      ORDER BY retained.approved_at DESC,retained.id DESC`, read.values);
-    return result.rows.map(projectRetainedScope);
-  }
-
-  async revokeRetainedScope(scope: DefenderHuntingReadScope, id: string, tokenMode: DefenderHuntingTokenMode, revokedBy: string,
-    mutationFence?: () => void) {
-    if (!revokedBy || revokedBy.length > 256) throw new AppError(403, "scope_mismatch", "Hunting scope revocation requires an exact current actor.");
-    const read = retainedScopeWhere(scope, "retained");
-    return transaction(this.database, async client => {
-      mutationFence?.();
-      const result = await client.query<RetainedScopeRow>(`UPDATE defender_hunting_retained_scopes retained
-      SET revoked_at=clock_timestamp(),revoked_by=$${read.values.length + 3}
-      WHERE retained.id=$${read.values.length + 1} AND retained.token_mode=$${read.values.length + 2}
-        AND ${read.sql} AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
-      RETURNING retained.*`, [...read.values, id, tokenMode, revokedBy]);
-      if (!result.rows[0]) throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
-      return projectRetainedScope(result.rows[0]);
-    }, undefined, mutationFence);
-  }
-
   async getJob(scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
-    const read = scopedWhere(toReadScope(scope), "job", !("resultScope" in scope));
+    const read = scopedWhere(toReadScope(scope));
     const result = await this.database.query<JobRow>(`SELECT job.*,(SELECT id FROM defender_hunting_snapshots WHERE job_id=job.id) AS snapshot_id,
       ${priorSuccessfulJobSelect("job")} AS prior_successful_job_id
       FROM defender_hunting_jobs job WHERE job.id=$${read.values.length + 1} AND ${read.sql} AND job.expires_at>clock_timestamp()`, [...read.values, id]);
@@ -195,7 +110,7 @@ export class DefenderHuntingRepository {
   }
 
   async listJobs(scope: DefenderHuntingReadScope, limit = 20, offset = 0): Promise<DefenderHuntingHistory> {
-    const read = scopedWhere(scope, "job", true);
+    const read = scopedWhere(scope);
     const boundedLimit = Math.min(Math.max(limit, 1), 50);
     const boundedOffset = Math.min(Math.max(offset, 0), 100_000);
     const rows = await this.database.query<JobRow>(`SELECT job.*,(SELECT id FROM defender_hunting_snapshots WHERE job_id=job.id) AS snapshot_id,
@@ -242,13 +157,11 @@ export class DefenderHuntingRepository {
   async authorizeProviderRequest(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, admissionFence?: () => void) {
     await transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution);
-      await requireExecutionRetainedScope(client, job);
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting reached its durable execution deadline.");
       if (job.provider_request_count >= 12) throw new AppError(409, "hunting_provider_request_limit", "Hunting reached its durable provider request limit.");
       await client.query(`UPDATE defender_hunting_jobs SET provider_request_count=provider_request_count+1,
         attempted_at=COALESCE(attempted_at,clock_timestamp()),updated_at=clock_timestamp()
         WHERE id=$1 AND execution_owner=$2 AND execution_version=$3`, [id, execution.owner, execution.version]);
-      await requireExecutionRetainedScope(client, job);
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting admission exceeded its durable deadline.");
     }, undefined, admissionFence);
   }
@@ -258,8 +171,7 @@ export class DefenderHuntingRepository {
     if (providerRequestId !== null && !isDefenderHuntingRequestId(providerRequestId)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid request identifier.");
     await transaction(this.database, async client => {
       publicationFence?.();
-      const job = await this.fence(client, scope, id, execution);
-      await requireExecutionRetainedScope(client, job);
+      await this.fence(client, scope, id, execution);
       const result = await client.query(`UPDATE defender_hunting_jobs SET provider_request_id=COALESCE($10,provider_request_id),updated_at=clock_timestamp()
         WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5
           AND authorization_principal_id=$6 AND token_mode=$7 AND execution_owner=$8 AND execution_version=$9
@@ -267,7 +179,6 @@ export class DefenderHuntingRepository {
       [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision,
         scope.authorizationPrincipalId, scope.tokenMode, execution.owner, execution.version, providerRequestId]);
       if (result.rowCount !== 1) throw executionLost();
-      await requireExecutionRetainedScope(client, job);
     }, undefined, publicationFence);
   }
 
@@ -276,7 +187,6 @@ export class DefenderHuntingRepository {
     validatePublicationEnvelope(result);
     return transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution);
-      await requireExecutionRetainedScope(client, job);
       publicationFence?.();
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting results arrived after its deadline.");
       validatePublicationRows(result.rows, job.filters, scope.tenantId);
@@ -313,43 +223,6 @@ export class DefenderHuntingRepository {
         result.complete ? null : filters.startDateTime, result.complete ? null : filters.endDateTime,
         result.partialReason, result.partialReason ? "The fixed hunting row cap was reached; the requested interval remains incompletely observed." : null,
         execution.owner, execution.version]);
-      if (job.is_qualification && result.complete) {
-        if (job.token_mode === "application") {
-          const configuration = await client.query<{ revision: string }>(`SELECT revision FROM capability_configuration
-            WHERE tenant_id=$1 AND capability_id=$2 FOR SHARE`, [scope.tenantId, job.capability_id]);
-          if (!configuration.rows[0] || Number(configuration.rows[0].revision) !== Number(job.qualification_configuration_revision)) {
-            throw new AppError(409, "qualification_superseded", "Hunting configuration changed before qualification evidence publication.");
-          }
-        }
-        const evidence = await client.query<{ qualified_at: Date }>(`INSERT INTO defender_hunting_qualification_evidence
-          (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,
-            capability_id,template_id,target_scope_hash,approved_scope,contract_revision,permission_revision,configuration_revision,
-            approved_by,qualified_job_id,provider_request_id)
-          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16)
-          RETURNING qualified_at`,
-        [scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId, scope.resultScope.kind,
-          scope.resultScope.configurationRevision, scope.tokenMode, job.capability_id, filters.templateId, job.target_scope_hash,
-          JSON.stringify(huntingTargetScope(filters)), job.contract_revision, job.permission_revision,
-          job.qualification_configuration_revision, job.approved_by, id, job.provider_request_id]);
-        const retained = await client.query<{ id: string }>(`INSERT INTO defender_hunting_retained_scopes
-          (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,
-            capability_id,template_id,target_scope_hash,approved_scope,query_version,contract_revision,permission_revision,configuration_revision,
-            approved_by,source_qualification_job_id,approved_at,qualified_at,expires_at)
-          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16,$17::timestamptz,$18,$17::timestamptz+interval '30 days')
-          ON CONFLICT (tenant_id,authorization_principal_id,result_scope_kind,result_scope_id,result_scope_configuration_key,token_mode,
-            capability_id,template_id,target_scope_hash,query_version,contract_revision,permission_revision,configuration_revision)
-            WHERE revoked_at IS NULL
-          DO UPDATE SET approved_scope=EXCLUDED.approved_scope,approved_by=EXCLUDED.approved_by,
-            source_qualification_job_id=EXCLUDED.source_qualification_job_id,approved_at=EXCLUDED.approved_at,
-            qualified_at=EXCLUDED.qualified_at,expires_at=EXCLUDED.expires_at
-          RETURNING id`, [scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId, scope.resultScope.kind,
-          scope.resultScope.configurationRevision, scope.tokenMode, job.capability_id, filters.templateId, job.target_scope_hash,
-          JSON.stringify(huntingTargetScope(filters)), job.query_version, job.contract_revision, job.permission_revision,
-          job.qualification_configuration_revision, job.approved_by, id, job.created_at, evidence.rows[0].qualified_at]);
-        await client.query("UPDATE defender_hunting_jobs SET retained_scope_id=$2 WHERE id=$1", [id, retained.rows[0].id]);
-        updated.rows[0].retained_scope_id = retained.rows[0].id;
-      }
-      await requireExecutionRetainedScope(client, job);
       publicationFence?.();
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting publication exceeded its durable deadline.");
       return projectJob({ ...updated.rows[0], snapshot_id: snapshotId });
@@ -453,7 +326,7 @@ export class DefenderHuntingRepository {
   }
 
   private async requireMutationJob(client: Pick<pg.PoolClient, "query">, scope: DefenderHuntingReadScope | DefenderHuntingScope, id: string) {
-    const read = scopedWhere(toReadScope(scope), "job", !("resultScope" in scope));
+    const read = scopedWhere(toReadScope(scope));
     read.values.push(scope.authorizationPrincipalId);
     read.sql += ` AND job.authorization_principal_id=$${read.values.length}`;
     const result = await client.query(`SELECT job.id FROM defender_hunting_jobs AS job
@@ -500,46 +373,11 @@ export class DefenderHuntingRepository {
   }
 }
 
-function validateSubmissionBinding(scope: DefenderHuntingScope, filters: DefenderHuntingFilters,
-  qualification?: DefenderHuntingQualificationBinding, retainedScope?: DefenderHuntingRetainedScopeBinding) {
-  if (!qualification && !retainedScope) {
-    if (scope.tokenMode !== "delegated") {
-      throw new AppError(400, "invalid_qualification", "Application hunting requires an exact retained-scope qualification.");
-    }
-    return;
-  }
-  if (qualification && retainedScope) {
-    throw new AppError(400, "invalid_qualification", "Hunting requires exactly one qualification approval or retained-scope binding.");
-  }
-  if (retainedScope) {
-    if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(retainedScope.id)) {
-      throw new AppError(400, "invalid_qualification", "Hunting retained-scope binding is invalid.");
-    }
-    validateAuthority(scope, retainedScope.authority);
-    return;
-  }
-  if (!qualification) throw new AppError(400, "invalid_qualification", "Hunting qualification approval is invalid.");
-  const targetCount = filters.agentIds.length + (filters.entraAgentIds?.length ?? 0) + (filters.entraAgentApplicationIds?.length ?? 0) + filters.blueprintIds.length + filters.actorObjectIds.length;
-  if (targetCount === 0 || (scope.tokenMode === "delegated") !== (qualification.capabilityId === "defender.hunting.delegated")
-    || !/^[a-f0-9]{64}$/.test(qualification.contractRevision) || !/^[a-f0-9]{64}$/.test(qualification.permissionRevision)
-    || !Number.isSafeInteger(qualification.configurationRevision) || qualification.configurationRevision < 1
-    || !qualification.approvedBy || qualification.approvedBy.length > 256) throw new AppError(400, "invalid_qualification", "Hunting qualification approval is invalid.");
-}
-
-function validateAuthority(scope: DefenderHuntingScope, authority: DefenderHuntingAuthorityBinding) {
-  if ((scope.tokenMode === "delegated") !== (authority.capabilityId === "defender.hunting.delegated")
-    || !/^[a-f0-9]{64}$/.test(authority.contractRevision) || !/^[a-f0-9]{64}$/.test(authority.permissionRevision)
-    || !Number.isSafeInteger(authority.configurationRevision) || authority.configurationRevision < 1
-    || scope.tokenMode === "application" && authority.configurationRevision !== scope.resultScope.configurationRevision) {
-    throw new AppError(403, "hunting_scope_unqualified", "Hunting qualification authority is invalid or no longer current.");
-  }
-}
-
 function validateScope(scope: DefenderHuntingScope) {
   validateReadScope(toReadScope(scope));
   if (!scope.authorizationPrincipalId) throw new AppError(403, "scope_mismatch", "Hunting requires an exact current authorization scope.");
   if (scope.tokenMode === "delegated" && (scope.resultScope.kind !== "principal" || scope.resultScope.scopeId !== scope.authorizationPrincipalId)) throw new AppError(403, "scope_mismatch", "Delegated hunting results must remain scoped to the authorizing principal.");
-  if (scope.tokenMode === "application" && scope.resultScope.kind !== "application") throw new AppError(403, "scope_mismatch", "Application hunting results require the approved shared application scope.");
+  if (scope.tokenMode === "application" && scope.resultScope.kind !== "application") throw new AppError(403, "scope_mismatch", "Application hunting results require the configured shared application scope.");
 }
 
 function validateReadScope(scope: DefenderHuntingReadScope) {
@@ -548,16 +386,16 @@ function validateReadScope(scope: DefenderHuntingReadScope) {
     || resultScope.kind === "application" && (!Number.isSafeInteger(resultScope.configurationRevision) || resultScope.configurationRevision < 1))) {
     throw new AppError(403, "scope_mismatch", "Hunting requires an exact current result scope.");
   }
-  for (const qualification of scope.qualifications ?? []) validateAuthority({ tenantId: scope.tenantId,
-    authorizationPrincipalId: scope.authorizationPrincipalId, resultScope: qualification.resultScope,
-    tokenMode: qualification.resultScope.kind === "principal" ? "delegated" : "application" }, qualification.authority);
+  if (scope.resultScopes.some(resultScope => resultScope.kind === "principal" && resultScope.scopeId !== scope.authorizationPrincipalId)) {
+    throw new AppError(403, "scope_mismatch", "Delegated hunting results must remain private to the current principal.");
+  }
 }
 
 function toReadScope(scope: DefenderHuntingReadScope | DefenderHuntingScope): DefenderHuntingReadScope {
   return "resultScope" in scope ? { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId, resultScopes: [scope.resultScope] } : scope;
 }
 
-function scopedWhere(scope: DefenderHuntingReadScope, alias = "job", requireQualification = false) {
+function scopedWhere(scope: DefenderHuntingReadScope, alias = "job") {
   validateReadScope(scope);
   const values: unknown[] = [scope.tenantId];
   const clauses = scope.resultScopes.map(resultScope => {
@@ -565,25 +403,8 @@ function scopedWhere(scope: DefenderHuntingReadScope, alias = "job", requireQual
     values.push(resultScope.kind, resultScope.scopeId, resultScope.configurationRevision);
     return `(${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1} AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2})`;
   });
-  const qualification = requireQualification ? retainedVisibilityPredicate(scope, alias, values) : "";
   const agent = agentScopePredicate(scope, `${alias}.filters`, values);
-  return { sql: `${alias}.tenant_id=$1 AND (${clauses.join(" OR ")})${requireQualification ? qualification ? ` AND (${qualification})` : " AND false" : ""}${agent}`, values };
-}
-
-function qualificationWhere(scope: DefenderHuntingReadScope) {
-  validateReadScope(scope);
-  const values: unknown[] = [scope.tenantId];
-  const predicate = qualificationEvidencePredicate(scope, "evidence", values);
-  const agent = agentScopePredicate(scope, "evidence.approved_scope", values);
-  return { sql: `evidence.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}${agent}`, values };
-}
-
-function retainedScopeWhere(scope: DefenderHuntingReadScope, alias: string) {
-  validateReadScope(scope);
-  const values: unknown[] = [scope.tenantId];
-  const predicate = retainedAuthorityPredicate(scope, alias, values);
-  const agent = agentScopePredicate(scope, `${alias}.approved_scope`, values);
-  return { sql: `${alias}.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}${agent}`, values };
+  return { sql: `${alias}.tenant_id=$1 AND (${clauses.join(" OR ")})${agent}`, values };
 }
 
 function agentScopePredicate(scope: DefenderHuntingReadScope, filters: string, values: unknown[]) {
@@ -616,107 +437,24 @@ function agentScopePredicate(scope: DefenderHuntingReadScope, filters: string, v
   return `${user} AND (${clauses.join(" OR ")}) AND ${filters}->'agentIds'='[]'::jsonb AND ${filters}->'blueprintIds'='[]'::jsonb`;
 }
 
-function qualificationEvidencePredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
-  return (scope.qualifications ?? []).map(({ resultScope, authority }) => {
-    const offset = values.length + 1;
-    values.push(resultScope.kind, resultScope.scopeId, resultScope.configurationRevision, authority.capabilityId,
-      authority.contractRevision, authority.permissionRevision, authority.configurationRevision);
-    return `(${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1}
-      AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2}
-      AND ${alias}.capability_id=$${offset + 3} AND ${alias}.contract_revision=$${offset + 4}
-      AND ${alias}.permission_revision=$${offset + 5} AND ${alias}.configuration_revision=$${offset + 6})`;
-  }).join(" OR ");
-}
-
-function retainedAuthorityPredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
-  return (scope.qualifications ?? []).map(({ resultScope, authority }) => {
-    const offset = values.length + 1;
-    values.push(resultScope.kind, resultScope.scopeId, resultScope.configurationRevision, authority.capabilityId,
-      authority.contractRevision, authority.permissionRevision, authority.configurationRevision);
-    return `(${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1}
-      AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2}
-      AND ${alias}.capability_id=$${offset + 3} AND ${alias}.contract_revision=$${offset + 4}
-      AND ${alias}.permission_revision=$${offset + 5} AND ${alias}.configuration_revision=$${offset + 6})`;
-  }).join(" OR ");
-}
-
-function retainedVisibilityPredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
-  const principalOffset = values.length + 1;
-  values.push(scope.authorizationPrincipalId);
-  const ordinaryDelegated = `(${alias}.token_mode='delegated' AND ${alias}.result_scope_kind='principal'
-    AND ${alias}.result_scope_id=$${principalOffset} AND ${alias}.authorization_principal_id=$${principalOffset}
-    AND NOT ${alias}.is_qualification AND ${alias}.retained_scope_id IS NULL)`;
-  const qualified = (scope.qualifications ?? []).map(({ resultScope, authority }) => {
-    const offset = values.length + 1;
-    values.push(resultScope.kind, resultScope.scopeId, resultScope.configurationRevision, authority.capabilityId,
-      authority.contractRevision, authority.permissionRevision, authority.configurationRevision, scope.authorizationPrincipalId);
-    const scopeMatch = `${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1}
-      AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2}`;
-    return `(${scopeMatch} AND ((${alias}.is_qualification AND ${alias}.status<>'succeeded'
-      AND ${alias}.authorization_principal_id=$${offset + 7} AND ${alias}.query_version=3
-      AND ${alias}.capability_id=$${offset + 3} AND ${alias}.contract_revision=$${offset + 4}
-      AND ${alias}.permission_revision=$${offset + 5} AND ${alias}.qualification_configuration_revision=$${offset + 6})
-      OR EXISTS (SELECT 1 FROM defender_hunting_retained_scopes retained WHERE retained.id=${alias}.retained_scope_id
-        AND retained.tenant_id=${alias}.tenant_id AND retained.authorization_principal_id=${alias}.authorization_principal_id
-        AND retained.result_scope_kind=${alias}.result_scope_kind AND retained.result_scope_id=${alias}.result_scope_id
-        AND retained.result_scope_configuration_revision IS NOT DISTINCT FROM ${alias}.result_scope_configuration_revision
-        AND retained.token_mode=${alias}.token_mode AND retained.template_id=${alias}.template_id
-        AND retained.target_scope_hash=${alias}.target_scope_hash AND retained.query_version=${alias}.query_version
-        AND retained.capability_id=$${offset + 3} AND retained.contract_revision=$${offset + 4}
-        AND retained.permission_revision=$${offset + 5} AND retained.configuration_revision=$${offset + 6}
-        AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp())))`;
-  });
-  return [ordinaryDelegated, ...qualified].join(" OR ");
-}
-
-async function requireRetainedScope(client: Pick<pg.Pool | pg.PoolClient, "query">, scope: DefenderHuntingScope,
-  filters: DefenderHuntingFilters, binding: DefenderHuntingRetainedScopeBinding) {
-  const authority = binding.authority;
-  const result = await client.query(`SELECT 1 FROM defender_hunting_retained_scopes retained
-    JOIN defender_hunting_qualification_evidence evidence ON evidence.qualified_job_id=retained.source_qualification_job_id
-    JOIN defender_hunting_jobs qualification_job ON qualification_job.id=evidence.qualified_job_id
-    WHERE retained.id=$1 AND retained.tenant_id=$2 AND retained.authorization_principal_id=$3
-      AND retained.result_scope_kind=$4 AND retained.result_scope_id=$5
-      AND retained.result_scope_configuration_revision IS NOT DISTINCT FROM $6 AND retained.token_mode=$7
-      AND retained.capability_id=$8 AND retained.template_id=$9 AND retained.target_scope_hash=$10
-      AND retained.approved_scope=$11::jsonb AND retained.query_version=3 AND qualification_job.query_version=retained.query_version
-      AND retained.contract_revision=$12 AND retained.permission_revision=$13 AND retained.configuration_revision=$14
-      AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp() AND evidence.expires_at>clock_timestamp()`,
-  [binding.id, scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.kind, scope.resultScope.scopeId,
-    scope.resultScope.configurationRevision, scope.tokenMode, authority.capabilityId, filters.templateId, huntingTargetScopeHash(filters),
-    JSON.stringify(huntingTargetScope(filters)), authority.contractRevision, authority.permissionRevision, authority.configurationRevision]);
-  if (!result.rowCount) throw new AppError(403, "hunting_scope_unqualified", "This exact hunting template, identity target, and approved data scope requires current qualification.");
-}
-
-async function requireExecutionRetainedScope(client: pg.PoolClient, job: JobRow) {
-  if (!job.retained_scope_id) return;
-  const retained = await client.query(`SELECT retained.id FROM defender_hunting_retained_scopes retained
-    JOIN defender_hunting_qualification_evidence evidence ON evidence.qualified_job_id=retained.source_qualification_job_id
-    WHERE retained.id=$1 AND retained.query_version=$2 AND retained.revoked_at IS NULL
-      AND retained.expires_at>clock_timestamp() AND evidence.expires_at>clock_timestamp()
-    FOR SHARE OF retained`, [job.retained_scope_id, job.query_version]);
-  if (!retained.rowCount) throw new AppError(403, "hunting_scope_unqualified", "Hunting retained-scope qualification expired or was revoked before execution.");
-}
-
-function requestHash(scope: DefenderHuntingScope, filters: DefenderHuntingFilters, qualification?: DefenderHuntingQualificationBinding,
-  retainedScope?: DefenderHuntingRetainedScopeBinding) {
+function requestHash(scope: DefenderHuntingScope, filters: DefenderHuntingFilters) {
   return createHash("sha256").update(JSON.stringify({ cloud: "global", tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-    resultScope: scope.resultScope, tokenMode: scope.tokenMode, filters, qualification: qualification ?? null, retainedScope: retainedScope ?? null })).digest("hex");
+    resultScope: scope.resultScope, tokenMode: scope.tokenMode, filters })).digest("hex");
 }
 
 function priorSuccessfulJobSelect(alias: string) {
-  return `CASE WHEN NOT ${alias}.is_qualification AND ${alias}.status IN ('failed','cancelled','inconclusive') THEN
+  return `CASE WHEN ${alias}.status IN ('failed','cancelled','inconclusive') THEN
     (SELECT previous.id FROM defender_hunting_jobs previous JOIN defender_hunting_snapshots snapshot ON snapshot.job_id=previous.id
       WHERE previous.tenant_id=${alias}.tenant_id AND previous.authorization_principal_id=${alias}.authorization_principal_id
         AND previous.result_scope_kind=${alias}.result_scope_kind AND previous.result_scope_id=${alias}.result_scope_id
         AND previous.result_scope_configuration_revision IS NOT DISTINCT FROM ${alias}.result_scope_configuration_revision
         AND previous.token_mode=${alias}.token_mode AND previous.template_id=${alias}.template_id
-        AND previous.target_scope_hash=${alias}.target_scope_hash AND NOT previous.is_qualification AND previous.status='succeeded'
+        AND previous.target_scope_hash=${alias}.target_scope_hash AND previous.status='succeeded'
         AND previous.finished_at<=${alias}.created_at AND previous.expires_at>clock_timestamp() AND snapshot.expires_at>clock_timestamp()
       ORDER BY previous.finished_at DESC,previous.id DESC LIMIT 1) END`;
 }
 
-export function huntingTargetScope(filters: DefenderHuntingFilters) {
+function huntingTargetScope(filters: DefenderHuntingFilters) {
   return { templateId: filters.templateId, agentIds: [...filters.agentIds].sort(ordinal), blueprintIds: [...filters.blueprintIds].sort(ordinal),
     actorObjectIds: [...filters.actorObjectIds].sort(ordinal), operations: [...filters.operations].sort(ordinal),
     ...(filters.userObjectId !== undefined ? { userObjectId: filters.userObjectId } : {}),
@@ -724,7 +462,7 @@ export function huntingTargetScope(filters: DefenderHuntingFilters) {
     ...(filters.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...filters.entraAgentApplicationIds].sort(ordinal) } : {}) };
 }
 
-export function huntingTargetScopeHash(filters: DefenderHuntingFilters) {
+function huntingTargetScopeHash(filters: DefenderHuntingFilters) {
   return createHash("sha256").update(JSON.stringify(huntingTargetScope(filters))).digest("hex");
 }
 
@@ -816,15 +554,14 @@ function projectResultScope(row: Pick<JobRow | SnapshotRow, "result_scope_kind" 
 }
 
 function projectJob(row: JobRow): DefenderHuntingJob {
-  const qualification = row.is_qualification ? { capabilityId: row.capability_id!, contractRevision: row.contract_revision!, permissionRevision: row.permission_revision!,
-    configurationRevision: Number(row.qualification_configuration_revision), approvedBy: row.approved_by! } : null;
   return { id: row.id, authorizationPrincipalId: row.authorization_principal_id, resultScope: projectResultScope(row), tokenMode: row.token_mode,
-    status: row.status, filters: row.filters, queryVersion: row.query_version, retainedScopeId: row.retained_scope_id, localRequestId: row.local_request_id,
+    origin: parseStoredOrigin(row.origin), initiatingActor: row.initiating_actor ?? null,
+    status: row.status, filters: row.filters, queryVersion: row.query_version, localRequestId: row.local_request_id,
     providerRequestId: row.provider_request_id, providerRequestCount: row.provider_request_count, activationCount: row.activation_count,
     providerRowCount: row.provider_row_count, storedRowCount: row.stored_row_count, byteCount: row.byte_count, complete: row.result_complete,
     noData: row.no_data, partialReason: row.partial_reason, observedRange: range(row.observed_start, row.observed_end),
     unobservedRange: range(row.unobserved_start, row.unobserved_end), snapshotId: row.snapshot_id,
-    priorSuccessfulJobId: row.prior_successful_job_id ?? null, qualification,
+    priorSuccessfulJobId: row.prior_successful_job_id ?? null,
     ...(row.error_code ? { errorCode: row.error_code } : {}), ...(row.message ? { message: row.message } : {}), cancelRequested: row.cancel_requested,
     createdAt: row.created_at.toISOString(), attemptedAt: row.attempted_at?.toISOString() ?? null, updatedAt: row.updated_at.toISOString(),
     finishedAt: row.finished_at?.toISOString() ?? null, expiresAt: row.expires_at.toISOString(),
@@ -838,14 +575,6 @@ function projectSnapshot(row: SnapshotRow): DefenderHuntingSnapshot {
     observedRange: range(row.observed_start, row.observed_end), unobservedRange: range(row.unobserved_start, row.unobserved_end),
     observationTime: row.observation_time.toISOString(), complete: row.result_complete, noData: row.no_data, partialReason: row.partial_reason,
     providerRowCount: row.provider_row_count, storedRowCount: row.stored_row_count, byteCount: row.byte_count, expiresAt: row.expires_at.toISOString() };
-}
-
-function projectRetainedScope(row: RetainedScopeRow): DefenderHuntingRetainedScope {
-  return { id: row.id, resultScope: projectResultScope(row), tokenMode: row.token_mode, capabilityId: row.capability_id,
-    templateId: row.template_id, targetScopeHash: row.target_scope_hash, approvedScope: row.approved_scope, queryVersion: row.query_version,
-    contractRevision: row.contract_revision, permissionRevision: row.permission_revision, configurationRevision: Number(row.configuration_revision),
-    approvedBy: row.approved_by, sourceQualificationJobId: row.source_qualification_job_id, approvedAt: row.approved_at.toISOString(),
-    qualifiedAt: row.qualified_at.toISOString(), expiresAt: row.expires_at.toISOString(), revokedAt: row.revoked_at?.toISOString() ?? null };
 }
 
 function range(start: Date | null, end: Date | null) {

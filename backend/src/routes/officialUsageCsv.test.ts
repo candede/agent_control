@@ -87,8 +87,11 @@ describe("persisted official usage CSV HTTP contracts", () => {
     await vi.waitFor(async () => {
       const audits = await fixture.database.runtime.query(`SELECT action,status,scope,metadata FROM audit_events
         WHERE tenant_id=$1 AND operation_id=$2 ORDER BY id LIMIT 250`, [fixture.identity.tenantId, `data-export:${id}`]);
-      expect(audits.rows).toHaveLength(4);
+      expect(audits.rows).toHaveLength(5);
       expect(audits.rows.filter(row => row.status === "started")).toHaveLength(2);
+      expect(audits.rows.filter(row => row.status === "inconclusive")).toMatchObject([{
+        metadata: { phase: "download", rowCount: rows.length, resultingBytes: status!.bytes },
+      }]);
       const completed = audits.rows.filter(row => row.status === "succeeded");
       expect(completed).toHaveLength(2);
       for (const audit of completed) expect(audit).toMatchObject({

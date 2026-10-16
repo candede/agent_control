@@ -197,8 +197,8 @@ function evidenceFixture(kind: EvidencePublication) {
     : kind === "operation"
       ? service.observeOperation("graph.licenses.read", actor, async () => "business-result", { signal: controller.signal })
       : kind === "audit"
-        ? service.recordAuditQualificationEvidence("purview.audit.search.delegated", actor, "available", {}, undefined, controller.signal)
-        : service.recordHuntingQualificationEvidence("defender.hunting.delegated", actor, "available", {}, undefined, controller.signal);
+        ? service.recordAuditProviderEvidence("purview.audit.search.delegated", actor, "available", {}, undefined, controller.signal)
+        : service.recordHuntingProviderEvidence("defender.hunting.delegated", actor, "available", {}, undefined, controller.signal);
   return { actor, service, controller, publish, started, held, client, clientQuery, original, persisted: () => persisted };
 }
 

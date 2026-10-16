@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { config } from "../config.js";
 import { AppError } from "../errors.js";
 import { capabilities } from "../services/capabilities.js";
 import { copilotStudioQuarantineControl } from "../services/copilotStudioQuarantineControl.js";
@@ -9,7 +10,9 @@ vi.mock("../middleware/auth.js", async original => ({
   ...await original<typeof import("../middleware/auth.js")>(),
   requireSession: (_request: Request, _response: Response, next: () => void) => next(),
 }));
-afterEach(() => vi.restoreAllMocks());
+const tenants = config.tenants;
+beforeEach(() => { config.tenants = [{ tenantId: "tenant-a", clientId: "api-a", clientSecret: "synthetic", domains: ["example.invalid"] }]; });
+afterEach(() => { config.tenants = tenants; vi.restoreAllMocks(); });
 
 const snapshotId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const nativeId = "Native-Agent";
@@ -24,7 +27,7 @@ const status = {
 function invoke(path: string, method: "get" | "post", roles = ["AgentControl.Admin"], csrf = true) {
   const route = copilotStudioQuarantineRouter.stack.find(layer => layer.route?.path === path && layer.route.methods[method])!.route!;
   const request = {
-    session: { user: { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator",
+    session: { tenantId: "tenant-a", clientId: "api-a", accountId: "operator-a", user: { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator",
       username: "operator@example.invalid", roles }, csrfToken: "synthetic-csrf" },
     query: { snapshotId, nativeId },
     body: { action: "quarantine", snapshotId, resourceNativeIds: [nativeId], confirmationHash: "e".repeat(64) },

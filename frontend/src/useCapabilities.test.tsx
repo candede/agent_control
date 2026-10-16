@@ -18,7 +18,8 @@ const user: SessionUser = {
 
 function available(expiresAt = new Date(Date.now() + 60_000).toISOString(), capabilityId: CapabilityId = "graph.package.read.delegated"): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(definition => definition.id === capabilityId)!,
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === capabilityId)!,
+    ...(capabilityId.endsWith(".application") ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
     decision: {
       capabilityId,
       status: "available",

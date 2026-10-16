@@ -53,19 +53,16 @@ describe("package selection session state", () => {
     expect(restorePackageSelection(reader, 1)).toEqual({ status: "unavailable" });
   });
 
-  it("handles denied storage access and clears current and legacy records only for its owner", () => {
+  it("handles denied storage access and clears selections only for their owner", () => {
     const other = { ...reader, tenantId: "tenant-2" };
     expect(storePackageSelection(reader, ["package-1"])).toBe(true);
     expect(storePackageSelection(other, ["other-package"])).toBe(true);
-    const legacyKey = `agent-control:package-selection:v1:${encodeURIComponent(`${reader.tenantId}:${reader.homeAccountId}`)}`;
-    window.sessionStorage.setItem(legacyKey, "old-selection");
     vi.spyOn(Storage.prototype, "getItem").mockImplementationOnce(() => { throw new DOMException("Storage denied.", "SecurityError"); });
     expect(restorePackageSelection(reader, 1)).toEqual({ status: "unavailable" });
     clearPackageSelection(undefined);
     clearPackageSelection(reader);
     clearPackageSelection(reader);
     expect(restorePackageSelection(reader, 1)).toEqual({ status: "unavailable" });
-    expect(window.sessionStorage.getItem(legacyKey)).toBeNull();
     expect(restorePackageSelection(other, 1)).toEqual({ status: "restored", ids: ["other-package"] });
   });
 

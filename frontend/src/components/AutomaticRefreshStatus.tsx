@@ -2,16 +2,15 @@ import { useCallback, useRef } from "react";
 import type { AutomaticRefreshStatus as RefreshStatus } from "../useAutomaticRefresh";
 import "./automaticRefresh.css";
 
-export function AutomaticRefreshStatus({ status, onOpenSync, onOpenPermissions }: {
+export function AutomaticRefreshStatus({ status, onOpenPermissions }: {
   status: RefreshStatus;
-  onOpenSync: () => void;
   onOpenPermissions: () => void;
 }) {
   const pauseButton = useRef<HTMLButtonElement>(null);
-  const signInLink = useCallback((link: HTMLAnchorElement | null) => {
-    if (!link) return;
+  const recoveryControl = useCallback((control: HTMLAnchorElement | HTMLButtonElement | null) => {
+    if (!control) return;
     return () => {
-      if (document.activeElement === link) pauseButton.current?.focus();
+      if (document.activeElement === control) pauseButton.current?.focus();
     };
   }, []);
   const signInRequired = status.phase === "sign_in_required";
@@ -37,12 +36,12 @@ export function AutomaticRefreshStatus({ status, onOpenSync, onOpenPermissions }
       <p>Users and inventory every 15 minutes; package details hourly. Checks run about every minute while this page is visible and online.</p>
     </div>
     <div className="automatic-refresh-actions">
-      {signInRequired ? <a ref={signInLink} href="/api/auth/login">Sign in again</a> : null}
+      {signInRequired ? <a ref={recoveryControl} href="/api/auth/login">Sign in again</a> : null}
       <button ref={pauseButton} type="button" className="secondary" onClick={() => status.setPaused(!status.paused)}>
         {status.paused ? "Resume automatic refresh" : "Pause automatic refresh"}
       </button>
-      <button type="button" className="secondary" onClick={onOpenSync}>View sync status</button>
-      <button type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button>
+      {status.phase === "permission_required"
+        ? <button ref={recoveryControl} type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button> : null}
     </div>
   </section>;
 }

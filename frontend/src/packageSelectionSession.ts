@@ -76,7 +76,6 @@ export function clearPackageSelection(user: SessionUser | undefined) {
   const owner = selectionOwner(user);
   try {
     window.sessionStorage.removeItem(storageKey(user));
-    window.sessionStorage.removeItem(`agent-control:package-selection:v1:${encodeURIComponent(owner)}`);
     failedClears.delete(owner);
   } catch {
     // Denied cleanup must not revive retired targets when storage becomes readable again.

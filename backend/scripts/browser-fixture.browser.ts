@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { type Server } from "node:http";
 import { resolve } from "node:path";
+import type { AuthenticationResult } from "@azure/msal-node";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { testDatabase, fixturePassword } from "./testDatabase.js";
 import { browserFixtureFilePattern, browserFixtureTestFiles, closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
@@ -32,6 +33,8 @@ import { packageInventory } from "../src/services/packageInventory.js";
 import { powerPlatformInventory } from "../src/services/powerPlatformInventory.js";
 import { savedReadBrowserFixture } from "./savedReadBrowserFixture.js";
 import { DataSyncRepository } from "../src/db/dataSync.js";
+import { UserSourceProvider } from "../src/services/userSourceProvider.js";
+import { buildCopilotReportUrl, reportHeaders } from "../src/services/userSourceGraphFields.js";
 
 await vi.hoisted(async () => {
   const { configureBrowserFixtureEnvironment } = await import("./fixtureSupport.js");
@@ -46,6 +49,20 @@ await vi.hoisted(async () => {
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, { scenario: string; tenantId: string; username: string }>() }));
 vi.mock("../src/auth/msal.js", async original => {
   const actual = await original<typeof import("../src/auth/msal.js")>();
+  const fixtureResult = (tenantId: string, accountId: string): AuthenticationResult => {
+    const scenario = accountId.replace(/^fixture-/, "");
+    const roles = scenario === "missing_internal_role" ? [] : scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${scenario.slice(5)}`)) : [...appRoles];
+    const username = `fixture@${config.tenants.find(profile => profile.tenantId === tenantId)!.domains[0]}`;
+    const claims = { tid: tenantId, oid: accountId, preferred_username: username, roles,
+      wids: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
+    return {
+      authority: `https://login.microsoftonline.com/${tenantId}`, uniqueId: accountId, tenantId,
+      scopes: ["openid", "profile"], account: { homeAccountId: accountId, localAccountId: accountId, tenantId,
+        environment: "login.microsoftonline.com", username, name: "Synthetic account", idTokenClaims: claims },
+      idToken: "synthetic-browser-identity", idTokenClaims: claims, accessToken: accountId,
+      fromCache: false, expiresOn: new Date(Date.now() + 3600_000), tokenType: "Bearer", correlationId: "",
+    };
+  };
   return {
     ...actual,
     createAuthorizationUrl: async (flow: ReturnType<typeof actual.createAuthFlow>) => {
@@ -54,23 +71,18 @@ vi.mock("../src/auth/msal.js", async original => {
       return `/api/auth/callback?state=${flow.state}&code=${flow.state}`;
     },
     redeemAuthorizationCode: async (code: string) => identity.scenarios.get(code),
-    toAuthenticatedUser: (result: { scenario: string; tenantId: string; username: string }) => {
+    toAuthenticatedUser: (result: AuthenticationResult | { scenario: string; tenantId: string; username: string }) => {
+      if (!("scenario" in result)) return actual.toAuthenticatedUser(result);
       const roles = result.scenario === "missing_internal_role" ? [] : result.scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${result.scenario.slice(5)}`)) : [...appRoles];
       return { tenantId: result.tenantId, homeAccountId: `fixture-${result.scenario}`, displayName: "Synthetic account", username: result.username, roles,
         providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
     },
-    acquireDelegatedToken: async (_tenantId: string, accountId: string) => {
+    acquireDelegatedTokenResult: async (tenantId: string, accountId: string) => {
       if (accountId === "fixture-missing_permission" || accountId === "fixture-missing_delegated_grant") throw new AppError(403, "missing_permission", "Synthetic missing permission");
-      return accountId;
+      return fixtureResult(tenantId, accountId);
     },
     acquireApplicationToken: async () => "fixture-application",
-    revalidateAuthenticatedUser: async (tenantId: string, accountId: string) => {
-      const scenario = accountId.replace(/^fixture-/, "");
-      const roles = scenario === "missing_internal_role" ? [] : scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${scenario.slice(5)}`)) : [...appRoles];
-      return { tenantId, homeAccountId: accountId, displayName: "Synthetic account",
-        username: `fixture@${config.tenants.find(profile => profile.tenantId === tenantId)!.domains[0]}`, roles,
-        providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
-    },
+    revalidateAuthenticatedUserResult: async (tenantId: string, accountId: string) => fixtureResult(tenantId, accountId),
     evictAccount: async () => undefined,
   };
 });
@@ -136,6 +148,20 @@ beforeAll(async () => {
   });
   vi.spyOn(GraphPackagesClient.prototype, "getPackageDetails").mockResolvedValue({ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [], sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {} });
   vi.spyOn(DirectoryPrincipalsClient.prototype, "search").mockResolvedValue([]);
+  const directory = UserSourceProvider.prototype.directory;
+  const activity = UserSourceProvider.prototype.activity;
+  const users = new UserSourceProvider(async input => {
+    const url = new URL(String(input));
+    if (url.origin === "https://graph.microsoft.com"
+      && ["/v1.0/subscribedSkus", "/v1.0/users"].includes(url.pathname)) {
+      return new Response(JSON.stringify({value:[],"@odata.count":0}), {headers:{"Content-Type":"application/json"}});
+    }
+    if (url.href === buildCopilotReportUrl()) return new Response(`${reportHeaders.join(",")}\n`,
+      {headers:{"Content-Type":"text/csv"}});
+    throw new Error("Unexpected synthetic user-source request.");
+  });
+  vi.spyOn(UserSourceProvider.prototype, "directory").mockImplementation((...args) => directory.apply(users,args));
+  vi.spyOn(UserSourceProvider.prototype, "activity").mockImplementation((...args) => activity.apply(users,args));
   vi.spyOn(PowerPlatformResourceQueryClient.prototype, "checkAccess").mockResolvedValue(undefined);
   vi.spyOn(PowerPlatformResourceQueryClient.prototype, "pages").mockImplementation(async function* (token, types, options) {
     options.signal?.throwIfAborted();
@@ -213,10 +239,18 @@ afterAll(() => closeFixtureResources(
   () => { vi.unstubAllGlobals(); },
   () => { vi.restoreAllMocks(); },
 ));
-it("qualifies packaged browser workflows through Chromium and axe", async ({ signal }) => {
+const browserRuns = selectedBrowserFiles.length
+  ? [{ name: "selected workflows", project: undefined }]
+  : ["desktop", "mobile"].map(project => ({ name: `${project} workflows`, project }));
+for (const run of browserRuns) it(`qualifies packaged ${run.name} through Chromium and axe`, async ({ signal }) => {
+  const evidence = process.env.PLAYWRIGHT_EVIDENCE_DIR;
   const exitCode = await new Promise<number | null>((done, reject) => {
     const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts",
-      ...selectedBrowserFiles.map(browserFixtureFilePattern)], { stdio: "inherit", env: process.env, signal });
+      ...(run.project ? ["--project", run.project] : []), ...selectedBrowserFiles.map(browserFixtureFilePattern)], {
+      stdio: "inherit", env: { ...process.env,
+        ...(run.project && evidence ? { PLAYWRIGHT_EVIDENCE_DIR: `${evidence}/${run.project}` } : {}),
+      }, signal,
+    });
     child.once("error", reject); child.once("exit", done);
   });
   if (exitCode !== 0) {
@@ -231,11 +265,14 @@ it("qualifies packaged browser workflows through Chromium and axe", async ({ sig
   }
   expect(exitCode).toBe(0);
   expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows[0].count).toBe(0);
+});
+if (!selectedBrowserFiles.length) it("verifies full-browser persistence and exact native provider counts", async () => {
   // The report restart and quarantine mutation postconditions belong to the full browser campaign.
-  if (selectedBrowserFiles.length) return;
+  const reportTenant = config.tenants.find(tenant => tenant.domains.includes("csv-desktop.example.invalid"));
+  if (!reportTenant) throw new Error("Synthetic desktop CSV tenant is required for persisted report qualification.");
   const reportReader = new LargeTenantUsersReports(fixture.runtime, config.sessionSecret, config.officialUsageStaleDays);
-  const reportScope = await reportIdentity(fixture.runtime, { tenantId: config.tenants[0].tenantId, homeAccountId: "browser-restart-observer",
-    username: "fixture@example.invalid", displayName: "Synthetic observer", roles: ["AgentControl.Admin"] });
+  const reportScope = await reportIdentity(fixture.runtime, { tenantId: reportTenant.tenantId, homeAccountId: "browser-restart-observer",
+    username: "fixture@csv-desktop.example.invalid", displayName: "Synthetic observer", roles: ["AgentControl.Admin"] });
   const beforeRestart = await officialReportFingerprint(reportReader, reportScope);
 
   await closeFixtureResources(() => closeFixtureServer(server), () => reportRuntime(fixture.runtime).drain(), () => application.store.close());

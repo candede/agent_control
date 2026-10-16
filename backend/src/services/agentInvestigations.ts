@@ -1,7 +1,6 @@
 import { AppError } from "../errors.js";
 import { createHash } from "node:crypto";
 import type { AgentIdentityCacheStatus, AgentInvestigationContext, AgentInvestigationReasonCode, AgentInvestigationScope, AgentPurviewTarget } from "../types/agentInvestigations.js";
-import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestigations.js";
 import { AgentIdentityRepository, type AgentIdentityCacheState, type AgentIdentitySource } from "../db/agentIdentity.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
@@ -49,20 +48,19 @@ export class AgentInvestigationsService {
     const commonReason = unsupported ? "Provider-native logs may exist, including for Agent Builder, but a verified crosswalk from this saved agent's ResourceQuery or package identities is unavailable."
       : uncertain ? "Saved identity metadata is ambiguous or conflicting. Refresh and resolve the agent identity first."
       : !current ? "A current authorized Power Platform agent identity is required. Refresh Agents first." : undefined;
-    const exactIds = (kind: "entra_app_id" | "cds_bot_id" | "entra_agent_id") => {
+    const exactIds = (kind: "cds_bot_id" | "entra_agent_id") => {
       const values = record.native?.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value) ?? [];
       if (values.some(id => !isDirectoryObjectId(id) || id === "00000000-0000-0000-0000-000000000000")) return [];
       return [...new Set(values.map(id => id.toLowerCase()))];
     };
-    const applicationIds = exactIds("entra_app_id");
     const bots = exactIds("cds_bot_id");
     const agentIds = exactIds("entra_agent_id");
-    const candidates = !commonReason && (applicationIds.length === 1 || bots.length === 1 || agentIds.length === 1)
+    const candidates = !commonReason && (bots.length === 1 || agentIds.length === 1)
       ? await this.identities.identityCandidates(scope, record, read).catch(error => {
         if (error instanceof AppError && error.code === "snapshot_invalidated") throw sourceChanged();
         throw error;
       }) : [];
-    const unambiguous = (kind: "entra_app_id" | "cds_bot_id" | "entra_agent_id", ids: string[]) => {
+    const unambiguous = (kind: "cds_bot_id" | "entra_agent_id", ids: string[]) => {
       if (!resource || ids.length !== 1) return false;
       const match = resolveExactInventoryIdentity({ tenantId: resource.tenantId, nativeId: resource.nativeId,
         environmentId: resource.environmentId, sourceSystem: "power_platform", resourceType: resource.type,
@@ -93,10 +91,10 @@ export class AgentInvestigationsService {
       ])).digest("hex"),
     } : undefined;
     const savedCache: AgentIdentityCacheState = identitySource ? await this.mappings.readState(scope, identitySource, read.client) : { status: "source_unavailable" };
-    return { record, resource, observation, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
+    return { record, resource, current, commonReason, commonReasonCode, bots, unambiguous,
       identitySource, savedCache, resolutionReason, resolutionCode };
     });
-    const { record, resource, current, commonReason, commonReasonCode, applicationIds, bots, unambiguous,
+    const { record, resource, current, commonReason, commonReasonCode, bots, unambiguous,
       identitySource, savedCache, resolutionReason, resolutionCode } = loaded;
     if (current) {
       try { await this.inventory.assertCurrent(scope, record.id, record.revision); }
@@ -113,21 +111,12 @@ export class AgentInvestigationsService {
     const savedReasonCode = resolutionCode ?? cacheReasons[cache.status]?.reasonCode;
     const inventoryReason = mapping ? undefined : commonReason ?? savedReason
       ?? "Defender inventory requires a verified enterprise-application object ID. Explicitly resolve the saved Entra identity first.";
-    const applicationProvenance = resource?.provenance?.entraAppId;
-    const legacyAvailable = applicationIds.length === 1 && unambiguous("entra_app_id", applicationIds)
-      && applicationProvenance?.sourceSystem === "power_platform" && applicationProvenance.path === "properties.entraAppId";
-    const verifiedClientId = mapping?.runtimeProvenance === verifiedAgentIdentityClientIdProvenance
-      && mapping.applicationId === mapping.objectId;
-    const runtimeIds = mapping ? verifiedClientId ? [mapping.objectId] : [] : legacyAvailable ? applicationIds : [];
-    const runtimeReason = commonReason ?? (mapping && !verifiedClientId
-      ? "This cached mapping lacks verified agentIdentity client-ID provenance. Explicitly resolve again; equality is never assumed for ordinary service principals, blueprints or platform IDs."
-      : runtimeIds.length !== 1
-      ? savedReason ?? "Agent activity requires a verified own application/client ID from explicit typed directory resolution or the saved legacy properties.entraAppId. Enterprise object, package, bot and blueprint IDs cannot substitute." : undefined);
+    const runtimeIds = mapping ? [mapping.applicationId] : [];
+    const runtimeReason = mapping ? undefined : commonReason ?? savedReason
+      ?? "Agent activity requires a verified own application/client ID from explicit typed directory resolution. Enterprise object, package, bot and blueprint IDs cannot substitute.";
     const runtimeAvailability = { status: runtimeReason ? "unavailable" as const : "available" as const,
-      ...(runtimeReason ? { reasonCode: commonReasonCode ?? (identitySource && !mapping
-        ? savedReasonCode ?? "identity_resolution_required" as const : "application_identity_unavailable" as const) } : {}),
-      reason: runtimeReason ?? (mapping ? "Verified Entra agentIdentity client ID: its object and client IDs have the same value by the documented contract. This identifies the child agent, not its blueprint, but does not establish comprehensive telemetry coverage."
-        : "Can query by the saved, documented legacy application identity; this does not verify runtime correlation or comprehensive telemetry coverage.") };
+      ...(runtimeReason ? { reasonCode: commonReasonCode ?? savedReasonCode ?? "identity_resolution_required" as const } : {}),
+      reason: runtimeReason ?? "Verified Entra agentIdentity client ID: its object and client IDs have the same value by the documented contract. This identifies the child agent, not its blueprint, but does not establish comprehensive telemetry coverage." };
     const environment = resource?.environmentId;
     const purviewReason = commonReason ?? (bots.length !== 1 || !environment || normalizeEnvironmentIdentity(record.environmentId ?? "") !== normalizeEnvironmentIdentity(environment)
       || !unambiguous("cds_bot_id", bots)
@@ -137,15 +126,15 @@ export class AgentInvestigationsService {
       ...(identitySource ? { identitySource } : {}),
       context: {
         recordId: record.id, displayName: record.displayName,
-        defender: { status: mapping || !runtimeReason ? "available" : "unavailable",
-          ...(!mapping && runtimeReason ? { reason: savedReason ?? runtimeReason, reasonCode: savedReasonCode ?? "identity_resolution_required" as const } : {}),
-          entraAgentIds: mapping ? [mapping.objectId] : [], entraAgentApplicationIds: runtimeReason ? [] : runtimeIds,
+        defender: { status: mapping ? "available" : "unavailable",
+          ...(!mapping ? { reason: savedReason ?? runtimeReason, reasonCode: savedReasonCode ?? "identity_resolution_required" as const } : {}),
+          entraAgentIds: mapping ? [mapping.objectId] : [], entraAgentApplicationIds: runtimeIds,
           resolution: { canResolve: Boolean(identitySource), capabilityId: "graph.agentIdentity.read", cacheStatus: cache.status,
             ...(cache.checkedAt ? { lastCheckedAt: cache.checkedAt } : {}),
             ...(cache.expiresAt ? { expiresAt: cache.expiresAt } : {}),
             ...(cache.lastErrorCode ? { lastErrorCode: cache.lastErrorCode } : {}),
-            ...(mapping ? { resolvedAt: mapping.checkedAt, runtimeStatus: verifiedClientId ? "available" : "unverified",
-              ...(verifiedClientId ? { runtimeProvenance: verifiedAgentIdentityClientIdProvenance } : {}) }
+            ...(mapping ? { resolvedAt: mapping.checkedAt, runtimeStatus: mapping.runtimeStatus,
+              runtimeProvenance: mapping.runtimeProvenance }
               : { reason: savedReason ?? "Explicit delegated directory resolution is required; opening this context does not contact Graph.",
                 reasonCode: savedReasonCode ?? "identity_resolution_required" }) },
           templates: { agents_inventory: { status: mapping ? "available" : "unavailable",
@@ -153,9 +142,10 @@ export class AgentInvestigationsService {
           agent_activity: runtimeAvailability, agent_tools: runtimeAvailability } },
         purview: { status: purviewReason ? "unavailable" : "available",
           ...(purviewReason ? { reason: purviewReason, reasonCode: commonReasonCode ?? "purview_identity_unavailable" as const } : {}),
-          mode: "search", presets: purviewReason ? [] : legacyAvailable ? ["copilot_interactions", "copilot_studio_admin"] : ["copilot_studio_admin"] },
+          mode: "search", presets: purviewReason ? [] : mapping ? ["copilot_interactions", "copilot_studio_admin"] : ["copilot_studio_admin"] },
       },
-      ...(!purviewReason ? { purviewTarget: { environmentId: normalizeEnvironmentIdentity(environment!), botId: bots[0] } } : {}),
+      ...(!purviewReason ? { purviewTarget: { environmentId: normalizeEnvironmentIdentity(environment!), botId: bots[0],
+        ...(mapping ? { applicationId: mapping.applicationId } : {}) } } : {}),
     };
   }
 
@@ -186,7 +176,7 @@ export function bindAgentHuntingFilters(value: unknown, scope: AgentInvestigatio
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new AppError(400, "invalid_hunting_filters", "Hunting filters must be a structured object.");
   const input = value as Record<string, unknown>;
   const applications = scope.entraAgentApplicationIds ?? [];
-  const invalidLegacyIdentity = ["agentIds", "blueprintIds", "actorObjectIds"].some(key =>
+  const invalidIdentityOverride = ["agentIds", "blueprintIds", "actorObjectIds"].some(key =>
     input[key] !== undefined && (!Array.isArray(input[key]) || input[key].length !== 0));
   const mismatchedEntraIdentity = [["entraAgentIds", scope.entraAgentIds], ["entraAgentApplicationIds", applications]].some(([key, ids]) => {
     const supplied = input[key as string];
@@ -194,7 +184,7 @@ export function bindAgentHuntingFilters(value: unknown, scope: AgentInvestigatio
     return supplied !== undefined && (!Array.isArray(supplied) || supplied.length !== 0
       && (supplied.length !== expected.length || supplied.some((id, index) => typeof id !== "string" || id.toLowerCase() !== expected[index])));
   });
-  if (invalidLegacyIdentity || mismatchedEntraIdentity) {
+  if (invalidIdentityOverride || mismatchedEntraIdentity) {
     throw new AppError(400, "agent_identity_override", "Agent investigation identities are derived from current saved inventory, not caller-supplied filters.");
   }
   if (input.templateId === "agents_inventory" ? scope.entraAgentIds.length !== 1 : applications.length !== 1) {

@@ -52,17 +52,17 @@ def owned_volume_bytes(pg, record):
     return None
 
 
-def build(directory, project):
-    if docker("image", "inspect", "--format", "{{.Id}}", BASELINE).stdout.strip() != BASELINE_ID:
+def build(directory, project, baseline=BASELINE, baseline_id=BASELINE_ID):
+    if docker("image", "inspect", "--format", "{{.Id}}", baseline).stdout.strip() != baseline_id:
         raise RuntimeError("protected_baseline_identity")
     if docker("image", "inspect", "--format", "{{.Id}}", BROWSER).stdout.strip() != BROWSER_ID:
         raise RuntimeError("protected_browser_identity")
-    if docker("image", "inspect", "--format", "{{.Architecture}}", BASELINE).stdout != \
+    if docker("image", "inspect", "--format", "{{.Architecture}}", baseline).stdout != \
             docker("image", "inspect", "--format", "{{.Architecture}}", BROWSER).stdout:
         raise RuntimeError("capacity_browser_architecture")
     proof = docker("run", "--rm", "--network", "none", "--name", project+"-dependency-proof",
                    "--label", "com.docker.compose.project="+project, "--memory", "128m", "--cpus", ".25",
-                   "--volume", f"{directory}/unused-pgdata:/var/lib/postgresql/data", "--entrypoint", "node", BASELINE,
+                   "--volume", f"{directory}/unused-pgdata:/var/lib/postgresql/data", "--entrypoint", "node", baseline,
                    "-e", 'const fs=require("node:fs"),c=require("node:crypto");console.log(JSON.stringify(Object.fromEntries('
                    '["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(p=>'
                    '[p,c.createHash("sha256").update(fs.readFileSync("/app/"+p)).digest("hex")]))))')
@@ -82,7 +82,7 @@ def build(directory, project):
     save(directory / "runtime-source-expected.json", expected)
     # No dependency installation and no network during build.
     recipe = directory / "Dockerfile"
-    recipe.write_text(f"FROM {BASELINE} AS application\n"
+    recipe.write_text(f"FROM {baseline} AS application\n"
                       "RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans\n"
                       "COPY backend /app/backend\nCOPY frontend /app/frontend\nCOPY scripts /app/scripts\n"
                       "COPY docs /app/docs\nCOPY compose.yaml compose.large-tenant-test.yaml /app/\n"
@@ -97,10 +97,10 @@ def build(directory, project):
             subprocess.run(["docker", "build", "--network", "none", "--target",target,"-f", str(recipe), "-t", tag, str(ROOT)],
                            cwd=ROOT, env=ENV, stdout=log, stderr=subprocess.STDOUT, check=True)
     save(directory / "image.json", {"tag": image, "id": docker("image", "inspect", "--format", "{{.Id}}", image).stdout.strip(),
-                                   "baseline": BASELINE_ID})
+                                   "baseline": baseline_id})
     save(directory / "controller-image.json", {"tag": controller_image,
         "id": docker("image", "inspect", "--format", "{{.Id}}", controller_image).stdout.strip(),
-        "browserBaseline": BROWSER_ID,"applicationBaseline": BASELINE_ID})
+        "browserBaseline": BROWSER_ID,"applicationBaseline": baseline_id})
     for tag,prefix in ((image,""),(controller_image,"controller-")):
         actual = docker("run", "--rm", "--network", "none", "--name", project+"-"+prefix+"source-proof",
                         "--label", "com.docker.compose.project="+project, "--memory", "128m", "--cpus", ".25",
@@ -275,9 +275,9 @@ def verify_effective_postgres(text):
     return observed
 
 
-def run(mode):
+def run(mode, baseline=BASELINE, baseline_id=BASELINE_ID):
     receipts = []
-    for attempt in range(1 if mode in ("query", "probe") else 3):
+    for attempt in range(1 if mode in ("query", "probe", "web") else 3):
         identity = uuid.uuid4().hex
         project = "agent-control-ltdp-" + identity
         directory = ROOT / "artifacts" / "large-tenant-data-platform" / identity
@@ -288,7 +288,7 @@ def run(mode):
         commands = []
         compose = None
         try:
-            image,controller_image = build(directory, project)
+            image,controller_image = build(directory, project, baseline, baseline_id)
             compose, control = fixture(directory, project, image,controller_image)
             docker(*compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
             owned = snapshot(directory, project, "before")
@@ -307,7 +307,11 @@ def run(mode):
             app = owned["test-db"]["Id"]
             ready = docker("exec", app, "node", "-e", "fetch('http://controller:8080/ready').then(r=>{if(!r.ok)process.exit(1);return r.text()}).then(console.log)")
             (directory / "provider-ready.json").write_text(ready.stdout)
-            save(directory / "engine.json", json.loads(docker("info", "--format", "{{json .}}").stdout))
+            engine_format = ('{"ServerVersion":{{json .ServerVersion}},"Architecture":{{json .Architecture}},'
+                             '"OSType":{{json .OSType}},"OperatingSystem":{{json .OperatingSystem}},'
+                             '"MemTotal":{{json .MemTotal}},"NCPU":{{json .NCPU}},'
+                             '"CgroupVersion":{{json .CgroupVersion}},"Driver":{{json .Driver}}}')
+            save(directory / "engine.json", json.loads(docker("info", "--format", engine_format).stdout))
             host = subprocess.run(["sh", "-c", "sysctl hw.memsize hw.logicalcpu; df -Pk ."], cwd=ROOT,
                                   text=True, capture_output=True)
             (directory / "host-resources.txt").write_text(host.stdout+host.stderr)
@@ -335,7 +339,7 @@ def run(mode):
                     monitor = subprocess.Popen(["docker", "exec", owned[service]["Id"], "sh", "-c", sample],
                                                stdout=handle, stderr=subprocess.STDOUT, env=ENV)
                     monitors.append((service, monitor))
-                for current in (["probe", "query"] if mode == "query" else ["probe"] if mode == "probe" else ["probe", "full"]):
+                for current in (["probe", mode] if mode in ("query", "web") else ["probe"] if mode == "probe" else ["probe", "full"]):
                     commands.append({"mode": current, "exit": run_mode(directory, project, owned, current)})
             finally:
                 for process in log_processes:
@@ -389,9 +393,13 @@ def run(mode):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("query", "probe", "full"), default="full")
+    parser.add_argument("--mode", choices=("query", "probe", "full", "web"), default="full")
+    parser.add_argument("--baseline-image", default=BASELINE)
+    parser.add_argument("--baseline-image-id", default=BASELINE_ID)
     args = parser.parse_args()
     for key in os.environ:
         if re.match(r"^(PG|APP_PG|TENANT|CLIENT_|SESSION_SECRET)", key) and os.environ[key]:
             raise RuntimeError(f"capacity_fixture_rejects_inherited_{key}")
-    raise SystemExit(run(args.mode))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]{0,200}", args.baseline_image) or not re.fullmatch(r"sha256:[a-f0-9]{64}", args.baseline_image_id):
+        parser.error("An explicit local image and exact SHA-256 identity are required.")
+    raise SystemExit(run(args.mode, args.baseline_image, args.baseline_image_id))

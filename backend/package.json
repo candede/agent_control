@@ -21,14 +21,17 @@
     "express": "^5.2.1",
     "express-session": "^1.18.2",
     "helmet": "^8.1.0",
-    "multer": "^2.3.0",
+    "jsonwebtoken": "9.0.3",
+    "multer": "^2.4.0",
     "pg": "^8.16.3"
   },
   "devDependencies": {
     "@kusto/language-service-next": "12.4.1",
+    "@playwright/test": "1.58.2",
     "@types/connect-pg-simple": "^7.0.3",
     "@types/express": "^5.0.6",
     "@types/express-session": "^1.18.2",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.2.0",
     "@types/node": "^24.13.2",
     "@types/pg": "^8.15.6",

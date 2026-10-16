@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router, type Request } from "express";
 import type pg from "pg";
 import { config, getTenantConfiguration } from "../config.js";
@@ -73,10 +74,10 @@ export function createInventoryDataRouter(database: pg.Pool) {
   async function packageReader(request: Request, requestedMode: unknown) {
     const mode = requestedMode ?? "delegated";
     if (mode !== "delegated" && mode !== "application") throw new AppError(400, "invalid_token_mode", "Use delegated or application mode.");
-    const identity = await reportIdentity(database, request.session.user!);
+    const identity = await reportIdentity(database, requestUser(request));
     let applicationScope;
     if (mode === "application") {
-      await capabilities.requireApplicationDataScope("graph.package.read.application", request.session.user!);
+      await capabilities.requireApplicationDataScope("graph.package.read.application", requestUser(request));
       applicationScope = { tenantId: identity.tenantId, principalId: getTenantConfiguration(identity.tenantId).clientId };
     }
     const packages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, applicationScope,
@@ -95,14 +96,14 @@ export function createInventoryDataRouter(database: pg.Pool) {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
   }, async (request, response) => {
     const query = capturedQuery(request);
-    const result = await capture(await reportIdentity(database, request.session.user!), query);
+    const result = await capture(await reportIdentity(database, requestUser(request)), query);
     response.status("state" in result ? 200 : 201).json(result);
   });
   policyRoute(router, "get", "/agent-inventory/health", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     if (Object.keys(request.query).length) throw new AppError(400, "invalid_inventory_query", "Workspace health does not accept selection IDs or filters.");
-    const identity = await reportIdentity(database, request.session.user!);
+    const identity = await reportIdentity(database, requestUser(request));
     const selected = await capture(identity, {});
     response.setHeader("Cache-Control", "no-store");
     if ("state" in selected) { response.json(selected); return; }
@@ -130,7 +131,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
       || Object.keys(body).some(key => !["selectionId", "ids", "recordIds"].includes(key))) {
       throw new AppError(400, "invalid_inventory_query", "Select current inventory targets without a client-expanded target list.");
     }
-    const user = request.session.user!, owner = requestScope(request);
+    const user = requestUser(request), owner = requestScope(request);
     const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
     const validateCapability = capabilities.beginOperationValidation("graph.package.read.delegated", user);
     const assertCurrent = () => {
@@ -139,7 +140,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
       requireProviderAdmissions();
     };
     assertCurrent();
-    const identity = await reportIdentity(database, request.session.user!);
+    const identity = await reportIdentity(database, requestUser(request));
     assertCurrent();
     const job = await commitAccountSessionValidation(validation, () => new PackageRefreshJobs(database).submitSelected(
       { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: "delegated" }, identity, {
@@ -150,7 +151,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     response.status(202).json(job);
   });
   async function selected(request: Request, dependent = false, extra: string[] = [], unfiltered = false) {
-    const identity = await reportIdentity(database, request.session.user!);
+    const identity = await reportIdentity(database, requestUser(request));
     const allowed = ["selectionId", "limit", "cursor", ...extra, ...dependent ? [] : filterFields];
     for (const [key, value] of Object.entries(request.query)) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported inventory query field: ${key}.`);
@@ -221,10 +222,10 @@ export function createInventoryDataRouter(database: pg.Pool) {
       || request.query.mode !== undefined && !["delegated", "application"].includes(String(request.query.mode))) {
       throw new AppError(400, "invalid_inventory_query", "Use the exact saved inventory selection and token mode.");
     }
-    const identity = await reportIdentity(database, request.session.user!);
+    const identity = await reportIdentity(database, requestUser(request));
     let applicationScope;
     if (request.query.mode === "application") {
-      await capabilities.requireApplicationDataScope("graph.package.read.application", request.session.user!);
+      await capabilities.requireApplicationDataScope("graph.package.read.application", requestUser(request));
       applicationScope = { tenantId: identity.tenantId, principalId: getTenantConfiguration(identity.tenantId).clientId };
     }
     const selectedPackages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, applicationScope);
@@ -270,6 +271,17 @@ export function createInventoryDataRouter(database: pg.Pool) {
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     response.json(await inventory.sections(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
       { ...read.options, sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512) }));
+  });
+  policyRoute(router, "get", "/agent-inventory/:recordId/about", {
+    access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    const read = await selected(request, true, ["sourceScopeId", "sourceIdentity", "field"]);
+    const sourceScopeId = scalar(request.query.sourceScopeId, "sourceScopeId", 36);
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
+    const field = scalar(request.query.field, "field", 16);
+    if (field !== "long" && field !== "short" && field !== "native") throw new AppError(400, "invalid_inventory_query", "Use long, native or short About text.");
+    response.json(await inventory.about(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+      { sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512), field, cursor: read.options.cursor }));
   });
   policyRoute(router, "get", "/agents", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],

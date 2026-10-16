@@ -126,7 +126,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
         <button key={value} type="button" className="metric agent-overview-filter" aria-label={label} aria-pressed={filters.cohort === value}
           aria-description={`${read.loading && !data ? "Loading" : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating" : usageCount(data?.summary[metric])}. ${description}`}
           onClick={() => setFilters({ ...filters, cohort: filters.cohort === value ? "licensed" : value })}><span title={label}>{label}</span><strong>{read.loading && !data
-            ? <span className="skeleton-block skeleton-count" aria-label="Loading count" />
+            ? <span className="skeleton-block skeleton-count" aria-hidden="true" />
             : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating..." : usageCount(data?.summary[metric])}</strong>
           <small title={description}>{description}</small></button>)}{reportContext}</div>
     {directoryProgress ? <p className="reported-users-note" role="status">{directoryProgress}</p>

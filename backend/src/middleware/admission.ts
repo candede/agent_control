@@ -12,8 +12,8 @@ export const apiAdmission: RequestHandler = (request, response, next) => {
   }
   const now = Date.now();
   const operation = ["GET", "HEAD", "OPTIONS"].includes(request.method) ? "read" : "write";
-  const principal = request.session?.accountId;
-  const tenant = request.session?.tenantId;
+  const principal = request.authentication?.principal.principalId ?? request.session?.accountId;
+  const tenant = request.authentication?.principal.tenantId ?? request.session?.tenantId;
   try {
     admit(`ip:${request.ip}:${operation}`, operation === "read" ? 1_200 : 300, now, response);
     if (tenant && principal) admit(`principal:${tenant}:${principal}:${operation}`, operation === "read" ? 600 : 200, now, response);

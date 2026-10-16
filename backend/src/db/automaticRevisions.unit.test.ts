@@ -199,13 +199,13 @@ describe("automatic saved-data revision boundaries", () => {
     expect(await f.repository.automaticRevisions(scope)).toEqual(stale);
   });
 
-  it("hashes only current typed heads and scoped people metadata, never predecessor payloads", async () => {
+  it("hashes current typed heads and scoped people revisions without per-record payload reads", async () => {
     const f = fixture();
     await readAutomaticInventoryRevisions(scope, f.database);
     const sql = f.query.mock.calls.map(([text]) => String(text)).join("\n");
     expect(sql).toContain("data_generation_heads");
     expect(sql).toContain("inventory_people_revisions");
-    expect(sql).not.toMatch(/package_inventory_snapshots|power_platform_inventory_snapshots|package_detail_cache|object_id/);
+    expect(sql).not.toMatch(/package_inventory_snapshots|object_id/);
   });
 
   it("scopes empty dataset revisions and rejects missing account scope", async () => {

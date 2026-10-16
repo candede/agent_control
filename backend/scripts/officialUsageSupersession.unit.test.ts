@@ -20,6 +20,7 @@ function databaseFixture(name: string, superseded = false) {
       return { rows: [{ database: name }], rowCount: 1 };
     }
     if (sql === "SELECT transaction_timestamp() AS now") return { rows: [{ now: capturedAt }], rowCount: 1 };
+    if (sql.startsWith("UPDATE operational_state SET mode=")) return { rows: [], rowCount: 1 };
     if (sql.includes("pg_try_advisory_xact_lock")) return { rows: [{ acquired: true }], rowCount: 1 };
     if (sql.includes("pg_try_advisory_lock_shared")) return { rows: [{ acquired: true }],rowCount: 1 };
     if (sql.includes("pg_advisory_unlock_shared")) return { rows: [{ unlocked: true }],rowCount: 1 };
@@ -84,7 +85,7 @@ describe("official usage supersession lifecycle SQL", () => {
   ])("fences restore when current supersession=%s and restored supersession=%s", async (currentSuperseded, restoredSuperseded, safeSets) => {
     const current = databaseFixture("current", currentSuperseded);
     const restored = databaseFixture("restored", restoredSuperseded);
-    await prepareRestoredDatabase(current.database, restored.database, new Date("2026-01-01T00:00:00Z"));
+    await prepareRestoredDatabase(current.database, restored.database);
 
     const [signatureSql] = current.client.query.mock.calls.find(([sql]) =>
       sql.includes("SELECT report_set.id,md5"))!;

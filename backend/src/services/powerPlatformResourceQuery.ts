@@ -26,7 +26,6 @@ const defaultPageSize = 100;
 const maximumConnectors = 200;
 const maximumOperations = 200;
 
-export { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -601,7 +600,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
   };
 }
 
-const sharedProperties = fields("ga", "displayName", "createdAt", "createdBy");
+const sharedProperties = schema(fields("ga", "displayName", "createdAt", "createdBy"), fields("observed", "description"));
 const ownedResourceProperties = fields("ga", "ownerId", "environmentId", "lastModifiedAt", "lastModifiedBy");
 const connectorUsageProperties = fields("preview", "powerPlatformConnectors");
 const resourcePropertySchemas: Record<PowerPlatformResourceType, ReadonlyMap<string, InventoryFieldMaturity>> = {
@@ -659,6 +658,7 @@ function projectionContext(value: unknown, type: PowerPlatformResourceType): Pro
 
 function projectDetails(context: ProjectionContext): PowerPlatformResourceDetails {
   const details: PowerPlatformResourceDetails = {};
+  assign(details, "description", optionalString(context, "description", "properties.description", "observed", 4 * 1024 ** 2));
   assign(details, "ownerId", optionalString(context, "ownerId", "properties.ownerId", "ga", 512));
   assign(details, "lastModifiedAt", optionalDate(context, "lastModifiedAt", "properties.lastModifiedAt", "ga"));
   assign(details, "lastModifiedBy", optionalString(context, "lastModifiedBy", "properties.lastModifiedBy", "ga", 512));

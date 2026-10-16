@@ -1,8 +1,19 @@
 # Disaster recovery
 
-Production recovery is an approved maintenance action. Use an isolated restore
-target, verify the current application schema, and keep provider changes disabled
-until review is complete.
+Production recovery is a maintenance action with an exact authorized target.
+Use an isolated restore database and verify the current application schema.
+
+The current backup/isolated-restore helper accepts only the compiled current
+schema, with exact structure/grants/table inventory and checksum validation.
+Restored authority is revoked and current ownership/deletion/configuration is
+reconciled automatically before reopening. Only current-schema backups are
+supported; incompatible schemas fail without conversion. A database reset needs
+explicit exact-target/data-loss confirmation and deletes official report history;
+provider resync cannot replace reimport. Successful reconciliation/reopen returns
+to normal authenticated operation, without review timestamps or a second
+provider-enable step.
+See [existing installation maintenance](../docs/operations.md#existing-installation-maintenance)
+for the existing start/preflight/recovery contract.
 
 ## Local recovery rehearsal
 
@@ -29,7 +40,7 @@ Verify:
 - audit and job integrity;
 - no active sessions or provider execution owners.
 
-Reopen the reviewed database:
+Reopen through the same owner, which repeats current-state reconciliation:
 
 ```powershell
 Invoke-LocalDeployment $context 'Reopen' `

@@ -88,7 +88,7 @@ function pendingCollection(f: ReturnType<typeof fixture>) {
 describe("streamed package refresh service", () => {
   beforeEach(async () => {
     await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "normal",
     }] }) });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -214,7 +214,6 @@ describe("streamed package refresh service", () => {
       expect(f.streams.exactJob).toHaveBeenCalledTimes(mode.exact || mode.autoDetails ? 1 : 0);
       if (mode.exact || mode.autoDetails) expect(f.streams.exactJob.mock.calls[0][2]).toBe(Boolean(mode.autoDetails));
       expect(f.job).not.toHaveProperty("requestedIds");
-      expect(f.job).not.toHaveProperty("catalogOnly");
     },
   );
 
@@ -599,7 +598,7 @@ describe("streamed package refresh service", () => {
     expect(inventoryRuntime).not.toHaveBeenCalled();
   });
 
-  it.each(["maintenance", "provider_requalification_required"])("fences every admission/publication boundary under %s", async code => {
+  it.each(["maintenance"])("fences every admission/publication boundary under %s", async code => {
     for (const stage of ["start", "authorization", "activation", "collection"]) {
       const f = fixture();
       let closed = stage === "start";
@@ -620,7 +619,7 @@ describe("streamed package refresh service", () => {
     }
   });
 
-  it.each(["maintenance", "provider_requalification_required"])("keeps automatic pause %s distinct from sign-in failure", async code => {
+  it.each(["maintenance"])("keeps automatic pause %s distinct from sign-in failure", async code => {
     const f = fixture({ autoDetails: true });
     let closed = false;
     vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {

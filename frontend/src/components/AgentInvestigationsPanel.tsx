@@ -132,7 +132,7 @@ function InvestigationSession({ recordId, agentName, identity, revision, user }:
 }
 
 function IdentityUnavailable({ source, reason, reasonCode }: { source: string; reason?: string; reasonCode?: AgentInvestigationContext["defender"]["reasonCode"] }) {
-  const unsupported = reasonCode === "unsupported_agent_type" || reasonCode === "unsupported_identity_crosswalk";
+  const unsupported = reasonCode === "unsupported_identity_crosswalk";
   return <div className="agent-insight-empty">
     <h4>{unsupported ? `${source} linking not supported for this agent` : `${source} identity not mapped`}</h4>
     <p>{unsupported ? "This app cannot reliably match this agent to this log source. Changing permissions will not create a missing identity mapping."

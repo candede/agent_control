@@ -32,7 +32,7 @@ beforeEach(async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(now);
   await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
   await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
 });
@@ -47,10 +47,10 @@ function setup(mode: DefenderHuntingTokenMode = "delegated") {
     id: "11111111-1111-4111-8111-111111111111", authorizationPrincipalId: user.homeAccountId,
     resultScope: mode === "delegated" ? { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }
       : { kind: "application", scopeId: "application-client", configurationRevision: 1 },
-    tokenMode: mode, status: "waiting_authorization", filters, queryVersion: 3, retainedScopeId: mode === "application" ? scopeId : null,
+    tokenMode: mode, status: "waiting_authorization", filters, queryVersion: 3,
     localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: null, providerRequestCount: 0,
     activationCount: 0, providerRowCount: 0, storedRowCount: 0, byteCount: 0, complete: false, noData: false, partialReason: null,
-    observedRange: null, unobservedRange: null, snapshotId: null, priorSuccessfulJobId: null, qualification: null,
+    observedRange: null, unobservedRange: null, snapshotId: null, priorSuccessfulJobId: null,
     cancelRequested: false, createdAt: now.toISOString(), attemptedAt: null, updatedAt: now.toISOString(), finishedAt: null,
     expiresAt: new Date(now.getTime() + 60_000).toISOString(), canResume: true,
   };
@@ -60,7 +60,6 @@ function setup(mode: DefenderHuntingTokenMode = "delegated") {
     current = { ...current, status: "running", activationCount: current.activationCount + 1 };
     return { owner: "33333333-3333-4333-8333-333333333333", version: 1, job: current };
   });
-  vi.spyOn(repository, "requireQualifiedScope").mockImplementation(async (_scope, _filters, authority) => ({ id: scopeId, authority }));
   const admit = vi.spyOn(repository, "authorizeProviderRequest").mockResolvedValue(undefined);
   const publish = vi.spyOn(repository, "publish").mockImplementation(async (_scope, _id, _execution, _result, fence) => {
     fence?.();
@@ -86,16 +85,12 @@ function setup(mode: DefenderHuntingTokenMode = "delegated") {
   const dependencies: Dependencies = {
     delegatedToken: vi.fn(async () => "fixture-token"), applicationToken: vi.fn(async () => "fixture-application-token"),
     revalidateUser: vi.fn(async () => user),
-    requireAvailable: vi.fn<Dependencies["requireAvailable"]>(async () => ({ capabilityId: "defender.hunting.delegated", status: "available",
-      authorized: true, fresh: true, previewQualification: "not_required", remediation: [] })),
     beginOperationValidation: () => () => {
       if (!capabilityCurrent) throw new AppError(401, "authorization_expired", "Hunting capability changed.");
     },
     observeOperation: async (_id, _user, operation) => operation(() => undefined),
     requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, previewQualified: true, revision: 1 })),
     applicationIdentity: () => "application-client",
-    qualificationContext: vi.fn(async capabilityId => ({ capabilityId, contractRevision: "a".repeat(64),
-      permissionRevision: "b".repeat(64), configurationRevision: 1 })),
     recordProviderEvidence: vi.fn<Dependencies["recordProviderEvidence"]>(async () => ({ capabilityId: "defender.hunting.delegated", status: "available",
       authorized: true, fresh: true, previewQualification: "not_required", remediation: [] })),
     auditLog: () => audit,
@@ -114,15 +109,10 @@ function setup(mode: DefenderHuntingTokenMode = "delegated") {
 
 describe("Hunting authority and committed outcomes without services", () => {
   it.each(["cancel", "delete"] as const)("rejects foreign application %s without exposing job-state availability", async action => {
-    for (const qualification of [false, true]) {
       for (const status of ["waiting_authorization", "running", "succeeded"] as const) {
         const f = setup("application");
         f.current().authorizationPrincipalId = "other-owner";
         f.current().status = status;
-        if (qualification) f.current().qualification = {
-          capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-          configurationRevision: 1, approvedBy: "other-owner",
-        };
         const mutation = vi.spyOn(f.repository, action).mockRejectedValue(new AppError(409, "hunting_job_state", "Mutation rejected."));
         await expect(f.service.get(user, f.current().id)).resolves.toMatchObject({ authorizationPrincipalId: "other-owner" });
         await expect(f.service[action](user, f.current().id)).rejects.toMatchObject({
@@ -132,7 +122,6 @@ describe("Hunting authority and committed outcomes without services", () => {
         expect(f.dependencies.applicationToken).not.toHaveBeenCalled();
         expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
       }
-    }
   });
 
   it.each(["cancel", "delete"] as const)("does not let a shared reader %s or abort the owner's provider work", async action => {
@@ -151,14 +140,9 @@ describe("Hunting authority and committed outcomes without services", () => {
     expect(f.pause).not.toHaveBeenCalled();
   });
 
-  it.each(["delegated", "application"] as const)("keeps owned %s cancellation and deletion available without provider or qualification approval", async mode => {
-    for (const qualification of [false, true]) {
+  it.each(["delegated", "application"] as const)("keeps owned %s cancellation and deletion available without live provider access", async mode => {
       const f = setup(mode);
       const owner = { ...user, roles: ["AgentControl.Viewer"] as AuthenticatedUser["roles"] };
-      if (qualification) f.current().qualification = {
-        capabilityId: mode === "delegated" ? "defender.hunting.delegated" : "defender.hunting.application",
-        contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
-      };
       const cancel = vi.spyOn(f.repository, "cancel").mockImplementation(async (_scope, _id, fence) => {
         fence?.();
         return { ...f.current(), status: "cancelled" };
@@ -168,10 +152,8 @@ describe("Hunting authority and committed outcomes without services", () => {
       await expect(f.service.delete(owner, f.current().id)).resolves.toBeUndefined();
       expect(cancel).toHaveBeenCalledOnce();
       expect(remove).toHaveBeenCalledOnce();
-      expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
       expect(f.dependencies.applicationToken).not.toHaveBeenCalled();
       expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
-    }
   });
 
   it.each(["delegated", "application"] as const)("fences %s invalidation after admission settles but before fetch", async mode => {
@@ -317,39 +299,6 @@ describe("Hunting authority and committed outcomes without services", () => {
     expect(committed).toBe(false);
   });
 
-  it("reads both catalog collections under one saved-agent authority and withholds obsolete associations", async () => {
-    const f = setup();
-    const evidence = vi.spyOn(f.repository, "listQualificationEvidence").mockImplementationOnce(async () => {
-      f.dependencies.agentScope = vi.fn(async (_scope, recordId) => ({
-        recordId, entraAgentIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
-      }));
-      return [];
-    });
-    const retained = vi.spyOn(f.repository, "listRetainedScopes").mockResolvedValueOnce([]);
-    await expect(f.service.catalog(user, { agentRecordId: "agent:selected" })).rejects.toMatchObject({ code: "not_found" });
-    expect(evidence).toHaveBeenCalledOnce();
-    expect(retained).toHaveBeenCalledOnce();
-    expect(evidence.mock.calls[0][0]).toBe(retained.mock.calls[0][0]);
-    expect(f.dispatched).not.toHaveBeenCalled();
-  });
-
-  it("revokes a retained UUID regardless of request casing", async () => {
-    const f = setup();
-    const retained = { id: "abcdefab-1234-4123-8123-abcdefabcdef", resultScope: f.current().resultScope,
-      tokenMode: "delegated" as const, capabilityId: "defender.hunting.delegated" as const, templateId: filters.templateId,
-      targetScopeHash: "c".repeat(64), approvedScope: filters, queryVersion: 3 as const,
-      contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
-      sourceQualificationJobId: f.current().id, approvedAt: now.toISOString(), qualifiedAt: now.toISOString(),
-      expiresAt: f.current().expiresAt, revokedAt: null };
-    const repository = new DefenderHuntingRepository();
-    vi.spyOn(repository, "listRetainedScopes").mockResolvedValue([retained]);
-    const revoke = vi.spyOn(repository, "revokeRetainedScope").mockResolvedValue({ ...retained, revokedAt: now.toISOString() });
-    const service = new DefenderHuntingService(repository, f.dependencies);
-    services.push(service);
-    await expect(service.revokeRetainedScope(user, retained.id.toUpperCase())).resolves.toMatchObject({ id: retained.id });
-    expect(revoke).toHaveBeenCalledWith(expect.anything(), retained.id, "delegated", user.homeAccountId, expect.any(Function));
-  });
-
   it.each(["session", "capability"] as const)("withholds a saved job when %s authority changes during the repository read", async authority => {
     const f = setup();
     f.get.mockImplementationOnce(async () => {
@@ -415,26 +364,15 @@ describe("Hunting authority and committed outcomes without services", () => {
     expect(f.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
   });
 
-  it.each(["submission", "qualification"] as const)("does not persist %s after capability authority changes during its saved-identity lookup", async action => {
+  it("does not persist submission after capability authority changes during its saved-identity lookup", async () => {
     const f = setup();
     f.dependencies.agentScope = vi.fn(async (_scope, recordId) => {
       f.invalidate();
       return { recordId, entraAgentIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] };
     });
     const input = { tokenMode: "delegated" as const, filters, agentRecordId: "agent:selected", idempotencyKey: "fenced-submit" };
-    await expect(action === "submission" ? f.service.submit(user, input) : f.service.approveQualification(user, input))
+    await expect(f.service.submit(user, input))
       .rejects.toMatchObject({ code: "authorization_expired" });
-    expect(f.submit).not.toHaveBeenCalled();
-  });
-
-  it("does not adopt a replacement sign-in while qualification authority is awaited", async () => {
-    const f = setup();
-    f.dependencies.qualificationContext = vi.fn(async capabilityId => {
-      await revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined);
-      await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
-      return { capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 };
-    });
-    await expect(f.service.approveQualification(user, { tokenMode: "delegated", filters })).rejects.toMatchObject({ status: 401 });
     expect(f.submit).not.toHaveBeenCalled();
   });
 

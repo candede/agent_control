@@ -7,9 +7,6 @@ import {
   parseAgentRoute,
   parseAuditRoute,
   parseSyncReportRoute,
-  migrateOfficialUsageRoute,
-  migrateSecurityRoute,
-  migrateJobsRoute,
   isWorkbenchPath,
   parseUsersRoute,
   parseWorkbenchView,
@@ -19,6 +16,13 @@ import {
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it("round trips exact administrative origin filters without actor or provider authority", () => {
+    const route = parseAuditRoute("origin=mcp&integration=app-id&client=Case-sensitive&callingAgent=reported-caller&page=2");
+    expect(route).toMatchObject({ originChannel: "mcp", originIntegrationClientId: "app-id", originClientId: "Case-sensitive",
+      originCallingAgentId: "reported-caller", page: 1 });
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
+    expect(parseAuditRoute("origin=spoof&client=bad%00label")).toMatchObject({ originChannel: "all", originClientId: undefined });
+  });
   it("round trips server-owned 5000-target selection without member IDs in the URL", () => {
     const query = agentRouteSearch({ ...parseAgentRoute("status=blocked"), selectedIds: [],
       selectionStorage: "session", selectionCount: 5_000 });
@@ -39,14 +43,6 @@ describe("workbench routing", () => {
     expect(usersRouteSearch({ ...route, detailId: "Alice" }).get("detail")).toBe("invalid");
     expect(parseUsersRoute(`detail=${route.detailId}&tab=invalid`).detailTab).toBe("overview");
   });
-  it("maps retired responsibility bookmarks to user details without reviving the cohort or its pagination", () => {
-    const route = parseUsersRoute("view=responsibility&person=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA&selection=retired&cursor=old");
-    expect(route).toMatchObject({ view: "licenses", detailId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", detailTab: "responsibility" });
-    expect(usersRouteSearch(route).toString()).toBe("detail=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&tab=responsibility");
-    expect(parseUsersRoute("view=responsibility&person=Alice").detailId).toBe("invalid");
-    expect(parseUsersRoute("view=responsibility")).toMatchObject({ view: "licenses" });
-    expect(parseUsersRoute("view=responsibility")).not.toHaveProperty("detailId");
-  });
   it.each(["available", "unavailable", "unknown"] as const)("round trips the %s end-user access filter", endUserAccess => {
     const state = { ...parseAgentRoute(""), endUserAccess };
     const query = agentRouteSearch(state);
@@ -66,21 +62,14 @@ describe("workbench routing", () => {
 
   it("maps every canonical deep link without a query-string view alias", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
-    expect(parseWorkbenchView("/power-platform/")).toBe("agents");
-    expect(isWorkbenchPath("/power-platform/")).toBe(false);
-    expect(parseWorkbenchView("/official-usage")).toBe("sync");
-    expect(parseWorkbenchView("/security")).toBe("agents");
-    expect(migrateSecurityRoute("/security/")).toBe("/agents");
-    expect(migrateSecurityRoute("/agents")).toBeUndefined();
-    expect(parseWorkbenchView("/jobs")).toBe("sync");
     expect(parseWorkbenchView("/sync")).toBe("sync");
     expect(parseWorkbenchView("/unknown")).toBe("agents");
   });
 
-  it("redirects retired Jobs bookmarks without keeping a separate view", () => {
-    expect(isWorkbenchPath("/jobs/")).toBe(true);
-    expect(migrateJobsRoute("/jobs/")).toBe("/sync");
-    expect(migrateJobsRoute("/agents")).toBeUndefined();
+  it("does not recognize an unregistered path", () => {
+    const path = "/not-a-current-page";
+    expect(isWorkbenchPath(path)).toBe(false);
+    expect(parseWorkbenchView(path)).toBe("agents");
   });
 
   it("round trips exact sync and package refresh jobs on the dedicated sync route", () => {
@@ -107,7 +96,7 @@ describe("workbench routing", () => {
       }
       const agent = parseAgentRoute(params.toString());
       expect(agent).toMatchObject({
-        syncRunId: id.toLowerCase(), refreshJobId: id.toLowerCase(), controlJobId: id.toLowerCase(),
+        refreshJobId: id.toLowerCase(), controlJobId: id.toLowerCase(),
         quarantineJobId: id.toLowerCase(), inventorySnapshotId: id.toLowerCase(),
       });
       const sync = parseDataSyncRoute(`${params}&reports=import`);
@@ -115,9 +104,9 @@ describe("workbench routing", () => {
         reports: { stagingId: id.toLowerCase(), reportSetId: id.toLowerCase() } });
       expect(parseUsersRoute(params.toString()).reportSetId).toBe(id.toLowerCase());
       expect(parseSyncReportRoute(`${params}&reports=snapshot`)?.reportSetId).toBe(id.toLowerCase());
-      const agentSearch = agentRouteSearch({ ...agent, syncRunId: id, refreshJobId: id, controlJobId: id,
+      const agentSearch = agentRouteSearch({ ...agent, refreshJobId: id, controlJobId: id,
         quarantineJobId: id, inventorySnapshotId: id, selectedIds: [id] });
-      for (const key of ["syncRun", "refreshJob", "controlJob", "quarantineJob", "inventorySnapshot"]) {
+      for (const key of ["refreshJob", "controlJob", "quarantineJob", "inventorySnapshot"]) {
         expect(agentSearch.get(key)).toBe(id.toLowerCase());
       }
       expect(agentSearch.getAll("selected")).toEqual([id]);
@@ -130,7 +119,7 @@ describe("workbench routing", () => {
     },
   );
 
-  it("round trips report-scoped activity filters and preserves legacy matrix links", () => {
+  it("round trips report-scoped activity filters", () => {
     const state = {
       view: "activity" as const, search: "Ada@example.invalid", agentId: "Report/Agent:Upper",
       reportSetId: "11111111-1111-4111-8111-111111111111", page: 0,
@@ -138,13 +127,12 @@ describe("workbench routing", () => {
     const query = usersRouteSearch(state);
     expect(parseUsersRoute(query.toString())).toEqual(state);
     expect(query.get("view")).toBe("activity");
-    expect(parseUsersRoute(query.toString().replace("view=activity", "view=matrix"))).toEqual(state);
     expect(workbenchUrl("users", query)).toContain("agent=Report%2FAgent%3AUpper");
     expect(parseUsersRoute("view=unknown&page=-1")).toEqual({ view: "licenses", search: "", agentId: undefined, reportSetId: undefined, page: 0 });
     expect(usersRouteSearch({ ...state, view: "licenses" }).toString())
       .toBe("q=Ada%40example.invalid&snapshot=11111111-1111-4111-8111-111111111111");
-    expect(parseUsersRoute(`view=matrix&agent=${"x".repeat(513)}&snapshot=bad%0Aid`).agentId).toBeUndefined();
-    expect(parseUsersRoute("view=matrix&snapshot=bad%0Aid").reportSetId).toBeUndefined();
+    expect(parseUsersRoute(`view=activity&agent=${"x".repeat(513)}&snapshot=bad%0Aid`).agentId).toBeUndefined();
+    expect(parseUsersRoute("view=activity&snapshot=bad%0Aid").reportSetId).toBeUndefined();
   });
 
   it("retains licensed-user search and report scope beside an exact detail link", () => {
@@ -154,10 +142,10 @@ describe("workbench routing", () => {
     expect(parseUsersRoute(usersRouteSearch(state).toString())).toEqual({ ...state, agentId: undefined });
   });
 
-  it.each(["licenses", "activity"] as const)("does not advertise unsupported numeric pages for %s cursor-based Users", view => {
-    const state = parseUsersRoute(new URLSearchParams({ view, q: "Ada", page: "3" }).toString());
-    expect(state).toMatchObject({ view, search: "Ada", page: 0 });
-    expect(usersRouteSearch({ ...state, page: 2 }).has("page")).toBe(false);
+  it.each(["licenses", "activity"] as const)("omits unsupported query parameters from canonical %s Users routes", view => {
+    const state = parseUsersRoute(new URLSearchParams({ view, q: "Ada", unsupported: "3" }).toString());
+    expect(state).toMatchObject({ view, search: "Ada" });
+    expect(usersRouteSearch(state).has("unsupported")).toBe(false);
   });
   it("round trips bounded agent search, status and selection", () => {
     const query = agentRouteSearch({
@@ -176,8 +164,6 @@ describe("workbench routing", () => {
       page: 0,
       selectedIds: ["native-1", "native-1", "native-2"],
       refreshMode: "delegated",
-      source: "all",
-      linkState: "all",
       environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
@@ -204,9 +190,6 @@ describe("workbench routing", () => {
       refreshJobId: undefined,
       refreshMode: "delegated",
       controlJobId: undefined,
-      syncRunId: undefined,
-      source: "all",
-      linkState: "all",
       environmentId: undefined,
       inventorySnapshotId: undefined,
       selectedPowerPlatformIds: [],
@@ -224,15 +207,15 @@ describe("workbench routing", () => {
     expect(route.selectedIds).not.toContain("bad\nvalue");
   });
 
-  it("rejects repeated scalar routes without choosing a detail, job, filter or legacy alias", () => {
+  it("rejects repeated scalar routes without choosing a detail, job or filter", () => {
     const route = parseAgentRoute("inventory=all&inventory=catalog&detail=one&detail=two&refreshJob=one&refreshJob=two"
       + "&controlJob=one&controlJob=two&syncRun=one&syncRun=two&quarantineJob=one&quarantineJob=two"
-      + "&inventorySnapshot=one&inventorySnapshot=two&type=~string:a&type=~string:b&show=first_party"
+      + "&inventorySnapshot=one&inventorySnapshot=two&type=~string:a&type=~string:b"
       + "&q=first&q=second&status=allowed&status=blocked&sort=status&sort=publisher&page=2&page=3"
       + "&selected=one&selected=two&selectedResource=graph_packages:one&selectedResource=graph_packages:two");
     expect(route).toMatchObject({
       inventoryScope: "catalog", detailId: undefined, refreshJobId: undefined, controlJobId: undefined,
-      syncRunId: undefined, quarantineJobId: undefined, inventorySnapshotId: undefined,
+      quarantineJobId: undefined, inventorySnapshotId: undefined,
       packageType: undefined, search: "", status: "all", sortBy: "displayName", page: 0,
       selectedIds: ["one", "two"], selectedPowerPlatformIds: ["graph_packages:one", "graph_packages:two"],
     });
@@ -243,8 +226,7 @@ describe("workbench routing", () => {
     expect(parseUsersRoute("detail=one&detail=two&agent=one&agent=two&snapshot=one&snapshot=two"))
       .toMatchObject({ detailId: "invalid", agentId: undefined, reportSetId: undefined });
     expect(parseAuditRoute("q=one&q=two&action=block&action=unblock&status=failed&status=succeeded&page=2&page=3"))
-      .toEqual({ search: "", action: "all", status: "all", page: 0 });
-    expect(migrateOfficialUsageRoute("/official-usage", "staging=one&staging=two")?.toString()).toBe("reports=manage");
+      .toEqual({ search: "", action: "all", status: "all", page: 0, originChannel: "all" });
     expect(parseAgentRoute(agentRouteSearch(route).toString())).toEqual(route);
   });
 
@@ -262,15 +244,6 @@ describe("workbench routing", () => {
     const opaque = parseAgentRoute("environment=~string:ENV-A");
     expect(opaque.environmentId).toBe("ENV-A");
     expect(agentRouteSearch(opaque).get("environment")).toBe("~string:ENV-A");
-  });
-
-  it.each([
-    ["access", "available", "endUserAccess"], ["usage", "used", "reportedUsage"],
-    ["management", "user_managed", "management"], ["relevance", "organization", "relevance"],
-  ] as const)("does not revive legacy show=%s after its explicit %s filter is invalid", (parameter, legacy, field) => {
-    expect(parseAgentRoute(`show=${legacy}&${parameter}=invalid`)[field]).toBe("all");
-    expect(parseAgentRoute(`show=${legacy}&${parameter}=all&${parameter}=${legacy}`)[field]).toBe("all");
-    expect(parseAgentRoute(`show=${legacy}`)[field]).toBe(legacy);
   });
 
   it.each([NaN, Infinity, 1.5])("does not serialize invalid numeric route state %s", value => {
@@ -319,8 +292,6 @@ describe("workbench routing", () => {
       page: 0,
       selectedIds,
       refreshMode: "delegated",
-      source: "all",
-      linkState: "all",
       environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
@@ -365,7 +336,6 @@ describe("workbench routing", () => {
 
   it("keeps quarantine job-only links independently of a saved selection", () => {
     expect(parseAgentRoute("quarantineJob=job-1")).toMatchObject({
-      source: "all",
       selectedPowerPlatformIds: [],
       quarantineJobId: "job-1",
     });
@@ -390,38 +360,41 @@ describe("workbench routing", () => {
       .toBe("power_platform:ENV-A:Opaque%2FNative");
   });
 
-  it("keeps package refresh, controls, and data sync explicitly source-discriminated", () => {
+  it("keeps package refresh/control links current and data sync owned only by the Sync route", () => {
     const route = parseAgentRoute("refreshJob=refresh-old&mode=application&controlJob=control-old&syncRun=sync-old&job=ambiguous");
     expect(route).toMatchObject({
       refreshJobId: "refresh-old",
       refreshMode: "application",
       controlJobId: "control-old",
-      syncRunId: "sync-old",
     });
 
     expect(agentRouteSearch(route).toString()).toContain("refreshJob=refresh-old");
     expect(agentRouteSearch(route).toString()).toContain("controlJob=control-old");
-    expect(agentRouteSearch(route).toString()).toContain("syncRun=sync-old");
+    expect(route).not.toHaveProperty("syncRunId");
+    expect(agentRouteSearch(route).has("syncRun")).toBe(false);
+    expect(parseDataSyncRoute("syncRun=sync-current").syncRunId).toBe("sync-current");
     expect(agentRouteSearch(route).toString()).not.toContain("job=ambiguous");
   });
 
-  it("drops obsolete source/link filters without losing legacy exact resource identities", () => {
+  it("ignores obsolete source/link filters without inferring a native detail identity", () => {
     const route = parseAgentRoute("source=power_platform&linkState=matched&environment=~string%3Aenv-a&detail=bot-a&selectedResource=power_platform%3Aenv-a%3Abot-a");
     expect(route).toMatchObject({
-      source: "all", linkState: "all", environmentId: "env-a",
-      detailId: "power_platform:env-a:bot-a",
+      environmentId: "env-a",
+      detailId: "bot-a",
       selectedPowerPlatformIds: ["power_platform:env-a:bot-a"],
     });
 
     expect(agentRouteSearch(route).has("source")).toBe(false);
     expect(agentRouteSearch(route).has("linkState")).toBe(false);
+    expect(route).not.toHaveProperty("source");
+    expect(route).not.toHaveProperty("linkState");
     expect(parseAgentRoute(agentRouteSearch(route).toString()).detailId).toBe(route.detailId);
     expect(parseAgentRoute("source=power_platform&environment=~string%3Aenv-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
   });
 
   it("round trips source-specific audit and Sync report state", () => {
     const audit = parseAuditRoute("source=purview&job=older&q=actor&action=block&status=failed&page=3");
-    expect(audit).toEqual({ search: "actor", action: "block", status: "failed", page: 2 });
+    expect(audit).toEqual({ search: "actor", action: "block", status: "failed", page: 2, originChannel: "all" });
     expect(parseAuditRoute(auditRouteSearch(audit).toString())).toEqual(audit);
 
     const sync = parseDataSyncRoute("reports=snapshot&snapshot=11111111-1111-4111-8111-111111111111&window=90");
@@ -436,20 +409,6 @@ describe("workbench routing", () => {
     const serialized = auditRouteSearch({ ...route, search: "a".repeat(201), page: 2000 });
     expect(serialized.get("q")).toHaveLength(200);
     expect(serialized.get("page")).toBe("1001");
-  });
-
-  it.each([
-    ["", "reports=manage"],
-    ["view=overview", "reports=manage"],
-    ["view=history&snapshot=retained", "reports=manage"],
-    ["view=snapshot", "reports=snapshot"],
-    ["snapshot=retained", "reports=snapshot&snapshot=retained"],
-    ["window=90", "reports=snapshot&window=90"],
-    ["staging=draft&snapshot=retained", "reports=import&staging=draft"],
-    ["snapshot=bad%0Aid&window=999", "reports=manage"],
-  ])("migrates legacy report bookmarks %s without restoring a duplicate page", (search, expected) => {
-    expect(migrateOfficialUsageRoute("/official-usage/", search)?.toString()).toBe(expected);
-    expect(migrateOfficialUsageRoute("/agents", search)).toBeUndefined();
   });
 
   it("bounds report route state and keeps sync job links when opening or closing reports", () => {
@@ -505,25 +464,6 @@ describe("workbench routing", () => {
     expect(agentRouteSearch({ ...parseAgentRoute(""), publisher: null }).get("publisher")).toBe("~null");
   });
 
-  it.each([
-    ["available", "access", "available"], ["unavailable", "access", "unavailable"],
-    ["availability_unknown", "access", "unknown"], ["used", "usage", "used"],
-    ["organization", "relevance", "organization"], ["unknown", "relevance", "unknown"],
-    ["first_party", "type", "firstParty"], ["third_party", "type", "thirdParty"],
-    ["user_managed", "management", "user_managed"], ["organization_managed", "management", "organization_managed"],
-    ["copilot_studio", "platform", "Copilot Studio"],
-  ])("migrates legacy show=%s without broadening its result", (legacy, key, value) => {
-    const route = parseAgentRoute(`show=${legacy}&inventory=power_platform_only&q=policy&page=3`);
-    const query = agentRouteSearch(route);
-    expect(route.packageType).toBe(key === "type" ? value : undefined);
-    expect(query.has("show")).toBe(false);
-    expect(query.get(key)).toBe(["type", "platform"].includes(key) ? `~string:${value}` : value);
-    expect(query.get("inventory")).toBe("power_platform_only");
-    expect(query.get("q")).toBe("policy");
-    expect(query.get("page")).toBe("3");
-    expect(parseAgentRoute(query.toString())).toEqual(route);
-  });
-
   it("round trips the unified agent inventory export audit action", () => {
     const route = parseAuditRoute("action=export-agent-inventory&status=succeeded");
     expect(route.action).toBe("export-agent-inventory");
@@ -531,8 +471,8 @@ describe("workbench routing", () => {
   });
 
   it.each([
-    "reassign", "approve-hunting", "qualify-hunting", "submit-hunting", "query-hunting",
-    "cancel-hunting", "delete-hunting", "revoke-hunting-scope",
+    "reassign", "submit-hunting", "query-hunting",
+    "cancel-hunting", "delete-hunting",
     "export-official-usage-aggregate", "export-official-usage-users", "export-administrative-audit",
   ])("round trips the backend-supported %s administrative audit filter", action => {
     const route = parseAuditRoute(`action=${action}&status=succeeded`);
@@ -567,7 +507,7 @@ describe("workbench routing", () => {
 
   it("drops obsolete provider source, job and user parameters from local Audit", () => {
     const route = parseAuditRoute("source=purview&user=employee%2Btest%40example.invalid");
-    expect(route).toEqual({ search: "", action: "all", status: "all", page: 0 });
+    expect(route).toEqual({ search: "", action: "all", status: "all", page: 0, originChannel: "all" });
     expect(auditRouteSearch(route).toString()).toBe("");
     expect(auditRouteSearch(parseAuditRoute("job=old&source=purview&action=block")).toString()).toBe("action=block");
   });

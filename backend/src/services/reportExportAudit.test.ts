@@ -2,6 +2,7 @@ import pg from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { reportExportAudit } from "./reportExportAudit.js";
 import type { ExportAudit, ExportKind } from "./dataExports.js";
+import { unknownOrigin, withActionOrigin } from "./actionOrigin.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn() }));
 
@@ -16,6 +17,7 @@ const start: Parameters<ExportAudit>[1] = {
 function fixture(kind: ExportKind = "official_users") {
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
   const job = { tenant_id: actor.tenantId, principal_id: actor.homeAccountId, actor: { ...actor, roles: ["private-role"] },
+    origin: unknownOrigin,
     kind, selection_id: selection, query_hash: "a".repeat(64), selection_mode: "explicit", set_id: setId, history_revision: "17" };
   const receipts: pg.QueryResultRow[] = [];
   const result = (rows: object[] = []) => ({ command: "SELECT", fields: [], oid: 0, rowCount: rows.length, rows });
@@ -32,7 +34,7 @@ function fixture(kind: ExportKind = "official_users") {
         actor_username: values?.[5], actor_name: values?.[6], scope: values?.[7], action: values?.[8],
         target_blocked_state: values?.[9], agent_id: values?.[10], agent_display_name: values?.[11],
         started_at: new Date(String(values?.[12])), completed_at: values?.[13] ? new Date(String(values[13])) : null,
-        status: values?.[14], message: values?.[15], error_code: values?.[16], request_path: values?.[17], metadata: values?.[18],
+        status: values?.[14], message: values?.[15], error_code: values?.[16], request_path: values?.[17], metadata: values?.[18], origin: values?.[19],
       });
       return result();
     }
@@ -42,6 +44,20 @@ function fixture(kind: ExportKind = "official_users") {
 }
 
 describe("transactional report export audit", () => {
+  it("keeps durable build provenance and separately records a later download/cancel origin without adding provider writes", async () => {
+    const { client, job, receipts } = fixture();
+    const mcp = { ...unknownOrigin, channel: "mcp" as const, integrationClientId: "33333333-3333-3333-3333-333333333333", requestId: id };
+    const web = { ...unknownOrigin, channel: "webapp" as const, integrationClientId: "22222222-2222-2222-2222-222222222222", requestId: id };
+    Object.assign(job, { origin: mcp });
+    await withActionOrigin(web, () => reportExportAudit(client, start));
+    await withActionOrigin(web, () => reportExportAudit(client, { ...start, status: "succeeded" }));
+    expect(receipts.slice(0, 2).map(receipt => receipt.origin)).toEqual([mcp, mcp]);
+    await withActionOrigin(web, () => reportExportAudit(client, { ...start, phase: "download" }));
+    await withActionOrigin(web, () => reportExportAudit(client, { ...start, phase: "cancel" }));
+    expect(receipts[2].origin).toEqual(web);
+    expect(receipts[3]).toMatchObject({ origin: web, action: "cancel-control" });
+    expect(job.origin).toEqual(mcp);
+  });
   it.each([
     ["copilot_users", "export-official-usage-users"], ["official_agents", "export-official-usage-aggregate"],
     ["official_users", "export-official-usage-users"], ["graph_packages", "export-package-inventory"],

@@ -5,7 +5,6 @@ import type { UnifiedAgentRecord } from "./api/client";
 export function findUnifiedAgentRecord(
   records: UnifiedAgentRecord[],
   recordId: string,
-  legacyEnvironmentId?: string,
 ): UnifiedAgentRecord | undefined {
   const target = parseUnifiedAgentRecordId(recordId);
   if (target?.source === "canonical") {
@@ -25,10 +24,5 @@ export function findUnifiedAgentRecord(
   const packages = records.filter(record => (!target && record.id === recordId)
     || record.packages.some(item => item.id === packageId));
   if (packages.length) return packages.length === 1 ? packages[0] : undefined;
-  if (target || !legacyEnvironmentId) return undefined;
-
-  const key = powerPlatformAgentKey(legacyEnvironmentId, recordId);
-  const resources = records.filter(record => record.powerPlatformResource
-    && powerPlatformAgentKey(record.powerPlatformResource.environmentId, record.powerPlatformResource.nativeId) === key);
-  return resources.length === 1 ? resources[0] : undefined;
+  return undefined;
 }

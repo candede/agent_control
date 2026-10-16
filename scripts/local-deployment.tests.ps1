@@ -90,6 +90,7 @@ function Invoke-TestDocker {
         return
     }
     if ($Arguments[0] -eq 'run' -and $Arguments -contains 'backend/scripts/database.ts' -and ($Arguments -contains 'preflight' -or $Arguments -contains 'preflight-reset')) {
+        if ($Arguments -contains 'preflight-reset') { return '{"outcome":"succeeded","database":"agentcontrol","exists":true}' }
         return (@{state='current';currentFingerprint=('1'*64);targetFingerprint=('1'*64)} | ConvertTo-Json -Compress)
     }
     if ($Arguments[0] -eq 'stop') { $script:AppContainers[$Arguments[-1]].running=$false; return }
@@ -194,7 +195,7 @@ function Get-LocalHealth {
     return @{authConfigured=$script:AuthConfigured;callback="$Url/api/auth/callback"}
 }
 function Assert-True { param([bool]$Condition,[string]$Message) if (-not $Condition) { throw $Message }; $script:Checks++ }
-function Assert-Fails { param([scriptblock]$Command,[string]$Pattern) try { & $Command; throw 'Expected failure did not occur' } catch { Assert-True ($_.Exception.Message -match $Pattern) "Unexpected failure: $($_.Exception.Message)" } }
+function Assert-Fails { param([scriptblock]$Command,[string]$Pattern) try { & $Command; throw 'Expected failure did not occur' } catch { Assert-True ($_.Exception.Message -match $Pattern) "Unexpected failure: $($_.Exception.Message); expected $Pattern; injected=$script:Failure; $($_.ScriptStackTrace)" } }
 function Assert-QualificationWorkloads {
     param($Context,[int]$Expected,[switch]$ForceChecks)
     $offset=$script:Calls.Count
@@ -334,22 +335,24 @@ try {
     Assert-True ($guidance.Contains('User.Read is not used by Agent Control.')) 'Registration guidance must identify the unused Graph profile grant.'
     Assert-True ($guidance.Contains('the current app requests these read scopes separately.')) 'Registration guidance must preserve separately requested read scopes.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
-    foreach ($removed in @('TenantId','ClientId','ClientSecretFile','Port','StateRoot','Action','DryRun','ConfirmCleanup','BackupFile','RestoreDatabase','CleanupBatchSize','ConfirmReset','OpenBrowser')) {
-        Assert-True (-not $entry.Parameters.ContainsKey($removed)) "Entry point still accepts $removed."
-    }
+    $publicParameters=@($entry.ScriptBlock.Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
     Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
-    Assert-True ($entry.Parameters['DbReset'].Aliases -contains 'db-reset') 'The db-reset spelling must select the same switch.'
+    Assert-True ($entry.Parameters['DbReset'].Aliases.Count -eq 0) 'DbReset must have one canonical parameter name.'
     Assert-True ($entry.Parameters['ForceChecks'].ParameterType -eq [Management.Automation.SwitchParameter]) 'ForceChecks must be an opt-in switch.'
     Assert-True ($entry.Parameters['AgentSharingDiagnostics'].ParameterType -eq [Management.Automation.SwitchParameter]) 'Temporary sharing diagnostics must be an opt-in switch.'
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 5) 'Entry point must expose only Command, Project, DbReset, ForceChecks and AgentSharingDiagnostics.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 9) 'Entry point release parameters differ from the bounded start contract.'
+    foreach ($parameter in @('Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')) {
+        Assert-True ($entry.Parameters.ContainsKey($parameter)) "Missing release parameter $parameter."
+    }
     foreach ($contract in @(
         @{file='large-tenant-tests.ps1';call='Invoke-LocalSoftwareChecks @{Root=$root;Operator=$image} -ForceChecks'},
         @{file='persistence.tests.ps1';call="Invoke-LocalDeployment `$context 'Deploy' -ForceChecks"}
     )) {
         Assert-True ([IO.File]::ReadAllText((Join-Path $PSScriptRoot $contract.file)).Contains($contract.call)) "Explicit validation runner $($contract.file) must force fresh qualification."
     }
-    Assert-True ($entry.Parameters['Command'].Aliases -contains 'Action') 'Entry point must accept -Action as an alias for Command.'
+    Assert-True ($entry.Parameters['Command'].Aliases.Count -eq 0) 'Command must have one canonical parameter name.'
     $defaultProject=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Project' }).DefaultValue.Value
     Assert-True ($defaultProject -ceq 'agent-control') 'Default project changed.'
     $defaultCommand=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Command' }).DefaultValue.Value
@@ -384,12 +387,12 @@ try {
     $script:Failure=''; $script:ComposeVersion='1.29.0'
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Compose v2'
     $script:ComposeVersion='2.30.0'
-    foreach ($action in @('Stop','EditConfig','Start','Test','Reset','Retain')) {
+    foreach ($action in @('Stop','EditConfig','Test','Retain')) {
         $callCount=$script:Calls.Count
         Assert-Fails { Invoke-LocalDeployment $context $action -DbReset } 'DbReset.*start'
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid DbReset combination invoked Docker.'
     }
-    Assert-Fails { Invoke-LocalDeployment $context 'Reset' } 'reset denied'
+    foreach ($removedAction in @('Start','Reset')) { Assert-Fails { Invoke-LocalDeployment $context $removedAction } 'ValidateSet|validate argument' }
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try { Assert-Fails { Assert-LocalPort $listener.LocalEndpoint.Port } 'occupied' } finally { $listener.Stop() }
     foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
@@ -429,7 +432,7 @@ try {
     $secret=Join-Path $context.State 'secrets/postgres-app'
     $before=[IO.File]::ReadAllText($secret)
     Invoke-LocalDeployment $context 'Deploy' 6>$null
-    Invoke-LocalDeployment $context 'Start' 6>$null
+    Invoke-LocalDeployment $context 'Deploy' 6>$null
     Assert-True ($script:Prompts.Count -eq 4) 'Configured Deploy/Start prompted again.'
     Assert-True ([IO.File]::ReadAllText($secret) -ceq $before) 'Repeat deploy rotated credentials.'
     Assert-True ((Read-FixtureRegistry $context)[0].clientSecret -ceq $clientSecret) 'Repeat deploy changed the Entra secret.'
@@ -443,10 +446,10 @@ try {
     Invoke-LocalDeployment $context 'Retain' -ConfirmCleanup 'fixture-project/agentcontrol' -DryRun 6>$null
     Assert-True (($script:Calls -join "`n") -match 'database.ts\|retain\|confirmed\|1000\|dry-run') 'Dry-run cleanup was not explicit and bounded.'
     $script:AuthConfigured=$false
-    Assert-Fails { Invoke-LocalDeployment $context 'Start' } 'sign-in configuration is missing'
+    Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'sign-in configuration is missing'
     Assert-True (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance')) 'Missing runtime identity did not close admissions.'
     $script:AuthConfigured=$true
-    Invoke-LocalDeployment $context 'Start' 6>$null
+    Invoke-LocalDeployment $context 'Deploy' 6>$null
 
     $defaultContext=New-LocalContext $testRoot $defaultProject
     $customerContext=New-LocalContext $testRoot 'newCustomer'
@@ -473,9 +476,7 @@ try {
     $registryContext=New-FixtureContext 'current-tenant-registry'
     Initialize-LocalState $registryContext $false
     $registrySettingsPath=Join-Path $registryContext.State 'settings.json'
-    [IO.File]::WriteAllText($registrySettingsPath,(@{port=14391;publicUrl='https://registry.example.com';note='retained settings'} | ConvertTo-Json))
-    $legacySecret=Join-Path $registryContext.State 'secrets/client-secret'
-    [IO.File]::WriteAllText($legacySecret,'unused-standalone-credential')
+    [IO.File]::WriteAllText($registrySettingsPath,(@{port=14391;publicUrl='https://registry.example.com'} | ConvertTo-Json))
     $registryPath=Join-Path $registryContext.State 'secrets/tenants.json'
     [IO.File]::WriteAllText($registryPath,(ConvertTo-Json -InputObject @(@{tenantId=$tenant;clientId=$client;clientSecret=$clientSecret;domains=@('contoso.com','contoso.onmicrosoft.com')}) -Depth 6))
     $registrySnapshot=Get-ConfigSnapshot $registryContext
@@ -490,11 +491,34 @@ try {
     $registryProfiles=Read-FixtureRegistry $registryContext
     Assert-True ($registryProfiles.Count -eq 1 -and $registryProfiles[0].tenantId -ceq $tenant -and $registryProfiles[0].clientId -ceq $client -and $registryProfiles[0].clientSecret -ceq $clientSecret) 'Registry validation lost the original identity or credential.'
     Assert-True (($registryProfiles[0].domains -join ',') -ceq 'contoso.com,contoso.onmicrosoft.com') 'Registry validation changed accepted domains.'
-    Assert-True ($registrySettings.port -eq 14391 -and $registrySettings.publicUrl -ceq 'https://registry.example.com' -and $registrySettings.note -ceq 'retained settings') 'Registry validation lost unrelated saved settings.'
+    Assert-True ($registrySettings.port -eq 14391 -and $registrySettings.publicUrl -ceq 'https://registry.example.com') 'Registry validation lost saved settings.'
     $snapshot=Get-ConfigSnapshot $registryContext
     Initialize-LocalState $registryContext $true -Onboard 6>$null
     Assert-True ($script:Prompts.Count -eq $promptCount) 'Current registry prompted on rerun.'
     Assert-ConfigUnchanged $registryContext $snapshot
+
+    $integrationProfile = [ordered]@{
+        tenantId=$tenant; clientId=$client; clientSecret=$clientSecret; domains=@('contoso.com')
+        integration=[ordered]@{clientId='33333333-3333-3333-3333-333333333333';audience=$client;scope='AgentControl.Access'}
+    }
+    $parsedIntegration = (ConvertFrom-DeploymentTenantRegistry (ConvertTo-Json -InputObject @($integrationProfile) -Depth 20))[0]
+    Assert-True ($parsedIntegration.integration.clientId -ceq $integrationProfile.integration.clientId) 'Registry parser dropped the optional dormant integration binding.'
+    $integrationMetadata = (Get-LocalTenantMetadata @($parsedIntegration))[0]
+    Assert-True ($integrationMetadata.integration.audience -ceq $client -and -not $integrationMetadata.Contains('clientSecret')) 'Non-secret tenant metadata lost the integration or included a credential.'
+    $retainedIntegration = Read-LocalTenantProfile $parsedIntegration
+    Assert-True ($retainedIntegration.integration.scope -ceq 'AgentControl.Access') 'Existing onboarding silently discarded dormant integration configuration.'
+    foreach ($invalidIntegration in @(
+        $null, @{}, @{clientId=$client;audience=$client;scope='AgentControl.Access'},
+        @{clientId=$otherClient;audience=$otherClient;scope='AgentControl.Access'},
+        @{clientId=$otherClient;audience=$client;scope='User.Read'},
+        @{clientId=$otherClient;audience=$client;scope='AgentControl.Access';enabled=$true}
+    )) {
+        $invalidProfile = [ordered]@{
+            tenantId=$tenant;clientId=$client;clientSecret=$clientSecret;domains=@('contoso.com');integration=$invalidIntegration
+        }
+        Assert-Fails { ConvertFrom-DeploymentTenantRegistry (ConvertTo-Json -InputObject @($invalidProfile) -Depth 20) } 'integration'
+    }
+    Assert-Fails { ConvertFrom-DeploymentTenantRegistry "[{`"tenantId`":`"$tenant`",`"clientId`":`"$client`",`"clientSecret`":`"$clientSecret`",`"domains`":[`"contoso.com`"],`"integrations`":{}}]" } 'unknown profile field'
 
     $secondSecret='second-tenant-hidden-credential'
     foreach ($answer in @('','','','','','y',$otherTenant,$otherClient,$secondSecret,'fabrikam.com','Fabrikam','','','')) { $script:Answers.Enqueue($answer) }
@@ -547,7 +571,6 @@ try {
     $editSettings=Join-Path $editContext.State 'settings.json'
     $editSecret=Join-Path $editContext.State 'secrets/tenants.json'
     $savedEditSettings=Read-LocalSettings $editContext.State
-    $savedEditSettings.note='preserve me'
     [IO.File]::WriteAllText($editSettings,($savedEditSettings | ConvertTo-Json -Depth 20))
     [IO.File]::WriteAllText($editSecret," `n$([IO.File]::ReadAllText($editSecret))`n")
     foreach ($relative in (Get-ConfigSnapshot $editContext).Keys) {
@@ -567,7 +590,7 @@ try {
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     $edited=Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json
-    Assert-True ($edited.port -eq 14393 -and $edited.note -ceq 'preserve me' -and $edited.tenants[0].tenantId -ceq $tenant -and $edited.tenants[0].clientId -ceq $client) 'Port-only edit changed unrelated settings.'
+    Assert-True ($edited.port -eq 14393 -and $edited.tenants[0].tenantId -ceq $tenant -and $edited.tenants[0].clientId -ceq $client) 'Port-only edit changed tenant settings.'
     Assert-True ($editContext.Url -ceq 'http://localhost:14393' -and (New-LocalContext $testRoot 'editable-project').Port -eq 14393) 'Edited port was not applied to saved/new contexts.'
     Assert-True ($script:Calls[$script:Calls.Count-1] -match '\|stop\|--timeout\|130\|app$') 'Configuration changed before stopping/draining the app.'
     Assert-True (Test-Path -LiteralPath (Join-Path $editContext.State 'control/maintenance')) 'Edited project was not left in maintenance.'
@@ -701,7 +724,7 @@ try {
         $script:Volumes.Add($portOnly.Volume) | Out-Null
         $settingsPath=Join-Path $portOnly.State 'settings.json'
         $secretPath=Join-Path $portOnly.State 'secrets/client-secret'
-        $original=@{port=14391;note='keep this'}
+        $original=@{port=14391}
         [IO.File]::WriteAllText($settingsPath,($original | ConvertTo-Json))
         $unchanged=@{}
         foreach ($relative in @('secrets/client-secret','secrets/postgres-admin','secrets/postgres-app','secrets/session')) {
@@ -713,7 +736,7 @@ try {
         Add-EditAnswers @('','','','14395','')
         $messages=Invoke-LocalDeployment $portOnly 'EditConfig' 6>&1
         $updated=Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
-        Assert-True ($updated.port -eq 14395 -and $updated.note -ceq $original.note) 'Port-only edit did not preserve unrelated settings.'
+        Assert-True ($updated.port -eq 14395) 'Port-only edit did not persist the selected port.'
         foreach ($key in @('tenantId','clientId')) {
             Assert-True ($updated.Contains($key) -eq $original.ContainsKey($key) -and $updated[$key] -ceq $original[$key]) "Port-only edit changed skipped $key in $variant configuration."
         }
@@ -796,22 +819,20 @@ try {
         }
     }
 
-    foreach ($field in @('tenantId','clientId','tenantDomains','tenantDisplayName','client-secret')) {
+    foreach ($field in @('unexpectedField','otherUnexpectedField')) {
         $partial=New-FixtureContext "unsupported-$($field.ToLowerInvariant())"
         Initialize-LocalState $partial $false
         $partialSettings=Join-Path $partial.State 'settings.json'
-        $partialSecret=Join-Path $partial.State 'secrets/client-secret'
         $partialValues=@{port=14391}
-        if ($field -eq 'client-secret') { [IO.File]::WriteAllText($partialSecret,'unused-standalone-credential') }
-        else { $partialValues[$field]=$null }
+        $partialValues[$field]=$null
         [IO.File]::WriteAllText($partialSettings,($partialValues | ConvertTo-Json))
         $snapshot=Get-ConfigSnapshot $partial
         $promptCount=$script:Prompts.Count
         $callCount=$script:Calls.Count
-        Assert-Fails { Initialize-LocalState $partial $true -Onboard 6>$null } 'no longer supported.*TENANTS_JSON'
-        Assert-True ($script:Prompts.Count -eq $promptCount -and $script:Calls.Count -eq $callCount) 'Unsupported standalone settings prompted or mutated services.'
+        Assert-Fails { Initialize-LocalState $partial $true -Onboard 6>$null } 'unsupported fields'
+        Assert-True ($script:Prompts.Count -eq $promptCount -and $script:Calls.Count -eq $callCount) 'Unsupported settings prompted or mutated services.'
         Assert-ConfigUnchanged $partial $snapshot
-        Assert-True (-not (Test-Path -LiteralPath (Join-Path $partial.State 'secrets/tenants.json'))) 'Unsupported standalone configuration was converted.'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $partial.State 'secrets/tenants.json'))) 'Unsupported configuration created a tenant registry.'
     }
 
     $invalidContext=New-LocalContext $testRoot 'invalid-input'
@@ -827,10 +848,10 @@ try {
         Assert-True (-not (Test-Path -LiteralPath $cancelled.State)) 'Incomplete onboarding persisted partial state.'
     }
     $invalidSettings=Join-Path $invalidContext.State 'settings.json'
-    [IO.File]::WriteAllText($invalidSettings,(@{port=3001;tenantId='corrupt';clientId=$client} | ConvertTo-Json))
-    Assert-Fails { Initialize-LocalState $invalidContext $true -Onboard } 'Standalone tenant settings'
+    [IO.File]::WriteAllText($invalidSettings,(@{port=3001;unexpectedField='invalid'} | ConvertTo-Json))
+    Assert-Fails { Initialize-LocalState $invalidContext $true -Onboard } 'unsupported fields'
     foreach ($invalidPort in @('3001',1023,65536,3001.5,$null)) {
-        [IO.File]::WriteAllText($invalidSettings,(@{port=$invalidPort;tenantId=$tenant;clientId=$client} | ConvertTo-Json))
+        [IO.File]::WriteAllText($invalidSettings,(@{port=$invalidPort} | ConvertTo-Json))
         Assert-Fails { New-LocalContext $testRoot 'invalid-input' } 'Saved project port'
     }
     [IO.File]::WriteAllText($invalidSettings,'[]')
@@ -845,7 +866,7 @@ try {
     Invoke-LocalDeployment $maintenanceContext 'Backup' 6>$null
     Assert-True ($script:Prompts.Count -eq $promptCount) 'Maintenance actions unexpectedly required onboarding.'
     foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
-    Invoke-LocalDeployment $maintenanceContext 'Start' 6>$null
+    Invoke-LocalDeployment $maintenanceContext 'Deploy' 6>$null
     Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Start did not onboard an existing unconfigured project.'
     Assert-True ($script:Answers.Count -eq 0) 'Not all expected wizard answers were consumed.'
 
@@ -886,17 +907,17 @@ try {
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Stop unexpectedly displayed onboarding guidance.'
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/control/maintenance")) 'Explicit stop did not close admissions.'
         Add-EditAnswers @('','','','',$tunnelUrl)
-        $messages=. $entryPath -Action edit-config @projectArguments 6>&1
+        $messages=. $entryPath -Command edit-config @projectArguments 6>&1
         Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the complete registration guidance.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Edit-config displayed the saved client secret.'
         Assert-True ($script:Prompts.Count -eq $promptCount+13) 'Explicit edit-config did not prompt for all settings.'
         $entrySettings=Read-LocalSettings (Join-Path $entryState $projectName)
-        Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) '-Action edit-config did not persist the public URL independently of the port.'
-        $messages=. $entryPath -Action start @projectArguments 6>&1
-        Assert-True ($script:Prompts.Count -eq $promptCount+13 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) '-Action start did not reuse the saved public URL.'
+        Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) 'Edit-config did not persist the public URL independently of the port.'
+        $messages=. $entryPath -Command start @projectArguments 6>&1
+        Assert-True ($script:Prompts.Count -eq $promptCount+13 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) 'Start did not reuse the saved public URL.'
         $savedEntry=Get-ConfigSnapshot $context
         $callOffset=$script:Calls.Count
-        $messages=if ($projectArguments.Project) { . $entryPath start @projectArguments -db-reset 6>&1 }
+        $messages=if ($projectArguments.Project) { . $entryPath start @projectArguments -DbReset 6>&1 }
             else { . $entryPath @projectArguments -DbReset 6>&1 }
         $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
         Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'Public DbReset did not reset the selected application database exactly once.'
@@ -908,7 +929,7 @@ try {
     Assert-True ($script:Answers.Count -eq 0) 'Entry-point wizard did not consume the expected answers.'
     Assert-Fails { . $entryPath -Port 3001 } 'parameter.*Port'
     Assert-Fails { . $entryPath -StateRoot $testRoot } 'parameter.*StateRoot'
-    Assert-Fails { . $entryPath -Action Reset } 'ValidateSet|validation|not belong'
+    Assert-Fails { . $entryPath -Command unsupported } 'ValidateSet|validation|not belong'
     foreach ($invalidResetCommand in @('stop','edit-config')) {
         $callCount=$script:Calls.Count
         Assert-Fails { . $entryPath $invalidResetCommand -DbReset } 'DbReset.*only with start'
@@ -917,6 +938,7 @@ try {
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public ForceChecks combination invoked Docker.'
     }
     $context=$retainedContext
+    Remove-Item -LiteralPath (Join-Path $entryState 'newcustomer/deployment-operation.json')
     $script:Failure='database\.ts\|initialize$'
     try {
         Assert-Fails { . $entryPath start -Project newcustomer -DbReset 6>$null 3>$null } 'explicit database reset began; data may already have been deleted'
@@ -1012,7 +1034,7 @@ try {
     }
     try {
         foreach ($hadMaintenance in @($false,$true)) {
-            foreach ($failurePattern in @('^build\|--target\|operator\|','^build\|--target\|qualification\|','\|--wait-timeout\|90\|test-postgres$','backend/scripts/test-all\.ts$','\|down\|--volumes','^build\|--target\|runtime\|')) {
+            foreach ($failurePattern in @('^build\|.*--target\|operator\|','^build\|.*--target\|qualification\|','\|--wait-timeout\|90\|test-postgres$','backend/scripts/test-all\.ts$','\|down\|--volumes','^build\|.*--target\|runtime\|')) {
                 if ($hadMaintenance) { [IO.File]::WriteAllText($script:MonitoredMarker,'prior-maintenance-state') }
                 elseif (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
                 $callOffset=$script:Calls.Count
@@ -1070,7 +1092,7 @@ try {
         $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
         $tests=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/test-all\.ts$'
         $cleanup=Get-UniqueCallIndex $deploymentCalls '\|down\|--volumes\|--remove-orphans$'
-        $runtime=Get-UniqueCallIndex $deploymentCalls '^build\|--target\|runtime\|'
+        $runtime=Get-UniqueCallIndex $deploymentCalls '^build\|.*--target\|runtime\|'
         $databasePreflight=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|preflight$'
         $stop=Get-UniqueCallIndex $deploymentCalls '\|stop\|--timeout\|130\|app$'
         $initialization=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|initialize$'
@@ -1086,7 +1108,7 @@ try {
         Assert-True (-not (($messages -join "`n") -match 'MICROSOFT ACCESS|review Permissions')) 'Deployment summary included an unnecessary Microsoft access status or Permissions follow-up.'
         Assert-ConfigUnchanged $qualification $snapshot
         Assert-True (-not (($deploymentCalls -join "`n") -match 'database\.ts\|(?:reset|preflight-reset)\|')) 'Normal start invoked the destructive reset path.'
-        $messages=Invoke-LocalDeployment $qualification 'Start' 6>&1
+        $messages=Invoke-LocalDeployment $qualification 'Deploy' 6>&1
         Assert-True (($messages -join "`n").Contains('[AUTOMATED CHECKS] NOT RUN')) 'Existing-image Start falsely reported automated checks.'
 
         $script:Failure='backend/scripts/test-all\.ts$|\|down\|--volumes'
@@ -1123,7 +1145,7 @@ try {
         $initialize=Get-UniqueCallIndex $resetCalls 'database\.ts\|initialize$'
         $start=Get-UniqueCallIndex $resetCalls '\|--wait-timeout\|90\|app$'
         Assert-True ($preflight -lt $tests -and $tests -lt $stop -and $stop -lt $reset -and $reset -lt $initialize -and $initialize -lt $start) 'DbReset did not preflight, qualify, drain, reset, initialize and start in order.'
-        Assert-True (-not (($resetCalls -join "`n") -match 'database\.ts\|preflight$')) 'Explicit reset checked compatibility with the schema it is replacing.'
+        Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|preflight$' }).Count -eq 1) 'Explicit reset did not verify its final current schema.'
         Assert-True (-not (($resetCalls -join "`n") -match 'backup\.ts|pg_dump')) 'Explicit reset required a pre-reset backup.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'database\.ts\|reset\|agentcontrol$' -and $_.maintenance }).Count -eq 1) 'DbReset ran without maintenance.'
         Assert-True (($messages -join "`n").Contains('All saved application data')) 'DbReset omitted the destructive-data warning.'
@@ -1131,7 +1153,7 @@ try {
         Assert-True ([IO.File]::ReadAllText($backup) -ceq 'retained-backup') 'DbReset removed existing backup files.'
         foreach ($resetFailure in @(
             @{pattern='backend/scripts/test-all\.ts$';maintenance=$false;started=$false},
-            @{pattern='^build\|--target\|runtime\|';maintenance=$false;started=$false},
+            @{pattern='^build\|.*--target\|runtime\|';maintenance=$false;started=$false},
             @{pattern='database\.ts\|preflight-reset\|agentcontrol$';maintenance=$false;started=$false},
             @{pattern='\|stop\|--timeout\|130\|app$';maintenance=$true;started=$false},
             @{pattern='database\.ts\|reset\|agentcontrol$';maintenance=$true;started=$true},
@@ -1139,6 +1161,8 @@ try {
             @{pattern='\|--wait-timeout\|90\|app$';maintenance=$true;started=$true}
         )) {
             if (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
+            $syntheticOperation=Join-Path $resetContext.State 'deployment-operation.json'
+            if (Test-Path -LiteralPath $syntheticOperation) { Remove-Item -LiteralPath $syntheticOperation }
             $callOffset=$script:Calls.Count
             $script:Failure=$resetFailure.pattern
             Assert-Fails { Invoke-LocalDeployment $resetContext 'Deploy' -DbReset -ForceChecks 6>$null } 'Simulated'
@@ -1217,7 +1241,7 @@ try {
     [IO.File]::WriteAllText($secret,$before)
     Remove-Item -LiteralPath $secret
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'original secret'
-    Assert-Fails { Invoke-LocalDeployment $context 'Reset' -ConfirmReset 'other/other_data' } 'reset denied'
+    Assert-Fails { Invoke-LocalDeployment $context 'Reset' } 'ValidateSet|validate argument'
     Write-Host "Passed $script:Checks PowerShell orchestration assertions."
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force

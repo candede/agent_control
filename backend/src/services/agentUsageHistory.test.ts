@@ -6,12 +6,31 @@ import { OfficialReportImports } from "../db/officialReportImports.js";
 import { deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent } from "../db/agentUsageTestSupport.js";
 import { OfficialAgentUsage } from "./officialAgentUsage.js";
 import { LargeTenantUsersReports, reportQuery, type ReportReadContext } from "./largeTenantUsersReports.js";
-import { readAgentHistory } from "./officialAgentHistory.js";
+import { compareAgentHistory, readAgentHistory } from "./officialAgentHistory.js";
 import type { UserSourceMetadata } from "../types/userSources.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>, reports: LargeTenantUsersReports;
 afterEach(() => vi.restoreAllMocks());
 const dates = (date: string) => (_kind: string, csv: string) => csv.replaceAll(/2026-09-\d{2}/g, date);
+
+describe("qualified retained snapshot comparison", () => {
+  const from: Parameters<typeof compareAgentHistory>[0] = { id: "30000000-0000-4000-8000-000000000001",
+    reporting_start: "2026-01-01", reporting_end: "2026-01-30", period_provenance: "operator_asserted",
+    accepted_at: "2026-01-31T00:00:00Z", responses: "0", last_activity: null, association_count: "1", page_key: null,
+    cohort_hash: "exact-cohort", candidate_count: "1", matched_count: "1", ambiguous_report_rows: false };
+  const to = { ...from, id: "30000000-0000-4000-8000-000000000003", reporting_start: "2026-03-01", reporting_end: "2026-03-30", responses: "50" };
+  it("labels new activity without division by a zero baseline", () => {
+    expect(compareAgentHistory(from, to)).toMatchObject({ state: "comparable", reasons: ["new_activity"], responsesDelta: 50, responseGrowthPercent: null });
+  });
+  it("does not qualify partial, ambiguous, unknown or changed association cohorts as growth", () => {
+    expect(compareAgentHistory(from, { ...to, candidate_count: "2" })).toMatchObject({ state: "unknown", responseGrowthPercent: null,
+      reasons: ["unknown_agent_report_coverage"] });
+    expect(compareAgentHistory(from, { ...to, ambiguous_report_rows: true }).state).toBe("unknown");
+    expect(compareAgentHistory(from, { ...to, cohort_hash: "other-cohort" })).toMatchObject({ state: "incomparable",
+      reasons: ["different_association_cohorts"] });
+    expect(compareAgentHistory(from, { ...to, responses: null }).state).toBe("unknown");
+  });
+});
 
 describe("exact agent report history", () => {
   beforeAll(async () => {
@@ -220,7 +239,7 @@ describe("agent history discovery query", () => {
       expect(sql).toContain("COALESCE(page_key,'') COLLATE \"C\",id::text COLLATE \"C\"");
       expect(sql).not.toContain("userAgents");
       expect(query.mock.calls[1][1]).toEqual([context.identity.tenantId, "2", context.identity.principalId,
-        target.id, context.evaluatedAt, null, "", "", 2]);
+        target.id, context.evaluatedAt, null, "", "", 2, null, null]);
       expect(database.connect).not.toHaveBeenCalled();
     } finally { await database.end(); }
   });

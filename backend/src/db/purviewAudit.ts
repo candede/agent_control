@@ -8,7 +8,6 @@ import type {
   PurviewAuditHistory,
   PurviewAuditJob,
   PurviewAuditPartialReason,
-  PurviewAuditQualification,
   PurviewAuditRecord,
   PurviewAuditRecordPage,
   PurviewAuditResultScope,
@@ -31,6 +30,7 @@ export type PurviewAuditScope = {
 
 export type PurviewAuditReadScope = {
   tenantId: string;
+  authorizationPrincipalId: string;
   resultScopes: PurviewAuditResultScope[];
   inventoryIdentityScope?: InventoryIdentityReadScope;
 };
@@ -38,15 +38,6 @@ export type PurviewAuditReadScope = {
 export type PurviewAuditExecution = {
   owner: string;
   version: number;
-};
-
-export type QualificationInput = {
-  filters: PurviewAuditFilters;
-  capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application";
-  contractRevision: string;
-  permissionRevision: string;
-  configurationRevision: number;
-  approvedBy: string;
 };
 
 type JobRow = {
@@ -80,7 +71,6 @@ type JobRow = {
   unobserved_end: Date | null;
   error_code: string | null;
   message: string | null;
-  qualification_id: string | null;
   cancel_requested: boolean;
   remote_work_may_continue: boolean;
   created_at: Date;
@@ -89,27 +79,6 @@ type JobRow = {
   finished_at: Date | null;
   deadline_at: Date;
   expires_at: Date;
-};
-
-type QualificationRow = {
-  id: string;
-  request_hash: string;
-  capability_id: QualificationInput["capabilityId"];
-  token_mode: PurviewAuditTokenMode;
-  authorization_principal_id: string;
-  result_scope_id: string;
-  result_scope_kind: PurviewAuditResultScope["kind"];
-  result_scope_configuration_revision: string | null;
-  filters: PurviewAuditFilters;
-  status: PurviewAuditQualification["status"];
-  contract_revision: string;
-  permission_revision: string;
-  configuration_revision: string;
-  approved_by: string;
-  approved_at: Date;
-  expires_at: Date;
-  job_id: string | null;
-  error_code: string | null;
 };
 
 type RecordRow = {
@@ -144,32 +113,7 @@ type RecordRow = {
 export class PurviewAuditRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async approveQualification(scope: PurviewAuditScope, input: QualificationInput, assertCurrent?: () => void) {
-    assertCurrent?.();
-    requireProviderAdmissions();
-    validateScope(scope);
-    validateQualification(input, scope.tokenMode);
-    const id = randomUUID();
-    await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`purview-qualification:${scope.tenantId}:${input.capabilityId}`]);
-      const active = await client.query(`SELECT 1 FROM purview_audit_qualifications
-        WHERE tenant_id=$1 AND capability_id=$2 AND status IN ('approved','running') AND expires_at>clock_timestamp() LIMIT 1`, [scope.tenantId, input.capabilityId]);
-      if (active.rowCount) throw new AppError(409, "qualification_in_progress", "An unexpired Audit Search qualification already exists for this capability.");
-      await client.query(`INSERT INTO purview_audit_qualifications
-        (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,capability_id,filters,request_hash,contract_revision,permission_revision,configuration_revision,approved_by)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14)`, [id, scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId,
-        scope.resultScope.kind, scope.resultScope.configurationRevision, scope.tokenMode, input.capabilityId, JSON.stringify(input.filters), requestHash(scope, input.filters),
-        input.contractRevision, input.permissionRevision, input.configurationRevision, input.approvedBy]);
-    }, undefined, () => { requireProviderAdmissions(); assertCurrent?.(); });
-    return (await this.getQualification(scope.tenantId, id))!;
-  }
-
-  async getQualification(tenantId: string, id: string) {
-    const { rows } = await this.database.query<QualificationRow>(`SELECT * FROM purview_audit_qualifications WHERE tenant_id=$1 AND id=$2`, [tenantId, id]);
-    return rows[0] ? projectQualification(rows[0]) : undefined;
-  }
-
-  async submit(scope: PurviewAuditScope, input: { idempotencyKey: string; filters: PurviewAuditFilters; qualificationId?: string }, assertCurrent?: () => void) {
+  async submit(scope: PurviewAuditScope, input: { idempotencyKey: string; filters: PurviewAuditFilters }, assertCurrent?: () => void) {
     assertCurrent?.();
     requireProviderAdmissions();
     validateScope(scope);
@@ -188,13 +132,11 @@ export class PurviewAuditRepository {
         count(*) FILTER (WHERE authorization_principal_id=$2)::int AS principal_count,count(*)::int AS tenant_count
         FROM purview_audit_jobs WHERE tenant_id=$1 AND status IN ('waiting_authorization','reconciling_create','running') AND expires_at>clock_timestamp()`, [scope.tenantId, scope.authorizationPrincipalId]);
       if (unfinished.rows[0].principal_count >= 5 || unfinished.rows[0].tenant_count >= 10) throw new AppError(429, "job_limit", "The bounded Audit Search unfinished-job limit was reached.");
-      if (input.qualificationId) await validateQualificationForJob(client, scope, input.qualificationId, input.filters);
       const jobId = randomUUID();
       await client.query(`INSERT INTO purview_audit_jobs
-        (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,idempotency_key,request_hash,display_name,filters,local_request_id,qualification_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)`, [jobId, scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId,
-        scope.resultScope.kind, scope.resultScope.configurationRevision, scope.tokenMode, input.idempotencyKey, hash, `agent-control-audit:${jobId}`, JSON.stringify(input.filters), randomUUID(), input.qualificationId ?? null]);
-      if (input.qualificationId) await client.query("UPDATE purview_audit_qualifications SET job_id=$3,updated_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2", [scope.tenantId, input.qualificationId, jobId]);
+        (id,tenant_id,authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,idempotency_key,request_hash,display_name,filters,local_request_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)`, [jobId, scope.tenantId, scope.authorizationPrincipalId, scope.resultScope.scopeId,
+        scope.resultScope.kind, scope.resultScope.configurationRevision, scope.tokenMode, input.idempotencyKey, hash, `agent-control-audit:${jobId}`, JSON.stringify(input.filters), randomUUID()]);
       return jobId;
     }, undefined, () => { requireProviderAdmissions(); assertCurrent?.(); });
     return (await this.getJob(scope, id))!;
@@ -244,8 +186,6 @@ export class PurviewAuditRepository {
         activation_count=activation_count+1,execution_version=execution_version+1,execution_owner=$7
         WHERE id=$1 AND tenant_id=$2 AND result_scope_kind=$3 AND result_scope_id=$4 AND result_scope_configuration_revision IS NOT DISTINCT FROM $5 RETURNING *`,
       [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision, action === "poll" ? "running" : "reconciling_create", owner]);
-      await client.query(`UPDATE purview_audit_qualifications SET status='running',attempted_at=COALESCE(attempted_at,clock_timestamp()),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND job_id=$2 AND status='approved'`, [scope.tenantId, id]);
       const row = updated.rows[0];
       return { action, owner, version: Number(row.execution_version), job: projectJob(row) };
     });
@@ -311,10 +251,6 @@ export class PurviewAuditRepository {
           AND execution_owner=$6 AND execution_version=$7 AND status IN ('running','reconciling_create') AND NOT cancel_requested RETURNING status,error_code`,
       [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision, execution.owner, execution.version]);
       if (result.rowCount !== 1) throw executionLost();
-      if (result.rows[0].status === "inconclusive") {
-        await client.query(`UPDATE purview_audit_qualifications SET status='inconclusive',error_code=$3,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-          WHERE tenant_id=$1 AND job_id=$2 AND status IN ('approved','running')`, [scope.tenantId, id, result.rows[0].error_code]);
-      }
     });
     return this.getJob(scope, id);
   }
@@ -370,19 +306,12 @@ export class PurviewAuditRepository {
       [id, scope.tenantId, scope.resultScope.kind, scope.resultScope.scopeId, scope.resultScope.configurationRevision, complete ? "succeeded" : "partial", result.pageCount,
         result.providerRowCount, result.storedRowCount, Math.min(result.byteCount, 10_000_000), result.unknownFieldCount, complete, execution.owner, execution.version,
         partial?.code ?? null, partial?.message ?? null]);
-      await client.query(`UPDATE purview_audit_qualifications SET status=CASE WHEN $3 THEN 'qualified' ELSE 'inconclusive' END,
-        error_code=$4,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND job_id=$2 AND status='running'`, [scope.tenantId, id, complete, partial?.code ?? null]);
       if (job.expires_at <= new Date()) throw new AppError(409, "audit_job_expired", "The local Audit Search cache expired during publication.");
       if (complete && job.deadline_at <= new Date()) {
         const expired = partialPublication(false, "audit_job_expired")!;
-        await client.query(`WITH expired_job AS (
-          UPDATE purview_audit_jobs SET status='partial',page_complete=false,error_code=$2,message=$3,
+        await client.query(`UPDATE purview_audit_jobs SET status='partial',page_complete=false,error_code=$2,message=$3,
             unobserved_start=(filters->>'startDateTime')::timestamptz,unobserved_end=(filters->>'endDateTime')::timestamptz,
-            updated_at=clock_timestamp() WHERE id=$1 RETURNING tenant_id,id)
-          UPDATE purview_audit_qualifications qualification SET status='inconclusive',error_code=$2,updated_at=clock_timestamp()
-          FROM expired_job WHERE qualification.tenant_id=expired_job.tenant_id AND qualification.job_id=expired_job.id
-            AND qualification.status='qualified'`, [id, expired.code, expired.message]);
+            updated_at=clock_timestamp() WHERE id=$1`, [id, expired.code, expired.message]);
         if (job.expires_at <= new Date()) throw new AppError(409, "audit_job_expired", "The local Audit Search cache expired during publication.");
       }
     }, undefined, assertCurrent);
@@ -400,36 +329,30 @@ export class PurviewAuditRepository {
         finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
         WHERE id=$1 AND tenant_id=$2 AND result_scope_id=$3 AND execution_owner=$8 AND execution_version=$9`,
       [id, scope.tenantId, scope.resultScope.scopeId, status, safeCode(code), message.slice(0, 1024), remoteWorkMayContinue, execution.owner, execution.version]);
-      await client.query(`UPDATE purview_audit_qualifications SET status=$3,error_code=$4,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND job_id=$2 AND status IN ('approved','running')`, [scope.tenantId, id, status, safeCode(code)]);
     }, undefined, assertCurrent);
     return this.getJob(scope, id);
   }
 
   async cancel(scope: PurviewAuditReadScope | PurviewAuditScope, id: string, assertCurrent?: () => void) {
     assertCurrent?.();
-    const read = scopedWhere(toReadScope(scope));
     await transaction(this.database, async client => {
-      const result = await client.query<{ qualification_id: string | null }>(`UPDATE purview_audit_jobs SET status='cancelled',cancel_requested=true,
+      const read = await this.requireMutationJob(client, scope, id);
+      const result = await client.query(`UPDATE purview_audit_jobs SET status='cancelled',cancel_requested=true,
         remote_work_may_continue=attempted_at IS NOT NULL AND (provider_status IS NULL OR provider_status IN ('notStarted','running')),
         error_code=NULL,message='Local polling and download stopped. Microsoft Graph may continue the remote query.',finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
-        WHERE id=$${read.values.length + 1} AND ${read.sql} AND status IN ('waiting_authorization','running','reconciling_create') RETURNING qualification_id`, [...read.values, id]);
+        WHERE id=$${read.values.length + 1} AND ${read.sql} AND status IN ('waiting_authorization','running','reconciling_create') RETURNING id`, [...read.values, id]);
       if (result.rowCount !== 1) throw new AppError(409, "audit_job_state", "Only an unfinished Audit Search can be cancelled locally.");
-      if (result.rows[0].qualification_id) await client.query(`UPDATE purview_audit_qualifications SET status='failed',error_code='audit_cancelled',finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND id=$2 AND status IN ('approved','running')`, [read.values[0], result.rows[0].qualification_id]);
     }, undefined, assertCurrent);
     return this.getJob(scope, id);
   }
 
   async delete(scope: PurviewAuditReadScope | PurviewAuditScope, id: string, assertCurrent?: () => void) {
     assertCurrent?.();
-    const read = scopedWhere(toReadScope(scope));
     await transaction(this.database, async client => {
-      const selected = await client.query<{ qualification_id: string | null }>(`SELECT qualification_id FROM purview_audit_jobs WHERE id=$${read.values.length + 1} AND ${read.sql}
+      const read = await this.requireMutationJob(client, scope, id);
+      const selected = await client.query(`SELECT id FROM purview_audit_jobs WHERE id=$${read.values.length + 1} AND ${read.sql}
         AND status NOT IN ('running','reconciling_create') FOR UPDATE`, [...read.values, id]);
       if (selected.rowCount !== 1) throw new AppError(409, "audit_job_state", "Stop an active Audit Search before deleting its local cache.");
-      if (selected.rows[0].qualification_id) await client.query(`UPDATE purview_audit_qualifications SET status='failed',error_code='audit_deleted',finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND id=$2 AND status IN ('approved','running')`, [read.values[0], selected.rows[0].qualification_id]);
       await client.query("DELETE FROM purview_audit_jobs WHERE id=$1", [id]);
     }, undefined, assertCurrent);
   }
@@ -502,9 +425,6 @@ export class PurviewAuditRepository {
           remote_work_may_continue=attempted_at IS NOT NULL AND (provider_status IS NULL OR provider_status IN ('notStarted','running')),
           finished_at=clock_timestamp(),execution_owner=NULL,updated_at=clock_timestamp()
         FROM candidates WHERE job.id=candidates.id RETURNING job.id,job.tenant_id,job.error_code`);
-      if (terminal.rows.length) await client.query(`UPDATE purview_audit_qualifications qualification SET status='inconclusive',error_code=job.error_code,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        FROM purview_audit_jobs job WHERE qualification.job_id=job.id AND qualification.tenant_id=job.tenant_id AND qualification.status IN ('approved','running')
-          AND job.id=ANY($1::uuid[])`, [terminal.rows.map(row => row.id)]);
       const waiting = await client.query(`WITH candidates AS (
         SELECT id FROM purview_audit_jobs WHERE status IN ('running','reconciling_create') AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()
           AND provider_request_count<64 AND activation_count<12
@@ -544,6 +464,16 @@ export class PurviewAuditRepository {
     });
   }
 
+  private async requireMutationJob(client: Pick<pg.PoolClient, "query">, scope: PurviewAuditReadScope | PurviewAuditScope, id: string) {
+    const read = scopedWhere(toReadScope(scope));
+    read.values.push(scope.authorizationPrincipalId);
+    read.sql += ` AND authorization_principal_id=$${read.values.length}`;
+    const result = await client.query(`SELECT id FROM purview_audit_jobs
+      WHERE id=$${read.values.length + 1} AND ${read.sql} AND expires_at>clock_timestamp() FOR UPDATE`, [...read.values, id]);
+    if (result.rowCount !== 1) throw new AppError(404, "not_found", "Audit Search job was not found.");
+    return read;
+  }
+
   private async fence(client: pg.PoolClient, scope: PurviewAuditScope, id: string, execution: PurviewAuditExecution,
     statuses: PurviewAuditJob["status"][] = ["running", "reconciling_create"]) {
     const result = await client.query<JobRow>(`SELECT * FROM purview_audit_jobs
@@ -569,15 +499,6 @@ function relatedRecordsWhere(scope: PurviewAuditReadScope, target: AgentPurviewT
         AND record.audit_log_record_type='powerPlatformAdministratorActivity' AND record.service='PowerPlatform'
         AND lower(record.environment_id)=$${offset + 1} AND lower(record.bot_id)=$${offset + 2}
         AND record.operation=ANY($${offset + 3}::text[])` };
-}
-
-async function validateQualificationForJob(client: pg.PoolClient, scope: PurviewAuditScope, id: string, filters: PurviewAuditFilters) {
-  const result = await client.query<Pick<QualificationRow, "authorization_principal_id" | "result_scope_id" | "result_scope_kind" | "result_scope_configuration_revision" | "token_mode" | "request_hash">>(`SELECT authorization_principal_id,result_scope_id,result_scope_kind,result_scope_configuration_revision,token_mode,request_hash
-    FROM purview_audit_qualifications WHERE id=$1 AND tenant_id=$2 AND status='approved' AND expires_at>clock_timestamp() AND job_id IS NULL FOR UPDATE`, [id, scope.tenantId]);
-  const value = result.rows[0];
-  if (!value || value.authorization_principal_id !== scope.authorizationPrincipalId || value.result_scope_id !== scope.resultScope.scopeId || value.result_scope_kind !== scope.resultScope.kind
-    || Number(value.result_scope_configuration_revision) !== Number(scope.resultScope.configurationRevision) || value.token_mode !== scope.tokenMode
-    || value.request_hash !== requestHash(scope, filters)) throw new AppError(409, "qualification_mismatch", "Audit Search qualification does not match the exact approved scope and filters.");
 }
 
 function requestHash(scope: PurviewAuditScope, filters: PurviewAuditFilters) {
@@ -608,20 +529,13 @@ function projectJob(row: JobRow): PurviewAuditJob {
     byteCount: row.byte_count, unknownFieldCount: row.unknown_field_count, pageComplete: row.page_complete,
     observedRange: row.observed_start && row.observed_end ? { startDateTime: row.observed_start.toISOString(), endDateTime: row.observed_end.toISOString() } : null,
     unobservedRange: row.unobserved_start && row.unobserved_end ? { startDateTime: row.unobserved_start.toISOString(), endDateTime: row.unobserved_end.toISOString() } : null,
-    ...(row.error_code ? { errorCode: row.error_code } : {}), ...(row.message ? { message: row.message } : {}), qualificationId: row.qualification_id,
+    ...(row.error_code ? { errorCode: row.error_code } : {}), ...(row.message ? { message: row.message } : {}),
     cancelRequested: row.cancel_requested, createdAt: row.created_at.toISOString(), attemptedAt: row.attempted_at?.toISOString() ?? null,
     updatedAt: row.updated_at.toISOString(), finishedAt: row.finished_at?.toISOString() ?? null, expiresAt: row.expires_at.toISOString(),
     canResume: row.status === "waiting_authorization" && !row.cancel_requested && row.deadline_at > new Date()
       && row.activation_count < 12 && row.provider_request_count < 64,
     remoteWorkMayContinue: row.remote_work_may_continue,
   };
-}
-
-function projectQualification(row: QualificationRow): PurviewAuditQualification {
-  return { id: row.id, capabilityId: row.capability_id, tokenMode: row.token_mode, authorizationPrincipalId: row.authorization_principal_id,
-    resultScope: projectResultScope(row), filters: row.filters, status: row.status, contractRevision: row.contract_revision,
-    permissionRevision: row.permission_revision, configurationRevision: Number(row.configuration_revision), approvedBy: row.approved_by,
-    approvedAt: row.approved_at.toISOString(), expiresAt: row.expires_at.toISOString(), jobId: row.job_id, ...(row.error_code ? { errorCode: row.error_code } : {}) };
 }
 
 function projectRecord(row: RecordRow): PurviewAuditRecord {
@@ -633,24 +547,21 @@ function projectRecord(row: RecordRow): PurviewAuditRecord {
     contentAvailable: false, unknownFieldCount: row.unknown_field_count, ...(row.association ? { association: row.association } : {}) };
 }
 
-function validateQualification(input: QualificationInput, tokenMode: PurviewAuditTokenMode) {
-  if ((tokenMode === "delegated") !== (input.capabilityId === "purview.audit.search.delegated") || !/^[a-f0-9]{64}$/.test(input.contractRevision)
-    || !/^[a-f0-9]{64}$/.test(input.permissionRevision) || !Number.isSafeInteger(input.configurationRevision) || input.configurationRevision < 1
-    || !input.approvedBy || input.approvedBy.length > 256) throw new AppError(400, "invalid_qualification", "Audit Search qualification approval is invalid.");
-}
-
 function validateScope(scope: PurviewAuditScope) {
   validateReadScope(toReadScope(scope));
   if (!scope.authorizationPrincipalId || !(["delegated", "application"] as const).includes(scope.tokenMode)) throw new AppError(403, "scope_mismatch", "Audit Search requires an exact current authorization scope.");
   if (scope.tokenMode === "delegated" && (scope.resultScope.kind !== "principal" || scope.authorizationPrincipalId !== scope.resultScope.scopeId)) throw new AppError(403, "scope_mismatch", "Delegated Audit Search results must remain scoped to the authorizing principal.");
-  if (scope.tokenMode === "application" && scope.resultScope.kind !== "application") throw new AppError(403, "scope_mismatch", "Application Audit Search results require the approved shared application scope.");
+  if (scope.tokenMode === "application" && scope.resultScope.kind !== "application") throw new AppError(403, "scope_mismatch", "Application Audit Search results require the configured shared application scope.");
 }
 
 function validateReadScope(scope: PurviewAuditReadScope) {
-  if (!scope.tenantId || !scope.resultScopes.length || scope.resultScopes.length > 2 || scope.resultScopes.some(resultScope => !resultScope.scopeId
+  if (!scope.tenantId || !scope.authorizationPrincipalId || !scope.resultScopes.length || scope.resultScopes.length > 2 || scope.resultScopes.some(resultScope => !resultScope.scopeId
     || resultScope.kind === "principal" && resultScope.configurationRevision !== null
     || resultScope.kind === "application" && (!Number.isSafeInteger(resultScope.configurationRevision) || resultScope.configurationRevision < 1))) {
     throw new AppError(403, "scope_mismatch", "Audit Search requires an exact current result scope.");
+  }
+  if (scope.resultScopes.some(resultScope => resultScope.kind === "principal" && resultScope.scopeId !== scope.authorizationPrincipalId)) {
+    throw new AppError(403, "scope_mismatch", "Delegated Audit Search results must remain private to the current principal.");
   }
   if (scope.inventoryIdentityScope) {
     const identity = scope.inventoryIdentityScope;
@@ -663,7 +574,7 @@ function validateReadScope(scope: PurviewAuditReadScope) {
 }
 
 function toReadScope(scope: PurviewAuditReadScope | PurviewAuditScope): PurviewAuditReadScope {
-  return "resultScope" in scope ? { tenantId: scope.tenantId, resultScopes: [scope.resultScope] } : scope;
+  return "resultScope" in scope ? { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId, resultScopes: [scope.resultScope] } : scope;
 }
 
 function scopedWhere(scope: PurviewAuditReadScope, alias = "") {
@@ -696,7 +607,7 @@ function partialPublication(complete: boolean, reason: PurviewAuditPartialReason
   throw new AppError(409, "invalid_audit_publication", "Audit Search completion and partial reason are inconsistent.");
 }
 
-function projectResultScope(row: Pick<JobRow | QualificationRow, "result_scope_kind" | "result_scope_id" | "result_scope_configuration_revision">): PurviewAuditResultScope {
+function projectResultScope(row: Pick<JobRow, "result_scope_kind" | "result_scope_id" | "result_scope_configuration_revision">): PurviewAuditResultScope {
   return row.result_scope_kind === "application"
     ? { kind: "application", scopeId: row.result_scope_id, configurationRevision: Number(row.result_scope_configuration_revision) }
     : { kind: "principal", scopeId: row.result_scope_id, configurationRevision: null };

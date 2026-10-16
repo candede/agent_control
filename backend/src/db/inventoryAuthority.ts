@@ -11,6 +11,7 @@ export const currentInventorySourcesSql = `SELECT * FROM inventory_live_sources
 // Only use inside a validated inventory selection read, never as mutation authority.
 export function selectedInventorySourcesSql(tenant: string, principal: string, agent: string, selection: string) {
   return `SELECT canonical.identity AS agent_id,canonical.generation_id AS control_revision,
+      source.scope_id AS source_scope_id,source.generation_id AS source_generation_id,source.identity AS source_identity,
       CASE WHEN source.domain='packages' THEN 'graph_packages' ELSE 'power_platform' END AS source,
       source.native_id,coalesce(source.environment_id,'') AS environment_id,
       CASE WHEN source.domain='power_platform' THEN ${normalizeNativeIdentitySql("source.native_id")} ELSE source.native_id END AS normalized_native_id,

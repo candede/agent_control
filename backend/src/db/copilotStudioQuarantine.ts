@@ -21,6 +21,8 @@ import { quarantineTargetIdentity, sameQuarantineTarget } from "../types/copilot
 import { pool, transaction } from "./pool.js";
 import { NativeInventory, nativeTarget } from "./nativeInventory.js";
 import { clientErrorState } from "./clientErrors.js";
+import { currentActionOrigin, initiatingOrigin, parseStoredOrigin, lifecycleActor, originFilterColumns } from "../services/actionOrigin.js";
+import type { AuditOriginV1, OriginFilters } from "../types/actionOrigin.js";
 
 export type QuarantineScope = { tenantId: string; principalId: string };
 export type QuarantineJobInput = {
@@ -46,6 +48,7 @@ export type QuarantineJobRow = {
   id: string; tenant_id: string; principal_id: string; action: QuarantineAction; status: QuarantineJobStatus;
   request_hash: string; confirmation_hash: string; confirmation_summary: QuarantineConfirmationSummary; actor_name: string; actor_username: string;
   request_path: string; contract_revision: string; permission_revision: string; configuration_revision: string; is_canary: boolean;
+  origin?: AuditOriginV1;
   canary_approval_id: string | null; cancel_requested: boolean; lease_owner: string | null; lease_version: string; lease_until: Date | null;
   attempts: number; created_at: Date; updated_at: Date; deadline_at: Date; expires_at: Date;
 };
@@ -145,6 +148,7 @@ export class CopilotStudioQuarantineRepository {
     const durableReceipt = await this.existingSubmission(scope, identity);
     if (durableReceipt) return durableReceipt;
     const confirmation = createQuarantineConfirmation(input);
+    const origin = initiatingOrigin(input.actor);
     if (input.confirmationHash !== confirmation.confirmationHash) throw new AppError(409, "confirmation_mismatch", "The exact quarantine target or direct status changed. Review and confirm again.");
     const id = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`quarantine-submit:${scope.tenantId}:${scope.principalId}`]);
@@ -178,10 +182,10 @@ export class CopilotStudioQuarantineRepository {
       }
       await client.query(`INSERT INTO copilot_quarantine_jobs
         (id,tenant_id,principal_id,idempotency_key,request_hash,action,confirmation_hash,confirmation_summary,actor_name,actor_username,
-         request_path,contract_revision,permission_revision,configuration_revision,is_canary,canary_approval_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [jobId, scope.tenantId, scope.principalId, input.idempotencyKey,
+         request_path,contract_revision,permission_revision,configuration_revision,is_canary,canary_approval_id,origin)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, [jobId, scope.tenantId, scope.principalId, input.idempotencyKey,
         confirmation.requestHash, input.action, input.confirmationHash, confirmation.summary, input.actor.displayName, input.actor.username, input.requestPath,
-        input.authority.contractRevision, input.authority.permissionRevision, input.authority.configurationRevision, Boolean(input.canaryApprovalId), input.canaryApprovalId ?? null]);
+        input.authority.contractRevision, input.authority.permissionRevision, input.authority.configurationRevision, Boolean(input.canaryApprovalId), input.canaryApprovalId ?? null, origin]);
       for (const [index, target] of confirmation.targets.entries()) {
         const itemId = randomUUID();
         const requestedState = input.action === "quarantine";
@@ -190,7 +194,7 @@ export class CopilotStudioQuarantineRepository {
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [itemId, jobId, index, target.resourceNativeId, target.displayName,
           target.snapshotId, target.inventoryObservedAt, target.environmentId, target.botId, target.directStatus.isBotQuarantined,
           target.directStatus.lastUpdateTimeUtc, requestedState]);
-        await insertAudit(client, { scope, actor: input.actor, jobId, itemId, action: input.action, phase: "requested", target, requestedState,
+        await insertAudit(client, { scope, actor: input.actor, origin, jobId, itemId, action: input.action, phase: "requested", target, requestedState,
           message: "Quarantine mutation requested and confirmed; provider dispatch has not started." });
       }
       if (input.canaryApprovalId) {
@@ -217,13 +221,20 @@ export class CopilotStudioQuarantineRepository {
     return { value: (await Promise.all(rows.rows.map(row => this.get(scope, row.id)))).filter((value): value is QuarantineJob => Boolean(value)) };
   }
 
-  async listAudit(scope: QuarantineScope, limit = 100) {
+  async listAudit(scope: QuarantineScope, limit = 100, filters: OriginFilters = {}) {
     validateScope(scope);
+    const values: unknown[] = [scope.tenantId, scope.principalId];
+    const clauses = ["tenant_id=$1", "principal_id=$2", "expires_at>clock_timestamp()"];
+    for (const [key, column] of Object.entries(originFilterColumns)) {
+      const value = filters[key as keyof OriginFilters];
+      if (value !== undefined) { values.push(value); clauses.push(`${column}=$${values.length}`); }
+    }
     const rows = await this.database.query<{ id: string; principal_id: string; actor_username: string; actor_name: string; job_id: string; item_id: string | null;
       correlation_id: string | null; action: string; phase: string; resource_native_id: string; environment_id: string; bot_id: string;
-      requested_state: boolean; observed_state: boolean | null; observed_provider_updated_at: string | null; error_code: string | null; message: string | null; observed_at: Date }>(`SELECT * FROM copilot_quarantine_audit
-      WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp() ORDER BY observed_at DESC,id DESC LIMIT $3`, [scope.tenantId, scope.principalId, Math.min(Math.max(Math.trunc(limit), 1), 500)]);
-    return { value: rows.rows.map(row => ({ id: row.id, principalId: row.principal_id, actor: { username: row.actor_username, displayName: row.actor_name },
+      origin: AuditOriginV1; requested_state: boolean; observed_state: boolean | null; observed_provider_updated_at: string | null; error_code: string | null; message: string | null; observed_at: Date }>(`SELECT * FROM copilot_quarantine_audit
+      WHERE ${clauses.join(" AND ")} ORDER BY observed_at DESC,id DESC LIMIT $${values.length + 1}`, [...values, Math.min(Math.max(Math.trunc(limit), 1), 500)]);
+    const count = (await this.database.query<{ count: number }>(`SELECT count(*)::int AS count FROM copilot_quarantine_audit WHERE ${clauses.join(" AND ")}`, values)).rows[0].count;
+    return { count, value: rows.rows.map(row => ({ id: row.id, origin: parseStoredOrigin(row.origin), principalId: row.principal_id, actor: { username: row.actor_username, displayName: row.actor_name },
       jobId: row.job_id, itemId: row.item_id, correlationId: row.correlation_id, action: row.action, phase: row.phase,
       target: { resourceNativeId: row.resource_native_id, environmentId: row.environment_id, botId: row.bot_id }, requestedState: row.requested_state,
       observedState: row.observed_state, observedProviderUpdatedAt: row.observed_provider_updated_at, errorCode: row.error_code, message: row.message,
@@ -233,21 +244,33 @@ export class CopilotStudioQuarantineRepository {
   async cancel(scope: QuarantineScope, id: string) {
     validateScope(scope);
     await transaction(this.database, async client => {
-      const job = await client.query("UPDATE copilot_quarantine_jobs SET cancel_requested=true,updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp() RETURNING id", [id, scope.tenantId, scope.principalId]);
+      const job = await client.query<QuarantineJobRow>("UPDATE copilot_quarantine_jobs SET cancel_requested=true,updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp() RETURNING *", [id, scope.tenantId, scope.principalId]);
       if (!job.rowCount) return;
       await this.aggregate(client, id);
+      await this.lifecycle(client, job.rows[0], "cancel");
     });
     return this.get(scope, id);
   }
 
   async claim(scope: QuarantineScope, id: string, owner: string, resume = false): Promise<QuarantineLease | undefined> {
     requireProviderAdmissions();
-    const result = await this.database.query<QuarantineJobRow>(`UPDATE copilot_quarantine_jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
+    return transaction(this.database, async client => {
+    const result = await client.query<QuarantineJobRow>(`UPDATE copilot_quarantine_jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
       lease_until=clock_timestamp()+interval '120 seconds',attempts=attempts+1,updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND cancel_requested=false AND attempts<10 AND deadline_at>clock_timestamp()
         AND (lease_until IS NULL OR lease_until<clock_timestamp()) AND (status='queued' OR ($5 AND status='waiting_authorization'))
         AND EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='queued') RETURNING *`, [id, scope.tenantId, scope.principalId, owner, resume]);
+    if (resume && result.rows[0]) await this.lifecycle(client, result.rows[0], "resume");
     return result.rows[0] ? { jobId: id, scope, owner, version: Number(result.rows[0].lease_version) } : undefined;
+    });
+  }
+
+  private async lifecycle(client: pg.PoolClient, job: QuarantineJobRow, action: "resume" | "cancel") {
+    const item = (await client.query<QuarantineItemRow>("SELECT * FROM copilot_quarantine_job_items WHERE job_id=$1 ORDER BY ordinal LIMIT 1", [job.id])).rows[0];
+    if (!item) throw new Error("quarantine_lifecycle_item_missing");
+    await insertAudit(client, { scope: { tenantId: job.tenant_id, principalId: job.principal_id },
+      actor: lifecycleActor(actorFromJob(job)), origin: currentActionOrigin(), jobId: job.id, action, phase: "requested",
+      target: targetFromItem(item), requestedState: item.requested_state, message: `${action} requested; initiating attribution is unchanged.` });
   }
 
   async beginItem(lease: QuarantineLease) {
@@ -263,7 +286,7 @@ export class CopilotStudioQuarantineRepository {
       await client.query("UPDATE copilot_quarantine_job_items SET status='running',correlation_id=$2,updated_at=clock_timestamp() WHERE id=$1", [item.id, correlationId]);
       await client.query(`INSERT INTO copilot_quarantine_attempts(id,job_id,item_id,lease_owner,lease_version,correlation_id)
         VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)`, [lease.jobId, item.id, lease.owner, lease.version, correlationId]);
-      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), jobId: job.id, itemId: item.id, correlationId,
+      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), origin: parseStoredOrigin(job.origin), jobId: job.id, itemId: item.id, correlationId,
         action: job.action, phase: "started", target: targetFromItem(item), requestedState: item.requested_state });
       return { job, item: { ...item, status: "running" as const, correlation_id: correlationId } };
     });
@@ -309,7 +332,7 @@ export class CopilotStudioQuarantineRepository {
       const result = await client.query("UPDATE copilot_quarantine_job_items SET sent_at=clock_timestamp() WHERE id=$1 AND job_id=$2 AND status='running' AND sent_at IS NULL", [item.id, lease.jobId]);
       if (result.rowCount !== 1) throw new AppError(409, "already_dispatched", "A quarantine mutation must never be dispatched twice.");
       await client.query("UPDATE copilot_quarantine_attempts SET sent_at=clock_timestamp() WHERE item_id=$1 AND lease_version=$2", [item.id, lease.version]);
-      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), jobId: job.id, itemId: item.id, correlationId: item.correlation_id!,
+      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), origin: parseStoredOrigin(job.origin), jobId: job.id, itemId: item.id, correlationId: item.correlation_id!,
         action: job.action, phase: "sent", target: targetFromItem(item), requestedState: item.requested_state,
         message: "The one permitted provider POST is marked sent; HTTP acceptance is not success." });
     }, signal, beforeCommit);
@@ -330,7 +353,7 @@ export class CopilotStudioQuarantineRepository {
       if (result.rowCount !== 1) throw new AppError(409, "terminal_item", "Terminal quarantine results cannot be overwritten.");
       await client.query("UPDATE copilot_quarantine_attempts SET finished_at=clock_timestamp(),outcome=$3 WHERE item_id=$1 AND lease_version=$2", [item.id, lease.version, outcome]);
       if (evidence.observed) await insertObservation(client, lease.scope, targetFromItem(item), evidence.observed);
-      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), jobId: job.id, itemId: item.id, correlationId: item.correlation_id!, action: job.action,
+      await insertAudit(client, { scope: lease.scope, actor: actorFromJob(job), origin: parseStoredOrigin(job.origin), jobId: job.id, itemId: item.id, correlationId: item.correlation_id!, action: job.action,
         phase: outcome === "succeeded" ? "succeeded" : outcome === "skipped" ? "skipped" : outcome === "inconclusive" ? "inconclusive" : outcome === "cancelled" ? "failed" : "failed",
         target: targetFromItem(item), requestedState: item.requested_state, observed: evidence.observed, errorCode: evidence.errorCode, message: evidence.message });
     }, signal, beforeCommit);
@@ -448,7 +471,7 @@ export class CopilotStudioQuarantineRepository {
         throw new AppError(502, "target_mismatch", "Provider status did not match the exact quarantine target.");
       }
       await insertObservation(client, scope, targetFromItem(saved), observed);
-      await insertAudit(client, { scope, actor: actorFromJob(current.rows[0]), jobId: current.rows[0].id, itemId: saved.id, correlationId: observed.correlationId, action: "reconcile",
+      await insertAudit(client, { scope, actor: lifecycleActor(actorFromJob(current.rows[0])), origin: currentActionOrigin(), jobId: current.rows[0].id, itemId: saved.id, correlationId: observed.correlationId, action: "reconcile",
         phase: "reconciled", target: targetFromItem(saved), requestedState: saved.requested_state, observed, message });
       await this.aggregate(client, current.rows[0].id);
     }, signal, beforeCommit);
@@ -586,7 +609,7 @@ function projectJob(job: QuarantineJobRow, items: QuarantineItemRow[]): Quaranti
     retryEligible: item.status === "inconclusive" && item.reconciliation_status === "verified_not_applied",
     ...(item.error_code ? { errorCode: item.error_code } : {}), ...(item.message ? { message: item.message } : {}) }));
   const terminal = results.filter(item => !["queued", "running"].includes(item.status));
-  return { id: job.id, action: job.action, status: job.status, confirmationHash: job.confirmation_hash, confirmation: job.confirmation_summary,
+  return { id: job.id, origin: parseStoredOrigin(job.origin), action: job.action, status: job.status, confirmationHash: job.confirmation_hash, confirmation: job.confirmation_summary,
     isCanary: job.is_canary, total: items.length, completed: terminal.length, succeeded: terminal.filter(item => item.status === "succeeded").length,
     failed: terminal.filter(item => item.status === "failed").length, skipped: terminal.filter(item => item.status === "skipped").length,
     inconclusive: terminal.filter(item => item.status === "inconclusive").length, cancelled: terminal.filter(item => item.status === "cancelled").length,
@@ -605,16 +628,16 @@ async function insertObservation(client: pg.PoolClient, scope: QuarantineScope, 
     target.botId.toLowerCase(), status.isBotQuarantined, status.lastUpdateTimeUtc, status.observedAt, status.correlationId]);
 }
 
-async function insertAudit(client: pg.PoolClient, value: { scope: QuarantineScope; actor: QuarantineActor; jobId: string; itemId?: string; correlationId?: string;
-  action: QuarantineAction | "reconcile"; phase: string; target: InventoryQuarantineTarget; requestedState: boolean; observed?: CopilotStudioQuarantineStatus;
+async function insertAudit(client: pg.PoolClient, value: { scope: QuarantineScope; actor: QuarantineActor; origin: AuditOriginV1; jobId: string; itemId?: string; correlationId?: string;
+  action: QuarantineAction | "reconcile" | "resume" | "cancel"; phase: string; target: InventoryQuarantineTarget; requestedState: boolean; observed?: CopilotStudioQuarantineStatus;
   errorCode?: string; message?: string }) {
   await client.query(`INSERT INTO copilot_quarantine_audit
     (id,tenant_id,principal_id,actor_username,actor_name,job_id,item_id,correlation_id,action,phase,resource_native_id,environment_id,bot_id,
-     requested_state,observed_state,observed_provider_updated_at,error_code,message)
-    VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, [value.scope.tenantId, value.scope.principalId,
+     requested_state,observed_state,observed_provider_updated_at,error_code,message,origin)
+    VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, [value.scope.tenantId, value.scope.principalId,
     value.actor.username, value.actor.displayName, value.jobId, value.itemId ?? null, value.correlationId ?? null, value.action, value.phase,
     value.target.resourceNativeId, value.target.environmentId, value.target.botId, value.requestedState, value.observed?.isBotQuarantined ?? null,
-    value.observed?.lastUpdateTimeUtc ?? null, safeCode(value.errorCode), value.message?.slice(0, 1024) ?? null]);
+    value.observed?.lastUpdateTimeUtc ?? null, safeCode(value.errorCode), value.message?.slice(0, 1024) ?? null, parseStoredOrigin(value.origin)]);
 }
 
 function actorFromJob(job: QuarantineJobRow): QuarantineActor {

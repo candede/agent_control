@@ -121,7 +121,7 @@ export function packageAuthoringTool(item: Pick<CopilotPackage, "authoringTool" 
   return item.authoringTool ?? item.platform ?? item.shortDescription?.trim().match(/^built\s+using\s+(.+?)\.?$/i)?.[1]?.trim();
 }
 
-export function agentAuthoringToolLabels(record: UnifiedAgentRecord) {
+function agentAuthoringToolLabels(record: UnifiedAgentRecord) {
   return uniqueValues([record.powerPlatformResource ? powerPlatformAuthoringTool(record.powerPlatformResource) : null,
     ...record.packages.map(packageAuthoringTool)], formatAgentAuthoringTool);
 }

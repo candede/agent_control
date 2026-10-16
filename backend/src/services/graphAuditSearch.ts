@@ -32,11 +32,10 @@ const auditDictionaryType = "#microsoft.graph.security.auditRecordTypeDictionary
 const auditLogRecordType = "#microsoft.graph.security.auditLogRecord";
 const maximumResponseBytes = 2_000_000;
 const maximumRequestBudgetMs = 30_000;
-export const purviewMaximumResultBytes = 8_000_000;
-export const purviewMaximumRecordPages = 20;
-export const purviewMaximumRecords = 5_000;
-export const purviewMaximumWindowMs = 7 * 24 * 60 * 60 * 1000;
-export const purviewQualificationMaximumWindowMs = 60 * 60 * 1000;
+const purviewMaximumResultBytes = 8_000_000;
+const purviewMaximumRecordPages = 20;
+const purviewMaximumRecords = 5_000;
+const purviewMaximumWindowMs = 7 * 24 * 60 * 60 * 1000;
 
 type ClientDependencies = {
   fetch: typeof fetch;
@@ -313,7 +312,7 @@ export class GraphAuditSearchClient {
   }
 }
 
-export function validatePurviewAuditFilters(value: unknown, options: { now?: Date; qualification?: boolean } = {}): PurviewAuditFilters {
+export function validatePurviewAuditFilters(value: unknown, options: { now?: Date } = {}): PurviewAuditFilters {
   if (!isObject(value)) throw new AppError(400, "invalid_audit_filters", "Audit Search filters must be a structured object.");
   const allowed = new Set(["presetId", "operations", "startDateTime", "endDateTime", "userPrincipalNames", "ipAddresses", "objectIds", "administrativeUnitIds", "agent"]);
   if (Object.keys(value).some(key => !allowed.has(key))) throw new AppError(400, "invalid_audit_filters", "Audit Search filters contain an unsupported field.");
@@ -324,7 +323,7 @@ export function validatePurviewAuditFilters(value: unknown, options: { now?: Dat
   const start = Date.parse(startDateTime);
   const end = Date.parse(endDateTime);
   const now = (options.now ?? new Date()).getTime();
-  const maximumWindow = options.qualification ? purviewQualificationMaximumWindowMs : purviewMaximumWindowMs;
+  const maximumWindow = purviewMaximumWindowMs;
   if (end <= start || end - start > maximumWindow || end > now + 5 * 60 * 1000 || start < now - purviewMaximumWindowMs) {
     throw new AppError(400, "invalid_audit_range", `Audit Search requires a recent UTC range no longer than ${maximumWindow / 3_600_000} hour(s).`);
   }
@@ -703,9 +702,9 @@ function nativeRecordFingerprint(record: PurviewAuditRecord) {
 function providerFailure(response: Response, now = Date.now()) {
   const details = responseDetails(response, now);
   const status = response.status >= 400 ? response.status : 502;
-  const code = response.status === 401 ? "authorization_expired" : response.status === 403 ? "provider_denied"
+  const code = response.status === 401 || response.status === 403 ? "provider_denied"
     : response.status === 404 ? "provider_not_found" : response.status === 429 ? "provider_throttled" : "provider_error";
-  const message = response.status === 401 ? "Microsoft Graph Audit Search authorization expired."
+  const message = response.status === 401 ? "Microsoft Graph rejected Audit Search authorization without identifying the underlying cause."
     : response.status === 403 ? "Microsoft Graph denied Audit Search without identifying a permission, Purview role, license, or tenant-support cause."
       : response.status === 404 ? "Microsoft Graph could not find the selected Audit Search query."
         : response.status === 429 ? "Microsoft Graph throttled Audit Search within its bounded retry budget."

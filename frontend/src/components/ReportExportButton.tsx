@@ -14,7 +14,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   const [pending, setPending] = useState(false);
   const [checking, setChecking] = useState(false);
   const [cancellation, setCancellation] = useState<"pending" | "failed">();
-  const [retry, setRetry] = useState<"admission" | "status">();
+  const [retry, setRetry] = useState<"admission" | "status" | "authorization">();
   const [owner, setOwner] = useState<string>();
   const normalizedSelectionId = selectionId?.toLowerCase();
   const context = JSON.stringify([preserveOnRefresh ? null : normalizedSelectionId, kind, ids]);
@@ -25,7 +25,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   const retrying = !withdrawn && owner === context ? retry : undefined;
   const controller = useRef<AbortController | undefined>(undefined);
   const operation = useRef<"preparing" | "checking" | "cancelling" | undefined>(undefined);
-  const attempt = useRef<{ input: OfficialReportExportRequest; id?: string; settled: boolean } | undefined>(undefined);
+  const attempt = useRef<{ input: OfficialReportExportRequest; id?: string; settled: boolean; reauthorize?: boolean } | undefined>(undefined);
   const admission = useRef(admissionAllowed);
   useLayoutEffect(() => { admission.current = admissionAllowed; }, [admissionAllowed]);
   const currentSelection = useRef(normalizedSelectionId);
@@ -68,15 +68,16 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
     controller.current?.abort();
     const abort = new AbortController(); controller.current = abort;
     const request = retryAttempt ?? {
-      input: { selectionId: requestedSelection, kind, ids: ids?.slice(), idempotencyKey: crypto.randomUUID() }, settled: false,
+      input: { selectionId: requestedSelection, kind, ids: ids?.slice(), idempotencyKey: crypto.randomUUID() }, settled: false, reauthorize: false,
     };
     attempt.current = request;
     nativeDownload.current = undefined; setOwner(context); setChecking(false);
     setPending(true); setStatus(undefined); setError(undefined); setCancellation(undefined); setRetry(undefined);
     try {
-      const id = request.id ?? (await createReportExport(request.input, abort.signal)).id;
+      const id = request.id && !request.reauthorize ? request.id : (await createReportExport(request.input, abort.signal)).id;
       abort.signal.throwIfAborted();
       request.id = id;
+      request.reauthorize = false;
       let interval = 2000;
       for (;;) {
         await new Promise<void>((resolve, reject) => {
@@ -87,6 +88,12 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
         const next = await reportExportStatus(id, abort.signal);
         if (abort.signal.aborted) return;
         setStatus(next);
+        if (next.status === "queued" && next.error === "authorization_required") {
+          request.reauthorize = true;
+          setRetry("authorization");
+          setError("Export paused for authorization. Sign in again if needed, then explicitly authorize and resume this export.");
+          break;
+        }
         if (next.status === "failed" && ["selection_invalidated", "export_selection_changed"].includes(next.error ?? "")) invalidated();
         if (!["queued", "building"].includes(next.status)) { request.settled = true; break; }
         interval = Math.min(interval + 1000, 10000);
@@ -177,7 +184,7 @@ export function ReportExportButton({ selectionId, kind, ids, label, disabled = f
   }
   return <div className="report-export">
     <button type="button" className="secondary" disabled={withdrawn || preparing || checking || cancelling
-      || !retrying && (disabled || !selectionId || Boolean(admissionAllowed && !admissionAllowed()))} onClick={() => void start()}>{preparing && !cancelling ? "Preparing export..." : retrying === "status" ? "Retry export status" : retrying === "admission" ? "Retry export request" : label}</button>
+      || !retrying && (disabled || !selectionId || Boolean(admissionAllowed && !admissionAllowed()))} onClick={() => void start()}>{preparing && !cancelling ? "Preparing export..." : retrying === "authorization" ? "Authorize and resume export" : retrying === "status" ? "Retry export status" : retrying === "admission" ? "Retry export request" : label}</button>
     {preparing || cancelling || cancellationFailed || retrying || visibleStatus?.status === "ready" ? <button type="button" className="secondary"
       disabled={cancelling} onClick={() => void cancel()}>{cancelling ? "Cancelling export..." : "Cancel export"}</button> : null}
     {visibleStatus ? <p role="status">{visibleStatus.status}: {visibleStatus.rows.toLocaleString()} rows, {visibleStatus.bytes.toLocaleString()} bytes.

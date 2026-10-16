@@ -14,6 +14,52 @@ import { schemaFingerprint } from "../src/db/schema.js";
 import { testSchemaTemplateIdentity } from "./testDatabaseTemplate.js";
 
 describe("large tenant fixture and frozen semantic seeds", () => {
+  it("bounds deployment preparation to current schema, reset, backup and authority contracts", () => {
+    const commands=fixtureCommands("deployment-current");
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toEqual(["run","test","--workspace","backend","--",
+      "scripts/databasePreflight.test.ts","scripts/database.test.ts","scripts/databaseReset.test.ts",
+      "scripts/backup.test.ts","src/db/auditOriginSchema.test.ts","src/db/agentControlReceiptsSchema.test.ts",
+      "src/db/schema.test.ts","scripts/largeTenantFixture.test.ts","src/routes/mcpContractFeasibility.test.ts",
+      "src/db/sessions.test.ts","src/db/dataGenerations.test.ts","src/routes/mcpApiAuth.test.ts",
+      "src/routes/sharedAgentControls.test.ts","src/routes/mcpReadContracts.test.ts"]);
+    expect(commands[1]).toEqual(["run","typecheck","--workspace","backend"]);
+  });
+  it("keeps shared controls on one bounded existing runner with actual provider jobs, schema and web consumers",()=>{
+    const commands=fixtureCommands("shared-agent-controls");
+    expect(commands).toHaveLength(5);
+    for(const workspace of ["backend","frontend"]) {
+      const command=commands.find(value=>value[1]==="test"&&value[3]===workspace)!;
+      const files=command.filter(value=>/\.test\.tsx?$/.test(value));
+      expect(new Set(files).size).toBe(files.length);
+      for(const file of files) expect(existsSync(new URL(`../../${workspace}/${file}`,import.meta.url))).toBe(true);
+    }
+    expect(commands[0]).toContain("src/routes/sharedAgentControls.test.ts");
+    expect(commands[0]).toContain("src/services/copilotStudioQuarantineJobs.test.ts");
+    expect(commands[1]).toEqual(["run","typecheck","--workspace","backend"]);
+    expect(commands.slice(-2)).toEqual([["run","build","--workspace","frontend"],["run","lint","--workspace","frontend"]]);
+  });
+  it("keeps saved-read proof on one existing bounded selector with persistent numeric SQL evidence", () => {
+    const commands = fixtureCommands("mcp-read-contracts");
+    expect(commands).toHaveLength(2);
+    expect(commands[0].slice(0, 5)).toEqual(["run", "test", "--workspace", "backend", "--"]);
+    expect(commands[0]).toContain("src/routes/mcpReadContracts.test.ts");
+    expect(commands[0]).toContain("src/routes/auditOriginHttp.test.ts");
+    expect(commands[0]).toContain("--silent=false");
+    const files = commands[0].filter(value => value.endsWith(".test.ts"));
+    expect(files).toHaveLength(18);
+    for (const file of files) expect(existsSync(new URL(`../${file}`, import.meta.url))).toBe(true);
+    expect(commands[1]).toEqual(["run", "typecheck", "--workspace", "backend"]);
+  });
+  it("keeps issuance-fence proof on the existing fixed-budget isolated runner without capacity or browser workloads", () => {
+    const commands = fixtureCommands("auth-recovery");
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toEqual(["run", "test", "--workspace", "backend", "--", "src/routes/mcpApiAuth.test.ts",
+      "src/db/sessions.test.ts", "src/db/dataGenerations.test.ts", "src/db/schema.test.ts",
+      "scripts/database.test.ts", "scripts/backup.test.ts"]);
+    expect(commands[1]).toEqual(["run", "typecheck", "--workspace", "backend"]);
+    for (const file of commands[0].filter(value => value.endsWith(".test.ts"))) expect(existsSync(new URL(`../${file}`, import.meta.url))).toBe(true);
+  });
   it("runs every frontend test under the configured software-gate deadline", () => {
     const commands = fixtureCommands("production-frontend");
     expect(commands).toEqual([["run", "test", "--workspace", "frontend"]]);
@@ -186,6 +232,22 @@ describe("large tenant fixture and frozen semantic seeds", () => {
         "src/services/powerPlatformResourceQuery.test.ts", "src/services/graphPackagePacing.test.ts", "src/services/graphPackageReadBudget.test.ts"],
       ["run", "typecheck", "--workspace", "backend"],
     ]);
+  });
+  it("reuses all software commands for web qualification without invoking the auxiliary campaign", () => {
+    expect(fixtureCommands("webapp-qualification")).toEqual([
+      ...fixtureCommands("all"), ["run", "typecheck", "--workspace", "frontend"],
+    ]);
+  });
+  it("keeps root-regression ownership bounded, unique and on the existing backend runner", () => {
+    const commands = fixtureCommands("webapp-regressions"), files = commands[0].slice(5);
+    expect(commands).toHaveLength(2);
+    expect(commands[0].slice(0, 5)).toEqual(["run", "test", "--workspace", "backend", "--"]);
+    expect(files).toHaveLength(32);
+    expect(new Set(files).size).toBe(32);
+    expect(files).toEqual(expect.arrayContaining(["src/routes/agentInvestigationHttp.test.ts",
+      "src/services/purviewAudit.test.ts", "src/db/purviewAudit.test.ts"]));
+    expect(files.every(file => /^src\/(?:(?:db|routes|services)\/)?[A-Za-z]+(?:\.unit)?\.test\.ts$/.test(file))).toBe(true);
+    expect(commands[1]).toEqual(["run", "typecheck", "--workspace", "backend"]);
   });
   it("freezes complete-set counts and unknown versus zero through native imports and selections", async () => {
     const fixture = await testDatabase();

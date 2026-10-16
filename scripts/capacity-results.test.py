@@ -46,6 +46,23 @@ class Directory:
 
 
 class CapacityContracts(unittest.TestCase):
+    def test_explicit_baseline_keeps_exact_identity_guard(self):
+        image = "approved-fixture:local"
+        expected = "sha256:" + "a" * 64
+        with patch.object(runner, "docker", return_value=SimpleNamespace(stdout="sha256:" + "b" * 64)) as command:
+            with self.assertRaisesRegex(RuntimeError, "protected_baseline_identity"):
+                runner.build(None, "synthetic", image, expected)
+        command.assert_called_once_with("image", "inspect", "--format", "{{.Id}}", image)
+
+    def test_explicit_baseline_does_not_replace_browser_guard(self):
+        expected = "sha256:" + "a" * 64
+        with patch.object(runner, "docker", side_effect=[
+            SimpleNamespace(stdout=expected), SimpleNamespace(stdout="sha256:" + "b" * 64),
+        ]) as command:
+            with self.assertRaisesRegex(RuntimeError, "protected_browser_identity"):
+                runner.build(None, "synthetic", "approved-fixture:local", expected)
+        self.assertEqual(command.call_args_list[1].args, ("image", "inspect", "--format", "{{.Id}}", runner.BROWSER))
+
     def test_parent_heap_requires_owned_complete_samples_and_terminal_identity(self):
         identity = {"event": "identity", "pid": 42, "isolate": 0, "node": "24.21.0", "v8": "13.6",
                     "heap": {"heap_size_limit": 905969664}, "execArgv": ["--max-old-space-size=768"]}

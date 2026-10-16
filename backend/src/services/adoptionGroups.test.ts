@@ -29,7 +29,8 @@ describe("read-only adoption groups", () => {
     await stages.execute(generationInput({ scope: { ...generationInput().scope, ...identity } }), async lease => {
       const key = await stages.query(lease, "discovery", "synthetic:adoption");
       await stages.page(lease, key, "synthetic:adoption", users.length, users.length);
-      await stages.directory(lease, key, users); await stages.finishQuery(lease, key);
+      for (let offset = 0; offset < users.length; offset += 250) await stages.directory(lease, key, users.slice(offset, offset + 250));
+      await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
     const reader = new LargeTenantUsersReports(fixture.runtime, secret, 7);
     const read = async (query: ReportQuery = {}, limit = 5) => {
@@ -47,6 +48,10 @@ describe("read-only adoption groups", () => {
     }
     return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
   }
+  it("rejects the bounded group-row sentinel instead of extracting an unbounded cohort or returning a partial success", async () => {
+    const { read } = await setup(Array.from({ length: 16_385 }, (_, index) => user(index + 1)));
+    await expect(read()).rejects.toMatchObject({ status: 413, code: "adoption_page_too_large" });
+  }, 60000);
   it("normalizes organization fields, keeps missing departments, and includes users without paid Copilot", async () => {
     const { read } = await setup([user(1), user(2, " contoso ", " hr "), user(3, "Contoso", null)]);
     const page = await read();

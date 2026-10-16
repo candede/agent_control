@@ -1,23 +1,25 @@
-export type BlockAuditAction = "block" | "unblock";
+import type { AuditOriginV1, OriginFilters } from "./actionOrigin.js";
+type BlockAuditAction = "block" | "unblock";
 
-export type AccessAuditAction = "update-availability" | "update-installation";
+type AccessAuditAction = "update-availability" | "update-installation";
 
-export type ReassignAuditAction = "reassign";
+type ReassignAuditAction = "reassign";
 
-export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
+type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
 
-export type HuntingReadAction = "view-hunting" | "export-hunting";
+type HuntingReadAction = "view-hunting" | "export-hunting";
 
-export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
+type HuntingLifecycleAction = "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting";
 
 export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
 
 export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory" | "export-agent-inventory";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
-export type AdministrativeExportAction = "export-administrative-audit";
+type AdministrativeExportAction = "export-administrative-audit";
 export type AgentUsageAuditAction = "associate-agent-usage" | "remove-agent-usage-association";
 
-export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction | AgentUsageAuditAction;
+export type ControlLifecycleAction = "resume-control" | "cancel-control" | "reconcile-control";
+export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction | AgentUsageAuditAction | ControlLifecycleAction;
 
 export type AuditScope = "single" | "bulk";
 
@@ -68,6 +70,7 @@ type AuditEventBase = {
   errorCode?: string;
   requestPath: string;
   metadata?: Record<string, unknown>;
+  origin: AuditOriginV1;
 };
 
 type AuditEventAction =
@@ -76,7 +79,7 @@ type AuditEventAction =
       targetBlockedState: boolean;
     }
   | {
-      action: AccessAuditAction | ReassignAuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction | AgentUsageAuditAction;
+      action: Exclude<LocalAuditAction, BlockAuditAction>;
       targetBlockedState?: never;
     };
 
@@ -84,12 +87,13 @@ export type AuditEvent = AuditEventBase & AuditEventAction;
 
 export type StartAuditEvent = Omit<
   AuditEventBase,
-  "id" | "startedAt" | "completedAt" | "status"
+  "id" | "startedAt" | "completedAt" | "status" | "origin"
 > &
   AuditEventAction & {
     id?: string;
     startedAt?: string;
     status?: "started";
+    origin?: AuditOriginV1;
   };
 
 export type CompleteAuditEvent = {
@@ -100,7 +104,7 @@ export type CompleteAuditEvent = {
   metadata?: Record<string, unknown>;
 };
 
-export type ListAuditEventsQuery = {
+export type ListAuditEventsQuery = OriginFilters & {
   limit?: number;
   offset?: number;
   agentId?: string;

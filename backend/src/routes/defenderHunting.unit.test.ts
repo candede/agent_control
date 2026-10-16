@@ -6,7 +6,7 @@ import "./defenderHunting.js";
 const mocks = vi.hoisted(() => ({
   handlers: new Map<string, RequestHandler>(),
   hunting: {
-    beginReadValidation: vi.fn(), catalog: vi.fn(), get: vi.fn(), rows: vi.fn(), cancel: vi.fn(),
+    beginReadValidation: vi.fn(), get: vi.fn(), rows: vi.fn(), cancel: vi.fn(),
   },
   audit: { startEvent: vi.fn(), completeEvent: vi.fn() },
   assertCurrent: vi.fn(),
@@ -20,6 +20,9 @@ vi.mock("./policy.js", () => ({
 }));
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn() }));
 vi.mock("../middleware/auth.js", () => ({ requestScope: () => ({ tenantId: "hunting-tenant", principalId: "hunting-reader" }) }));
+vi.mock("../middleware/requestAuthentication.js", () => ({
+  requestUser: (request: Request) => request.session.user,
+}));
 vi.mock("../services/defenderHunting.js", () => ({ defenderHunting: mocks.hunting }));
 vi.mock("../services/auditLog.js", () => ({ getAuditLog: () => mocks.audit }));
 vi.mock("../services/telemetry.js", async original => ({
@@ -29,7 +32,6 @@ vi.mock("../services/telemetry.js", async original => ({
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.hunting.beginReadValidation.mockReturnValue(mocks.assertCurrent);
-  mocks.hunting.catalog.mockResolvedValue({ qualifications: [], retainedScopes: [] });
   mocks.hunting.get.mockResolvedValue({ id: "11111111-1111-4111-8111-111111111111" });
   mocks.hunting.rows.mockResolvedValue({ value: [{ agentId: "saved-agent" }], count: 1 });
   mocks.audit.startEvent.mockResolvedValue({ id: "hunting-event" });
@@ -47,7 +49,6 @@ function transport(method: string, path: string) {
 
 describe("Hunting JSON publication without services", () => {
   it.each([
-    ["/hunting/catalog", "catalog"],
     ["/hunting/jobs/:id", "get"],
   ] as const)("withholds %s when authority changes after its read settles", async (path, operation) => {
     const f = transport("get", path);
@@ -56,8 +57,18 @@ describe("Hunting JSON publication without services", () => {
       mocks.assertCurrent.mockImplementation(() => { throw failure; });
       return {};
     });
+
     await expect(f.run()).rejects.toBe(failure);
     expect(f.response.json).not.toHaveBeenCalled();
+  });
+
+  it("returns current catalog metadata without reading saved results or dispatching work", async () => {
+    const f = transport("get", "/hunting/catalog");
+    await f.run();
+    expect(f.response.json).toHaveBeenCalledWith(expect.objectContaining({
+      templates: expect.any(Array), limits: expect.objectContaining({ maximumWindowHours: 168 }),
+    }));
+    expect(mocks.hunting.get).not.toHaveBeenCalled();
   });
 
   it("withholds rows when saved scope is revoked during audit completion", async () => {

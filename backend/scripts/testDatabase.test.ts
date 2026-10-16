@@ -45,7 +45,7 @@ beforeEach(() => {
     .mockImplementationOnce(function () { return mocks.operator; })
     .mockImplementationOnce(function () { return mocks.runtime; });
   mocks.runtime.query.mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] });
 });
 afterEach(() => { vi.useRealTimers(); });
@@ -115,7 +115,7 @@ describe("isolated test database lifecycle without PostgreSQL", () => {
 
   it("cleans up rather than returning an initialized fixture with invalid operational state", async () => {
     mocks.runtime.query.mockResolvedValueOnce({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: "false", restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "invalid",
     }] });
     await expect(testDatabase()).rejects.toThrow("Operational state is invalid.");
     for (const pool of [mocks.admin, mocks.operator, mocks.runtime]) expect(pool.end).toHaveBeenCalledOnce();

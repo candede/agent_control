@@ -1,4 +1,4 @@
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { AgentIdentityRepository, type AgentIdentityFailure } from "../db/agentIdentity.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, isTimeoutError } from "../errors.js";
@@ -14,8 +14,8 @@ type Dependencies = {
   inventory: Pick<typeof agentInvestigations, "resolve">;
   repository: Pick<AgentIdentityRepository, "save" | "invalidate" | "saveFailure">;
   directory: Pick<GraphAgentIdentityClient, "resolve">;
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  delegatedToken: typeof acquireDelegatedToken;
+  revalidateUser: typeof revalidateAuthorizedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
   requireAvailable: typeof capabilities.requireAvailable;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
@@ -28,8 +28,8 @@ export class AgentIdentityResolutionService {
 
   constructor(dependencies: Partial<Dependencies> = {}) {
     this.dependencies = { inventory: agentInvestigations, repository: new AgentIdentityRepository(),
-      directory: new GraphAgentIdentityClient(), revalidateUser: revalidateAuthenticatedUser,
-      delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      directory: new GraphAgentIdentityClient(), revalidateUser: revalidateAuthorizedUser,
+      delegatedToken: acquireAuthorizedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, ...dependencies };

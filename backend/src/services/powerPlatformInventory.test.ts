@@ -147,7 +147,7 @@ describe("Power Platform inventory refresh service", () => {
 
   beforeEach(async () => {
     await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "normal",
     }] }) });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -431,7 +431,7 @@ describe("Power Platform inventory refresh service", () => {
     expect(repository.complete).not.toHaveBeenCalled();
   });
 
-  it.each(["maintenance", "provider_requalification_required"])(
+  it.each(["maintenance"])(
     "fences inventory resume and publication when admissions close: %s", async code => {
       for (const stage of ["start", "authorization", "activation", "collection"]) {
         const { service, repository, dependencies, job } = fixture();

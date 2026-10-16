@@ -8,6 +8,9 @@ import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScop
 import { operationalLog } from "../services/telemetry.js";
 import type { AppRole } from "../types/capability.js";
 import { DataGenerations } from "./dataGenerations.js";
+import { currentAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
+import { assertAuthSignal, authCancelled } from "../auth/boundedAuth.js";
 
 const PgSessionStore = connectPgSimple(session);
 
@@ -73,16 +76,18 @@ export async function revokeAccountSessions(database: pg.Pool, tenantId: string,
   await database.query("DELETE FROM sessions WHERE tenant_id=$1 AND principal_id=$2", [tenantId, principalId]);
 }
 
-type SessionValidation = { key: string; generation: number };
-type AccountMutationState = { generation: number; revoked: boolean; tail: Promise<void> };
+type SessionValidation = { key: string; generation: number; authority?: DelegatedCredentialSource };
+type AccountMutationState = { generation: number; revoked: boolean; bearerIssuedAfter: number; tail: Promise<void> };
 const accountMutations = new Map<string, AccountMutationState>();
 let nextGeneration = 0;
 const maximumAccountMutationStates = 10_000;
 
-export function beginAccountSessionValidation(tenantId: string, principalId: string): SessionValidation {
+export function beginAccountSessionValidation(tenantId: string, principalId: string, bindAuthority = true): SessionValidation {
   const key = accountMutationKey(tenantId, principalId);
   const state = accountMutationState(key);
-  return { key, generation: state.generation };
+  const source = bindAuthority ? currentAuthority() : undefined;
+  if (source && (source.principal.tenantId !== tenantId || source.principal.principalId !== principalId)) throw AppError.unauthorized();
+  return { key, generation: state.generation, ...(source ? { authority: source } : {}) };
 }
 
 export function commitAccountSessionValidation<T>(validation: SessionValidation, operation: () => Promise<T>) {
@@ -99,6 +104,38 @@ export function assertAccountSessionValidation(validation: SessionValidation) {
   if (!state || state.revoked || state.generation !== validation.generation) {
     throw AppError.unauthorized("The session was revoked or superseded.");
   }
+  validation.authority?.assertCurrent();
+}
+
+export function authorizeAccountBearer<T>(
+  tenantId: string, principalId: string, issuedAt: number,
+  operation: (validation: SessionValidation) => Promise<T>, signal?: AbortSignal,
+) {
+  const validation = beginAccountSessionValidation(tenantId, principalId);
+  const state = accountMutations.get(validation.key)!;
+  const assertCandidate = () => {
+    assertAuthSignal(signal);
+    if (accountMutations.get(validation.key) !== state || state.generation !== validation.generation
+      || !Number.isSafeInteger(issuedAt) || issuedAt <= state.bearerIssuedAfter) {
+      throw AppError.unauthorized("The bearer was revoked or superseded.");
+    }
+    validation.authority?.assertCurrent();
+  };
+  return enqueueAccountMutation(state, async () => {
+    assertCandidate();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(authCancelled());
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      const result = await Promise.race([operation(validation), cancelled]);
+      assertCandidate();
+      // A proven post-revocation assertion opens this generation, not a new one.
+      state.revoked = false;
+      return result;
+    } finally { signal?.removeEventListener("abort", abort); }
+  });
 }
 
 export async function assertCurrentStoredSession(
@@ -134,6 +171,7 @@ export function revokeAccountSessionMutations<T>(tenantId: string, principalId: 
   const state = accountMutationState(accountMutationKey(tenantId, principalId));
   state.generation = ++nextGeneration;
   state.revoked = true;
+  state.bearerIssuedAfter = Math.max(state.bearerIssuedAfter, Date.now());
   return enqueueAccountMutation(state, operation);
 }
 
@@ -144,11 +182,16 @@ function accountMutationKey(tenantId: string, principalId: string) {
 function accountMutationState(key: string) {
   let state = accountMutations.get(key);
   if (!state) {
-    state = { generation: 0, revoked: false, tail: Promise.resolve() };
+    state = { generation: ++nextGeneration, revoked: false, bearerIssuedAfter: 0, tail: Promise.resolve() };
     accountMutations.set(key, state);
     while (accountMutations.size > maximumAccountMutationStates) accountMutations.delete(accountMutations.keys().next().value!);
   }
   return state;
+}
+
+export function clearAccountSessionMutationsForTest() {
+  if (process.env.NODE_ENV !== "test") throw new Error("test_only");
+  accountMutations.clear();
 }
 
 function enqueueAccountMutation<T>(state: AccountMutationState, operation: () => Promise<T>) {

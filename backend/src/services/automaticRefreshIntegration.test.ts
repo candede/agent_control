@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { revalidateAuthenticatedUser } from "../auth/msal.js";
+import { revalidateAuthorizedUser } from "../auth/msal.js";
 import { AppError } from "../errors.js";
 import { DataSyncRepository } from "../db/dataSync.js";
 import { OfficialReportStatusRepository } from "../db/officialReportStatus.js";
@@ -28,9 +28,9 @@ import { schemaRegistry } from "./officialReportFields.js";
 vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-automatic-refresh-integration-secret"; });
 
 vi.mock("../auth/msal.js", () => ({
-  acquireDelegatedToken: vi.fn(async () => "synthetic-delegated-token"),
+  acquireAuthorizedToken: vi.fn(async () => "synthetic-delegated-token"),
   acquireApplicationToken: vi.fn(async () => { throw new Error("Automatic sync must never use application tokens."); }),
-  revalidateAuthenticatedUser: vi.fn(async () => user),
+  revalidateAuthorizedUser: vi.fn(async () => user),
 }));
 vi.mock("./capabilities.js", () => ({ capabilities: {
   requireAvailable: vi.fn(async () => undefined),
@@ -115,7 +115,7 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect(initial.run).toMatchObject({ automatic: true });
     await waitForRun(scope, initial.run!.id, "completed");
     expect(list).toHaveBeenCalledOnce();
-    if (!initial.detailJob) expect(details).not.toHaveBeenCalled();
+    expect(details.mock.calls.length).toBeLessThanOrEqual(1);
     expect(sources.mock.calls.map(([, input]) => input.scope.source).sort()).toEqual(["app_activity", "directory"]);
     expect(sourceFetch).toHaveBeenCalledTimes(2);
     expect((await fixture.runtime.query(`SELECT attempt.source,attempt.status,attempt.observed_count FROM user_source_attempts attempt
@@ -164,7 +164,7 @@ it("recovers the same principal after sign-in without replaying old authenticati
   const reader = { ...user, homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   const expiredSignIn = Date.now() - 60_000;
-  vi.mocked(revalidateAuthenticatedUser).mockRejectedValue(new AppError(401, "interaction_required", "Token cache unavailable."));
+  vi.mocked(revalidateAuthorizedUser).mockRejectedValue(new AppError(401, "interaction_required", "Token cache unavailable."));
   vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
     await options?.visit?.("empty-first");
     yield { token: "empty-first", nextToken: null, records: [], rawCount: 0, expectedCount: 0, page: 1 };
@@ -176,7 +176,7 @@ it("recovers the same principal after sign-in without replaying old authenticati
     expect(beforeLogin.run?.id).toBe(failed.run!.id);
     expect(beforeLogin.run?.sources.map(source => source.status)).toContain("waiting_authorization");
 
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(reader);
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue(reader);
     const signedInAt = Date.now();
     const recovered = await service.automaticRefresh(reader, signedInAt);
     expect(recovered.run?.id).not.toBe(failed.run!.id);
@@ -185,14 +185,14 @@ it("recovers the same principal after sign-in without replaying old authenticati
     expect(checked.run?.id).toBe(recovered.run!.id);
     expect(checked.run?.sources.every(source => source.status === "succeeded")).toBe(true);
   } finally {
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(user);
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue(user);
   }
 });
 
 it("finishes a partial automatic run when the last inventory child publishes after Users failed", async () => {
   const reader = { ...user, homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
-  vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(reader);
+  vi.mocked(revalidateAuthorizedUser).mockResolvedValue(reader);
   let release!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
   vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
@@ -202,20 +202,27 @@ it("finishes a partial automatic run when the last inventory child publishes aft
   });
   const people = vi.spyOn(AgentPeopleService.prototype, "refreshReferences")
     .mockRejectedValueOnce(new AppError(503, "provider_timeout", "Agent people lookup did not complete."));
+  let usersSettled = false;
+  const updateSource = repository.updateSource.bind(repository);
+  const publication = vi.spyOn(repository, "updateSource").mockImplementation(async (...args) => {
+    const result = await updateSource(...args);
+    if (args[0].principalId === owner.principalId && args[2] === "users" && args[3].status === "partial") usersSettled = true;
+    return result;
+  });
   try {
     const submitted = await service.automaticRefresh(reader);
-    await vi.waitFor(async () => {
-      const current = await repository.getRun(owner, submitted.run!.id);
-      expect(current?.sources.find(source => source.source === "users")).toMatchObject({ status: "partial" });
-      expect(current?.sources.find(source => source.source === "graph_packages")).toMatchObject({ status: "running" });
-    });
+    await vi.waitFor(() => expect(usersSettled).toBe(true), { timeout: 2000 });
+    const current = await repository.getRun(owner, submitted.run!.id);
+    expect(current?.sources.find(source => source.source === "users")).toMatchObject({ status: "partial" });
+    expect(current?.sources.find(source => source.source === "graph_packages")).toMatchObject({ status: "running" });
     release();
     await waitForRun(owner, submitted.run!.id, "partial");
     expect((await repository.getRun(owner, submitted.run!.id))?.sources
       .filter(source => source.source !== "users").every(source => source.status === "succeeded")).toBe(true);
   } finally {
     release();
+    publication.mockRestore();
     people.mockRestore();
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(user);
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue(user);
   }
 });

@@ -25,12 +25,12 @@ function fixture() {
   const now = new Date();
   const row = { id, authorization_principal_id: scope.authorizationPrincipalId, result_scope_id: scope.resultScope.scopeId,
     result_scope_kind: scope.resultScope.kind, result_scope_configuration_revision: null, token_mode: scope.tokenMode,
-    status: "running", filters, query_version: 3, retained_scope_id: null as string | null, local_request_id: execution.owner,
+    status: "running", filters, query_version: 3, local_request_id: execution.owner,
     provider_request_id: null, provider_request_count: 1, activation_count: 1, execution_owner: execution.owner, execution_version: "1",
     provider_row_count: 0, stored_row_count: 0, byte_count: 2, result_complete: true, no_data: true, partial_reason: null,
     observed_start: null, observed_end: null, unobserved_start: null, unobserved_end: null, error_code: null, message: null,
     cancel_requested: false, created_at: now, attempted_at: now, updated_at: now, finished_at: now, expires_at: new Date(Date.now() + 60_000),
-    deadline_at: new Date(Date.now() + 60_000), is_qualification: false };
+    deadline_at: new Date(Date.now() + 60_000), };
   const query = vi.fn(async (text: unknown, _values?: unknown[]) => response(typeof text === "string" && text.includes("FOR UPDATE") ? [row]
     : typeof text === "string" && text.includes("UPDATE defender_hunting_jobs SET status=") ? [{ ...row, status: "succeeded" }] : []));
   vi.spyOn(client, "query").mockImplementation(query);
@@ -62,21 +62,46 @@ function projectedClient(selected: DefenderHuntingFilters, overrides: Record<str
 }
 
 describe("Defender publication transaction without a database", () => {
+  it.each(["delegated", "application"] as const)("always stores an exact-target SHA-256 for current %s submissions", async tokenMode => {
+    const f = fixture();
+    const currentScope: DefenderHuntingScope = tokenMode === "delegated" ? scope : {
+      ...scope, tokenMode, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
+    };
+    const query = f.query.getMockImplementation()!;
+    f.query.mockImplementation(async (text, values) => typeof text === "string" && text.includes("AS principal_count")
+      ? f.response([{ principal_count: 0, tenant_count: 0 }]) : query(text, values));
+    f.databaseQuery.mockResolvedValue(f.response([f.row]));
+    const targets: DefenderHuntingFilters[] = [
+      filters,
+      { ...filters, startDateTime: "2026-09-10T10:00:00.000Z", endDateTime: "2026-09-10T11:00:00.000Z" },
+      { ...filters, agentIds: [id] },
+      { ...filters, entraAgentIds: [id] },
+    ];
+    for (const [index, selected] of targets.entries()) {
+      await f.repository.submit(currentScope, { idempotencyKey: `target-hash-${index}`, filters: selected });
+    }
+    const inserts = f.query.mock.calls.filter(([text]) => typeof text === "string" && text.includes("INSERT INTO defender_hunting_jobs"));
+    expect(inserts).toHaveLength(targets.length);
+    const hashes = inserts.map(([text, values]) => {
+      expect(text).toContain("target_scope_hash");
+      const hash = values?.[12];
+      expect(hash).toMatch(/^[a-f0-9]{64}$/);
+      return hash;
+    });
+    expect(hashes[0]).toBe(hashes[1]);
+    expect(new Set([hashes[0], hashes[2], hashes[3]]).size).toBe(3);
+    await f.repository.getJob(currentScope, id);
+    expect(f.databaseQuery.mock.lastCall?.[0]).toContain("previous.target_scope_hash=job.target_scope_hash");
+  });
+
   it.each(["cancel", "delete"] as const)("denies foreign application %s under both saved and execution scopes while leaving shared reads available", async action => {
-    for (const qualification of [false, true]) {
       const f = fixture();
       const applicationScope: DefenderHuntingScope = { ...scope, tokenMode: "application",
         resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 } };
       const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-        resultScopes: [applicationScope.resultScope], qualifications: [{ resultScope: applicationScope.resultScope, authority: {
-          capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
-          permissionRevision: "b".repeat(64), configurationRevision: 1,
-        } }] };
+        resultScopes: [applicationScope.resultScope], };
       const foreign = { ...f.row, authorization_principal_id: "other-owner", result_scope_kind: "application",
-        result_scope_id: "application-client", result_scope_configuration_revision: "1", token_mode: "application",
-        is_qualification: qualification, status: "succeeded", capability_id: "defender.hunting.application",
-        contract_revision: "a".repeat(64), permission_revision: "b".repeat(64), qualification_configuration_revision: "1",
-        approved_by: "other-owner" };
+        result_scope_id: "application-client", result_scope_configuration_revision: "1", token_mode: "application", status: "succeeded" };
       f.databaseQuery.mockResolvedValue(f.response([foreign]));
       await expect(f.repository.getJob(readScope, id)).resolves.toMatchObject({ authorizationPrincipalId: "other-owner" });
       f.query.mockImplementation(async text => f.response(typeof text === "string" && /^(UPDATE|DELETE)/.test(text) ? [foreign] : []));
@@ -93,7 +118,6 @@ describe("Defender publication transaction without a database", () => {
       }
       expect(f.query.mock.calls.some(([text]) => typeof text === "string" && /^(UPDATE|DELETE)/.test(text))).toBe(false);
       expect(f.query).not.toHaveBeenCalledWith("COMMIT");
-    }
   });
 
   it.each(["cancel", "delete"] as const)("retains the owned-job state error for invalid %s without treating it as a missing foreign job", async action => {
@@ -150,25 +174,21 @@ describe("Defender publication transaction without a database", () => {
     expect(f.query).not.toHaveBeenCalledWith("COMMIT");
   });
 
-  it.each(["cancel", "delete", "revoke"] as const)("rolls back %s when its mutation authority changes during the database write", async action => {
+  it.each(["cancel", "delete"] as const)("rolls back %s when its mutation authority changes during the database write", async action => {
     const f = fixture();
     let allowed = true;
-    const retained = { ...f.row, configuration_revision: "1", approved_at: f.row.created_at, qualified_at: f.row.created_at,
-      revoked_at: f.row.created_at };
     const query = async (text: unknown) => {
       if (typeof text === "string" && text.includes("FOR UPDATE")) return f.response([f.row]);
       if (typeof text === "string" && /^(UPDATE|DELETE)/.test(text)) {
         allowed = false;
-        return f.response([action === "revoke" ? retained : { ...f.row, status: "cancelled" }]);
+        return f.response([{ ...f.row, status: "cancelled" }]);
       }
       return f.response();
     };
     f.query.mockImplementation(query);
     f.databaseQuery.mockImplementation(query);
     const fence = () => { if (!allowed) throw AppError.unauthorized("Mutation authority changed."); };
-    const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId, resultScopes: [scope.resultScope] };
-    await expect(action === "revoke" ? f.repository.revokeRetainedScope(readScope, id, "delegated", "reader", fence)
-      : action === "cancel" ? f.repository.cancel(scope, id, fence) : f.repository.delete(scope, id, fence))
+    await expect(action === "cancel" ? f.repository.cancel(scope, id, fence) : f.repository.delete(scope, id, fence))
       .rejects.toMatchObject({ status: 401 });
     expect(f.query).toHaveBeenCalledWith("ROLLBACK");
     expect(f.query).not.toHaveBeenCalledWith("COMMIT");
@@ -235,15 +255,6 @@ describe("Defender publication transaction without a database", () => {
     await expect(f.repository.listRows(scope, id)).rejects.toMatchObject({ code: "not_found" });
   });
 
-  it.each(["admission", "publication"] as const)("rejects expired or revoked retained qualification in the %s transaction", async phase => {
-    const f = fixture();
-    f.row.retained_scope_id = "44444444-4444-4444-8444-444444444444";
-    await expect(phase === "admission" ? f.repository.authorizeProviderRequest(scope, id, execution)
-      : f.repository.publish(scope, id, execution, result)).rejects.toMatchObject({ code: "hunting_scope_unqualified" });
-    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
-    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
-  });
-
   it("returns its committed snapshot without a fallible post-commit read", async () => {
     const f = fixture();
     f.databaseQuery.mockRejectedValue(new Error("Read unavailable after commit."));
@@ -269,22 +280,6 @@ describe("Defender publication transaction without a database", () => {
     })).rejects.toMatchObject({ status: 401 });
     expect(f.query).toHaveBeenCalledWith("ROLLBACK");
     expect(f.query).not.toHaveBeenCalledWith("COMMIT");
-  });
-
-  it("keeps partial qualification visible only under its approving account and exact current authority", async () => {
-    const f = fixture();
-    const qualificationScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-      resultScopes: [scope.resultScope], qualifications: [{ resultScope: scope.resultScope, authority: {
-        capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1,
-      } }] };
-    await f.repository.getJob(qualificationScope, id);
-    const [sql, values] = f.databaseQuery.mock.calls[0];
-    expect(sql).toContain("job.is_qualification AND job.status<>'succeeded'");
-    expect(sql).toContain("job.authorization_principal_id=$");
-    expect(sql).toContain("job.qualification_configuration_revision=$");
-    expect(sql).toContain("retained.revoked_at IS NULL");
-    expect(values).toEqual(expect.arrayContaining([scope.authorizationPrincipalId, "a".repeat(64), "b".repeat(64), 1]));
   });
 
   it.each([

@@ -4,8 +4,30 @@ import { assertAccountSessionValidation, assertCurrentStoredSession, beginAccoun
 import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
 import { hasAppRole, type AppRole } from "../types/capability.js";
+import { DataGenerations } from "../db/dataGenerations.js";
 
 export function createExportPublicationValidator(request: Request, requiredRole: AppRole, database: pg.Pool = pool) {
+  const source = request.authentication;
+  if (source?.principal.transport === "bearer") {
+    const { tenantId, principalId, sessionEpoch } = source.principal;
+    const validation = beginAccountSessionValidation(tenantId, principalId);
+    const assertCurrent = () => {
+      source.assertCurrent();
+      assertAccountSessionValidation(validation);
+      if (!hasAppRole([...source.principal.roles], requiredRole)) throw AppError.unauthorized();
+    };
+    const validate = () => commitAccountSessionValidation(validation, async () => {
+      assertCurrent();
+      if (await new DataGenerations(database).sessionEpoch(tenantId, principalId) !== sessionEpoch) throw AppError.unauthorized();
+      assertCurrent();
+    });
+    return async (validateSource?: () => Promise<void>) => {
+      await validate();
+      if (validateSource) { await validateSource(); await validate(); }
+      assertCurrent();
+      return assertCurrent;
+    };
+  }
   const identity = getValidatedSessionIdentity(request.session);
   const sessionId = request.sessionID;
   if (!identity || !hasAppRole(identity.user.roles, requiredRole)) {
@@ -14,6 +36,7 @@ export function createExportPublicationValidator(request: Request, requiredRole:
   const { tenantId, accountId: principalId, clientId } = identity;
   const validation = beginAccountSessionValidation(tenantId, principalId);
   const assertCurrent = () => {
+    source?.assertCurrent();
     assertAccountSessionValidation(validation);
     const current = getValidatedSessionIdentity(request.session);
     if (request.sessionID !== sessionId || !current || current.accountId !== principalId || current.tenantId !== tenantId

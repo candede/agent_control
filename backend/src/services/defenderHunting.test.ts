@@ -2,12 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DefenderHuntingRepository } from "../db/defenderHunting.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingQueryResult, DefenderHuntingRetainedScope } from "../types/defenderHunting.js";
+import type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingQueryResult } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { DefenderHuntingService } from "./defenderHunting.js";
 import { GraphHuntingClient, expectedHuntingSchema } from "./graphHunting.js";
 import type { CapabilityService } from "./capabilities.js";
 import { loadOperationalState } from "./operationalState.js";
+import { unknownOrigin } from "./actionOrigin.js";
 
 vi.mock("../config.js", () => ({ config: {
   nodeEnv: "test", officialUsageStaleDays: 30, sessionSecret: "synthetic-defender-unit-session-secret",
@@ -21,14 +22,10 @@ const user: AuthenticatedUser = { homeAccountId: "security-a", tenantId: "tenant
   roles: ["AgentControl.Viewer"], providerRoleIds: [] };
 const filters: DefenderHuntingFilters = { templateId: "agents_inventory", startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(),
   endDateTime: new Date().toISOString(), agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] };
-const qualification = { capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId };
-const retainedScope = { id: "44444444-4444-4444-8444-444444444444", authority: {
-  capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-} };
 
 beforeEach(async () => {
   await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
   await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
 });
@@ -36,23 +33,13 @@ beforeEach(async () => {
 function job(overrides: Partial<DefenderHuntingJob> = {}): DefenderHuntingJob {
   return { id: "11111111-1111-4111-8111-111111111111", authorizationPrincipalId: user.homeAccountId,
     resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, tokenMode: "delegated", status: "waiting_authorization",
-    filters, queryVersion: 3, retainedScopeId: retainedScope.id, localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: null, providerRequestCount: 0,
+    filters, queryVersion: 3, localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: null, providerRequestCount: 0,
     activationCount: 0, providerRowCount: 0, storedRowCount: 0, byteCount: 0, complete: false, noData: false, partialReason: null,
-    observedRange: null, unobservedRange: null, snapshotId: null, priorSuccessfulJobId: null, qualification: null, cancelRequested: false, createdAt: new Date().toISOString(),
+    observedRange: null, unobservedRange: null, snapshotId: null, priorSuccessfulJobId: null, cancelRequested: false, createdAt: new Date().toISOString(),
     attemptedAt: null, updatedAt: new Date().toISOString(), finishedAt: null, expiresAt: new Date(Date.now() + 60_000).toISOString(), canResume: true, ...overrides };
 }
 
 const emptyResult: DefenderHuntingQueryResult = { rows: [], providerRowCount: 0, storedRowCount: 0, byteCount: 2, complete: true, partialReason: null };
-
-function retained(overrides: Partial<DefenderHuntingRetainedScope> = {}): DefenderHuntingRetainedScope {
-  return { ...retainedScope.authority, id: retainedScope.id, tokenMode: "delegated",
-    resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null },
-    templateId: filters.templateId, targetScopeHash: "c".repeat(64),
-    approvedScope: { templateId: filters.templateId, agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] },
-    queryVersion: 3, approvedBy: user.homeAccountId, sourceQualificationJobId: job().id,
-    approvedAt: new Date().toISOString(), qualifiedAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null, ...overrides };
-}
 
 function setup(overrides: Record<string, unknown> = {}) {
   let current = job();
@@ -60,38 +47,32 @@ function setup(overrides: Record<string, unknown> = {}) {
   const audit = { startEvent: vi.fn(async () => ({ id: "audit-event" })), completeEvent: vi.fn(async () => undefined) };
   const repository = {
     getJob: vi.fn(async () => current), begin: vi.fn(async () => { current = { ...current, status: "running", activationCount: current.activationCount + 1 }; return { ...execution, job: current }; }),
-    requireQualifiedScope: vi.fn(async (_scope, _filters, authority) => ({ id: retainedScope.id, authority })),
-    listQualificationEvidence: vi.fn(async () => []), listRetainedScopes: vi.fn<DefenderHuntingRepository["listRetainedScopes"]>(async () => []),
     authorizeProviderRequest: vi.fn(async () => undefined), recordProviderResponse: vi.fn(async () => undefined),
     publish: vi.fn<DefenderHuntingRepository["publish"]>(async () => { current = { ...current, status: "succeeded", complete: true, noData: true }; return current; }),
     markWaitingAuthorization: vi.fn(async () => { current = { ...current, status: "waiting_authorization" }; return current; }),
     fail: vi.fn(async (_scope, _id, _execution, code) => { current = { ...current, status: "inconclusive", errorCode: code }; return current; }),
     submit: vi.fn(async () => current), listJobs: vi.fn<DefenderHuntingRepository["listJobs"]>(async () => ({ value: [current], count: 1, limit: 20, offset: 0 })),
-    listRows: vi.fn(), cancel: vi.fn(async () => { current = { ...current, status: "cancelled" }; return current; }), delete: vi.fn(),
-    revokeRetainedScope: vi.fn(async () => ({ id: retainedScope.id })), recoverInterrupted: vi.fn(async () => 0),
+    listRows: vi.fn(), cancel: vi.fn(async () => { current = { ...current, status: "cancelled" }; return current; }), delete: vi.fn(), recoverInterrupted: vi.fn(async () => 0),
   };
   const dependencies = { delegatedToken: vi.fn(async () => "delegated-token"), applicationToken: vi.fn(async () => "application-token"),
     observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     revalidateUser: vi.fn(async () => user),
-    requireAvailable: vi.fn(async () => ({ authorized: true })),
     beginOperationValidation: vi.fn(() => () => undefined),
     requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 1 })), applicationIdentity: () => undefined,
-    qualificationContext: vi.fn(async (capabilityId: "defender.hunting.delegated" | "defender.hunting.application") => ({ capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
-    recordProviderEvidence: vi.fn(async (..._args: Parameters<CapabilityService["recordHuntingQualificationEvidence"]>) => ({ authorized: true })), auditLog: vi.fn(() => audit), runQuery: vi.fn(async () => emptyResult), ...overrides };
+    recordProviderEvidence: vi.fn(async (..._args: Parameters<CapabilityService["recordHuntingProviderEvidence"]>) => ({ authorized: true })), auditLog: vi.fn(() => audit), runQuery: vi.fn(async () => emptyResult), ...overrides };
   return { repository, dependencies, service: new DefenderHuntingService(repository as never, dependencies as never), current: () => current,
     setCurrent: (value: DefenderHuntingJob) => { current = value; }, audit };
 }
 
 describe("Defender hunting worker", () => {
-  it.each([false, true])("tracks the initial saved-identity lookup during shutdown (qualification=%s)", async qualificationOnly => {
+  it("tracks the initial saved-identity lookup during shutdown", async () => {
     const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
     const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
     const pending = Promise.withResolvers<void>();
     const agentScope = vi.fn(async () => { await pending.promise; return { recordId: agentRecordId, entraAgentIds }; });
     const fixture = setup({ agentScope });
-    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds }, qualification: qualificationOnly ? qualification : null }));
-    const starting = qualificationOnly ? fixture.service.startQualification(user, job().id, { agentRecordId: agentRecordId })
-      : fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
+    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds }, }));
+    const starting = fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
     const outcome = starting.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
     await vi.waitFor(() => expect(agentScope).toHaveBeenCalled());
     await fixture.service.drain();
@@ -300,33 +281,6 @@ describe("Defender hunting worker", () => {
     } finally { pending.resolve("late-token"); await fixture.service.drain(); }
   });
 
-  it("checks saved identity after awaited qualification authority before dispatch", async () => {
-    const agentRecordId = "agent:selected";
-    const selected = "22222222-2222-4222-8222-222222222222";
-    let changed = false;
-    const dispatched = vi.fn();
-    const fixture = setup({
-      agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds: [
-        changed ? "33333333-3333-4333-8333-333333333333" : selected,
-      ] })),
-      runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-        fixture.repository.requireQualifiedScope.mockImplementationOnce(async (_scope, _filters, authority) => {
-          changed = true;
-          return { id: retainedScope.id, authority };
-        });
-        await options?.beforeRequest?.(options.signal!);
-        dispatched();
-        return emptyResult;
-      }),
-    });
-    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds: [selected] } }));
-    await fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId });
-    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledOnce());
-    expect(dispatched).not.toHaveBeenCalled();
-    expect(fixture.repository.authorizeProviderRequest).not.toHaveBeenCalled();
-    await fixture.service.drain();
-  });
-
   it("closes the audit if cancellation wins during failure persistence", async () => {
     const pending = Promise.withResolvers<void>();
     const fixture = setup({ runQuery: vi.fn(async () => { throw new AppError(502, "provider_error", "Synthetic failure."); }) });
@@ -365,7 +319,7 @@ describe("Defender hunting worker", () => {
     expect(fixture.repository.listJobs).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds: [], entraAgentApplicationIds: [applicationId] }), 10, 0);
   });
 
-  it("derives scoped submission filters from current inventory and preserves qualification bounds", async () => {
+  it("derives scoped submission filters from current inventory", async () => {
     const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
     const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
     const agentScope = vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds }));
@@ -374,10 +328,6 @@ describe("Defender hunting worker", () => {
     await fixture.service.submit(user, { tokenMode: "delegated", filters: input, idempotencyKey: "agent-scoped", agentRecordId });
     expect(agentScope).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, agentRecordId);
     expect(fixture.repository.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ filters: { ...filters, entraAgentIds } }), expect.any(Function));
-    await fixture.service.approveQualification(user, { tokenMode: "delegated", filters: input, agentRecordId });
-    expect(fixture.repository.submit).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ filters: { ...filters, entraAgentIds }, qualification }), expect.any(Function));
-    await expect(fixture.service.approveQualification(user, { tokenMode: "delegated", agentRecordId,
-      filters: { ...input, startDateTime: new Date(Date.now() - 2 * 3_600_000).toISOString() } })).rejects.toMatchObject({ code: "invalid_hunting_range" });
     await fixture.service.submit(user, { tokenMode: "delegated", filters: { ...filters, entraAgentIds }, idempotencyKey: "exact-context", agentRecordId });
     await expect(fixture.service.submit(user, { tokenMode: "delegated", filters: { ...filters, agentIds: entraAgentIds }, idempotencyKey: "override", agentRecordId }))
       .rejects.toMatchObject({ code: "agent_identity_override" });
@@ -392,7 +342,6 @@ describe("Defender hunting worker", () => {
       fixture.setCurrent(job({ filters: { ...filters, ...(entraAgentIds ? { entraAgentIds } : {}) } }));
       await expect(fixture.service.get(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
       await expect(fixture.service.start(user, job().id, "delegated", { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
-      await expect(fixture.service.startQualification(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
       await expect(fixture.service.cancel(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
       await expect(fixture.service.delete(user, job().id, { agentRecordId: agentRecordId })).rejects.toMatchObject({ status: 404 });
       expect(fixture.repository.begin).not.toHaveBeenCalled();
@@ -402,21 +351,20 @@ describe("Defender hunting worker", () => {
     }
   });
 
-  it("scopes history, rows and catalog in the repository without running or authorizing a provider query", async () => {
+  it("scopes history and rows in the repository without running or authorizing a provider query", async () => {
     const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
     const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
     const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds })) });
-    await fixture.service.list(user, 10, 30, agentRecordId);
-    await fixture.service.rows(user, job().id, 10, 30, agentRecordId);
-    await fixture.service.catalog(user, agentRecordId);
-    for (const method of [fixture.repository.listJobs, fixture.repository.listRows, fixture.repository.listQualificationEvidence, fixture.repository.listRetainedScopes]) {
+    await fixture.service.list(user, 10, 30, { agentRecordId });
+    await fixture.service.rows(user, job().id, 10, 30, { agentRecordId });
+    for (const method of [fixture.repository.listJobs, fixture.repository.listRows]) {
       expect(method).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds, tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId }), ...(
         method === fixture.repository.listJobs ? [10, 30] : method === fixture.repository.listRows ? [job().id, 10, 30] : []));
     }
     expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
     expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
     expect(fixture.dependencies.applicationToken).not.toHaveBeenCalled();
-    expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
+    expect(fixture.dependencies.agentScope).toHaveBeenCalledTimes(4);
   });
 
   it("revalidates current saved identities before provider work and before publishing scoped results", async () => {
@@ -491,8 +439,7 @@ describe("Defender hunting worker", () => {
 
   it("publishes provider-verified readiness after an explicit bounded query", async () => {
     const fixture = setup();
-    fixture.setCurrent(job({ qualification }));
-    await fixture.service.startQualification(user, job().id);
+    await fixture.service.start(user, job().id, "delegated");
     await vi.waitFor(() => expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledOnce());
     expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
       "defender.hunting.delegated",
@@ -512,16 +459,21 @@ describe("Defender hunting worker", () => {
       await publication;
       return job({ status: "succeeded", complete: true, noData: true, providerRequestCount: 1 });
     });
-    await fixture.service.start(user, job().id, "delegated");
-    await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
-    expect(fixture.audit.startEvent).toHaveBeenCalledWith({
-      operationId: `query-hunting:${job().id}:${job().localRequestId}`, scope: "single", action: "query-hunting", agentId: job().id,
-      actor: user, requestPath: `/api/hunting/jobs/${job().id}`,
-      metadata: { source: "microsoft_defender_hunting", template: "agents_inventory", mode: "delegated", correlationId: job().localRequestId },
-    });
-    expect(fixture.audit.completeEvent).not.toHaveBeenCalled();
-    release();
-    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledWith("audit-event", expect.objectContaining({ status: "succeeded" })));
+    try {
+      await fixture.service.start(user, job().id, "delegated");
+      await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
+      expect(fixture.audit.startEvent).toHaveBeenCalledWith({
+        operationId: `query-hunting:${job().id}:${job().localRequestId}`, scope: "single", action: "query-hunting", agentId: job().id,
+        actor: user, origin: unknownOrigin, requestPath: `/api/hunting/jobs/${job().id}`,
+        metadata: { source: "microsoft_defender_hunting", template: "agents_inventory", mode: "delegated", correlationId: job().localRequestId },
+      });
+      expect(fixture.audit.completeEvent).not.toHaveBeenCalled();
+      release();
+      await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledWith("audit-event", expect.objectContaining({ status: "succeeded" })));
+    } finally {
+      release();
+      await fixture.service.drain();
+    }
   });
 
   it.each([401, 403])("classifies ambiguous Defender HTTP %s as provider_error evidence rather than expired local authority", async status => {
@@ -531,8 +483,7 @@ describe("Defender hunting worker", () => {
         httpStatus: status, retryAfterMs: 120_000, correlationId: "denied-request", body: "private provider body",
       });
     }) });
-    fixture.setCurrent(job({ qualification }));
-    await fixture.service.startQualification(user, job().id);
+    await fixture.service.start(user, job().id, "delegated");
     await vi.waitFor(() => expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledOnce());
     expect(fixture.dependencies.recordProviderEvidence).toHaveBeenCalledWith(
       "defender.hunting.delegated",
@@ -550,75 +501,38 @@ describe("Defender hunting worker", () => {
     await fixture.service.drain();
   });
 
-  it("allows Viewer delegated qualification and reserves application qualification for Admin", async () => {
-    const fixture = setup();
-    const unassigned = { ...user, roles: [] as AuthenticatedUser["roles"] };
-    expect(() => fixture.service.start(unassigned, job().id, "delegated")).toThrowError(expect.objectContaining({ code: "missing_internal_role" }));
-    await expect(fixture.service.approveQualification(user, { tokenMode: "delegated", filters })).resolves.toBeDefined();
-
-    const application = setup({ applicationIdentity: () => "application-client" });
-    await expect(application.service.approveQualification(user, { tokenMode: "application", filters }))
-      .rejects.toMatchObject({ code: "missing_internal_role" });
-    const admin: AuthenticatedUser = { ...user, roles: ["AgentControl.Admin"] };
-    await expect(application.service.approveQualification(admin, { tokenMode: "application", filters })).resolves.toBeDefined();
-    application.setCurrent(job({
-      tokenMode: "application",
-      resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
-      qualification: { ...qualification, capabilityId: "defender.hunting.application" },
-    }));
-    await expect(application.service.startQualification(user, job().id)).rejects.toMatchObject({ code: "missing_internal_role" });
-  });
-
-  it("submits an ordinary bounded delegated investigation without retained-scope qualification", async () => {
+  it("submits an ordinary bounded delegated investigation directly", async () => {
     const fixture = setup();
     await expect(fixture.service.submit(user, { tokenMode: "delegated", filters, idempotencyKey: "ordinary-delegated" }))
       .resolves.toMatchObject({ tokenMode: "delegated" });
-    expect(fixture.dependencies.requireAvailable).toHaveBeenCalledWith("defender.hunting.delegated", user);
-    expect(fixture.dependencies.qualificationContext).not.toHaveBeenCalled();
-    expect(fixture.repository.requireQualifiedScope).not.toHaveBeenCalled();
     expect(fixture.repository.submit).toHaveBeenCalledWith(expect.objectContaining({
       tokenMode: "delegated",
       resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null },
-    }), { idempotencyKey: "ordinary-delegated", filters }, expect.any(Function));
+    }), { idempotencyKey: "ordinary-delegated", filters, actor: user }, expect.any(Function));
   });
 
-  it("uses current exact-scope evidence for ordinary submissions and exact configuration for shared application results", async () => {
+  it("submits application hunts directly within the configured shared scope", async () => {
     const fixture = setup({ applicationIdentity: () => "application-client",
-      requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 5 })),
-      qualificationContext: vi.fn(async (capabilityId: "defender.hunting.delegated" | "defender.hunting.application") => ({
-        capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: capabilityId.endsWith(".application") ? 5 : 1,
-      })) });
+      requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 5 })), });
     fixture.repository.submit.mockResolvedValue(job({ tokenMode: "application" }));
     await fixture.service.submit(user, { tokenMode: "application", filters, idempotencyKey: "shared-hunt" });
-    expect(fixture.dependencies.qualificationContext).toHaveBeenCalledWith("defender.hunting.application", user);
-    expect(fixture.repository.requireQualifiedScope).toHaveBeenCalledWith(expect.objectContaining({ tokenMode: "application" }), filters,
-      expect.objectContaining({ capabilityId: "defender.hunting.application" }));
     expect(fixture.repository.submit).toHaveBeenCalledWith(expect.objectContaining({ tokenMode: "application",
       resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 5 } }),
-    { idempotencyKey: "shared-hunt", filters, retainedScope: { id: retainedScope.id, authority: expect.objectContaining({
-      capabilityId: "defender.hunting.application", configurationRevision: 5,
-    }) } }, expect.any(Function));
+    { idempotencyKey: "shared-hunt", filters, actor: user }, expect.any(Function));
   });
 
-  it("lets Viewer revoke its exact retained read scope", async () => {
-    const fixture = setup();
-    fixture.repository.listRetainedScopes.mockResolvedValue([retained()]);
-    await expect(fixture.service.revokeRetainedScope({ ...user, roles: [] }, retainedScope.id))
-      .rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(fixture.service.revokeRetainedScope(user, retainedScope.id)).resolves.toMatchObject({ id: retainedScope.id });
-    expect(fixture.repository.revokeRetainedScope).toHaveBeenCalledWith(expect.objectContaining({ tenantId: "tenant-a" }),
-      retainedScope.id, "delegated", user.homeAccountId, expect.any(Function));
-  });
-
-  it("does not let Viewer revoke a shared application retained scope", async () => {
+  it("executes and publishes an ordinary application hunt within the configured shared scope", async () => {
     const fixture = setup({ applicationIdentity: () => "application-client" });
-    fixture.repository.listRetainedScopes.mockResolvedValue([retained({
-      capabilityId: "defender.hunting.application",
+    fixture.setCurrent(job({
       tokenMode: "application",
       resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
-    })]);
-    await expect(fixture.service.revokeRetainedScope(user, retainedScope.id)).rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(fixture.service.revokeRetainedScope({ ...user, roles: ["AgentControl.Admin"] }, retainedScope.id)).resolves.toMatchObject({ id: retainedScope.id });
+    }));
+    await fixture.service.start(user, job().id, "application");
+    await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
+    expect(fixture.dependencies.applicationToken).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(fixture.current()).toMatchObject({ status: "succeeded", noData: true });
+    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledOnce());
   });
 
   it("reuses one active reservation and fences a held lookup during drain", async () => {
@@ -684,24 +598,6 @@ describe("Defender hunting worker", () => {
     await draining;
     expect(await startedResult).toEqual([{ status: "rejected", reason: failure }]);
     expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
-  });
-
-  it.each(["delegated", "application"] as const)("revalidates %s retained authority before every physical provider request", async mode => {
-    const fixture = setup({ applicationIdentity: () => "application-client",
-      runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.(options.signal!);
-      fixture.repository.requireQualifiedScope.mockRejectedValueOnce(new AppError(403, "hunting_scope_unqualified", "Revoked."));
-      await options?.beforeRequest?.(options.signal!);
-      return emptyResult;
-    }) });
-    if (mode === "application") fixture.setCurrent(job({ tokenMode: mode,
-      resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 } }));
-    await fixture.service.start(user, job().id, mode);
-    await vi.waitFor(() => expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
-    await fixture.service.drain();
-    expect(fixture.repository.authorizeProviderRequest).toHaveBeenCalledOnce();
-    expect(fixture.repository.publish).not.toHaveBeenCalled();
-    expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
   });
 
   it("does not send after the Viewer role is lost while acquiring a token", async () => {

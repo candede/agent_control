@@ -6,7 +6,7 @@ export const purviewAuditPresetIds = [
 export type PurviewAuditPresetId = (typeof purviewAuditPresetIds)[number];
 export type PurviewAuditTokenMode = "delegated" | "application";
 export type PurviewProviderQueryStatus = "notStarted" | "running" | "succeeded" | "failed" | "cancelled" | "unknownFutureValue";
-export type PurviewAuditJobStatus = "waiting_authorization" | "reconciling_create" | "running" | "succeeded" | "failed" | "cancelled" | "partial" | "inconclusive";
+type PurviewAuditJobStatus = "waiting_authorization" | "reconciling_create" | "running" | "succeeded" | "failed" | "cancelled" | "partial" | "inconclusive";
 export type PurviewAuditPartialReason = "provider_error" | "provider_throttled" | "provider_result_limit" | "audit_provider_request_limit" | "audit_job_expired" | "audit_activation_timeout" | "audit_page_limit" | "audit_row_limit" | "audit_byte_limit" | "audit_identity_unresolved";
 export type PurviewAuditResultScope =
   | { kind: "principal"; scopeId: string; configurationRevision: null }
@@ -53,7 +53,7 @@ export type PurviewMessageReference = {
   isPrompt: boolean;
 };
 
-export type PurviewRecordAssociation =
+type PurviewRecordAssociation =
   | { status: "resolved"; sourceSystem: "power_platform"; nativeId: string; resourceType: string; environmentId: string; matchedKind: "cds_bot_id" }
   | { status: "unresolved"; reason: "missing_environment" | "no_documented_exact_identifier" | "no_documented_cross_source_relation" }
   | { status: "ambiguous"; reason: "multiple_exact_candidates"; candidateCount: number };
@@ -124,7 +124,6 @@ export type PurviewAuditJob = {
   unobservedRange: { startDateTime: string; endDateTime: string } | null;
   errorCode?: string;
   message?: string;
-  qualificationId: string | null;
   cancelRequested: boolean;
   createdAt: string;
   attemptedAt: string | null;
@@ -148,24 +147,6 @@ export type PurviewAuditRecordPage = {
   limit: number;
   offset: number;
   job: PurviewAuditJob;
-};
-
-export type PurviewAuditQualification = {
-  id: string;
-  capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application";
-  tokenMode: PurviewAuditTokenMode;
-  authorizationPrincipalId: string;
-  resultScope: PurviewAuditResultScope;
-  filters: PurviewAuditFilters;
-  status: "approved" | "running" | "qualified" | "failed" | "inconclusive" | "expired";
-  contractRevision: string;
-  permissionRevision: string;
-  configurationRevision: number;
-  approvedBy: string;
-  approvedAt: string;
-  expiresAt: string;
-  jobId: string | null;
-  errorCode?: string;
 };
 
 export const purviewAuditPresets: Record<PurviewAuditPresetId, {

@@ -31,7 +31,7 @@ const record: UnifiedAgentRecord = {
 function authorized({ children, account = "reader", allowed = true }: { children: ReactNode; account?: string; allowed?: boolean }) {
   const now = Date.now();
   const directory: CapabilityView = {
-    definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
     decision: {
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],

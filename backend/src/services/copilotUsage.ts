@@ -1,7 +1,8 @@
 import type pg from "pg";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { config } from "../config.js";
 import { requireUserPublication, type UserSourcePublication } from "../db/dataSync.js";
+import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
 import { UserSourcesRepository } from "../db/userSources.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
@@ -23,8 +24,8 @@ export type CopilotUsageRefreshResult = {
   count: number | null; message: string;
 };
 type Dependencies = {
-  provider: UserSourceProvider; revalidateUser: typeof revalidateAuthenticatedUser;
-  delegatedToken: typeof acquireDelegatedToken;
+  provider: UserSourceProvider; revalidateUser: typeof revalidateAuthorizedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
   requireAvailable: (capability: CapabilityId, user: AuthenticatedUser) => Promise<unknown>; observeOperation: typeof capabilities.observeOperation;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   admissions: typeof requireProviderAdmissions;
@@ -38,8 +39,8 @@ export class CopilotUsageService {
     this.stages = new UserSourceStages(database);
     this.reports = new LargeTenantUsersReports(database, config.sessionSecret, config.officialUsageStaleDays);
     this.sources = this.reports.sources;
-    this.dependencies = { provider: new UserSourceProvider(), revalidateUser: revalidateAuthenticatedUser,
-      delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+    this.dependencies = { provider: new UserSourceProvider(), revalidateUser: revalidateAuthorizedUser,
+      delegatedToken: acquireAuthorizedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities), admissions: requireProviderAdmissions, ...dependencies };
   }
@@ -60,13 +61,17 @@ export class CopilotUsageService {
     fence();
     const before = await this.sources.refreshStatus(identity, "delegated");
     fence();
+    const reportChanged = (options.automatic || options.incompleteOnly) && await directoryNeedsReportRefresh(this.database, scope);
+    fence();
     const due = (source: UserSourceMetadata) => {
-      if (!options.automatic) return !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
+      if (!options.automatic) return source.source === "directory" && reportChanged
+        || !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
       if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
       const retryDelay = source.attemptStatus === "waiting_authorization" || source.attemptStatus === "permission_required" ? 3600000 : 900000;
       if (source.attemptedAt && source.attemptStatus !== "available" && Date.now() - Date.parse(source.attemptedAt) < retryDelay) return false;
-      return !source.generationId || !source.observedAt || Date.now() - Date.parse(source.observedAt) >= (source.source === "directory" ? 900000 : 21600000);
+      return source.source === "directory" && reportChanged || !source.generationId || !source.observedAt
+        || Date.now() - Date.parse(source.observedAt) >= (source.source === "directory" ? 900000 : 21600000);
     };
     const requested = (["directory", "app_activity"] as const).filter(source => due(before.sources[source]));
     if (!requested.length) return { status: before.status, count: before.count, message: "Current saved user sources do not require collection." };

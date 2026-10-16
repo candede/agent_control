@@ -6,10 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { TemporaryAgentSharingDiagnostic } from "./temporaryAgentSharingDiagnostic.js";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
-vi.mock("../auth/msal.js", () => ({ acquireDelegatedToken: vi.fn(), revalidateAuthenticatedUser: vi.fn() }));
+vi.mock("../auth/msal.js", () => ({ acquireAuthorizedToken: vi.fn(), revalidateAuthorizedUser: vi.fn() }));
 vi.mock("./capabilities.js", () => ({ capabilities: {
   beginOperationValidation: vi.fn(() => () => {}), requireAvailable: vi.fn(async () => {}),
 } }));
@@ -34,8 +34,8 @@ async function fixture() {
     ({ id, futureChatSetting: false, recipients: [], optional: null, instructions: "private agent instructions", access_token: "private credential" })) };
   const powerPlatform = { getDiagnosticAgentDetail: vi.fn(async (_token: string, nativeId: string) =>
     ({ data: [{ name: nativeId, properties: { futureSharing: { orgWide: true }, missingPreviously: [], optional: null } }] })) };
-  vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(user);
-  vi.mocked(acquireDelegatedToken).mockResolvedValue("synthetic-transport-secret");
+  vi.mocked(revalidateAuthorizedUser).mockResolvedValue(user);
+  vi.mocked(acquireAuthorizedToken).mockResolvedValue("synthetic-transport-secret");
   const log = vi.fn();
   const dependencies = { enabled: true, directory, graph, powerPlatform, log };
   const service = new TemporaryAgentSharingDiagnostic(dependencies);
@@ -54,7 +54,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const service = new TemporaryAgentSharingDiagnostic({ ...f.dependencies, enabled: false, files: { ...fs, lstat } });
     await expect(service.run(f.user, f.context)).resolves.toBe("disabled");
     expect(lstat).not.toHaveBeenCalled();
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.graph.getDiagnosticPackageDetails).not.toHaveBeenCalled();
     expect(f.log).not.toHaveBeenCalled();
   });
@@ -65,7 +65,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     else f.user.roles = ["AgentControl.Viewer"];
     await expect(f.service.run(f.user, f.context)).resolves.toBe("skipped");
     expect(await fs.readdir(f.directory)).toEqual([]);
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith("warn", "agent_sharing_diagnostic_skipped", expect.any(Object));
   });
 
@@ -125,9 +125,9 @@ describe("temporary two-agent sharing diagnostic", () => {
 
   it("stops when fresh authorization no longer grants administrator scope", async () => {
     const f = await fixture();
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue({ ...f.user, roles: ["AgentControl.Viewer"] });
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue({ ...f.user, roles: ["AgentControl.Viewer"] });
     await expect(f.service.run(f.user, f.context)).rejects.toMatchObject({ code: "diagnostic_authorization_changed" });
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.graph.getDiagnosticPackageDetails).not.toHaveBeenCalled();
     expect((await f.capture()).files).toHaveLength(2);
   });
@@ -135,9 +135,9 @@ describe("temporary two-agent sharing diagnostic", () => {
   it("cancels a pending token acquisition and ignores its late result", async () => {
     const f = await fixture();
     let resolve!: (value: string) => void;
-    vi.mocked(acquireDelegatedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
     const running = f.service.run(f.user, f.context);
-    await vi.waitFor(() => expect(acquireDelegatedToken).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(acquireAuthorizedToken).toHaveBeenCalledOnce());
     f.controller.abort(new DOMException("Stopped", "AbortError"));
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
     resolve("late-token");
@@ -162,9 +162,9 @@ describe("temporary two-agent sharing diagnostic", () => {
   it("does not overlap captures", async () => {
     const f = await fixture();
     let resolve!: (value: string) => void;
-    vi.mocked(acquireDelegatedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
     const running = f.service.run(f.user, f.context);
-    await vi.waitFor(() => expect(acquireDelegatedToken).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(acquireAuthorizedToken).toHaveBeenCalledOnce());
     await expect(f.service.run(f.user, f.context)).resolves.toBe("skipped");
     resolve("synthetic-transport-secret");
     await expect(running).resolves.toBe("succeeded");
@@ -176,7 +176,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     let started!: () => void;
     const authorizing = new Promise<void>(resolve => { started = resolve; });
-    vi.mocked(acquireDelegatedToken).mockImplementationOnce(() => { started(); return new Promise(() => {}); });
+    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => { started(); return new Promise(() => {}); });
     const running = f.service.run(f.user, f.context);
     const rejected = expect(running).rejects.toMatchObject({ name: "TimeoutError" });
     await authorizing;
@@ -226,7 +226,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const f = await fixture();
     for (let index = 0; index < 3; index++) await fs.mkdir(join(f.directory, randomUUID()), { mode: 0o700 });
     await expect(f.service.run(f.user, f.context)).rejects.toMatchObject({ code: "diagnostic_capture_limit" });
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(await fs.readdir(f.directory)).toHaveLength(3);
   });
 
@@ -240,7 +240,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     }
     await expect(new TemporaryAgentSharingDiagnostic({ ...f.dependencies, directory }).run(f.user, f.context))
       .rejects.toMatchObject({ code: "diagnostic_storage_unsafe" });
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
   });
 
   it("surfaces write failure without dispatching providers or claiming completion", async () => {
@@ -248,7 +248,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const open = vi.fn(async () => { throw new Error("Synthetic disk full"); });
     await expect(new TemporaryAgentSharingDiagnostic({ ...f.dependencies, files: { ...fs, open } }).run(f.user, f.context))
       .rejects.toMatchObject({ code: "diagnostic_storage_failed" });
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.log.mock.calls.some(call => call[1] === "agent_sharing_diagnostic_finished")).toBe(false);
   });
 });

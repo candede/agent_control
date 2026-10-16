@@ -33,7 +33,7 @@ RUN rm -rf backend/src backend/scripts backend/dist frontend/src frontend/browse
 COPY backend backend
 COPY frontend frontend
 COPY scripts scripts
-COPY Dockerfile compose.yaml compose.large-tenant-test.yaml deploy-local.ps1 deploy-azure.ps1 README.md ./
+COPY Dockerfile compose.yaml compose.large-tenant-test.yaml deploy-local.ps1 deploy-azure.ps1 README.md knip.json ./
 COPY docs docs
 COPY infra infra
 CMD ["npm", "test"]
@@ -52,6 +52,7 @@ RUN find node_modules -type f \( -name '*.test.*' -o -name '*.spec.*' \) -delete
 
 FROM postgres:17-bookworm AS operator
 ENV NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
+ENV TMPDIR=/app TSX_DISABLE_CACHE=1
 COPY --from=dependencies /usr/local /usr/local
 WORKDIR /app
 COPY --from=dependencies /app/node_modules node_modules

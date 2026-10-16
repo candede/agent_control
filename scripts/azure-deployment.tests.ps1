@@ -486,59 +486,52 @@ try {
         'Bicep containment, silent-availability, or structured-event monitoring contract is incomplete.'
     $target = New-Target
     Assert-True ((Test-ApprovedAzureTarget $target Mock).installationMode -ceq 'existing') 'Valid current-schema target was rejected.'
-    $example = Get-Content -LiteralPath (Join-Path $root 'infra/production-target.example.json') -Raw | ConvertFrom-Json
-    foreach ($name in @('legacyAuditBackupPath', 'legacyAuditBackupSha256', 'legacyStaticWebApp', 'expectedSchemaVersion','tenantDomains','tenantDisplayName')) {
-        Assert-True ($name -notin @($example.PSObject.Properties.Name)) "Example still advertises retired option $name."
-        foreach ($value in @($null, '', $false, @{}, @{ resourceId = 'retired-target'; retirementApproved = $true }, 'retired-input')) {
+    foreach ($name in @('unexpectedField','UnexpectedField')) {
+        foreach ($value in @($null, '', $false, @{}, 'invalid-input')) {
             $invalid = Copy-Object $target
             $invalid | Add-Member -NotePropertyName $name -NotePropertyValue $value
-            Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } "$name.*no longer supported"
+            Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } 'unsupported fields'
             $invalidDictionary = $invalid | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40 -AsHashtable
-            Assert-Fails { Test-ApprovedAzureTarget $invalidDictionary Mock } "$name.*no longer supported"
+            Assert-Fails { Test-ApprovedAzureTarget $invalidDictionary Mock } 'unsupported fields'
         }
     }
     $invalidCase = Copy-Object $target
-    $invalidCase | Add-Member -NotePropertyName 'LegacyStaticWebApp' -NotePropertyValue $null
-    Assert-Fails { Test-ApprovedAzureTarget $invalidCase Mock } 'legacyStaticWebApp.*no longer supported'
-    $retiredTarget = Copy-Object $target
-    $retiredTarget.installationMode = 'legacy_import'
-    Assert-Fails { Test-ApprovedAzureTarget $retiredTarget Mock } 'only fresh or existing'
-    $rejectedReceipt = Join-Path $scratch 'retired-input-receipt.json'
+    $invalidCase | Add-Member -NotePropertyName 'unexpectedField' -NotePropertyValue $null
+    Assert-Fails { Test-ApprovedAzureTarget $invalidCase Mock } 'unsupported fields'
+    $invalidModeTarget = Copy-Object $target
+    $invalidModeTarget.installationMode = 'unsupported'
+    Assert-Fails { Test-ApprovedAzureTarget $invalidModeTarget Mock } 'only fresh or existing'
+    $rejectedReceipt = Join-Path $scratch 'invalid-input-receipt.json'
     foreach ($arguments in @(
-        @('-InstallationMode', 'legacy_import'),
-        @('-InstallationMode', 'upgrade'),
-        @('-ExpectedSchemaVersion', '26'),
-        @('-TenantDomains', 'example.invalid'),
-        @('-TenantDisplayName', 'Retired standalone profile'),
-        @('-LegacyAuditBackupPath', 'retired-input'),
-        @('-LegacyAuditBackupSha256', ('a' * 64))
+        @('-InstallationMode', 'unsupported'),
+        @('-UnexpectedField', 'invalid-input')
     )) {
         $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
             -Action Plan -ExecutionMode Mock -ReceiptPath $rejectedReceipt @arguments 2>&1
         Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'ValidateSet|does not belong to the set|parameter cannot be found') `
-            'Retired named input did not fail at parameter binding.'
-        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Retired named input produced an execution receipt.'
+            'Invalid named input did not fail at parameter binding.'
+        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Invalid named input produced an execution receipt.'
     }
-    foreach ($invalid in @($retiredTarget, $invalidCase)) {
-        $invalidPath = Save-Json $invalid 'retired-target.json'
+    foreach ($invalid in @($invalidModeTarget, $invalidCase)) {
+        $invalidPath = Save-Json $invalid 'invalid-target.json'
         $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
             -Action Plan -ExecutionMode Mock -TargetFile $invalidPath -ReceiptPath $rejectedReceipt 2>&1
-        Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'installationMode|legacyStaticWebApp') `
-            "Retired target input did not fail before context creation: $($output -join "`n")"
-        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Retired target input produced an execution receipt.'
+        Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'installationMode|unsupported') `
+            "Invalid target input did not fail before context creation: $($output -join "`n")"
+        Assert-True (-not (Test-Path -LiteralPath $rejectedReceipt)) 'Invalid target input produced an execution receipt.'
     }
-    foreach ($step in @('legacy_import', 'retire_legacy_swa', 'database_migrate')) {
-        $retiredContext = New-Context $target (New-Fixture $target) "retired-$step" 'Plan'
-        Assert-Fails { Invoke-DeploymentOperation $retiredContext $step } 'not registered'
-        Assert-True ($retiredContext.CommandOffsets.Count -eq 0 -and $retiredContext.Owned.Count -eq 0 -and
-            -not $retiredContext.BootstrapSecretsMaterialized) 'Retired operation reached external commands or materialized credentials.'
+    foreach ($step in @('unsupported-operation')) {
+        $invalidContext = New-Context $target (New-Fixture $target) "invalid-$step" 'Plan'
+        Assert-Fails { Invoke-DeploymentOperation $invalidContext $step } 'not registered'
+        Assert-True ($invalidContext.CommandOffsets.Count -eq 0 -and $invalidContext.Owned.Count -eq 0 -and
+            -not $invalidContext.BootstrapSecretsMaterialized) 'Invalid operation reached external commands or materialized credentials.'
         foreach ($field in @('completedSteps', 'failedStep', 'attemptedSteps')) {
-            $retiredReceipt = Write-AzureDeploymentReceipt $retiredContext 'failed' '' @{}
-            $retiredReceipt.completedSteps = @()
-            $retiredReceipt.attemptedSteps = @()
-            $retiredReceipt[$field] = $(if ($field -eq 'failedStep') { $step } else { @($step) })
-            $retiredReceiptPath = Save-Json $retiredReceipt "retired-$step-$field-receipt.json"
-            Assert-Fails { Import-AzureDeploymentReceipt $retiredContext $retiredReceiptPath 'Plan' } 'unknown completed step|unsupported failed or attempted step'
+            $invalidReceipt = Write-AzureDeploymentReceipt $invalidContext 'failed' '' @{}
+            $invalidReceipt.completedSteps = @()
+            $invalidReceipt.attemptedSteps = @()
+            $invalidReceipt[$field] = $(if ($field -eq 'failedStep') { $step } else { @($step) })
+            $invalidReceiptPath = Save-Json $invalidReceipt "invalid-$step-$field-receipt.json"
+            Assert-Fails { Import-AzureDeploymentReceipt $invalidContext $invalidReceiptPath 'Plan' } 'unknown completed step|unsupported failed or attempted step'
         }
     }
     $currentSchemaContext = New-Context $target (New-Fixture $target) 'current-schema'
@@ -617,11 +610,22 @@ try {
     Assert-True ((Invoke-DeploymentOperation $idnContext vault_preflight).tenantProfileCount -eq 2 -and
         $idnContext.SecretValues['agent-control-tenants-json'] -ceq $idnRegistryValue) 'Azure rejected a supported Unicode-letter domain or rewrote the protected registry during validation.'
     Remove-AzureSensitiveDirectories $idnContext
+    $integrationProfiles = @(New-RegistryProfiles $registryTarget)
+    $integrationProfiles[0].integration = @{clientId='55555555-5555-4555-8555-555555555555';audience=$integrationProfiles[0].clientId;scope='AgentControl.Access'}
+    $integrationValue = ConvertTo-Json -InputObject $integrationProfiles -Depth 20
+    $integrationFixture = New-Fixture $registryTarget
+    $integrationFixture.commands.vault_preflight[1].json.value = $integrationValue
+    $integrationContext = New-Context $registryTarget $integrationFixture 'registry-dormant-integration'
+    Assert-True ((Invoke-DeploymentOperation $integrationContext vault_preflight).tenantProfileCount -eq 2 -and
+        $integrationContext.SecretValues['agent-control-tenants-json'] -ceq $integrationValue) 'Azure validation silently discarded the dormant tenant integration binding.'
+    Remove-AzureSensitiveDirectories $integrationContext
     foreach ($case in @(
         @{ name='malformed'; json='[{"clientSecret":"synthetic-secondary-tenant-secret-never-log"}'; error='valid JSON array' },
         @{ name='empty'; json='[]'; error='at least one tenant' },
         @{ name='object'; json='{}'; error='JSON array' },
-        @{ name='wrong-property-case'; mutate={ param($p) $p[1].Remove('tenantId'); $p[1]['TenantId']='88888888-8888-4888-8888-888888888888' }; error='tenantId and clientId must be GUIDs' },
+        @{ name='wrong-property-case'; mutate={ param($p) $p[1].Remove('tenantId'); $p[1]['TenantId']='88888888-8888-4888-8888-888888888888' }; error='unknown profile field' },
+        @{ name='unknown-integration-field'; mutate={ param($p) $p[0].integration=@{clientId='33333333-3333-4333-8333-333333333333';audience=$p[0].clientId;scope='AgentControl.Access';enabled=$true} }; error='integration contains an unknown field' },
+        @{ name='conflicting-integration'; mutate={ param($p) $p[0].integration=@{clientId=$p[0].clientId;audience=$p[0].clientId;scope='AgentControl.Access'} }; error='distinct clientId GUID' },
         @{ name='missing-domain'; mutate={ param($p) $p[1].domains=@() }; error='accepted sign-in domain' },
         @{ name='non-string-domain'; mutate={ param($p) $p[1].domains=@('fabrikam.com',42) }; error='exact organization domains' },
         @{ name='unicode-domain-separator'; mutate={ param($p) $p[1].domains=@("example$([char]0x3002)com") }; error='exact organization domains' },
@@ -668,7 +672,7 @@ try {
     $registrationEvidence = Invoke-DeploymentOperation $registration registration_verify
     Assert-True ($registrationEvidence.roleCount -eq 2 -and $registrationEvidence.administratorAssignmentCount -eq 1) 'Two-role registration with a portal-created Admin ID was rejected.'
     foreach ($case in @(
-        @{ name = 'legacy-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'AgentControl.Reader' }; error = 'two-role' },
+        @{ name = 'unknown-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'Unrecognized.Role' }; error = 'two-role' },
         @{ name = 'application-members'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].allowedMemberTypes = @('User','Application') }; error = 'Users/Groups' },
         @{ name = 'unrestricted-signin'; mutate = { param($f) $f.commands.registration_verify[1].json[0].appRoleAssignmentRequired = $false }; error = 'Assignment required' },
         @{ name = 'no-admin'; mutate = { param($f) $f.commands.registration_verify[2].json.value = @() }; error = 'AgentControl.Admin assignment' }

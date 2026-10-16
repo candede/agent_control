@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput } from "../../scripts/largeTenantFixtures.js";
+import { seedReportSet } from "../../scripts/officialReportFixtures.js";
 import { DataSyncRepository, requireUserPublication } from "../db/dataSync.js";
 import { transaction } from "../db/pool.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
@@ -9,6 +10,8 @@ import { UserSourcesRepository } from "../db/userSources.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { OfficialReportImports } from "../db/officialReportImports.js";
+import { OfficialReportHistory } from "../db/officialReportHistory.js";
+import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
 import { AppError } from "../errors.js";
 import { CopilotUsageService } from "./copilotUsage.js";
 import { UserSourceProvider } from "./userSourceProvider.js";
@@ -185,6 +188,52 @@ describe("live Users orchestration and publication boundary", () => {
     h.fetcher.mockClear(); h.requireAvailable.mockClear();
     expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true })).toMatchObject({ status: "partial" });
     expect(h.fetcher).not.toHaveBeenCalled(); expect(h.requireAvailable).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("acknowledges a changed report with one necessary directory collection, including another change during collection: %s", async changesDuringCollection => {
+    const h = await harness(), history = new OfficialReportHistory(fixture.runtime), imports = new OfficialReportImports(fixture.runtime);
+    await h.seed("directory");
+    await h.seed("app_activity");
+    const before = await h.status();
+    await history.ensure(h.identity.tenantId);
+    const activateReport = async (revision: number) => {
+      const report = await seedReportSet(fixture.runtime, h.identity.tenantId, revision);
+      await history.connections.run(client => history.accepted(client, h.identity.tenantId, report.id));
+      await imports.confirm(h.identity, await imports.confirmPreview(h.identity, report.id, "select"));
+    };
+    await activateReport(1);
+    expect(await directoryNeedsReportRefresh(fixture.runtime, h.identity)).toBe(true);
+    h.fetcher.mockClear();
+    if (changesDuringCollection) {
+      const original = h.fetcher.getMockImplementation()!;
+      h.fetcher.mockImplementationOnce(async (url, init) => {
+        await activateReport(2);
+        return original(url, init);
+      });
+    }
+    expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true }))
+      .toMatchObject({ status: "succeeded", count: 1 });
+    expect((await h.status()).sources.directory.generationId).not.toBe(before.sources.directory.generationId);
+    expect(h.fetcher).toHaveBeenCalledTimes(2);
+    expect(await directoryNeedsReportRefresh(fixture.runtime, h.identity)).toBe(changesDuringCollection);
+    if (changesDuringCollection) {
+      await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true });
+      expect(h.fetcher).toHaveBeenCalledTimes(4);
+    }
+    expect(await directoryNeedsReportRefresh(fixture.runtime, h.identity)).toBe(false);
+    const saved = await h.status();
+    expect(saved.sources.app_activity.generationId).toBe(before.sources.app_activity.generationId);
+    h.fetcher.mockClear();
+    await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true });
+    expect(h.fetcher).not.toHaveBeenCalled();
+    expect((await h.status()).sources.directory.generationId).toBe(saved.sources.directory.generationId);
+    await h.repository.updateSource(h.identity, h.publication.runId, "users", {
+      status: "succeeded", count: 1, message: "Saved current report identities.", canRetry: false,
+    });
+    for (const source of ["graph_packages", "power_platform"] as const) {
+      await h.repository.recordSuccessMarker(h.identity, source, 0, new Date().toISOString());
+    }
+    for (let check = 0; check < 3; check++) expect((await h.repository.submitDue(h.identity)).created).toBe(false);
+    expect(await h.repository.listRuns(h.identity)).toHaveLength(1);
   });
   it("blocks restored provider-disabled collection before any token or provider call", async () => {
     const h = await harness();

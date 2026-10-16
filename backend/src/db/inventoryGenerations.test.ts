@@ -1037,7 +1037,7 @@ describe("immutable inventory record storage", () => {
       VALUES($1,'graph.package.read.application',true,true,$2) ON CONFLICT(tenant_id,capability_id)
       DO UPDATE SET enabled=true,shared_data_scope=true`, [input.scope.tenantId, principal]);
     const records = Array.from({ length: 20 }, (_, index) => packageInventoryRecord({ id: `wide-${index}`, displayName: `Wide ${index}`,
-      isBlocked: false, longDescription: "x".repeat(32768) }));
+      isBlocked: false, longDescription: "x".repeat(16384), shortDescription: "x".repeat(16384) }));
     const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: records.map(row => row.native_id) },
       lease => store.appendBounded(lease, records), { authorize: async () => {} });
     const identity = { ...selectionIdentity, principalId: principal };

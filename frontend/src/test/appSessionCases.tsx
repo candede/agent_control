@@ -5,12 +5,12 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions, workbenchViews } from "../../../backend/src/services/workbenchMetadata";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
+import { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import App from "../App";
 import {
   getAgents,
   getUnifiedAgents,
   getAgentDetails,
-  powerPlatformResourceTypes,
   type BulkActionJob,
   type AuditEvent,
   type AutomaticRefreshResult,
@@ -672,8 +672,8 @@ export function sessionAndNavigationCases() {
     expect(reads()).toBe(before);
   });
 
-  it.each(["licenses", "activity"] as const)("canonicalizes legacy %s numeric pages without restarting cursor-owned Users reads", async view => {
-    window.history.replaceState({}, "", `/users?view=${view}&q=Ada&page=3`);
+  it.each(["licenses", "activity"] as const)("canonicalizes unsupported %s query parameters without restarting cursor-owned Users reads", async view => {
+    window.history.replaceState({}, "", `/users?view=${view}&q=Ada&unsupported=3`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -682,14 +682,14 @@ export function sessionAndNavigationCases() {
     const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
       new URL(input, "http://localhost").pathname === (view === "licenses" ? "/api/copilot-usage/users" : "/api/official-usage/users")).length;
     expect(reads()).toBe(1);
-    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("unsupported")).toBe(false);
     act(() => {
-      window.history.pushState({}, "", `/users?view=${view}&page=4&q=Ada`);
+      window.history.pushState({}, "", `/users?view=${view}&unsupported=4&q=Ada`);
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     await act(async () => {});
     expect(screen.getByRole("searchbox", { name: label })).toHaveValue("Ada");
-    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("unsupported")).toBe(false);
     expect(reads()).toBe(1);
   });
 
@@ -2492,7 +2492,7 @@ export function sessionAndNavigationCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(checks);
   });
 
-  it.each(["missing_permission", "interaction_required"] as const)("keeps automatic due checks eligible with one %s provider and unverified detail metadata", async category => {
+  it.each(["missing_permission", "interaction_required", "authorization_expired"] as const)("keeps automatic due checks eligible with one %s provider and unverified detail metadata", async category => {
     vi.useFakeTimers();
     const transport = initialCatalogTransport();
     transport.page = packagePage;
@@ -2501,7 +2501,8 @@ export function sessionAndNavigationCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const capabilities = await (await base(input, init)).json();
-        capabilities.value[0].decision.evidence = { category };
+        capabilities.value[0].decision = { ...capabilities.value[0].decision,
+          status: category === "missing_permission" ? "missing_permission" : "unknown", evidence: { category } };
         return Response.json(capabilities);
       }
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
@@ -2513,7 +2514,7 @@ export function sessionAndNavigationCases() {
           startedAt: "2026-09-24T10:00:00Z", updatedAt: "2026-09-24T10:01:00Z", completedAt: "2026-09-24T10:01:00Z",
           sources: [
             { source: "users", status: "succeeded", jobId: null, count: 42, lastSuccessAt: "2026-09-24T10:01:00Z", updatedAt: "2026-09-24T10:01:00Z", message: "", canRetry: false },
-            { source: "graph_packages", status: category === "interaction_required" ? "waiting_authorization" : "permission_required", jobId: null, count: null, lastSuccessAt: null, updatedAt: "2026-09-24T10:01:00Z", message: "", canRetry: false },
+            { source: "graph_packages", status: category === "missing_permission" ? "permission_required" : "waiting_authorization", jobId: null, count: null, lastSuccessAt: null, updatedAt: "2026-09-24T10:01:00Z", message: "", canRetry: false },
           ],
         },
       }));
@@ -2528,6 +2529,13 @@ export function sessionAndNavigationCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(2);
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(transport.session.meCalls()).toBe(1);
+    expect(screen.queryByText("Checking sign-in...")).not.toBeInTheDocument();
+    const checks = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/capabilities/check").length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(4 * 60_000); });
+    expect(transport.session.meCalls()).toBe(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/capabilities/check")).toHaveLength(checks);
+    expect(screen.getByText(agent.displayName)).toBeVisible();
   });
 
   it.each((["power_platform", "graph_packages"] as const).flatMap(source => [
@@ -2617,7 +2625,7 @@ export function sessionAndNavigationCases() {
     "does not reattach a post-action %s read to another observer's pre-action request",
     async resource => {
       const usage = resource === "selected-agent-page";
-      window.history.replaceState({}, "", usage ? "/official-usage?view=snapshot" : "/sync");
+      window.history.replaceState({}, "", usage ? "/sync?reports=snapshot" : "/sync");
       const client = savedQueries.createSavedQueryClient();
       const admittedKeys = new Map<string, readonly unknown[]>();
       const unsubscribe = client.getQueryCache().subscribe(event => {
@@ -2719,27 +2727,17 @@ export function sessionAndNavigationCases() {
     },
   );
 
-  it("does not migrate or interpret a retired catalog bookmark", () => {
-    window.history.replaceState({}, "", "/power-platform?refreshJob=old-job&detail=old-object");
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    render(<App />);
-    expect(screen.getByRole("heading", { name: "Page not found" })).toBeVisible();
-    expect(window.location.pathname + window.location.search).toBe("/power-platform?refreshJob=old-job&detail=old-object");
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("does not revive or rewrite a retired catalog route restored through browser history", async () => {
+  it("shows an unregistered route restored through browser history without rewriting it", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
     act(() => {
-      window.history.pushState({}, "", "/power-platform?refreshJob=retired-job");
+      window.history.pushState({}, "", "/not-a-current-page");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     expect(screen.getByRole("heading", { name: "Page not found" })).toBeVisible();
-    expect(window.location.pathname + window.location.search).toBe("/power-platform?refreshJob=retired-job");
+    expect(window.location.pathname + window.location.search).toBe("/not-a-current-page");
   });
 
   it("opens the exact bookmarked Power Platform job in Sync without selecting the latest or starting provider work", async () => {
@@ -3108,7 +3106,7 @@ export function sessionAndNavigationCases() {
   );
 
   it("retains the loaded report summary when an unrelated saved agent read is forbidden", async () => {
-    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    window.history.replaceState({}, "", "/sync?reports=snapshot");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const denied = deferredResponse();
@@ -4330,7 +4328,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("round trips organization views and new sorts through list requests, headings, export and clear", async () => {
-    window.history.replaceState({}, "", "/agents?show=organization&sort=responses&direction=desc");
+    window.history.replaceState({}, "", "/agents?relevance=organization&sort=responses&direction=desc");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     const download = mockCsvDownload();
@@ -4369,14 +4367,14 @@ export function sessionAndNavigationCases() {
   });
 
   it("combines party, access, usage and management across requests, exports and browser history", async () => {
-    window.history.replaceState({}, "", "/agents?show=third_party&access=available&usage=used&management=organization_managed");
+    window.history.replaceState({}, "", "/agents?type=~string%3AthirdParty&access=available&usage=used&management=organization_managed");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     const download = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
     expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue(encodeInventoryFacet("thirdParty"));
-    expect(screen.getByRole("button", { name: "Show available to end users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Show admin-permitted agents" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Show reported used agents" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
     const lastQuery = () => selectedInventoryUrl(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?")).at(-1)![0]).searchParams;
@@ -4399,7 +4397,7 @@ export function sessionAndNavigationCases() {
     expect(lastQuery().has("view")).toBe(false);
     expect(lastQuery().get("management")).toBe("organization_managed");
     await act(async () => {
-      window.history.pushState({}, "", "/agents?show=first_party&usage=used");
+      window.history.pushState({}, "", "/agents?type=~string%3AfirstParty&usage=used");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     await waitFor(() => expect(lastQuery().get("type")).toBe("firstParty"));
@@ -4944,7 +4942,7 @@ export function savedInventoryCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
-        return Response.json({ value: [{ definition, decision: {
+        return Response.json({ value: [{ enabled: true, definition, decision: {
           capabilityId: definition.id, status: "available", authorized: true, fresh: true, verification: "provider",
           checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
           previewQualification: "not_required", remediation: [],
@@ -5547,6 +5545,20 @@ export function savedInventoryCases() {
     expect(screen.queryByText("The bookmarked identity was withdrawn.")).not.toBeInTheDocument();
     expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.filter(([input]) => unifiedDetailId(input) === id)).toHaveLength(1);
+  });
+
+  it("rejects a bare native quarantine bookmark instead of using the list environment", async () => {
+    window.history.replaceState({}, "", `/agents?${new URLSearchParams({
+      selectedResource: "bare-native-identity", environment: encodeInventoryFacet("env-a"),
+    })}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"],
+      unifiedResponse: unifiedRecordsPage([]),
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(/Could not restore 1 bookmarked quarantine target: An exact environment and native resource identity is required/)).toBeVisible();
+    expect(transport.fetchMock.mock.calls.some(([input]) => unifiedDetailId(input))).toBe(false);
   });
 
   it("shares an off-page logical read between equivalent detail and quarantine bookmarks", async () => {
@@ -6171,18 +6183,6 @@ export function savedInventoryCases() {
     await screen.findByText(agent.displayName);
     expect(agentListRequests(transport.fetchMock)).toHaveLength(4);
     expect(currentInventorySelection(transport.fetchMock)).not.toBe(originalSelection);
-  });
-
-  it("retires Security bookmarks to Agents without restoring tenant hunt filters or running a hunt", async () => {
-    window.history.replaceState({}, "", "/security?job=legacy-job&mode=application&agentIds=not-an-inventory-identity");
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
-    vi.stubGlobal("fetch", transport.fetchMock);
-    render(<App />);
-    expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/agents");
-    expect(window.location.search).toBe("");
-    expect(screen.queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
-    expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/hunting/"))).toBe(false);
   });
 
   it("lets Admin inherit every view while exposing supported mutation controls", async () => {
@@ -7440,7 +7440,7 @@ export function savedInventoryCases() {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.inventory.read")!;
         return Response.json({ value: [{
-          definition,
+          enabled: true, definition,
           decision: {
             capabilityId: definition.id,
             status: "available",
@@ -7953,7 +7953,7 @@ export function savedInventoryCases() {
             item.id === "graph.package.read.delegated"
             || item.id === "powerPlatform.inventory.read");
           return Response.json({ value: definitions.map(definition => ({
-            definition,
+            enabled: true, definition,
             decision: {
               capabilityId: definition.id,
               status: "available",
@@ -8474,11 +8474,11 @@ export function savedInventoryCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-selection")).toHaveLength(1);
   });
 
-  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)("uses the durable initial sync instead of an automatic package scan for %s", async role => {
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)("starts first sync automatically and opens the workspace without a click for %s", async role => {
     const transport = initialCatalogTransport({ initialRoles: [role], revalidatedRoles: [role] });
     transport.page = undefined;
     const base = transport.fetchMock.getMockImplementation()!;
-    const syncSources = ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
+    const syncSources = (["users", "graph_packages", "power_platform", "usage_reports"] as const).map(source => ({
       source,
       status: "not_started",
       jobId: null,
@@ -8488,46 +8488,51 @@ export function savedInventoryCases() {
       message: "",
       canRetry: false,
     }));
+    let currentRun: AutomaticRefreshResult["run"] = null;
+    let completed = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") {
+        currentRun ??= {
+          id: "durable-initial-sync", mode: "incremental", automatic: true, status: "running",
+          startedAt: "2026-09-15T08:00:00.000Z", updatedAt: "2026-09-15T08:00:00.000Z", completedAt: null,
+          sources: syncSources.filter(source => source.source !== "usage_reports").map(source => ({
+            ...source, status: "queued" as const,
+          })),
+        };
+        return Response.json(automaticRefreshResponse({ run: currentRun }));
+      }
       if (input === "/api/data-sync/state") return Response.json({
-        onboardingRequired: true,
+        onboardingRequired: !completed,
         usageImportRequired: true,
-        run: null,
-        sources: syncSources,
+        run: currentRun,
+        sources: completed ? syncSources.map(source => ({ ...source, status: "succeeded", count: 0 })) : syncSources,
       });
-      if (input === "/api/data-sync/runs" && init?.method === "POST") return Response.json({
-        id: "durable-initial-sync",
-        mode: "initial",
-        status: "running",
-        startedAt: "2026-09-15T08:00:00.000Z",
-        updatedAt: "2026-09-15T08:00:00.000Z",
-        completedAt: null,
-        sources: syncSources.map(source => ({ ...source, status: "queued" })),
-      }, { status: 202 });
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    const notice = await screen.findByRole("dialog", { name: "Your first sync is in progress" });
+    expect(notice).toBeVisible();
     expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
     expect(screen.queryByText(/No saved package catalog observation. Open Sync to collect it/)).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "Set up your workspace" })).toBeVisible();
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
-    await userEvent.click(screen.getByRole("button", { name: "View sync details" }));
-    expect(await screen.findByRole("region", { name: "Data sync" })).toBeVisible();
+    expect(within(notice).queryByRole("button")).not.toBeInTheDocument();
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs?"))).toBe(false);
 
-    await userEvent.click(await screen.findByRole("button", { name: "Start initial sync" }));
     const request = transport.fetchMock.mock.calls.find(([path, init]) =>
-      path === "/api/data-sync/runs" && init?.method === "POST");
+      path === "/api/data-sync/auto-refresh" && init?.method === "POST");
     expect(request).toBeDefined();
     if (!request) throw new Error("Expected the durable initial sync request.");
     expect(request[1]).toMatchObject({ method: "POST" });
     expect(new Headers(request[1]?.headers).get("X-CSRF-Token")).toBe("csrf-1");
-    expect(JSON.parse(String(request[1]?.body))).toEqual({ mode: "initial" });
+    expect(JSON.parse(String(request[1]?.body))).toEqual({});
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/data-sync/runs")).toHaveLength(0);
+    completed = true;
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument(), { timeout: 2_000 });
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
@@ -8537,7 +8542,12 @@ export function savedInventoryCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/data-sync/state") return Response.json({
-        onboardingRequired: true, usageImportRequired: true, run: null,
+        onboardingRequired: true, usageImportRequired: true, run: {
+          id: "permission-failure", mode: "initial", status: "partial",
+          startedAt: "2026-09-15T08:00:00.000Z", updatedAt: "2026-09-15T08:00:00.000Z", completedAt: "2026-09-15T08:00:00.000Z",
+          sources: [{ source: "graph_packages", status: "permission_required", jobId: null, count: null,
+            lastSuccessAt: null, updatedAt: null, message: "Microsoft denied package access.", canRetry: true }],
+        },
         sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
           source, status: "not_started", jobId: null, count: null, lastSuccessAt: null, updatedAt: null,
           message: "", canRetry: false,
@@ -8551,7 +8561,7 @@ export function savedInventoryCases() {
     await userEvent.click(screen.getByRole("button", { name: "Pause automatic refresh" }));
     expect(screen.getByRole("button", { name: "Resume automatic refresh" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
-    const notice = await screen.findByRole("dialog", { name: "Set up your workspace" });
+    const notice = await screen.findByRole("dialog", { name: "First sync needs attention" });
     const sessionReads = transport.meCalls();
     const syncRequests = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/data-sync/")).length;
     const before = syncRequests();
@@ -8565,7 +8575,7 @@ export function savedInventoryCases() {
     expect(transport.meCalls()).toBe(sessionReads);
     expect(syncRequests()).toBe(before);
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
-    expect(await screen.findByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
+    expect(await screen.findByRole("dialog", { name: "First sync needs attention" })).toBeVisible();
     expect(screen.getByText(/Automatic sync is paused for this session/)).toBeVisible();
     expect(syncRequests()).toBe(before);
     expect(agentListRequests(transport.fetchMock)).toHaveLength(inventoryReads);
@@ -8574,7 +8584,7 @@ export function savedInventoryCases() {
 }
 
 export function commandsAndExportsCases() {
-  it.each(["/permissions", "/official-usage"])("does not start a package scan from %s or when Agents is later opened", async route => {
+  it.each(["/permissions", "/sync?reports=manage"])("does not start a package scan from %s or when Agents is later opened", async route => {
     window.history.replaceState({}, "", route);
     const transport = initialCatalogTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -8597,19 +8607,6 @@ export function commandsAndExportsCases() {
     await waitFor(() => expect(screen.getByText(/Catalog collected/)).toBeInTheDocument());
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
-  });
-
-  it("does not use legacy package-refresh job history as onboarding authority", async () => {
-    const transport = initialCatalogTransport();
-    transport.jobs = [{ ...completedRefreshJob(), status: "running", snapshotId: null }];
-    vi.stubGlobal("fetch", transport.fetchMock);
-    render(<App />);
-    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
-    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
-    expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs?"))).toBe(false);
-    await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
-    await userEvent.click(screen.getByText("View diagnostics"));
-    expect(await screen.findByRole("button", { name: "Refresh agents" })).toBeEnabled();
   });
 
   it("does not turn a pending or empty saved catalog response into provider enumeration", async () => {
@@ -8667,8 +8664,6 @@ export function commandsAndExportsCases() {
 
   it.each([
     { code: "maintenance", detail: "Maintenance is active; provider work is not accepted.", guidance: "Retry after maintenance ends." },
-    { code: "provider_requalification_required", detail: "Provider work remains disabled until restored access is reviewed and explicitly requalified.",
-      guidance: "Contact the deployment administrator to review and requalify provider access." },
   ])("explains $code without treating it as a missing user permission or losing saved inventory", async ({ code, detail, guidance }) => {
     const transport = initialCatalogTransport();
     const base = transport.fetchMock.getMockImplementation()!;
@@ -9533,7 +9528,7 @@ export function commandsAndExportsCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!;
-        return Response.json({ value: [{ definition, decision: {
+        return Response.json({ value: [{ enabled: true, definition, decision: {
           capabilityId: definition.id, status: "available", authorized: true, fresh: true,
           verification: "on_demand", previewQualification: "not_required", remediation: [],
         } }] });
@@ -9610,7 +9605,7 @@ export function commandsAndExportsCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.quarantine.manage")!;
-        return Response.json({ value: [{ definition, decision: {
+        return Response.json({ value: [{ enabled: true, definition, decision: {
           capabilityId: definition.id, status: "available", authorized: true, fresh: true,
           verification: "on_demand", previewQualification: "not_required", remediation: [],
         } }] });
@@ -9756,7 +9751,7 @@ export function commandsAndExportsCases() {
     ["official_agents", "official_users", "copilot_users"].map(kind => ({ boundary, kind })),
   ))("does not publish a pending private $kind export after $boundary", async ({ boundary, kind }) => {
     window.history.replaceState({}, "", kind === "official_users" ? "/users?view=activity"
-      : kind === "copilot_users" ? "/users" : "/official-usage?view=snapshot");
+      : kind === "copilot_users" ? "/users" : "/sync?reports=snapshot");
     const transport = appTransport({
       revalidatedRoles: boundary === "role-loss" ? [] : viewer.roles,
       revalidatedUser: boundary === "account-change"
@@ -9797,7 +9792,7 @@ export function commandsAndExportsCases() {
     expect(transport.fetchMock.mock.calls.some(([path]) => /official-usage\/.*\.csv/.test(path))).toBe(false);
   });
 
-  it.each(["/official-usage", "/official-usage?view=history", "/sync?reports=manage"])(
+  it.each(["/sync?reports=manage"])(
     "opens one read-only report manager for Viewer from %s", async path => {
       window.history.replaceState({}, "", path);
       const transport = appTransport({ revalidatedRoles: viewer.roles });
@@ -9841,7 +9836,7 @@ export function commandsAndExportsCases() {
 
   it("restores a historical official-usage snapshot as exact GET reads without changing active selection", async () => {
     const reportSetId = "11111111-1111-4111-8111-111111111111";
-    window.history.replaceState({}, "", `/official-usage?snapshot=${reportSetId}`);
+    window.history.replaceState({}, "", `/sync?reports=snapshot&snapshot=${reportSetId}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
@@ -9873,7 +9868,7 @@ export function commandsAndExportsCases() {
 
   it("does not show current-snapshot data when an exact historical set is unavailable", async () => {
     const reportSetId = "99999999-9999-4999-8999-999999999999";
-    window.history.replaceState({}, "", `/official-usage?snapshot=${reportSetId}`);
+    window.history.replaceState({}, "", `/sync?reports=snapshot&snapshot=${reportSetId}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
@@ -9903,7 +9898,7 @@ export function commandsAndExportsCases() {
   it.each(["current", "historical"] as const)("hides a superseded %s snapshot summary until its new activity window loads", async scope => {
     const data = selectedAgentsPage();
     window.history.replaceState({}, "", scope === "current"
-      ? "/official-usage?view=snapshot" : `/official-usage?snapshot=${data.reports.setId}`);
+      ? "/sync?reports=snapshot" : `/sync?reports=snapshot&snapshot=${data.reports.setId}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
@@ -9937,7 +9932,7 @@ export function commandsAndExportsCases() {
   });
 
   it("withholds current-report totals after a failed HTTP selected read and retries only explicitly", async () => {
-    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    window.history.replaceState({}, "", "/sync?reports=snapshot");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     let failed = true;
@@ -9994,7 +9989,7 @@ export function commandsAndExportsCases() {
   });
 
   it("keeps saved-report management history-only without an additional cross-report exploration surface", async () => {
-    window.history.replaceState({}, "", "/official-usage");
+    window.history.replaceState({}, "", "/sync?reports=manage");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -10121,7 +10116,7 @@ export function commandsAndExportsCases() {
   });
 
   it("loads the cumulative summary on Sync but opens report history only on demand without person-level data", async () => {
-    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    window.history.replaceState({}, "", "/sync?reports=snapshot");
     const transport = appTransport({ revalidatedRoles: viewer.roles, reportHistory: selectedHistoryPage() });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -10143,7 +10138,7 @@ export function commandsAndExportsCases() {
   });
 
   it("ignores a late aggregate when activity returns after visiting report history", async () => {
-    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    window.history.replaceState({}, "", "/sync?reports=snapshot");
     const transport = appTransport({ revalidatedRoles: viewer.roles, reportHistory: selectedHistoryPage() });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
@@ -10174,7 +10169,7 @@ export function commandsAndExportsCases() {
 
   it("clears historical loading when reversed dates cancel a pending aggregate", async () => {
     const data = selectedAgentsPage();
-    window.history.replaceState({}, "", `/official-usage?snapshot=${data.reports.setId}`);
+    window.history.replaceState({}, "", `/sync?reports=snapshot&snapshot=${data.reports.setId}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
@@ -10330,8 +10325,8 @@ export function commandsAndExportsCases() {
     expect(unchangedReads.map(count)).toEqual(before);
   });
 
-  it.each(["/sync", "/agents"])("recovers an exact package refresh on Sync from a %s job link", async path => {
-    window.history.replaceState({}, "", `${path}?refreshJob=retained-package-run&mode=application`);
+  it("recovers an exact package refresh on Sync from its canonical job link", async () => {
+    window.history.replaceState({}, "", "/sync?refreshJob=retained-package-run&mode=application");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
@@ -10724,7 +10719,7 @@ export function commandsAndExportsCases() {
   });
 
   it("opens the exact data-sync run requested by a history link instead of showing the latest run", async () => {
-    window.history.replaceState({}, "", "/agents?syncRun=retained-sync-run");
+    window.history.replaceState({}, "", "/sync?syncRun=retained-sync-run");
     const sources = ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
       source,
       status: "succeeded",
@@ -10780,17 +10775,15 @@ export function commandsAndExportsCases() {
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
   });
 
-  it.each(["/jobs", "/jobs/?source=package-controls"])("redirects the retired %s bookmark to Sync without job recovery controls", async path => {
+  it("shows a 404 page for an unregistered path without changing its URL", async () => {
+    const path = "/not-a-current-page?context=exact";
     window.history.replaceState({}, "", path);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("heading", { name: "Sync history" })).toBeVisible();
-    expect(window.location.pathname).toBe("/sync");
-    expect(window.location.search).toBe("");
-    expect(screen.queryByRole("button", { name: "Jobs" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry incomplete" })).not.toBeInTheDocument();
-    expect(transport.fetchMock.mock.calls.some(([input]) => String(input).endsWith("/retry"))).toBe(false);
+    expect(await screen.findByRole("heading", { name: "Page not found" })).toBeVisible();
+    expect(window.location.pathname + window.location.search).toBe(path);
+    expect(screen.queryByRole("heading", { name: "Sync history" })).not.toBeInTheDocument();
   });
 
   it.each(["selection_invalidated", "inventory_changed", "confirmation_mismatch"].flatMap(code =>
@@ -11781,7 +11774,6 @@ export function commandsAndExportsCases() {
   it.each([
     ["another tenant's", activeBulkJobStorageKey({ ...viewer, tenantId: "tenant-2" })],
     ["another user's", activeBulkJobStorageKey({ ...viewer, homeAccountId: "viewer-2" })],
-    ["legacy unscoped", "agent-control:active-bulk-job:v1"],
   ])("restores only the current principal's job and never %s browser job", async (_label, otherKey) => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
@@ -12572,7 +12564,7 @@ function appTransport({
     if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
       const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.inventory.read")!;
       return Response.json({ value: inventoryReadAuthorized ? [{
-        definition,
+        enabled: true, definition,
         decision: {
           capabilityId: definition.id,
           status: "available",
@@ -12848,7 +12840,7 @@ function initialCatalogTransport(options: Partial<Parameters<typeof appTransport
     if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
       const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
       return Response.json({ value: [{
-        definition,
+        enabled: true, definition,
         decision: { capabilityId: definition.id, status: transport.readAuthorized ? "available" : "missing_permission", authorized: transport.readAuthorized, fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), previewQualification: "not_required", remediation: [] },
       }] });
     }
@@ -12954,9 +12946,9 @@ function accessEditorTransport(revalidatedUser = viewer) {
       const blockDefinition = capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!;
       return Response.json({ value: [
         ...body.value,
-        { definition, decision: { capabilityId: definition.id, status: transport.accessAuthorized ? "available" : "missing_permission", authorized: transport.accessAuthorized, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] } },
-        { definition: blockDefinition, decision: { capabilityId: blockDefinition.id, status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] } },
-        { definition: capabilityDefinitions.find(item => item.id === "graph.directory.read")!, decision: { ...body.value[0].decision, capabilityId: "graph.directory.read" } },
+        { enabled: true, definition, decision: { capabilityId: definition.id, status: transport.accessAuthorized ? "available" : "missing_permission", authorized: transport.accessAuthorized, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] } },
+        { enabled: true, definition: blockDefinition, decision: { capabilityId: blockDefinition.id, status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] } },
+        { enabled: true, definition: capabilityDefinitions.find(item => item.id === "graph.directory.read")!, decision: { ...body.value[0].decision, capabilityId: "graph.directory.read" } },
       ] });
     }
     return response;

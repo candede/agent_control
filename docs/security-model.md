@@ -1,5 +1,10 @@
 # Security model
 
+The [MCP integration contract](mcp-integration.md) documents shared API
+identity, bounded credentials, audit attribution, and browser/bearer boundaries.
+Its feasibility fixtures are synthetic; unproven bearer identity remains closed,
+and the existing browser authentication and source isolation stay authoritative.
+
 Agent Control uses Microsoft Entra ID for authentication, app roles for product
 authorization, and provider permissions for Microsoft operations.
 
@@ -30,6 +35,35 @@ each approved user or group one role.
 App roles do not grant Microsoft Graph, Power Platform, Purview, or Defender
 access. Those providers still enforce their own permissions, roles, licenses,
 policies, and data scope.
+
+## Shared exact agent controls
+
+`POST /api/agent-controls/preview` and `/execute`, plus
+`GET /api/agent-controls/:receiptId`, use the same registered Admin
+handlers for verified same-origin browser sessions and the configured delegated
+API bearer grant. Browser CSRF and mixed-credential rejection remain unchanged.
+There is no caller-selected identity, permission bypass, API approval engine or
+scheduler. Interactive confirmation and external scheduling are client workflows;
+both submit the same current server receipt.
+
+Generic Studio effects are quarantine/unquarantine only. Other exactly supported
+agents use existing package block/unblock. Explicit package controls, including
+Studio-linked package buttons, remain package-only; explicit Studio controls
+remain distinct. Names, descriptions and reported origin labels never establish
+provider identity or authority.
+
+Private exact receipts bind tenant/home-account principal, authorization and
+session epoch, selected source memberships/revisions, prestate, action, provider
+effect, IDs/names and expiry. Ineligible/report-only/ambiguous targets are explicit
+and never sent. First acceptance atomically fixes initiating actor/origin and the
+stable key. Crash/replay recovers deterministic existing child jobs without
+copying execution state; expiry prohibits admission of a missing child even
+after parent acceptance. Current lifecycle attribution is separate. Mixed
+providers are not atomic. Accepted, final and verified are distinct; existing
+child status/items/recovery routes disclose authorization-wait and unknown
+readback, and uncertain writes require read-only reconciliation, never resend.
+The generic GET projects only retained accepted receipts and existing child
+repositories; it is provider-free and cannot admit, resume or reconcile work.
 
 ## Tenant and account isolation
 
@@ -64,6 +98,51 @@ State-changing browser requests require:
 
 Provider changes also recheck the exact target, current authorization, current
 inventory authority, provider prestate, and provider readback.
+
+## Delegated API foundation and canonical integration
+
+The [current principal foundation](mcp-integration.md#current-principal-and-credential-foundation)
+serves canonical routes, services and workers. It
+uses exact tenant/API/client/scope-bound RS256 validation, bounded JWKS refresh,
+and an actual SDK OBO exchange proving the existing private home-account key.
+Guest resource object IDs are not home keys. Missing client info/account,
+sub-only identity or contradictory metadata explicitly closes admission.
+API roles come from the verified API assertion, never Graph roles or reported
+client labels. An assertion older than five minutes cannot refresh its own role
+evidence; a new API token is required.
+
+The credential source is separate process memory. Job references are non-secret
+and unusable after restart; expiry, changed epochs, revoked authority and claims
+challenges require same-principal reauthorization. Account-wide revocation uses
+the existing account/durable epoch authority; connection disconnect removes only
+that source and later the MCP-owned OAuth connection. Internal fences are
+immediate, including after awaited work; actual Entra revocation follows expiry,
+Conditional Access/provider denial and challenge timing, not an instantaneous
+external event. Phase 03 preserves existing pre-COMMIT epoch locks and browser
+stored-session checks. These sources never serialize
+assertions/provider tokens into sessions, jobs, audit, SQL or principal DTOs.
+Fresh verified native/guest API issuance can reauthorize its exact private
+principal after account revocation without portal sign-in. The existing durable
+epoch row also retains a non-secret monotonic `bearer_issued_after` cutoff.
+Assertions issued at/before that cutoff remain rejected, including after
+restart or another fresh grant; same-second issuance requires a later token.
+Recovery uses existing account mutation serialization, does not supersede valid
+independent peer grants, and preserves old workers' captured generation/epoch.
+The current DDL installs this cutoff directly. Synthetic native/guest fixtures
+do not establish live consent or provider admission.
+
+Both transports use the same registered handlers and authorization/data fences.
+Only verified bearer authority bypasses cookie Origin/CSRF; mixed credentials
+return `ambiguous_authentication` with no fallback. Public endpoints retain public
+admission; browser-only boundaries reject bearer authority. Saved reads remain provider-free and browser saved
+reads survive an empty process-local MSAL cache without inventing a local ID.
+Nested operations inherit one initiating ephemeral source; new requests cannot
+lend authority to already-running jobs. Expiry, stale issuance, revocation or
+restart pauses work for explicit same-principal recovery. SQL exports retain
+queued `authorization_required` state and require explicit idempotent resume;
+partial files cannot be published. Uncertain sent provider writes retain their
+existing reconciliation-before-resend gates. See the
+[canonical integration contract](mcp-integration.md#current-canonical-integration).
 
 ## Provider credentials and permissions
 
@@ -101,7 +180,7 @@ Directory principal IDs follow Microsoft Graph's hexadecimal 8-4-4-4-12 GUID syn
 - Sessions are opaque, server-side PostgreSQL records addressed by an `HttpOnly` cookie with an eight-hour lifetime. HTTPS cookies are `Secure`; `SameSite=Lax` permits the Entra top-level GET callback.
 - Only sanitized identity, recognized app roles, expiry metadata, CSRF state, authorization freshness metadata, and the random authentication-transaction handle are persisted. Access tokens, refresh tokens, ID tokens, authorization codes, OAuth state, OIDC nonces, PKCE verifiers, and MSAL cache contents are never stored in PostgreSQL or sent to the browser.
 - MSAL's token cache remains process-local. A restart requires token reacquisition; persisted application data and sessions remain governed by their own expiry rules.
-- The two-role application release treats legacy-role-only sessions as having no protected access; they are never upgraded or aliased. Deployment requires a fresh sign-in, and role-bound principal capability evidence is reacquired or revalidated under Viewer/Admin authority using existing session/account fencing.
+- Protected requests require recognized Viewer/Admin authority. Role-bound capability evidence is reacquired or revalidated under the current session/account fences; unsupported roles grant no protected access.
 - App roles are revalidated with Entra every five minutes. Revocation can therefore take up to that interval to affect an otherwise active session. Consent/account changes and logout are ordered against concurrent refreshes so stale role data cannot restore a revoked session.
 - Logout evicts the account cache, pauses its delegated jobs, deletes all server-side sessions for that tenant/account, and expires the browser cookie.
 - Power Platform role-template IDs are allowlisted from validated ID-token role claims into sanitized session state. Only the six documented inventory role IDs are retained; raw claims are not persisted. Full, AI and unknown remain distinct diagnostic hints, not provider authorization or measured coverage. All supported hints request the same allowlisted agents and supporting environments; only the actual executed query and validated saved counts establish coverage.
@@ -126,28 +205,28 @@ selection never grants permission to dispatch.
 
 - Workbench views and actions are code-owned, immutable definitions; each metadata response gets independent role arrays. The browser accepts only the bounded (64 KiB), unique-ID JSON contract with explicit registered roles, capabilities, safe local paths, and finite action semantics. Missing or malformed authorization fields fail the metadata read closed, rather than making actions role-free. Unknown fields are not forwarded to routing or action consumers; JSON parsing never inspects caller-owned accessors or proxies. A null capability remains intentional for saved-data actions and workflows whose selected or retained token mode determines provider authorization.
 - The UI imports the backend capability types and renders only registered adapters. One shared gate explains backend decisions on provider actions and separately applies local data-role visibility. It does not infer grants, Microsoft roles, licenses or write qualification from a successful read.
-- Permission diagnostics do not continuously gate delegated operation attempts. A registered, matching delegated capability last reported as available with valid token/provider timestamps remains retryable after diagnostic expiry, without claiming fresh verification. Known denials, malformed evidence, disabled modes and internal-role checks still apply; application/shared-scope evidence retains its expiry requirements. On-demand Admin writes require no prior probe evidence. Every submitted operation still enforces current server/provider authorization, exact-target confirmation and readback.
+- Permission diagnostics do not continuously gate ordinary operation attempts. Requested reads obtain current authorization; cached diagnostic expiry is not a separate approval requirement. Disabled modes, internal roles and current application-sharing configuration still apply. Admin writes require current provider authority, exact-target confirmation and readback, not prior probe evidence.
 - When an assigned Viewer/Admin session appears, the UI loads `GET /api/capabilities` and makes one `POST /api/capabilities/check`, deferring that initial check while hidden. Subsequent checks require **Check status**. Expiry, focus, visibility changes, page entry and rerenders do not trigger recurring provider checks; local timers only age diagnostic labels and issue reports. One check promise runs per session generation. Requests use `AbortSignal`; logout, unmount, or a tenant/principal/role/session change aborts and fences stale results. A transient transport failure gets one abortable retry after one second, not a recurring expiry-retry loop.
-- Retired consent requests cannot start a flow, and pending legacy consent transactions fail closed. Normal sign-in callback failures consume the one-time flow before redirecting to a safe local path with a fixed cancellation, interaction-required or failed outcome. Provider error descriptions, OAuth state and token data are never reflected into UI notices.
+- Sign-in callback failures consume the one-time flow before redirecting to a safe local path with a fixed cancellation, interaction-required or failed outcome. Provider error descriptions, OAuth state and token data are never reflected into UI notices.
 - Missing API permission is an administrator prerequisite: the UI links to Entra setup and lists exact delegated/application permissions, never Request consent or Authorize controls. `interaction_required` and `authorization_expired` offer ordinary **Sign in again** for MFA/session recovery, not capability-scoped consent. Setup remains external, and normal authentication does not establish feature grants. No action redirects automatically.
 - Permission diagnostics expose only allowlisted error categories, bounded provider error codes, HTTP status and validated correlation identifiers, alongside code-owned requirements and observation timestamps. They never expose provider response bodies, token/claim data or another principal's evidence. A consent-required Entra suberror is not labeled expired authorization; generic `invalid_grant` requires interaction without asserting its cause.
-- Browser qualification uses a separate Docker-only fixture app and isolated PostgreSQL databases. Test auth/provider mocks are not runtime routes or configuration options. Ordinary runtime validation rejects `AGENT_CONTROL_FIXTURE_MODE`, and production images contain neither the fixture runner nor browser/test dependencies. See the [qualification commands](operations.md#permission-center-qualification).
+- Browser tests use a separate fixture app and isolated PostgreSQL databases. Test auth/provider mocks are not runtime routes or configuration options. Ordinary runtime rejects fixture mode, and production images exclude fixture runners/browser dependencies. See [validation](operations.md#validation).
 
 ## Capabilities and provider credentials
 
-- Side-effect-free `GET /api/capabilities` returns `{ value: CapabilityView[] }`. The authenticated assigned Viewer-accessible, CSRF-protected `POST /api/capabilities/check` accepts only an absent body or empty object and returns the same shape; Admin inherits Viewer access. Nonempty, array, and `null` bodies return `400 invalid_request` with **Automatic capability checks do not accept request parameters.** The frontend never calls it for unassigned or legacy-role-only sessions, and the backend never schedules page-load checks by itself. The CSRF-protected `POST /api/capabilities/:id/probe` remains an explicit targeted-retry API, not a UI prerequisite.
+- Side-effect-free `GET /api/capabilities` returns `{ value: CapabilityView[] }`. Assigned Viewer/Admin may call CSRF-protected `POST /api/capabilities/check` with an absent/empty-object body. Other bodies return `400 invalid_request`. Unassigned sessions do not run checks; the backend does not schedule page-load checks itself. `POST /api/capabilities/:id/probe` is an explicit targeted retry, not a prerequisite UI step.
 - Read-only `GET /api/capabilities/check-progress` accepts only the same optional `retry=failed` query as the batch POST. It requires an assigned Viewer/Admin session, returns `Cache-Control: no-store`, and reports only that tenant/principal/generation/effective-role/retry-mode batch, or `null` when absent. Copied in-memory entries contain only automatic-check capability IDs and `reviewing`, `checking` or `complete` states; no provider requests, persistent progress records, target selection or authorization changes occur. Completed reviews include reused evidence and failed checks, not necessarily provider verification. Entries disappear when the batch settles.
 - An automatic batch failure releases its ownership of pending probes and cancels probes with no other caller, preventing abandoned provider work and late evidence publication. A probe shared with an independently active batch or targeted caller continues for that caller; the original batch failure remains an error, not a partial-success response.
-- Each `CapabilityView` contains its code-owned definition and decision, may carry application `configuration: { enabled, sharedDataScope, revision }`, and includes an optional top-level `enabled` compatibility field. The backend currently emits `enabled` for every view, but consumers tolerate omission. The frontend uses it for application presentation and falls back to `configuration.enabled` for compatibility. The revision binds saved application data to the current approved configuration even when the flags are unchanged. `enabled` is false only for a disabled application capability; delegated and local capabilities report true. A disabled application capability is `not_configured` with `configuration.enabled=false`; an enabled but unapproved application capability remains `not_configured` with `configuration.enabled=true` and `sharedDataScope=false`. A decision contains `capabilityId`, `status`, `authorized`, `fresh`, optional `verification`, optional `checkedAt`, `expiresAt`, `lastSuccessAt`, optional allowlisted evidence `{ category?, correlationId?, httpStatus?, providerErrorCode?, phase?, timeoutMs? }`, remediation, and `previewQualification` (`not_required`, `unqualified`, or `qualified`). `authorized` is true only for `available`; evidence-backed decisions require unexpired evidence for `fresh`. An `on_demand` decision instead reports current internal-role authorization with `fresh=true`, `previewQualification=not_required` and no evidence-expiry requirement: Viewer-authorized reads and Admin-authorized writes defer provider authorization to the submitted operation. Verification values are `token`, `provider`, `local`, `on_demand`, or `qualification`. `on_demand` is not token or live-operation proof; qualification records separately verified optional evidence, never an ordinary-write prerequisite. Failed, unchecked, disabled and expired provider checks carry no successful verification claim. The UI also guards older payloads so a probe type cannot be mistaken for successful proof.
+- Each `CapabilityView` carries its code-owned definition/decision and emitted `enabled` state. Application `configuration: { enabled, sharedDataScope, revision }` binds saved results to exact current configuration, including revisions that leave flags unchanged. Disabled application modes or missing configured shared scope remain `not_configured`. Decisions include status/authorization/freshness, optional verified timestamps/evidence, remediation and optional mutation-diagnostic qualification state. `on_demand` reports current internal-role authorization, not token/provider proof; requested operations obtain actual provider authority. Failed/unchecked/expired checks make no successful verification claim. Optional mutation diagnostics never gate ordinary reads or writes.
 - Provider statuses are `available`, `missing_permission`, `missing_internal_role`, `missing_role`, `missing_license`, `not_configured`, `unsupported`, `preview_disabled`, `provider_error`, and `unknown`. `interaction_required` and `authorization_expired` are evidence categories, not additional capability statuses: their decisions map to `unknown` while preserving the exact safe category. The UI consumes those categories for normal sign-in recovery, not permission requests. A confirmed missing grant remains status/category `missing_permission`; ambiguous `401`/`403` and source failures map to `provider_error`, while explicit unsupported or `404` responses map to `unsupported`. Correlation IDs are sanitized, and bearer data/provider bodies are stripped.
 - Capability definitions are code-owned contracts. Admins can configure application-mode enablement and approved shared scope. Automatic and explicit delegated checks are non-mutating and session-scoped; neither accepts fabricated evidence or edits provider, audience, permissions, roles, or write qualification.
 - Application configuration writes retain the initiating account-session and principal-authorization generations while queued. Sign-out, replacement sign-in or role/authorization invalidation rejects an old queued write before persistence; another administrator's configuration request does not invalidate the initiating principal.
-- Readiness and qualification generations also retain the initiating account-session generation before configuration/evidence lookups. Replacement sign-in cannot authorize an older pending read, provider probe or qualification publication, and a new session cannot join its automatic batch or individual probe.
+- Readiness and operation evidence retain the initiating account-session generation before configuration/evidence lookups. Replacement sign-in cannot authorize older pending work or join its batch/probe under another session.
 - Package access, block/unblock and Copilot Studio quarantine management use `on_demand` probing. Ordinary Admin-confirmed writes require no prior canary or qualification record. Token/status readiness is not exact-target operation proof; current provider authorization, exact targets, immediate prestate checks and readback are enforced by the submitted operation.
 - Provider permission is acquired only for the capability that needs it. OIDC login scopes, delegated capability scopes, and application-role capability permissions are separate authorization paths.
 - Microsoft access tokens are client-opaque. The runtime validates MSAL response tenant, account, token mode, returned delegated scopes or exposed application roles, resource metadata when exposed, and expiry. Optional readable JWT claims can reject contradictions, but the client does not require Microsoft-owned access tokens to be parseable JWTs.
 - Provider-read evidence is keyed by tenant, resource principal/application, authorizing principal, capability, resource audience, environment, token mode, permission revision, contract revision, and configuration revision. Full check batches are singleflight by tenant/principal/generation/effective Admin access/retry mode, individual refreshes are singleflight by evidence key, and fresh successes or failures are reused during the five-minute cooldown. A concurrent Viewer batch cannot suppress Admin-only token checks. Automatic, targeted-refresh, and read-through paths capture the generation before any await. Invalidation during configuration, token, or provider work prevents later provider steps and evidence publication. Readiness, live-qualification and operation-diagnostic evidence writes also recheck their initiating session, principal/capability generations and cancellation inside the transaction immediately before commit; stale writes roll back without replacing previous evidence. Audit and hunting workers pass their publication/failure-evidence cancellation signals through to that fence. Successful login/consent plus logout or demotion invalidation increments the generation and deletes that principal's evidence. A generation change fails with `401 authorization_expired` rather than returning stale or mixed results. Each coalesced caller receives a separate current-role projection, preventing an Admin-shaped response from leaking to a Viewer.
-- Application qualification evidence must retain its originally approved configuration revision. Recording rejects a missing or superseded revision, disabled application mode, or withdrawn shared scope before persistence. A late success or failure from an older qualification cannot authorize or overwrite evidence for a newer application configuration.
+- Application operation evidence retains the current captured configuration revision. Disabled mode, withdrawn shared scope or a superseded revision rejects stale publication; an earlier operation cannot overwrite evidence for a newer configuration.
 - Authorization-check evidence expires after five minutes and stops authorizing evidence-backed actions, while stale metadata remains until retention. Safe checks separately bound each token attempt to ten seconds and each provider-read attempt to ten seconds, except package catalog reads use thirty seconds. A genuinely transient failure, including a deadline, receives at most one retry with a fresh bounded signal; caller cancellation, session revocation and deterministic denials never retry. Provider `Retry-After` is honored: only a short cooldown within the one-second backoff ceiling may retry, while longer cooldowns are persisted. The maximum token-plus-catalog check is eighty-two seconds including retry backoff. Response bodies share the attempt's signal and two-MB limit. The fixed eligible set runs concurrently. Eligible explicit operations refresh absent/expired readiness once without requiring a manual probe.
 - Ordinary catalog, directory and inventory checks may invoke their bounded safe read adapter. Authorized quarantine read, Purview, Defender and implemented Admin write checks acquire only the scoped delegated token; token success is not proof that an exact provider operation, tenant data source or license is available. Package access/block and quarantine management initially report `on_demand` Admin authorization only when no evidence exists. Automatic checks replace this with expiring `token` evidence or a failure; on-demand readiness never overrides missing permission, interaction errors or expired evidence. The submitted operation still acquires and validates provider authorization. Viewer receives `missing_internal_role`. Management availability selects no target, calls no quarantine status or mutation, executes/resumes/reconciles no job, and runs no canary.
 - Automatic checks never include application/shared mode, imports, provider writes, mutation canary execution, raw-data collectors, Audit Search or Defender workloads, or data-refresh jobs. Disabled optional application modes are excluded from primary health, remain Admin-configured, and are never used as delegated fallback. The separate Agents initial-inventory workflow can submit one delegated read-only refresh per authorized session when no broad saved snapshot exists; a Permissions first-page check alone does not import inventory.
@@ -185,7 +264,7 @@ Automatic detail fallback reads also recheck the initiating account session and 
 
 For both refresh services, local pending/running reservations are private to the owning tenant and principal: other callers receive `404 not_found`, not a lifecycle conflict. UUID casing does not create a separate reservation or prevent cancellation from reaching its worker. Cancellation and execution deadlines are observed eagerly throughout execution, including pending publication authorization; the first interruption remains authoritative even if shutdown or another interruption follows before work settles. Later provider or authorization results cannot replace that cancellation, authorization-wait, or execution-deadline outcome. Abort listeners are released when execution settles, and shutdown still joins the work rather than abandoning it. Outcome-persistence failures still surface separately and do not count as a recorded outcome.
 
-Purview Audit Search is a separate on-demand provider-read lifecycle. Viewer may submit and access their own delegated results without a separate qualification approval/start ritual; the explicit bounded search establishes evidence for that principal and request. Admin inherits that workflow and adds application/shared-scope qualification and configuration but does not gain access to another principal's private results. Application results are readable only through the current Admin-approved shared scope and exact application qualification. The runtime accepts only code-owned presets, required operation subsets and structured filters, persists a durable operation marker before create, never retries an ambiguous POST, and requires explicit current authorization to reconcile or poll after interruption. Every physical Graph attempt reserves durable capacity immediately before dispatch; provider and local request IDs remain separate, and execution owner/version fencing prevents stale publication. Automatic capability checks acquire a token but perform zero Graph query operations. Cancellation and deletion are local only; Microsoft may continue remote work. Stored rows are allowlisted metadata with message IDs but no prompt, response, transcript or unrestricted `auditData`. Results expire after 30 days, remain separate from local administrative audit and official usage, and associate with private Power Platform inventory only through exact Bot ID plus environment. See [the Audit Search runbook](purview-audit-search.md).
+Purview Audit Search is an explicit provider-read lifecycle. Viewer/Admin may submit ordinary delegated/private or configured application/shared searches directly under current authority. Admin does not gain another principal's private results or job lifecycle ownership. Code-owned presets, required operation subsets and structured filters bind the request. A durable create marker prevents ambiguous POST replay; interrupted work needs explicit current authorization. Per-attempt durable capacity and execution-owner/version fences protect dispatch/publication. Automatic checks create no Graph queries. Cancel/delete are local; Microsoft may continue remote work. Rows contain minimized metadata/message IDs, not prompts, responses, transcripts or unrestricted `auditData`. Results expire after 30 days and remain distinct from administrative audit/official usage. Agent interactions require the current typed verified mapping; Studio administration retains exact Bot ID/environment scope. See [Audit Search](purview-audit-search.md).
 
 Every available package mutation requires a current server preview hash over the actor, exact native targets, frozen mutation-relevant prestate and requested intent. Jobs retain the scalar confirmation metadata and per-target prestate immutably; sampled before/after targets remain in the reviewed preview and its hash, not duplicated in the bounded job metadata. Job status and result paging retain their existing contracts. A tenant/package advisory lock serializes this application's local operations; under it the worker immediately rereads and hashes provider state before dispatch. Microsoft documents no ETag/`If-Match` on these endpoints, so this cannot prevent an external administrator from changing state after the reread and is never represented as provider atomicity. Full access replacement can overwrite such a concurrent change even though the app preserves and verifies the unselected collection. This risk is disclosed, not used to withhold implemented access or block/unblock functionality. Duplicate, non-UUID, unresolved, deleted or redirected principals are rejected.
 
@@ -231,4 +310,21 @@ Bounded administrative Audit, Purview and Defender CSV downloads check the curre
 
 One process admits at most 1,200 read or 300 write API requests per minute per trusted IP and 600 read or 200 write requests per minute per authenticated principal. Liveness, readiness and auth status are excluded. The limiter holds at most 10,000 local keys and is intentionally not a distributed quota. Uploads allow two concurrent 8 MiB/50,000-row operations. Exports have source-specific row/byte ceilings and a 15-second publication deadline. CSV formatting stops at the first cell exceeding the byte or time budget, without formatting the remaining cells or rows. Publication rechecks the captured account generation and request identity after both stored-session and source validation, so logout or a superseding sign-in during those reads cannot release another chunk. Source validation does not hold the account mutation lock needed by logout. Provider workers and durable queues retain their smaller per-principal, attempt, page and concurrency bounds; durable database admission, leases and one-shot dispatch survive process restart.
 
-The singleton database operational state is runtime-readable but operator-writable. Readiness fails for missing/changed schema, maintenance file or database maintenance mode. A configured maintenance marker closes admissions when present (including a dangling symlink) or when inspection fails for any reason other than a missing marker path; permission, I/O and invalid-path errors cannot silently reopen work. Removing the marker or correcting its access restores the external file switch, but process shutdown remains latched until restart. SIGTERM and SIGINT share one shutdown: it closes HTTP admission, drains the sync coordinator before its child workers, and waits for admitted HTTP requests before closing sessions and PostgreSQL. Failed drains or the 125-second deadline produce a nonzero exit and sanitized `shutdown_failed` or `shutdown_timeout` telemetry, never a successful shutdown receipt. Safe Admin diagnostics reveal only auth configuration, maintenance/provider admission state, schema fingerprint and fixed pool/body/export limits. Optional provider failure disables its capability rather than liveness. A logical restore accepts only the exact compiled current schema and receipt format, verifies table fingerprints, invalidates sessions, staging previews, confirmations and provider qualifications, fences old ownership, marks sent writes inconclusive, and repeats bounded retention to zero before review. It compares exact current owners and authority bindings for retained caches, current official set/version deletion and selection, and Defender retained-scope revocation. Reopening repeats that comparison from one current-database snapshot while holding the restored operational row in a real transaction; unavailable or over-bound current review fails closed in maintenance. Mismatched cached content is purged, provider work remains disabled, and uncertain writes are never replayed.
+The singleton operational state is runtime-readable and operator-writable.
+Readiness fails for missing/changed schema or actual file/database maintenance.
+A marker also closes admission when inspection fails for anything except a
+missing path; removing it never reopens a draining process. SIGTERM/SIGINT close
+HTTP admission, drain sync before child workers and wait for admitted requests
+before closing sessions/PostgreSQL. Failed drains or the 125-second deadline
+produce nonzero exit and sanitized failure telemetry.
+
+Safe Admin diagnostics expose auth configuration, current maintenance/admission,
+schema fingerprint and fixed resource limits, not secrets. Optional provider
+failure does not fail process liveness. Current-schema restore verifies dump/
+table fingerprints, revokes sessions and recovered execution authority, clears
+staging/previews, fences owners and marks uncertain writes inconclusive.
+Bounded retention and automatic current owner/deletion/configuration
+reconciliation precede reopening. Mismatched cache content is purged; unavailable
+or over-bound reconciliation leaves actual maintenance. Successful reopen
+returns to normal authenticated operation without review timestamps or a second
+provider-enable action. Uncertain writes are never replayed.

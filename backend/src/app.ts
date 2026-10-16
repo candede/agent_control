@@ -12,6 +12,7 @@ import { AppError, errorHandler } from "./errors.js";
 import { apiAdmission } from "./middleware/admission.js";
 import { agentsRouter, createAgentJobReadRouter, createAgentRefreshTargetsRouter } from "./routes/agents.js";
 import { createInventoryMutationsRouter } from "./routes/inventoryMutations.js";
+import { createSharedAgentControlsRouter } from "./routes/sharedAgentControls.js";
 import { auditRouter } from "./routes/audit.js";
 import { authRouter } from "./routes/auth.js";
 import { capabilitiesRouter } from "./routes/capabilities.js";
@@ -31,8 +32,9 @@ import { maintenanceActive } from "./services/maintenance.js";
 import { providerWorkEnabled, readOperationalState } from "./services/operationalState.js";
 import { httpTelemetry } from "./services/telemetry.js";
 import "./types/session.js";
+import { requestAuthentication, requestUser } from "./middleware/requestAuthentication.js";
 
-export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToPath(new URL("../../frontend/dist/", import.meta.url))) {
+export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToPath(new URL("../../frontend/dist/", import.meta.url)), identityFetch: typeof fetch = fetch) {
   const app = express();
   if (config.trustProxy) app.set("trust proxy", 1);
   app.disable("x-powered-by");
@@ -76,24 +78,21 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   });
   policyRoute(app, "get", "/api/auth/status", { access: "public", dataClass: "identity" }, (_request, response) => response.json({ authConfigured, callback: config.redirectUri,
     setup: authConfigured ? undefined : "Configure each tenant's ID, client credentials, and accepted username domains, and register the displayed callback in Entra." }));
-  policyRoute(app, "get", "/security", { access: "public", dataClass: "public" }, (_request, response) => {
-    response.setHeader("Cache-Control", "no-store");
-    response.redirect(302, "/agents");
-  });
   app.use(express.json({ limit: "512kb" }));
   const store = createSessionStore(database);
   app.use(session({ name: "agent-control.sid", store, secret: config.sessionSecret, resave: false, saveUninitialized: false,
     cookie: { httpOnly: true, sameSite: "lax", secure: config.frontendOrigin.startsWith("https://"), maxAge: 8*60*60*1000 } }));
+  app.use("/api", requestAuthentication(database, identityFetch));
   app.use("/api", apiAdmission);
   app.use("/api", (request, response, next) => {
     response.setHeader("Cache-Control", "private, no-store");
-    if (!["GET","HEAD","OPTIONS"].includes(request.method) && request.get("Origin") !== config.frontendOrigin) return next(new AppError(403,"invalid_origin","A same-origin request is required. Open the configured public URL and ensure the tunnel/reverse proxy preserves the browser Origin header. For an existing Dev Tunnel port, use devtunnel port update with --origin-header unchanged; host flags alone may not update the port. This is a connection configuration issue, not a missing permission.", {
+    if (request.authentication?.principal.transport !== "bearer" && !["GET","HEAD","OPTIONS"].includes(request.method) && request.get("Origin") !== config.frontendOrigin) return next(new AppError(403,"invalid_origin","A same-origin request is required. Open the configured public URL and ensure the tunnel/reverse proxy preserves the browser Origin header. For an existing Dev Tunnel port, use devtunnel port update with --origin-header unchanged; host flags alone may not update the port. This is a connection configuration issue, not a missing permission.", {
       expectedOrigin: config.frontendOrigin,
       receivedOrigin: request.get("Origin") ?? null,
     }));
     next();
   });
-  policyRoute(app, "get", "/api/diagnostics", { access: "authenticated", dataClass: "operational_metadata", roles: ["AgentControl.Admin"] }, async (_request, response) => {
+  policyRoute(app, "get", "/api/diagnostics", { access: "authenticated", browserOnly: true, dataClass: "operational_metadata", roles: ["AgentControl.Admin"] }, async (_request, response) => {
     const state = await readOperationalState(database);
     const maintenance = maintenanceActive() || state.mode !== "normal";
     response.json({
@@ -107,9 +106,9 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   const reports = reportRuntime(database);
   app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(),
     createOfficialReportDataRouter({ reports: reports.reports,
-      identity: async request => ({ identity: await reportIdentity(database, request.session.user!), tokenMode: "delegated" }),
-      enqueueExport: async () => { reports.wake(); } }),
-    createInventoryDataRouter(database), createInventoryMutationsRouter(database), createAgentJobReadRouter(database), createAgentRefreshTargetsRouter(database), createUnifiedAgentsRouter(database),
+      identity: async request => ({ identity: await reportIdentity(database, requestUser(request)), tokenMode: "delegated" }),
+      enqueueExport: async job => { reports.enqueue(job.id, job.identity); } }),
+    createInventoryDataRouter(database), createInventoryMutationsRouter(database), createSharedAgentControlsRouter(database), createAgentJobReadRouter(database), createAgentRefreshTargetsRouter(database), createUnifiedAgentsRouter(database),
     createInventoryReadRouter(database), inventoryRouter, copilotStudioQuarantineRouter, purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);
   app.use("/api", (_request, _response, next) => next(new AppError(404, "not_found", "API route not found.")));
   app.use("/assets", express.static(`${staticDirectory}/assets`, { immutable: true, maxAge: "1y", fallthrough: false, dotfiles: "deny" }));

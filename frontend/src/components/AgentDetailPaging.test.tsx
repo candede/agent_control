@@ -7,7 +7,6 @@ import { CapabilityContext } from "../capabilityContext";
 import { createSavedQueryClient } from "../savedQueries";
 import { deferred } from "../test/deferred";
 import { AgentPublishedVersions } from "./AgentPublishedVersions";
-import { InventoryMembers } from "./InventoryMembers";
 import { SavedAgentChannels, SavedAgentConnectors } from "./SavedAgentConfiguration";
 
 vi.mock("../api/client", async original => ({
@@ -293,29 +292,6 @@ describe("restored agent detail sections over paged storage", () => {
     expect(api.getInventoryChildren).toHaveBeenCalledTimes(5);
   });
 
-  it("retires member-page navigation and pending reads when only the account changes", async () => {
-    const pending = deferred<Awaited<ReturnType<typeof api.getInventoryMembers>>>();
-    const panel = <InventoryMembers selectionId="selected" recordId={record.id} />;
-    const view = render(scope(panel));
-    await screen.findByRole("button", { name: "Published agent" });
-    vi.mocked(api.getInventoryMembers).mockReturnValueOnce(pending.promise);
-    fireEvent.click(screen.getByRole("button", { name: "Next members" }));
-    const signal = vi.mocked(api.getInventoryMembers).mock.lastCall?.[3]?.signal;
-    view.rerender(scope(panel, { ...user, homeAccountId: "next-account" }));
-    expect(signal?.aborted).toBe(true);
-    await waitFor(() => expect(api.getInventoryMembers).toHaveBeenLastCalledWith(
-      "selected", record.id, undefined, { signal: expect.any(AbortSignal) }));
-    await act(async () => pending.resolve({
-      value: [{ ...member("retired"), display_name: "Retired member" }], total: 1, nextCursor: null,
-    }));
-    expect(await screen.findByRole("button", { name: "Published agent" })).toBeVisible();
-    expect(screen.queryByText("Retired member")).not.toBeInTheDocument();
-    view.rerender(scope(panel));
-    await waitFor(() => expect(api.getInventoryMembers).toHaveBeenCalledTimes(4));
-    expect(api.getInventoryMembers).toHaveBeenLastCalledWith(
-      "selected", record.id, undefined, { signal: expect.any(AbortSignal) });
-  });
-
   it.each(["versions", "channels"] as const)("shows one pending %s retry after a cached read fails", async section => {
     const client = sharedClient();
     const read = section === "versions" ? vi.mocked(api.getInventoryMembers) : vi.mocked(api.getInventoryChildren);
@@ -386,9 +362,9 @@ describe("restored agent detail sections over paged storage", () => {
     const view = render(<QueryClientProvider client={client}>{versions}</QueryClientProvider>);
     await screen.findByRole("option", { name: "Published agent" });
     view.rerender(<QueryClientProvider client={client}>{versions}
-      <InventoryMembers selectionId="selected" recordId={record.id} />
+      <AgentPublishedVersions selectionId="selected" record={record} disabled={false} onSelect={vi.fn()} />
     </QueryClientProvider>);
-    expect(await screen.findByRole("button", { name: "Published agent" })).toBeVisible();
+    expect(await screen.findAllByRole("option", { name: "Published agent" })).toHaveLength(2);
     expect(api.getInventoryMembers).toHaveBeenCalledOnce();
     await act(async () => { await client.invalidateQueries(); });
     expect(api.getInventoryMembers).toHaveBeenCalledTimes(2);

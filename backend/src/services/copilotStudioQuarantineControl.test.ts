@@ -156,7 +156,7 @@ describe("Copilot Studio quarantine control", () => {
 
   it("rolls back new-job publication if provider admission closes during submission", async () => {
     const { value, repository, dependencies } = service(true);
-    const failure = new AppError(503, "provider_requalification_required", "Provider admission closed.");
+    const failure = new AppError(503, "maintenance", "Provider admission closed.");
     let published = false;
     repository.submit.mockImplementationOnce(async (_scope, _input, beforeCommit: () => void) => {
       vi.mocked(requireProviderAdmissions).mockImplementation(() => { throw failure; });

@@ -28,7 +28,7 @@ function capabilities(directoryAllowed: boolean, now: number): CapabilityView[] 
     definition.id === "graph.package.access.manage"
     || directoryAllowed && definition.id === "graph.directory.read",
   ).map(definition => ({
-    definition,
+    enabled: true, definition,
     decision: definition.id === "graph.directory.read" ? {
       capabilityId: definition.id, status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],

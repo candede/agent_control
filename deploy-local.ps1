@@ -2,14 +2,16 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Position=0)]
-    [Alias('Action')]
     [ValidateSet('start','stop','edit-config','check')]
     [string]$Command = 'start',
     [string]$Project = 'agent-control',
-    [Alias('db-reset')]
     [switch]$DbReset,
     [switch]$ForceChecks,
-    [switch]$AgentSharingDiagnostics
+    [switch]$AgentSharingDiagnostics,
+    [string]$Candidate,
+    [string]$CandidateSha256,
+    [string]$ExpectedPreflight,
+    [switch]$ReadOnly
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts/local-deployment.ps1')
@@ -18,8 +20,13 @@ try {
     if ($DbReset -and $Command -ne 'start') { throw '-DbReset is supported only with start.' }
     if ($ForceChecks -and $Command -ne 'start') { throw '-ForceChecks is supported only with start.' }
     if ($AgentSharingDiagnostics -and $Command -ne 'start') { throw '-AgentSharingDiagnostics is supported only with start.' }
+    if (($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly) -and $Command -ne 'start') { throw 'Release parameters are supported only with start.' }
     $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -in @('stop','check'))
     $context.AgentSharingDiagnostics = [bool]$AgentSharingDiagnostics
+    $context.Candidate = $Candidate
+    $context.CandidateSha256 = $CandidateSha256
+    $context.ExpectedPreflight = $ExpectedPreflight
+    $context.ReadOnly = [bool]$ReadOnly
     $operation = switch ($Command) {
         'start' { 'Deploy' }
         'stop' { 'Stop' }

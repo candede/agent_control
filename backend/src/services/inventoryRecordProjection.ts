@@ -1,10 +1,10 @@
-import { assertResidualBytes, digest, dataLimitError } from "../db/dataBounds.js";
+import { assertResidualBytes, digest, dataLimitError, dataLimits } from "../db/dataBounds.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import { formatAgentAuthoringTool, isDirectoryObjectId, isPackageProviderUsage, normalizePackageAuthoringTool, packagePrincipalCollections } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { powerPlatformAuthoringTool } from "../types/powerPlatformInventory.js";
 import { inventoryLimits, type InventoryClassification } from "../types/inventoryRecords.js";
-import { allowlistedPackage } from "./packageObservation.js";
+import { allowlistedSavedPackage } from "./packageObservation.js";
 import { isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName, readPackageAgentMetadata, readPackageCustomEngineBotIdentity } from "./packageAgentMetadata.js";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { buildRecords } from "./inventoryComponent.js";
@@ -37,6 +37,20 @@ function bounded(record: InventoryRecord) {
   return record;
 }
 
+function aboutFacts(kind: string, text: string): InventoryFact[] {
+  const bytes = Buffer.byteLength(text);
+  if (bytes > dataLimits.agentDefinitionBytes) throw dataLimitError("inventory_about_bytes", dataLimits.agentDefinitionBytes, bytes);
+  if (bytes <= 16384) return [];
+  const facts: InventoryFact[] = [];
+  for (let offset = 0, part = 0; offset < text.length; part++) {
+    let end = Math.min(text.length, offset + 8192);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+    facts.push({ kind, value: String(part), payload: { text: text.slice(offset, end) } });
+    offset = end;
+  }
+  return facts;
+}
+
 export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRecord {
   const retainedFields = ["identityDetailsCollected", "identityRevalidationRequired", "detailFreshness", "controlObservations", "providerUsage", "provenance"] as const;
   const properties = Object.getOwnPropertyDescriptors(input);
@@ -49,8 +63,10 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   }
   // Local freshness/control annotations are not omitted provider fields.
   for (const key of retainedFields) delete observation[key];
-  const value = { ...allowlistedPackage(observation), ...structuredClone(Object.fromEntries(
-    retainedFields.filter(key => Object.hasOwn(input, key)).map(key => [key, input[key]]))) } as CopilotPackageDetail;
+  const checked = allowlistedSavedPackage(observation);
+  const value: CopilotPackageDetail = { ...checked, ...structuredClone(Object.fromEntries(
+    retainedFields.filter(key => key !== "provenance" && Object.hasOwn(input, key)).map(key => [key, input[key]]))),
+    provenance: { ...checked.provenance, ...input.provenance } };
   const facts: InventoryFact[] = [];
   const fact = (kind: string, value: string, payload: Record<string, unknown> = {}) => facts.push({ kind, value, payload });
   for (const kind of ["supportedHosts", "elementTypes", "categories"] as const) {
@@ -93,6 +109,14 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   }
   // Source-native identity evidence stays bounded; child collections are not list payloads.
   const residual: Record<string, unknown> = { ...value };
+  for (const field of ["longDescription", "shortDescription"] as const) {
+    const text = value[field];
+    const chunks = text === undefined ? [] : aboutFacts(`about:${field === "longDescription" ? "long" : "short"}`, text);
+    if (chunks.length) {
+      facts.push(...chunks);
+      delete residual[field];
+    }
+  }
   for (const key of ["supportedHosts", "elementTypes", "categories", ...packagePrincipalCollections, "elementDetails"]) delete residual[key];
   const projection = canonicalRecord(value.id, buildRecords([value], [], resolvePackageAgentLinks("", [value], []), null, null)[0]);
   facts.push(...projection.facts);
@@ -121,6 +145,8 @@ export function powerPlatformInventoryRecord(value: PowerPlatformResource): Inve
   const residual = structuredClone(value) as unknown as Record<string, unknown>;
   delete residual.identifiers;
   const details = residual.details as Record<string, unknown>;
+  const about = value.details.description === undefined ? [] : aboutFacts("about:native", value.details.description);
+  if (about.length) { facts.push(...about); delete details.description; }
   for (const [kind, items] of Object.entries(details)) if (Array.isArray(items)) {
     facts.push({ kind: "collection", value: `detail:${kind}`, payload: {} });
     for (const [ordinal, item] of items.entries()) {
@@ -153,6 +179,15 @@ export function restoreInventoryRecord(residual: Record<string, unknown>, inputF
     throw new AppError(500, "saved_source_invalid", "Saved inventory child facts are invalid.");
   }
   if (domain === "packages") {
+    for (const [field, kind] of [["longDescription", "about:long"], ["shortDescription", "about:short"]] as const) {
+      const chunks = facts.filter(fact => fact.kind === kind);
+      if (chunks.length) {
+        if (chunks.some((fact, index) => fact.value !== String(index) || typeof fact.payload.text !== "string")) {
+          throw new AppError(500, "saved_source_invalid", "Saved About text has invalid chunk ordering.");
+        }
+        value[field] = chunks.map(fact => fact.payload.text).join("");
+      }
+    }
     for (const kind of ["supportedHosts", "elementTypes", "categories", ...packagePrincipalCollections]) {
       const selected = facts.filter(fact => fact.kind === kind);
       if (selected.length || facts.some(fact => fact.kind === "collection" && fact.value === kind)) value[kind] = selected.map(fact => kind.endsWith("UsersAndGroups") ? fact.payload : fact.value);
@@ -178,6 +213,13 @@ export function restoreInventoryRecord(residual: Record<string, unknown>, inputF
     }
     value.identifiers = facts.filter(fact => fact.kind === "identifier").map(fact => fact.payload);
     const details = value.details as Record<string, unknown>;
+    const about = facts.filter(fact => fact.kind === "about:native");
+    if (about.length) {
+      if (about.some((fact, index) => fact.value !== String(index) || typeof fact.payload.text !== "string")) {
+        throw new AppError(500, "saved_source_invalid", "Saved native About text has invalid chunk ordering.");
+      }
+      details.description = about.map(fact => fact.payload.text).join("");
+    }
     let connectorOrdinal: string | undefined;
     for (const fact of facts) {
       if (fact.kind === "collection" && fact.value.startsWith("detail:")) {

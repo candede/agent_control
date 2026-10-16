@@ -55,8 +55,10 @@ wizard, and sign in with an assigned work or school account.
 
 ### 4. Collect data
 
-Open **Permissions** to check access, then open **Sync** to collect agent,
-environment, user, license, and activity data.
+Initial read-only synchronization starts automatically after sign-in while the
+app is visible and online. **Sync** shows source progress and retained history.
+Use **Permissions** to diagnose an actual authorization failure, not as a
+prerequisite to collection.
 
 To add Microsoft 365 Copilot agent usage, export the **Agents**,
 **Users & agents**, and **Users** CSV reports for the same period and import them
@@ -82,5 +84,7 @@ Add `-Project <name>` to keep separate installations.
 | [Microsoft roles](docs/user-roles-and-permissions.md) | Roles required for each feature |
 | [Usage reports](docs/official-usage-import.md) | Exporting and importing Microsoft 365 reports |
 | [Operations](docs/operations.md) | Updates, troubleshooting, backups, and recovery |
+| [Saved data](docs/data-architecture.md) | Current schema, source publication, selections, and lifecycle |
+| [Provider contracts](docs/provider-contracts.md) | Supported Microsoft contracts, permissions, limits, and evidence |
 | [Security](docs/security-model.md) | Authentication, authorization, and data isolation |
 | [Azure deployment](docs/azure-production-deployment.md) | Production requirements and deployment |

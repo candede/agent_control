@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import type { CapabilityView, CopilotPackageDetail, PackageAccessUpdate, PackageRefreshJob } from "../src/api/client";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
@@ -18,10 +19,17 @@ test("edits access and installation and reviews blocking inside one agent modal"
   let detail: CopilotPackageDetail = {
     ...agent, availableTo: "all", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [],
   };
+  await page.route(url => url.pathname === "/api/agent-inventory", route => {
+    const value = unifiedAgents.value.filter(record => record.packages.length > 0).map(record => ({
+      ...record, packages: record.packages.map(item => item.id === agent.id ? detail : item),
+    }));
+    return fulfillInventoryPage(route, { ...unifiedAgents, value,
+      counts: { ...unifiedAgents.counts, scoped: value.length, filtered: value.length } });
+  });
   const views: CapabilityView[] = capabilityDefinitions.filter(definition =>
     ["graph.package.read.delegated", "graph.package.access.manage", "graph.package.block.manage", "graph.directory.read"].includes(definition.id),
   ).map(definition => ({
-    definition,
+    enabled: true, definition,
     decision: {
       capabilityId: definition.id, status: "available", authorized: true, fresh: true,
       verification: definition.probe.kind === "on_demand" ? "on_demand" : "provider",

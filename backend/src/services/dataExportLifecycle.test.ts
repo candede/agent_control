@@ -51,7 +51,8 @@ describe("all artifact producer lifecycle contracts", () => {
     await expect(engine.create(identity, { ...input, ids: ["changed"] })).rejects.toMatchObject({ code: "export_idempotency_conflict" });
     await engine.cancel(ids[0], identity);
     await engine.cancel(ids[0], identity);
-    expect(events.map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect(events.filter(event => event.phase === "build").map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect(events.filter(event => event.phase === "cancel").map(event => event.status)).toEqual(["started", "succeeded"]);
     expect(await engine.create(identity, input)).toBe(ids[0]);
     expect((await engine.status(ids[0], identity)).status).toBe("cancelled");
   });

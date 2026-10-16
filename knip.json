@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "includeEntryExports": true,
+  "workspaces": {
+    ".": {
+      "entry": ["scripts/browser-smoke.mjs"],
+      "project": ["scripts/**/*.mjs"]
+    },
+    "backend": {
+      "includeEntryExports": false,
+      "entry": [
+        "scripts/azure-database.ts!",
+        "scripts/azure-pitr.ts!",
+        "scripts/backup.ts!",
+        "scripts/compiledRestartFixture.ts",
+        "scripts/database.ts!",
+        "scripts/exportReadonlyFixture.ts",
+        "scripts/kusto-semantic.cjs",
+        "scripts/package-smoke.ts",
+        "scripts/package.mjs",
+        "scripts/production-inspect.mjs",
+        "scripts/release-inspect.mjs",
+        "scripts/reportReadProfile.ts",
+        "scripts/restart-fixture.ts",
+        "scripts/restart-runtime.mjs",
+        "scripts/test-all.ts",
+        "scripts/zip-runtime-smoke.mjs"
+      ],
+      "project": [
+        "src/**/*.ts!",
+        "scripts/**/*.{ts,mjs,cjs}",
+        "!src/**/*.test.ts!",
+        "!src/test/**!",
+        "!src/**/*TestSupport.ts!"
+      ],
+      "paths": {
+        "/app/backend/scripts/*": ["scripts/*"]
+      },
+      "vitest": {
+        "config": ["vitest.config.ts", "scripts/browser-fixture.config.ts"]
+      }
+    },
+    "frontend": {
+      "entry": ["src/main.tsx!"],
+      "project": [
+        "src/**/*.{ts,tsx}!",
+        "browser/**/*.ts",
+        "!src/**/*.test.{ts,tsx}!",
+        "!src/test/**!"
+      ]
+    }
+  }
+}

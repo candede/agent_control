@@ -269,14 +269,14 @@ describe("capability request session ownership", () => {
     });
   });
 
-  it.each(["audit", "hunting"] as const)("rejects superseded %s qualification evidence before persistence", async kind => {
+  it.each(["audit", "hunting"] as const)("rejects superseded %s provider evidence before persistence", async kind => {
     const { value, repository } = service();
-    const user = { ...reader, homeAccountId: `qualification-${kind}` };
+    const user = { ...reader, homeAccountId: `provider-${kind}` };
     const held = deferred<CapabilityConfiguration>();
     repository.configuration.mockImplementationOnce(() => held.promise);
     const pending = kind === "audit"
-      ? value.recordAuditQualificationEvidence("purview.audit.search.delegated", user, "available", {})
-      : value.recordHuntingQualificationEvidence("defender.hunting.delegated", user, "available", {});
+      ? value.recordAuditProviderEvidence("purview.audit.search.delegated", user, "available", {})
+      : value.recordHuntingProviderEvidence("defender.hunting.delegated", user, "available", {});
     const rejection = expect(pending).rejects.toMatchObject({ status: 401, code: "authorization_expired" });
     await vi.waitFor(() => expect(repository.configuration).toHaveBeenCalledOnce());
     await activateAccountSession(user.tenantId, user.homeAccountId, async () => undefined);
@@ -782,9 +782,9 @@ describe("capability decisions", () => {
         repository.configurations.set(definition.id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 1 });
       }
       const decision = definition.id === "purview.audit.search.application"
-        ? await value.recordAuditQualificationEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
+        ? await value.recordAuditProviderEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
         : definition.id === "defender.hunting.application"
-          ? await value.recordHuntingQualificationEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
+          ? await value.recordHuntingProviderEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
           : await value.refresh(definition.id, admin);
       expect(decision.status).toBe("missing_permission");
       const message = decision.remediation.join(" ");
@@ -842,14 +842,15 @@ describe("capability decisions", () => {
       const { value, probes, repository } = service();
       repository.configurations.set(id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
       const decision = await value.decision(id, reader);
-      expect(decision.status).toBe("unknown");
-      expect(decision.remediation.join(" ")).toMatch(/explicit.*application-scope/i);
+      const onDemand = id !== "graph.package.read.application";
+      expect(decision.status).toBe(onDemand ? "available" : "unknown");
+      expect(decision.remediation.join(" ")).toMatch(onDemand ? /Request the read from its feature/i : /Request the application-scope read/i);
       expect(decision.remediation.join(" ")).not.toMatch(/Run the automatic/i);
       await value.check(reader, { retryFailed: true });
       expect(probes.applicationToken).not.toHaveBeenCalled();
-      expect((await value.decision(id, reader)).status).toBe("unknown");
-      await expect(value.requireAvailable(id, reader)).rejects.toMatchObject({ code: "capability_unavailable" });
-      expect(probes.applicationToken).not.toHaveBeenCalled();
+      expect((await value.decision(id, reader)).status).toBe(onDemand ? "available" : "unknown");
+      await expect(value.requireAvailable(id, reader)).resolves.toMatchObject({ status: "available", authorized: true });
+      expect(probes.applicationToken).toHaveBeenCalledTimes(onDemand ? 0 : 1);
     },
   );
 
@@ -1005,15 +1006,16 @@ describe("capability decisions", () => {
   it("publishes verification only for successful current evidence, not absent, failed, expired, or disabled checks", async () => {
     const { value, repository } = service();
     const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
-    for (const id of ["graph.package.read.delegated", "purview.audit.search.delegated", "powerPlatform.quarantine.read",
+    for (const id of ["graph.package.read.delegated", "powerPlatform.quarantine.read",
       "graph.package.read.application", "graph.package.reassign.manage"] as const) {
       expect((await value.decision(id, administrator)).verification).toBeUndefined();
     }
+    expect((await value.decision("purview.audit.search.delegated", administrator)).verification).toBe("on_demand");
     expect((await value.decision("reports.official.import", reader)).verification).toBeUndefined();
     expect((await value.decision("reports.official.import", administrator)).verification).toBe("local");
     expect((await value.refresh("graph.package.read.delegated", reader)).verification).toBe("provider");
     const evidence = [...repository.evidenceRows.values()][0];
-    for (const verification of [undefined, "local", "qualification", "token"]) {
+    for (const verification of [undefined, "local", "invalid", "token"]) {
       evidence.details.verification = verification;
       expect((await value.decision("graph.package.read.delegated", reader)).verification).toBeUndefined();
     }
@@ -1028,13 +1030,13 @@ describe("capability decisions", () => {
     }
   });
 
-  it("does not label failed token acquisition or explicit provider qualification as successful proof", async () => {
+  it("does not label failed token acquisition or provider requests as successful proof", async () => {
     const { value } = service(new MemoryRepository(), {
       delegatedToken: async () => { throw new AppError(403, "missing_permission", "Denied"); },
     });
     expect((await value.refresh("powerPlatform.quarantine.read", reader)).verification).toBeUndefined();
-    expect((await value.recordAuditQualificationEvidence("purview.audit.search.delegated", reader, "provider_error", {})).verification).toBeUndefined();
-    expect((await value.recordHuntingQualificationEvidence("defender.hunting.delegated", reader, "provider_error", {})).verification).toBeUndefined();
+    expect((await value.recordAuditProviderEvidence("purview.audit.search.delegated", reader, "provider_error", {})).verification).toBeUndefined();
+    expect((await value.recordHuntingProviderEvidence("defender.hunting.delegated", reader, "provider_error", {})).verification).toBeUndefined();
   });
 
   it("publishes bounded Graph diagnostics without copying provider messages, bodies, or tokens", async () => {
@@ -1097,7 +1099,7 @@ describe("capability decisions", () => {
 
   it("rejects unsafe and oversized provider evidence fields before persistence and publication", async () => {
     const { value, repository } = service();
-    const result = await value.recordAuditQualificationEvidence("purview.audit.search.delegated", reader, "provider_error", {
+    const result = await value.recordAuditProviderEvidence("purview.audit.search.delegated", reader, "provider_error", {
       category: "person@example.invalid", correlationId: "person@example.invalid", httpStatus: "403 private",
       providerErrorCode: "x".repeat(129), accessToken: "private-token", body: "private-body",
     });
@@ -1110,7 +1112,7 @@ describe("capability decisions", () => {
     [Number.NaN, undefined], [Number.POSITIVE_INFINITY, undefined], [" 403", undefined], ["403 private", undefined],
   ])("publishes only bounded integral provider HTTP status from %s", async (httpStatus, expected) => {
     const { value, repository } = service();
-    const result = await value.recordAuditQualificationEvidence("purview.audit.search.delegated", reader, "provider_error", { httpStatus });
+    const result = await value.recordAuditProviderEvidence("purview.audit.search.delegated", reader, "provider_error", { httpStatus });
     expect(result.evidence?.httpStatus).toBe(expected);
     expect([...repository.evidenceRows.values()][0].details.httpStatus).toBe(expected);
   });
@@ -1385,23 +1387,27 @@ describe("capability decisions", () => {
       expect.objectContaining({ verification: "token" }), expect.any(Number), expect.any(Function));
   });
 
-  it("does not turn application qualification into token-only readiness", async () => {
+  it.each(["purview.audit.search.application", "defender.hunting.application"] as const)("allows configured %s reads without a prior provider check", async id => {
     const operator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const { value, probes, repository } = service();
-    repository.configurations.set("purview.audit.search.application", { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+    repository.configurations.set(id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
 
-    await expect(value.refresh("purview.audit.search.application", operator)).resolves.toMatchObject({
-      status: "unknown",
-      authorized: false,
+    await expect(value.requireAvailable(id, operator)).resolves.toMatchObject({
+      status: "available",
+      authorized: true,
+      verification: "on_demand",
     });
     expect(probes.applicationToken).not.toHaveBeenCalled();
+    expect(probes.packageProbe).not.toHaveBeenCalled();
+    expect(probes.directoryProbe).not.toHaveBeenCalled();
+    expect(probes.inventoryProbe).not.toHaveBeenCalled();
     expect(repository.evidenceRows.size).toBe(0);
   });
 
   it("records explicit Audit and Hunting execution as provider verification", async () => {
     const { value, repository } = service();
-    await value.recordAuditQualificationEvidence("purview.audit.search.delegated", reader, "available", { providerRequestId: "audit-request" });
-    await value.recordHuntingQualificationEvidence("defender.hunting.delegated", reader, "available", { providerRequestId: "hunting-request" });
+    await value.recordAuditProviderEvidence("purview.audit.search.delegated", reader, "available", { providerRequestId: "audit-request" });
+    await value.recordHuntingProviderEvidence("defender.hunting.delegated", reader, "available", { providerRequestId: "hunting-request" });
     expect(repository.recordEvidence).toHaveBeenNthCalledWith(1, expect.any(Object), "available",
       expect.objectContaining({ verification: "provider" }), expect.any(Number), expect.any(Function));
     expect(repository.recordEvidence).toHaveBeenNthCalledWith(2, expect.any(Object), "available",
@@ -1624,27 +1630,27 @@ describe("capability decisions", () => {
       name: "Audit",
       applicationId: "purview.audit.search.application" as const,
       record: (value: CapabilityService, mode: "delegated" | "application" = "delegated", configurationRevision?: number, status: CapabilityEvidence["status"] = "available") =>
-        value.recordAuditQualificationEvidence(`purview.audit.search.${mode}`, reader, status, {}, configurationRevision),
+        value.recordAuditProviderEvidence(`purview.audit.search.${mode}`, reader, status, {}, configurationRevision),
     },
     {
       name: "Hunting",
       applicationId: "defender.hunting.application" as const,
       record: (value: CapabilityService, mode: "delegated" | "application" = "delegated", configurationRevision?: number, status: CapabilityEvidence["status"] = "available") =>
-        value.recordHuntingQualificationEvidence(`defender.hunting.${mode}`, reader, status, {}, configurationRevision),
+        value.recordHuntingProviderEvidence(`defender.hunting.${mode}`, reader, status, {}, configurationRevision),
     },
   ])("$name evidence invalidation", ({ applicationId, record }) => {
-    it.each([undefined, 1])("rejects application evidence without a matching approved revision (%s)", async revision => {
+    it.each([undefined, 1])("rejects application evidence without a matching current revision (%s)", async revision => {
       const { value, repository } = service();
       repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
       for (const status of ["available", "provider_error"] as const) {
-        await expect(record(value, "application", revision, status)).rejects.toMatchObject({ code: "qualification_superseded" });
+        await expect(record(value, "application", revision, status)).rejects.toMatchObject({ code: "application_scope_changed" });
       }
       expect(repository.recordEvidence).not.toHaveBeenCalled();
       expect(repository.evidenceRows.size).toBe(0);
-      await expect(value.decision(applicationId, reader)).resolves.toMatchObject({ status: "unknown", authorized: false });
+      await expect(value.decision(applicationId, reader)).resolves.toMatchObject({ status: "available", authorized: true, verification: "on_demand" });
     });
 
-    it("records application evidence only for the still-enabled approved revision", async () => {
+    it("records application evidence only for the still-enabled current revision", async () => {
       const { value, repository } = service();
       repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
       await expect(record(value, "application", 2)).resolves.toMatchObject({ status: "available", verification: "provider" });
@@ -1652,7 +1658,7 @@ describe("capability decisions", () => {
         "available", { verification: "provider" }, expect.any(Number), expect.any(Function));
       for (const configuration of [{ enabled: false, sharedDataScope: true }, { enabled: true, sharedDataScope: false }]) {
         repository.configurations.set(applicationId, { ...configuration, previewQualified: false, revision: 2 });
-        await expect(record(value, "application", 2)).rejects.toMatchObject({ code: "qualification_superseded" });
+        await expect(record(value, "application", 2)).rejects.toMatchObject({ code: "application_scope_changed" });
       }
       expect(repository.recordEvidence).toHaveBeenCalledOnce();
     });
@@ -1664,7 +1670,7 @@ describe("capability decisions", () => {
       const current = await value.configureApplication(applicationId, admin, true, true);
       await record(value, "application", current.revision);
       for (const status of ["available", "provider_error"] as const) {
-        await expect(record(value, "application", approved.revision, status)).rejects.toMatchObject({ code: "qualification_superseded" });
+        await expect(record(value, "application", approved.revision, status)).rejects.toMatchObject({ code: "application_scope_changed" });
       }
       expect(repository.recordEvidence).toHaveBeenCalledOnce();
       await expect(value.decision(applicationId, reader)).resolves.toMatchObject({ status: "available", verification: "provider" });

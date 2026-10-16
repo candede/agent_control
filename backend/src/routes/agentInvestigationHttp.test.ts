@@ -3,7 +3,10 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
+import { config } from "../config.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { defenderHuntingRouter } from "./defenderHunting.js";
+import { purviewAuditRouter } from "./purviewAudit.js";
 import { createUnifiedAgentsRouter } from "./unifiedAgents.js";
 import { defenderHunting } from "../services/defenderHunting.js";
 import { purviewAudit } from "../services/purviewAudit.js";
@@ -27,51 +30,97 @@ vi.mock("../services/auditLog.js", () => ({
 }));
 vi.mock("../services/csvExport.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/csvExport.js")>(),
-  createExportPublicationValidator: () => async (validateSource?: () => Promise<void>) => { await validateSource?.(); },
+  createExportPublicationValidator: () => {
+    const validation = beginAccountSessionValidation("tenant-a", "reader-a");
+    return async (validateSource?: () => Promise<void>) => {
+      await validateSource?.();
+      const assertCurrent = () => assertAccountSessionValidation(validation);
+      assertCurrent();
+      return assertCurrent;
+    };
+  },
 }));
-vi.mock("../services/defenderHunting.js", () => ({ defenderHunting: Object.fromEntries([
-  "qualificationEvidence", "retainedScopes", "approveQualification", "startQualification", "revokeRetainedScope",
+vi.mock("../services/defenderHunting.js", () => ({ defenderHunting: { ...Object.fromEntries([
   "submit", "start", "list", "get", "cancel", "delete", "rows",
-].map(key => [key, vi.fn()])) }));
-vi.mock("../services/purviewAudit.js", () => ({ purviewAudit: { agentRecords: vi.fn() } }));
+].map(key => [key, vi.fn()])),
+  beginReadValidation: (actor: typeof user) => {
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.homeAccountId);
+    return () => assertAccountSessionValidation(validation);
+  } } }));
+vi.mock("../services/purviewAudit.js", () => ({ purviewAudit: { agentRecords: vi.fn(), list: vi.fn(),
+  submit: vi.fn(), start: vi.fn() } }));
 
 const id = "11111111-1111-4111-8111-111111111111";
 const recordId = `agent:${id}`;
-const user = { tenantId: "tenant-a", homeAccountId: "reader-a", roles: ["AgentControl.Viewer"] };
+const user = { tenantId: "tenant-a", homeAccountId: "reader-a", username: "reader@example.invalid",
+  displayName: "Synthetic reader", roles: ["AgentControl.Viewer"] };
+const tenants = config.tenants;
 const agentIdentityResolution = new AgentIdentityResolutionService();
 let server: Server;
 let origin: string;
 
 beforeAll(async () => {
+  config.tenants = [{ tenantId: user.tenantId, clientId: "synthetic-api", clientSecret: "synthetic", domains: ["example.invalid"] }];
   const app = express();
   app.use(express.json());
   app.use((request, _response, next) => {
     request.session = { user: request.get("x-test-user") === "anonymous" ? undefined
       : { ...user, roles: request.get("x-test-user") === "unassigned" ? [] : user.roles },
-    accountId: "reader-a", csrfToken: "test-csrf" } as never;
+    tenantId: user.tenantId, clientId: "synthetic-api", accountId: "reader-a", csrfToken: "test-csrf" } as never;
     next();
   });
-  app.use("/api", defenderHuntingRouter, createUnifiedAgentsRouter(undefined,
+  app.use("/api", defenderHuntingRouter, purviewAuditRouter, createUnifiedAgentsRouter(undefined,
     { investigations: agentInvestigations, identities: agentIdentityResolution, purview: purviewAudit }));
   app.use(((error: AppError, _request, response, _next) => response.status(error.status ?? 500).json({ code: error.code })) as express.ErrorRequestHandler);
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
-afterAll(async () => { server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve())); });
+afterAll(async () => { config.tenants = tenants; server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve())); });
 beforeEach(() => {
   vi.clearAllMocks();
-  for (const method of [defenderHunting.get, defenderHunting.submit, defenderHunting.start, defenderHunting.startQualification,
-    defenderHunting.approveQualification, defenderHunting.cancel, defenderHunting.revokeRetainedScope]) {
+  for (const method of [defenderHunting.get, defenderHunting.submit, defenderHunting.start, defenderHunting.cancel]) {
     vi.mocked(method).mockResolvedValue({ id, tokenMode: "delegated" } as never);
   }
-  vi.mocked(defenderHunting.qualificationEvidence).mockResolvedValue([]);
-  vi.mocked(defenderHunting.retainedScopes).mockResolvedValue([]);
   vi.mocked(defenderHunting.list).mockResolvedValue({ count: 0, value: [], limit: 20, offset: 0 });
   vi.mocked(defenderHunting.rows).mockResolvedValue({ count: 0, value: [] } as never);
+  for (const method of [purviewAudit.submit, purviewAudit.start]) {
+    vi.mocked(method).mockResolvedValue({ id, tokenMode: "delegated" } as never);
+  }
+  vi.mocked(purviewAudit.list).mockResolvedValue({ count: 0, value: [], limit: 20, offset: 40 });
 });
 
 describe("agent investigation HTTP wiring", () => {
+  it("forwards the exact saved agent reference and filters to Purview jobs", async () => {
+    const filters = { presetId: "copilot_studio_admin", operations: ["BotCreate"] };
+    const response = await fetch(`${origin}/api/audit-search/jobs`, { method: "POST",
+      headers: { "content-type": "application/json", "x-csrf-token": "test-csrf", "idempotency-key": "exact-agent-search" },
+      body: JSON.stringify({ tokenMode: "delegated", filters, agentRecordId: recordId }) });
+    expect(response.status).toBe(202);
+    expect(purviewAudit.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(user),
+      { tokenMode: "delegated", filters, agentRecordId: recordId, idempotencyKey: "exact-agent-search" });
+    expect(purviewAudit.start).toHaveBeenCalledOnce();
+  });
+
+  it("forwards the exact agent and user intersection before Purview history pagination", async () => {
+    const query = new URLSearchParams({ limit: "20", offset: "40", agentRecordId: recordId, userPrincipalName: user.username });
+    const response = await fetch(`${origin}/api/audit-search/jobs?${query}`);
+    expect(response.status).toBe(200);
+    expect(purviewAudit.list).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(user), 20, 40, user.username, recordId);
+  });
+
+  it("retains Viewer and CSRF denial before scoped Purview history or submission", async () => {
+    const path = `${origin}/api/audit-search/jobs?agentRecordId=${encodeURIComponent(recordId)}`;
+    expect((await fetch(path, { headers: { "x-test-user": "anonymous" } })).status).toBe(401);
+    expect((await fetch(path, { headers: { "x-test-user": "unassigned" } })).status).toBe(403);
+    for (const target of ["jobs"]) {
+      expect((await fetch(`${origin}/api/audit-search/${target}`, { method: "POST",
+        headers: { "content-type": "application/json" }, body: JSON.stringify({ tokenMode: "delegated", agentRecordId: recordId, filters: {} }) })).status).toBe(403);
+    }
+    expect(purviewAudit.list).not.toHaveBeenCalled();
+    expect(purviewAudit.submit).not.toHaveBeenCalled();
+  });
+
   it("protects explicit resolution with Viewer, CSRF, narrow capability and an exact record-only body", async () => {
     const result = { recordId, displayName: "Agent", defender: { status: "available" as const, entraAgentIds: [id] },
       purview: { status: "unavailable" as const, mode: "search" as const, presets: [] } };
@@ -113,29 +162,28 @@ describe("agent investigation HTTP wiring", () => {
       expect(response.headers.get("cache-control")).toBe("private, no-store");
       await response.text();
     }
-    for (const method of [defenderHunting.get, defenderHunting.list, defenderHunting.rows, defenderHunting.qualificationEvidence, defenderHunting.retainedScopes]) {
+    for (const method of [defenderHunting.get, defenderHunting.list, defenderHunting.rows]) {
       expect(vi.mocked(method).mock.calls.length).toBeGreaterThan(0);
       for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toEqual({ agentRecordId: recordId });
     }
   });
 
-  it.each(["body", "query"] as const)("forwards %s context through submission, qualification, resume, cancellation, delete and revoke", async location => {
+  it.each(["body", "query"] as const)("forwards %s context through submission, resume, cancellation and delete", async location => {
     const userObjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     for (const [path, method, expected] of [
-      ["jobs", "POST", 202], ["qualifications", "POST", 201], [`qualifications/${id}/start`, "POST", 202],
+      ["jobs", "POST", 202],
       [`jobs/${id}/resume`, "POST", 202], [`jobs/${id}/cancel`, "POST", 200], [`jobs/${id}`, "DELETE", 204],
-      [`retained-scopes/${id}/revoke`, "POST", 200],
     ] as const) {
       const response = await fetch(`${origin}/api/hunting/${path}${location === "query" ? `?agentRecordId=${encodeURIComponent(recordId)}&userObjectId=${userObjectId}` : ""}`, { method,
         headers: { "content-type": "application/json", "x-csrf-token": "test-csrf" },
         body: JSON.stringify({ ...(location === "body" ? { agentRecordId: recordId, userObjectId } : {}),
-          ...(path.includes("revoke") || method === "DELETE" ? { confirmation: id } : { tokenMode: "delegated", filters: {} }) }) });
+          ...(method === "DELETE" ? { confirmation: id } : { tokenMode: "delegated", filters: {} }) }) });
       expect(response.status, path).toBe(expected); await response.text();
     }
-    for (const method of [defenderHunting.submit, defenderHunting.approveQualification]) {
+    for (const method of [defenderHunting.submit]) {
       expect(method).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentRecordId: recordId, userObjectId }));
     }
-    for (const method of [defenderHunting.start, defenderHunting.startQualification, defenderHunting.cancel, defenderHunting.delete, defenderHunting.revokeRetainedScope]) {
+    for (const method of [defenderHunting.start, defenderHunting.cancel, defenderHunting.delete]) {
       for (const args of vi.mocked(method).mock.calls) expect(args.at(-1)).toEqual({ agentRecordId: recordId, userObjectId });
     }
   });
@@ -160,7 +208,7 @@ describe("agent investigation HTTP wiring", () => {
       expect(defenderHunting.submit).not.toHaveBeenCalled();
       expect(context).toHaveBeenCalledOnce();
       expect(purviewAudit.agentRecords).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(user), recordId,
-        { limit: 50, offset: 0 }, expect.any(Function));
+        { limit: 50, offset: 0 }, expect.any(Function), expect.any(Function));
     } finally { context.mockRestore(); }
   });
 });

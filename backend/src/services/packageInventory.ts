@@ -1,4 +1,4 @@
-import { acquireApplicationToken, acquireDelegatedToken, isRetryableIdentityProviderError, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, isRetryableIdentityProviderError, revalidateAuthorizedUser } from "../auth/msal.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { findTenantConfiguration } from "../config.js";
 import { PackageRefreshJobs, type PackageDataScope, type PackageRefreshInput } from "../db/packageRefreshJobs.js";
@@ -19,9 +19,9 @@ import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inv
 import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
 
 type PackageRefreshDependencies = {
-  delegatedToken: typeof acquireDelegatedToken;
+  delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
-  revalidateUser: typeof revalidateAuthenticatedUser;
+  revalidateUser: typeof revalidateAuthorizedUser;
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
@@ -32,9 +32,9 @@ type PackageRefreshDependencies = {
 };
 
 const defaultDependencies: PackageRefreshDependencies = {
-  delegatedToken: acquireDelegatedToken,
+  delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
-  revalidateUser: revalidateAuthenticatedUser,
+  revalidateUser: revalidateAuthorizedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
@@ -712,7 +712,7 @@ function isAuthorizationFailure(error: unknown) {
 
 function isAdmissionPause(error: unknown): error is AppError {
   return error instanceof AppError && !graphResponseDiagnostics(error)
-    && ["maintenance", "provider_requalification_required"].includes(error.code);
+    && error.code === "maintenance";
 }
 
 function syncFailureCode(error: unknown) {

@@ -2,15 +2,14 @@ import type { PurviewAuditRecord } from "./purviewAudit.js";
 import type { PurviewAuditPresetId } from "./purviewAudit.js";
 import type { DefenderHuntingTemplateId } from "./defenderHunting.js";
 
-export type AgentInvestigationReasonCode = "unsupported_agent_type" | "unsupported_identity_crosswalk" | "ambiguous_identity" | "stale_source"
+export type AgentInvestigationReasonCode = "unsupported_identity_crosswalk" | "ambiguous_identity" | "stale_source"
   | "missing_identity_candidate" | "invalid_identity_candidate" | "identity_resolution_required"
-  | "application_identity_unavailable" | "shared_application_identity" | "purview_identity_unavailable"
+  | "purview_identity_unavailable"
   | "identity_resolution_expired" | "identity_authorization_required" | "identity_not_found"
   | "identity_provider_error" | "identity_setup_required";
 
 export type AgentIdentityResolutionOutcome = "resolved" | "authorization_required" | "not_found" | "provider_error" | "setup_required";
 export type AgentIdentityCacheStatus = AgentIdentityResolutionOutcome | "missing" | "expired" | "source_unavailable";
-export type AgentIdentityRuntimeStatus = "available" | "missing" | "shared" | "unverified";
 export const verifiedAgentIdentityClientIdProvenance = "verified-entra-agent-identity-client-id" as const;
 export type AgentIdentityRuntimeProvenance = typeof verifiedAgentIdentityClientIdProvenance;
 export type VerifiedAgentIdentityIds = {
@@ -42,7 +41,7 @@ export type AgentInvestigationContext = {
       cacheStatus?: AgentIdentityCacheStatus;
       lastCheckedAt?: string;
       lastErrorCode?: string;
-      runtimeStatus?: AgentIdentityRuntimeStatus;
+      runtimeStatus?: "available";
       runtimeProvenance?: AgentIdentityRuntimeProvenance;
     };
   };

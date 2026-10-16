@@ -35,7 +35,7 @@ in Purview. See [Microsoft roles](user-roles-and-permissions.md).
 
 When an explicit delegated search or resume completes successfully, the panel refreshes readiness once to display the saved lifecycle evidence without replaying Audit Search. Partial and inconclusive jobs do not claim provider verification. Manual history refresh can retry the readiness read for that completed selection; merely opening saved history does not trigger this lifecycle refresh.
 
-Application mode requires configured application identity/credentials, the application permission, Admin-enabled mode and an approved shared data scope. **Check permissions** does not run application qualification. An Admin selects a window of at most one hour, approves it, then explicitly starts the qualification. Ordinary searches allow up to 168 hours; collection remains bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
+Application mode requires configured identity/credentials, application permission, enabled mode and configured shared scope. An authorized Viewer/Admin submits an ordinary search directly; no prior approval query is required. Searches allow up to 168 hours, bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
 
 `PurviewAuditView` accepts `active?: boolean` (default `true`) for visited tabs that stay mounted. While inactive it renders no content, stops saved-history polling and aborts its owned reads/actions. Form fields and selected-job state are retained in memory for the same account, roles, selected UPN and meaningful capability access/configuration state. Capability timestamp, freshness and verification-only renewals do not remount the form.
 
@@ -43,7 +43,7 @@ On return, the tab reloads the catalog and scoped history, revalidates the exact
 
 Editing draft filters clears the selected results and cancels that selection's pending exact-job or record read, including revalidation on tab return, manual refresh or polling. Independent catalog/history reads and already admitted saved-job commands continue; a retired selection response cannot clear their state or leave the history loading indicator stuck.
 
-Capability responses include the application configuration revision as part of the saved-data authority. A revision change retires prior records, approvals and in-flight commands even when enablement, shared-scope flags and readiness remain unchanged. Diagnostic-only updates still preserve the current view. Manual history refresh hides selected results during revalidation, then preserves the loaded page when the authorized job ID and saved version are unchanged; a different version requires loading current minimized results.
+Capability responses include the application configuration revision in saved-data authority. A revision change retires prior records and in-flight commands even when enablement, shared-scope flags and readiness remain unchanged. Diagnostic-only updates preserve the current view. Manual history refresh hides selected results during revalidation, preserving a loaded page only when the authorized job ID and saved version are unchanged.
 
 Saved record reads share pending requests only for the same authorized job, saved version and page. A reader that has observed a newer job version cannot join an older reader's pending record request. Exact-job and record responses also update the corresponding history row, so its status and actions use the newly observed evidence without another history request. If export, resume, cancellation or local deletion reports that the job is missing, its application scope changed, or its saved state no longer permits the command, the panel withdraws its saved evidence and actions. Explicit history refresh revalidates availability without replaying the failed command; transient command failures and provider-consent failures do not by themselves invalidate authorized saved records.
 
@@ -87,9 +87,9 @@ The Copilot references have a casing gap: older schema XML names the message ide
 
 ## Authorization And Eligibility
 
-- Viewer and Admin with current or safely read-through-refreshed capability readiness may directly submit their own bounded delegated search and access, export, cancel, or locally delete only results authorized for their principal. The actual successful search establishes delegated principal provider evidence; there is no preceding qualification approval/start ritual. Explicit delegated qualification APIs may remain optional but are not prerequisites. Application-mode qualification and shared-scope controls require `AgentControl.Admin`; Admin inherits the delegated Viewer workflow.
+- Viewer and Admin may submit bounded searches under current real authorization and read/export only locally authorized results. Job resume/cancel/delete retain authorizing-principal ownership. No preceding qualification or approval endpoint is part of the workflow.
 - Delegated mode is private to the authorizing principal and requires that user to hold the Purview **Audit Logs** or **View-Only Audit Logs** role.
-- Application mode is separately disabled by default. It requires explicit Admin enablement, approved shared data scope and application permission qualification; it does not convert delegated results into tenant-shared data and is never an automatic fallback. Delegated-only deployments keep it disabled.
+- Application mode requires current tenant/client credentials, enabled configuration, application permission and configured shared scope. An authorized Viewer may submit shared reads. It neither converts private delegated results into shared data nor provides automatic fallback authority.
 - Both modes use `AuditLogsQuery.Read.All`. Personal Microsoft accounts and non-global clouds are unsupported by this implementation.
 - Microsoft Purview licensing, unified audit logging, workload support, retention, service limits and tenant rollout independently control whether a query can run and what it can observe.
 
@@ -108,7 +108,7 @@ The UI exposes two code-owned presets:
 - **Copilot interactions:** service `Copilot`, record type `copilotInteraction`, operation `CopilotInteraction`.
 - **Copilot Studio administration:** service `PowerPlatform`, record type `powerPlatformAdministratorActivity`, and explicit bot, bot-component, AI-plugin-operation and environment-variable create/update/delete or publish/share/auth/name/icon operations.
 
-Users may narrow a preset with exact UTC start/end times, user principal names, IP addresses, object IDs and administrative-unit UUIDs. Each identity-filter array accepts at most 20 unique validated values; UPNs are whitespace-free exact values of at most 320 characters, matching user-scoped saved history. Delegated searches cover at most the most recent seven days. A separately configured application/shared qualification remains bounded to at most one hour.
+Users may narrow a preset with exact UTC start/end times, user principal names, IP addresses, object IDs and administrative-unit UUIDs. Each identity-filter array accepts at most 20 unique validated values; UPNs are whitespace-free exact values of at most 320 characters. Searches cover at most the most recent seven days.
 
 | Boundary | Limit |
 | --- | --- |
@@ -127,7 +127,7 @@ Fetch and retry waits are raced against finite deadlines even when their impleme
 
 The initiating session and capability generations are checked synchronously immediately before each physical request and after awaited admission, transport, body and retry work, including rejections. Result persistence rechecks that same authority immediately before transaction commit. Saved JSON and CSV release are likewise fenced after awaited reads and auditing; a replacement session cannot adopt stale work.
 
-Job submission and qualification approval also retain the initiating session/capability authority and recheck it with provider admissions immediately before committing. Logout, replacement sign-in, configuration changes or closed admissions during persistence roll back the write rather than leaving a stale job or approval.
+Job submission retains initiating session/capability authority and rechecks provider admission immediately before commit. Logout, replacement sign-in, configuration changes or actual maintenance during persistence roll back stale work.
 
 ### Exact subject binding
 
@@ -148,7 +148,7 @@ User-on-agent searches intersect both filters. Bot IDs are not sent as
 Unsupported log types remain unavailable rather than running broader searches.
 Current authorized inventory remains usable while a replacement sync is running.
 
-Agent-specific saved reads revalidate the exact source revision as well as bot/environment after their content-free audit receipt and current retained-scope checks. Replacing the source, even with the same bot/environment, withdraws the in-flight result instead of releasing stale agent evidence. These reads do not acquire provider tokens or start a search.
+Agent-specific saved reads revalidate exact source revision, bot/environment and current result visibility after their content-free audit receipt. Source replacement, even with the same bot/environment, withdraws stale in-flight evidence. Reads obtain no provider token and start no search.
 
 Identity reads reselect the authorized snapshots after loading and verifying candidates, and check expiry again before returning them. Replacement, withdrawal, newly selected resource types or expiry during the read returns `snapshot_invalidated` rather than a stale exact association; retry against refreshed inventory.
 
@@ -166,17 +166,15 @@ Purview query or prove that a query will return records.
 Search jobs support status, paging, export, cancellation, and local deletion.
 Closing the browser does not cancel an accepted Microsoft query.
 
-Qualification approval must remain unexpired at physical dispatch, after asynchronous authorization checks, and through result and capability-evidence persistence. Expiry withdraws the activation without publishing or qualifying stale evidence, marks unfinished work `inconclusive` with `qualification_expired`, and requires new approval rather than repeatedly offering resume. If persisting that terminal expiry state fails, the worker propagates the persistence error rather than treating the qualification deadline's abort as lost authorization; actual authorization revocation and caller cancellation retain their existing handling. Previously published results remain subject to their separate saved-data scope and retention.
-
 Cancel stops local polling/download and records that Microsoft Graph may continue the remote query. Delete removes only a non-running local job and its cached rows. A rejected cancel or delete does not interrupt the active worker. The selected Microsoft contract exposes no remote cancel or delete operation, so the product never claims either action changes the provider query or source events. Failed and inconclusive local jobs report possible remote continuation from the attempted request and last provider status, not from the local failure category.
 
 Cancel and local delete retain the initiating account and capability-generation authority through transaction commit. A superseded account or changed saved-data scope cannot commit either command. These saved-only commands remain available while provider admissions are closed and do not acquire tokens or require live provider readiness.
 
 Waiting-for-authorization jobs can also be cancelled directly from history without resuming a provider request or deleting the recovery record. If the 48-hour execution deadline expires during collection or bounded publication authorization, an owned, still-retained result is saved as `partial` with `audit_job_expired`; even a fully downloaded result cannot qualify the capability after that deadline. Cancellation/recovery ownership fences and the separate 30-day local-cache expiry still prohibit stale publication.
 
-The durable deadline is rechecked after request accounting and after final job/qualification writes. Accounting that crosses it rolls back before dispatch; finalization that crosses it preserves retained rows as partial and downgrades qualification rather than committing complete evidence. Crossing the separate cache expiry rolls publication back.
+The durable deadline is rechecked after request accounting and final job writes. Accounting that crosses it rolls back before dispatch; finalization preserves retained rows as partial rather than claiming complete evidence. Crossing the separate cache expiry rolls publication back.
 
-Jobs and dependent records expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive, preserving whether an attempted remote create may continue. Separately configured application/shared qualification approval expires after one day; detached expired qualification history is removed after the additional finite cleanup window. Delegated searches have no preceding qualification approval record. View/export audit expires under the ordinary 90-day local audit policy. Microsoft source-event retention and any remote query lifetime are separate provider policies and are never inferred from local expiry.
+Jobs/results expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive while preserving whether remote work may continue. View/export audit follows the ordinary 90-day policy. Microsoft source-event retention and remote query lifetime remain separate provider policies; local expiry does not establish either.
 
 | Problem | Check |
 | --- | --- |

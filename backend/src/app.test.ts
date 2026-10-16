@@ -63,20 +63,50 @@ const authFixture = vi.hoisted(() => ({
   pendingRevalidation: undefined as Promise<unknown> | undefined,
   revalidationStarted: 0,
   redemptions: 0,
+  users: new Map<string, { tenantId: string; homeAccountId: string; displayName: string; username: string; roles: string[] }>(),
 }));
 const inventoryProviderFixture = vi.hoisted(() => ({ queries: 0 }));
 vi.mock("./auth/msal.js", async original => {
   const actual = await original<typeof import("./auth/msal.js")>();
+  const acquire = vi.fn(async () => "fixture-token");
+  const revalidate = vi.fn(async (_tenantId: string, _principalId: string) => {
+    authFixture.revalidationStarted += 1;
+    if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation;
+    const user = authFixture.revalidatedUser;
+    return { ...user, roles: [...user.roles] };
+  });
+  const account = (tenantId: string, principalId: string) => ({
+    tenantId, homeAccountId: principalId, localAccountId: principalId,
+    environment: "login.microsoftonline.com", username: `${principalId}@example.invalid`,
+    idTokenClaims: { tid: tenantId, oid: principalId },
+  });
+  const result = (user: typeof authFixture.user, scopes: string[], accessToken = "fixture-token") => ({
+    authority: `https://login.microsoftonline.com/${user.tenantId}`, uniqueId: user.homeAccountId, tenantId: user.tenantId,
+    account: account(user.tenantId, user.homeAccountId), idToken: "synthetic-identity", idTokenClaims: { tid: user.tenantId, oid: user.homeAccountId },
+    scopes, accessToken, expiresOn: new Date(Date.now() + 3_600_000), fromCache: false, tokenType: "Bearer", correlationId: "",
+    syntheticUser: user,
+  });
   return {
   ...actual,
-  acquireDelegatedToken: vi.fn(async () => "fixture-token"),
+  getMsalClient: (tenantId: string) => ({ getTokenCache: () => ({ getAccountByHomeId: async (principalId: string) => account(tenantId, principalId) }) }),
+  acquireDelegatedToken: acquire,
+  acquireDelegatedTokenResult: async (tenantId: string, principalId: string, capabilityId: Parameters<typeof actual.capabilityScopes>[0]) =>
+    result(authFixture.users.get(`${tenantId}:${principalId}`) ?? { ...authFixture.user, tenantId, homeAccountId: principalId },
+      actual.capabilityScopes(capabilityId), await acquire()),
+  revalidateAuthenticatedUserResult: async (tenantId: string, principalId: string) => {
+    const user = await revalidate(tenantId, principalId);
+    return result(user.homeAccountId === principalId ? user : authFixture.users.get(`${tenantId}:${principalId}`) ?? user, ["openid", "profile"]);
+  },
   acquireApplicationToken: vi.fn(async () => "fixture-application-token"),
   createAuthFlow: (kind:"login", options:Parameters<typeof actual.createAuthFlow>[1]) => ({
     ...actual.createAuthFlow(kind, options),state:"fixture-state______________________________",nonce:"fixture-nonce".padEnd(43, "_"),codeVerifier:"fixture-verifier".padEnd(43, "_"),
   }),
   createAuthorizationUrl: async () => "https://login.microsoftonline.com/fixture", redeemAuthorizationCode: async () => { authFixture.redemptions += 1; return {}; },
-  toAuthenticatedUser: () => ({...authFixture.user,roles:[...authFixture.user.roles]}),
-  evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
+  toAuthenticatedUser: (value?: { syntheticUser?: typeof authFixture.user }) => {
+    const user = value?.syntheticUser ?? authFixture.user;
+    return { ...user, roles: [...user.roles] };
+  },
+  evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: revalidate,
 }; });
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
   checkProgress: vi.fn(() => null),
@@ -84,10 +114,8 @@ vi.mock("./services/capabilities.js", () => ({ capabilities: {
   observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
   requireAvailable: vi.fn(async () => undefined), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: huntingCapabilityFixture.applicationRevision })), invalidatePrincipal: vi.fn(async () => undefined), list: vi.fn(async () => []), check: vi.fn(async () => []), refresh: vi.fn(), configureApplication: vi.fn(),
   packageQualificationIdentity: vi.fn(async (action: string) => ({ capabilityId: action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage", contractRevision: "a".repeat(64), configurationRevision: 1, authMode: "delegated" })),
-  auditQualificationContext: vi.fn(async (capabilityId: string) => ({ capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
-  recordAuditQualificationEvidence: vi.fn(async () => ({ authorized: true })),
-  huntingQualificationContext: vi.fn(async (capabilityId: string) => ({ capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: capabilityId.endsWith(".application") ? huntingCapabilityFixture.applicationRevision : 1 })),
-  recordHuntingQualificationEvidence: vi.fn(async () => ({ authorized: true })),
+  recordAuditProviderEvidence: vi.fn(async () => ({ authorized: true })),
+  recordHuntingProviderEvidence: vi.fn(async () => ({ authorized: true })),
   quarantineAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
   quarantineApprovalAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
 } }));
@@ -157,7 +185,9 @@ function signedSessionCookie(sid: string) {
 }
 async function roleCookie(principalId: string, roles: AppRole[], rolesValidatedAt = Date.now(), tenant = config.tenants[0]) {
   const sid=randomUUID();
-  await new Promise<void>((resolve,reject) => application.store.set(sid,{cookie:new session.Cookie({maxAge:60000}),tenantId:tenant.tenantId,clientId:tenant.clientId,accountId:principalId,csrfToken,rolesValidatedAt,user:{tenantId:tenant.tenantId,homeAccountId:principalId,username:`${principalId}@${tenant.domains[0]}`,displayName:principalId,roles}},error => error ? reject(error) : resolve()));
+  authFixture.users.set(`${tenant.tenantId}:${principalId}`, { tenantId: tenant.tenantId, homeAccountId: principalId,
+    username: `${principalId}@${tenant.domains[0]}`, displayName: principalId, roles });
+  await new Promise<void>((resolve,reject) => application.store.set(sid,{cookie:new session.Cookie({maxAge:60000}),tenantId:tenant.tenantId,clientId:tenant.clientId,accountId:principalId,csrfToken,signedInAt:Date.now(),rolesValidatedAt,user:{tenantId:tenant.tenantId,homeAccountId:principalId,username:`${principalId}@${tenant.domains[0]}`,displayName:principalId,roles}},error => error ? reject(error) : resolve()));
   return signedSessionCookie(sid);
 }
 async function publishPackageSnapshot(principalId: string, requestedIds?: string[], tenantId = config.tenants[0].tenantId,
@@ -261,7 +291,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(await result.json()).toEqual(responseBody);
       expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
         homeAccountId: "automatic-viewer", tenantId: config.tenants[0].tenantId, roles: ["AgentControl.Viewer"],
-      }), undefined);
+      }), expect.any(Number));
       for (const body of [{ tenantId: "other" }, { principalId: "other" }, { signedInAt: Date.now() }, { clearSavedData: true }, { sources: ["usage_reports"] }, { mode: "full" }]) {
         expect((await send(body)).status).toBe(400);
       }
@@ -599,23 +629,7 @@ describe.sequential("packaged API/session contracts", () => {
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
     const filters = { templateId: "agents_inventory" as const, startDateTime: "2026-09-09T10:00:00.000Z", endDateTime: "2026-09-09T11:00:00.000Z",
       agentIds: ["@defender-agent"], blueprintIds: [], actorObjectIds: [], operations: [] };
-    const authority = { capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64),
-      permissionRevision: "b".repeat(64), configurationRevision: 1 };
-    const qualificationJob = await repository.submit(scope, { idempotencyKey: "defender-hunting-qualification-http", filters,
-      qualification: { ...authority, approvedBy: principalId } });
-    const qualificationExecution = await repository.begin(scope, qualificationJob.id);
-    await repository.publish(scope, qualificationJob.id, qualificationExecution, { rows: [{
-      projectionVersion: 3, sourceTable: "AgentsInfo", observationTime: "2026-09-09T10:30:00.000Z", agentId: "@defender-agent",
-      agentName: "=Formula agent", platform: "CopilotStudio", agentDescription: null, version: null, sourceAgentId: null,
-      entraAgentObjectId: "11111111-1111-4111-8111-111111111111", entraBlueprintId: "22222222-2222-4222-8222-222222222222",
-      observabilityId: null, publishedStatus: "Published", lifecycleStatus: "Active", availability: null, createdDateTime: null,
-      lastPublishedDateTime: null, lastUpdatedDateTime: null, instanceCount: 1, model: null, ownerCount: 1, sharedWithCount: 0,
-      permissionMetadataKeyCount: 2, authenticationMetadataKeyCount: 1,
-      detailStates: { owners: "present_unqualified_shape", sharing: "present_unqualified_shape", permissions: "present_unqualified_shape",
-        authentication: "present_unqualified_shape", risk: "not_exposed" },
-    }], providerRowCount: 1, storedRowCount: 1, byteCount: 1024, complete: true, partialReason: null });
-    const retainedScope = await repository.requireQualifiedScope(scope, filters, authority);
-    const job = await repository.submit(scope, { idempotencyKey: "defender-hunting-http", filters, retainedScope });
+    const job = await repository.submit(scope, { idempotencyKey: "defender-hunting-http", filters });
     const execution = await repository.begin(scope, job.id);
     await repository.authorizeProviderRequest(scope, job.id, execution);
     await repository.recordProviderResponse(scope, job.id, execution, "defender-provider-http");
@@ -629,7 +643,7 @@ describe.sequential("packaged API/session contracts", () => {
       detailStates: { owners: "present_unqualified_shape", sharing: "present_unqualified_shape", permissions: "present_unqualified_shape",
         authentication: "present_unqualified_shape", risk: "not_exposed" },
     }], providerRowCount: 1, storedRowCount: 1, byteCount: 1024, complete: true, partialReason: null });
-    const pending = await repository.submit(scope, { idempotencyKey: "defender-hunting-cancel-http", filters, retainedScope });
+    const pending = await repository.submit(scope, { idempotencyKey: "defender-hunting-cancel-http", filters });
     const beforeNavigation = await repository.getJob(scope, job.id);
 
     try {
@@ -637,17 +651,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect(catalog.status).toBe(200);
       expect(catalog.headers.get("cache-control")).toContain("no-store");
       const catalogBody = await catalog.json();
-      expect(catalogBody).toMatchObject({ templates: expect.arrayContaining([expect.objectContaining({ id: "agents_inventory", sourceTable: "AgentsInfo" })]),
-        qualifications: [expect.objectContaining({ capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", queryVersion: 3, approvedBy: principalId })],
-        retainedScopes: [expect.objectContaining({ id: retainedScope.id, tokenMode: "delegated", queryVersion: 3, approvedBy: principalId })] });
+      expect(catalogBody).toMatchObject({ templates: expect.arrayContaining([expect.objectContaining({ id: "agents_inventory", sourceTable: "AgentsInfo" })]) });
       expect(catalogBody).not.toHaveProperty("workspaceId");
       expect(catalogBody.templates.every((template: Record<string, unknown>) => !("workspaceId" in template))).toBe(true);
-      await fixture.operator.query("UPDATE defender_hunting_qualification_evidence SET expires_at=clock_timestamp()-interval '1 second' WHERE qualified_job_id=$1", [qualificationJob.id]);
       const tokenCalls = vi.mocked(acquireDelegatedToken).mock.calls.length;
       const history = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: securityCookie } });
       expect(history.status).toBe(200);
       expect(history.headers.get("cache-control")).toContain("no-store");
-      await expect(history.json()).resolves.toMatchObject({ count: 3, limit: 10, offset: 0 });
+      await expect(history.json()).resolves.toMatchObject({ count: 2, limit: 10, offset: 0 });
       expect((await repository.getJob(scope, job.id))?.providerRequestCount).toBe(beforeNavigation?.providerRequestCount);
       expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: readerCookie } })).status).toBe(404);
       expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(404);
@@ -675,24 +686,12 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await request(`/api/hunting/jobs/${pending.id}`, { method: "DELETE", headers: { Cookie: securityCookie, "Content-Type": "application/json" },
         body: JSON.stringify({ confirmation: pending.id }) })).status).toBe(204);
       await retain(fixture.operator);
-      expect((await fixture.operator.query("SELECT count(*)::int AS count FROM defender_hunting_qualification_evidence WHERE qualified_job_id=$1", [qualificationJob.id])).rows[0].count).toBe(0);
-      expect((await fixture.operator.query("SELECT count(*)::int AS count FROM defender_hunting_retained_scopes WHERE id=$1", [retainedScope.id])).rows[0].count).toBe(1);
       expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: securityCookie } })).status).toBe(200);
       expect((await request(`/api/hunting/jobs/${job.id}/export.csv`, { headers: { Cookie: securityCookie } })).status).toBe(200);
       const retainedHistory = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: securityCookie } });
-      await expect(retainedHistory.json()).resolves.toMatchObject({ count: 2 });
+      await expect(retainedHistory.json()).resolves.toMatchObject({ count: 1 });
       expect((await request("/api/hunting/jobs", { method: "POST", headers: { Cookie: securityCookie, "Content-Type": "application/json" },
         body: JSON.stringify({ tokenMode: "delegated", filters: { ...filters, Query: "CloudAppEvents" } }) })).status).toBe(400);
-      expect((await request("/api/hunting/qualifications", { method: "POST", headers: { Cookie: securityCookie, "Content-Type": "application/json" },
-        body: JSON.stringify({ tokenMode: "delegated", filters: { ...filters, Query: "CloudAppEvents" } }) })).status).toBe(400);
-      expect((await request("/api/hunting/qualifications/44444444-4444-4444-8444-444444444444/start", { method: "POST", headers: { Cookie: securityCookie } })).status).toBe(404);
-
-      expect((await request(`/api/hunting/retained-scopes/${retainedScope.id}/revoke`, { method: "POST", headers: { Cookie: securityCookie, "Content-Type": "application/json" },
-        body: JSON.stringify({ confirmation: retainedScope.id }) })).status).toBe(200);
-      const hiddenHistory = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: securityCookie } });
-      await expect(hiddenHistory.json()).resolves.toMatchObject({ count: 0, value: [] });
-      expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: securityCookie } })).status).toBe(404);
-      expect((await request(`/api/hunting/jobs/${job.id}/export.csv`, { headers: { Cookie: securityCookie } })).status).toBe(404);
       expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM defender_hunting_rows WHERE snapshot_id=$1", [beforeNavigation!.snapshotId])).rows[0].count).toBe(1);
 
       const configuration = await fixture.operator.query<{ revision: string }>(`INSERT INTO capability_configuration
@@ -705,22 +704,13 @@ describe.sequential("packaged API/session contracts", () => {
       const applicationScope = { tenantId: config.tenants[0].tenantId!, authorizationPrincipalId: principalId,
         resultScope: { kind: "application" as const, scopeId: config.tenants[0].clientId!, configurationRevision: huntingCapabilityFixture.applicationRevision },
         tokenMode: "application" as const };
-      const applicationAuthority = { capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: huntingCapabilityFixture.applicationRevision };
-      const applicationQualification = await repository.submit(applicationScope, { idempotencyKey: "defender-application-qualification-http", filters,
-        qualification: { ...applicationAuthority, approvedBy: principalId } });
-      const applicationQualificationExecution = await repository.begin(applicationScope, applicationQualification.id);
       const { association: _association, ...applicationRow } = savedBody.value[0];
-      await repository.publish(applicationScope, applicationQualification.id, applicationQualificationExecution,
-        { rows: [applicationRow], providerRowCount: 1, storedRowCount: 1, byteCount: 1024, complete: true, partialReason: null });
-      const applicationRetainedScope = await repository.requireQualifiedScope(applicationScope, filters, applicationAuthority);
-      const applicationJob = await repository.submit(applicationScope, { idempotencyKey: "defender-application-http", filters,
-        retainedScope: applicationRetainedScope });
+      const applicationJob = await repository.submit(applicationScope, { idempotencyKey: "defender-application-http", filters });
       const applicationExecution = await repository.begin(applicationScope, applicationJob.id);
       await repository.publish(applicationScope, applicationJob.id, applicationExecution,
         { rows: [applicationRow], providerRowCount: 1, storedRowCount: 1, byteCount: 1024, complete: true, partialReason: null });
       const sharedHistory = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: otherCookie } });
-      await expect(sharedHistory.json()).resolves.toMatchObject({ count: 2 });
+      await expect(sharedHistory.json()).resolves.toMatchObject({ count: 1 });
       expect((await request(`/api/hunting/jobs/${applicationJob.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(200);
 
       const changedConfiguration = await fixture.operator.query<{ revision: string }>(`UPDATE capability_configuration
@@ -734,7 +724,6 @@ describe.sequential("packaged API/session contracts", () => {
       const auditRows = (await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action LIKE '%hunting%' ORDER BY action,observed_at", [config.tenants[0].tenantId, principalId])).rows;
       expect(auditRows).toEqual(expect.arrayContaining([
         { action: "cancel-hunting", status: "succeeded", metadata: { source: "microsoft_defender_hunting" } },
-        { action: "revoke-hunting-scope", status: "succeeded", metadata: { source: "microsoft_defender_hunting" } },
         { action: "export-hunting", status: "succeeded", metadata: {
           source: "microsoft_defender_hunting", jobId: job.id, resultingCount: 1, resultingBytes: expect.any(Number),
         } },
@@ -746,11 +735,11 @@ describe.sequential("packaged API/session contracts", () => {
       cookie = previousCookie;
     }
   });
-  it("accepts unqualified delegated hunting without bypassing worker authorization or application scope", async () => {
+  it.each(["delegated", "application"] as const)("accepts direct %s hunting without bypassing worker authorization", async tokenMode => {
     const previousUser = authFixture.revalidatedUser;
     const previousCsrf = csrfToken;
     csrfToken = "delegated-hunting-fixture-csrf";
-    const principalId = "unqualified-delegated-hunting-viewer";
+    const principalId = `direct-${tokenMode}-hunting-viewer`;
     const filters = {
       templateId: "agents_inventory",
       startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(),
@@ -764,25 +753,18 @@ describe.sequential("packaged API/session contracts", () => {
     authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: principalId, roles: ["AgentControl.Viewer"] };
     try {
       const viewerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-      const application = await request("/api/hunting/jobs", {
-        method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
-        body: JSON.stringify({ tokenMode: "application", filters }),
-      });
-      expect(application.status).toBe(403);
-      await expect(application.json()).resolves.toMatchObject({ code: "hunting_scope_unqualified" });
-
       const response = await request("/api/hunting/jobs", {
         method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
-        body: JSON.stringify({ tokenMode: "delegated", filters }),
+        body: JSON.stringify({ tokenMode, filters }),
       });
       expect(response.status).toBe(202);
       const job = await response.json();
       assert(job !== null && typeof job === "object" && "id" in job && typeof job.id === "string");
       expect(job).toMatchObject({
-        authorizationPrincipalId: principalId, tokenMode: "delegated",
-        resultScope: { kind: "principal", scopeId: principalId },
+        authorizationPrincipalId: principalId, tokenMode,
+        resultScope: tokenMode === "delegated" ? { kind: "principal", scopeId: principalId }
+          : { kind: "application", scopeId: config.tenants[0].clientId, configurationRevision: huntingCapabilityFixture.applicationRevision },
         status: "running", activationCount: 1, providerRequestCount: 0,
-        qualification: null, retainedScopeId: null,
       });
       await vi.waitFor(() => expect(vi.mocked(revalidateAuthenticatedUser).mock.calls.slice(revalidationCalls)
         .filter(([, accountId]) => accountId === principalId)).toHaveLength(1));
@@ -1597,7 +1579,7 @@ describe.sequential("packaged API/session contracts", () => {
       cookie = originalCookie;
     }
   });
-  it("returns a durable waiting inventory job when token acquisition fails after submission", async () => {
+  it("preserves waiting inventory admission after provider authorization loss and allows a fresh saved-status request", async () => {
     const principalId="inventory-token-loss";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:principalId,displayName:"Inventory token loss",username:"inventory-token-loss@example.invalid",roles:["AgentControl.Viewer"]};
@@ -1605,12 +1587,16 @@ describe.sequential("packaged API/session contracts", () => {
     vi.mocked(acquireDelegatedToken).mockRejectedValueOnce(new AppError(401,"interaction_required","Interactive authorization is required."));
     try {
       const response=await request("/api/inventory/refresh-jobs",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({types:["microsoft.copilotstudio/agents"],environmentId:"environment-a"})});
-      expect(response.status).toBe(202);
-      const job=await response.json();
-      expect(job).toMatchObject({status:"waiting_authorization",environmentScope:"environment-a",requestedTypes:["microsoft.copilotstudio/agents"],snapshotId:null});
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({code:"authorization_required"});
       expect(inventoryProviderFixture.queries).toBe(0);
-      const persisted=await new PowerPlatformRefreshJobs(fixture.runtime).getJob({tenantId:config.tenants[0].tenantId!,principalId},job.id);
-      expect(persisted).toMatchObject({status:"waiting_authorization",snapshotId:null});
+      const persisted=await new PowerPlatformRefreshJobs(fixture.runtime).listJobs({tenantId:config.tenants[0].tenantId!,principalId});
+      expect(persisted.value).toHaveLength(1);
+      expect(persisted.value[0]).toMatchObject({status:"waiting_authorization",environmentScope:"environment-a",requestedTypes:["microsoft.copilotstudio/agents"],snapshotId:null});
+      const status = await request(`/api/inventory/refresh-jobs/${persisted.value[0].id}`,{headers:{Cookie:readerCookie}});
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({status:"waiting_authorization",snapshotId:null});
+      expect(inventoryProviderFixture.queries).toBe(0);
     } finally {
       authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
     }
@@ -2235,15 +2221,15 @@ describe.sequential("packaged API/session contracts", () => {
       expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: true, providerWorkEnabled: false });
     } finally { vi.unstubAllEnvs(); }
     try {
-      await fixture.operator.query("UPDATE operational_state SET mode='maintenance',provider_work_enabled=true");
+      await fixture.operator.query("UPDATE operational_state SET mode='maintenance'");
       expect((await request("/api/ready")).status).toBe(503);
       expect((await request("/api/health")).status).toBe(200);
       expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: true, providerWorkEnabled: false });
-      await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=false");
+      await fixture.operator.query("UPDATE operational_state SET mode='normal'");
       expect((await request("/api/ready")).status).toBe(200);
-      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: false, providerWorkEnabled: false });
+      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: false, providerWorkEnabled: true });
     } finally {
-      await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=true");
+      await fixture.operator.query("UPDATE operational_state SET mode='normal'");
     }
     await fixture.operator.query("UPDATE app_schema SET fingerprint=$1 WHERE singleton", ["0".repeat(64)]);
     try {

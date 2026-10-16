@@ -12,6 +12,14 @@ export function evidenceIsFresh(view: CapabilityView, now = Date.now()) {
   return providerEvidenceIsFresh(view, now);
 }
 
+export function queryReadAllowed(view: CapabilityView | undefined) {
+  return Boolean(view && view.enabled && view.definition.probe.adapterRegistered
+    && view.definition.probe.kind === "on_demand"
+    && (view.definition.dataClass === "hunting" || view.definition.dataClass === "provider_audit")
+    && (view.definition.mode === "delegated"
+      || view.definition.mode === "application" && view.configuration?.sharedDataScope === true));
+}
+
 export function providerActionAllowed(view: CapabilityView | undefined, _write?: boolean, now = Date.now()) {
   if (!view || !hasCurrentAuthorization(view)) return false;
   if (view.decision.verification === "on_demand") return isOnDemandDecision(view);
@@ -20,19 +28,23 @@ export function providerActionAllowed(view: CapabilityView | undefined, _write?:
   const checkedAt = Date.parse(decision.checkedAt ?? "");
   const expiresAt = Date.parse(decision.expiresAt ?? "");
   // Expired diagnostics are not a revoked grant. Submitted operations enforce current authorization.
-  return definition.mode === "delegated" && (decision.verification === "provider" || decision.verification === "token")
+  return (definition.mode === "delegated" || definition.mode === "application"
+    && definition.probe.kind === "on_demand" && view.configuration?.sharedDataScope === true)
+    && (decision.verification === "provider" || decision.verification === "token")
     && Number.isFinite(checkedAt) && checkedAt <= now && expiresAt > checkedAt && expiresAt <= now;
 }
 
 function hasCurrentAuthorization(view: CapabilityView) {
   return view.definition.probe.adapterRegistered && view.decision.capabilityId === view.definition.id
-    && capabilityModeEnabled(view) && view.decision.authorized && view.decision.status === "available";
+    && capabilityModeEnabled(view) && view.decision.authorized && view.decision.status === "available"
+    && (view.definition.mode !== "application" || view.configuration?.sharedDataScope === true);
 }
 
 function isOnDemandDecision(view: CapabilityView) {
   const { definition, decision } = view;
   return definition.probe.kind === "on_demand"
-    && definition.mode === "delegated" && definition.probe.adapterRegistered
+    && (definition.mode === "delegated" || definition.mode === "application" && view.configuration?.sharedDataScope === true)
+    && definition.probe.adapterRegistered
     && decision.capabilityId === definition.id
     && decision.status === "available" && decision.authorized === true && decision.fresh === true
     && decision.verification === "on_demand" && decision.previewQualification === "not_required"
@@ -40,7 +52,7 @@ function isOnDemandDecision(view: CapabilityView) {
 }
 
 export function capabilityModeEnabled(view: CapabilityView) {
-  return view.definition.mode !== "application" || (view.enabled ?? view.configuration?.enabled ?? true);
+  return view.enabled;
 }
 
 export function evidenceIsStale(view: CapabilityView, now = Date.now()) {
@@ -65,20 +77,14 @@ export function currentVerification(view: CapabilityView, now = Date.now()) {
 
 export function operationAccessLabel(view: CapabilityView, now = Date.now()) {
   const { definition } = view;
+  if (currentVerification(view, now) === "provider") return "Bounded provider operation succeeded";
   if (definition.probe.kind === "on_demand") return "Microsoft validates permission when the operation is requested";
-  if (definition.probe.kind === "live_qualification") {
-    return currentVerification(view, now) === "provider"
-      ? "Bounded provider operation succeeded"
-      : definition.mode === "application"
-        ? "Requires an explicitly approved bounded application-scope operation"
-        : "Provider access is checked by an explicit bounded operation; no separate pre-approval required";
-  }
   return "No separate operation check";
 }
 
 function capabilityCheckGuidance(view: CapabilityView) {
   if (view.definition.mode === "application") {
-    return "Use an explicitly approved bounded application-scope operation to check access. Check status does not run application checks.";
+    return "Request the operation from its feature. Microsoft validates the configured application identity when it runs.";
   }
   if (supportsAutomaticCapabilityCheck(view.definition.id)) return "Use Check status to retry.";
   if (view.definition.probe.kind === "on_demand") return "Request the read from the dashboard; Check status does not run this capability.";
@@ -106,9 +112,7 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
     case "missing_license": return `Requires ${definition.licenses.join(" or ") || "the documented service license"}.`;
     case "not_configured": return `Requires ${definition.configuration.join("; ") || "provider configuration"}.`;
     case "unsupported": return `Unsupported endpoint, resource, or cloud. Required cloud: ${definition.cloud}.`;
-    case "preview_disabled": return definition.probe.kind === "live_qualification"
-          ? `${operationAccessLabel(view, now)}. A token check alone does not establish provider access.`
-          : "This capability is not currently available. Review the returned reason and remediation.";
+    case "preview_disabled": return "This capability is not currently available. Review the returned reason and remediation.";
     case "provider_error":
       if (decision.evidence?.category === "provider_timeout") {
         const stage = decision.evidence.phase === "token_acquisition" ? "Microsoft token acquisition" : "The bounded provider check";
@@ -119,8 +123,8 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
       if (decision.evidence?.category === "provider_throttled") return "The provider throttled the check. Wait until the current evidence cooldown expires before retrying; changing permissions will not resolve throttling.";
       return "The latest capability check failed. Permission, role, and license causes are not established; authorized saved data remains readable.";
     case "unknown": return evidenceIsStale(view, now) ? staleExplanation(view)
-      : definition.probe.kind === "live_qualification" && definition.mode === "application"
-        ? "Provider operation access is not currently verified. An Admin must explicitly approve a bounded application-scope operation; automatic refresh does not run it."
+      : definition.probe.kind === "on_demand"
+        ? "Ready to request. Microsoft validates current permissions and provider access when the operation runs."
       : decision.checkedAt ? "The check did not establish availability. Review the evidence and remediation; authorized saved data remains readable."
         : supportsAutomaticCapabilityCheck(definition.id)
           ? "Not checked yet. Use Check status to check access."
@@ -129,7 +133,7 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
       if (!decision.authorized) return "Current authorization is not established. Previous successful checks do not grant access.";
       if (currentVerification(view, now) === "on_demand") {
         const confirmation = definition.dataClass === "package_control" ? " Review and confirm the exact targets before submitting a change." : "";
-        return `Ready to try. Microsoft validates delegated permissions and provider roles on the actual operation.${confirmation}`;
+        return `Ready to try. Microsoft validates ${definition.mode} permissions and provider roles on the actual operation.${confirmation}`;
       }
       if (definition.mode !== "local" && !decision.checkedAt) return "Not checked yet. Current token or provider verification is not established.";
       if (definition.mode !== "local" && !providerEvidenceIsFresh(view, now)) return staleExplanation(view);
@@ -149,7 +153,5 @@ function providerEvidenceIsFresh(view: CapabilityView, now: number) {
 }
 
 function staleExplanation(view: CapabilityView) {
-  return view.definition.probe.kind === "live_qualification" && view.definition.mode === "application"
-      ? "Provider operation evidence is stale. An Admin must explicitly approve a new bounded application-scope operation; automatic refresh does not run it. Authorized saved data remains readable."
-    : `Evidence is stale; authorized saved data remains readable. ${capabilityCheckGuidance(view)}`;
+  return `Evidence is stale; authorized saved data remains readable. ${capabilityCheckGuidance(view)}`;
 }

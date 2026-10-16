@@ -320,9 +320,16 @@
   border-top: 1px solid #dce6ef;
 }
 
-.data-sync-activity-footer > .data-sync-run-meta { flex: 1 1 260px; min-width: 0; }
+.data-sync-activity-footer > .data-sync-run-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  flex: 1 1 260px;
+  min-width: 0;
+}
 .data-sync-activity-footer > .data-sync-run-actions { justify-content: flex-end; margin-left: auto; min-width: 0; }
-.data-sync-activity-footer .sync-text-button { width: auto; }
+.data-sync-activity-footer .sync-text-button { width: auto; flex-shrink: 0; }
 
 :is(.data-sync-run-actions, .data-sync-source-controls) button.secondary.data-sync-cancel {
   color: var(--danger);

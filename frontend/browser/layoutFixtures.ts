@@ -1,4 +1,4 @@
-import { expect, type Page, type Route } from "@playwright/test";
+import type { Page, Route } from "@playwright/test";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { permissionLayoutRequestKind } from "./permissionFixtures";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
@@ -9,6 +9,7 @@ import { responseAnalytics, selectedFixtureQuery, selectedFixtureRead, selectedF
 import { historySet, overviewAgent, reportAgent, reportPage, reportUser } from "../src/test/reportDataFixture";
 import { agentUsageHistoryFixture } from "../src/test/automaticAgentUsageFixture";
 import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, ReportUser } from "../../backend/src/types/officialReportData";
+import type { PackageDetailSyncState } from "../../backend/src/types/dataSync";
 import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
 import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
 import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery, inventoryFixtureSelection } from "./selectedInventoryFixture";
@@ -16,7 +17,7 @@ import { encodeInventoryFacet } from "../../backend/src/types/inventoryFacets";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
   PackagePage, PurviewAuditCatalog, PurviewAuditJob, PurviewAuditRecordPage, SessionUser,
-  WorkbenchJobsResponse, UnifiedAgentInventoryPage,
+  WorkbenchJobsResponse, UnifiedAgentInventoryPage, UnifiedAgentInventoryHealth,
 } from "../src/api/client";
 
 export const layoutTime = "2026-09-12T10:00:00.000Z";
@@ -30,7 +31,7 @@ const actor: SessionUser = {
 export const capabilityViews: CapabilityView[] = capabilityDefinitions.map(definition => {
   const local = definition.mode === "local";
   return {
-    definition,
+    enabled: true, definition,
     decision: {
       capabilityId: definition.id, status: local ? "available" : "provider_error",
       authorized: local, fresh: true, verification: local ? "local" : "provider",
@@ -95,7 +96,7 @@ export const unifiedAgents: UnifiedAgentInventoryPage = {
   partial: true,
   errors: [{ source: "power_platform", code: "snapshot_unavailable", message: "Power Platform saved inventory is unavailable." }],
 };
-export const inventoryFacetFixtures = { environments: [] as Array<{ value: string; label: string }>,
+const inventoryFacetFixtures = { environments: [] as Array<{ value: string; label: string }>,
   platforms: [{ value: "Copilot Studio", label: "Copilot Studio" }], types: [
     { value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" },
     { value: "shared", label: "Shared in your organization" },
@@ -203,7 +204,7 @@ export const purviewJob: PurviewAuditJob = {
   providerRequestCount: 2, activationCount: 1, pageCount: 1, providerRowCount: 1, storedRowCount: 1,
   byteCount: 512, unknownFieldCount: 0, pageComplete: true,
   observedRange: { startDateTime: observedAt, endDateTime: observedAt }, unobservedRange: null,
-  qualificationId: null, cancelRequested: false, createdAt: observedAt, attemptedAt: observedAt,
+  cancelRequested: false, createdAt: observedAt, attemptedAt: observedAt,
   updatedAt: observedAt, finishedAt: observedAt, expiresAt, canResume: false, remoteWorkMayContinue: false,
 };
 const purviewCatalog: PurviewAuditCatalog = {
@@ -211,7 +212,7 @@ const purviewCatalog: PurviewAuditCatalog = {
     id: id as PurviewAuditJob["filters"]["presetId"], label: preset.label, service: preset.serviceFilter,
     recordTypes: preset.recordTypeFilters, operations: preset.operationFilters,
   })),
-  limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumPages: 20, maximumRows: 5000,
+  limits: { maximumWindowHours: 168, maximumPages: 20, maximumRows: 5000,
     maximumBytes: 8_000_000, pollsPerActivation: 6, providerRequests: 64, activations: 12 },
   evidenceNotice: "Saved compliance and security evidence, separate from official usage.",
   contentNotice: "Content not present in Purview audit. Message identifiers are metadata, not prompt or response text.",
@@ -234,25 +235,16 @@ const huntingJob: DefenderHuntingJob = {
   resultScope: purviewJob.resultScope, tokenMode: "delegated", status: "succeeded",
   filters: { templateId: "agents_inventory", startDateTime: "2026-09-12T09:00:00.000Z", endDateTime: observedAt,
     agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] },
-  queryVersion: 3, retainedScopeId: "layout-retained-scope", localRequestId: "layout-hunting-request", providerRequestId: "layout-provider-request",
+  queryVersion: 3, localRequestId: "layout-hunting-request", providerRequestId: "layout-provider-request",
   providerRequestCount: 1, activationCount: 1, providerRowCount: 1, storedRowCount: 1, byteCount: 512,
   complete: true, noData: false, partialReason: null, observedRange: purviewJob.observedRange, unobservedRange: null,
-  snapshotId: "99999999-9999-4999-8999-999999999999", priorSuccessfulJobId: null, qualification: null,
+  snapshotId: "99999999-9999-4999-8999-999999999999", priorSuccessfulJobId: null,
   cancelRequested: false, createdAt: observedAt, attemptedAt: observedAt, updatedAt: observedAt, finishedAt: observedAt,
   expiresAt, canResume: false,
 };
 const huntingCatalog: DefenderHuntingCatalog = {
   templates: Object.entries(defenderHuntingTemplates).map(([id, template]) => ({ id: id as DefenderHuntingJob["filters"]["templateId"], ...template })),
-  qualifications: [],
-  retainedScopes: [{
-    id: huntingJob.retainedScopeId!, resultScope: huntingJob.resultScope, tokenMode: "delegated",
-    capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", targetScopeHash: "a".repeat(64),
-    approvedScope: { templateId: "agents_inventory", agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] },
-    queryVersion: 3, contractRevision: "b".repeat(64), permissionRevision: "c".repeat(64), configurationRevision: 1,
-    approvedBy: actor.homeAccountId, sourceQualificationJobId: huntingJob.id,
-    approvedAt: observedAt, qualifiedAt: observedAt, expiresAt, revokedAt: null,
-  }],
-  limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
+  limits: { maximumWindowHours: 168, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
   scopeNotice: "Graph-selected Defender scope; no workspace selection.",
   contentNotice: "Messages and tool content are not retained or reconstructed.",
   readinessNotice: "Verify connector, license, role and rollout separately.",
@@ -286,7 +278,11 @@ const jobs: WorkbenchJobsResponse = {
   unavailableSources: [], polledAt: observedAt, requestId: "layout-jobs-request",
 };
 
-export async function mockLayoutApi(page: Page) {
+export async function mockLayoutApi(page: Page, options: { metadataAfterPermissionCatalog?: boolean } = {}) {
+  // The check request proves catalog state committed, without waiting on dependent UI or its response.
+  const initialPermissionCheck = options.metadataAfterPermissionCatalog
+    ? page.waitForRequest(request => new URL(request.url()).pathname === "/api/capabilities/check" && request.method() === "POST")
+    : undefined;
   // The network-isolated runner serves reachable synthetic API routes.
   await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { get: () => true }));
   const unexpectedRequests: string[] = [];
@@ -313,6 +309,15 @@ export async function mockLayoutApi(page: Page) {
       defender: { status: "available", entraAgentIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
       purview: { status: "unavailable", mode: "search", presets: [], reason: "No exact saved audit bot identity." },
     },
+    "/api/agent-inventory/health": {
+      freshness: unifiedAgents.freshness, summary: unifiedAgents.summary, verification: unifiedAgents.verification,
+      identityCollection: unifiedAgents.identityCollection, sources: unifiedAgents.sources,
+      partial: unifiedAgents.partial, errors: unifiedAgents.errors,
+    } satisfies UnifiedAgentInventoryHealth,
+    "/api/data-sync/package-details": {
+      status: "complete", total: packages.value.length, fresh: packages.value.length, pending: 0, eligible: 0,
+      message: "All selected package details are saved.", job: null,
+    } satisfies PackageDetailSyncState,
     "/api/data-sync/state": {
       onboardingRequired: false, usageImportRequired: false, run: null,
       sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
@@ -337,10 +342,7 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route(url => isLocalFixtureUrl(url) && url.pathname.startsWith("/api/"), async route => {
     const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
-    if (path === "/api/workbench/metadata" && method === "GET") {
-      // Layout cases start with settled permissions; App tests cover startup authorization transitions.
-      await expect(page.getByRole("button", { name: "Permissions", exact: true })).toHaveAttribute("aria-busy", "false");
-    }
+    if (path === "/api/workbench/metadata" && method === "GET" && initialPermissionCheck) await initialPermissionCheck;
     if (["/api/capabilities", "/api/capabilities/check", "/api/capabilities/check-progress"].includes(path)
       && !permissionLayoutRequestKind(method, url)) return unexpectedRequest(route);
     if (path === "/api/agent-inventory/selections") return captureInventorySelection(route, unifiedAgents.selection);
@@ -361,6 +363,24 @@ export async function mockLayoutApi(page: Page) {
     if (detail) return fulfillInventoryDetail(route, decodeURIComponent(detail[1]));
     const members = /^\/api\/agent-inventory\/([^/]+)\/members$/.exec(path);
     if (members) return fulfillInventoryMembers(route, decodeURIComponent(members[1]));
+    const about = /^\/api\/agent-inventory\/([^/]+)\/about$/.exec(path);
+    if (about) {
+      const record = unifiedAgents.value.find(record => record.id === decodeURIComponent(about[1]));
+      if (!record) return unexpectedRequest(route);
+      const value = record.packages.find(item => item.id === url.searchParams.get("sourceIdentity"));
+      const native = record.powerPlatformResource?.savedSource?.identity === url.searchParams.get("sourceIdentity")
+        ? record.powerPlatformResource : null;
+      const text = url.searchParams.get("field") === "short" ? value?.shortDescription ?? null
+        : url.searchParams.get("field") === "native" ? native?.details.description ?? null
+          : value && "longDescription" in value && typeof value.longDescription === "string" ? value.longDescription : null;
+      return route.fulfill({ json: { recordId: record.id, sourceScopeId: url.searchParams.get("sourceScopeId"),
+        sourceIdentity: url.searchParams.get("sourceIdentity"), generationId: "layout-source-generation",
+        field: url.searchParams.get("field"), state: text === null ? "missing" : "available",
+        source: url.searchParams.get("field") === "native" ? "power_platform" : "graph_packages", observedAt,
+        provenance: { path: null, maturity: "unknown" },
+        text, totalBytes: text === null ? 0 : Buffer.byteLength(text), returnedBytes: text === null ? 0 : Buffer.byteLength(text),
+        nextCursor: null, selection: inventoryFixtureSelection(route) } });
+    }
     const history = /^\/api\/agent-inventory\/([^/]+)\/usage-history$/.exec(path);
     if (history) {
       const recordId = decodeURIComponent(history[1]);

@@ -11,6 +11,8 @@ import { maintenanceActive } from "./maintenance.js";
 import { readOperationalState } from "./operationalState.js";
 import { OfficialReportImports } from "../db/officialReportImports.js";
 import { retainRecordData } from "../db/dataRetention.js";
+import { currentAuthority, pruneAuthorities, withAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 
 type Work = { id: string; kind: OfficialExportKind; actor: AuditActor; identity: SelectionIdentity };
 export class ReportExportDispatcher {
@@ -20,7 +22,21 @@ export class ReportExportDispatcher {
   private draining?: Promise<void>;
   private drainFailure?: unknown;
   private stopping = false;
+  private readonly authorities = new Map<string, DelegatedCredentialSource>();
   constructor(readonly reports: LargeTenantUsersReports) {}
+
+  enqueue(id: string, identity: SelectionIdentity, schedule = true) {
+    const source = currentAuthority();
+    if (!source || source.principal.tenantId !== identity.tenantId || source.principal.principalId !== identity.principalId
+      || source.principal.sessionEpoch !== identity.sessionEpoch || source.principal.authorizationHash !== identity.authorizationHash) {
+      throw new AppError(401, "authorization_required", "The export requires the initiating account's current authorization.");
+    }
+    source.assertCurrent();
+    pruneAuthorities(this.authorities);
+    if (this.authorities.size >= 10_000 && !this.authorities.has(id)) throw new AppError(503, "credential_capacity", "Export authorization capacity is full.");
+    this.authorities.set(id, source);
+    if (schedule) this.wake();
+  }
 
   start() {
     if (this.timer || this.draining) return;
@@ -83,14 +99,24 @@ export class ReportExportDispatcher {
       const job: Work = { id: row.id, kind: row.kind, actor: row.actor, identity: { tenantId: row.tenant_id,
         principalId: row.principal_id, authorizationHash: row.authorization_hash, sessionEpoch: row.session_epoch } };
       const controller = new AbortController(), producer = new OfficialReportExports(this.reports, job.actor);
+      const source = this.authorities.get(job.id);
+      if (!source) {
+        await producer.engine.expire(job.id);
+        await this.reports.database.query(`UPDATE data_exports SET error_code='authorization_required'
+          WHERE id=$1 AND status='queued' AND error_code IS DISTINCT FROM 'authorization_required'`, [job.id]);
+        continue;
+      }
+      let retainAuthorization = true;
       const work = (async () => {
         await producer.engine.expire(job.id);
         if (this.stopping || maintenanceActive()) return;
         const status = await producer.status(job.id, job.identity);
-        if (status.status !== "queued" || this.stopping || maintenanceActive()) return;
+        if (status.status !== "queued") { retainAuthorization = false; return; }
+        if (this.stopping || maintenanceActive()) return;
         if (!await this.admissionsOpen() || controller.signal.aborted) return;
-        await producer.build(job.id, job.identity, job.kind, controller.signal, {
+        await withAuthority(source, () => producer.build(job.id, job.identity, job.kind, controller.signal, {
           assertCurrent: () => {
+            source.assertCurrent();
             controller.signal.throwIfAborted();
             if (this.stopping || maintenanceActive()) throw new AppError(503, "maintenance", "Export admissions are paused.");
           },
@@ -99,8 +125,14 @@ export class ReportExportDispatcher {
             if (item) item.settlementFailure = error;
             if (this.stopping) this.drainFailure ??= error;
           },
-        });
+        }));
+        retainAuthorization = false;
       })().catch(async error => {
+        if (error instanceof AppError && error.status === 401) {
+          retainAuthorization = false;
+          await this.reports.database.query(`UPDATE data_exports SET error_code='authorization_required'
+            WHERE id=$1 AND status='queued'`, [job.id]);
+        }
         // Unowned work remains retryable on contention, database outages and maintenance.
         const code = error instanceof AppError ? error.code : error instanceof Error ? error.message : undefined;
         if (!this.stopping && !(controller.signal.aborted && error === controller.signal.reason) && code !== undefined
@@ -112,7 +144,10 @@ export class ReportExportDispatcher {
           }
         }
         operationalLog("warn", "report_export_work_failed", { ...errorTelemetry(error), jobId: job.id });
-      }).finally(() => { this.active.delete(job.id); });
+      }).finally(() => {
+        this.active.delete(job.id);
+        if (!retainAuthorization && this.authorities.get(job.id) === source) this.authorities.delete(job.id);
+      });
       this.active.set(job.id, { tenantId: job.identity.tenantId, controller, work });
     }
   }

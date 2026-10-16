@@ -31,7 +31,7 @@ const user: AuthenticatedUser = {
 describe("DataSyncService", () => {
   beforeEach(async () => {
     await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "normal",
     }] }) });
   });
 
@@ -40,10 +40,10 @@ describe("DataSyncService", () => {
     harness.run.status = "partial";
     harness.run.sources = [{ ...harness.run.sources[0], status: "failed", canRetry: true }];
     const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
-      throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+      throw new AppError(503, "maintenance", "Provider admissions are closed.");
     });
     try {
-      await expect(harness.service.retry(user, harness.run.id)).rejects.toMatchObject({ code: "provider_requalification_required" });
+      await expect(harness.service.retry(user, harness.run.id)).rejects.toMatchObject({ code: "maintenance" });
       expect(harness.repository.retry).not.toHaveBeenCalled();
       expect(harness.packages.submit).not.toHaveBeenCalled();
       expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
@@ -64,10 +64,10 @@ describe("DataSyncService", () => {
     }
   });
 
-  it("keeps upload-only sync and retry available while providers await requalification", async () => {
+  it("keeps upload-only sync and retry independent of provider maintenance", async () => {
     const harness = serviceHarness();
     const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
-      throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+      throw new AppError(503, "maintenance", "Provider admissions are closed.");
     });
     try {
       await expect(harness.service.start(user, { mode: "initial", sources: ["usage_reports"] }))
@@ -89,14 +89,14 @@ describe("DataSyncService", () => {
     const harness = serviceHarness();
     let closed = false;
     const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
-      if (closed) throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+      if (closed) throw new AppError(503, "maintenance", "Provider admissions are closed.");
     });
     harness.repository.submit.mockImplementationOnce(async () => {
       closed = true;
       return { run: harness.run, created: true };
     });
     try {
-      await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "provider_requalification_required" });
+      await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "maintenance" });
       expect(harness.packages.submit).not.toHaveBeenCalled();
       expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
       expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
@@ -109,7 +109,7 @@ describe("DataSyncService", () => {
     }
   });
 
-  it.each(["maintenance", "provider_requalification_required"])(
+  it.each(["maintenance"])(
     "rejects manual admission before saved-data cleanup or retry while %s", async code => {
       const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
         throw new AppError(503, code, "Provider admissions are closed.");
@@ -139,7 +139,6 @@ describe("DataSyncService", () => {
     expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, undefined, expect.any(AbortSignal));
     await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
     expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({ requestedIds: [] }));
-    expect(harness.packages.submit.mock.calls[0][1]).not.toHaveProperty("catalogOnly");
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.objectContaining({ automatic: true }));
     expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.any(Object),
       { incompleteOnly: false, useCache: true });

@@ -18,6 +18,7 @@ export function UserPurviewAudit({ userPrincipalName, userObjectId, agent, activ
       user={{ objectId: userObjectId, userPrincipalName }} active={active} />
     : <p>A verified directory user is required to search this user's agent logs.</p>;
   return <section aria-label="User logs">
+    <h3>User logs</h3>
     <label className="agent-log-source-picker"><span>Source</span><select value={source} onChange={event => setSource(event.target.value as typeof source)}>
       <option value="purview">Purview audit</option><option value="defender">Defender</option>
     </select></label>

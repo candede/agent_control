@@ -101,6 +101,34 @@ describe("runtime configuration", () => {
   };
 
   describe("tenant configuration and username routing", () => {
+    it("defaults bearer admission closed and validates exact optional integration without requiring an MCP runtime", async () => {
+      const absent = await loadConfig({ TENANTS_JSON: JSON.stringify([tenantA]) });
+      expect(absent.config.tenants[0].integration).toBeUndefined();
+      const integration = { clientId: "ABCDEFAB-1111-2222-3333-444444444444", audience: tenantA.clientId, scope: "AgentControl.Access" };
+      const loaded = await loadConfig({ TENANTS_JSON: JSON.stringify([{ ...tenantA, integration }, tenantB]) });
+      expect(loaded.config.tenants[0].integration).toEqual({ ...integration, clientId: integration.clientId.toLowerCase() });
+      expect(loaded.config.tenants[1].integration).toBeUndefined();
+      expect(loaded.resolveTenantForUsername("admin@b.example").tenant.clientId).toBe(tenantB.clientId);
+    });
+
+    it.each([
+      null, [], {}, { clientId: tenantA.clientId, audience: tenantA.clientId, scope: "AgentControl.Access" },
+      { clientId: tenantB.clientId, audience: tenantB.clientId, scope: "AgentControl.Access" },
+      { clientId: tenantB.clientId, audience: `api://${tenantA.clientId}`, scope: "AgentControl.Access" },
+      { clientId: tenantB.clientId, audience: tenantA.clientId, scope: "User.Read" },
+      { clientId: tenantB.clientId, audience: tenantA.clientId, scope: "AgentControl.Access", enabled: true },
+      { clientId: "common", audience: tenantA.clientId, scope: "AgentControl.Access" },
+    ])("fails explicitly on invalid/conflicting integration %j without printing registry secrets", async integration => {
+      const error = await loadConfig({ TENANTS_JSON: JSON.stringify([{ ...tenantA, integration }]) }).catch(error => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain("integration");
+      expect(error.message).not.toContain(tenantA.clientSecret);
+    });
+
+    it("rejects unknown tenant-profile fields instead of silently dropping explicit integration configuration", async () => {
+      await expect(loadConfig({ TENANTS_JSON: JSON.stringify([{ ...tenantA, integrations: {} }]) })).rejects.toThrow("unknown tenant profile field");
+    });
+
     it("routes normalized usernames and aliases to the exact configured organization", async () => {
       const loaded = await loadConfig({ TENANTS_JSON: JSON.stringify([tenantA, tenantB]), SESSION_SECRET: "x".repeat(32) });
       loaded.validateRuntimeConfig();

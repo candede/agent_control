@@ -7,6 +7,9 @@ import { verifyInventoryReconciliationAdmissionSchema } from "./inventoryReconci
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
 import { verifyReportMembershipCountsSchema } from "./reportMembershipCountsSchema.js";
 import { inventoryLimits } from "../types/inventoryRecords.js";
+import { verifyPrincipalBearerFenceSchema } from "./principalBearerFenceSchema.js";
+import { verifyAuditOriginSchema } from "./auditOriginSchema.js";
+import { verifyAgentControlReceiptsSchema } from "./agentControlReceiptsSchema.js";
 
 export const schemaSql: string = currentSchemaSql;
 export const schemaFingerprint: string = createHash("sha256").update(schemaSql).digest("hex");
@@ -66,7 +69,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyUserSourceReportSchema(database);
   await verifyInventoryClassificationSchema(database);
   await verifyOfficialReportSchema(database);
-  await verifyUsersReportsCutoverSchema(database);
+  await verifyUsersReportsSchema(database);
   await verifyInventoryGenerationSchema(database);
   await verifyJobPagesSchema(database);
   await verifyInventoryRefreshTargetsSchema(database);
@@ -78,7 +81,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyInventoryClearSchema(database);
   await verifyInventorySelectionCriteriaSchema(database);
   await verifyInventoryObserverSchema(database);
-  await verifyInventoryCutoverSchema(database);
+  await verifyInventoryControlSnapshotSchema(database);
   await verifyInventoryProviderSchema(database);
   await verifyInventoryRefreshContractSchema(database);
   await verifyInventoryIdentityLookupSchema(database);
@@ -105,6 +108,9 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyInventoryCollectionRewindSchema(database);
   await verifyChildInsertFenceSchema(database);
   await verifyReportMembershipCountsSchema(database);
+  await verifyPrincipalBearerFenceSchema(database);
+  await verifyAuditOriginSchema(database);
+  await verifyAgentControlReceiptsSchema(database);
 }
 
 async function verifyDataSyncCleanupSchema(database: Pick<pg.Pool, "query">) {
@@ -253,21 +259,12 @@ async function verifyUserSourceReportSchema(database: Pick<pg.Pool, "query">) {
   }
 }
 
-async function verifyInventoryCutoverSchema(database: Pick<pg.Pool, "query">) {
+async function verifyInventoryControlSnapshotSchema(database: Pick<pg.Pool, "query">) {
   const row = (await database.query(`SELECT
-    NOT EXISTS(SELECT 1 FROM unnest(ARRAY['power_platform_inventory_snapshots','power_platform_inventory_resources',
-      'package_detail_cache','unified_agents','unified_agent_sources']) name WHERE to_regclass('public.'||name) IS NOT NULL) AS retired,
     EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='package_inventory_snapshots'::regclass
-      AND conname='package_control_only' AND convalidated) AS controls,
-    position('power_platform_inventory_snapshots' IN pg_get_functiondef('clear_admitted_data_sync_snapshots()'::regprocedure))=0 AS clear,
-    NOT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-      WHERE n.nspname='public' AND p.proname IN ('prepare_unified_agent_source_publication',
-        'advance_unified_agent_package_sources','advance_unified_agent_power_platform_sources',
-        'clear_admitted_unified_agent_registry','clear_admitted_package_details',
-        'unified_agent_package_publication_targets','unified_agent_power_platform_publication_snapshot',
-        'lock_unified_agent_publication','package_detail_current_catalog','package_detail_revision','package_detail_has_evidence')) AS functions
+      AND conname='package_control_only' AND convalidated) AS controls
   `)).rows[0];
-  if (!["retired", "controls", "clear", "functions"].every(key => row?.[key] === true)) throw new Error("inventory_cutover_schema_invalid");
+  if (row?.controls !== true) throw new Error("inventory_control_snapshot_schema_invalid");
 }
 
 async function verifyInventorySetPublicationSchema(database: Pick<pg.Pool,"query">) {
@@ -378,8 +375,6 @@ async function verifyInventoryIdentitySchema(database: Pick<pg.Pool, "query">) {
     to_regclass('public.inventory_live_sources') IS NOT NULL AS live_sources,
     EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='agent_identity_cache'::regclass
       AND confrelid='data_generations'::regclass AND conname='agent_identity_cache_generation') AS generation_reference,
-    NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='agent_identity_cache'::regclass
-      AND confrelid=to_regclass('public.power_platform_inventory_snapshots')) AS retired_reference,
     EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='agent_identity_cache'::regclass
       AND tgname='protect_inventory_identity_cache' AND tgenabled IN ('O','A')) AS live_guard,
     (SELECT count(*)=4 FROM pg_attribute WHERE NOT attisdropped AND atttypid='text'::regtype
@@ -392,7 +387,7 @@ async function verifyInventoryIdentitySchema(database: Pick<pg.Pool, "query">) {
       WHERE i.indexrelid=to_regclass('public.agent_usage_associations_target') AND i.indisvalid AND i.indisready
         AND i.indkey[3]=environment.attnum AND i.indkey[4]=native.attnum
         AND i.indcollation[3]='"C"'::regcollation AND i.indcollation[4]='"C"'::regcollation) AS normalized_keys`)).rows[0];
-  if (!["live_sources", "generation_reference", "retired_reference", "live_guard", "normalized_keys"]
+  if (!["live_sources", "generation_reference", "live_guard", "normalized_keys"]
     .every(key => row?.[key] === true)) throw new Error("inventory_identity_schema");
 }
 
@@ -515,8 +510,6 @@ async function verifyInventorySummaryAccessSchema(database: Pick<pg.Pool,"query"
 
 async function verifyInventoryRefreshContractSchema(database: Pick<pg.Pool, "query">) {
   const result = (await database.query(`SELECT
-    NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='package_refresh_jobs'::regclass
-      AND attname='catalog_only' AND NOT attisdropped) AS retired_mode,
     EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='package_refresh_jobs'::regclass
       AND conname='inventory_refresh_job_mode' AND convalidated) AS bounded_detail_mode,
     NOT EXISTS (
@@ -528,7 +521,7 @@ async function verifyInventoryRefreshContractSchema(database: Pick<pg.Pool, "que
           AND pg_get_expr(c.conbin,c.conrelid)=format('((%s >= 0) AND (%s <= %s))',bounds.column_name,bounds.column_name,bounds.maximum)
       )
     ) AS progress_bounds`, [inventoryLimits.sourceRows, inventoryLimits.pages])).rows[0];
-  if (!["retired_mode", "bounded_detail_mode", "progress_bounds"].every(key => result?.[key] === true)) {
+  if (!["bounded_detail_mode", "progress_bounds"].every(key => result?.[key] === true)) {
     throw new Error("inventory_refresh_contract_schema");
   }
 }
@@ -593,25 +586,20 @@ async function verifyInventoryRefreshTargetsSchema(database: Pick<pg.Pool, "quer
   const result = await database.query(`SELECT to_regclass('inventory_refresh_targets') IS NOT NULL AS targets,
     EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='inventory_attempts'::regclass
       AND attname='target_job_id' AND NOT attisdropped) AS target_job,
-    NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='package_refresh_jobs'::regclass
-      AND attname IN ('requested_ids','detail_targets') AND NOT attisdropped) AS retired_arrays,
     EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='package_refresh_jobs'::regclass
       AND attname='auto_details' AND NOT attisdropped) AS detail_metadata,
-    NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='package_refresh_jobs'::regclass
-      AND tgname IN ('reconcile_package_detail_cache','backoff_package_detail_job')) AS retired_triggers,
     current_user<>'agentcontrol_app' OR (has_table_privilege(current_user,'inventory_refresh_targets','SELECT,INSERT,UPDATE,DELETE')
       AND NOT has_table_privilege(current_user,'inventory_refresh_targets','TRUNCATE')) AS permissions`);
-  if (!["targets", "target_job", "retired_arrays", "detail_metadata", "retired_triggers", "permissions"]
+  if (!["targets", "target_job", "detail_metadata", "permissions"]
     .every(key => result.rows[0]?.[key] === true)) throw new Error("inventory_refresh_targets_schema");
 }
 
 async function verifyInventoryAuthoritySchema(database: Pick<pg.Pool, "query">) {
   const result = await database.query(`SELECT
     position('public.inventory_roots' IN pg_get_functiondef('protect_agent_usage_association()'::regprocedure))>0 AS current_memberships,
-    position('public.unified_agent_sources' IN pg_get_functiondef('protect_agent_usage_association()'::regprocedure))=0 AS retired_registry,
     EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='capability_configuration'::regclass
       AND tgname='fence_inventory_application_configuration' AND tgenabled IN ('O','A')) AS application_fence`);
-  if (!["current_memberships", "retired_registry", "application_fence"]
+  if (!["current_memberships", "application_fence"]
     .every(key => result.rows[0]?.[key] === true)) throw new Error("inventory_authority_schema");
 }
 
@@ -640,10 +628,8 @@ async function verifyInventoryObserverSchema(database: Pick<pg.Pool, "query">) {
   if (!row?.counter || row.guards !== 3) throw new Error("inventory_observer_schema_invalid");
 }
 
-async function verifyUsersReportsCutoverSchema(database: Pick<pg.Pool, "query">) {
-  const row = (await database.query(`SELECT to_regclass('public.copilot_usage_snapshots') AS snapshots,
-    to_regclass('public.copilot_usage_source_state') AS sources,
-    to_regclass('public.official_usage_row_facts_observed') AS fact_index,
+async function verifyUsersReportsSchema(database: Pick<pg.Pool, "query">) {
+  const row = (await database.query(`SELECT
     EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='data_exports' AND column_name='actor' AND data_type='jsonb') AS actor,
     EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='official_usage_ingestions'
       AND column_name='acceptance_revision' AND data_type='bigint') AS acceptance,
@@ -655,8 +641,8 @@ async function verifyUsersReportsCutoverSchema(database: Pick<pg.Pool, "query">)
       (tgrelid='public.agent_people_cache'::regclass AND tgname IN ('invalidate_user_people_insert','invalidate_user_people_update','invalidate_user_people_delete','preserve_user_people_identity')
       OR tgrelid='public.data_exports'::regclass AND tgname='data_export_actor_guard'
       OR tgrelid='public.official_usage_ingestions'::regclass AND tgname='official_acceptance_receipt_guard')) AS guards`)).rows[0];
-  if (!row || row.snapshots || row.sources || row.fact_index || !row.actor || !row.acceptance || !row.collection || !row.collection_guard || row.guards !== 6) {
-    throw new Error("users_reports_cutover_schema_required");
+  if (!["actor", "acceptance", "collection", "collection_guard"].every(key => row?.[key] === true) || row?.guards !== 6) {
+    throw new Error("users_reports_schema_invalid");
   }
 }
 

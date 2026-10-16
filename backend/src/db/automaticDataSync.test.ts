@@ -46,6 +46,19 @@ async function complete(scope: DataSyncScope, run: DataSyncRun) {
 }
 
 describe("session-driven automatic sync admission", () => {
+  it.each(["automatic", "manual"] as const)("does not let completed run history block %s sync and still joins concurrent starts", async kind => {
+    const scope = owner();
+    await fixture.operator.query(`INSERT INTO data_sync_runs(id,tenant_id,principal_id,mode,source_ids,request_hash,status,automatic)
+      SELECT gen_random_uuid(),$1,$2,'incremental','["users"]',repeat('a',64),'completed',true FROM generate_series(1,20)`,
+    [scope.tenantId, scope.principalId]);
+    const submit = () => kind === "automatic" ? repository.submitDue(scope) : repository.submit(scope, { mode: "incremental", sources: ["users"] });
+    const [first, second] = await Promise.all([submit(), submit()]);
+    expect(first.run?.id).toBe(second.run?.id);
+    expect([first.created, second.created].sort()).toEqual([false, true]);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_sync_runs
+      WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(21);
+  });
+
   it("finishes a mixed automatic run when inventory is the last source to publish and retries after cooldown", async () => {
     const scope = owner();
     const { run } = await repository.submitDue(scope);

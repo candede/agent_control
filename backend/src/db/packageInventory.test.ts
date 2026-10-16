@@ -162,7 +162,7 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
     await jobs.markFailed(scope, incomplete, "incomplete_coverage", "Synthetic partial provider response.");
     const duplicate = await running("package-duplicate");
     await expect(refreshThroughProvider(scope, duplicate, [packageValue("duplicate"), packageValue("duplicate")]))
-      .rejects.toMatchObject({ code: "23505" });
+      .rejects.toMatchObject({ code: "provider_schema" });
     await jobs.markFailed(scope, duplicate, "duplicate_identity", "Synthetic duplicate provider response.");
     const exact = await running("package-wrong-target", ["expected"]);
     const graph = new GraphPackagesClient(async () => Response.json(packageValue("other")), { minimumReadIntervalMs: 0, maxAttempts: 1 });

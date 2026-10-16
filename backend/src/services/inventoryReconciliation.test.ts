@@ -15,7 +15,7 @@ import { NativeInventory } from "../db/nativeInventory.js";
 import { InventoryRuntime } from "./inventoryRuntime.js";
 import { publishPackageReadback } from "../db/packageControls.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
-import { allowlistedPackage } from "./packageObservation.js";
+import { allowlistedPackage, allowlistedSavedPackage } from "./packageObservation.js";
 import { DataSyncRepository } from "../db/dataSync.js";
 import { StreamedInventory } from "./streamedInventory.js";
 import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisions.js";
@@ -319,7 +319,7 @@ describe("durable bounded reconciliation", () => {
       await stream.packageObservation(lease, catalogValue, "catalog");
       await sources.acceptPage(lease, { token: "catalog", nextToken: null, records: [catalogValue], rawCount: 1, expectedCount: 1, page: 1 }, 1);
     }, { authorize: async () => {} });
-    const blocked = allowlistedPackage({ ...value, isBlocked: true });
+    const blocked = allowlistedSavedPackage({ ...value, isBlocked: true });
     await sources.generations.connections.run(client => publishPackageReadback(
       { tenantId: source.tenantId, principalId: principal }, blocked, client, null, capturePackageMutationState(blocked, "block")));
     expect(await new InventoryRuntime(fixture.runtime, async () => {}).publishControls({ tenantId: source.tenantId, principalId: principal })).toBe(1);

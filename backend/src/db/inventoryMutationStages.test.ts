@@ -72,8 +72,14 @@ describe("record-store mutation staging", () => {
           isBlocked: ids.includes(item.id) && action === "block", availableTo: "some", deployedTo: "some",
         });
       }
+      const next = await stages.preview(identity, await stages.currentSelection(identity), intent, ids);
+      expect(next.summary.targetCount).toBe(ids.length);
+      expect(next.summary.targets.every(target => target.currentState.kind === "block"
+        && target.currentState.isBlocked === (action === "block"))).toBe(true);
     }
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(ids.length * 2);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM package_inventory_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2 AND observation_kind='block'`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(ids.length * 4);
   });
 
   it("acceptance: durable authority survives preview cleanup and preserves an unchanged qualified provider write", async () => {

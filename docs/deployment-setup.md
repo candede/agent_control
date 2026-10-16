@@ -2,6 +2,91 @@
 
 This guide configures Microsoft Entra ID and starts Agent Control locally.
 
+The [MCP integration contract](mcp-integration.md) documents the separate,
+locally implemented delegated API integration, registration audiences, secret
+ownership and independent API/web operation. It is not permission to
+provision MCP or change an existing production project.
+
+## Optional delegated API binding
+
+No MCP/Python package, service or registration is needed for the web app. Existing
+tenant profiles omit `integration` and browser sign-in/startup remains unchanged.
+The strict API and existing deployment registry parsers accept this optional
+non-secret object inside an **already configured** tenant profile:
+
+```json
+{
+  "integration": {
+    "clientId": "33333333-3333-3333-3333-333333333333",
+    "audience": "22222222-2222-2222-2222-222222222222",
+    "scope": "AgentControl.Access"
+  }
+}
+```
+
+These are synthetic GUIDs: `audience` must be that profile's exact existing
+API `clientId`, and the integration client must be distinct. Missing integration
+means bearer admission disabled; null/partial/unknown fields, other scopes or
+conflicting bindings fail explicitly. Local onboarding preserves the object
+without adding consent prompts; metadata contains no client secret. Existing
+`TENANTS_JSON`/`TENANTS_JSON_FILE` ownership and protected file handling remain.
+
+For a separately approved later registration change, the existing API exposes
+`api://<apiClientId>/AgentControl.Access`, uses v2 access tokens
+(`api.requestedAccessTokenVersion=2`), and retains Viewer/Admin **user/group**
+assignments. A distinct tenant-specific integration confidential client receives
+that delegated scope through **administrator-managed consent**. For example,
+an API scope declaration (merge with existing configuration, never replace it):
+
+```json
+{
+  "id": "44444444-4444-4444-4444-444444444444",
+  "value": "AgentControl.Access",
+  "type": "Admin",
+  "isEnabled": true,
+  "adminConsentDisplayName": "Use Agent Control as a signed-in user",
+  "adminConsentDescription": "Use assigned Agent Control roles and existing delegated provider permissions."
+}
+```
+
+The API validates v2 token audience as the **API client GUID**, not an audience
+array, MCP resource token, ID token or `api://` scope URI. API-owned OBO uses
+existing admin-consented Graph `User.ReadBasic.All`/OIDC metadata to prove native
+and guest private identity, without a Graph data read or prior portal login.
+Actual live account/client-info continuity is not yet proven; unsupported
+responses stay closed. No runtime consent writer, app-only grant, directory
+lookup fallback or identity migration is supplied. See the
+[integration contract](mcp-integration.md#current-principal-and-credential-foundation)
+for deadlines, role freshness and claims challenges, and its
+[canonical integration](mcp-integration.md#current-canonical-integration)
+for active HTTP/worker boundaries.
+These examples authorize no tenant setup, grant or deployment.
+
+Existing routes accept delegated bearer authority only where the frozen map
+allows it. Do not combine Authorization with the browser session cookie or
+provide identity/origin headers as authority. Browser-only sign-in, import,
+configuration and downloads retain cookie Origin/CSRF protections.
+Provider permissions still require administrator-managed consent and independent
+capability readiness. Long-running work pauses when its initiating source
+expires or becomes stale; obtain fresh same-account authorization and explicitly
+resume unsent work. Restart does not recover credentials from portal caches,
+sessions or durable jobs. Sent-unknown writes must reconcile before resend.
+After account-wide revocation, obtain an API token with issuance strictly later
+than the durable cutoff (a later second if needed); a new token with unchanged
+`iat` is not new authority. Supported native/guest recovery requires no portal
+login. Old grants, selections and workers do not inherit the new request's epoch.
+The current schema includes the issuance cutoff directly; see
+[schema/private identity](mcp-integration.md#sourceschemaprivate-identity-baseline).
+Installation supports empty/current schema only. An incompatible owned database
+requires explicit target/data-loss confirmation for reset; ordinary startup
+does not convert it. After verified installation/reset, normal operation starts
+without a provider-enable or release-acceptance step.
+
+Omitted integration configuration disables bearer admission without affecting
+browser startup. Configured bearer requests require actual supported token/
+identity proof, not a qualification artifact. This guide claims no live OBO,
+provider or MCP deployment result.
+
 ## Prerequisites
 
 - PowerShell 7

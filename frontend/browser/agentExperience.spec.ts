@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { selectedAgentsPage, selectedFixtureRead, selectedFixtureReports, selectedHistoryPage } from "../src/test/selectedUsageFixture";
 import { mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { selectedCohortData, selectedCohortRead } from "./selectedCohortFixture";
-import { fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
+import { fulfillInventoryPage, inventoryFixtureQuery, inventoryFixtureSelection } from "./selectedInventoryFixture";
 
 const usageFixtureSetId = selectedFixtureReports.setId!;
 async function mockUnavailableAgentUsage(page: Page) {
@@ -37,6 +37,45 @@ async function mockUsageReports(page: Page, unexpected: string[]) {
 }
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
+test("selected About reads retain exact source and complete Unicode text beyond the first segment", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  const original = unifiedAgents.value[0], savedSource = {
+    scopeId: "70000000-0000-4000-8000-000000000001", identity: original.packages[0].id,
+  };
+  const selectedPackage = { ...original.packages[0], savedSource };
+  const record = { ...original, packages: [selectedPackage] };
+  await page.route(url => url.pathname === "/api/agent-inventory", route => fulfillInventoryPage(route, {
+    ...unifiedAgents, value: [record], counts: { ...unifiedAgents.counts, filtered: 1 },
+  }));
+  await page.route(url => url.pathname === `/api/agents/${encodeURIComponent(selectedPackage.id)}/detail`, route => route.fulfill({ json: selectedPackage }));
+  const fullText = "Saved complete About 🧭 ".repeat(1000) + "FINAL VERIFIED ABOUT";
+  const characters = Array.from(fullText), requests: string[] = [];
+  await page.route(url => url.pathname === `/api/agent-inventory/${encodeURIComponent(record.id)}/about`, route => {
+    const params = new URL(route.request().url()).searchParams, cursor = params.get("cursor");
+    expect(params.get("selectionId")).toBeTruthy();
+    expect(params.get("sourceScopeId")).toBe(savedSource.scopeId);
+    expect(params.get("sourceIdentity")).toBe(savedSource.identity);
+    expect(params.get("field")).toBe("long");
+    expect([null, "about-next"]).toContain(cursor);
+    requests.push(cursor ?? "first");
+    const text = cursor ? characters.slice(16384).join("") : characters.slice(0, 16384).join("");
+    return route.fulfill({ json: { recordId: record.id, sourceScopeId: savedSource.scopeId, sourceIdentity: savedSource.identity,
+      generationId: "70000000-0000-4000-8000-000000000002", field: "long", state: "available", source: "graph_packages",
+      observedAt: "2026-09-12T09:58:00.000Z", provenance: { path: "longDescription", maturity: "ga" },
+      text, totalBytes: Buffer.byteLength(fullText), returnedBytes: Buffer.byteLength(text),
+      nextCursor: cursor ? null : "about-next", selection: inventoryFixtureSelection(route) } });
+  });
+  await page.goto("/agents");
+  await page.getByRole("button", { name: record.displayName, exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: record.displayName });
+  await dialog.getByRole("button", { name: "Load more About text" }).click();
+  await expect(dialog.getByLabel("Agent description")).toContainText("FINAL VERIFIED ABOUT");
+  expect(await dialog.getByLabel("Agent description").textContent()).toBe(fullText);
+  await expect(dialog.getByRole("button", { name: "Load more About text" })).toHaveCount(0);
+  expect(requests).toEqual(["first", "about-next"]);
+  expect(unexpected).toEqual([]);
+});
 
 test("Agents separates its compact overview from agent details and snapshot response totals", async ({ page }, info) => {
   test.setTimeout(60_000);

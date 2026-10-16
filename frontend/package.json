@@ -14,7 +14,7 @@
   "dependencies": {
     "@tanstack/react-query": "5.102.8",
     "@tanstack/react-table": "9.2.4",
-    "dompurify": "^3.4.11",
+    "dompurify": "^3.4.16",
     "lucide-react": "^1.23.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
@@ -31,6 +31,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "axe-core": "^4.13.0",
+    "csv-parse": "^7.0.2",
     "eslint": "^10.6.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",

@@ -1,4 +1,6 @@
-import type { InventorySnapshotVerification, PowerPlatformResourceType, UnifiedAgentInventoryVerification, UnifiedAgentInventoryPage } from "../api/client";
+import type { PowerPlatformResourceType, UnifiedAgentInventoryPage } from "../api/client";
+import type { InventorySnapshotVerification } from "../../../backend/src/types/powerPlatformInventory";
+import type { UnifiedAgentInventoryVerification } from "../../../backend/src/types/unifiedAgents";
 
 export function inventoryPageMetadata(counts: UnifiedAgentInventoryPage["counts"] = { total: 0, scoped: 0, filtered: 0, packageTargets: 0 },
   expiresAt = "2030-01-01T00:00:00.000Z",

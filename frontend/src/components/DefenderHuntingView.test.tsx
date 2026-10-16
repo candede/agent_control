@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
-import { ApiError, approveDefenderHuntingQualification, cancelDefenderHunt, deleteDefenderHunt, downloadDefenderHuntingCsv, getDefenderHuntingCatalog, getDefenderHuntingJob, getDefenderHuntingJobs, getDefenderHuntingRows, resumeDefenderHunt, startDefenderHuntingQualification,
-  revokeDefenderHuntingRetainedScope, submitDefenderHunt, type CapabilityView, type DefenderHuntingCatalog, type DefenderHuntingJob, type DefenderHuntingRowPage, type SessionUser } from "../api/client";
+import { ApiError, cancelDefenderHunt, deleteDefenderHunt, downloadDefenderHuntingCsv, getDefenderHuntingCatalog, getDefenderHuntingJob, getDefenderHuntingJobs, getDefenderHuntingRows, resumeDefenderHunt,
+  submitDefenderHunt, type CapabilityView, type DefenderHuntingCatalog, type DefenderHuntingJob, type DefenderHuntingRowPage, type SessionUser } from "../api/client";
 import { DefenderHuntingView as AgentDefenderHuntingView } from "./DefenderHuntingView";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
@@ -24,26 +24,17 @@ function render(ui: ReactNode, reactStrictMode = false) {
   return { ...result, rerender: (next: ReactNode) => result.rerender(wrap(next)) };
 }
 
-vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(), approveDefenderHuntingQualification: vi.fn(),
+vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(),
   cancelDefenderHunt: vi.fn(), deleteDefenderHunt: vi.fn(), downloadDefenderHuntingCsv: vi.fn(), getDefenderHuntingCatalog: vi.fn(),
-  getDefenderHuntingJob: vi.fn(), getDefenderHuntingJobs: vi.fn(), getDefenderHuntingRows: vi.fn(), resumeDefenderHunt: vi.fn(), revokeDefenderHuntingRetainedScope: vi.fn(),
-  startDefenderHuntingQualification: vi.fn(), submitDefenderHunt: vi.fn() }));
+  getDefenderHuntingJob: vi.fn(), getDefenderHuntingJobs: vi.fn(), getDefenderHuntingRows: vi.fn(), resumeDefenderHunt: vi.fn(),
+  submitDefenderHunt: vi.fn() }));
 
 const catalog: DefenderHuntingCatalog = { templates: [
   { id: "agents_inventory", label: "Defender agent inventory", sourceTable: "AgentsInfo", operations: [] },
   { id: "agent_activity", label: "Agent activity", sourceTable: "CloudAppEvents", operations: ["InvokeAgent", "InferenceCall"] },
   { id: "agent_tools", label: "Agent tool activity", sourceTable: "CloudAppEvents", operations: ["ExecuteToolBySDK"] },
-], qualifications: [{ capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", targetScopeHash: "c".repeat(64),
-  approvedScope: { templateId: "agents_inventory", agentIds: [], entraAgentIds: [entraAgentId], blueprintIds: [], actorObjectIds: [], operations: [] },
-  queryVersion: 3, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a",
-  qualifiedAt: "2026-09-09T11:00:00.000Z", expiresAt: "2026-09-09T12:00:00.000Z" }],
-retainedScopes: [{ id: "44444444-4444-4444-8444-444444444444", resultScope: { kind: "principal", scopeId: "security-a", configurationRevision: null },
-  tokenMode: "delegated", capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", targetScopeHash: "c".repeat(64),
-  approvedScope: { templateId: "agents_inventory", agentIds: [], entraAgentIds: [entraAgentId], blueprintIds: [], actorObjectIds: [], operations: [] }, queryVersion: 3,
-  contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a",
-  sourceQualificationJobId: "55555555-5555-4555-8555-555555555555", approvedAt: "2026-09-09T11:00:00.000Z",
-  qualifiedAt: "2026-09-09T11:00:00.000Z", expiresAt: "2026-10-09T11:00:00.000Z", revokedAt: null }],
-limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
+],
+limits: { maximumWindowHours: 168, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
 scopeNotice: "Graph-selected Defender scope; no workspace selection.", contentNotice: "Messages and tool content are absent.",
 readinessNotice: "Check license, connector, RBAC and rollout separately.", retentionNotice: "Local results expire after 30 days.",
 defenderPortalUrl: "https://security.microsoft.com/v2/advanced-hunting" };
@@ -52,10 +43,10 @@ function job(overrides: Partial<DefenderHuntingJob> = {}): DefenderHuntingJob {
   return { id: "11111111-1111-4111-8111-111111111111", authorizationPrincipalId: "security-a",
     resultScope: { kind: "principal", scopeId: "security-a", configurationRevision: null }, tokenMode: "delegated", status: "succeeded",
     filters: { templateId: "agents_inventory", startDateTime: "2026-09-09T10:00:00.000Z", endDateTime: "2026-09-09T11:00:00.000Z", agentIds: [], entraAgentIds: [entraAgentId], blueprintIds: [], actorObjectIds: [], operations: [] },
-    queryVersion: 3, retainedScopeId: catalog.retainedScopes[0].id, localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: "provider-a", providerRequestCount: 1,
+    queryVersion: 3, localRequestId: "22222222-2222-4222-8222-222222222222", providerRequestId: "provider-a", providerRequestCount: 1,
     activationCount: 1, providerRowCount: 1, storedRowCount: 1, byteCount: 512, complete: true, noData: false, partialReason: null,
     observedRange: { startDateTime: "2026-09-09T10:30:00.000Z", endDateTime: "2026-09-09T10:30:00.000Z" }, unobservedRange: null,
-    snapshotId: "33333333-3333-4333-8333-333333333333", priorSuccessfulJobId: null, qualification: null, cancelRequested: false, createdAt: "2026-09-09T11:00:00.000Z",
+    snapshotId: "33333333-3333-4333-8333-333333333333", priorSuccessfulJobId: null, cancelRequested: false, createdAt: "2026-09-09T11:00:00.000Z",
     attemptedAt: "2026-09-09T11:00:00.000Z", updatedAt: "2026-09-09T11:00:01.000Z", finishedAt: "2026-09-09T11:00:01.000Z",
     expiresAt: "2026-10-09T11:00:00.000Z", canResume: false, ...overrides };
 }
@@ -84,16 +75,16 @@ function context(available = true, roles: SessionUser["roles"] = ["AgentControl.
   return { user: { homeAccountId, tenantId: "tenant-a", displayName: "Security", username: `${homeAccountId}@example.invalid`, roles: [...roles] }, loading: false,
     pending: false, error: undefined,
     now: Date.parse("2026-09-09T11:02:00.000Z"), reload: vi.fn(async () => undefined), openPermissions: vi.fn(),
-    views: (["delegated", "application"] as const).map<CapabilityView>(mode => ({ definition: { id: `defender.hunting.${mode}`, displayName: "Defender hunting", purpose: "Hunt", provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: "https://graph.microsoft.com",
+    views: (["delegated", "application"] as const).map<CapabilityView>(mode => ({ enabled: true, definition: { id: `defender.hunting.${mode}`, displayName: "Defender hunting", purpose: "Hunt", provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: "https://graph.microsoft.com",
       mode, permissions: ["ThreatHunting.Read.All"], providerRoles: [], licenses: [], configuration: [], sources: [], dataClass: "hunting", internalRoles: ["AgentControl.Viewer"],
-      probe: { kind: "live_qualification", adapterRegistered: true, description: "bounded" } },
+      probe: { kind: "on_demand", adapterRegistered: true, description: "bounded" } },
+      ...(mode === "application" ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
       decision: { capabilityId: `defender.hunting.${mode}`, status: available ? "available" : "unknown", authorized: available, fresh: available,
         checkedAt: available ? "2026-09-09T11:00:00.000Z" : undefined, expiresAt: available ? "2026-09-09T11:05:00.000Z" : undefined,
-        previewQualification: "not_required", remediation: available ? [] : ["Run one approved qualification."] } })) };
+        verification: "token", previewQualification: "not_required", remediation: [] } })) };
 }
 
 function renderView(available = true, roles?: readonly ("AgentControl.Viewer" | "AgentControl.Admin")[]) {
-  if (!available) vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({ ...catalog, qualifications: [] });
   return render(<CapabilityContext value={context(available, roles ? [...roles] : undefined)}><DefenderHuntingView /></CapabilityContext>);
 }
 
@@ -113,6 +104,22 @@ afterEach(() => {
 });
 
 describe("DefenderHuntingView", () => {
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)("lets %s request a configured application hunt directly", async role => {
+    vi.mocked(submitDefenderHunt).mockResolvedValue(job({
+      tokenMode: "application", resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
+    }));
+    const access = context(true, [role]);
+    access.views = access.views.map(view => ({ ...view, decision: { ...view.decision,
+      verification: "on_demand", checkedAt: undefined, expiresAt: undefined } }));
+    render(<CapabilityContext value={access}><DefenderHuntingView /></CapabilityContext>);
+    await screen.findByText("No hunting history");
+    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
+    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledExactlyOnceWith("application",
+      expect.objectContaining({ templateId: "agents_inventory", entraAgentIds: [entraAgentId] }),
+      expect.objectContaining({ agentRecordId })));
+  });
   it("allows cancellation of waiting authorization without polling or replaying the provider query", async () => {
     vi.useFakeTimers();
     const waiting = job({ status: "waiting_authorization", snapshotId: null, canResume: true, complete: false });
@@ -131,86 +138,21 @@ describe("DefenderHuntingView", () => {
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
-  it("shows partial qualification evidence without unlocking shared hunting access", async () => {
-    const partial = job({ tokenMode: "application", status: "partial", retainedScopeId: null, complete: false,
-      partialReason: "hunting_row_limit", providerRowCount: 201, qualification: {
-        capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-        configurationRevision: 1, approvedBy: "security-a",
-      } });
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({ ...catalog, qualifications: [], retainedScopes: [] });
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [partial], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(partial, "Partial qualification evidence"));
-    renderView();
-    fireEvent.click(await screen.findByRole("button", { name: /View hunt/ }));
-    expect(await screen.findByText(/Partial qualification does not approve shared hunting access/)).toBeVisible();
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(screen.getByText("Shared application hunting is not qualified")).toBeVisible();
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
-
   it.each(["failed", "inconclusive"] as const)("displays the sanitized %s provider outcome without silently submitting again", async status => {
     const failed = job({ status, complete: false, snapshotId: null, message: "Microsoft Graph hunting failed within its bounded retry budget." });
     vi.mocked(submitDefenderHunt).mockResolvedValue(failed);
     vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
       .mockResolvedValue({ value: [failed], count: 1, limit: 20, offset: 0 });
     renderView();
-    fireEvent.click(await screen.findByRole("button", { name: "Run hunt" }));
+    const search = await screen.findByRole("button", { name: "Run hunt" });
+    await waitFor(() => expect(search).toBeEnabled());
+    fireEvent.click(search);
     expect(await screen.findByText(failed.message!)).toBeVisible();
     expect(submitDefenderHunt).toHaveBeenCalledOnce();
     expect(resumeDefenderHunt).not.toHaveBeenCalled();
   });
 
-  it.each(["history", "exact job"] as const)(
-    "settles terminal %s polling and reads qualification evidence after completion without duplicate job reads", async location => {
-      vi.useFakeTimers();
-      const qualification = { capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" };
-      const approved = job({ status: "waiting_authorization", tokenMode: "application", qualification, snapshotId: null, canResume: true });
-      const running = job({ status: "running", tokenMode: "application", qualification, snapshotId: null });
-      const completed = job({ tokenMode: "application", qualification });
-      const pendingCatalog = deferred<DefenderHuntingCatalog>();
-      const qualifiedCatalog: DefenderHuntingCatalog = { ...catalog,
-        qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application" }],
-        retainedScopes: [{ ...catalog.retainedScopes[0], capabilityId: "defender.hunting.application", tokenMode: "application",
-          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-      };
-      vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce({ ...catalog, qualifications: [], retainedScopes: [] })
-        .mockReturnValueOnce(pendingCatalog.promise);
-      vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-      vi.mocked(startDefenderHuntingQualification).mockResolvedValue(running);
-      vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-        .mockResolvedValueOnce({ value: [approved], count: 1, limit: 20, offset: 0 })
-        .mockResolvedValueOnce({ value: [running], count: 1, limit: 20, offset: 0 })
-        .mockResolvedValue({ value: location === "history" ? [completed] : [], count: location === "history" ? 1 : 0, limit: 20, offset: 0 });
-      vi.mocked(getDefenderHuntingJob).mockResolvedValueOnce(approved).mockResolvedValue(completed);
-      renderView();
-      await act(async () => {});
-      fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-      fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-      fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-      await act(async () => {});
-      fireEvent.click(screen.getByRole("button", { name: "Run approved qualification" }));
-      await act(async () => {});
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-      await act(() => vi.advanceTimersByTimeAsync(1_500));
-      expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-      const signal = vi.mocked(getDefenderHuntingCatalog).mock.calls[1][0]!.signal!;
-      expect(signal.aborted).toBe(false);
-      if (location === "exact job") {
-        expect(getDefenderHuntingJob).toHaveBeenCalledTimes(2);
-        expect(vi.mocked(getDefenderHuntingJob).mock.invocationCallOrder[1])
-          .toBeLessThan(vi.mocked(getDefenderHuntingCatalog).mock.invocationCallOrder[1]);
-      } else expect(getDefenderHuntingJob).toHaveBeenCalledOnce();
-      await act(async () => pendingCatalog.resolve(qualifiedCatalog));
-      expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
-      await act(() => vi.advanceTimersByTimeAsync(3_000));
-      expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-    },
-  );
-
-  it.each(["delete", "revoke", "cancel", "resume"] as const)(
+  it.each(["delete", "cancel", "resume"] as const)(
     "reconciles an admitted %s after draft edits without restoring cleared selection", async action => {
       vi.useFakeTimers();
       vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -218,21 +160,18 @@ describe("DefenderHuntingView", () => {
         : action === "resume" ? { status: "waiting_authorization" as const, canResume: true } : {}) });
       const pending = deferred<DefenderHuntingJob>();
       const deleted = deferred<void>();
-      const revoked = deferred<DefenderHuntingCatalog["retainedScopes"][number]>();
       vi.mocked(cancelDefenderHunt).mockReturnValue(pending.promise);
       vi.mocked(resumeDefenderHunt).mockReturnValue(pending.promise);
       vi.mocked(deleteDefenderHunt).mockReturnValue(deleted.promise);
-      vi.mocked(revokeDefenderHuntingRetainedScope).mockReturnValue(revoked.promise);
       vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [existing], count: 1, limit: 20, offset: 0 })
         .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
-      vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce(catalog).mockResolvedValue({ ...catalog, qualifications: [], retainedScopes: [] });
+      vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
       renderView();
       await act(async () => {});
-      const label = action === "revoke" ? /Revoke saved-data access/ : new RegExp(`${action[0].toUpperCase()}${action.slice(1)} hunt`);
+      const label = new RegExp(`${action[0].toUpperCase()}${action.slice(1)} hunt`);
       fireEvent.click(screen.getByRole("button", { name: label }));
       await act(async () => {});
-      const signal = action === "revoke" ? vi.mocked(revokeDefenderHuntingRetainedScope).mock.calls[0][1]!.signal!
-        : action === "delete" ? vi.mocked(deleteDefenderHunt).mock.calls[0][1]!.signal!
+      const signal = action === "delete" ? vi.mocked(deleteDefenderHunt).mock.calls[0][1]!.signal!
           : action === "cancel" ? vi.mocked(cancelDefenderHunt).mock.calls[0][1]!.signal!
             : vi.mocked(resumeDefenderHunt).mock.calls[0][1]!.signal!;
       fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
@@ -240,54 +179,14 @@ describe("DefenderHuntingView", () => {
       expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
       await act(async () => {
         if (action === "delete") deleted.resolve(undefined);
-        else if (action === "revoke") revoked.resolve({ ...catalog.retainedScopes[0], revokedAt: "2026-09-09T11:03:00.000Z" });
         else pending.resolve({ ...existing, status: action === "cancel" ? "cancelled" : "succeeded" });
       });
       expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
       expect(screen.getByText("No hunting history")).toBeVisible();
       expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
       expect(screen.queryByRole("region", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
-      if (action === "revoke") {
-        expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-        expect(screen.queryByRole("region", { name: "Retained hunting scope" })).not.toBeInTheDocument();
-      }
     },
   );
-
-  it.each(["start", "resume"] as const)("refreshes qualification evidence when %s finishes before its history read", async action => {
-    vi.useFakeTimers();
-    const qualification = { capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
-      permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" };
-    const approved = job({ status: "waiting_authorization", tokenMode: "application", qualification, snapshotId: null, canResume: true });
-    const running = { ...approved, status: "running" as const, canResume: false };
-    const completed = job({ tokenMode: "application", qualification });
-    vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue(approved);
-    vi.mocked(startDefenderHuntingQualification).mockResolvedValue(running);
-    vi.mocked(resumeDefenderHunt).mockResolvedValue(running);
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-      .mockResolvedValueOnce({ value: [approved], count: 1, limit: 20, offset: 0 })
-      .mockResolvedValue({ value: [completed], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce({ ...catalog, qualifications: [], retainedScopes: [] })
-      .mockResolvedValue({ ...catalog,
-        qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application" }],
-        retainedScopes: [{ ...catalog.retainedScopes[0], capabilityId: "defender.hunting.application", tokenMode: "application",
-          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-      });
-    renderView();
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: action === "start" ? "Run approved qualification" : /Resume hunt/ }));
-    await act(async () => {});
-    expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
-    await act(() => vi.advanceTimersByTimeAsync(3_000));
-    expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(3);
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
 
   it("does not poll an exact selected job already returned in the current history page", async () => {
     vi.useFakeTimers();
@@ -307,19 +206,12 @@ describe("DefenderHuntingView", () => {
 
   it("reads the catalog after progressing jobs settle during an explicit refresh", async () => {
     vi.useFakeTimers();
-    const qualification = { capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
-      permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" };
-    const running = job({ status: "running", tokenMode: "application", qualification, snapshotId: null });
-    const completed = job({ tokenMode: "application", qualification });
+    const running = job({ status: "running", tokenMode: "application", snapshotId: null });
+    const completed = job({ tokenMode: "application" });
     const history = deferred<Awaited<ReturnType<typeof getDefenderHuntingJobs>>>();
     vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [running], count: 1, limit: 20, offset: 0 })
       .mockReturnValueOnce(history.promise);
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce({ ...catalog, qualifications: [], retainedScopes: [] })
-      .mockResolvedValue({ ...catalog,
-        qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application" }],
-        retainedScopes: [{ ...catalog.retainedScopes[0], capabilityId: "defender.hunting.application", tokenMode: "application",
-          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-      });
+    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
     renderView();
     await act(async () => {});
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
@@ -331,73 +223,6 @@ describe("DefenderHuntingView", () => {
     expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
     await act(() => vi.advanceTimersByTimeAsync(3_000));
     expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
-  });
-
-  it("invalidates catalog qualification evidence after deleting its source job", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    const qualified = job({ tokenMode: "application", qualification: { capabilityId: "defender.hunting.application",
-      contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });
-    const qualifiedCatalog: DefenderHuntingCatalog = { ...catalog,
-      qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application" }],
-      retainedScopes: [{ ...catalog.retainedScopes[0], capabilityId: "defender.hunting.application", tokenMode: "application",
-        sourceQualificationJobId: qualified.id, resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-    };
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [qualified], count: 1, limit: 20, offset: 0 })
-      .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce(qualifiedCatalog)
-      .mockResolvedValue({ ...qualifiedCatalog, qualifications: [] });
-    vi.mocked(deleteDefenderHunt).mockResolvedValue(undefined);
-    renderView();
-    await screen.findByRole("button", { name: /Delete hunt/ });
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: /Delete hunt/ }));
-    await screen.findByText("No hunting history");
-    expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(screen.getByText("Shared application hunting is not qualified")).toBeVisible();
-  });
-
-  it.each(["delete", "resume", "cancel"] as const)("reconciles the current approval after history %s", async action => {
-    vi.useFakeTimers();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    const approved = job({ status: "waiting_authorization", tokenMode: "application", snapshotId: null, canResume: true,
-      qualification: { capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });
-    const running = { ...approved, status: "running" as const, canResume: false };
-    const cancelled = { ...approved, status: "cancelled" as const, canResume: false, cancelRequested: true };
-    vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-    vi.mocked(startDefenderHuntingQualification).mockResolvedValue(running);
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue(approved);
-    vi.mocked(deleteDefenderHunt).mockResolvedValue(undefined);
-    vi.mocked(resumeDefenderHunt).mockResolvedValue(running);
-    vi.mocked(cancelDefenderHunt).mockResolvedValue(cancelled);
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-      .mockResolvedValueOnce({ value: [approved], count: 1, limit: 20, offset: 0 });
-    if (action === "cancel") vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [running], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({
-      value: action === "delete" ? [] : [action === "resume" ? running : cancelled],
-      count: action === "delete" ? 0 : 1, limit: 20, offset: 0,
-    });
-    renderView(false);
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await act(async () => {});
-    if (action === "cancel") {
-      fireEvent.click(screen.getByRole("button", { name: "Run approved qualification" }));
-      await act(async () => {});
-    }
-    fireEvent.click(screen.getByRole("button", { name: new RegExp(`${action[0].toUpperCase()}${action.slice(1)} hunt`) }));
-    await act(async () => {});
-    expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-    if (action === "resume") {
-      vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [approved], count: 1, limit: 20, offset: 0 });
-      await act(() => vi.advanceTimersByTimeAsync(1_500));
-      expect(screen.getByRole("button", { name: "Run approved qualification" })).toBeEnabled();
-      expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    }
   });
 
   it.each(["refresh", "history page"] as const)("finishes an explicit %s read after draft edits without stranding loading", async action => {
@@ -512,7 +337,6 @@ describe("DefenderHuntingView", () => {
     { action: "cancel", error: new ApiError(404, "not_found", "Saved hunting job unavailable") },
     { action: "cancel", error: new ApiError(409, "hunting_job_state", "Saved hunting job changed") },
     { action: "delete", error: new ApiError(404, "not_found", "Saved hunting job unavailable") },
-    { action: "revoke", error: new ApiError(404, "not_found", "Saved hunting scope unavailable") },
   ] as const)("withdraws stale hunting evidence after $action rejects it with $error.code", async ({ action, error }) => {
     const saved = job(action === "resume" ? { canResume: true }
       : action === "cancel" ? { status: "running", finishedAt: null } : {});
@@ -520,13 +344,13 @@ describe("DefenderHuntingView", () => {
       .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
     vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(saved, "Retired saved agent"));
     const command = action === "export" ? downloadDefenderHuntingCsv : action === "resume" ? resumeDefenderHunt
-      : action === "cancel" ? cancelDefenderHunt : action === "delete" ? deleteDefenderHunt : revokeDefenderHuntingRetainedScope;
+      : action === "cancel" ? cancelDefenderHunt : deleteDefenderHunt;
     vi.mocked(command).mockRejectedValue(error);
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     vi.spyOn(window, "confirm").mockReturnValue(true);
     renderView();
     const name = action === "resume" ? /Resume hunt/ : action === "cancel" ? /Cancel hunt/
-      : action === "delete" ? /Delete hunt/ : action === "revoke" ? /Revoke saved-data access/ : /Export hunt/;
+      : action === "delete" ? /Delete hunt/ : /Export hunt/;
     await screen.findByRole("button", { name: /View hunt|Cancel hunt/ });
     if (action !== "cancel") {
       fireEvent.click(screen.getByRole("button", { name: /View hunt/ }));
@@ -553,28 +377,6 @@ describe("DefenderHuntingView", () => {
     expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
     expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
     expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
-
-  it("keeps the admitted approval when duplicate clicks arrive before React commits", async () => {
-    const pending = deferred<DefenderHuntingJob>();
-    vi.mocked(approveDefenderHuntingQualification).mockReturnValue(pending.promise);
-    renderView(false);
-    await screen.findByText("No hunting history");
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    const approve = screen.getByRole("button", { name: "Approve qualification" });
-    act(() => {
-      approve.click();
-      approve.click();
-    });
-    expect(approveDefenderHuntingQualification).toHaveBeenCalledOnce();
-    await act(async () => pending.resolve(job({ status: "waiting_authorization", snapshotId: null, canResume: true, qualification: {
-      capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-      configurationRevision: 1, approvedBy: "security-a",
-    } })));
-    expect(screen.getByRole("button", { name: "Run approved qualification" })).toBeEnabled();
-    expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
   });
 
   it("keeps the admitted row selection and announces its pending read when another click is rejected", async () => {
@@ -691,111 +493,7 @@ describe("DefenderHuntingView", () => {
     },
   );
 
-  it.each([
-    ["qualification", false], ["retained scope", false], ["qualification", true], ["retained scope", true],
-  ] as const)(
-    "expires application %s independently of the capability clock without reloading saved data (timers suspended: %s)", async (expiring, suspended) => {
-      vi.useFakeTimers();
-      const expiresAt = new Date(Date.now() + 1_000).toISOString();
-      vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
-        ...catalog,
-        qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application",
-          ...(expiring === "qualification" ? { expiresAt } : {}) }],
-        retainedScopes: [{ ...catalog.retainedScopes[0], tokenMode: "application", capabilityId: "defender.hunting.application",
-          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
-          ...(expiring === "retained scope" ? { expiresAt } : {}) }],
-      });
-      const access = context();
-      render(<CapabilityContext value={access}><DefenderHuntingView /></CapabilityContext>);
-      await act(async () => {});
-      fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-      expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
-      if (suspended) {
-        vi.setSystemTime(new Date(Date.parse(expiresAt) + 1));
-        fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
-        expect(submitDefenderHunt).not.toHaveBeenCalled();
-        act(() => window.dispatchEvent(new Event("focus")));
-      } else await act(() => vi.advanceTimersByTimeAsync(1_001));
-      expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-      if (expiring === "retained scope") expect(screen.queryByRole("region", { name: "Retained hunting scope" })).not.toBeInTheDocument();
-      expect(getDefenderHuntingCatalog).toHaveBeenCalledOnce();
-      expect(getDefenderHuntingJobs).toHaveBeenCalledOnce();
-      expect(access.reload).not.toHaveBeenCalled();
-      expect(submitDefenderHunt).not.toHaveBeenCalled();
-    },
-  );
-
-  it("keeps an admitted application hunt and filters when its qualification expires", async () => {
-    vi.useFakeTimers();
-    const expiresAt = new Date(Date.now() + 1_000).toISOString();
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
-      ...catalog,
-      qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application", expiresAt }],
-      retainedScopes: [{ ...catalog.retainedScopes[0], tokenMode: "application", capabilityId: "defender.hunting.application",
-        resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-    });
-    const pending = deferred<DefenderHuntingJob>();
-    vi.mocked(submitDefenderHunt).mockReturnValue(pending.promise);
-    const access = context();
-    render(<CapabilityContext value={access}><DefenderHuntingView /></CapabilityContext>);
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
-    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
-    const signal = vi.mocked(submitDefenderHunt).mock.calls[0][2]!.signal!;
-    await act(() => vi.advanceTimersByTimeAsync(1_001));
-    expect(signal.aborted).toBe(false);
-    expect(getDefenderHuntingCatalog).toHaveBeenCalledOnce();
-    expect(getDefenderHuntingJobs).toHaveBeenCalledOnce();
-    await act(async () => pending.resolve(job({ tokenMode: "application" })));
-    expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBeVisible();
-    expect(screen.getByLabelText("Start")).toHaveValue("2026-09-09T10:30");
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(submitDefenderHunt).toHaveBeenCalledOnce();
-    expect(access.reload).not.toHaveBeenCalled();
-  });
-
-  it.each(["timer", "suspended timer", "readback"] as const)(
-    "rejects an approval that expires during %s while the capability clock is unchanged", async phase => {
-      vi.useFakeTimers();
-      const expiresAt = new Date(Date.now() + 1_000).toISOString();
-      const approved = job({ status: "waiting_authorization", snapshotId: null, canResume: true, expiresAt, qualification: {
-        capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64),
-        configurationRevision: 1, approvedBy: "security-a",
-      } });
-      const readback = deferred<DefenderHuntingJob>();
-      vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-      vi.mocked(getDefenderHuntingJob).mockReturnValue(readback.promise);
-      renderView(false);
-      await act(async () => {});
-      fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-      fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-      fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-      await act(async () => {});
-      const start = screen.getByRole("button", { name: "Run approved qualification" });
-      if (phase === "readback") {
-        fireEvent.click(start);
-        await act(async () => {});
-        expect(getDefenderHuntingJob).toHaveBeenCalledOnce();
-      }
-      if (phase === "timer") {
-        await act(() => vi.advanceTimersByTimeAsync(1_001));
-        expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-      } else {
-        vi.setSystemTime(new Date(Date.parse(expiresAt) + 1));
-        if (phase === "suspended timer") {
-          fireEvent.click(start);
-          expect(getDefenderHuntingJob).not.toHaveBeenCalled();
-        } else {
-          await act(async () => readback.resolve(approved));
-          expect(screen.getByRole("alert")).toHaveTextContent("Qualification approval is no longer current");
-        }
-      }
-      expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["timestamps", "freshness", "verification", "qualification"] as const)(
+  it.each(["timestamps", "freshness", "verification"] as const)(
     "preserves the log type and dates across diagnostic %s renewals and inactive source refreshes", async diagnostic => {
     const access = context();
     const view = (active = true, value = access) => <CapabilityContext value={value}>
@@ -810,8 +508,7 @@ describe("DefenderHuntingView", () => {
     const renewed = { ...access, views: access.views.map(item => ({ ...item, decision: {
       ...item.decision, checkedAt: "2026-09-09T11:02:00Z", expiresAt: "2026-09-09T11:07:00Z",
       ...(diagnostic === "freshness" ? { fresh: false }
-        : diagnostic === "verification" ? { verification: "provider" as const }
-          : diagnostic === "qualification" ? { previewQualification: "qualified" as const } : {}),
+        : diagnostic === "verification" ? { verification: "provider" as const } : {}),
     } })) };
     rendered.rerender(view(true, renewed));
     expect(screen.getByLabelText("Log type")).toHaveValue("agent_tools");
@@ -882,7 +579,6 @@ describe("DefenderHuntingView", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
   });
 
   it("aborts an in-flight hunt when inactive and ignores its late result on resume", async () => {
@@ -941,7 +637,6 @@ describe("DefenderHuntingView", () => {
     expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBeVisible();
     expect(getDefenderHuntingJob).toHaveBeenCalledExactlyOnceWith(result.id, expect.objectContaining({ agentRecordId }));
     expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Revoke saved-data access" })).toBeDisabled();
     fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
     expect(submitDefenderHunt).toHaveBeenCalledOnce();
     await act(async () => latestCatalog.resolve(catalog));
@@ -1084,7 +779,6 @@ describe("DefenderHuntingView", () => {
     expect(filter).toHaveFocus();
     expect(table.scrollTop).toBe(137);
     expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Revoke saved-data access" })).toBeDisabled();
     expect(screen.getByRole("button", { name: /Delete hunt 11111111/ })).toBeDisabled();
     fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
     expect(submitDefenderHunt).not.toHaveBeenCalled();
@@ -1125,9 +819,6 @@ describe("DefenderHuntingView", () => {
     });
     expect(screen.getByText("Retained updated result")).toBeVisible();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
-    expect(approveDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(revokeDefenderHuntingRetainedScope).not.toHaveBeenCalled();
     expect(deleteDefenderHunt).not.toHaveBeenCalled();
   });
 
@@ -1218,8 +909,6 @@ describe("DefenderHuntingView", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal), agentRecordId }),
     );
     expect(submitDefenderHunt).not.toHaveBeenCalled();
-    expect(approveDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("Agent IDs")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Blueprint IDs")).not.toBeInTheDocument();
     expect(window.location.pathname).toBe("/agents");
@@ -1301,98 +990,9 @@ describe("DefenderHuntingView", () => {
     expect(submitted).not.toHaveProperty("workspaceId");
   });
 
-  it.each(["current", "expired", "revoked", "different-target"])(
-    "uses exact application qualification without delegated readiness (%s)",
-    async evidence => {
-      const approvedScope = {
-        ...catalog.qualifications[0].approvedScope,
-        entraAgentIds: [evidence === "different-target" ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" : entraAgentId],
-      };
-      vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
-        ...catalog,
-        qualifications: [{
-          ...catalog.qualifications[0],
-          capabilityId: "defender.hunting.application",
-          approvedScope,
-          expiresAt: evidence === "expired" ? "2026-09-09T11:01:00.000Z" : "2026-09-09T12:00:00.000Z",
-        }],
-        retainedScopes: [{
-          ...catalog.retainedScopes[0],
-          tokenMode: "application",
-          capabilityId: "defender.hunting.application",
-          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
-          approvedScope,
-          revokedAt: evidence === "revoked" ? "2026-09-09T11:01:00.000Z" : null,
-        }],
-      });
-      vi.mocked(submitDefenderHunt).mockResolvedValue(job({ tokenMode: "application" }));
-      render(<CapabilityContext value={{
-        user: {
-          homeAccountId: "security-a", tenantId: "tenant-a", displayName: "Security",
-          username: "security@example.invalid", roles: ["AgentControl.Admin"],
-        },
-        loading: false, pending: false, error: undefined, now: Date.parse("2026-09-09T11:02:00.000Z"),
-        reload: vi.fn(async () => undefined), openPermissions: vi.fn(),
-        views: context(false).views.map(view => ({ ...view, enabled: true, configuration: { enabled: true, sharedDataScope: true, revision: 1 } })),
-      }}><DefenderHuntingView /></CapabilityContext>);
-
-      await screen.findByText("No hunting history");
-      const authorization = screen.getByLabelText("Authorization");
-      expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-      fireEvent.change(authorization, { target: { value: "application" } });
-      const search = screen.getByRole("button", { name: "Run hunt" });
-      expect(search).toHaveProperty("disabled", evidence !== "current");
-      expect(submitDefenderHunt).not.toHaveBeenCalled();
-      fireEvent.click(search);
-
-      if (evidence === "current") {
-        await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledExactlyOnceWith(
-          "application", expect.objectContaining({ templateId: "agents_inventory", entraAgentIds: [entraAgentId], agentIds: [] }),
-          expect.objectContaining({ signal: expect.any(AbortSignal) }),
-        ));
-      } else {
-        expect(submitDefenderHunt).not.toHaveBeenCalled();
-      }
-    },
-  );
-
-  it.each([false, true])("does not borrow another account's application approval, but finds its own older approval (%s)", async ownApproval => {
-    const qualification = { ...catalog.qualifications[0], capabilityId: "defender.hunting.application" as const };
-    const retained = { ...catalog.retainedScopes[0], tokenMode: "application" as const,
-      capabilityId: "defender.hunting.application" as const,
-      resultScope: { kind: "application" as const, scopeId: "application-a", configurationRevision: 1 } };
-    const shared = job({ authorizationPrincipalId: "other-owner", tokenMode: "application", resultScope: retained.resultScope });
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
-      ...catalog,
-      qualifications: [{ ...qualification, approvedBy: "other-owner" }, ...(ownApproval ? [qualification] : [])],
-      retainedScopes: [{ ...retained, id: "66666666-6666-4666-8666-666666666666", approvedBy: "other-owner" }, ...(ownApproval ? [retained] : [])],
-    });
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [shared], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(shared, "Shared saved result"));
-    vi.mocked(submitDefenderHunt).mockResolvedValue(job({ id: "77777777-7777-4777-8777-777777777777",
-      tokenMode: "application", resultScope: retained.resultScope }));
-    renderView(true, ["AgentControl.Viewer"]);
-    await screen.findByRole("button", { name: /View hunt/ });
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    const run = screen.getByRole("button", { name: "Run hunt" });
-    if (ownApproval) {
-      expect(run).toBeEnabled();
-      fireEvent.click(run);
-      await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
-    } else {
-      expect(run).toBeDisabled();
-      fireEvent.click(run);
-      expect(submitDefenderHunt).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByRole("button", { name: /View hunt/ }));
-      expect(await screen.findByText("Shared saved result")).toBeVisible();
-    }
-  });
-
-  it.each([false, true])("withholds every foreign application job mutation while preserving shared view and export (qualification: %s)", async qualificationOnly => {
+  it("withholds every foreign application job mutation while preserving shared view and export", async () => {
     const completed = job({ authorizationPrincipalId: "other-owner", tokenMode: "application",
-      resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
-      qualification: qualificationOnly ? { capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "other-owner" } : null });
+      resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } });
     const waiting = { ...completed, id: "22222222-2222-4222-8222-222222222222",
       status: "waiting_authorization" as const, canResume: true, complete: false, snapshotId: null };
     const running = { ...waiting, id: "33333333-3333-4333-8333-333333333333", status: "running" as const, canResume: false };
@@ -1423,16 +1023,13 @@ describe("DefenderHuntingView", () => {
   });
 
   it.each([
-    ["other-owner", false, "AgentControl.Viewer", false],
-    ["security-a", false, "AgentControl.Viewer", true],
-    ["security-a", true, "AgentControl.Viewer", false],
-    ["security-a", true, "AgentControl.Admin", true],
-  ] as const)("offers resume only to the current owner with the required qualification role (%s, %s, %s)", async (owner, qualificationOnly, role, resumable) => {
+    ["other-owner", "AgentControl.Viewer", false],
+    ["security-a", "AgentControl.Viewer", true],
+    ["security-a", "AgentControl.Admin", true],
+  ] as const)("offers resume only to the current owner (%s, %s)", async (owner, role, resumable) => {
     const waiting = job({ authorizationPrincipalId: owner, tokenMode: "application",
       resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
-      status: "waiting_authorization", canResume: true, complete: false, snapshotId: null,
-      qualification: qualificationOnly ? { capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64),
-        permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: owner } : null });
+      status: "waiting_authorization", canResume: true, complete: false, snapshotId: null });
     vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [waiting], count: 1, limit: 20, offset: 0 });
     renderView(true, [role]);
     await screen.findByText("Waiting Authorization");
@@ -1449,28 +1046,6 @@ describe("DefenderHuntingView", () => {
     if (resumable) expect(resume).toBeEnabled();
     else expect(resume).not.toBeInTheDocument();
     expect(resumeDefenderHunt).not.toHaveBeenCalled();
-  });
-
-  it("keeps explicit application qualification approval and run separate", async () => {
-    const approved = job({ status: "waiting_authorization", complete: false, noData: false, snapshotId: null, canResume: true, qualification: {
-      capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });
-    vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue(approved);
-    vi.mocked(startDefenderHuntingQualification).mockResolvedValue({ ...approved, status: "running" });
-    renderView(false, ["AgentControl.Admin"]);
-    await screen.findByText("Delegated authorization is not ready");
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    await screen.findByText("Shared application hunting is not qualified");
-    const approve = screen.getByRole("button", { name: /Approve qualification/ });
-    expect(approve).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    expect(approve).toBeEnabled();
-    expect(screen.queryByLabelText("Agent IDs")).not.toBeInTheDocument();
-    fireEvent.click(approve);
-    await waitFor(() => expect(approveDefenderHuntingQualification).toHaveBeenCalledOnce());
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: /Run approved qualification/ }));
-    await waitFor(() => expect(startDefenderHuntingQualification).toHaveBeenCalledExactlyOnceWith(approved.id, expect.objectContaining({ signal: expect.any(AbortSignal) })));
   });
 
   it("renders no_data without diagnosing permission, connector, license or coverage", async () => {
@@ -1508,71 +1083,6 @@ describe("DefenderHuntingView", () => {
     expect(await screen.findByText(/200-row local cap was reached/)).toBeVisible();
     expect(screen.getAllByText("Not supplied").length).toBeGreaterThan(0);
     expect(screen.getByText("Exact entra_agent_id")).toBeVisible();
-  });
-
-  it("removes delegated qualification ritual while retaining own-scope revoke and Admin-only application setup", async () => {
-    renderView(false, ["AgentControl.Viewer"]);
-    await screen.findByText("Delegated authorization is not ready");
-    expect(screen.queryByRole("button", { name: /Approve qualification/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Revoke saved-data access/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    expect(screen.queryByRole("button", { name: /Approve qualification/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Revoke saved-data access/ })).not.toBeInTheDocument();
-  });
-
-  it("revokes the exact retained scope and refreshes saved visibility", async () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    vi.mocked(revokeDefenderHuntingRetainedScope).mockResolvedValue({ ...catalog.retainedScopes[0], revokedAt: "2026-09-09T11:03:00.000Z" });
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValueOnce(catalog).mockResolvedValueOnce({ ...catalog, qualifications: [], retainedScopes: [] });
-    try {
-      renderView();
-      expect(await screen.findByText("Exact saved-data scope approved")).toBeVisible();
-      fireEvent.click(screen.getByRole("button", { name: /Revoke saved-data access/ }));
-      await waitFor(() => expect(revokeDefenderHuntingRetainedScope).toHaveBeenCalledExactlyOnceWith(catalog.retainedScopes[0].id, expect.objectContaining({ signal: expect.any(AbortSignal) })));
-      await waitFor(() => expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2));
-      expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
-    } finally {
-      confirm.mockRestore();
-    }
-  });
-
-  it("does not let sibling evidence authorize another application template", async () => {
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({ ...catalog, qualifications: [{ ...catalog.qualifications[0], templateId: "agent_activity",
-      approvedScope: { templateId: "agent_activity", agentIds: [], blueprintIds: [], actorObjectIds: [], operations: ["InferenceCall", "InvokeAgent"] } }] });
-    renderView();
-    fireEvent.change(await screen.findByLabelText("Authorization"), { target: { value: "application" } });
-    expect(await screen.findByText("Shared application hunting is not qualified")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
-
-  it("invalidates pending approval and search responses when exact filters change", async () => {
-    let resolveApproval!: (value: DefenderHuntingJob) => void;
-    vi.mocked(approveDefenderHuntingQualification).mockReturnValue(new Promise(resolve => { resolveApproval = resolve; }));
-    const approvalView = renderView(false);
-    await screen.findByText("Delegated authorization is not ready");
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    await screen.findByText("Shared application hunting is not qualified");
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    fireEvent.click(screen.getByRole("button", { name: /Approve qualification/ }));
-    await waitFor(() => expect(approveDefenderHuntingQualification).toHaveBeenCalledOnce());
-    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_activity" } });
-    await act(async () => resolveApproval(job({ status: "waiting_authorization", snapshotId: null, canResume: true })));
-    expect(screen.queryByRole("button", { name: /Run approved qualification/ })).not.toBeInTheDocument();
-    approvalView.unmount();
-
-    let resolveSearch!: (value: DefenderHuntingJob) => void;
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
-    vi.mocked(submitDefenderHunt).mockReturnValue(new Promise(resolve => { resolveSearch = resolve; }));
-    renderView();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
-    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
-    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_tools" } });
-    await act(async () => resolveSearch(job()));
-    expect(screen.queryByRole("heading", { name: /Defender agent inventory result/ })).not.toBeInTheDocument();
-    expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
   });
 
   it("clears prior rows on selection and omits internal query-scope diagnostics", async () => {
@@ -1722,11 +1232,17 @@ describe("DefenderHuntingView", () => {
     }
   });
 
-  it("does not submit through the form when provider admission is unavailable", async () => {
-    renderView(false);
+  it("retries a prior missing-permission diagnostic through the normal provider-authorized request", async () => {
+    const access = context(false);
+    access.views[0].decision = { ...access.views[0].decision, status: "missing_permission",
+      checkedAt: new Date(access.now - 1_000).toISOString() };
+    vi.mocked(submitDefenderHunt).mockRejectedValue(new ApiError(403, "provider_denied", "Microsoft denied the current hunt."));
+    render(<CapabilityContext value={access}><DefenderHuntingView /></CapabilityContext>);
     await screen.findByText("No hunting history");
+    expect(screen.getByText(/Last provider check:.*Admin prerequisite/)).toBeVisible();
     fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Microsoft denied the current hunt.");
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
   });
 
   it("stops polling after failure and only restarts its budget after explicit refresh", async () => {
@@ -1749,7 +1265,7 @@ describe("DefenderHuntingView", () => {
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
-  it("isolates saved rows and pending approval when current roles change", async () => {
+  it("isolates saved rows when current roles change", async () => {
     vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ value: [job()], count: 1, limit: 20, offset: 0 })
       .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
     const view = render(<CapabilityContext value={context()}><DefenderHuntingView /></CapabilityContext>);
@@ -1764,55 +1280,9 @@ describe("DefenderHuntingView", () => {
     render(<CapabilityContext value={context()}><DefenderHuntingView /></CapabilityContext>, true);
     expect(await screen.findByRole("button", { name: /View hunt 11111111/ })).toBeVisible();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
   });
 
-  it.each(["", "not-a-date"])("rejects malformed authoritative approval expiry before provider start (%j)", async expiresAt => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-09T11:02:00.000Z"));
-    const approved = job({ status: "waiting_authorization", snapshotId: null, canResume: true, qualification: {
-      capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a",
-    } });
-    vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue({ ...approved, expiresAt });
-    vi.mocked(startDefenderHuntingQualification).mockResolvedValue({ ...approved, status: "running" });
-    renderView(false);
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: "Run approved qualification" }));
-    await act(async () => {});
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent("Qualification approval is no longer current");
-  });
-
-  it("revalidates an approved qualification before starting provider work", async () => {
-    const approved = job({ status: "waiting_authorization", snapshotId: null, canResume: true, qualification: {
-      capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a",
-    } });
-    vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue({ ...approved, canResume: false });
-    renderView(false);
-    await screen.findByText("No hunting history");
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Run approved qualification" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Qualification approval is no longer current");
-    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-  });
-
-  it("requires application mode to remain enabled even when exact catalog evidence is current", async () => {
-    const approvedScope = { ...catalog.qualifications[0].approvedScope, entraAgentIds: [entraAgentId] };
-    vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
-      ...catalog,
-      qualifications: [{ ...catalog.qualifications[0], capabilityId: "defender.hunting.application", approvedScope }],
-      retainedScopes: [{ ...catalog.retainedScopes[0], tokenMode: "application", capabilityId: "defender.hunting.application", approvedScope,
-        resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 } }],
-    });
+  it("does not expose application mode when it is not configured", async () => {
     const value = context();
     value.views = value.views.map(view => view.definition.mode === "application" ? {
       ...view, enabled: false, configuration: { enabled: false, sharedDataScope: false, revision: 1 },

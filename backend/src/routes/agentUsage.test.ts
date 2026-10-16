@@ -169,7 +169,7 @@ describe("native Admin reviewed usage routes", () => {
     for (const path of ["usage", "usage-associations", "usage-users", "usage-history"]) expect(declaredRoutePolicies.get(`GET /agent-inventory/:recordId/${path}`))
       .toEqual({ access: "authenticated", dataClass: "official_usage_association", roles: ["AgentControl.Viewer"] });
     for (const method of ["POST", "DELETE"]) expect(declaredRoutePolicies.get(`${method} /agent-inventory/:recordId/usage-associations`))
-      .toEqual({ access: "authenticated", dataClass: "official_usage_association", roles: ["AgentControl.Admin"], csrf: true });
+      .toEqual({ access: "authenticated", dataClass: "official_usage_association", roles: ["AgentControl.Admin"], csrf: true, browserOnly: true });
   });
   it.each([["GET", "/usage-candidates"], ["POST", "/usage-associations"], ["DELETE", "/usage-associations"]])(
     "enforces session, tenant and Admin on %s %s", async (method, suffix) => {

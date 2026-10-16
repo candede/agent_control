@@ -4,7 +4,7 @@ import type { AuditAction } from "../types/audit.js";
 import { isPackageAccessEntity, isWritablePackageAccessScope, normalizePackageStatus, packageAccessCollectionLimit } from "../types/copilotPackage.js";
 import type { CopilotPackageDetail, PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 
-export type PackageBlockMutationState = {
+type PackageBlockMutationState = {
   kind: "block";
   isBlocked: boolean;
 };
@@ -27,7 +27,7 @@ export function capturePackageMutationState(details: Pick<CopilotPackageDetail,
     return { kind: "block", isBlocked: observed.isBlocked };
   }
   if (action === "reassign") {
-    throw new AppError(409, "reassign_verification_unavailable", "Microsoft Graph documents reassignment but does not expose an owner field for provider readback. Reassign owner remains disabled until a verifiable owner contract is published.");
+    throw new AppError(409, "reassign_verification_unavailable", "Package owner reassignment is not implemented: Microsoft Graph package detail does not expose an owner field for verifying the result.");
   }
   if (observed.allowedUsersAndGroups === undefined || observed.acquireUsersAndGroups === undefined) {
     throw new AppError(409, "incomplete_package_access_state", "Both package access collections must be present before an access change can be confirmed.");

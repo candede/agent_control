@@ -146,13 +146,16 @@ export function useAutomaticRefresh({
     }));
     if (current.interaction) publish({ phase: "sign_in_required", message: "Sign in again to continue automatic refresh." });
 
-    const backoff = () => {
+    const backoff = (cause?: unknown) => {
       current.failures += 1;
       current.dueAt = Date.now() + Math.min(maximumBackoffMs, checkIntervalMs * 2 ** Math.min(current.failures - 1, 4));
       const issue = sourceIssueObservation(current.sourceIssues);
+      const failure = cause instanceof ApiError
+        ? `${cause.message}${cause.requestId ? ` Request ${cause.requestId}.` : ""}`
+        : "Automatic refresh could not be checked.";
       publish({
         phase: issue?.phase ?? "backoff",
-        message: `${issue?.message ? `${issue.message} ` : ""}Automatic refresh could not be checked. The next eligible check will retry after a delay; saved data remains available.`,
+        message: `${issue?.message ? `${issue.message} ` : ""}${failure} The next eligible check will retry after a delay; saved data remains available.`,
       });
     };
 
@@ -207,7 +210,7 @@ export function useAutomaticRefresh({
           current.denied = true;
           publish({ phase: "permission_required", message: "Automatic refresh access was denied. Review Sync and Permissions." });
         } else {
-          backoff();
+          backoff(cause);
         }
       } finally {
         controller.signal.removeEventListener("abort", finishChecking);

@@ -17,7 +17,7 @@ import type { CandidateAgentUsageSummary, CandidateAgentUsageMutation, Candidate
 import { currentInventorySourcesSql, selectedInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
 import type { InventoryQueries } from "../db/inventoryQueries.js";
 import { readAgentHistory, reportAgentLinksSql } from "./officialAgentHistory.js";
-export type { CandidateAgentUsageContext, CandidateAgentUsageSummary, CandidateAgentUsageMutation } from "../types/officialReportApi.js";
+export type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
 
 const authorizedSourcesSql = currentInventorySourcesSql;
 type UsageReadContext = ReportReadContext & { inventorySelectionId?: string };
@@ -140,7 +140,9 @@ export class OfficialAgentUsage {
     }));
   }
 
-  history(selectionId: string, identity: SelectionIdentity, recordId: string, options: { limit?: number; cursor?: string } = {}) {
+  history(selectionId: string, identity: SelectionIdentity, recordId: string, options: {
+    limit?: number; cursor?: string; compareFromSetId?: string; compareToSetId?: string;
+  } = {}) {
     return this.read(selectionId, identity, async (client, context) =>
       readAgentHistory(client, this.reports, context, await this.target(client, context, recordId), recordId, options));
   }

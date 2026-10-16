@@ -4,7 +4,7 @@ import { databaseSettings, secretValue, transaction } from "../src/db/pool.js";
 import { verifySchema } from "../src/db/schema.js";
 import { databaseOperatorFailure, preflightSchema } from "./database.js";
 
-export type AzureDatabaseMode = "fresh" | "existing";
+type AzureDatabaseMode = "fresh" | "existing";
 
 export type AzureDatabasePreflight = {
   mode: AzureDatabaseMode;
@@ -50,10 +50,10 @@ export async function enterAzureMaintenance(database: Pick<pg.Pool, "query">, ex
   await identity(database, expectedDatabase);
   await verifySchema(database as pg.Pool);
   const result = await database.query(
-    "UPDATE operational_state SET mode='maintenance',updated_at=clock_timestamp() WHERE singleton=true RETURNING provider_work_enabled",
+    "UPDATE operational_state SET mode='maintenance',updated_at=clock_timestamp() WHERE singleton=true",
   );
   if (result.rowCount !== 1) throw new Error("Operational state is missing; maintenance was not entered.");
-  return { mode: "maintenance" as const, providerWorkEnabledBefore: Boolean(result.rows[0].provider_work_enabled) };
+  return { mode: "maintenance" as const };
 }
 
 export async function verifyAzureDrain(database: Pick<pg.Pool, "query">, expectedDatabase = "agentcontrol") {
@@ -82,11 +82,11 @@ export async function reopenAzureDatabase(database: Pick<pg.Pool, "query">, expe
   await verifySchema(database as pg.Pool);
   const drained = await verifyAzureDrain(database, expectedDatabase);
   const result = await database.query(
-    `UPDATE operational_state SET mode='normal',provider_work_enabled=false,updated_at=clock_timestamp()
-      WHERE singleton=true AND mode='maintenance' RETURNING mode,provider_work_enabled`,
+    `UPDATE operational_state SET mode='normal',updated_at=clock_timestamp()
+      WHERE singleton=true AND mode='maintenance' RETURNING mode`,
   );
   if (result.rowCount !== 1) throw new Error("Reopen requires the exact database to remain in maintenance.");
-  return { mode: "normal" as const, providerWorkEnabled: false, inconclusiveWrites: drained.inconclusive_writes };
+  return { mode: "normal" as const, providerWorkEnabled: true, inconclusiveWrites: drained.inconclusive_writes };
 }
 
 export async function verifyAzureRuntimePrivileges(database: Pick<pg.Pool, "query">, expectedDatabase = "agentcontrol") {

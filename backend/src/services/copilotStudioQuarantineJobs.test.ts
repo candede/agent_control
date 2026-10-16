@@ -15,7 +15,6 @@ import {
   runCopilotStudioQuarantineJob,
   runTrackedCopilotStudioQuarantineJob,
 } from "./copilotStudioQuarantineJobs.js";
-import { loadOperationalState } from "./operationalState.js";
 import { capabilities } from "./capabilities.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -384,18 +383,14 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     expect(result).toMatchObject({ status: "inconclusive", reconciliation: { attempted: 1, failed: 1 } });
   });
 
-  it.each(["maintenance", "provider_requalification_required"] as const)(
+  it.each(["maintenance"] as const)(
     "stops quarantine execution at admission boundaries when %s applies",
     async errorCode => {
       for (const stage of ["start", "authorization", "lock", "pre-read", "immediate", "immediate-no-op", "sent", "post", "readback", "readback-retry", "publication", "no-op"] as const) {
         const value = scope();
         const job = await submitted(value);
         const closeAdmissions = async () => {
-          if (errorCode === "maintenance") vi.stubEnv("MAINTENANCE_MODE", "true");
-          else {
-            await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=false WHERE singleton=true");
-            await loadOperationalState(fixture.runtime);
-          }
+          vi.stubEnv("MAINTENANCE_MODE", "true");
         };
         let reads = 0;
         const provider = {
@@ -446,8 +441,6 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
             : ["immediate", "immediate-no-op", "sent", "post"].includes(stage) ? 2 : ["pre-read", "no-op"].includes(stage) ? 1 : 0);
         } finally {
           vi.unstubAllEnvs();
-          await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
-          await loadOperationalState(fixture.runtime);
           lockMock.mockRestore();
           markSentMock.mockRestore();
         }
@@ -455,7 +448,7 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     },
   );
 
-  it.each(["maintenance", "provider_requalification_required"] as const)(
+  it.each(["maintenance"] as const)(
     "stops quarantine reconciliation at every admission boundary when %s applies",
     async errorCode => {
       for (const stage of ["start", "authorization", "lock", "readback", "publication", "next-item"] as const) {
@@ -476,11 +469,7 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
         };
         await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
         const closeAdmissions = async () => {
-          if (errorCode === "maintenance") vi.stubEnv("MAINTENANCE_MODE", "true");
-          else {
-            await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=false WHERE singleton=true");
-            await loadOperationalState(fixture.runtime);
-          }
+          vi.stubEnv("MAINTENANCE_MODE", "true");
         };
         const read = provider.getStatus.mockImplementation(async (_token, selected) => {
           if (stage === "readback") await closeAdmissions();
@@ -511,8 +500,6 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
           expect((await repository.get(value, job.id))?.results.filter(item => item.reconciliationStatus === "required"), stage).toHaveLength(1);
         } finally {
           vi.unstubAllEnvs();
-          await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
-          await loadOperationalState(fixture.runtime);
           lockMock.mockRestore();
           publications.mockRestore();
         }

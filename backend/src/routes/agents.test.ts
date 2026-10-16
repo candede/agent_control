@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bulkJobs, launchBulkJob, requireWorkerCapacity } from "../services/bulkJobs.js";
-import { acquireDelegatedToken } from "../auth/msal.js";
+import { acquireAuthorizedToken } from "../auth/msal.js";
 import { InventoryMutationStages } from "../db/inventoryMutationStages.js";
 import { packageInventory } from "../services/packageInventory.js";
 import { createJobConfirmation, JobRepository } from "../db/jobs.js";
@@ -61,7 +61,7 @@ vi.mock("../services/bulkJobs.js", async original => ({
 }));
 vi.mock("../auth/msal.js", async original => ({
   ...await original<typeof import("../auth/msal.js")>(),
-  acquireDelegatedToken: vi.fn(async () => "token"),
+  acquireAuthorizedToken: vi.fn(async () => "token"),
 }));
 vi.mock("../services/reportIdentity.js", () => ({ reportIdentity: vi.fn() }));
 
@@ -102,7 +102,7 @@ describe("package refresh admission responses", () => {
         username: "reader@example.invalid", roles: ["AgentControl.Viewer" as const] };
       const waiting = {
         id: groupId, authorizationPrincipalId: user.homeAccountId, tokenMode: "delegated" as const,
-        scopeKind: "broad" as const, requestedIds: [], catalogOnly: false, autoDetails: false,
+        scopeKind: "broad" as const, requestedIds: [], autoDetails: false,
         status: "waiting_authorization" as const, pageCount: 0, observedCount: 0, totalRecords: null,
         snapshotId: null, createdAt: "2026-09-09T00:00:00.000Z", attemptedAt: null,
         updatedAt: "2026-09-09T00:00:00.000Z", finishedAt: null,
@@ -217,7 +217,7 @@ describe("directory request lifecycle", () => {
 
   beforeEach(async () => {
     await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
-    vi.mocked(acquireDelegatedToken).mockReset().mockResolvedValue("token");
+    vi.mocked(acquireAuthorizedToken).mockReset().mockResolvedValue("token");
     vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => undefined);
     vi.spyOn(capabilities, "requireAvailable").mockResolvedValue({
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
@@ -243,7 +243,7 @@ describe("directory request lifecycle", () => {
       return { capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
         verification: "provider", previewQualification: "not_required", remediation: [] };
     });
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
       await replaceSession();
       return "token";
     });
@@ -254,13 +254,13 @@ describe("directory request lifecycle", () => {
     const { pending, response, json } = startRequest(method);
     await expect(pending).rejects.toMatchObject({ code: "unauthorized" });
     if (stage !== "lookup") expect(lookup).not.toHaveBeenCalled();
-    if (stage === "capability") expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    if (stage === "capability") expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(json).not.toHaveBeenCalled();
     expect(response.listenerCount("close")).toBe(0);
   });
 
   it.each(["get", "post"] as const)("does not dispatch %s directory work after admissions close during token acquisition", async method => {
-    vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
       vi.mocked(operationalState.requireProviderAdmissions).mockImplementation(() => {
         throw new AppError(503, "maintenance", "Provider work paused.");
       });
@@ -280,7 +280,7 @@ describe("directory request lifecycle", () => {
     vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
       if (!current) throw new AppError(401, "authorization_expired", "Directory capability changed.");
     });
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
       current = false;
       return "token";
     });
@@ -306,7 +306,7 @@ describe("directory request lifecycle", () => {
       throw new AppError(503, "provider_error", "Upstream failure.");
     };
     if (stage === "capability") vi.mocked(capabilities.requireAvailable).mockImplementationOnce(failure);
-    else if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(failure);
+    else if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(failure);
     else {
       const lookup = method === "get" ? DirectoryPrincipalsClient.prototype.search : DirectoryPrincipalsClient.prototype.resolve;
       vi.mocked(lookup).mockImplementationOnce(failure);
@@ -319,7 +319,7 @@ describe("directory request lifecycle", () => {
 
   it.each(["get", "post"] as const)("does not dispatch %s directory work after disconnection during token acquisition", async method => {
     const token = Promise.withResolvers<string>();
-    vi.mocked(acquireDelegatedToken).mockReturnValueOnce(token.promise);
+    vi.mocked(acquireAuthorizedToken).mockReturnValueOnce(token.promise);
     const { pending, response, json } = startRequest(method);
     const observed = pending.catch(error => error);
     await setImmediate();
@@ -341,7 +341,7 @@ describe("directory request lifecycle", () => {
     const token = Promise.withResolvers<string>();
     const result = Promise.withResolvers<typeof principal[]>();
     let lookupSignal: AbortSignal | undefined;
-    vi.mocked(acquireDelegatedToken).mockReturnValueOnce(stage === "token" ? token.promise : Promise.resolve("token"));
+    vi.mocked(acquireAuthorizedToken).mockReturnValueOnce(stage === "token" ? token.promise : Promise.resolve("token"));
     if (method === "get") vi.mocked(DirectoryPrincipalsClient.prototype.search).mockImplementationOnce(
       async (_token, _query, _limit, signal) => { lookupSignal = signal; return result.promise; },
     );
@@ -444,7 +444,7 @@ describe("package mutation worker admission", () => {
     await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
     vi.mocked(launchBulkJob).mockReset();
     vi.mocked(requireWorkerCapacity).mockReset();
-    vi.mocked(acquireDelegatedToken).mockReset().mockResolvedValue("token");
+    vi.mocked(acquireAuthorizedToken).mockReset().mockResolvedValue("token");
     vi.spyOn(JobRepository.prototype, "getByIdempotency").mockResolvedValue(undefined);
     vi.spyOn(InventoryMutationStages.prototype, "submit").mockResolvedValue(receipt);
     vi.spyOn(InventoryMutationStages.prototype, "preview").mockResolvedValue({ ...confirmed.summary, confirmationHash: confirmed.confirmationHash });
@@ -493,7 +493,7 @@ describe("package mutation worker admission", () => {
       await replaceSession();
       return identity;
     });
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementation(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementation(async () => {
       await replaceSession();
       return "token";
     });
@@ -525,7 +525,7 @@ describe("package mutation worker admission", () => {
       return { capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
         verification: "provider", previewQualification: "not_required", remediation: [] };
     });
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
       await replaceSession();
       return "token";
     });
@@ -582,10 +582,10 @@ describe("package mutation worker admission", () => {
   it("rejects ordinary canary resume before provider tokens or recovery", async () => {
     vi.spyOn(bulkJobs, "get").mockResolvedValue({ ...receipt, isCanary: true, status: "waiting_authorization", canResume: false });
     const recover = vi.spyOn(bulkJobs, "recover").mockResolvedValue(0);
-    vi.mocked(acquireDelegatedToken).mockClear();
+    vi.mocked(acquireAuthorizedToken).mockClear();
     await expect(requestMutation("/agents/bulk-jobs/:id/resume", { confirmed: true }))
       .rejects.toMatchObject({ code: "canary_cycle_authorization_required" });
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(recover).not.toHaveBeenCalled();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
@@ -595,7 +595,7 @@ describe("package mutation worker admission", () => {
     vi.spyOn(bulkJobs, "recover").mockImplementation(async () => {
       if (stage === "recovery") await replaceSession();
     });
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementation(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementation(async () => {
       await replaceSession();
       return "token";
     });

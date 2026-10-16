@@ -23,10 +23,11 @@ function setup() {
     value: [{
       id: recordId, displayName: "Saved agent", environmentId: "environment-a", packages: [{ id: entra, appId: entra }],
       identity: { state: "matched", evidence: [], packageEvidence: [], reason: null },
-      observations: { powerPlatform: { current: true, expiresAt: new Date(Date.now() + 60_000).toISOString() } },
+      observations: { powerPlatform: { current: true, snapshotId: "44444444-4444-4444-8444-444444444444",
+        expiresAt: new Date(Date.now() + 60_000).toISOString() } },
       powerPlatformResource: { type: "microsoft.copilotstudio/agents", tenantId: "tenant-a", environmentId: "environment-a", nativeId: entra,
-        identifiers: [{ kind: "entra_app_id", value: entra }, { kind: "cds_bot_id", value: bot }],
-        provenance: { entraAppId: { sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga" } } },
+        agentKind: "copilot_studio_agent", identifiers: [{ kind: "entra_agent_id", value: entra }, { kind: "cds_bot_id", value: bot }],
+        provenance: { entraAgentId: { sourceSystem: "power_platform", path: "properties.entraAgentId", maturity: "ga" } } },
     }],
   } as unknown as UnifiedAgentInventoryPage;
   const read = { client: {}, evaluatedAt: new Date() } as LiveInventoryRead;
@@ -85,12 +86,12 @@ describe("source-verified agent investigation context", () => {
     expect(fixture.mappings.readState).not.toHaveBeenCalled();
   });
 
-  it.each(["legacy", "typed"] as const)("rejects a changed inventory revision after %s identity reads", async kind => {
-    const fixture = kind === "legacy" ? setup() : modern();
+  it.each(["bot and directory", "directory only"] as const)("rejects a changed inventory revision after %s identity reads", async kind => {
+    const fixture = kind === "bot and directory" ? setup() : modern();
     const changed = new AppError(409, "inventory_changed", "Saved inventory changed.");
     fixture.inventory.assertCurrent.mockImplementation(async () => {
       expect(fixture.identities.identityCandidates).toHaveBeenCalledOnce();
-      if (kind === "typed") expect(fixture.mappings.readState).toHaveBeenCalledOnce();
+      expect(fixture.mappings.readState).toHaveBeenCalledOnce();
       throw changed;
     });
     await expect(fixture.service.resolve(scope, recordId)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
@@ -104,8 +105,8 @@ describe("source-verified agent investigation context", () => {
     await expect(fixture.service.resolve(scope, recordId)).rejects.toBe(unavailable);
   });
 
-  it.each(["legacy", "typed"] as const)("rejects a %s identity selection invalidated during the candidate read", async kind => {
-    const fixture = kind === "legacy" ? setup() : modern();
+  it.each(["bot and directory", "directory only"] as const)("rejects a %s identity selection invalidated during the candidate read", async kind => {
+    const fixture = kind === "bot and directory" ? setup() : modern();
     fixture.identities.identityCandidates.mockRejectedValue(new AppError(409, "snapshot_invalidated", "Inventory changed."));
     await expect(fixture.service.resolve(scope, recordId)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
     expect(fixture.mappings.readState).not.toHaveBeenCalled();
@@ -118,9 +119,9 @@ describe("source-verified agent investigation context", () => {
     await expect(fixture.service.resolve(scope, recordId)).rejects.toBe(unavailable);
   });
 
-  it.each(["legacy candidates", "typed candidates", "typed cache", "revision"] as const)(
+  it.each(["bot candidates", "directory candidates", "directory cache", "revision"] as const)(
     "retains an authorized publication past its freshness horizon during the awaited %s read", async stage => {
-      const fixture = stage === "legacy candidates" ? setup() : modern();
+      const fixture = stage === "bot candidates" ? setup() : modern();
       const expiresAt = Date.parse(fixture.record.observations.powerPlatform!.expiresAt);
       const clock = vi.spyOn(Date, "now");
       try {
@@ -130,7 +131,7 @@ describe("source-verified agent investigation context", () => {
             clock.mockReturnValue(expiresAt);
             return candidates;
           });
-        } else if (stage === "typed cache") {
+        } else if (stage === "directory cache") {
           fixture.mappings.readState.mockImplementation(async () => {
             clock.mockReturnValue(expiresAt);
             return { status: "missing" };
@@ -182,7 +183,7 @@ describe("source-verified agent investigation context", () => {
     } finally { clock.mockRestore(); }
   });
 
-  it("requires a saved revision for legacy runtime and Purview identities as well as typed resolution", async () => {
+  it("requires a saved revision for both directory resolution and Purview identities", async () => {
     const fixture = setup();
     fixture.page.revision = undefined;
     const { context, identitySource, purviewTarget } = await fixture.service.resolve(scope, recordId);
@@ -283,8 +284,7 @@ describe("source-verified agent investigation context", () => {
   ] as const)("reports saved %s outcomes without treating their candidate IDs as verified mappings", async (status, reasonCode) => {
     const fixture = modern();
     const dates = { checkedAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 30_000).toISOString() };
-    fixture.mappings.readState.mockResolvedValue({ status, ...dates, lastErrorCode: "fixture_error",
-      value: { objectId: entra, applicationId: bot, ...dates } });
+    fixture.mappings.readState.mockResolvedValue({ status, ...dates, lastErrorCode: "fixture_error" });
     const { context } = await fixture.service.resolve(scope, recordId);
     expect(context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
       reasonCode, resolution: { canResolve: true, cacheStatus: status, reasonCode, lastErrorCode: "fixture_error",
@@ -292,23 +292,34 @@ describe("source-verified agent investigation context", () => {
     expect(context.defender.resolution?.resolvedAt).toBeUndefined();
   });
 
-  it.each([null, bot, entra])("does not infer client-ID equivalence from cached values without typed provenance: %s", async applicationId => {
-    const fixture = modern();
-    const dates = { checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 30_000).toISOString() };
-    fixture.mappings.readState.mockResolvedValue({ status: "resolved", ...dates,
-      value: { objectId: entra, applicationId, ...dates } });
-    const { context } = await fixture.service.resolve(scope, recordId);
-    expect(context.defender).toMatchObject({ status: "available", entraAgentIds: [entra], entraAgentApplicationIds: [],
-      resolution: { cacheStatus: "resolved", runtimeStatus: "unverified", resolvedAt: dates.checkedAt },
-      templates: { agents_inventory: { status: "available" }, agent_activity: { status: "unavailable" }, agent_tools: { status: "unavailable" } } });
-    expect(context.defender.resolution?.runtimeProvenance).toBeUndefined();
+  it("does not use saved application IDs in place of explicit typed directory resolution", async () => {
+    const fixture = setup();
+    fixture.record.powerPlatformResource!.identifiers = [{ kind: "entra_app_id", value: entra }, { kind: "cds_bot_id", value: bot }];
+    fixture.record.powerPlatformResource!.provenance = {
+      entraAppId: { sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga" },
+    };
+    const { context, identitySource, purviewTarget } = await fixture.service.resolve(scope, recordId);
+    expect(context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
+      reasonCode: "missing_identity_candidate",
+      templates: { agents_inventory: { status: "unavailable" }, agent_activity: { status: "unavailable" }, agent_tools: { status: "unavailable" } } });
+    expect(context.purview).toMatchObject({ status: "available", presets: ["copilot_studio_admin"] });
+    expect(purviewTarget).toEqual({ environmentId: "environment-a", botId: bot });
+    expect(identitySource).toBeUndefined();
+    expect(fixture.mappings.readState).not.toHaveBeenCalled();
   });
 
   it("resolves the current visible saved record without provider search or caller identity filters", async () => {
     const fixture = setup();
+    fixture.record.powerPlatformResource!.identifiers.push({ kind: "entra_app_id", value: bot });
+    fixture.record.powerPlatformResource!.provenance.entraAppId = {
+      sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga",
+    };
+    fixture.mappings.readState.mockResolvedValue({ status: "resolved", value: { objectId: entra, applicationId: entra,
+      runtimeStatus: "available", runtimeProvenance: verifiedAgentIdentityClientIdProvenance, checkedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30_000).toISOString() } });
     await expect(fixture.service.resolve(scope, recordId)).resolves.toMatchObject({
-      context: { recordId, displayName: "Saved agent", defender: { status: "available", entraAgentIds: [], entraAgentApplicationIds: [entra],
-        templates: { agents_inventory: { status: "unavailable" }, agent_activity: { status: "available" }, agent_tools: { status: "available" } } },
+      context: { recordId, displayName: "Saved agent", defender: { status: "available", entraAgentIds: [entra], entraAgentApplicationIds: [entra],
+        templates: { agents_inventory: { status: "available" }, agent_activity: { status: "available" }, agent_tools: { status: "available" } } },
       purview: { status: "available", mode: "search", presets: ["copilot_interactions", "copilot_studio_admin"] } },
       purviewTarget: { environmentId: "environment-a", botId: bot, applicationId: entra },
     });
@@ -316,7 +327,7 @@ describe("source-verified agent investigation context", () => {
     expect(fixture.identities.identityCandidates).toHaveBeenCalledExactlyOnceWith(scope, expect.objectContaining({ id: recordId }), fixture.read);
   });
 
-  it.each(["package_id", "package_app_id", "entra_agent_id", "entra_blueprint_id", "cds_bot_id"] as const)("never substitutes unverified %s, a native ID or a canonical ID for a verified runtime application identity", async kind => {
+  it.each(["package_id", "package_app_id", "entra_app_id", "entra_agent_id", "entra_blueprint_id", "cds_bot_id"] as const)("never substitutes unverified %s, a native ID or a canonical ID for a verified runtime application identity", async kind => {
     const fixture = setup();
     fixture.record.powerPlatformResource!.identifiers = [{ kind, value: entra }];
     await expect(fixture.service.resolve(scope, recordId)).resolves.toMatchObject({ context: { defender: { status: "unavailable", entraAgentIds: [] } } });
@@ -334,10 +345,10 @@ describe("source-verified agent investigation context", () => {
       (f: ReturnType<typeof setup>) => { f.record.identity.invalidMetadata = true; },
       (f: ReturnType<typeof setup>) => { f.record.observations.powerPlatform!.current = false; },
       (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.tenantId = "other-tenant"; },
-      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.identifiers.push({ kind: "entra_app_id", value: bot }); },
-      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.identifiers.push({ kind: "entra_app_id", value: "not-an-application-id" }); },
+      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.identifiers.push({ kind: "entra_agent_id", value: bot }); },
+      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.identifiers.push({ kind: "entra_agent_id", value: "not-an-agent-id" }); },
       (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.provenance = {}; },
-      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.provenance.entraAppId.path = "properties.entraAgentId"; },
+      (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource!.provenance.entraAgentId.path = "properties.entraAppId"; },
       (f: ReturnType<typeof setup>) => { f.record.powerPlatformResource = null; },
     ]) {
       const fixture = setup(); change(fixture);
@@ -347,8 +358,8 @@ describe("source-verified agent investigation context", () => {
 
   it("requires the current environment and a typed bot ID for saved Purview, not runtime AgentId", async () => {
     const fixture = setup();
-    fixture.record.powerPlatformResource!.identifiers = [{ kind: "entra_app_id", value: entra }];
-    await expect(fixture.service.resolve(scope, recordId)).resolves.toMatchObject({ context: { defender: { status: "available" }, purview: { status: "unavailable" } } });
+    fixture.record.powerPlatformResource!.identifiers = [{ kind: "entra_agent_id", value: entra }];
+    await expect(fixture.service.resolve(scope, recordId)).resolves.toMatchObject({ context: { defender: { status: "unavailable" }, purview: { status: "unavailable" } } });
     fixture.record.powerPlatformResource!.identifiers.push({ kind: "cds_bot_id", value: bot });
     fixture.record.environmentId = "other-environment";
     expect((await fixture.service.resolve(scope, recordId)).purviewTarget).toBeUndefined();
@@ -376,7 +387,7 @@ describe("source-verified agent investigation context", () => {
     }
   });
 
-  it("accepts exact context IDs and empty legacy fields but rejects conflicting or broad identity filters", () => {
+  it("accepts exact context IDs and empty general-scope fields but rejects conflicting or broad identity filters", () => {
     const agent = { recordId, entraAgentIds: [entra] };
     const input = { templateId: "agents_inventory", startDateTime: new Date(Date.now() - 30_000).toISOString(), endDateTime: new Date().toISOString(), actorObjectIds: [], operations: [] };
     expect(validateDefenderHuntingFilters(bindAgentHuntingFilters(input, agent))).toMatchObject({ agentIds: [], blueprintIds: [], entraAgentIds: [entra] });

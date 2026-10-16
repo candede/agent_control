@@ -144,23 +144,19 @@ function Test-ApprovedAzureTarget {
         throw 'Target contract version 2 and explicit isApproval=true are required.'
     }
     $targetKeys = if ($Target -is [Collections.IDictionary]) { @($Target.Keys) } else { @($Target.PSObject.Properties.Name) }
-    if ('expectedSchemaVersion' -in $targetKeys) {
-        throw "Target option 'expectedSchemaVersion' is no longer supported. Existing databases must match the compiled schema fingerprint; reset incompatible development databases explicitly."
-    }
-    foreach ($name in @('legacyAuditBackupPath', 'legacyAuditBackupSha256', 'legacyStaticWebApp')) {
-        if ($name -in $targetKeys) {
-            throw "Target option '$name' is no longer supported. SQLite audit import and Static Web App retirement are retired; remove the option even if it is empty or null. Existing data and resources are not changed."
-        }
+    $allowedTargetKeys = @('approvedMonthlyBudget','callbackUri','canonicalOrigin','contractVersion','entraApplicationId',
+        'estimate','existingVaultResourceId','expectedDatabaseName','expectedResourceIds','firstInstallApproved','installationMode',
+        'isApproval','maintenanceApproval','operatorApproval','preparedVaultContract','region','resourceGroup','resources',
+        'riskAcceptance','runnerIpv4Address','subscriptionId','tenantId','tenantRegistryRegistrationApprovalReference','tenantRegistrySecretName')
+    if (@($targetKeys | Where-Object { $_ -cnotin $allowedTargetKeys }).Count) {
+        throw 'Target contains unsupported fields.'
     }
     if ($Target.installationMode -cnotin @('fresh', 'existing')) {
-        throw 'installationMode supports only fresh or existing; schema upgrades and SQLite audit import are no longer supported.'
+        throw 'installationMode supports only fresh or existing.'
     }
     Assert-GuidValue $Target.tenantId 'tenantId'
     Assert-GuidValue $Target.subscriptionId 'subscriptionId'
     Assert-GuidValue $Target.entraApplicationId 'entraApplicationId'
-    foreach ($name in @('tenantDomains','tenantDisplayName')) {
-        if ($name -in $targetKeys) { throw "Standalone tenant option '$name' is no longer supported. Configure profiles in the TENANTS_JSON registry." }
-    }
     if ($Target.tenantRegistrySecretName -cne 'agent-control-tenants-json') {
         throw 'TENANTS_JSON is required: tenantRegistrySecretName must name the prepared agent-control-tenants-json secret.'
     }

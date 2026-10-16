@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import {
   ApiError,
-  approvePurviewAuditQualification,
   cancelPurviewAuditSearch,
   deletePurviewAuditSearch,
   downloadPurviewAuditCsv,
@@ -15,12 +14,10 @@ import {
   getPurviewAuditJobs,
   getPurviewAuditRecords,
   resumePurviewAuditSearch,
-  startPurviewAuditQualification,
   submitPurviewAuditSearch,
   type CapabilityView,
   type PurviewAuditFilters,
   type PurviewAuditJob,
-  type PurviewAuditQualification,
   type PurviewAuditRecordPage,
   type SessionUser,
 } from "../api/client";
@@ -33,7 +30,6 @@ import { workbenchActions } from "../../../backend/src/services/workbenchMetadat
 
 vi.mock("../api/client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api/client")>()),
-  approvePurviewAuditQualification: vi.fn(),
   cancelPurviewAuditSearch: vi.fn(),
   deletePurviewAuditSearch: vi.fn(),
   downloadPurviewAuditCsv: vi.fn(),
@@ -42,7 +38,6 @@ vi.mock("../api/client", async (importOriginal) => ({
   getPurviewAuditJobs: vi.fn(),
   getPurviewAuditRecords: vi.fn(),
   resumePurviewAuditSearch: vi.fn(),
-  startPurviewAuditQualification: vi.fn(),
   submitPurviewAuditSearch: vi.fn(),
 }));
 
@@ -88,7 +83,6 @@ const catalog = {
   ],
   limits: {
     maximumWindowHours: 168,
-    qualificationWindowHours: 1,
     maximumPages: 20,
     maximumRows: 5_000,
     maximumBytes: 8_000_000,
@@ -144,7 +138,6 @@ const partialJob: PurviewAuditJob = {
     startDateTime: "2026-09-08T12:45:00.000Z",
     endDateTime: "2026-09-08T13:00:00.000Z",
   },
-  qualificationId: null,
   cancelRequested: false,
   createdAt: "2026-09-08T13:01:00.000Z",
   attemptedAt: "2026-09-08T13:01:01.000Z",
@@ -175,10 +168,8 @@ function capabilityView(
       verification: "provider",
       checkedAt: authorized ? "2026-09-08T13:00:00.000Z" : undefined,
       expiresAt: authorized ? "2026-09-08T14:00:00.000Z" : undefined,
-      previewQualification: authorized ? "qualified" : "unqualified",
-      remediation: [
-        "Approve and run one bounded live qualification; routine probes never create queries.",
-      ],
+      previewQualification: "not_required",
+      remediation: [],
     },
   };
 }
@@ -197,28 +188,6 @@ function context(
     now,
     reload: vi.fn(async () => undefined),
     openPermissions: vi.fn(),
-  };
-}
-
-function approvedQualification(
-  overrides: Partial<PurviewAuditQualification> = {},
-): PurviewAuditQualification {
-  return {
-    id: "qualification-a",
-    capabilityId: "purview.audit.search.delegated",
-    tokenMode: "delegated",
-    authorizationPrincipalId: "reader-a",
-    resultScope: { kind: "principal", scopeId: "reader-a", configurationRevision: null },
-    filters,
-    status: "approved",
-    contractRevision: "fixture-contract",
-    permissionRevision: "fixture-permission",
-    configurationRevision: 1,
-    approvedBy: "reader-a",
-    approvedAt: "2026-09-08T13:00:00.000Z",
-    expiresAt: "2026-09-08T13:20:00.000Z",
-    jobId: null,
-    ...overrides,
   };
 }
 
@@ -255,6 +224,21 @@ describe("PurviewAuditView", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([viewer, administrator])("lets $displayName request a configured application search directly", async account => {
+    vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
+    const access = context(account, true);
+    access.views = access.views.map(view => ({ ...view, decision: { ...view.decision,
+      status: "available", authorized: true, fresh: true,
+      verification: "on_demand", previewQualification: "not_required", checkedAt: undefined, expiresAt: undefined } }));
+    render(<CapabilityContext value={access}><PurviewAuditView /></CapabilityContext>);
+    await screen.findByText("No Audit Search history");
+    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
+    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+    await waitFor(() => expect(submitPurviewAuditSearch).toHaveBeenCalledExactlyOnceWith("application",
+      expect.objectContaining({ presetId: "copilot_interactions" }), expect.anything()));
+  });
+
   it.each([undefined, viewer.username])("scopes agent collection and history to the selected agent and user %s", async userPrincipalName => {
     const agentRecordId = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     vi.mocked(submitPurviewAuditSearch).mockRejectedValue(new ApiError(403, "provider_denied", "Purview access denied by the provider."));
@@ -282,8 +266,10 @@ describe("PurviewAuditView", () => {
     expect(screen.queryByRole("button", { name: "Export CSV" })).not.toBeInTheDocument();
   });
 
-  it("keeps the scoped form compact and refreshes missing permissions without creating a query", async () => {
+  it("keeps the scoped form compact without using past permission diagnostics as a query gate", async () => {
     const value = context(viewer);
+    value.views[0].decision = { ...value.views[0].decision, status: "missing_permission",
+      checkedAt: new Date(value.now - 1_000).toISOString() };
     value.views = value.views.filter(view => view.definition.mode === "delegated");
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
@@ -294,42 +280,44 @@ describe("PurviewAuditView", () => {
     expect(screen.queryByRole("region", { name: "Structured identity filters" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("IP addresses")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Authorization")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Check permissions" }));
-    expect(value.reload).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
+    expect(screen.getByText(/Last provider check:.*Admin prerequisite/)).toBeVisible();
+    expect(value.reload).not.toHaveBeenCalled();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-    expect(approvePurviewAuditQualification).not.toHaveBeenCalled();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: "Open Permissions" }));
-    expect(value.openPermissions).toHaveBeenCalledOnce();
   });
 
-  it("keeps incomplete readiness concise while preserving actual setup failures", async () => {
-    const value = context(viewer);
-    value.views[0].decision.checkedAt = "2026-09-08T13:00:00.000Z";
+  it("allows current on-demand requests while preserving honest permission diagnostics", async () => {
+    const value = context(viewer, true);
+    value.views[0].decision = { ...value.views[0].decision, verification: "on_demand",
+      previewQualification: "not_required", checkedAt: undefined, expiresAt: undefined };
     const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
-    expect(screen.getByText("Check incomplete. Retry permissions.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "Audit Search authorization pending" })).not.toBeInTheDocument();
     expect(screen.queryByText(/did not establish/)).not.toBeInTheDocument();
-    const denied = { ...value, views: [{ ...value.views[0], decision: { ...value.views[0].decision, status: "missing_role" as const } }] };
+    const denied = { ...value, views: [{ ...value.views[0], decision: { ...value.views[0].decision, status: "missing_role" as const,
+      checkedAt: new Date(value.now - 1_000).toISOString() } }] };
     view.rerender(<CapabilityContext value={denied}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
-    expect(screen.getByRole("region", { name: "Audit Search authorization pending" })).toHaveTextContent("Requires Audit Logs or View-Only Audit Logs.");
+    expect(screen.getByText(/Last provider check: Requires Audit Logs or View-Only Audit Logs/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
   });
 
-  it.each(["unchecked", "expired"] as const)("uses application-specific recovery for %s evidence", async state => {
+  it.each(["on-demand", "expired"] as const)("requests an application search directly with %s evidence", async state => {
     const value = context(administrator);
-    const application = capabilityView(state === "expired", "purview.audit.search.application");
+    const application = capabilityView(true, "purview.audit.search.application");
     if (state === "expired") application.decision.expiresAt = new Date(value.now).toISOString();
+    else application.decision = { ...application.decision, verification: "on_demand",
+      previewQualification: "not_required", checkedAt: undefined, expiresAt: undefined };
     value.views.splice(1, 1, application);
+    vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
     render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    const access = screen.getByRole("region", { name: "Audit Search qualification required" });
-    expect(access).toHaveTextContent(/Application qualification required/);
-    expect(access).not.toHaveTextContent(/Check incomplete|Permissions have not been checked/);
-    expect(within(access).queryByText("Available")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
     expect(getPurviewAuditJobs).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+    await waitFor(() => expect(submitPurviewAuditSearch).toHaveBeenCalledOnce());
   });
 
   it("expires the last operation warning without changing admission or reloading saved results", async () => {
@@ -348,11 +336,12 @@ describe("PurviewAuditView", () => {
     expect(value.reload).not.toHaveBeenCalled();
   });
 
-  it("rejects an application search at submission when the diagnostics timer has not observed expiry", async () => {
+  it("does not treat application diagnostic expiry as revoked authorization at submission", async () => {
     const value = context(administrator);
     const application = capabilityView(true, "purview.audit.search.application");
     application.decision.expiresAt = new Date(value.now + 1_000).toISOString();
     value.views.splice(1, 1, application);
+    vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
     render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
@@ -360,7 +349,7 @@ describe("PurviewAuditView", () => {
     expect(submit).toBeEnabled();
     vi.setSystemTime(value.now + 1_000);
     fireEvent.submit(submit.closest("form")!);
-    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+    await waitFor(() => expect(submitPurviewAuditSearch).toHaveBeenCalledOnce());
   });
 
   it("preserves filters and selected records when only capability diagnostics renew", async () => {
@@ -402,30 +391,6 @@ describe("PurviewAuditView", () => {
     expect(getPurviewAuditJobs).toHaveBeenCalledOnce();
     expect(value.reload).not.toHaveBeenCalled();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-  });
-
-  it.each(["approve", "start"] as const)("waits for returning saved-state revalidation before qualification %s", async action => {
-    const value = context(administrator);
-    let finish!: (history: Awaited<ReturnType<typeof getPurviewAuditJobs>>) => void;
-    vi.mocked(getPurviewAuditJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue(approvedQualification({
-      tokenMode: "application", capabilityId: "purview.audit.search.application",
-    }));
-    const view = render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
-    await screen.findByText("No Audit Search history");
-    await userEvent.selectOptions(screen.getByLabelText("Authorization"), "application");
-    await userEvent.click(screen.getByRole("checkbox", { name: /Approve one narrow/ }));
-    if (action === "start") await userEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    view.rerender(<CapabilityContext value={value}><PurviewAuditView active={false} /></CapabilityContext>);
-    view.rerender(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
-    const button = screen.getByRole("button", { name: action === "start" ? "Run approved qualification" : "Approve qualification" });
-    expect(button).toBeDisabled();
-    fireEvent.click(button);
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-    expect(approvePurviewAuditQualification).toHaveBeenCalledTimes(action === "start" ? 1 : 0);
-    await act(async () => finish({ value: [], count: 0, limit: 20, offset: 0 }));
-    expect(button).toBeEnabled();
   });
 
   it("revalidates the exact saved selection and record page before showing them on return", async () => {
@@ -573,7 +538,6 @@ describe("PurviewAuditView", () => {
     await screen.findByText("No Audit Search history");
     expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
     expect(submitPurviewAuditSearch).toHaveBeenCalledOnce();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
     expect(resumePurviewAuditSearch).not.toHaveBeenCalled();
   });
 
@@ -773,16 +737,20 @@ describe("PurviewAuditView", () => {
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
   });
 
-  it("keeps delegated search disabled without exposing a qualification ritual", async () => {
+  it("keeps a real permission failure actionable", async () => {
+    const value = context(viewer);
+    value.views[0].decision = { ...value.views[0].decision, status: "missing_permission",
+      checkedAt: new Date(value.now - 1_000).toISOString() };
+    vi.mocked(submitPurviewAuditSearch).mockRejectedValue(new ApiError(403, "provider_denied", "Microsoft denied the current search."));
     render(
-      <CapabilityContext value={context(viewer)}>
+      <CapabilityContext value={value}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText("Delegated authorization is not ready")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
+    await screen.findByText("No Audit Search history");
+    expect(screen.getByText(/Last provider check:.*Admin prerequisite/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
     expect(getPurviewAuditCatalog).toHaveBeenCalledOnce();
     expect(getPurviewAuditJobs).toHaveBeenCalledExactlyOnceWith(
       20,
@@ -790,14 +758,18 @@ describe("PurviewAuditView", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-    expect(approvePurviewAuditQualification).not.toHaveBeenCalled();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Microsoft denied the current search.");
+    expect(submitPurviewAuditSearch).toHaveBeenCalledOnce();
   });
 
-  it.each([true, false])("uses application authorization independently of delegated readiness (available: %s)", async (available) => {
+  it.each([true, false])("uses configured shared application scope independently of delegated diagnostics (shared: %s)", async (available) => {
     const user = userEvent.setup();
     const selectedContext = context(administrator, !available);
     selectedContext.views.splice(1, 1, capabilityView(available, "purview.audit.search.application"));
+    selectedContext.views[1].configuration!.sharedDataScope = available;
+    selectedContext.views[0].decision.status = available ? "missing_permission" : "available";
+    if (!available) selectedContext.views[1].decision.status = "missing_permission";
     vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
     render(
       <CapabilityContext value={selectedContext}>
@@ -807,7 +779,7 @@ describe("PurviewAuditView", () => {
 
     const authorization = await screen.findByLabelText("Authorization");
     const search = screen.getByRole("button", { name: "Run Audit Search" });
-    expect(search).toHaveProperty("disabled", available);
+    expect(search).toBeEnabled();
     await user.selectOptions(authorization, "application");
     expect(search).toHaveProperty("disabled", !available);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
@@ -836,7 +808,6 @@ describe("PurviewAuditView", () => {
     expect(getPurviewAuditJobs).toHaveBeenCalledWith(20, 0, expect.objectContaining({ userPrincipalName: "employee@example.invalid" }));
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
     expect(submitPurviewAuditSearch).toHaveBeenCalledWith("delegated",
       expect.objectContaining({ userPrincipalNames: ["employee@example.invalid"] }), expect.anything());
@@ -850,97 +821,6 @@ describe("PurviewAuditView", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("did not match the selected user");
     expect(screen.queryByRole("button", { name: /View results/ })).not.toBeInTheDocument();
     expect(downloadPurviewAuditCsv).not.toHaveBeenCalled();
-  });
-
-  it("keeps explicit Admin application qualification approval and start", async () => {
-    vi.mocked(approvePurviewAuditQualification).mockImplementation(
-      async (tokenMode, approvedFilters) => ({
-        id: "qualification-a",
-        capabilityId: "purview.audit.search.application",
-        tokenMode,
-        authorizationPrincipalId: "reader-a",
-        resultScope: { kind: "principal", scopeId: "reader-a", configurationRevision: null },
-        filters: approvedFilters,
-        status: "approved",
-        contractRevision: "fixture-contract",
-        permissionRevision: "fixture-permission",
-        configurationRevision: 1,
-        approvedBy: "reader-a",
-        approvedAt: "2026-09-08T13:00:00.000Z",
-        expiresAt: "2026-09-08T13:10:00.000Z",
-        jobId: null,
-      }),
-    );
-    vi.mocked(startPurviewAuditQualification).mockResolvedValue({
-      ...partialJob,
-      status: "running",
-      qualificationId: "qualification-a",
-      canResume: false,
-    });
-    const user = userEvent.setup();
-
-    render(
-      <CapabilityContext value={context(administrator)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-
-    await screen.findByText("Delegated authorization is not ready");
-    await user.selectOptions(screen.getByLabelText("Authorization"), "application");
-    await screen.findByText("Application qualification required");
-    const approve = screen.getByRole("button", {
-      name: "Approve qualification",
-    });
-    expect(approve).toBeDisabled();
-    await user.click(
-      screen.getByRole("checkbox", {
-        name: "Approve one narrow remote query for contract qualification",
-      }),
-    );
-    await user.click(approve);
-
-    expect(approvePurviewAuditQualification).toHaveBeenCalledOnce();
-    expect(approvePurviewAuditQualification).toHaveBeenCalledWith(
-      "application",
-      expect.objectContaining({
-        presetId: "copilot_interactions",
-        operations: ["CopilotInteraction"],
-        userPrincipalNames: [viewer.username],
-        ipAddresses: [],
-        objectIds: [],
-        administrativeUnitIds: [],
-      }),
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-
-    await user.click(
-      await screen.findByRole("button", {
-        name: "Run approved qualification",
-      }),
-    );
-    expect(startPurviewAuditQualification).toHaveBeenCalledExactlyOnceWith(
-      "qualification-a",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-  });
-
-  it("keeps application qualification approval Admin-only", async () => {
-    const user = userEvent.setup();
-    render(
-      <CapabilityContext value={context(viewer)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-
-    await screen.findByText("Delegated authorization is not ready");
-    await user.selectOptions(screen.getByLabelText("Authorization"), "application");
-    expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox", {
-      name: "Approve one narrow remote query for contract qualification",
-    })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
   });
 
   it("shows bounded partial coverage, minimized identifiers, and exact associations", async () => {
@@ -1145,7 +1025,7 @@ describe("PurviewAuditView", () => {
     expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
   });
 
-  it("reloads saved state when the current account's capability configuration changes", async () => {
+  it("reloads saved state after capability diagnostics change without gating a new read", async () => {
     const view = render(
       <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
@@ -1153,14 +1033,16 @@ describe("PurviewAuditView", () => {
     );
     await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledOnce());
 
+    const unavailable = context(viewer);
+    unavailable.views[0].decision.status = "missing_permission";
     view.rerender(
-      <CapabilityContext value={context(viewer)}>
+      <CapabilityContext value={unavailable}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
 
     await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
   });
 
   it("keeps saved results and delegated search usable after available capability evidence expires", async () => {
@@ -1188,128 +1070,6 @@ describe("PurviewAuditView", () => {
       0,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-  });
-
-  it.each(["", "not-a-date"])("rejects malformed approval expiry at the provider-start boundary (%j)", async expiresAt => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-08T13:05:00.000Z"));
-    const approved = approvedQualification();
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue(approved);
-    vi.mocked(startPurviewAuditQualification).mockResolvedValue({ ...partialJob, status: "running", qualificationId: approved.id });
-    render(<CapabilityContext value={context(administrator)}><PurviewAuditView /></CapabilityContext>);
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one narrow/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await act(async () => {});
-    const start = screen.getByRole("button", { name: "Run approved qualification" });
-    // The handler must validate the current approval, not trust an already rendered button.
-    approved.expiresAt = expiresAt;
-    fireEvent.click(start);
-    await act(async () => {});
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-  });
-
-  it("does not run an approved qualification after its approval expires", async () => {
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue({
-      id: "qualification-expired",
-      capabilityId: "purview.audit.search.delegated",
-      tokenMode: "delegated",
-      authorizationPrincipalId: "reader-a",
-      resultScope: { kind: "principal", scopeId: "reader-a", configurationRevision: null },
-      filters,
-      status: "approved",
-      contractRevision: "fixture-contract",
-      permissionRevision: "fixture-permission",
-      configurationRevision: 1,
-      approvedBy: "reader-a",
-      approvedAt: "2026-09-08T13:00:00.000Z",
-      expiresAt: "2026-09-08T13:20:00.000Z",
-      jobId: null,
-    });
-    const user = userEvent.setup();
-    render(
-      <CapabilityContext
-        value={context(administrator, false, Date.parse("2026-09-08T13:30:00.000Z"))}
-      >
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
-    await user.click(await screen.findByRole("checkbox", {
-      name: "Approve one narrow remote query for contract qualification",
-    }));
-    await user.click(screen.getByRole("button", { name: "Approve qualification" }));
-
-    expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-  });
-
-  it.each(["timer", "suspended timer"] as const)(
-    "expires newly received approvals using wall time with a stale capability clock (%s)", async phase => {
-      vi.useFakeTimers();
-      const access = context(administrator);
-      vi.setSystemTime(new Date("2026-09-08T13:10:00.000Z"));
-      const expiresAt = new Date(Date.now() + 1_000).toISOString();
-      vi.mocked(approvePurviewAuditQualification).mockResolvedValue(approvedQualification({ expiresAt }));
-      render(<CapabilityContext value={access}><PurviewAuditView /></CapabilityContext>);
-      await act(async () => {});
-      fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-      fireEvent.click(screen.getByRole("checkbox", { name: /Approve one narrow/ }));
-      fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-      await act(async () => {});
-      const start = screen.getByRole("button", { name: "Run approved qualification" });
-      if (phase === "timer") {
-        await act(() => vi.advanceTimersByTimeAsync(1_001));
-        expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-      } else {
-        vi.setSystemTime(new Date(Date.parse(expiresAt) + 1));
-        fireEvent.click(start);
-        await act(async () => {});
-      }
-      expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-      expect(getPurviewAuditCatalog).toHaveBeenCalledOnce();
-      expect(access.reload).not.toHaveBeenCalled();
-    },
-  );
-
-  it("invalidates approval and qualification when exact filters change", async () => {
-    vi.mocked(approvePurviewAuditQualification).mockImplementation(
-      async (tokenMode, approvedFilters) => ({
-        id: "qualification-filter-bound",
-        capabilityId: "purview.audit.search.delegated",
-        tokenMode,
-        authorizationPrincipalId: "reader-a",
-        resultScope: { kind: "principal", scopeId: "reader-a", configurationRevision: null },
-        filters: approvedFilters,
-        status: "approved",
-        contractRevision: "fixture-contract",
-        permissionRevision: "fixture-permission",
-        configurationRevision: 1,
-        approvedBy: "reader-a",
-        approvedAt: "2026-09-08T13:00:00.000Z",
-        expiresAt: "2026-09-08T13:20:00.000Z",
-        jobId: null,
-      }),
-    );
-    const user = userEvent.setup();
-    render(
-      <CapabilityContext value={context(administrator)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
-    const approval = await screen.findByRole("checkbox", {
-      name: "Approve one narrow remote query for contract qualification",
-    });
-    await user.click(approval);
-    await user.click(screen.getByRole("button", { name: "Approve qualification" }));
-    expect(await screen.findByRole("button", { name: "Run approved qualification" })).toBeVisible();
-
-    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-08T10:30" } });
-
-    expect(approval).not.toBeChecked();
-    expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
   });
 
   it("ignores an active-job poll that resolves after the account changes", async () => {
@@ -1765,34 +1525,6 @@ describe("PurviewAuditView", () => {
     expect(getPurviewAuditJobs).toHaveBeenCalledTimes(2);
   });
 
-  it.each([false, true])("refreshes qualification readiness from the exact completed job (in history: %s)", async inHistory => {
-    vi.useFakeTimers();
-    const value = context(administrator);
-    const running = { ...partialJob, status: "running" as const, qualificationId: "qualification-a" };
-    const succeeded = { ...running, status: "succeeded" as const };
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue(approvedQualification());
-    vi.mocked(startPurviewAuditQualification).mockResolvedValue(running);
-    vi.mocked(getPurviewAuditJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-      .mockResolvedValue({ value: inHistory ? [running] : [], count: inHistory ? 1 : 0, limit: 20, offset: 0 });
-    vi.mocked(getPurviewAuditJob).mockResolvedValueOnce(running).mockResolvedValue(succeeded);
-    render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
-    await act(async () => {});
-    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Approve one narrow/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: "Run approved qualification" }));
-    await act(async () => {});
-    await act(() => vi.advanceTimersByTimeAsync(2_000));
-    expect(getPurviewAuditJob).toHaveBeenCalledTimes(inHistory ? 0 : 1);
-    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: inHistory ? [succeeded] : [], count: inHistory ? 1 : 0, limit: 20, offset: 0 });
-    await act(() => vi.advanceTimersByTimeAsync(2_000));
-    expect(value.reload).toHaveBeenCalledOnce();
-    await act(() => vi.advanceTimersByTimeAsync(10_000));
-    expect(value.reload).toHaveBeenCalledOnce();
-    expect(startPurviewAuditQualification).toHaveBeenCalledOnce();
-  });
-
   it.each(["succeeded", "partial", "inconclusive"] as const)(
     "refreshes delegated lifecycle readiness only for a complete explicit search: %s", async status => {
       vi.useFakeTimers();
@@ -1818,21 +1550,9 @@ describe("PurviewAuditView", () => {
       await act(async () => {});
       expect(value.reload).toHaveBeenCalledTimes(status === "succeeded" ? 2 : 0);
       expect(submitPurviewAuditSearch).toHaveBeenCalledOnce();
-      expect(startPurviewAuditQualification).not.toHaveBeenCalled();
       expect(resumePurviewAuditSearch).not.toHaveBeenCalled();
     },
   );
-
-  it("shows expired qualification remediation without offering stale resume or unpublished results", async () => {
-    const expired: PurviewAuditJob = { ...partialJob, status: "inconclusive", canResume: false, storedRowCount: 0, pageCount: 0,
-      errorCode: "qualification_expired", message: "Audit Search qualification approval expired. Approve a new bounded qualification." };
-    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [expired], count: 1, limit: 20, offset: 0 });
-    render(<CapabilityContext value={context(administrator, true)}><PurviewAuditView /></CapabilityContext>);
-    expect(await screen.findByText(/qualification_expired: Audit Search qualification approval expired/)).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Resume search|View results|Export results|Cancel local polling/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Delete local cache/ })).toBeEnabled();
-    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
-  });
 
   it("never claims complete coverage for an empty partial result", async () => {
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [partialJob], count: 1, limit: 20, offset: 0 });
@@ -1876,10 +1596,12 @@ describe("PurviewAuditView", () => {
     }
   });
 
-  it("enforces current authorization and operations in the form handler, not only the button", async () => {
+  it("enforces the current session role and operations in the form handler, not only the button", async () => {
     vi.mocked(getPurviewAuditCatalog).mockResolvedValue({ ...catalog,
       presets: catalog.presets.map(preset => preset.id === "copilot_studio_admin" ? { ...preset, operations: [] } : preset) });
-    const view = render(<CapabilityContext value={context(viewer)}><PurviewAuditView /></CapabilityContext>);
+    const unavailable = context(viewer);
+    unavailable.user = { ...viewer, roles: [] };
+    const view = render(<CapabilityContext value={unavailable}><PurviewAuditView /></CapabilityContext>);
     await screen.findByText("No Audit Search history");
     fireEvent.submit(screen.getByRole("button", { name: "Run Audit Search" }).closest("form")!);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
@@ -2103,104 +1825,6 @@ describe("PurviewAuditView", () => {
     await act(() => vi.advanceTimersByTimeAsync(2_000));
     expect(getPurviewAuditJobs).toHaveBeenCalledTimes(count + 2);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
-  });
-
-  it("reports failed qualification-readiness refresh and retries it manually without another provider start", async () => {
-    const value = context(administrator);
-    value.reload.mockRejectedValueOnce(new Error("Readiness unavailable")).mockResolvedValue(undefined);
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue(approvedQualification());
-    const succeeded = { ...partialJob, status: "succeeded" as const, qualificationId: "qualification-a" };
-    vi.mocked(startPurviewAuditQualification).mockResolvedValue(succeeded);
-    vi.mocked(getPurviewAuditJobs).mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 })
-      .mockResolvedValue({ value: [succeeded], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getPurviewAuditJob).mockResolvedValue(succeeded);
-    render(<CapabilityContext value={value}><PurviewAuditView /></CapabilityContext>);
-    await screen.findByText("No Audit Search history");
-    await userEvent.selectOptions(screen.getByLabelText("Authorization"), "application");
-    await userEvent.click(screen.getByRole("checkbox", { name: /Approve one narrow/ }));
-    await userEvent.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Run approved qualification" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Readiness unavailable");
-    expect(value.reload).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole("button", { name: "Refresh Audit Search history" }));
-    await waitFor(() => expect(value.reload).toHaveBeenCalledTimes(2));
-    expect(startPurviewAuditQualification).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  });
-
-  it("ignores a qualification approval that resolves after the account changes", async () => {
-    let resolveStaleApproval!: (value: PurviewAuditQualification) => void;
-    const currentAdmin: SessionUser = {
-      ...administrator,
-      homeAccountId: "reader-b",
-      username: "reader-b@example.invalid",
-    };
-    vi.mocked(approvePurviewAuditQualification).mockReturnValueOnce(
-      new Promise((resolve) => { resolveStaleApproval = resolve; }),
-    );
-    const user = userEvent.setup();
-    const view = render(
-      <CapabilityContext value={context(administrator)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
-    await user.click(await screen.findByRole("checkbox", {
-      name: "Approve one narrow remote query for contract qualification",
-    }));
-    await user.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await waitFor(() => expect(approvePurviewAuditQualification).toHaveBeenCalledOnce());
-
-    view.rerender(
-      <CapabilityContext value={context(currentAdmin)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await act(async () => {
-      resolveStaleApproval(approvedQualification());
-    });
-
-    expect(screen.queryByRole("button", { name: "Run approved qualification" })).not.toBeInTheDocument();
-  });
-
-  it("ignores a qualification job that starts after the account changes", async () => {
-    let resolveStaleStart!: (value: PurviewAuditJob) => void;
-    const currentAdmin: SessionUser = {
-      ...administrator,
-      homeAccountId: "reader-b",
-      username: "reader-b@example.invalid",
-    };
-    vi.mocked(approvePurviewAuditQualification).mockResolvedValue(
-      approvedQualification(),
-    );
-    vi.mocked(startPurviewAuditQualification).mockReturnValueOnce(
-      new Promise((resolve) => { resolveStaleStart = resolve; }),
-    );
-    const user = userEvent.setup();
-    const view = render(
-      <CapabilityContext value={context(administrator)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
-    await user.click(await screen.findByRole("checkbox", {
-      name: "Approve one narrow remote query for contract qualification",
-    }));
-    await user.click(screen.getByRole("button", { name: "Approve qualification" }));
-    await user.click(await screen.findByRole("button", { name: "Run approved qualification" }));
-    await waitFor(() => expect(startPurviewAuditQualification).toHaveBeenCalledOnce());
-
-    view.rerender(
-      <CapabilityContext value={context(currentAdmin)}>
-        <PurviewAuditView />
-      </CapabilityContext>,
-    );
-    await act(async () => {
-      resolveStaleStart({ ...partialJob, status: "running", finishedAt: null });
-    });
-
-    expect(screen.queryByRole("heading", { name: "Minimized results" })).not.toBeInTheDocument();
-    expect(getPurviewAuditJobs).toHaveBeenCalledTimes(2);
   });
 
   it.each([

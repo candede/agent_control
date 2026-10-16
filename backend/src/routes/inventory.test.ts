@@ -17,6 +17,10 @@ vi.mock("../db/nativeInventory.js", () => ({
   NativeInventory: class { getResource = mocks.exact; getQuarantineSelection = mocks.selection; },
 }));
 vi.mock("../middleware/auth.js", () => ({ requestScope: () => ({ tenantId: "tenant", principalId: "principal" }) }));
+vi.mock("../middleware/requestAuthentication.js", () => ({
+  requestUser: (request: Request) => request.session.user,
+  requestAuthenticatedAt: (request: Request) => request.session.signedInAt,
+}));
 vi.mock("../services/powerPlatformInventory.js", () => ({
   powerPlatformInventory: { submit: mocks.submit, start: mocks.start, get: mocks.get },
 }));

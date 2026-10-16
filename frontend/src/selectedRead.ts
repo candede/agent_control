@@ -4,7 +4,7 @@ import { compareInventoryInstants, isInventoryTimestamp } from "../../backend/sr
 import { ApiError } from "./api/client";
 
 const timings = new WeakMap<SelectedRead, { leaseUntil: number; reuseUntil: number }>();
-export const savedReadCacheMs = 30_000;
+const savedReadCacheMs = 30_000;
 
 export function acceptSelectedRead<T extends { selection: SelectedRead }>(data: T, startedAt: number, published = true): T {
   const selection = data.selection;

@@ -13,15 +13,16 @@ if ($Suite -in @('capacity-focused','capacity-core')) {
     & python3 -B (Join-Path $PSScriptRoot 'capacity-results.test.py')
     if ($LASTEXITCODE -ne 0) { throw 'Capacity parser/resource-model regression failed.' }
 }
-if ($Suite -in @('capacity','capacity-query','capacity-probe')) {
-    $mode = if ($Suite -eq 'capacity') { 'full' } elseif ($Suite -eq 'capacity-query') { 'query' } else { 'probe' }
-    & python3 (Join-Path $PSScriptRoot 'large-tenant-capacity.py') --mode $mode
+if ($Suite -in @('capacity','capacity-query','capacity-probe','capacity-web')) {
+    $mode = if ($Suite -eq 'capacity') { 'full' } elseif ($Suite -eq 'capacity-query') { 'query' } elseif ($Suite -eq 'capacity-web') { 'web' } else { 'probe' }
+    & python3 -B (Join-Path $PSScriptRoot 'large-tenant-capacity.py') --mode $mode --baseline-image $BaselineImage --baseline-image-id $BaselineImageId
     exit $LASTEXITCODE
 }
 $implemented = @('inventory-registry','inventory-native-source','inventory-control-integration','inventory-refresh-services','inventory-exports','inventory-metadata','inventory-lifecycle','inventory-details','cutover-native-views','cutover-overview-contract','cutover-history-contract','cutover-native-authority','cutover-user-protocol','cutover-http-lifecycle','cutover-automatic-contract','cutover-agent-usage','cutover-runtime-contract','cutover-ui-contract','cutover-source-activation','cutover-types','cutover-app-contract','cutover-people-fences','cutover-browser-contract','cutover-browser-ui-contract','cutover-capability-admission','cutover-retention-contract','users-reports-cutover','data-page-contract','official-reports-foundation','user-sources-foundation','selected-reads','foundation','all','gate-failure','software-gate','export-readonly')
 $implemented += @('production-publication','production-gate-repairs','fresh-installation','production-counts','production-gate-cost','production-prerequisites','capacity-focused','capacity-core','capacity-retention','capacity-schema','capacity-cost','capacity-software','lifecycle-acceptance-related','lifecycle-acceptance','lifecycle-race','restore-inventory','restore','lifecycle','lifecycle-core','lifecycle-repair','browser','restart')
 $implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
-$implemented += @('production-frontend')
+$implemented += @('production-frontend','auth-recovery','audit-origin','mcp-read-contracts','shared-agent-controls','webapp-regressions','webapp-qualification')
+$implemented += @('deployment-current','fresh-installation-current')
 if ($Suite -notin ($implemented + @('inventory-acceptance-repair','inventory-acceptance-recovery','inventory-controller-contract','report-source-scale','backend-shard-1','backend-shard-2','inventory-app-exports','inventory-http-contract','inventory-route-contract','inventory-integration','inventory-expiry','inventory-parity','inventory-verification','inventory-identity-proof','inventory-cleanup','inventory-identity','inventory-facets','inventory','inventory-cutover','inventory-usage-authority','inventory-native-evidence','inventory-staging','inventory-jobs','inventory-route','inventory-protocol','inventory-core','inventory-reconciliation','inventory-native-ui','inventory-groups','inventory-foundation')) -and -not $profile -and $Suite -ne 'cutover-compiled-restart') { throw "Suite '$Suite' is not yet implemented; no qualification claimed." }
 if ($Suite -in @('cutover-browser-contract','browser')) {
     if ($Suite -eq 'browser' -and -not $PSBoundParameters.ContainsKey('BrowserFiles')) { $BrowserFiles = 'largeTenantData.spec.ts' }
@@ -52,9 +53,9 @@ foreach ($path in $hashes.Keys) {
         throw 'Dependency manifests changed: rebuild an approved-feed baseline after checking every lockfile URL; this runner never installs packages.'
     }
 }
-if ($Suite -eq 'fresh-installation') {
+if ($Suite -in @('fresh-installation','fresh-installation-current')) {
     . (Join-Path $PSScriptRoot 'fresh-installation.ps1')
-    Invoke-FreshInstallation -Root $root -Directory $directory -Baseline $baseline
+    Invoke-FreshInstallation -Root $root -Directory $directory -Baseline $baseline -CurrentSchemaOnly:($Suite -eq 'fresh-installation-current')
     exit 0
 }
 if ($Suite -in @('browser','restart')) {

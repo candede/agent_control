@@ -1,10 +1,9 @@
-import { randomUUID } from "node:crypto";
-import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { findTenantConfiguration } from "../config.js";
 import { DefenderHuntingRepository, type DefenderHuntingExecution, type DefenderHuntingReadScope, type DefenderHuntingScope } from "../db/defenderHunting.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import type { DefenderHuntingJob, DefenderHuntingQualificationBinding, DefenderHuntingTokenMode, DefenderHuntingTarget } from "../types/defenderHunting.js";
+import type { DefenderHuntingJob, DefenderHuntingTokenMode, DefenderHuntingTarget } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
@@ -18,16 +17,14 @@ import { isDirectoryObjectId } from "../types/copilotPackage.js";
 
 type CapabilityId = "defender.hunting.delegated" | "defender.hunting.application";
 type Dependencies = {
-  delegatedToken: typeof acquireDelegatedToken;
+  delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  requireAvailable: typeof capabilities.requireAvailable;
+  revalidateUser: typeof revalidateAuthorizedUser;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
   applicationIdentity: (tenantId: string) => string | undefined;
-  qualificationContext: typeof capabilities.huntingQualificationContext;
-  recordProviderEvidence: typeof capabilities.recordHuntingQualificationEvidence;
+  recordProviderEvidence: typeof capabilities.recordHuntingProviderEvidence;
   auditLog: typeof getAuditLog;
   runQuery: GraphHuntingClient["runQuery"];
   agentScope: typeof agentInvestigations.defenderScope;
@@ -35,23 +32,21 @@ type Dependencies = {
 
 const graphHunting = new GraphHuntingClient();
 const defaultDependencies: Dependencies = {
-  delegatedToken: acquireDelegatedToken,
+  delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
-  revalidateUser: revalidateAuthenticatedUser,
-  requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  revalidateUser: revalidateAuthorizedUser,
   beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
   applicationIdentity: tenantId => findTenantConfiguration(tenantId)?.clientId,
-  qualificationContext: capabilities.huntingQualificationContext.bind(capabilities),
-  recordProviderEvidence: capabilities.recordHuntingQualificationEvidence.bind(capabilities),
+  recordProviderEvidence: capabilities.recordHuntingProviderEvidence.bind(capabilities),
   auditLog: getAuditLog,
   runQuery: graphHunting.runQuery.bind(graphHunting),
   agentScope: agentInvestigations.defenderScope.bind(agentInvestigations),
 };
 
 type SessionValidation = ReturnType<typeof beginAccountSessionValidation>;
-type ActiveHunt = { actor: { tenantId: string; principalId: string }; tokenMode: DefenderHuntingTokenMode | undefined; qualificationOnly: boolean;
+type ActiveHunt = { actor: { tenantId: string; principalId: string }; tokenMode: DefenderHuntingTokenMode;
   controller: AbortController; started: Promise<DefenderHuntingJob>; operation: Promise<void> };
 const maximumActiveHunts = 4;
 const activationDeadlineMs = 60_000;
@@ -77,52 +72,10 @@ export class DefenderHuntingService {
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
     assertAuthority();
     const scope = scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!));
-    if (input.tokenMode === "delegated") {
-      await this.dependencies.requireAvailable(capabilityId, user);
-      assertAuthority();
-      const job = await commitAccountSessionValidation(validation, () =>
-        this.repository.submit(scope, { idempotencyKey: input.idempotencyKey, filters }, assertAuthority));
-      assertAuthority();
-      return job;
-    }
-    const authority = await this.dependencies.qualificationContext(capabilityId, user);
-    assertAuthority();
-    const retainedScope = await this.repository.requireQualifiedScope(scope, filters, authority);
-    assertAuthority();
     const job = await commitAccountSessionValidation(validation, () =>
-      this.repository.submit(scope, { idempotencyKey: input.idempotencyKey, filters, retainedScope }, assertAuthority));
+      this.repository.submit(scope, { idempotencyKey: input.idempotencyKey, filters, actor: user }, assertAuthority));
     assertAuthority();
     return job;
-  }
-
-  async approveQualification(user: AuthenticatedUser, input: { tokenMode: DefenderHuntingTokenMode; filters: unknown } & DefenderHuntingTarget) {
-    requireQualificationRole(user, input.tokenMode);
-    const actor = actorScope(user);
-    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-    const assertAuthority = this.submissionAuthority(user, input.tokenMode, validation, true);
-    assertAuthority();
-    const agent = input.agentRecordId === undefined ? undefined : await this.dependencies.agentScope(actorScope(user), input.agentRecordId);
-    assertAuthority();
-    const selected = bindUserFilters(input.filters, input.userObjectId);
-    const filters = validateDefenderHuntingFilters(agent ? bindAgentHuntingFilters(selected, agent) : selected, { qualification: true });
-    const capabilityId = capabilityForMode(input.tokenMode);
-    const applicationConfiguration = input.tokenMode === "application"
-      ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
-    assertAuthority();
-    const context = await this.dependencies.qualificationContext(capabilityId, user);
-    assertAuthority();
-    const job = await commitAccountSessionValidation(validation, () => this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)), {
-      idempotencyKey: `qualification_${randomUUID().replaceAll("-", "")}`,
-      filters,
-      qualification: { ...context, approvedBy: user.homeAccountId },
-    }, assertAuthority));
-    assertAuthority();
-    return job;
-  }
-
-  async startQualification(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
-    requireViewer(user);
-    return this.startAuthorized(user, id, undefined, target, true);
   }
 
   start(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, target?: DefenderHuntingTarget): Promise<DefenderHuntingJob> {
@@ -130,27 +83,26 @@ export class DefenderHuntingService {
     return this.startAuthorized(user, id, tokenMode, target);
   }
 
-  private startAuthorized(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
-    target?: DefenderHuntingTarget, qualificationOnly = false): Promise<DefenderHuntingJob> {
+  private startAuthorized(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode,
+    target?: DefenderHuntingTarget): Promise<DefenderHuntingJob> {
     id = id.toLowerCase();
     if (this.draining) throw new AppError(503, "hunting_shutdown", "Hunting is stopping for application shutdown.");
     requireProviderAdmissions();
     const actor = actorScope(user);
     const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
     assertAccountSessionValidation(validation);
-    const assertCapability = tokenMode === undefined ? this.beginReadValidation(user)
-      : this.dependencies.beginOperationValidation(capabilityForMode(tokenMode), user);
+    const assertCapability = this.dependencies.beginOperationValidation(capabilityForMode(tokenMode), user);
     assertCapability();
     const existing = this.active.get(id);
     if (existing) {
       return existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId
-        && existing.tokenMode === tokenMode && existing.qualificationOnly === qualificationOnly && target === undefined
-        ? existing.started : this.currentJobForStart(user, id, tokenMode, target, qualificationOnly);
+        && existing.tokenMode === tokenMode && target === undefined
+        ? existing.started : this.currentJobForStart(user, id, tokenMode, target);
     }
-    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, target, qualificationOnly);
+    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, target);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(activationDeadlineMs)]);
-    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, validation, assertCapability, target, qualificationOnly);
+    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, validation, assertCapability, target);
     const started = prepared.then(value => value.job);
     let operation: Promise<void>;
     operation = prepared.then(value => value.run?.(), error => {
@@ -161,7 +113,7 @@ export class DefenderHuntingService {
       operationalLog("error", "hunting_worker_failed", { jobId: id,
         errorCode: error instanceof AppError ? error.code : "hunting_worker_failed" });
     });
-    this.active.set(id, { actor, tokenMode, qualificationOnly, controller, started, operation });
+    this.active.set(id, { actor, tokenMode, controller, started, operation });
     return started;
   }
 
@@ -177,35 +129,6 @@ export class DefenderHuntingService {
 
   async list(user: AuthenticatedUser, limit = 20, offset = 0, target?: DefenderHuntingTarget) {
     return this.savedRead(user, target, scope => this.repository.listJobs(scope, limit, offset));
-  }
-
-  async catalog(user: AuthenticatedUser, target?: DefenderHuntingTarget) {
-    return this.savedRead(user, target, async scope => {
-      const [qualifications, retainedScopes] = await Promise.all([
-        this.repository.listQualificationEvidence(scope), this.repository.listRetainedScopes(scope),
-      ]);
-      return { qualifications, retainedScopes };
-    });
-  }
-
-  async revokeRetainedScope(user: AuthenticatedUser, id: string, target?: DefenderHuntingTarget) {
-    id = id.toLowerCase();
-    return this.savedRead(user, target, async (readScope, assertAuthority, validation) => {
-      const retained = (await this.repository.listRetainedScopes(readScope)).find(scope => scope.id === id);
-      assertAuthority();
-      if (retained && readScope.entraAgentIds) assertAgentHuntingScope(retained.approvedScope, { recordId: target!.agentRecordId!,
-        entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
-      if (!retained || (retained.tokenMode === "delegated" &&
-        (retained.resultScope.kind !== "principal" || retained.resultScope.scopeId !== user.homeAccountId))) {
-        throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
-      }
-      const assertMutation = () => { assertAuthority(); requireQualificationRole(user, retained.tokenMode); };
-      return commitAccountSessionValidation(validation, async () => {
-        assertMutation();
-        await this.revalidateSavedAgentScope(user, target?.agentRecordId, readScope, assertMutation);
-        return this.repository.revokeRetainedScope(readScope, id, retained.tokenMode, user.homeAccountId, assertMutation);
-      });
-    });
   }
 
   async rows(user: AuthenticatedUser, id: string, limit = 100, offset = 0, target?: DefenderHuntingTarget) {
@@ -272,9 +195,9 @@ export class DefenderHuntingService {
   }
 
   private async prepareStart(user: AuthenticatedUser, actor: { tenantId: string; principalId: string }, id: string,
-    tokenMode: DefenderHuntingTokenMode | undefined, signal: AbortSignal, cancellationSignal: AbortSignal,
-    validation: SessionValidation, assertCapability: () => void, target?: DefenderHuntingTarget, qualificationOnly = false) {
-    const current = await abortable(this.currentJobForStart(user, id, tokenMode, target, qualificationOnly, signal), signal);
+    tokenMode: DefenderHuntingTokenMode, signal: AbortSignal, cancellationSignal: AbortSignal,
+    validation: SessionValidation, assertCapability: () => void, target?: DefenderHuntingTarget) {
+    const current = await abortable(this.currentJobForStart(user, id, tokenMode, target, signal), signal);
     assertCurrent(validation, signal);
     assertCapability();
     if (current.status !== "waiting_authorization") return { job: current };
@@ -296,22 +219,18 @@ export class DefenderHuntingService {
       run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal, validation, assertCapability, target) };
   }
 
-  private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
-    target?: DefenderHuntingTarget, qualificationOnly = false, signal?: AbortSignal) {
+  private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode,
+    target?: DefenderHuntingTarget, signal?: AbortSignal) {
     const assertAuthority = this.beginReadValidation(user);
     const readScope = await abortable(this.readScope(user, target, assertAuthority), signal);
     signal?.throwIfAborted();
     const current = await abortable(this.repository.getJob(readScope, id), signal);
     assertAuthority();
-    if (!current || current.authorizationPrincipalId !== user.homeAccountId || tokenMode !== undefined && current.tokenMode !== tokenMode
-      || qualificationOnly && !current.qualification) throw new AppError(404, "not_found", "Hunting job was not found.");
+    if (!current || current.authorizationPrincipalId !== user.homeAccountId || current.tokenMode !== tokenMode) {
+      throw new AppError(404, "not_found", "Hunting job was not found.");
+    }
     if (readScope.entraAgentIds) assertAgentHuntingScope(current.filters, { recordId: target!.agentRecordId!,
       entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
-    if (current.qualification) {
-      requireQualificationRole(user, current.tokenMode);
-      await this.validateQualification(current.qualification, user, signal);
-      assertAuthority();
-    }
     return current;
   }
 
@@ -334,15 +253,15 @@ export class DefenderHuntingService {
       }, { signal, clearOnSuccess: false }), signal);
       assertAuthority(signal);
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
-      if (current.qualification) await this.validateQualification(current.qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
         assertAuthority(signal);
         requireSamePrincipal(actor, freshUser);
-        current.qualification ? requireQualificationRole(freshUser, scope.tokenMode) : requireViewer(freshUser);
+        requireViewer(freshUser);
       }), signal);
       const audit = this.dependencies.auditLog(actor);
       auditEvent = await audit.startEvent({ operationId: `query-hunting:${current.id}:${current.localRequestId}`, scope: "single",
-        action: "query-hunting", agentId: current.id, actor: freshUser, requestPath: `/api/hunting/jobs/${current.id}`,
+        action: "query-hunting", agentId: current.id, actor: current.initiatingActor ?? freshUser,
+        origin: current.origin ?? (await import("./actionOrigin.js")).unknownOrigin, requestPath: `/api/hunting/jobs/${current.id}`,
         metadata: { source: "microsoft_defender_hunting", template: current.filters.templateId, mode: current.tokenMode, correlationId: current.localRequestId } });
       assertAuthority(signal);
       const result = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => this.dependencies.runQuery(token, current.filters, {
@@ -380,16 +299,16 @@ export class DefenderHuntingService {
       const job = await commitAccountSessionValidation(validation, async () => {
         assertAuthority(publicationSignal);
         requireSamePrincipal(actor, publicationUser);
-        current.qualification ? requireQualificationRole(publicationUser, scope.tokenMode) : requireViewer(publicationUser);
+        requireViewer(publicationUser);
         return this.repository.publish(scope, current.id, execution, result, () => assertAuthority(publicationSignal));
       });
       published = true;
-      if (scope.tokenMode === "delegated" && ["succeeded", "partial"].includes(job.status)) {
+      if (["succeeded", "partial"].includes(job.status)) {
         try {
           assertAuthority(publicationSignal);
           await abortable(this.dependencies.recordProviderEvidence(capabilityId, publicationUser, "available", {
             providerRequestId: job.providerRequestId,
-          }, undefined, publicationSignal), publicationSignal);
+          }, scope.resultScope.configurationRevision ?? undefined, publicationSignal), publicationSignal);
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId, outcome: "provider_success" });
         }
@@ -426,7 +345,7 @@ export class DefenderHuntingService {
           status: phaseSignal.aborted ? "cancelled" : "inconclusive", errorCode: failure.code });
         return;
       }
-      if (scope.tokenMode === "delegated" && providerRequestAuthorized && !providerCompleted
+      if (providerRequestAuthorized && !providerCompleted
         && error instanceof AppError && ["missing_permission", "unsupported", "provider_schema", "provider_scope_mismatch", "provider_result_limit", "provider_error",
           "provider_throttled", "invalid_provider_link", "hunting_access_denied"].includes(error.code)) {
         try {
@@ -438,7 +357,7 @@ export class DefenderHuntingService {
             ...huntingFailureDiagnostics(error),
             category: error.code,
             providerRequestId: failed?.providerRequestId ?? null,
-          }, undefined, signal), signal);
+          }, scope.resultScope.configurationRevision ?? undefined, signal), signal);
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: capabilityForMode(scope.tokenMode), outcome: "provider_failure" });
         }
@@ -455,20 +374,9 @@ export class DefenderHuntingService {
     const freshUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal);
     assertAuthority(signal);
     requireSamePrincipal(actor, freshUser);
-    current.qualification ? requireQualificationRole(freshUser, scope.tokenMode) : requireViewer(freshUser);
+    requireViewer(freshUser);
     const capabilityId = capabilityForMode(scope.tokenMode);
     if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
-    assertAuthority(signal);
-    if (current.qualification) await this.validateQualification(current.qualification, freshUser, signal);
-    else if (current.retainedScopeId) {
-      const authority = await abortable(this.dependencies.qualificationContext(capabilityId, freshUser), signal);
-      assertAuthority(signal);
-      await abortable(this.repository.requireQualifiedScope(scope, current.filters, authority, current.retainedScopeId), signal);
-    } else if (scope.tokenMode === "delegated") {
-      await abortable(this.dependencies.requireAvailable(capabilityId, freshUser), signal);
-    } else {
-      throw new AppError(403, "hunting_scope_unqualified", "Application hunting requires an exact current retained-scope qualification.");
-    }
     assertAuthority(signal);
     if (target?.agentRecordId !== undefined) {
       const agent = await abortable(this.dependencies.agentScope(actorScope(freshUser), target.agentRecordId), signal);
@@ -478,13 +386,13 @@ export class DefenderHuntingService {
     return { user: freshUser, capabilityId };
   }
 
-  private submissionAuthority(user: AuthenticatedUser, tokenMode: DefenderHuntingTokenMode, validation: SessionValidation, qualification = false) {
+  private submissionAuthority(user: AuthenticatedUser, tokenMode: DefenderHuntingTokenMode, validation: SessionValidation) {
     const assertCapability = this.dependencies.beginOperationValidation(capabilityForMode(tokenMode), user);
     return () => {
       assertAccountSessionValidation(validation);
       assertCapability();
       requireProviderAdmissions();
-      qualification ? requireQualificationRole(user, tokenMode) : requireViewer(user);
+      requireViewer(user);
     };
   }
 
@@ -527,12 +435,6 @@ export class DefenderHuntingService {
     assertAuthority();
   }
 
-  private async validateQualification(qualification: DefenderHuntingQualificationBinding, user: AuthenticatedUser, signal?: AbortSignal) {
-    const context = await abortable(this.dependencies.qualificationContext(qualification.capabilityId, user), signal);
-    if (qualification.contractRevision !== context.contractRevision || qualification.permissionRevision !== context.permissionRevision
-      || qualification.configurationRevision !== context.configurationRevision) throw new AppError(409, "qualification_superseded", "Hunting permission, contract, or configuration changed after approval.");
-  }
-
   private async requireExactApplicationScope(scope: DefenderHuntingScope, user: AuthenticatedUser, capabilityId: CapabilityId, signal: AbortSignal) {
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityId, user), signal);
     const current = scopeFor(user, "application", configuration.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
@@ -554,20 +456,15 @@ export class DefenderHuntingService {
       : await this.dependencies.agentScope(actorScope(user), target.agentRecordId);
     assertAuthority();
     const delegatedScope = scopeFor(user, "delegated").resultScope;
-    const delegatedAuthority = await this.dependencies.qualificationContext("defender.hunting.delegated", user);
-    assertAuthority();
     const resultScopes = [delegatedScope];
-    const qualifications = [{ resultScope: delegatedScope, authority: delegatedAuthority }];
     try {
       const applicationScope = await this.resultScopeForMode(user, "application");
       assertAuthority();
       resultScopes.push(applicationScope);
-      qualifications.push({ resultScope: applicationScope, authority: await this.dependencies.qualificationContext("defender.hunting.application", user) });
-      assertAuthority();
     }
     catch (error) { if (!(error instanceof AppError && error.code === "not_configured")) throw error; }
     assertAuthority();
-    return { tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId, resultScopes, qualifications,
+    return { tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId, resultScopes,
       ...(userObjectId ? { userObjectId } : {}),
       ...(agent ? { entraAgentIds: agent.entraAgentIds, entraAgentApplicationIds: agent.entraAgentApplicationIds } : {}),
       ...(hasAppRole(user.roles, "AgentControl.Viewer") ? { inventoryIdentityScope: {
@@ -629,20 +526,13 @@ function requireViewer(user: AuthenticatedUser) {
   if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Hunting requires the Viewer role.");
 }
 
-function requireQualificationRole(user: AuthenticatedUser, tokenMode: DefenderHuntingTokenMode) {
-  requireViewer(user);
-  if (tokenMode === "application" && !hasAppRole(user.roles, "AgentControl.Admin")) {
-    throw new AppError(403, "missing_internal_role", "Application hunting qualification approval requires the Admin role.");
-  }
-}
-
 function requireSamePrincipal(scope: { tenantId: string; principalId: string }, user: AuthenticatedUser) {
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The signed-in account changed during hunting.");
 }
 
 function isLocalAuthorizationFailure(error: unknown) {
   return error instanceof AppError && (error.status === 401 && error.code !== "hunting_access_denied" || ["interaction_required", "authorization_expired", "missing_internal_role", "capability_unavailable", "not_configured",
-    "application_scope_changed", "qualification_superseded", "hunting_scope_unqualified", "maintenance", "provider_requalification_required"].includes(error.code));
+    "application_scope_changed", "maintenance"].includes(error.code));
 }
 
 function assertCurrent(validation: SessionValidation, signal: AbortSignal) {

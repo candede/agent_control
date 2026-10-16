@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { types } from "node:util";
 import { AppError, errorName, errorTelemetry, hasNativeErrorPrototype, isApplicationError } from "../errors.js";
 import { getTenantConfiguration } from "../config.js";
-import { acquireApplicationToken, acquireDelegatedToken, isRetryableIdentityProviderError } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, isRetryableIdentityProviderError } from "../auth/msal.js";
 import { adminManagedPermissionsMessage } from "../auth/flows.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision, type CapabilityConfiguration, type CapabilityEvidence, type EvidenceKey } from "../db/capabilities.js";
 import { capabilityDefinitions, getCapabilityDefinition, hasAnyRole } from "./capabilityRegistry.js";
@@ -15,13 +15,14 @@ import type { AuditAction } from "../types/audit.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { operationalLog } from "./telemetry.js";
 import { mapWithConcurrency } from "./mapWithConcurrency.js";
+import { currentAuthority, requireAuthority } from "../auth/authorityContext.js";
 
 const evidenceTtlMs = 5 * 60 * 1000;
 const operationEvidenceTtlMs = 24 * 60 * 60 * 1000;
 const automaticCheckDeadlineMs = 10_000;
 type OperationPrincipal = Pick<AuthenticatedUser, "tenantId" | "homeAccountId">;
 type ProbeDependencies = {
-  delegatedToken: typeof acquireDelegatedToken;
+  delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
   packageProbe: (token: string, signal?: AbortSignal, assertCurrent?: () => void) => Promise<unknown>;
   directoryProbe: (token: string, signal?: AbortSignal) => Promise<unknown>;
@@ -30,7 +31,7 @@ type ProbeDependencies = {
 type SharedCheck<T> = { completion: Promise<T>; controller: AbortController; waiters: number };
 
 const defaultProbeDependencies: ProbeDependencies = {
-  delegatedToken: acquireDelegatedToken,
+  delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
   packageProbe: (token, signal, assertCurrent) => new GraphPackagesClient(undefined, { maxAttempts: 1 }).checkCatalogAccess(token, signal, assertCurrent),
   directoryProbe: (token, signal) => new DirectoryPrincipalsClient().search(token, "agent-control-permission-check", 1, signal),
@@ -207,7 +208,7 @@ export class CapabilityService {
         verification: "on_demand", previewQualification: "not_required",
         remediation: [definition.dataClass === "package_control"
           ? "Choose a target and confirm the operation. Microsoft validates delegated permissions when the request runs."
-          : "Request the read from its feature. Microsoft validates delegated permissions when the request runs."],
+          : "Request the read from its feature. Microsoft validates provider permissions when the request runs."],
       };
     }
     if (!evidence || !(Date.parse(evidence.expiresAt) > Date.now())) return decision(definition, "unknown", evidence, previewState(definition, configuration));
@@ -219,8 +220,7 @@ export class CapabilityService {
     const generation = this.generation(definition.id, user);
     let current = await this.decision(definition, user);
     this.requireGeneration(definition.id, user, generation);
-    if (!current.authorized && !reuseCapabilityCheck(current, Boolean(options.retryFailed))
-      && (supportsAutomaticCapabilityCheck(capabilityId) || definition.probe.kind === "on_demand")) {
+    if (!current.authorized && !reuseCapabilityCheck(current, Boolean(options.retryFailed))) {
       current = await this.refreshAtGeneration(definition, user, generation);
     }
     if (!current.authorized) throw unavailableCapabilityError(current);
@@ -229,7 +229,12 @@ export class CapabilityService {
 
   beginOperationValidation(capabilityId: CapabilityId, user: OperationPrincipal) {
     const generation = this.generation(capabilityId, user);
+    const source = currentAuthority();
+    if (source) requireAuthority(user.tenantId, user.homeAccountId);
+    const hash = source?.principal.authorizationHash;
     return () => {
+      source?.assertCurrent();
+      if (source && source.principal.authorizationHash !== hash) throw AppError.unauthorized("The initiating authorization changed.");
       this.requireGeneration(capabilityId, user, generation);
       if (this.pendingPrincipalInvalidations.has(this.principalGenerationKey(user.tenantId!, user.homeAccountId))) {
         throw new AppError(503, "capability_invalidation_failed", "Capability evidence could not be invalidated. Retry after account authorization cleanup succeeds.");
@@ -238,53 +243,24 @@ export class CapabilityService {
   }
 
   async requireApplicationDataScope(capabilityId: CapabilityId, user: AuthenticatedUser) {
+    if (currentAuthority()?.principal.transport === "bearer") throw new AppError(403, "invalid_token_mode", "Integration operations require delegated data scope.");
     const definition = requiredDefinition(capabilityId);
     if (definition.mode !== "application" || !hasAnyRole(user.roles, definition.internalRoles)) {
       throw new AppError(403, "missing_internal_role", "The application data scope is not authorized for this role.");
     }
     const configuration = await this.currentConfiguration(definition, user);
     if (!configuration.enabled || !configuration.sharedDataScope) {
-      throw new AppError(403, "not_configured", "Application package reads require an enabled, administrator-approved shared data scope.");
+      throw new AppError(403, "not_configured", "Application reads require an enabled, administrator-configured shared data scope.");
     }
     return configuration;
   }
 
-  async auditQualificationContext(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser) {
-    const definition = requiredDefinition(capabilityId);
-    if (!user.tenantId || !hasAnyRole(user.roles, definition.internalRoles)) throw new AppError(403, "missing_internal_role", "Audit Search qualification requires the Viewer role.");
-    const configuration = await this.currentConfiguration(definition, user);
-    if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) {
-      throw new AppError(403, "not_configured", "Application Audit Search requires an enabled, administrator-approved shared data scope.");
-    }
-    return {
-      capabilityId,
-      contractRevision: capabilityContractRevision(definition),
-      permissionRevision: capabilityPermissionRevision(definition),
-      configurationRevision: configuration.revision,
-    };
+  async recordAuditProviderEvidence(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, configurationRevision?: number, signal?: AbortSignal) {
+    return this.recordProviderEvidence(requiredDefinition(capabilityId), user, status, details, configurationRevision, signal);
   }
 
-  async recordAuditQualificationEvidence(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number, signal?: AbortSignal) {
-    const definition = requiredDefinition(capabilityId);
-    if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live lifecycle qualification.");
-    return this.recordQualificationEvidence(definition, user, status, details, approvedConfigurationRevision, signal);
-  }
-
-  async huntingQualificationContext(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser) {
-    const definition = requiredDefinition(capabilityId);
-    if (!user.tenantId || !hasAnyRole(user.roles, definition.internalRoles)) throw new AppError(403, "missing_internal_role", "Hunting qualification requires the Viewer role.");
-    const configuration = await this.currentConfiguration(definition, user);
-    if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) {
-      throw new AppError(403, "not_configured", "Application hunting requires an enabled, administrator-approved shared data scope.");
-    }
-    return { capabilityId, contractRevision: capabilityContractRevision(definition), permissionRevision: capabilityPermissionRevision(definition),
-      configurationRevision: configuration.revision };
-  }
-
-  async recordHuntingQualificationEvidence(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number, signal?: AbortSignal) {
-    const definition = requiredDefinition(capabilityId);
-    if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live hunting qualification.");
-    return this.recordQualificationEvidence(definition, user, status, details, approvedConfigurationRevision, signal);
+  async recordHuntingProviderEvidence(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, configurationRevision?: number, signal?: AbortSignal) {
+    return this.recordProviderEvidence(requiredDefinition(capabilityId), user, status, details, configurationRevision, signal);
   }
 
   async packageQualificationIdentity(action: AuditAction, user: AuthenticatedUser) {
@@ -334,8 +310,7 @@ export class CapabilityService {
     this.requireGeneration(definition.id, user, generation);
     if (!hasAnyRole(user.roles, definition.internalRoles)) return this.decision(definition, user);
     if (definition.mode === "local" || !definition.probe.adapterRegistered ||
-      !["provider_read", "live_qualification", "on_demand"].includes(definition.probe.kind) ||
-      definition.probe.kind === "live_qualification" && definition.mode !== "delegated") return this.decision(definition, user);
+      !["provider_read", "on_demand"].includes(definition.probe.kind)) return this.decision(definition, user);
     const configuration = await this.currentConfiguration(definition, user, generation);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) return this.decision(definition, user);
     const key = this.evidenceKey(definition, user, configuration);
@@ -475,7 +450,7 @@ export class CapabilityService {
     return configuration;
   }
 
-  private async recordQualificationEvidence(definition: CapabilityDefinition, user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number, signal?: AbortSignal) {
+  private async recordProviderEvidence(definition: CapabilityDefinition, user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, configurationRevision?: number, signal?: AbortSignal) {
     signal?.throwIfAborted();
     const generation = this.generation(definition.id, user);
     const assertCurrent = () => {
@@ -485,8 +460,8 @@ export class CapabilityService {
     const configuration = await this.currentConfiguration(definition, user, generation);
     assertCurrent();
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope
-      || configuration.revision !== approvedConfigurationRevision)) {
-      throw new AppError(409, "qualification_superseded", "Application qualification evidence no longer matches the approved configuration.");
+      || configuration.revision !== configurationRevision)) {
+      throw new AppError(409, "application_scope_changed", "Application provider evidence no longer matches the current configured shared scope.");
     }
     const key = this.evidenceKey(definition, user, configuration);
     await this.mutate(async () => {
@@ -765,15 +740,15 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
     `${adminManagedPermissionsMessage} Required ${definition.mode} permissions: ${definition.permissions.join(", ")}.`,
   ];
   if (status === "unknown" && !supportsAutomaticCapabilityCheck(capabilityId)) {
-    if (definition.mode === "application") return [definition.probe.kind === "live_qualification"
-      ? "An Admin must explicitly approve a bounded application-scope operation; automatic delegated checks do not verify application access."
-      : "After an Admin enables application mode and approves its shared data scope, request an explicit bounded application-scope read; automatic delegated checks do not verify application access."];
+    if (definition.mode === "application") return [
+      "Request the application-scope read from its feature. It obtains current application authorization within the configured shared data scope; no separate query approval is required.",
+    ];
     if (definition.probe.kind === "on_demand") return ["Retry the read from the dashboard; automatic permission checks do not run this capability."];
   }
   if (capabilityId.startsWith("purview.audit.search.")) {
     const auditValues: Partial<Record<CapabilityStatus, string[]>> = {
       missing_internal_role: ["Assign the AgentControl.Viewer role."],
-      not_configured: ["Enable application mode and its shared data scope before approving an application qualification."],
+      not_configured: ["Configure application authorization and its shared data scope before requesting an application search."],
       provider_error: ["Verify Purview Audit entitlement, unified auditing, and Audit Logs or View-Only Audit Logs role for delegated use, then retry the bounded search."],
       unsupported: ["Verify tenant rollout for the selected Microsoft Graph v1.0 Audit Search lifecycle."],
       unknown: ["Run the automatic delegated readiness check or submit one explicit bounded search."],
@@ -783,7 +758,7 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
   if (capabilityId.startsWith("defender.hunting.")) {
     const huntingValues: Partial<Record<CapabilityStatus, string[]>> = {
       missing_internal_role: ["Assign AgentControl.Viewer."],
-      not_configured: ["Enable application mode and approve its shared data scope before application qualification."],
+      not_configured: ["Configure application authorization and its shared data scope before requesting an application hunt."],
       provider_error: ["Check Defender XDR RBAC/data-source scope, licensing, Agent 365 connectivity and table rollout separately, then retry the bounded investigation."],
       unsupported: ["Verify the Graph v1.0 hunting endpoint and AgentsInfo or CloudAppEvents rollout for this tenant."],
       unknown: ["Run the automatic delegated readiness check or submit one explicit bounded investigation."],
@@ -804,7 +779,7 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
 
 function defaultVerification(definition: CapabilityDefinition): NonNullable<CapabilityDecision["verification"]> {
   if (definition.mode === "local") return "local";
-  if (definition.probe.kind === "live_qualification" || definition.probe.kind === "on_demand" || definition.id.startsWith("powerPlatform.quarantine.")) return "token";
+  if (definition.probe.kind === "on_demand" || definition.id.startsWith("powerPlatform.quarantine.")) return "token";
   return "provider";
 }
 
@@ -813,7 +788,7 @@ function evidenceVerification(definition: CapabilityDefinition, status: Capabili
   if (definition.mode === "local") return "local";
   if (!evidence || evidence.status !== "available" || !(Date.parse(evidence.expiresAt) > Date.now())) return undefined;
   const value = evidence.details.verification;
-  if (definition.probe.kind === "live_qualification") return value === "token" || value === "provider" ? value : undefined;
+  if (definition.probe.kind === "on_demand") return value === "token" || value === "provider" ? value : undefined;
   const expected = defaultVerification(definition);
   return value === expected ? expected : undefined;
 }

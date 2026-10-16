@@ -196,7 +196,9 @@ describe("separate package detail projection", () => {
         SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
       }) }] }],
     });
-    const conflicted = projectPackageControl(detailed, {
+    const conflicted = projectPackageControl({ ...detailed, detailFreshness: {
+      state: "fresh", observedAt: observation.observedAt, expiresAt: observation.expiresAt,
+    } }, {
       detail: readback, state: { kind: "block", isBlocked: true },
       observation: { snapshotId: "control", observedAt: observation.observedAt, expiresAt: observation.expiresAt },
     });
@@ -256,17 +258,16 @@ describe("separate package detail projection", () => {
     expect(empty).not.toHaveProperty("elementDetails");
   });
 
-  it("preserves structured legacy detail evidence without treating empty groups as a completed read", () => {
-    const { identityDetailsCollected: _collected, ...legacy } = detailed;
-    expect(projectPackageDetails(summary, { ...observation, package: legacy }, true, now)).toMatchObject({
-      identityDetailsCollected: true, elementDetails: detailed.elementDetails, detailFreshness: { state: "fresh" },
-    });
-    const unknown = projectPackageDetails(summary, {
-      ...observation, package: { ...summary, elementDetails: [{ elementType: "AgentMetadatas", elements: [] }] },
-    }, true, now);
-    expect(unknown).not.toHaveProperty("identityDetailsCollected");
-    expect(unknown.detailFreshness?.state).toBe("missing");
-  });
+  it.each([detailed.elementDetails, [{ elementType: "AgentMetadatas", elements: [] }]])(
+    "does not infer a completed identity read from manifest element shape: %j", elementDetails => {
+      const unknown = projectPackageDetails(summary, {
+        ...observation, package: { ...summary, elementDetails },
+      }, true, now);
+      expect(unknown).not.toHaveProperty("identityDetailsCollected");
+      expect(unknown).not.toHaveProperty("elementDetails");
+      expect(unknown.detailFreshness?.state).toBe("missing");
+    },
+  );
 
   it("never supplies cached access membership for a different catalog access scope", () => {
     const result = projectPackageDetails({ ...summary, availableTo: "none" }, observation, false, now);

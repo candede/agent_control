@@ -41,6 +41,7 @@ export function assertLoginAuthFlow(flow: AuthFlow) {
 export function tenantConfigurationFingerprint(tenant: TenantConfiguration) {
   return createHash("sha256").update(JSON.stringify([
     tenant.tenantId, tenant.clientId, tenant.clientSecret, [...tenant.domains].sort(), tenant.displayName,
+    ...(tenant.integration ? [tenant.integration.clientId, tenant.integration.audience, tenant.integration.scope] : []),
   ])).digest("hex");
 }
 

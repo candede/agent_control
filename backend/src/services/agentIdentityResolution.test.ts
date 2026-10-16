@@ -29,7 +29,7 @@ function setup(operationObserver = observeOperation) {
     identitySource: source, inventoryRevision: "revision-1", context: { recordId, displayName: "Current agent",
       defender: { status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
         resolution: { canResolve: true, capabilityId: "graph.agentIdentity.read" } },
-      purview: { status: "unavailable", mode: "saved_only" } },
+      purview: { status: "unavailable", mode: "search", presets: [] } },
   };
   const inventory = { resolve: vi.fn(async () => structuredClone(state)) };
   const repository = {
@@ -37,7 +37,7 @@ function setup(operationObserver = observeOperation) {
     save: vi.fn<AgentIdentityRepository["save"]>(async (_scope, _source, value, fence) => {
       await fence();
       state.context.defender.entraAgentIds = [value.objectId];
-      state.context.defender.entraAgentApplicationIds = value.applicationId ? [value.applicationId] : [];
+      state.context.defender.entraAgentApplicationIds = [value.applicationId];
       state.context.defender.status = "available";
       state.context.defender.resolution = { canResolve: true, capabilityId: "graph.agentIdentity.read",
         cacheStatus: "resolved", runtimeStatus: value.runtimeStatus, runtimeProvenance: value.runtimeProvenance };

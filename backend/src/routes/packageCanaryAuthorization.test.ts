@@ -1,7 +1,7 @@
 import type { Request, RequestHandler, Response, Router } from "express";
 import session from "express-session";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { PackageMutationQualificationRepository } from "../db/packageMutationQualifications.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { bulkJobs, runTrackedBulkJob } from "../services/bulkJobs.js";
@@ -31,8 +31,8 @@ vi.mock("./policy.js", () => ({
 }));
 vi.mock("../auth/msal.js", async original => ({
   ...await original<typeof import("../auth/msal.js")>(),
-  acquireDelegatedToken: vi.fn(),
-  revalidateAuthenticatedUser: vi.fn(),
+  acquireAuthorizedToken: vi.fn(),
+  revalidateAuthorizedUser: vi.fn(),
 }));
 vi.mock("../services/bulkJobs.js", async original => ({
   ...await original<typeof import("../services/bulkJobs.js")>(),
@@ -74,11 +74,11 @@ const restorationJob = { ...originalJob, id: "restoration-job", action: "unblock
 
 beforeEach(async () => {
   await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
   await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
-  vi.mocked(revalidateAuthenticatedUser).mockReset().mockResolvedValue(user);
-  vi.mocked(acquireDelegatedToken).mockReset().mockResolvedValue("fixture-token");
+  vi.mocked(revalidateAuthorizedUser).mockReset().mockResolvedValue(user);
+  vi.mocked(acquireAuthorizedToken).mockReset().mockResolvedValue("fixture-token");
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Unit tests must not contact providers."); }));
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -135,14 +135,14 @@ describe("package canary session authorization", () => {
     const f = fixture();
     await expect(f.request(true, { action: ["block"] }).pending).rejects.toMatchObject({ code: "invalid_mutation_action" });
     expect(f.createApproved).not.toHaveBeenCalled();
-    expect(revalidateAuthenticatedUser).not.toHaveBeenCalled();
+    expect(revalidateAuthorizedUser).not.toHaveBeenCalled();
   });
 
   it.each([1, null, ["package-1"], { id: "package-1" }])("rejects non-string package targets without coercion (%j)", async targetId => {
     const f = fixture();
     await expect(f.request(true, { targetId }).pending).rejects.toMatchObject({ code: "invalid_qualification" });
     expect(f.createApproved).not.toHaveBeenCalled();
-    expect(revalidateAuthenticatedUser).not.toHaveBeenCalled();
+    expect(revalidateAuthorizedUser).not.toHaveBeenCalled();
   });
 
   it("does not approve a capability replaced while its identity is being resolved", async () => {
@@ -154,7 +154,7 @@ describe("package canary session authorization", () => {
 
   it.each(["token", "attachment", "result"] as const)("does not renew the cycle's initiating capability after replacement during %s", async stage => {
     const f = fixture();
-    if (stage === "token") vi.mocked(acquireDelegatedToken).mockImplementationOnce(async () => {
+    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
       f.invalidateCapability(); return "fixture-token";
     });
     if (stage === "attachment") f.record.mockImplementationOnce(async () => { f.invalidateCapability(); return original; });
@@ -169,7 +169,7 @@ describe("package canary session authorization", () => {
     let identities = 0;
     f.qualificationIdentity.mockImplementation(async () => {
       if (++identities === 6) await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-        mode: "maintenance", provider_work_enabled: false, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+        mode: "maintenance",
       }] }) });
       return identity;
     });
@@ -181,16 +181,16 @@ describe("package canary session authorization", () => {
   it("approves using the current Admin without acquiring a provider token", async () => {
     const f = fixture();
     const current = { ...user, displayName: "Current Admin" };
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue(current);
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue(current);
     await f.request(true).pending;
     expect(f.createApproved).toHaveBeenCalledWith(current, expect.objectContaining({ targetId: original.targetId }), expect.any(Function));
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it.each(["tenant", "principal", "role"] as const)("does not approve when the current Admin's %s changes", async change => {
     const f = fixture();
-    vi.mocked(revalidateAuthenticatedUser).mockResolvedValue({
+    vi.mocked(revalidateAuthorizedUser).mockResolvedValue({
       ...user, ...(change === "tenant" ? { tenantId: "other-tenant" }
         : change === "principal" ? { homeAccountId: "other-principal" } : { roles: [] }),
     });
@@ -271,7 +271,7 @@ describe("package canary session authorization", () => {
     });
     await expect(f.request().pending).rejects.toMatchObject({ code: "canary_cycle_incomplete" });
     expect(f.authorize).not.toHaveBeenCalled();
-    expect(acquireDelegatedToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.submit).toHaveBeenCalledOnce();
   });
 

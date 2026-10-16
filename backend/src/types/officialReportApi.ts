@@ -24,12 +24,6 @@ export type OfficialReportAccepted = { setId: string; activeRevision: string; co
 export type OfficialReportConfirmation = { id: string; setId: string; operation: "select" | "delete";
   activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };
 export type OfficialReportConfirmed = { activeSetId: string | null; activeRevision: string };
-export type OfficialReportDiagnostics = {
-  value: Array<{ ordinal: number; agentId: string | null; username: string | null;
-    code: "users_bridge_mismatch" | "agent_bridge_mismatch" | "missing_user_report" }>;
-  counts: { total: number; filtered: number }; preview: { id: string; revision: number; contentHash: string };
-  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
-};
 export type OfficialReportFacetPage = {
   value: Array<{ value: string | null; count: number }>; selection: PublishedSelectedRead;
   counts: { total: number; filtered: number }; page: { limit: number; nextCursor: string | null; previousCursor: string | null };
@@ -53,6 +47,18 @@ export type CandidateAgentUsageHistory = {
   latestReportSetId: string | null;
   latestReported: AgentUsageHistoryPoint | null;
   counts: { total: number; filtered: number }; page: OfficialReportFacetPage["page"];
+  comparison?: AgentUsageComparison;
+};
+export type AgentUsageComparison = {
+  state: "comparable" | "incomparable" | "unknown";
+  reasons: string[];
+  from: { setId: string; window: { start: string | null; end: string | null; provenance: string };
+    metrics: { responses: number | null; associationCount: number; source: "agents"; cohortHash: string | null;
+      cohortKind: "report_agent_associations";
+      coverage: { expectedAssociations: number; matchedAssociations: number; ambiguousReportRows: boolean } } };
+  to: AgentUsageComparison["from"];
+  responsesDelta: number | null;
+  responseGrowthPercent: number | null;
 };
 export type CandidateAgentUsageMutation = Pick<CandidateAgentUsageContext, "selectionId" | "usageRevision" | "inventoryRevision">
   & { reportSetId: string; reportAgentId: string; confirmed: true; target?: AgentUsageTarget };

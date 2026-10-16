@@ -2334,8 +2334,7 @@ button.audit-result-button:focus-visible {
 .hunting-history > header,
 .hunting-results > header,
 .hunting-search-actions,
-.hunting-qualification,
-.hunting-qualification-actions,
+.hunting-authorization,
 .hunting-row-actions,
 .hunting-page-actions {
   display: flex;
@@ -2348,7 +2347,7 @@ button.audit-result-button:focus-visible {
 .hunting-history > header,
 .hunting-results > header,
 .hunting-search-actions,
-.hunting-qualification,
+.hunting-authorization,
 .hunting-page-actions {
   justify-content: space-between;
 }
@@ -2369,7 +2368,7 @@ button.audit-result-button:focus-visible {
 .hunting-heading p:not(.eyebrow),
 .hunting-history header p,
 .hunting-results header p,
-.hunting-qualification p {
+.hunting-authorization p {
   margin: 4px 0 0;
   color: var(--muted);
 }
@@ -2460,8 +2459,7 @@ button.audit-result-button:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
-.hunting-operations label,
-.hunting-qualification-actions label {
+.hunting-operations label {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -2470,8 +2468,7 @@ button.audit-result-button:focus-visible {
   font-weight: 700;
 }
 
-.hunting-operations input,
-.hunting-qualification-actions input {
+.hunting-operations input {
   width: 16px;
   height: 16px;
   min-height: 16px;
@@ -2479,14 +2476,13 @@ button.audit-result-button:focus-visible {
   accent-color: var(--ink);
 }
 
-.hunting-qualification {
+.hunting-authorization {
   align-items: flex-start;
   padding: 14px 0 14px 16px;
   border-left: 3px solid #b85c48;
   background: linear-gradient(90deg, rgba(255, 241, 235, 0.9), transparent 74%);
 }
 
-.hunting-qualification-actions,
 .hunting-row-actions,
 .hunting-heading-actions {
   flex-wrap: wrap;
@@ -2578,13 +2574,12 @@ button.audit-result-button:focus-visible {
   .hunting-history > header,
   .hunting-results > header,
   .hunting-search-actions,
-  .hunting-qualification {
+  .hunting-authorization {
     align-items: stretch;
     flex-direction: column;
   }
 
   .hunting-heading-actions,
-  .hunting-qualification-actions,
   .hunting-prior-result {
     justify-content: flex-start;
   }
@@ -2624,8 +2619,7 @@ button.audit-result-button:focus-visible {
 .purview-history > header,
 .purview-results > header,
 .purview-search-actions,
-.purview-qualification,
-.purview-qualification-actions,
+.purview-authorization,
 .purview-row-actions,
 .purview-access > header {
   display: flex;
@@ -2638,7 +2632,7 @@ button.audit-result-button:focus-visible {
 .purview-history > header,
 .purview-results > header,
 .purview-search-actions,
-.purview-qualification,
+.purview-authorization,
 .purview-access > header {
   justify-content: space-between;
 }
@@ -2660,7 +2654,7 @@ button.audit-result-button:focus-visible {
 .purview-audit-heading p:not(.eyebrow),
 .purview-history header p,
 .purview-results header p,
-.purview-qualification p,
+.purview-authorization p,
 .purview-coverage p,
 .purview-access p {
   margin: 4px 0 0;
@@ -2798,30 +2792,11 @@ button.audit-result-button:focus-visible {
   accent-color: var(--ink);
 }
 
-.purview-qualification {
+.purview-authorization {
   align-items: flex-start;
   padding: 14px 0 14px 16px;
   border-left: 3px solid #b85c48;
   background: linear-gradient(90deg, rgba(255, 241, 235, 0.9), transparent 74%);
-}
-
-.purview-qualification-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-.purview-approval-check {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  max-width: 310px;
-  color: var(--text-h);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.purview-approval-check input {
-  flex: 0 0 auto;
 }
 
 .purview-search-actions span {
@@ -3390,8 +3365,7 @@ dialog.inventory-detail-modal:not([open]) {
   .purview-history > header,
   .purview-results > header,
   .purview-search-actions,
-  .purview-qualification,
-  .purview-qualification-actions {
+  .purview-authorization {
     align-items: stretch;
     flex-direction: column;
   }
@@ -3570,4 +3544,18 @@ dialog.inventory-detail-modal:not([open]) {
     justify-content: flex-start;
     text-align: left;
   }
+}
+.audit-origin-cell,
+.audit-origin-details dd {
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.audit-origin-details dd {
+  margin: 0 0 0.75rem;
+}
+
+.audit-origin-details dt {
+  font-weight: 600;
 }

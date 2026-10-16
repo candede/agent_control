@@ -7,8 +7,8 @@ import {
 import { isGraphGuid } from "../../backend/src/types/copilotUsage";
 import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
 import { decodeInventoryFacet, encodeInventoryFacet, type InventoryFacetValue } from "../../backend/src/types/inventoryFacets";
-import { quarantineTargetKey } from "./quarantineTarget";
 import { normalizeEnvironmentIdentity } from "../../backend/src/services/inventoryIdentity";
+import { quarantineTargetKey } from "./quarantineTarget";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
@@ -39,9 +39,6 @@ export type AgentRouteState = {
   refreshJobId?: string;
   refreshMode: "delegated" | "application";
   controlJobId?: string;
-  syncRunId?: string;
-  source: "all" | "graph_packages" | "power_platform" | "both";
-  linkState: "all" | "matched" | "unmatched" | "ambiguous" | "conflicting";
   environmentId?: string | null;
   inventorySnapshotId?: string;
   selectedPowerPlatformIds: string[];
@@ -53,6 +50,10 @@ export type AuditRouteState = {
   action: string;
   status: string;
   page: number;
+  originChannel?: "all" | "webapp" | "mcp" | "unknown";
+  originIntegrationClientId?: string;
+  originClientId?: string;
+  originCallingAgentId?: string;
 };
 
 export type SyncReportRouteState = {
@@ -62,7 +63,7 @@ export type SyncReportRouteState = {
   activityWindowDays: number;
 };
 
-export const userDetailTabs = ["overview", "usage", "licenses", "responsibility", "purview"] as const;
+const userDetailTabs = ["overview", "usage", "licenses", "responsibility", "purview"] as const;
 export type UserDetailTab = typeof userDetailTabs[number];
 
 export type UsersRouteState = {
@@ -104,21 +105,12 @@ const viewsByPath = new Map(
 );
 
 export function parseWorkbenchView(pathname: string): WorkbenchViewId {
-  if (["/official-usage", "/jobs"].includes(normalizePath(pathname))) return "sync";
   return viewsByPath.get(normalizePath(pathname)) ?? "agents";
 }
 
 export function isWorkbenchPath(pathname: string) {
   const path = normalizePath(pathname);
-  return path === "/" || path === "/official-usage" || path === "/security" || path === "/jobs" || viewsByPath.has(path);
-}
-
-export function migrateJobsRoute(pathname: string): string | undefined {
-  return normalizePath(pathname) === "/jobs" ? "/sync" : undefined;
-}
-
-export function migrateSecurityRoute(pathname: string): string | undefined {
-  return normalizePath(pathname) === "/security" ? "/agents" : undefined;
+  return path === "/" || viewsByPath.has(path);
 }
 
 export function workbenchUrl(
@@ -168,34 +160,26 @@ export function parseAgentRoute(search: string): AgentRouteState {
   const params = routeParams(search);
   const query = bounded((params.get("q") ?? "").slice(0, 256), 256) ?? "";
   const status = params.get("status");
-  const legacyView = params.get("show");
   const sortBy = params.get("sort");
   const selectedIds = [...new Set(params.getAll("selected").filter(validSelectedId))].slice(0, maximumPackageSelection);
   const selectionCount = boundedSelectionCount(params.get("selectionCount"));
   const selectionStored = params.get("selectionState") === "session" && selectionCount !== undefined;
   const environment = routeFacet(params, "environment", 512);
   const environmentId = typeof environment === "string" ? normalizeEnvironmentIdentity(environment) : environment;
-  const rawDetailId = agentRecordId(params.get("detail"));
-  const detailId = rawDetailId && !parseUnifiedAgentRecordId(rawDetailId) && params.get("source") === "power_platform" && environmentId
-    ? quarantineTargetKey({ environmentId, nativeId: rawDetailId })
-    : rawDetailId;
+  const detailId = agentRecordId(params.get("detail"));
   return {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
-    packageType: params.has("type") ? routeFacet(params, "type", 4096) : legacyView === "first_party" ? "firstParty" : legacyView === "third_party" ? "thirdParty" : undefined,
-    endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access"))
-      ?? (!params.has("access") && (legacyView === "available" || legacyView === "unavailable") ? legacyView
-        : !params.has("access") && legacyView === "availability_unknown" ? "unknown" : "all"),
-    reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (!params.has("usage") && legacyView === "used" ? "used" : "all"),
-    management: unifiedAgentManagementFilters.find(value => value === params.get("management"))
-      ?? (!params.has("management") && (legacyView === "user_managed" || legacyView === "organization_managed") ? legacyView : "all"),
-    relevance: unifiedAgentRelevanceFilters.find(value => value === params.get("relevance"))
-      ?? (!params.has("relevance") && (legacyView === "organization" || legacyView === "unknown") ? legacyView : "all"),
+    packageType: routeFacet(params, "type", 4096),
+    endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access")) ?? "all",
+    reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? "all",
+    management: unifiedAgentManagementFilters.find(value => value === params.get("management")) ?? "all",
+    relevance: unifiedAgentRelevanceFilters.find(value => value === params.get("relevance")) ?? "all",
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
     publisher: routeFacet(params, "publisher", 4096),
     availability: routeFacet(params, "availability", 4096, true),
     host: routeFacet(params, "host", 4096),
-    platform: params.has("platform") ? routeFacet(params, "platform", 4096) : legacyView === "copilot_studio" ? "Copilot Studio" : undefined,
+    platform: routeFacet(params, "platform", 4096),
     createdWithinDays: boundedIntegerText(params.get("createdWithinDays"), 3650),
     sortBy: unifiedAgentSortKeys.find(value => value === sortBy) ?? "displayName",
     sortDirection: params.get("direction") === "desc" ? "desc" : "asc",
@@ -207,9 +191,6 @@ export function parseAgentRoute(search: string): AgentRouteState {
     refreshJobId: durableRouteId(params.get("refreshJob")),
     refreshMode: params.get("mode") === "application" ? "application" : "delegated",
     controlJobId: durableRouteId(params.get("controlJob")),
-    syncRunId: durableRouteId(params.get("syncRun")),
-    source: "all",
-    linkState: "all",
     environmentId,
     inventorySnapshotId: durableRouteId(params.get("inventorySnapshot"), 64),
     selectedPowerPlatformIds: [...new Set(params.getAll("selectedResource").map(agentRecordId).filter(value => value !== undefined))].slice(0, 25),
@@ -256,7 +237,6 @@ export function agentRouteSearch(state: AgentRouteState) {
     if (state.refreshMode === "application") params.set("mode", "application");
   }
   setDurableRouteId(params, "controlJob", state.controlJobId);
-  setDurableRouteId(params, "syncRun", state.syncRunId);
   if (state.environmentId !== undefined) params.set("environment",
     encodeInventoryFacet(state.environmentId === null ? null : normalizeEnvironmentIdentity(state.environmentId)));
   setDurableRouteId(params, "inventorySnapshot", state.inventorySnapshotId, 64);
@@ -283,7 +263,7 @@ export function agentRouteSearch(state: AgentRouteState) {
 const localAuditActions = new Set([
   "block", "unblock", "update-availability", "update-installation", "reassign",
   "view-audit-search", "export-audit-search", "view-hunting", "export-hunting",
-  "approve-hunting", "qualify-hunting", "submit-hunting", "query-hunting", "cancel-hunting", "delete-hunting", "revoke-hunting-scope",
+  "submit-hunting", "query-hunting", "cancel-hunting", "delete-hunting",
   "export-package-inventory", "export-power-platform-inventory", "export-agent-inventory",
   "export-official-usage-aggregate", "export-official-usage-users", "export-administrative-audit",
   "associate-agent-usage", "remove-agent-usage-association",
@@ -291,6 +271,7 @@ const localAuditActions = new Set([
 const localAuditStatuses = new Set([
   "requested", "started", "succeeded", "failed", "skipped", "inconclusive", "cancelled",
 ]);
+for (const action of ["resume-control", "cancel-control", "reconcile-control"]) localAuditActions.add(action);
 
 export function parseAuditRoute(search: string): AuditRouteState {
   const params = routeParams(search);
@@ -301,6 +282,11 @@ export function parseAuditRoute(search: string): AuditRouteState {
     action: action && localAuditActions.has(action) ? action : "all",
     status: status && localAuditStatuses.has(status) ? status : "all",
     page: Math.min(boundedPage(params.get("page")), maximumAuditPageIndex),
+    originChannel: ["webapp", "mcp", "unknown"].includes(params.get("origin") ?? "")
+      ? params.get("origin") as "webapp" | "mcp" | "unknown" : "all",
+    originIntegrationClientId: bounded(params.get("integration"), 256),
+    originClientId: bounded(params.get("client"), 256),
+    originCallingAgentId: bounded(params.get("callingAgent"), 256),
   };
 }
 
@@ -310,6 +296,10 @@ export function auditRouteSearch(state: AuditRouteState) {
   if (search) params.set("q", search);
   if (state.action !== "all" && localAuditActions.has(state.action)) params.set("action", state.action);
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
+  if (state.originChannel && state.originChannel !== "all") params.set("origin", state.originChannel);
+  if (state.originIntegrationClientId) params.set("integration", state.originIntegrationClientId);
+  if (state.originClientId) params.set("client", state.originClientId);
+  if (state.originCallingAgentId) params.set("callingAgent", state.originCallingAgentId);
   if (Number.isSafeInteger(state.page) && state.page > 0) params.set("page", String(Math.min(state.page, maximumAuditPageIndex) + 1));
   return params;
 }
@@ -330,27 +320,9 @@ export function parseSyncReportRoute(search: string): SyncReportRouteState | und
   };
 }
 
-export function migrateOfficialUsageRoute(pathname: string, search: string): URLSearchParams | undefined {
-  if (normalizePath(pathname) !== "/official-usage") return undefined;
-  const params = routeParams(search);
-  const stagingId = durableRouteId(params.get("staging"));
-  const reportSetId = durableRouteId(params.get("snapshot"));
-  const window = Number(params.get("window"));
-  const validWindow = Number.isSafeInteger(window) && window >= 1 && window <= 365;
-  const view = stagingId ? "import"
-    : params.get("view") === "history" ? "manage"
-    : params.get("view") === "snapshot" || reportSetId || validWindow ? "snapshot" : "manage";
-  return dataSyncRouteSearch({
-    refreshMode: "delegated",
-    reports: { view, stagingId, reportSetId: view === "snapshot" ? reportSetId : undefined,
-      activityWindowDays: validWindow ? window : reportSetId ? 365 : 30 },
-  });
-}
-
 export function parseUsersRoute(search: string): UsersRouteState {
   const params = routeParams(search);
-  const legacyResponsibility = params.get("view") === "responsibility";
-  const detailId = params.get("detail") ?? (legacyResponsibility ? params.get("person") : null);
+  const detailId = params.get("detail");
   return {
     ...(params.get("section") === "adoption" ? { section: "adoption" as const } : {}),
     ...(params.get("section") === "adoption" ? {
@@ -358,15 +330,15 @@ export function parseUsersRoute(search: string): UsersRouteState {
       adoptionChamps: params.get("champs") === "with" ? "with" as const : params.get("champs") === "without" ? "without" as const : undefined,
       adoptionAgents: params.get("groupAgents") === "with" ? "with" as const : params.get("groupAgents") === "without" ? "without" as const : undefined,
     } : {}),
-    view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
+    view: params.get("view") === "activity" ? "activity" : "licenses",
     ...(detailId !== null ? {
       detailId: isGraphGuid(detailId) ? detailId.toLowerCase() : "invalid",
-      detailTab: userDetailTabs.find(tab => tab === params.get("tab")) ?? (legacyResponsibility ? "responsibility" : "overview"),
+      detailTab: userDetailTabs.find(tab => tab === params.get("tab")) ?? "overview",
     } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: durableRouteId(params.get("snapshot")),
-    // Users pages require an owned selection cursor, not a legacy offset.
+    // Users pages require an owned selection cursor, not an offset.
     page: 0,
   };
 }
@@ -403,7 +375,7 @@ function routeParams(search: string) {
   for (const key of params.keys()) counts.set(key, (counts.get(key) ?? 0) + 1);
   for (const [key, count] of counts) {
     if (key !== "selected" && key !== "selectedResource" && count > 1) {
-      // Retain presence so an ambiguous explicit filter cannot fall back to a legacy alias.
+      // Repeated scalar filters are invalid, not permission to choose one value.
       params.set(key, "");
     }
   }

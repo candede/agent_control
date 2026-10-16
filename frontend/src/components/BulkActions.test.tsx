@@ -1,13 +1,12 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
-import { getBulkActionJobItems, type BulkActionJob, type BulkJobItemPage, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
+import { getBulkActionJobItems, type BulkActionJob, type BulkJobStatus, type BulkPackageResult, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { BulkActions } from "./BulkActions";
-import { BulkJobItems } from "./BulkJobItems";
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getBulkActionJobItems: vi.fn(),
 }));
@@ -35,7 +34,7 @@ function mount(overrides: Partial<Parameters<typeof BulkActions>[0]> = {}, roles
   };
   const renderPanel = (currentProps: typeof props) => <CapabilityContext value={{
     user: { ...user, roles }, views: [{
-      definition: capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!,
+      enabled: true, definition: capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!,
       decision: { capabilityId: "graph.package.block.manage", status: "available", authorized: true, fresh: true,
         verification: "on_demand", previewQualification: "not_required", remediation: [] },
     }], loading: false, pending: false, error: undefined, now: Date.now(),
@@ -280,24 +279,4 @@ describe("unified access job panel", () => {
     expect(panel.getByRole("group", { name: "Package job progress" }).lastElementChild).toHaveClass("bulk-progress-meta");
   });
 
-  it.each(["owner", "job", "revision"] as const)("cancels obsolete result reads across a changed %s and ignores late results", async boundary => {
-    let resolve!: (page: BulkJobItemPage) => void;
-    vi.mocked(getBulkActionJobItems).mockImplementationOnce(() => new Promise(done => { resolve = done; }))
-      .mockResolvedValueOnce({ value: [{ id: "new", displayName: "Current result", status: "succeeded" }],
-        revision: "2", counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
-    const view = render(<BulkJobItems job={running} owner="first-session" />);
-    await waitFor(() => expect(getBulkActionJobItems).toHaveBeenCalledOnce());
-    const signal = vi.mocked(getBulkActionJobItems).mock.calls[0][2]!.signal!;
-    view.rerender(<BulkJobItems owner={boundary === "owner" ? "next-session" : "first-session"}
-      job={{ ...running, id: boundary === "job" ? "next-job" : running.id, resultRevision: boundary === "revision" ? "2" : "1" }} />);
-    expect(await screen.findByText("Current result")).toBeVisible();
-    expect(signal.aborted).toBe(true);
-    await act(async () => resolve({
-      value: [{ id: "old", displayName: "Retired result", status: "failed" }], revision: "1",
-      counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null },
-    }));
-    expect(screen.queryByText("Retired result")).not.toBeInTheDocument();
-    expect(screen.getByText("Current result")).toBeVisible();
-    expect(getBulkActionJobItems).toHaveBeenCalledTimes(2);
-  });
 });

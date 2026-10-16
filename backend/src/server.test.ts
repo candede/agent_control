@@ -52,7 +52,8 @@ vi.mock("./services/inventoryRuntime.js", () => ({
 vi.mock("./services/operationalState.js", () => ({
   loadOperationalState: mocks.loadOperationalState, readOperationalState: mocks.readOperationalState,
 }));
-vi.mock("./services/telemetry.js", () => ({
+vi.mock("./services/telemetry.js", async original => ({
+  ...await original<typeof import("./services/telemetry.js")>(),
   operationalLog: mocks.log, observeDatabasePool: vi.fn(), observeRuntimeResources: mocks.resources,
   withTelemetryContext: (_fields: unknown, operation: () => unknown) => operation(),
 }));
@@ -205,7 +206,7 @@ describe("maintenance shutdown lifecycle", () => {
     vi.clearAllTimers();
     vi.resetModules();
     mocks.recover.mockClear();
-    mocks.loadOperationalState.mockResolvedValue({ mode: "normal", providerWorkEnabled: false });
+    mocks.loadOperationalState.mockResolvedValue({ mode: "normal" });
     mocks.recover.mockResolvedValue(0);
     await import("./server.js");
     expect(mocks.recover).toHaveBeenCalledTimes(13);
@@ -215,8 +216,7 @@ describe("maintenance shutdown lifecycle", () => {
     vi.clearAllTimers();
     vi.resetModules();
     mocks.recover.mockClear();
-    const state = { mode: "normal", provider_work_enabled: true, restored_from_at: null,
-      deletion_reviewed_at: null, access_reviewed_at: null };
+    const state = { mode: "normal" };
     mocks.query.mockImplementation(async () => ({ rowCount: 1, rows: [{ ...state }] }));
     const operationalState = await vi.importActual<typeof import("./services/operationalState.js")>("./services/operationalState.js");
     mocks.loadOperationalState.mockImplementation(operationalState.loadOperationalState);
@@ -235,8 +235,7 @@ describe("maintenance shutdown lifecycle", () => {
     vi.clearAllTimers();
     vi.resetModules();
     mocks.listen.mockClear(); mocks.recover.mockClear();
-    const row = { mode: "normal", provider_work_enabled: true, restored_from_at: null,
-      deletion_reviewed_at: null, access_reviewed_at: null };
+    const row = { mode: "normal" };
     const initial = Promise.withResolvers<{ rowCount: number; rows: typeof row[] }>();
     mocks.query.mockReturnValueOnce(initial.promise).mockResolvedValue({ rowCount: 1, rows: [{ ...row }] });
     const operationalState = await vi.importActual<typeof import("./services/operationalState.js")>("./services/operationalState.js");
@@ -253,12 +252,12 @@ describe("maintenance shutdown lifecycle", () => {
     expect(operationalState.providerWorkEnabled()).toBe(true);
   });
 
-  it.each(["read failure", "invalid provider flag", "incomplete review", "duplicate singleton"])(
+  it.each(["read failure", "invalid mode", "missing singleton", "duplicate singleton"])(
     "closes the real provider-admission gate on periodic %s until a later recovery pass", async outcome => {
     vi.clearAllTimers();
     vi.resetModules();
     mocks.query.mockResolvedValue({ rowCount: 1, rows: [{
-      mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+      mode: "normal",
     }] });
     const operationalState = await vi.importActual<typeof import("./services/operationalState.js")>("./services/operationalState.js");
     mocks.loadOperationalState.mockImplementation(operationalState.loadOperationalState);
@@ -268,10 +267,9 @@ describe("maintenance shutdown lifecycle", () => {
     expect(operationalState.providerWorkEnabled()).toBe(true);
     if (outcome === "read failure") mocks.query.mockRejectedValueOnce(new Error("Private operational-state database detail."));
     else {
-      const row = { mode: "normal", provider_work_enabled: outcome === "invalid provider flag" ? "false" : true,
-        restored_from_at: outcome === "incomplete review" ? new Date() : null, deletion_reviewed_at: null, access_reviewed_at: null };
-      mocks.query.mockResolvedValueOnce({ rowCount: outcome === "duplicate singleton" ? 2 : 1,
-        rows: outcome === "duplicate singleton" ? [row, row] : [row] });
+      const row = { mode: outcome === "invalid mode" ? "invalid" : "normal" };
+      const rows = outcome === "missing singleton" ? [] : outcome === "duplicate singleton" ? [row, row] : [row];
+      mocks.query.mockResolvedValueOnce({ rowCount: rows.length, rows });
     }
     mocks.recover.mockClear();
     await vi.advanceTimersByTimeAsync(30_000);

@@ -4,6 +4,7 @@ import { isPackageElementType, validatePackageAgentMetadata } from "./packageAge
 import { operationalLog } from "./telemetry.js";
 import { isInventoryTimestamp } from "../types/inventoryTimestamp.js";
 import { parseProviderContractJson } from "./providerJson.js";
+import { dataLimits, dataLimitError } from "../db/dataBounds.js";
 
 const descriptionFields = ["shortDescription", "longDescription"] as const;
 const facetFields = ["type", "publisher", "availableTo", "deployedTo", "platform", "version", "manifestVersion", "sensitivity"] as const;
@@ -28,6 +29,14 @@ export function parsePackageObservationJson(text: string): unknown {
 }
 
 export function allowlistedPackage(input: unknown): CopilotPackageDetail {
+  return packageObservation(input, false);
+}
+
+export function allowlistedSavedPackage(input: unknown): CopilotPackageDetail {
+  return packageObservation(input, true);
+}
+
+function packageObservation(input: unknown, saved: boolean): CopilotPackageDetail {
   const row = observationRecord(input);
   if (row["@odata.type"] !== undefined && row["@odata.type"] !== "#microsoft.graph.copilotPackage"
     && row["@odata.type"] !== "#microsoft.graph.copilotPackageDetail") {
@@ -49,7 +58,9 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
     const value = row[key];
     if (value === undefined || value === null) continue;
     if (!isPackageText(value)) throw new AppError(502, "provider_schema", "Package description text is invalid.");
-    result[key] = boundedDescription(value, key === "longDescription" ? 32768 : 4096);
+    if (Buffer.byteLength(value) > dataLimits.agentDefinitionBytes) throw dataLimitError("inventory_about_bytes", dataLimits.agentDefinitionBytes, Buffer.byteLength(value));
+    result[key] = value;
+    result.provenance[key] = { sourceSystem: "graph_packages", path: key, maturity: "ga" };
   }
   for (const key of facetFields) {
     const value = row[key];
@@ -137,7 +148,10 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
             throw new AppError(502, "provider_schema", "Package element identity or definition is invalid.");
           }
           elementBytes += Buffer.byteLength(element.definition, "utf8");
-          if (elementBytes > packageObservationLimits.bytes) {
+          if (saved && Buffer.byteLength(element.definition) > dataLimits.agentDefinitionBytes) {
+            throw dataLimitError("data_detail_bytes", dataLimits.agentDefinitionBytes, Buffer.byteLength(element.definition));
+          }
+          if (elementBytes > (saved ? dataLimits.agentDefinitionWorkBytes : packageObservationLimits.bytes)) {
             throw new AppError(502, "provider_result_limit", "Package details exceed the saved observation limit; no truncated identity was saved.");
           }
           return {
@@ -149,7 +163,7 @@ export function allowlistedPackage(input: unknown): CopilotPackageDetail {
       };
     });
   }
-  if (Buffer.byteLength(JSON.stringify(result), "utf8") > packageObservationLimits.bytes) {
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > (saved ? dataLimits.agentDefinitionWorkBytes : packageObservationLimits.bytes)) {
     throw new AppError(502, "provider_result_limit", "Package details exceed the saved observation limit; no truncated identity was saved.");
   }
   const knownFields = new Set([

@@ -1,5 +1,5 @@
 export type OfficialUsageReportKind = "agents" | "userAgents" | "users";
-export type OfficialUsagePeriodProvenance = "source_metadata" | "operator_asserted" | "activity_range";
+type OfficialUsagePeriodProvenance = "source_metadata" | "operator_asserted" | "activity_range";
 export type OfficialUsageMetadata = {
   reportingPeriod?: { startDate: string; endDate: string; provenance: Exclude<OfficialUsagePeriodProvenance, "activity_range"> };
   sourceAsOf?: { value: string; provenance: "source_metadata" | "operator_asserted" };

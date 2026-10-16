@@ -293,7 +293,8 @@ async function childBatch(client: pg.PoolClient, members: Member[], after: strin
       WHERE requested.index>=$2 AND fact.generation_id=requested.generation AND fact.identity=requested.identity
         AND fact.ordinal>CASE WHEN requested.index=$2 THEN $3::integer ELSE -1 END
         AND (fact.kind LIKE 'detail:%' OR fact.kind IN
-          ('collection','element','elementGroup','identifier','connectorOperation','supportedHosts','elementTypes','categories'))
+          ('collection','element','elementGroup','identifier','connectorOperation','supportedHosts','elementTypes','categories',
+           'about:long','about:native','about:short'))
         AND NOT (fact.kind='collection' AND fact.value IN ('allowedUsersAndGroups','acquireUsersAndGroups','sharedWithUsersAndGroups'))
       ORDER BY fact.ordinal LIMIT 251 OFFSET 0) f
     ORDER BY (${key}) COLLATE "C" LIMIT 251)${boundedResult}`, [batch.json,memberIndex,ordinal]);

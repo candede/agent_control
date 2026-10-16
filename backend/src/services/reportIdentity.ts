@@ -7,6 +7,7 @@ import type { AuthenticatedUser } from "../types/session.js";
 import type { SelectionIdentity } from "./dataSelections.js";
 import { appRoles, hasAppRole } from "../types/capability.js";
 import { normalizeInventoryProviderRoleIds } from "./inventoryRoleScope.js";
+import { currentAuthority, requireAuthority } from "../auth/authorityContext.js";
 
 function ownValue(value: object, key: string) {
   const property = Object.getOwnPropertyDescriptor(value, key);
@@ -28,6 +29,14 @@ function roleValues(value: unknown): string[] {
 }
 
 export async function reportIdentity(database: pg.Pool, user: AuthenticatedUser): Promise<SelectionIdentity> {
+  if (currentAuthority()) {
+    const source = requireAuthority(user.tenantId, user.homeAccountId);
+    const { tenantId, principalId, authorizationHash, sessionEpoch } = source.principal;
+    const currentEpoch = await new DataGenerations(database).sessionEpoch(tenantId, principalId);
+    source.assertCurrent();
+    if (currentEpoch !== sessionEpoch) throw AppError.unauthorized("The authorization epoch changed.");
+    return Object.freeze({ tenantId, principalId, authorizationHash, sessionEpoch });
+  }
   if (isProxy(user) || !user || typeof user !== "object"
     || Object.getPrototypeOf(user) !== Object.prototype && Object.getPrototypeOf(user) !== null) throw AppError.unauthorized();
   const tenantId = identityText(ownValue(user, "tenantId"), 512), principalId = identityText(ownValue(user, "homeAccountId"), 1024);
@@ -37,9 +46,13 @@ export async function reportIdentity(database: pg.Pool, user: AuthenticatedUser)
   if (!hasAppRole(roles, "AgentControl.Viewer")) throw AppError.unauthorized();
   const suppliedProviderRoles = ownValue(user, "providerRoleIds");
   const providerRoles = normalizeInventoryProviderRoleIds(suppliedProviderRoles === undefined ? [] : roleValues(suppliedProviderRoles));
-  const authorizationHash = createHash("sha256").update(JSON.stringify({
-    tenantId, principalId, roles, providerRoles, tokenMode: "delegated",
-  })).digest("hex");
+  const authorizationHash = principalAuthorizationHash(tenantId, principalId, roles, providerRoles);
   const sessionEpoch = await new DataGenerations(database).sessionEpoch(tenantId, principalId);
   return Object.freeze({ tenantId, principalId, sessionEpoch, authorizationHash });
+}
+
+export function principalAuthorizationHash(tenantId: string, principalId: string, roles: readonly string[], providerRoles: readonly string[]) {
+  return createHash("sha256").update(JSON.stringify({
+    tenantId, principalId, roles: [...roles].sort(), providerRoles: [...providerRoles].sort(), tokenMode: "delegated",
+  })).digest("hex");
 }

@@ -15,6 +15,7 @@ import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegist
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import type { CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser, AuthFlow } from "../types/session.js";
+import { authorityUser, currentAuthority, requireAuthority } from "./authorityContext.js";
 
 type TokenCache = {
   getAccountByHomeId(homeAccountId: string): Promise<AccountInfo | null>;
@@ -50,7 +51,7 @@ export function replaceMsalClientForTest(tenantId: string, value: MsalClient | u
   }
 }
 
-export function requireAuthConfigured() {
+function requireAuthConfigured() {
   if (!authConfigured || config.tenants.length === 0) {
     throw AppError.serviceUnavailable(
       "Configure an Entra tenant, application credentials, and organizational email domains before signing in.",
@@ -161,6 +162,22 @@ function assertLiveAuthFlow(flow: AuthFlow) {
 }
 
 export async function acquireDelegatedToken(tenantId: string, homeAccountId: string, capabilityId: CapabilityId) {
+  const source = currentAuthority();
+  if (source) return requireAuthority(tenantId, homeAccountId).acquire(capabilityId);
+  return (await acquireDelegatedTokenResult(tenantId, homeAccountId, capabilityId)).accessToken;
+}
+
+export async function acquireAuthorizedToken(tenantId: string, homeAccountId: string, capabilityId: CapabilityId) {
+  return requireAuthority(tenantId, homeAccountId).acquire(capabilityId);
+}
+
+export async function revalidateAuthorizedUser(tenantId: string, homeAccountId: string) {
+  const source = requireAuthority(tenantId, homeAccountId);
+  await source.revalidate();
+  return authorityUser(source);
+}
+
+export async function acquireDelegatedTokenResult(tenantId: string, homeAccountId: string, capabilityId: CapabilityId) {
   const definition = getCapabilityDefinition(capabilityId);
   if (!definition || definition.mode !== "delegated") throw new AppError(400, "invalid_token_mode", "The capability does not support delegated tokens.");
   const tenant = getTenantConfiguration(tenantId);
@@ -175,13 +192,14 @@ export async function acquireDelegatedToken(tenantId: string, homeAccountId: str
     const result = await client.acquireTokenSilent({ authority: tenantAuthority(tenantId), account, scopes: capabilityScopes(capabilityId) });
     assertTenantConfiguration(tenantId, fingerprint);
     validateTokenResult(tenant, result, "delegated", definition.audience, definition.permissions, definition.acceptedPermissions, homeAccountId);
-    return result.accessToken;
+    return result;
   } catch (error) {
     throw normalizeTokenError(error);
   }
 }
 
 export async function acquireApplicationToken(tenantId: string, capabilityId: CapabilityId) {
+  if (currentAuthority()?.principal.transport === "bearer") throw new AppError(403, "invalid_token_mode", "Integration operations require delegated authorization.");
   const definition = getCapabilityDefinition(capabilityId);
   if (!definition || definition.mode !== "application" || definition.provider !== "Microsoft Graph") {
     throw new AppError(400, "invalid_token_mode", "The capability does not support application tokens.");
@@ -200,6 +218,15 @@ export async function acquireApplicationToken(tenantId: string, capabilityId: Ca
 }
 
 export async function revalidateAuthenticatedUser(tenantId: string, homeAccountId: string) {
+  const source = currentAuthority();
+  if (source) {
+    await requireAuthority(tenantId, homeAccountId).revalidate();
+    return authorityUser(source);
+  }
+  return toAuthenticatedUser(await revalidateAuthenticatedUserResult(tenantId, homeAccountId));
+}
+
+export async function revalidateAuthenticatedUserResult(tenantId: string, homeAccountId: string) {
   const tenant = getTenantConfiguration(tenantId);
   const fingerprint = tenantConfigurationFingerprint(tenant);
   const client = getMsalClient(tenantId);
@@ -211,7 +238,7 @@ export async function revalidateAuthenticatedUser(tenantId: string, homeAccountI
     const result = await client.acquireTokenSilent({ authority: tenantAuthority(tenantId), account, scopes: loginScopes, forceRefresh: true });
     assertTenantConfiguration(tenantId, fingerprint);
     validateAuthenticationPrincipal(tenant, result, homeAccountId);
-    return toAuthenticatedUser(result);
+    return result;
   } catch (error) {
     throw normalizeTokenError(error);
   }
@@ -307,7 +334,7 @@ function validateOptionalIdentityClaims(tenant: TenantConfiguration, claims: Rec
   validateClientClaims(tenant, claims);
 }
 
-function validateTokenResult(tenant: TenantConfiguration, result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
+export function validateTokenResult(tenant: TenantConfiguration, result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
   if (!result?.accessToken) {
     if (mode === "application") throw new AppError(502, "identity_provider_error",
       "Microsoft Entra ID did not return an application token. An administrator must verify the existing app registration and its credentials.");
@@ -448,7 +475,7 @@ export function isRetryableIdentityProviderError(error: unknown): boolean {
     && ownErrorField(details, "retryable") === true;
 }
 
-function normalizeTokenError(error: unknown) {
+export function normalizeTokenError(error: unknown) {
   if (isApplicationError(error)) return error;
   const errorCode = ownErrorField(error, "errorCode");
   const errorSubCode = ownErrorField(error, "subError");

@@ -3,6 +3,7 @@ import type { publishBoundedCsv } from "../services/csvExport.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { capabilities } from "../services/capabilities.js";
+import { config } from "../config.js";
 import "./audit.js";
 import "./defenderHunting.js";
 import "./purviewAudit.js";
@@ -40,8 +41,10 @@ vi.mock("../services/telemetry.js", async original => ({
 }));
 
 const paths = ["/audit/events/export.csv", "/hunting/jobs/:id/export.csv", "/audit-search/jobs/:id/export.csv"];
+const originalTenants = config.tenants;
 
 beforeEach(() => {
+  config.tenants = [{ tenantId: "csv-tenant", clientId: "csv-api", clientSecret: "synthetic-unused", domains: ["example.invalid"] }];
   vi.resetAllMocks();
   mocks.audit.startEvent.mockResolvedValue({ id: "csv-receipt" });
   mocks.audit.completeEvent.mockResolvedValue(undefined);
@@ -51,12 +54,14 @@ beforeEach(() => {
   mocks.purview.get.mockResolvedValue({ status: "succeeded" });
   mocks.purview.records.mockResolvedValue({ count: 0, value: [], job: { filters: {}, resultScope: {} } });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); config.tenants = originalTenants; });
 
 function transport(path: string, method = path === "/audit/events/export.csv" ? "post" : "get") {
   const request = {
     path, params: { id: "11111111-1111-4111-8111-111111111111" }, query: {}, body: { ids: ["event-1"] },
-    aborted: false, session: { user: { tenantId: "csv-tenant", homeAccountId: "csv-principal" } },
+    aborted: false, session: { tenantId: "csv-tenant", clientId: "csv-api", accountId: "csv-principal", signedInAt: Date.now(),
+      rolesValidatedAt: Date.now(), user: { tenantId: "csv-tenant", homeAccountId: "csv-principal",
+        username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"], providerRoleIds: [] } },
     get: vi.fn(() => undefined),
   } as unknown as Request;
   const response = {

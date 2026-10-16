@@ -15,7 +15,7 @@ const user: SessionUser = { displayName: "Synthetic administrator", username: "f
 const now = Date.parse("2026-09-24T00:00:00Z");
 function fixture(status: CapabilityStatus = "available", id: CapabilityId = "graph.package.read.delegated"): CapabilityView {
   return {
-    definition: capabilityDefinitions.find(definition => definition.id === id)!,
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
     decision: {
       capabilityId: id, status, authorized: status === "available", fresh: true,
       verification: status === "available" ? "token" : undefined,

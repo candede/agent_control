@@ -62,7 +62,10 @@ test("user details restore all five task-focused tabs without exposing storage d
     }
     if (tab === "Licenses") await expect(panel.getByRole("list", { name: "Paid feature states" })).toBeVisible();
     if (tab === "Responsibility") await expect(panel.getByRole("heading", { name: "Agent responsibility" })).toBeVisible();
-    if (tab === "Logs") await expect(panel.getByText(/Purview/).first()).toBeVisible();
+    if (tab === "Logs") {
+      await expect(panel.getByRole("combobox", {name:"Source",exact:true})).toHaveValue("purview");
+      await expect(panel.getByRole("heading", {name:"Search Purview logs",exact:true})).toBeVisible();
+    }
     expect((await new AxeBuilder({ page }).include(".user-detail-modal").analyze()).violations).toEqual([]);
     await dialog.screenshot({ path: info.outputPath(`user-${tab.replaceAll(" ", "-")}.png`) });
   }

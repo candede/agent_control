@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { CopilotStudioQuarantineCanaryRepository, type QuarantineCanaryApproval } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { NativeInventory } from "../db/nativeInventory.js";
@@ -16,16 +16,16 @@ import { operationalLog } from "./telemetry.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 
 type CanaryDependencies = {
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  delegatedToken: typeof acquireDelegatedToken;
+  revalidateUser: typeof revalidateAuthorizedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
   requireAvailable: typeof capabilities.requireAvailable;
   authorityContext: typeof capabilities.quarantineAuthorityContext;
   approvalAuthorityContext: typeof capabilities.quarantineApprovalAuthorityContext;
 };
 
 const defaultDependencies: CanaryDependencies = {
-  revalidateUser: revalidateAuthenticatedUser,
-  delegatedToken: acquireDelegatedToken,
+  revalidateUser: revalidateAuthorizedUser,
+  delegatedToken: acquireAuthorizedToken,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   authorityContext: capabilities.quarantineAuthorityContext.bind(capabilities),
   approvalAuthorityContext: capabilities.quarantineApprovalAuthorityContext.bind(capabilities),

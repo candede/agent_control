@@ -107,13 +107,6 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); flows.clearAuthFlowsForTest(); config.tenants = originalTenants; });
 afterAll(async () => { server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve())); });
 
-function consent(capabilityId = "graph.agentIdentity.read", headers = {}) {
-  return fetch(`${origin}/api/auth/consent`, {
-    method: "POST", headers: { "content-type": "application/json", "x-csrf-token": "test-csrf", ...headers },
-    body: JSON.stringify({ capabilityId, returnTo: "/agents" }),
-  });
-}
-
 function postLogin(body: unknown, anonymous = false) {
   return fetch(`${origin}/api/auth/login`, {
     method: "POST", headers: { "content-type": "application/json", ...(anonymous ? { "x-test-user": "anonymous" } : {}) },
@@ -134,36 +127,13 @@ function successfulRedemption(selected = tenant, username = `viewer@${selected.d
 }
 
 describe("administrator-managed API permission policy", () => {
-  it("retains authentication, Viewer and CSRF protection on the retired endpoint", async () => {
-    expect((await consent(undefined, { "x-test-user": "anonymous" })).status).toBe(401);
-    sessionState = makeSession(tenant);
-    expect((await consent(undefined, { "x-test-user": "unassigned" })).status).toBe(403);
-    sessionState = makeSession(tenant);
-    const badCsrf = await consent(undefined, { "x-csrf-token": "wrong" });
-    expect(badCsrf.status).toBe(403);
-    expect(await badCsrf.json()).toMatchObject({ code: "invalid_csrf" });
+  it("does not expose the retired consent endpoint or create a permission flow", async () => {
+    const response = await fetch(`${origin}/api/auth/consent`, { method: "POST" });
+    expect(response.status).toBe(404);
     expect(flows.storeAuthFlow).not.toHaveBeenCalled();
     expect(msal.createAuthorizationUrl).not.toHaveBeenCalled();
+    expect(msal.redeemAuthorizationCode).not.toHaveBeenCalled();
   });
-
-  it.each(["graph.agentIdentity.read", "graph.package.read.delegated", "defender.hunting.application", "unknown"])(
-    "returns 410 for %s without creating a flow or disturbing a pending normal login", async capabilityId => {
-      const login = msal.createAuthFlow("login", { tenantId: tenant.tenantId, username: user.username });
-      const handle = flows.storeAuthFlow("auth-http-session", undefined, login);
-      sessionState.authFlowHandle = handle;
-      vi.mocked(flows.storeAuthFlow).mockClear();
-      const response = await consent(capabilityId);
-      expect(response.status).toBe(410);
-      const body = await response.json();
-      expect(body).toMatchObject({ code: "admin_managed_permissions", detail: expect.stringContaining("Grant admin consent") });
-      expect(body).not.toHaveProperty("authorizationUrl");
-      expect(sessionState.authFlowHandle).toBe(handle);
-      expect(flows.consumeAuthFlow("auth-http-session", handle, login.state)).toBe(login);
-      expect(flows.storeAuthFlow).not.toHaveBeenCalled();
-      expect(msal.createAuthorizationUrl).not.toHaveBeenCalled();
-      expect(msal.redeemAuthorizationCode).not.toHaveBeenCalled();
-    },
-  );
 
   it("preserves normal sign-in and ignores caller-supplied API scope selectors", async () => {
     const response = await fetch(`${origin}/api/auth/login?returnTo=%2Fagents&scope=https%3A%2F%2Fgraph.microsoft.com%2FAgentIdentity.Read.All`, { redirect: "manual" });

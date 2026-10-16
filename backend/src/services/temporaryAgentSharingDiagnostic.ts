@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { config } from "../config.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
@@ -211,14 +211,14 @@ async function authorize(user: AuthenticatedUser, capabilityId: CapabilityId, co
   const validateCapability = capabilities.beginOperationValidation(capabilityId, user);
   const assertCurrent = () => { context.signal.throwIfAborted(); context.assertCurrent(); validateCapability(); };
   assertCurrent();
-  const fresh = await interruptible(() => revalidateAuthenticatedUser(tenant, user.homeAccountId), context.signal);
+  const fresh = await interruptible(() => revalidateAuthorizedUser(tenant, user.homeAccountId), context.signal);
   assertCurrent();
   if (fresh.tenantId !== tenant || fresh.homeAccountId !== user.homeAccountId || !hasAppRole(fresh.roles, "AgentControl.Admin")) {
     throw new AppError(401, "diagnostic_authorization_changed", "Diagnostic administrator authorization changed.");
   }
   await interruptible(() => capabilities.requireAvailable(capabilityId, fresh), context.signal);
   assertCurrent();
-  const token = await interruptible(() => acquireDelegatedToken(tenant, user.homeAccountId, capabilityId), context.signal);
+  const token = await interruptible(() => acquireAuthorizedToken(tenant, user.homeAccountId, capabilityId), context.signal);
   assertCurrent();
   return { token, assertCurrent };
 }

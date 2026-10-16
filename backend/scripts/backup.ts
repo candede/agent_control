@@ -37,7 +37,7 @@ async function checksum(filename: string) {
   return hash.digest("hex");
 }
 
-export function databaseTargetIdentity(database: Pick<pg.Pool, "options">) {
+function databaseTargetIdentity(database: Pick<pg.Pool, "options">) {
   const host = String(database.options.host ?? "").trim().toLowerCase().replace(/\.$/, "");
   const name = String(database.options.database ?? "").trim();
   if (!host || !name) throw new Error("Database target identity requires an exact server and database.");
@@ -113,17 +113,20 @@ async function command(name: string, args: string[], database: string) {
 
 export async function backup(database: pg.Pool, filename: string) {
   if (existsSync(filename) || existsSync(`${filename}.json`)) throw new Error("Backup target already exists; choose a new filename.");
-  await verifySchema(database);
+  const preflight = await preflightSchema(database);
+  if (!preflight.currentFingerprint) throw new Error("Backup requires the initialized current schema.");
+  const fingerprint = preflight.currentFingerprint;
   const client = await database.connect();
   try {
     checkpointQueries(client);
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await verifySchema(client);
     const snapshot = await client.query("SELECT pg_export_snapshot() AS snapshot,transaction_timestamp() AS snapshot_at");
     await verifyReportMembershipCounts(client);
-    const counts = await fingerprints(client);
+    const counts = await fingerprints(client, await validateBackupInventory(client));
     await command("pg_dump",["--format=custom","--no-owner","--no-privileges",`--snapshot=${snapshot.rows[0].snapshot}`,"--file",filename],String(database.options.database));
     chmodSync(filename,0o600);
-    writeFileSync(`${filename}.json`,JSON.stringify({format:"agent-control-backup-v1",fingerprintAlgorithm,sha256:await checksum(filename),schemaFingerprint,tables:counts,
+    writeFileSync(`${filename}.json`,JSON.stringify({format:"agent-control-backup-v1",fingerprintAlgorithm,sha256:await checksum(filename),schemaFingerprint:fingerprint,tables:counts,
       snapshotAt:new Date(snapshot.rows[0].snapshot_at).toISOString(),createdAt:new Date().toISOString()}),{flag:"wx",mode:0o600});
     await client.query("COMMIT");
     return counts;
@@ -142,14 +145,17 @@ export async function restore(operator: pg.Pool, filename: string, target: strin
     || !Number.isFinite(restoredFromAt.getTime()) || restoredFromAt.getTime() > Date.parse(receipt.createdAt)) {
     throw new Error("Backup receipt/checksum mismatch.");
   }
-  if (JSON.stringify(Object.keys(receipt.tables).sort()) !== JSON.stringify(Object.keys(backupTableKeys).sort())) {
+  const expectedTables = Object.keys(backupTableKeys);
+  if (JSON.stringify(Object.keys(receipt.tables).sort()) !== JSON.stringify(expectedTables.sort())) {
     throw new Error("Backup schema inventory mismatch.");
   }
   await operator.query(`CREATE DATABASE "${target}"`);
   const database = new pg.Pool({...databaseSettings(),database:target});
   try {
     await command("pg_restore",["--no-owner","--no-privileges","--exit-on-error","--single-transaction","--dbname",target,filename],target);
-    if ((await preflightSchema(database)).state !== "current") throw new Error("Backup does not contain the current schema.");
+    await grantRuntime(database);
+    const restored = await preflightSchema(database);
+    if (restored.currentFingerprint !== receipt.schemaFingerprint) throw new Error("Backup schema differs from its receipt.");
     await validateBackupInventory(database);
     const actual = await fingerprints(database, Object.keys(receipt.tables));
     if (JSON.stringify(actual) !== JSON.stringify(receipt.tables)) throw new Error("Restore count/content mismatch; keep target isolated.");
@@ -162,8 +168,7 @@ export async function restore(operator: pg.Pool, filename: string, target: strin
     await database.query("REVOKE ALL ON FUNCTION directory_service_plan_rows_insert_guard(),inventory_facts_insert_guard() FROM PUBLIC");
     await database.query("REVOKE ALL ON FUNCTION official_usage_membership_count() FROM PUBLIC");
     await database.query("GRANT SELECT ON app_schema,official_usage_membership_counts TO agentcontrol_app");
-    await prepareRestoredDatabase(operator, database, restoredFromAt);
-    await grantRuntime(database);
+    await prepareRestoredDatabase(operator, database);
     await verifySchema(database);
     await verifyDataGenerationCharges(database);
     await verifyReportMembershipCounts(database);
@@ -171,21 +176,22 @@ export async function restore(operator: pg.Pool, filename: string, target: strin
   } finally { await database.end(); }
 }
 
-export async function prepareRestoredDatabase(current: pg.Pool, restored: pg.Pool, restoredFromAt: Date) {
-  if (!Number.isFinite(restoredFromAt.getTime()) || restoredFromAt.getTime() > Date.now() + 300_000) throw new Error("Backup creation time is invalid.");
+export async function prepareRestoredDatabase(current: pg.Pool, restored: pg.Pool) {
   assertDistinctDatabaseTargets(current, restored);
   await withCurrentReview(current, async review => transaction(restored, async client => {
     await invalidateRestoredAuthority(client);
     await reconcileCurrentCaches(review, client, new OfficialReportHistory(restored));
-    await client.query(`UPDATE operational_state SET mode='maintenance',provider_work_enabled=false,restored_from_at=$1,
-      deletion_reviewed_at=clock_timestamp(),access_reviewed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE singleton=true`, [restoredFromAt]);
+    const state = await client.query("UPDATE operational_state SET mode='maintenance',updated_at=clock_timestamp() WHERE singleton=true");
+    if (state.rowCount !== 1) throw new Error("Operational state is missing; restore preparation was not completed.");
   }));
+  await grantRuntime(restored);
   await retainUntilConverged(restored, { batchSize: 250 });
 }
 
 async function invalidateRestoredAuthority(restored: pg.PoolClient) {
   await mutateReviewRows(restored, "sessions");
-  await mutateReviewRows(restored, "data_principal_epochs", "true", "epoch=epoch+1");
+  await mutateReviewRows(restored, "data_principal_epochs", "true",
+    `epoch=epoch+1,bearer_issued_after=GREATEST(bearer_issued_after,${Date.now()}::bigint,ceil(extract(epoch FROM clock_timestamp())*1000)::bigint)`);
   await mutateReviewRows(restored, "data_scope_epochs", "record.scope_kind='principal'",
     `epoch=epoch+1,session_epoch=(SELECT epoch FROM data_principal_epochs principal
       WHERE principal.tenant_id=record.tenant_id AND principal.principal_id=record.principal_id)`);
@@ -197,9 +203,6 @@ async function invalidateRestoredAuthority(restored: pg.PoolClient) {
   await mutateReviewRows(restored, "official_usage_ingestions", "state IN ('streaming','validating','ready','accepting')", "state='cancelled'");
   await mutateReviewRows(restored, "capability_evidence");
   await mutateReviewRows(restored, "package_mutation_qualifications");
-  await mutateReviewRows(restored, "purview_audit_jobs", "qualification_id IS NOT NULL", "qualification_id=NULL");
-  await mutateReviewRows(restored, "purview_audit_qualifications");
-  await mutateReviewRows(restored, "defender_hunting_qualification_evidence");
   await mutateReviewRows(restored, "copilot_quarantine_canary_approvals");
   await mutateReviewRows(restored, "copilot_quarantine_qualifications");
   await mutateReviewRows(restored, "official_usage_staged_rows");
@@ -289,25 +292,12 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
       observation.resource_native_id,observation.environment_id,observation.bot_id)::text) AS signature
     FROM copilot_quarantine_status_observations observation WHERE observation.expires_at>clock_timestamp()`));
 
-  const safeRetainedScopes = await exactCurrentIds(current, restored, `
-    SELECT retained.id,md5(jsonb_build_array(retained.id,retained.tenant_id,retained.authorization_principal_id,
-      retained.result_scope_id,retained.result_scope_kind,retained.result_scope_configuration_revision,retained.token_mode,
-      retained.capability_id,retained.template_id,retained.target_scope_hash,retained.approved_scope,retained.query_version,
-      retained.contract_revision,retained.permission_revision,retained.configuration_revision,retained.source_qualification_job_id)::text) AS signature
-    FROM defender_hunting_retained_scopes retained
-    WHERE retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()`);
-  await mutateReviewRows(restored, "defender_hunting_retained_scopes",
-    `revoked_at IS NULL AND id NOT IN (${safeRetainedScopes})`,
-    "revoked_at=COALESCE(revoked_at,clock_timestamp()),revoked_by=COALESCE(revoked_by,'restore-review')");
   await purgeMismatched(restored, "defender_hunting_jobs", await exactCurrentIds(current, restored, `
     SELECT job.id,md5(jsonb_build_array(job.id,job.tenant_id,job.authorization_principal_id,job.result_scope_id,
-      job.result_scope_kind,job.result_scope_configuration_revision,job.token_mode,job.retained_scope_id,
-      retained.capability_id,retained.template_id,retained.target_scope_hash,retained.approved_scope,retained.contract_revision,
-      retained.permission_revision,retained.configuration_revision)::text) AS signature
+      job.result_scope_kind,job.result_scope_configuration_revision,job.token_mode,job.request_hash,job.target_scope_hash,
+      job.template_id,job.query_version)::text) AS signature
     FROM defender_hunting_jobs job
-    JOIN defender_hunting_retained_scopes retained ON retained.id=job.retained_scope_id
-      AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
-    WHERE NOT job.is_qualification AND job.expires_at>clock_timestamp()`));
+    WHERE job.expires_at>clock_timestamp()`));
 
   const safeSets = await exactCurrentIds(current, restored, `
     SELECT report_set.id,md5(jsonb_build_array(report_set.id,report_set.tenant_id,report_set.actor_principal_id,
@@ -412,7 +402,6 @@ async function purgeMismatched(restored: pg.PoolClient, table: string, safeIds: 
     await mutateReviewRows(restored, "defender_hunting_rows", `snapshot_id IN (
       SELECT id FROM defender_hunting_snapshots WHERE job_id NOT IN (${safeIds}))`);
     await mutateReviewRows(restored, "defender_hunting_snapshots", `job_id NOT IN (${safeIds})`);
-    await mutateReviewRows(restored, "defender_hunting_qualification_evidence", `qualified_job_id NOT IN (${safeIds})`);
   }
   await mutateReviewRows(restored, table, predicate);
 }
@@ -443,8 +432,7 @@ export async function reopenPreparedRestoredDatabase(current: pg.Pool, restored:
   await retainUntilConverged(restored, { batchSize: 250 });
   await withCurrentReview(current, async review => transaction(restored, async client => {
       const state = await client.query("SELECT * FROM operational_state WHERE singleton=true FOR UPDATE");
-      if (state.rows[0]?.mode !== "maintenance" || state.rows[0]?.provider_work_enabled !== false
-        || !state.rows[0]?.deletion_reviewed_at || !state.rows[0]?.access_reviewed_at) throw new Error("Restore reopening review is incomplete.");
+      if (state.rowCount !== 1 || state.rows[0]?.mode !== "maintenance") throw new Error("Restored database must be in maintenance before reopening.");
       await reconcileCurrentCaches(review, client, new OfficialReportHistory(restored));
       const unsafe = await client.query(`SELECT
         (SELECT count(*) FROM sessions)
@@ -453,16 +441,13 @@ export async function reopenPreparedRestoredDatabase(current: pg.Pool, restored:
         +(SELECT count(*) FROM defender_hunting_jobs WHERE execution_owner IS NOT NULL)
         +(SELECT count(*) FROM copilot_quarantine_jobs WHERE lease_owner IS NOT NULL OR lease_until IS NOT NULL)
         +(SELECT count(*) FROM package_mutation_qualifications)
-        +(SELECT count(*) FROM purview_audit_qualifications)
         +(SELECT count(*) FROM copilot_quarantine_canary_approvals)
         +(SELECT count(*) FROM copilot_quarantine_qualifications)
-        +(SELECT count(*) FROM defender_hunting_qualification_evidence)
         +(SELECT count(*) FROM capability_evidence) AS count`);
       if (Number(unsafe.rows[0].count) !== 0) throw new Error("Restored sessions, ownership or provider authority remains.");
-      await client.query(`UPDATE operational_state SET mode='normal',provider_work_enabled=false,
-        deletion_reviewed_at=clock_timestamp(),access_reviewed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE singleton=true`);
+      await client.query("UPDATE operational_state SET mode='normal',updated_at=clock_timestamp() WHERE singleton=true");
   }));
-  return { mode: "normal", providerWorkEnabled: false };
+  return { mode: "normal", providerWorkEnabled: true };
 }
 
 export async function reopenRestoredDatabase(operator: pg.Pool, target: string) {

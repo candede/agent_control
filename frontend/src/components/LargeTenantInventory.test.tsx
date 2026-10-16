@@ -2,10 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect, useMemo, useState } from "react";
-import { ApiError, getBulkActionJobItems, getInventoryMembers, getInventoryChildren, getInventoryFacets, getInventorySections,
-  type BulkActionJob, type BulkJobItemPage } from "../api/client";
-import { BulkJobItems } from "./BulkJobItems";
-import { InventoryMembers } from "./InventoryMembers";
+import { ApiError, getInventoryChildren, getInventoryFacets } from "../api/client";
 import { InventoryFacetSelect } from "./InventoryFacetSelect";
 import { InventoryRefreshTargets } from "./InventoryRefreshTargets";
 import { getPackageRefreshTargets, type PackageRefreshJob } from "../api/client";
@@ -25,18 +22,9 @@ vi.mock("../api/reportData", () => ({
   createReportExport: vi.fn(), reportExportStatus: vi.fn(), cancelReportExport: vi.fn(),
   reportExportDownload: (id: string) => `/api/data-exports/${id}/download`,
 }));
-vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(), getBulkActionJobItems: vi.fn(),
-  getInventoryMembers: vi.fn(), getInventoryChildren: vi.fn(), getInventoryFacets: vi.fn(), getInventorySections: vi.fn(), getPackageRefreshTargets: vi.fn(),
+vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(),
+  getInventoryChildren: vi.fn(), getInventoryFacets: vi.fn(), getPackageRefreshTargets: vi.fn(),
   getUnifiedAgents: vi.fn() }));
-const job: BulkActionJob = { id: "job", action: "block", targetBlockedState: true, status: "partial", canResume: false,
-  total: 5000, completed: 5000, succeeded: 4000, failed: 500, skipped: 0, inconclusive: 500, cancelled: 0,
-  queued: 0, reconciliationRequired: 500, retryEligible: 0, resultRevision: "10",
-  createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
-function page(name = "first", next: string | null = "next"): BulkJobItemPage {
-  return { value: [{ id: name, displayName: name, status: "inconclusive" }], revision: "10",
-    counts: { total: 5000, filtered: 5000 }, page: { limit: 50, nextCursor: next, previousCursor: null } };
-}
-beforeEach(() => { vi.mocked(getBulkActionJobItems).mockReset().mockResolvedValue(page()); });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 function inventoryPage(offset = 0, prefix = "First account"): UnifiedAgentInventoryPage {
@@ -217,18 +205,6 @@ describe("large inventory outcome consumers", () => {
     await waitFor(() => expect(getPackageRefreshTargets).toHaveBeenLastCalledWith(expect.objectContaining({ resultRevision: "2" }), expect.objectContaining({ cursor: undefined })));
   });
 
-  it("renders server totals and one byte-short outcome page without draining the cursor", async () => {
-    render(<BulkJobItems job={job} owner="tenant:principal:admin" />);
-    expect(await screen.findByText("first")).toBeVisible();
-    expect(screen.getByText("Results (5,000 targets)")).toBeVisible();
-    expect(getBulkActionJobItems).toHaveBeenCalledTimes(1);
-    vi.mocked(getBulkActionJobItems).mockResolvedValueOnce(page("second", null));
-    await userEvent.click(screen.getByRole("button", { name: "Next results" }));
-    expect(await screen.findByText("second")).toBeVisible();
-    expect(screen.queryByText("first")).not.toBeInTheDocument();
-    expect(getBulkActionJobItems).toHaveBeenLastCalledWith("job", { revision: "10", cursor: "next" }, expect.anything());
-  });
-
   describe("large saved configuration pages", () => {
     const props = { selectionId: "configuration-selection", recordId: "agent:configuration",
       source: { scopeId: "source-scope", identity: "native-agent" } };
@@ -352,105 +328,9 @@ describe("large inventory outcome consumers", () => {
     });
   });
 
-  describe("selected inventory child and facet consumers", () => {
-    const member = { source_scope_id: "scope", source_identity: "source", source_generation_id: "generation", domain: "packages" as const,
-      native_id: "package", environment_id: null, display_name: "Primary package", observed_at: "2026-09-29T00:00:00Z", expires_at: "2026-09-30T00:00:00Z" };
+  describe("selected inventory facet consumers", () => {
     beforeEach(() => {
-      vi.mocked(getInventorySections).mockReset().mockResolvedValue({ value: [{ kind: "element", total: 9000 }], nextCursor: null });
-      vi.mocked(getInventoryMembers).mockReset().mockResolvedValue({ value: [member], total: 6000, nextCursor: "members-next" });
-      vi.mocked(getInventoryChildren).mockReset().mockResolvedValue({
-        value: [{ ordinal: 0, kind: "element", value: "wide-element", payload: { definition: "saved definition" } }], total: 9000, nextCursor: "children-next",
-      });
       vi.mocked(getInventoryFacets).mockReset().mockResolvedValue({ value: [{ value: "platform", label: "Platform" }], total: 6001, nextCursor: "facet-next" });
-    });
-    it("inspects an exact opaque off-preview member without fetching other member or child pages", async () => {
-      const inspect = vi.fn();
-      const nativeId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-      vi.mocked(getInventoryMembers).mockResolvedValueOnce({ value: [{ ...member, native_id: nativeId }],
-        total: 6000, nextCursor: "other-members" });
-      render(<InventoryMembers selectionId="selected" recordId="agent:one" onInspectPackage={inspect} />);
-      await userEvent.click(await screen.findByRole("button", { name: `Inspect published version (${nativeId})` }));
-      expect(inspect).toHaveBeenCalledExactlyOnceWith(nativeId);
-      expect(getInventoryMembers).toHaveBeenCalledOnce();
-      expect(getInventoryChildren).not.toHaveBeenCalled();
-    });
-    it("clears a selected child section when a new pin has the same native member identity", async () => {
-      const view = render(<InventoryMembers selectionId="old-pin" recordId="agent:one" />);
-      await userEvent.click(await screen.findByRole("button", { name: "Primary package" }));
-      await screen.findByText("wide-element");
-      expect(getInventoryChildren).toHaveBeenCalledOnce();
-      view.rerender(<InventoryMembers selectionId="new-pin" recordId="agent:one" />);
-      await screen.findByRole("button", { name: "Primary package" });
-      expect(screen.queryByRole("region", { name: "Source detail rows" })).not.toBeInTheDocument();
-      expect(screen.queryByText("wide-element")).not.toBeInTheDocument();
-      expect(getInventoryChildren).toHaveBeenCalledOnce();
-    });
-    it.each(["sections", "rows"] as const)("stops loading after a failed detail %s read and retries only explicitly", async phase => {
-      const read = phase === "sections" ? vi.mocked(getInventorySections) : vi.mocked(getInventoryChildren);
-      read.mockRejectedValueOnce(new Error("Saved details unavailable."));
-      render(<InventoryMembers selectionId="selected" recordId="agent:one" />);
-      await userEvent.click(await screen.findByRole("button", { name: "Primary package" }));
-      expect(await screen.findByRole("alert")).toHaveTextContent("Saved details unavailable.");
-      expect(screen.queryByText(/Loading detail/)).not.toBeInTheDocument();
-      expect(read).toHaveBeenCalledTimes(1);
-      if (phase === "sections") expect(getInventoryChildren).not.toHaveBeenCalled();
-      await userEvent.click(screen.getByRole("button", { name: `Retry detail ${phase}` }));
-      expect(await screen.findByText("wide-element")).toBeVisible();
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-      expect(read).toHaveBeenCalledTimes(2);
-    });
-    it("withdraws old sections and rows while paging, and ignores abandoned child responses", async () => {
-      vi.mocked(getInventorySections).mockResolvedValueOnce({
-        value: [{ kind: "element", total: 9000 }], nextCursor: "section-next",
-      });
-      render(<InventoryMembers selectionId="selected" recordId="agent:one" />);
-      await userEvent.click(await screen.findByRole("button", { name: "Primary package" }));
-      await screen.findByText("wide-element");
-      let finishRows!: (page: Awaited<ReturnType<typeof getInventoryChildren>>) => void;
-      let finishSections!: (page: Awaited<ReturnType<typeof getInventorySections>>) => void;
-      vi.mocked(getInventoryChildren).mockReturnValueOnce(new Promise(resolve => { finishRows = resolve; }));
-      await userEvent.click(screen.getByRole("button", { name: "Next detail rows" }));
-      const rowsSignal = vi.mocked(getInventoryChildren).mock.calls.at(-1)?.[5]?.signal;
-      vi.mocked(getInventorySections).mockReturnValueOnce(new Promise(resolve => { finishSections = resolve; }));
-      await userEvent.click(screen.getByRole("button", { name: "More detail sections" }));
-      expect(rowsSignal?.aborted).toBe(true);
-      expect(screen.getByRole("combobox", { name: "Detail section" })).toBeDisabled();
-      expect(screen.queryByText("wide-element")).not.toBeInTheDocument();
-      expect(screen.getByText("Loading detail sections…")).toBeVisible();
-      await act(async () => finishRows({
-        value: [{ ordinal: 1, kind: "element", value: "retired-element", payload: {} }], total: 9000, nextCursor: null,
-      }));
-      expect(screen.queryByText("retired-element")).not.toBeInTheDocument();
-      expect(getInventoryChildren).toHaveBeenCalledTimes(2);
-      await act(async () => finishSections({ value: [{ kind: "owner", total: 2 }], nextCursor: null }));
-      await waitFor(() => expect(getInventoryChildren).toHaveBeenLastCalledWith("selected", "agent:one", member, "owner", undefined, expect.anything()));
-      expect(getInventoryChildren).toHaveBeenCalledTimes(3);
-    });
-    it("keeps 6000 members and 9000 detail rows server-counted without downloading unseen pages", async () => {
-      render(<InventoryMembers selectionId="selected" recordId="agent:one" />);
-      expect(await screen.findByText("1 shown of 6,000 source members.")).toBeVisible();
-      expect(getInventoryMembers).toHaveBeenCalledTimes(1);
-      expect(getInventoryChildren).not.toHaveBeenCalled();
-      await userEvent.click(screen.getByRole("button", { name: "Primary package" }));
-      expect(await screen.findByText("1 shown of 9,000 element rows.")).toBeVisible();
-      expect(getInventoryChildren).toHaveBeenCalledTimes(1);
-      vi.mocked(getInventoryChildren).mockResolvedValueOnce({ value: [{ ordinal: 2, kind: "element", value: "next-element", payload: {} }], total: 9000, nextCursor: null });
-      await userEvent.click(screen.getByRole("button", { name: "Next detail rows" }));
-      expect(await screen.findByText("next-element")).toBeVisible();
-      expect(screen.queryByText("wide-element")).not.toBeInTheDocument();
-      expect(getInventoryChildren).toHaveBeenLastCalledWith("selected", "agent:one", member, "element", "children-next", expect.anything());
-    });
-    it("aborts and hides abandoned member pages on selection and principal changes", async () => {
-      let resolve!: (page: Awaited<ReturnType<typeof getInventoryMembers>>) => void;
-      vi.mocked(getInventoryMembers).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-      const rendered = render(<InventoryMembers selectionId="old-principal-selection" recordId="agent:one" />);
-      await waitFor(() => expect(getInventoryMembers).toHaveBeenCalledTimes(1));
-      const signal = vi.mocked(getInventoryMembers).mock.calls[0][3]!.signal!;
-      rendered.rerender(<InventoryMembers selectionId="new-principal-selection" recordId="agent:two" />);
-      expect(signal.aborted).toBe(true);
-      await act(async () => resolve({ value: [{ ...member, display_name: "private old member" }], total: 1, nextCursor: null }));
-      expect(await screen.findByRole("button", { name: "Primary package" })).toBeVisible();
-      expect(screen.queryByText("private old member")).not.toBeInTheDocument();
     });
     it("searches and pages facet options on the server instead of draining 6001 values", async () => {
       render(<InventoryFacetSelect selectionId="selected" field="platform" label="Built with" allLabel="All platforms" onChange={vi.fn()} />);
@@ -522,26 +402,5 @@ describe("large inventory outcome consumers", () => {
       await waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
       expect(screen.queryByRole("option", { name: /Finance/ })).not.toBeInTheDocument();
     });
-  });
-  it("aborts abandoned principal reads and clears protected rows", async () => {
-    let resolve!: (value: BulkJobItemPage) => void;
-    vi.mocked(getBulkActionJobItems).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-    const view = render(<BulkJobItems job={job} owner="first-owner" />);
-    await waitFor(() => expect(getBulkActionJobItems).toHaveBeenCalledOnce());
-    const signal = vi.mocked(getBulkActionJobItems).mock.calls[0][2]!.signal!;
-    view.rerender(<BulkJobItems job={job} owner="second-owner" />);
-    expect(signal.aborted).toBe(true);
-    await act(async () => resolve(page("private-first-owner")));
-    expect(await screen.findByText("first")).toBeVisible();
-    expect(screen.queryByText("private-first-owner")).not.toBeInTheDocument();
-  });
-  it("invalidates an incompatible revision visibly without retrying old cursors", async () => {
-    vi.mocked(getBulkActionJobItems).mockRejectedValueOnce(new ApiError(409, "selection_invalidated", "changed"));
-    const view = render(<BulkJobItems job={job} owner="owner" />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Job results changed");
-    view.rerender(<BulkJobItems job={{ ...job, resultRevision: "11" }} owner="owner" />);
-    expect(await screen.findByText("first")).toBeVisible();
-    expect(screen.getByText("Job results changed; showing the first result page.")).toBeVisible();
-    expect(getBulkActionJobItems).toHaveBeenLastCalledWith("job", { revision: "11", cursor: undefined }, expect.anything());
   });
 });

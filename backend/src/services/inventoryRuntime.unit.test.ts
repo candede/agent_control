@@ -283,9 +283,7 @@ describe("package job control settlement commit fencing", () => {
     vi.spyOn(database, "query").mockImplementation(async sql => {
       const statement = String(sql);
       if (statement.startsWith("SELECT 1 FROM job_items item JOIN jobs")) return rows([{}]);
-      if (statement.startsWith("SELECT mode,provider_work_enabled")) return rows([{
-        mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
-      }]);
+      if (statement.startsWith("SELECT mode FROM operational_state")) return rows([{ mode: "normal" }]);
       if (statement.startsWith("SELECT p.target_id")) return rows(stage === "package-publication"
         ? [{ target_id: "package", observation_id: randomUUID(), updated_at: at }] : []);
       if (statement.startsWith("SELECT p.scope_id")) return rows(stage === "native-publication" ? [{

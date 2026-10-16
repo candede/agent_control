@@ -4,7 +4,7 @@ import type { AuditActor, LocalAuditAction as BackendLocalAuditAction } from "..
 import { getWorkbenchMetadata as backendWorkbenchMetadata } from "../../../backend/src/services/workbenchMetadata";
 import { createUnifiedVerification } from "../test/inventoryVerification";
 import { deferred } from "../test/deferred";
-import { createReportExport, reportExportStatus, reportExportDownload, reportPages, readReportDetail, readAgentReportSummary, readAgentReportCandidates, mutateAgentReportAssociation, stageReport } from "./reportData";
+import { createReportExport, reportExportStatus, reportExportDownload, reportPages, readReportDetail, readAgentReportSummary, mutateAgentReportAssociation, stageReport } from "./reportData";
 
 import {
   ApiError,
@@ -27,7 +27,6 @@ import {
   getAgentDetails,
   getAgentInvestigationContext,
   resolveAgentInvestigationIdentity,
-  getAgentPurviewRecords,
   getCurrentUser,
   getWorkbenchMetadata,
   getUnifiedAgents,
@@ -41,8 +40,6 @@ import {
   downloadAdministrativeAuditCsv,
   deletePurviewAuditSearch,
   deleteDefenderHunt,
-  approvePurviewAuditQualification,
-  approveDefenderHuntingQualification,
   getPackageRefreshJob,
   getPackageRefreshJobs,
   getPackageRefreshTargets,
@@ -66,7 +63,6 @@ import {
   resumeQuarantineJob,
   resumePurviewAuditSearch,
   resumeDefenderHunt,
-  revokeDefenderHuntingRetainedScope,
   refreshPackageIdentityDetails,
   refreshInventory,
   request,
@@ -78,8 +74,6 @@ import {
   signOut,
   startSignIn,
   startDataSync,
-  startPurviewAuditQualification,
-  startDefenderHuntingQualification,
   subscribeSessionRevalidationRequired,
   submitPurviewAuditSearch,
   submitDefenderHunt,
@@ -138,6 +132,14 @@ afterEach(() => {
 });
 
 describe("workbench metadata contract", () => {
+  it("serializes exact origin filters on the existing administrative-audit route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ value: [], count: 0 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await getAuditEvents({ originChannel: "mcp", originIntegrationClientId: "app-id", originClientId: "Case-sensitive",
+      originCallingAgentId: "caller/a" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/audit/events?originChannel=mcp&originIntegrationClientId=app-id&originClientId=Case-sensitive&originCallingAgentId=caller%2Fa",
+      expect.objectContaining({ credentials: "include" }));
+  });
   it("accepts the backend contract without changing provider modes, roles or report workflows", async () => {
     const metadata = backendWorkbenchMetadata();
     const controller = new AbortController();
@@ -518,21 +520,6 @@ describe("access API client", () => {
     expectTypeOf<AuditEvent["actor"]>().toEqualTypeOf<AuditActor>();
   });
 
-  it("filters and retains hunting-scope revocation receipts without package blocked state", async () => {
-    const event: AuditEvent = {
-      id: "hunting-scope-revocation", operationId: "revoke-operation", action: "revoke-hunting-scope",
-      scope: "single", agentId: "retained-scope-one", status: "succeeded",
-      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer" },
-      startedAt: "2026-09-15T12:00:00.000Z", completedAt: "2026-09-15T12:00:01.000Z",
-      requestPath: "/api/hunting/retained-scopes/retained-scope-one/revoke",
-    };
-    const fetchMock = mockJsonResponse({ value: [event], count: 1 });
-    const result = await getAuditEvents({ action: "revoke-hunting-scope" });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/audit/events?action=revoke-hunting-scope", expect.objectContaining({ credentials: "include" }));
-    expect(result.value).toEqual([event]);
-    expect(result.value[0]).not.toHaveProperty("targetBlockedState");
-  });
-
   it.each(["official_agents", "official_users"] as const)("passes cancellation through %s durable export admission", async kind => {
     const fetchMock = mockJsonResponse({ id: "export-id" });
     const controller = new AbortController();
@@ -600,20 +587,14 @@ describe("access API client", () => {
   it("encodes agent usage reads and sends confirmed, CSRF-protected association changes", async () => {
     const fetchMock = mockJsonResponse({ csrfToken: "association-fixture-csrf" });
     await getCurrentUser();
-    const controller = new AbortController();
     const id = "graph_packages:package%2Fone";
-    await readAgentReportCandidates(id, { search: "Report & agent", limit: 20, cursor: "next" }, controller.signal);
     const common = {
       reportSetId: "11111111-1111-4111-8111-111111111111", reportAgentId: "report/Upper:1",
       selectionId: "22222222-2222-4222-8222-222222222222", inventoryRevision: "a".repeat(64), usageRevision: "b".repeat(64), confirmed: true as const,
     };
     await mutateAgentReportAssociation(id, { ...common, target: { source: "graph_packages", packageId: "package/one" } }, "associate");
     await mutateAgentReportAssociation(id, common, "remove");
-    expect(fetchMock.mock.calls[1]).toEqual([
-      "/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-candidates?search=Report+%26+agent&limit=20&cursor=next",
-      expect.objectContaining({ signal: controller.signal }),
-    ]);
-    for (const [index, method] of [[2, "POST"], [3, "DELETE"]] as const) {
+    for (const [index, method] of [[1, "POST"], [2, "DELETE"]] as const) {
       const [path, options] = fetchMock.mock.calls[index];
       expect(path).toBe("/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-associations");
       expect(options).toMatchObject({ method, credentials: "include" });
@@ -1389,16 +1370,11 @@ describe("investigation request cancellation", () => {
     { name: "Purview resume", path: "/api/audit-search/jobs/job%2Fone/resume", method: "POST", send: options => resumePurviewAuditSearch(id, options) },
     { name: "Purview cancel", path: "/api/audit-search/jobs/job%2Fone/cancel", method: "POST", send: options => cancelPurviewAuditSearch(id, options) },
     { name: "Purview delete", path: "/api/audit-search/jobs/job%2Fone", method: "DELETE", body: confirmationBody, send: options => deletePurviewAuditSearch(id, options) },
-    { name: "Purview qualification approval", path: "/api/audit-search/qualifications", method: "POST", body: auditBody, send: options => approvePurviewAuditQualification("delegated", auditFilters, options) },
-    { name: "Purview qualification start", path: "/api/audit-search/qualifications/job%2Fone/start", method: "POST", send: options => startPurviewAuditQualification(id, options) },
     { name: "Purview CSV", path: "/api/audit-search/jobs/job%2Fone/export.csv", send: options => downloadPurviewAuditCsv(id, options) },
     { name: "Defender submit", path: "/api/hunting/jobs", method: "POST", body: huntingBody, send: options => submitDefenderHunt("application", huntingFilters, options) },
     { name: "Defender resume", path: "/api/hunting/jobs/job%2Fone/resume", method: "POST", send: options => resumeDefenderHunt(id, options) },
     { name: "Defender cancel", path: "/api/hunting/jobs/job%2Fone/cancel", method: "POST", send: options => cancelDefenderHunt(id, options) },
     { name: "Defender delete", path: "/api/hunting/jobs/job%2Fone", method: "DELETE", body: confirmationBody, send: options => deleteDefenderHunt(id, options) },
-    { name: "Defender qualification approval", path: "/api/hunting/qualifications", method: "POST", body: huntingBody, send: options => approveDefenderHuntingQualification("application", huntingFilters, options) },
-    { name: "Defender qualification start", path: "/api/hunting/qualifications/job%2Fone/start", method: "POST", send: options => startDefenderHuntingQualification(id, options) },
-    { name: "Defender scope revocation", path: "/api/hunting/retained-scopes/job%2Fone/revoke", method: "POST", body: confirmationBody, send: options => revokeDefenderHuntingRetainedScope(id, options) },
     { name: "Defender CSV", path: "/api/hunting/jobs/job%2Fone/export.csv", send: options => downloadDefenderHuntingCsv(id, options) },
   ];
 
@@ -1451,12 +1427,11 @@ describe("investigation request cancellation", () => {
       expect.objectContaining({ credentials: "include" }));
   });
 
-  it("sends only investigation choices, never client-supplied identities, for an agent-scoped hunt or approval", async () => {
+  it.each(["delegated", "application"] as const)("sends only investigation choices, never client-supplied identities, for an agent-scoped %s hunt", async mode => {
     const fetchMock = mockJsonResponse({});
     const choices = { ...huntingFilters, agentIds: ["untrusted-agent"], entraAgentIds: ["untrusted-object"],
       entraAgentApplicationIds: ["untrusted-application"], blueprintIds: ["untrusted-blueprint"], actorObjectIds: ["untrusted-actor"] };
-    await submitDefenderHunt("delegated", choices, { agentRecordId: "graph_packages:agent" });
-    await approveDefenderHuntingQualification("application", choices, { agentRecordId: "graph_packages:agent" });
+    await submitDefenderHunt(mode, choices, { agentRecordId: "graph_packages:agent" });
     for (const [, init] of fetchMock.mock.calls) {
       expect(JSON.parse(init.body as string).filters).toEqual({
         templateId: choices.templateId, startDateTime: choices.startDateTime, endDateTime: choices.endDateTime, operations: choices.operations,
@@ -1474,18 +1449,16 @@ describe("investigation request cancellation", () => {
     await getDefenderHuntingJob("job/one", options);
     await getDefenderHuntingRows("job/one", 100, 100, options);
     await getAgentInvestigationContext(recordId);
-    await getAgentPurviewRecords(recordId, { limit: 50, offset: 50, search: "actor+correlation", operation: "InvokeAgent" });
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       `/api/hunting/catalog?${agentQuery}`,
       `/api/hunting/jobs?limit=20&offset=40&${agentQuery}`,
       `/api/hunting/jobs/job%2Fone?${agentQuery}`,
       `/api/hunting/jobs/job%2Fone/rows?limit=100&offset=100&${agentQuery}`,
       `/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`,
-      `/api/agent-inventory/investigations/purview?${new URLSearchParams({ recordId, limit: "50", offset: "50", search: "actor+correlation", operation: "InvokeAgent" })}`,
     ]);
   });
 
-  it.each(["capability_unavailable", "hunting_scope_unqualified", "not_configured"])(
+  it.each(["capability_unavailable", "missing_permission", "not_configured"])(
     "keeps explicit provider failure %s separate from session invalidation",
     async code => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code }, { status: 403 })));
@@ -1848,14 +1821,14 @@ describe("API response failures", () => {
     await expect(getAgents()).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
   });
 
-  it("clears CSRF and notifies session owners for an expired CSV session", async () => {
+  it.each(["session_invalidated", "authorization_required", "authorization_stale"])("clears CSRF and notifies session owners for %s", async code => {
     const fetchMock = mockJsonResponse({ csrfToken: "expired-session-csrf" });
     await getCurrentUser();
     const listener = vi.fn();
     const unsubscribe = subscribeSessionRevalidationRequired(listener);
     try {
-      fetchMock.mockResolvedValueOnce(Response.json({ code: "session_invalidated" }, { status: 401 }));
-      await expect(createReportExport({ kind: "unified_agents", selectionId: "saved-selection" })).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
+      fetchMock.mockResolvedValueOnce(Response.json({ code }, { status: 401 }));
+      await expect(createReportExport({ kind: "unified_agents", selectionId: "saved-selection" })).rejects.toMatchObject({ status: 401, code });
       expect(listener).toHaveBeenCalledOnce();
       await checkCapabilities();
       expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);

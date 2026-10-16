@@ -6,7 +6,7 @@ function Assert-FreshInstallationContext {
         $Context.Image -cne "$($Context.Project)-app:local" -or $Context.Operator -cne "$($Context.Project)-operator:local" -or $Context.Checks -cne "$($Context.Project)-checks:local" -or
         $Context.Port -in @(3001,3002) -or $Context.Port -lt 1024 -or $Context.Port -gt 65535 -or
         -not ([IO.Path]::GetFullPath($Directory).StartsWith((Join-Path $Context.Root 'artifacts') + [IO.Path]::DirectorySeparatorChar))) {
-        throw 'Fresh installation requires its exact synthetic project, state, images, resources and non-retained loopback port.'
+        throw 'Fresh installation requires its exact synthetic project, state, images, resources and non-retained synthetic origin port.'
     }
     foreach ($path in @($Context.State,$Directory,(Join-Path $Context.Root '.local'),(Join-Path $Context.Root 'artifacts'),(Split-Path $Directory -Parent))) {
         if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path -Force).LinkType) { throw 'Fresh installation paths must not be links.' }
@@ -40,21 +40,22 @@ function Assert-FreshInstallationContainer {
     $labels = $Container.Config.Labels
     $service = $labels.'com.docker.compose.service'
     $composeFiles = if ($Context.AppliedComposeFiles) { $Context.AppliedComposeFiles } else { @((Join-Path $Context.Root 'compose.yaml'),$Context.FixtureCompose) }
-    # Reset can recreate only the app; the already-verified PostgreSQL container keeps its original compose paths.
-    $retainedPostgres = $service -ceq 'postgres' -and $Context.VerifiedPostgres -and
-        $Container.Id -ceq $Context.VerifiedPostgres.Id -and $Container.Image -ceq $Context.VerifiedPostgres.Image -and
-        $labels.'com.docker.compose.project.config_files' -ceq $Context.VerifiedPostgres.Config.Labels.'com.docker.compose.project.config_files'
+    # Compose retains original config-file labels when unchanged service bytes reuse a verified container.
+    $verified = if ($service -ceq 'postgres') { $Context.VerifiedPostgres } else { $Context.VerifiedApp }
+    $retainedContainer = $verified -and $Container.Id -ceq $verified.Id -and $Container.Image -ceq $verified.Image -and
+        $labels.'com.docker.compose.project.config_files' -ceq $verified.Config.Labels.'com.docker.compose.project.config_files'
     if ($labels.'com.docker.compose.project' -cne $Context.Project -or $service -notin @('app','postgres') -or
         $labels.'com.docker.compose.project.working_dir' -cne $Context.Root -or
         $Container.Name -cne "/$($Context.Project)-$service-1" -or
         $Container.Id -cnotmatch '^[a-f0-9]{64}$' -or
-        ($labels.'com.docker.compose.project.config_files' -cne ($composeFiles -join ',') -and -not $retainedPostgres)) {
+        ($labels.'com.docker.compose.project.config_files' -cne ($composeFiles -join ',') -and -not $retainedContainer)) {
         throw 'Fresh installation container metadata differs; cleanup refused.'
     }
     $expected = if ($service -eq 'postgres') {
         @{ '/var/lib/postgresql/data'=$Context.Volume; '/run/secrets/postgres-admin'=(Join-Path $Context.State 'secrets/postgres-admin') }
     } else {
-        @{ '/run/control'=(Join-Path $Context.State 'control'); '/run/secrets/tenants.json'=(Join-Path $Context.State 'secrets/tenants.json')
+        @{ '/run/agent-sharing-diagnostics'=(Join-Path $Context.State 'agent-sharing-diagnostics')
+            '/run/control'=(Join-Path $Context.State 'control'); '/run/secrets/tenants.json'=(Join-Path $Context.State 'secrets/tenants.json')
             '/run/secrets/session'=(Join-Path $Context.State 'secrets/session'); '/run/secrets/postgres-app'=(Join-Path $Context.State 'secrets/postgres-app') }
     }
     if (@($Container.Mounts).Count -ne $expected.Count) { throw 'Fresh installation mount count differs; cleanup refused.' }
@@ -62,21 +63,24 @@ function Assert-FreshInstallationContainer {
         if (-not $expected.ContainsKey($mount.Destination)) { throw 'Unexpected fresh installation mount; cleanup refused.' }
         if ($mount.Destination -eq '/var/lib/postgresql/data') {
             if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination]) { throw 'Fresh installation requires its exact owned disk-backed data volume.' }
-        } elseif ($mount.Type -cne 'bind' -or $mount.RW -or $mount.Source -cne $expected[$mount.Destination]) {
+        } elseif ($mount.Type -cne 'bind' -or
+            $mount.RW -ne ($service -ceq 'app' -and $mount.Destination -ceq '/run/agent-sharing-diagnostics') -or
+            $mount.Source -cne $expected[$mount.Destination]) {
             throw 'Fresh installation has an unexpected configuration mount; cleanup refused.'
         }
     }
     $ports = $Container.HostConfig.PortBindings
+    if ($null -ne $ports -and @($ports.PSObject.Properties).Count) {
+        throw 'Fresh installation cannot publish a host port.'
+    }
     if ($service -eq 'app') {
         if ($labels.'io.agent-control.fixture' -cne $Context.Project -or
             $labels.'io.agent-control.source-sha256' -cne $Context.SourceHash) { throw 'Fresh runtime source identity differs.' }
-        if (@($ports.PSObject.Properties).Count -ne 1 -or @($ports.'3001/tcp').Count -ne 1 -or
-            $ports.'3001/tcp'[0].HostIp -cne '127.0.0.1' -or $ports.'3001/tcp'[0].HostPort -cne [string]$Context.Port -or
-            $Container.HostConfig.Memory -ne 1610612736 -or $Container.HostConfig.NanoCpus -ne 1500000000) {
-            throw 'Fresh application port or fixed resource budget differs.'
+        if ($Container.HostConfig.Memory -ne 1610612736 -or $Container.HostConfig.NanoCpus -ne 1500000000) {
+            throw 'Fresh application fixed resource budget differs.'
         }
-    } elseif (@($ports.PSObject.Properties).Count -or $Container.HostConfig.Memory -ne 1073741824 -or $Container.HostConfig.NanoCpus -ne 500000000) {
-        throw 'Fresh PostgreSQL port or fixed resource budget differs.'
+    } elseif ($Container.HostConfig.Memory -ne 1073741824 -or $Container.HostConfig.NanoCpus -ne 500000000) {
+        throw 'Fresh PostgreSQL fixed resource budget differs.'
     }
     if (@($Container.NetworkSettings.Networks.PSObject.Properties).Count -ne 1 -or
         -not $Container.NetworkSettings.Networks.PSObject.Properties[$Context.Network]) { throw 'Fresh installation network differs.' }
@@ -219,7 +223,7 @@ function Remove-FreshInstallation {
 }
 
 function Invoke-FreshInstallation {
-    param([string]$Root,[string]$Directory,[string]$Baseline)
+    param([string]$Root,[string]$Directory,[string]$Baseline,[switch]$CurrentSchemaOnly)
     $project = "ac-ltdp-install-$([Guid]::NewGuid().ToString('N').Substring(0,12))"
     $context = New-LocalContext $Root $project
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
@@ -244,6 +248,7 @@ services:
     cpus: 0.5
     command: [postgres, -c, shared_buffers=32MB, -c, min_wal_size=32MB, -c, max_wal_size=1GB]
   app:
+    ports: !reset []
     mem_limit: 1536m
     cpus: 1.5
     environment:
@@ -260,11 +265,13 @@ networks:
         $context.BuildArguments = @('--network','none','--build-arg',"DEPENDENCY_BASE=$Baseline",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1','--label',"io.agent-control.fixture=$project")
         $context.OperatorArguments = @('--memory','1536m','--cpus','1.5','-e','NODE_OPTIONS=--max-old-space-size=768')
         $context.IsolatedHealthContainer = "$project-app-1"
-        Write-Host "Fresh installation: $project; evidence: $Directory; loopback port: $($context.Port)"
-        Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks
+        Write-Host "Fresh installation: $project; evidence: $Directory; unpublished synthetic origin port: $($context.Port)"
+        if ($CurrentSchemaOnly) { Invoke-LocalDeployment -Context $context -Action Deploy }
+        else { Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks }
         $snapshot = Write-FreshInstallationEvidence $context $Directory 'ready'
         if ($snapshot.containers.Count -ne 2 -or @($snapshot.containers | Where-Object { $_.State.Health.Status -cne 'healthy' -or $_.State.OOMKilled }).Count) { throw 'Fresh installation is not healthy.' }
         $context.VerifiedPostgres = $snapshot.containers | Where-Object { $_.Config.Labels.'com.docker.compose.service' -ceq 'postgres' }
+        $context.VerifiedApp = $snapshot.containers | Where-Object { $_.Config.Labels.'com.docker.compose.service' -ceq 'app' }
         $schema = Invoke-LocalOperator $context @('backend/scripts/database.ts','preflight') -Capture | ConvertFrom-Json
         if ($schema.state -cne 'current' -or $schema.targetFingerprint -cnotmatch '^[a-f0-9]{64}$' -or
             $schema.currentFingerprint -cne $schema.targetFingerprint) { throw 'Fresh installation does not match the compiled schema fingerprint.' }
@@ -299,7 +306,7 @@ networks:
         Copy-Item -LiteralPath "$afterBackup.json" -Destination (Join-Path $Directory 'backup-restarted.json')
         Write-LocalText (Join-Path $Directory 'restart-progress.json') (@{before=$progressBefore;after=$progressAfter;interpretation='Only scheduled lifecycle metadata may advance within existing 1000-row/1-MiB slice bounds; all other table fingerprints and all row counts must match.'} | ConvertTo-Json -Depth 5)
         Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter
-        Invoke-FreshFirstSync $context $Directory 'collected'
+        if (-not $CurrentSchemaOnly) { Invoke-FreshFirstSync $context $Directory 'collected' }
         $restore = 'agentcontrol_restore_' + ($project -replace '^ac-ltdp-install-','')
         Invoke-LocalDeployment -Context $context -Action Restore -BackupFile $backup -RestoreDatabase $restore
         $retained = @{}
@@ -308,6 +315,8 @@ networks:
         }
         Assert-FreshInstallationContext $context $Directory
         @(Get-FreshInstallationResources $context $Directory) | Out-Null
+        Invoke-LocalOperator $context @('--input-type=module','--eval',
+            'import pg from "pg";import {databaseSettings} from "./backend/src/db/pool.ts";const db=new pg.Pool(databaseSettings());try{await db.query("INSERT INTO sessions(sid,sess,expire) VALUES($1,$2,clock_timestamp()+interval ''1 hour'')",["clean-break-synthetic","{}"]);await db.query("INSERT INTO data_principal_epochs(tenant_id,principal_id,epoch) VALUES($1,$2,7)",["clean-break-synthetic","saved-home"]);}finally{await db.end();}')
         Invoke-LocalDeployment -Context $context -Action Deploy -DbReset
         foreach ($path in $retained.Keys) {
             if ((Get-FileHash -LiteralPath (Join-Path $context.State $path) -Algorithm SHA256).Hash -cne $retained[$path]) {
@@ -318,8 +327,15 @@ networks:
         if ($resetSchema.state -cne 'current' -or $resetSchema.currentFingerprint -cne $schema.targetFingerprint) {
             throw 'Explicit reset did not initialize the current schema.'
         }
-        Invoke-FreshFirstSync $context $Directory 'recollected'
-        Write-LocalText (Join-Path $Directory 'result.json') (@{suite='fresh-installation';project=$project;deploy='passed';reset='passed';firstSync='passed';firstSyncAfterReset='passed';retainedConfigurationAndBackups='unchanged';schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;authenticatedWorkflow='synthetic compiled loopback router; no real sign-in';at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
+        $operational = Invoke-LocalOperator $context @('--input-type=module','--eval',
+            'import pg from "pg";import {databaseSettings} from "./backend/src/db/pool.ts";const db=new pg.Pool(databaseSettings());try{console.log(JSON.stringify((await db.query("SELECT mode,(SELECT count(*)::int FROM sessions) AS sessions,(SELECT count(*)::int FROM data_principal_epochs) AS epochs FROM operational_state WHERE singleton")).rows[0]));}finally{await db.end();}') -Capture | ConvertFrom-Json
+        if ($operational.mode -cne 'normal' -or $operational.sessions -ne 0 -or $operational.epochs -ne 0) { throw 'Current reset retained saved authority or did not return to normal operation.' }
+        $operationHash = (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment-operation.json')).Hash
+        $postgresId = $context.VerifiedPostgres.Id
+        Invoke-LocalDeployment -Context $context -Action Deploy
+        if ((Get-FileHash -LiteralPath (Join-Path $context.State 'deployment-operation.json')).Hash -cne $operationHash -or
+            @((Get-FreshInstallationResources $context $Directory).containers | Where-Object {$_.Config.Labels.'com.docker.compose.service' -eq 'postgres'})[0].Id -cne $postgresId) { throw 'Ordinary start after reset replayed work or replaced PostgreSQL.' }
+        Write-LocalText (Join-Path $Directory 'result.json') (@{suite=$(if ($CurrentSchemaOnly) {'fresh-installation-current'} else {'fresh-installation'});project=$project;deploy='passed';reset='passed';firstSync=$(if ($CurrentSchemaOnly) {'not_run'} else {'passed'})        ;firstSyncAfterReset='not_run';providerWorkEnabled=($operational.mode -ceq 'normal');savedSessionsAndEpochsDeleted=$true;verifiedStartAfterResetNoReplay=$true;postgresContainerPreserved=$true;retainedConfigurationAndBackups='unchanged';schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
     } catch { $failures.Add($_.Exception) }
     finally {
         foreach ($tag in @($context.Operator,$context.Image,$context.Checks)) {

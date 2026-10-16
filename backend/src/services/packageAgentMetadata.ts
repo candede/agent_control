@@ -1,6 +1,7 @@
 import { AppError } from "../errors.js";
 import { packageObservationLimits, type CopilotPackageDetail, type PackageElementDetail } from "../types/copilotPackage.js";
 import { operationalLog } from "./telemetry.js";
+import { dataLimits } from "../db/dataBounds.js";
 
 export type PackageAgentMetadata = {
   environmentId?: string;
@@ -37,7 +38,7 @@ export function isPackageElementType(value: unknown, expected: string) {
 }
 
 export function parsePackageIdentityDefinition(definition: string, elementType: string): unknown {
-  if (typeof definition !== "string" || Buffer.byteLength(definition, "utf8") > packageObservationLimits.bytes) {
+  if (typeof definition !== "string" || Buffer.byteLength(definition, "utf8") > dataLimits.agentDefinitionBytes) {
     throw new SyntaxError("Package identity definition must be a bounded JSON string.");
   }
   const metadata: unknown = JSON.parse(definition);
@@ -293,15 +294,15 @@ function identityElementGroups(value: CopilotPackageDetail): PackageElementDetai
       const id = ownValue(element, "id"), definition = ownValue(element, "definition");
       if (typeof id !== "string" || id.length > 512 || typeof definition !== "string"
         || /[\0\uD800-\uDFFF]/u.test(id) || /[\0\uD800-\uDFFF]/u.test(definition)
-        || Buffer.byteLength(definition, "utf8") > packageObservationLimits.bytes) {
+        || Buffer.byteLength(definition, "utf8") > dataLimits.agentDefinitionBytes) {
         throw new SyntaxError("Invalid package identity element.");
       }
       bytes += Buffer.byteLength(id, "utf8") + Buffer.byteLength(definition, "utf8");
-      if (bytes > packageObservationLimits.bytes) throw new SyntaxError("Package identity elements exceed the observation limit.");
+      if (bytes > dataLimits.agentDefinitionWorkBytes) throw new SyntaxError("Package identity elements exceed the saved work limit.");
       return { id, definition };
     }) };
   });
-  if (Buffer.byteLength(JSON.stringify(groups), "utf8") > packageObservationLimits.bytes) {
+  if (Buffer.byteLength(JSON.stringify(groups), "utf8") > dataLimits.agentDefinitionWorkBytes) {
     throw new SyntaxError("Package identity elements exceed the observation limit.");
   }
   return groups;

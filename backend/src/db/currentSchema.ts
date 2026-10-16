@@ -1,7 +1,10 @@
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 import { inventoryLimits } from "../types/inventoryRecords.js";
+import { auditOriginIntegritySql, auditOriginValidationSql } from "./auditOriginSchema.js";
+import { agentControlReceiptsSql } from "./agentControlReceiptsSchema.js";
+import { unknownOrigin } from "../types/actionOrigin.js";
 
-export const currentSchemaSql: string = String.raw`
+const schemaBaseSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
     provider = icu, deterministic = 'false', locale = 'en-US-u-ks-level1'
 );
@@ -97,6 +100,7 @@ CREATE TABLE source_identifiers (
 );
 
 CREATE TABLE jobs (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT jobs_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
@@ -263,6 +267,7 @@ CREATE TABLE job_attempts (
 
 CREATE TABLE audit_events (
     id uuid NOT NULL
+  , origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT audit_events_origin_check CHECK (audit_origin_valid(origin))
   , event_id text NOT NULL
   , operation_id text NOT NULL
   , tenant_id text
@@ -291,13 +296,10 @@ CREATE TABLE audit_events (
                                                                  , CAST('export-audit-search' AS text)
                                                                  , CAST('view-hunting' AS text)
                                                                  , CAST('export-hunting' AS text)
-                                                                 , CAST('approve-hunting' AS text)
-                                                                 , CAST('qualify-hunting' AS text)
                                                                  , CAST('submit-hunting' AS text)
                                                                  , CAST('query-hunting' AS text)
                                                                  , CAST('cancel-hunting' AS text)
                                                                  , CAST('delete-hunting' AS text)
-                                                                 , CAST('revoke-hunting-scope' AS text)
                                                                  , CAST('export-package-inventory' AS text)
                                                                  , CAST('export-power-platform-inventory' AS text)
                                                                  , CAST('export-official-usage-aggregate' AS text)
@@ -305,7 +307,10 @@ CREATE TABLE audit_events (
                                                                  , CAST('export-administrative-audit' AS text)
                                                                  , CAST('export-agent-inventory' AS text)
                                                                  , CAST('associate-agent-usage' AS text)
-                                                                 , CAST('remove-agent-usage-association' AS text)]))
+                                                                 , CAST('remove-agent-usage-association' AS text)
+                                                                 , CAST('resume-control' AS text)
+                                                                 , CAST('cancel-control' AS text)
+                                                                 , CAST('reconcile-control' AS text)]))
   , CONSTRAINT audit_events_action_state CHECK ((action = ANY(ARRAY[CAST('block' AS text)
                                                                   , CAST('unblock' AS text)])
                                              AND target_blocked_state IS NOT NULL)
@@ -527,7 +532,6 @@ CREATE TABLE package_inventory_snapshots (
   , control_state jsonb
   , identity_revalidation_required boolean DEFAULT FALSE NOT NULL
   , read_started_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , catalog_only boolean DEFAULT FALSE NOT NULL
   , CONSTRAINT package_control_only CHECK (observation_kind = ANY(ARRAY[CAST('block' AS text)
                                                                       , CAST('access' AS text)])
                                        AND token_mode = CAST('delegated' AS text)
@@ -1025,6 +1029,7 @@ CREATE TABLE official_usage_confirmations (
 );
 
 CREATE TABLE official_usage_audit (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT official_usage_audit_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , actor_principal_id text NOT NULL
@@ -1076,74 +1081,6 @@ CREATE TABLE official_usage_bundle_receipts (
   , CONSTRAINT official_usage_bundle_receipts_pkey PRIMARY KEY (tenant_id, bundle_id)
 );
 
-CREATE TABLE purview_audit_qualifications (
-    id uuid NOT NULL
-  , tenant_id text NOT NULL
-  , authorization_principal_id text NOT NULL
-  , result_scope_id text NOT NULL
-  , token_mode text NOT NULL
-  , capability_id text NOT NULL
-  , filters jsonb NOT NULL
-  , request_hash text NOT NULL
-  , contract_revision text NOT NULL
-  , permission_revision text NOT NULL
-  , configuration_revision bigint NOT NULL
-  , status text DEFAULT CAST('approved' AS text) NOT NULL
-  , approved_by text NOT NULL
-  , approved_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , attempted_at timestamp with time zone
-  , finished_at timestamp with time zone
-  , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('1 day' AS interval) NOT NULL
-  , job_id uuid
-  , error_code text
-  , created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , result_scope_kind text NOT NULL
-  , result_scope_configuration_revision bigint
-  , result_scope_configuration_key bigint GENERATED ALWAYS AS (COALESCE(result_scope_configuration_revision
-                                                                      , CAST(0 AS bigint))) STORED
-  , CONSTRAINT purview_audit_qualification_result_scope CHECK ((result_scope_kind = CAST('principal' AS text)
-                                                            AND result_scope_configuration_revision IS NULL)
-                                                            OR (result_scope_kind = CAST('application' AS text)
-                                                            AND result_scope_configuration_revision > 0))
-  , CONSTRAINT purview_audit_qualifications_approved_by_check CHECK (length(approved_by) >= 1
-                                                                 AND length(approved_by) <= 256)
-  , CONSTRAINT purview_audit_qualifications_authorization_principal_id_check CHECK (length(authorization_principal_id) >= 1
-                                                                                AND length(authorization_principal_id) <= 256)
-  , CONSTRAINT purview_audit_qualifications_capability_id_check CHECK (capability_id = ANY(ARRAY[CAST('purview.audit.search.delegated' AS text)
-                                                                                               , CAST('purview.audit.search.application' AS text)]))
-  , CONSTRAINT purview_audit_qualifications_check CHECK ((token_mode = CAST('delegated' AS text)
-                                                      AND capability_id = CAST('purview.audit.search.delegated' AS text))
-                                                      OR (token_mode = CAST('application' AS text)
-                                                      AND capability_id = CAST('purview.audit.search.application' AS text)))
-  , CONSTRAINT purview_audit_qualifications_configuration_revision_check CHECK (configuration_revision > 0)
-  , CONSTRAINT purview_audit_qualifications_contract_revision_check CHECK (length(contract_revision) >= 1
-                                                                       AND length(contract_revision) <= 128)
-  , CONSTRAINT purview_audit_qualifications_error_code_check CHECK (length(error_code) <= 128)
-  , CONSTRAINT purview_audit_qualifications_filters_check CHECK (jsonb_typeof(filters) = CAST('object' AS text)
-                                                             AND octet_length(CAST(filters AS text)) <= 16384)
-  , CONSTRAINT purview_audit_qualifications_permission_revision_check CHECK (length(permission_revision) >= 1
-                                                                         AND length(permission_revision) <= 128)
-  , CONSTRAINT purview_audit_qualifications_request_hash_check CHECK (request_hash ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT purview_audit_qualifications_result_principal_id_check CHECK (length(result_scope_id) >= 1
-                                                                         AND length(result_scope_id) <= 256)
-  , CONSTRAINT purview_audit_qualifications_result_scope_kind_check CHECK (result_scope_kind = ANY(ARRAY[CAST('principal' AS text)
-                                                                                                       , CAST('application' AS text)]))
-  , CONSTRAINT purview_audit_qualifications_status_check CHECK (status = ANY(ARRAY[CAST('approved' AS text)
-                                                                                 , CAST('running' AS text)
-                                                                                 , CAST('qualified' AS text)
-                                                                                 , CAST('failed' AS text)
-                                                                                 , CAST('inconclusive' AS text)
-                                                                                 , CAST('expired' AS text)]))
-  , CONSTRAINT purview_audit_qualifications_tenant_id_check CHECK (length(tenant_id) >= 1
-                                                               AND length(tenant_id) <= 128)
-  , CONSTRAINT purview_audit_qualifications_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                         , CAST('application' AS text)]))
-  , CONSTRAINT purview_audit_qualification_scope_identity_v17 UNIQUE (id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key)
-  , CONSTRAINT purview_audit_qualifications_pkey PRIMARY KEY (id)
-  , CONSTRAINT purview_audit_qualifications_tenant_id_id_key UNIQUE (tenant_id, id)
-);
-
 CREATE TABLE purview_audit_jobs (
     id uuid NOT NULL
   , tenant_id text NOT NULL
@@ -1170,7 +1107,6 @@ CREATE TABLE purview_audit_jobs (
   , unobserved_end timestamp with time zone
   , error_code text
   , message text
-  , qualification_id uuid
   , cancel_requested boolean DEFAULT FALSE NOT NULL
   , remote_work_may_continue boolean DEFAULT FALSE NOT NULL
   , created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
@@ -1333,6 +1269,13 @@ CREATE TABLE purview_audit_records (
 );
 
 CREATE TABLE defender_hunting_jobs (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT defender_hunting_jobs_origin_check CHECK (audit_origin_valid(origin)),
+    initiating_actor jsonb CONSTRAINT defender_hunting_jobs_initiating_actor_check CHECK (initiating_actor IS NULL OR (
+      jsonb_typeof(initiating_actor)='object' AND initiating_actor ?& ARRAY['tenantId','homeAccountId','username','displayName']
+      AND initiating_actor-ARRAY['tenantId','homeAccountId','username','displayName']='{}'::jsonb
+      AND initiating_actor->>'tenantId'=tenant_id AND initiating_actor->>'homeAccountId'=authorization_principal_id
+      AND jsonb_typeof(initiating_actor->'username')='string' AND length(initiating_actor->>'username') BETWEEN 1 AND 256
+      AND jsonb_typeof(initiating_actor->'displayName')='string' AND length(initiating_actor->>'displayName')<=256)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , authorization_principal_id text NOT NULL
@@ -1364,12 +1307,6 @@ CREATE TABLE defender_hunting_jobs (
   , observed_end timestamp with time zone
   , unobserved_start timestamp with time zone
   , unobserved_end timestamp with time zone
-  , is_qualification boolean DEFAULT FALSE NOT NULL
-  , capability_id text
-  , contract_revision text
-  , permission_revision text
-  , qualification_configuration_revision bigint
-  , approved_by text
   , error_code text
   , message text
   , cancel_requested boolean DEFAULT FALSE NOT NULL
@@ -1379,18 +1316,15 @@ CREATE TABLE defender_hunting_jobs (
   , finished_at timestamp with time zone
   , deadline_at timestamp with time zone DEFAULT clock_timestamp() + CAST('00:15:00' AS interval) NOT NULL
   , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('30 days' AS interval) NOT NULL
-  , target_scope_hash text
-  , retained_scope_id uuid
+  , target_scope_hash text NOT NULL
   , CONSTRAINT defender_hunting_jobs_activation_count_check CHECK (activation_count >= 0
                                                                AND activation_count <= 4)
-  , CONSTRAINT defender_hunting_jobs_approved_by_check CHECK (length(approved_by) >= 1
-                                                          AND length(approved_by) <= 256)
+
   , CONSTRAINT defender_hunting_jobs_authorization_principal_id_check CHECK (length(authorization_principal_id) >= 1
                                                                          AND length(authorization_principal_id) <= 256)
   , CONSTRAINT defender_hunting_jobs_byte_count_check CHECK (byte_count >= 0
                                                          AND byte_count <= 2000000)
-  , CONSTRAINT defender_hunting_jobs_capability_id_check CHECK (capability_id = ANY(ARRAY[CAST('defender.hunting.delegated' AS text)
-                                                                                        , CAST('defender.hunting.application' AS text)]))
+
   , CONSTRAINT defender_hunting_jobs_check CHECK ((result_scope_kind = CAST('principal' AS text)
                                                AND result_scope_configuration_revision IS NULL
                                                AND token_mode = CAST('delegated' AS text))
@@ -1399,23 +1333,8 @@ CREATE TABLE defender_hunting_jobs (
                                                AND token_mode = CAST('application' AS text)))
   , CONSTRAINT defender_hunting_jobs_check1 CHECK ((observed_start IS NULL) = (observed_end IS NULL))
   , CONSTRAINT defender_hunting_jobs_check2 CHECK ((unobserved_start IS NULL) = (unobserved_end IS NULL))
-  , CONSTRAINT defender_hunting_jobs_check3 CHECK ((is_qualification
-                                                AND capability_id IS NOT NULL
-                                                AND contract_revision IS NOT NULL
-                                                AND permission_revision IS NOT NULL
-                                                AND qualification_configuration_revision IS NOT NULL
-                                                AND approved_by IS NOT NULL)
-                                                OR (NOT is_qualification
-                                                AND capability_id IS NULL
-                                                AND contract_revision IS NULL
-                                                AND permission_revision IS NULL
-                                                AND qualification_configuration_revision IS NULL
-                                                AND approved_by IS NULL))
-  , CONSTRAINT defender_hunting_jobs_check4 CHECK (capability_id IS NULL
-                                                OR (token_mode = CAST('delegated' AS text)
-                                                AND capability_id = CAST('defender.hunting.delegated' AS text))
-                                                OR (token_mode = CAST('application' AS text)
-                                                AND capability_id = CAST('defender.hunting.application' AS text)))
+
+
   , CONSTRAINT defender_hunting_jobs_check5 CHECK ((status = ANY(ARRAY[CAST('succeeded' AS text)
                                                                      , CAST('partial' AS text)])
                                                 AND result_complete = (status = CAST('succeeded' AS text))
@@ -1423,7 +1342,7 @@ CREATE TABLE defender_hunting_jobs (
                                                            AND status = CAST('succeeded' AS text)))
                                                 OR status <> ALL(ARRAY[CAST('succeeded' AS text)
                                                                      , CAST('partial' AS text)]))
-  , CONSTRAINT defender_hunting_jobs_contract_revision_check CHECK (contract_revision ~ CAST('^[a-f0-9]{64}$' AS text))
+
   , CONSTRAINT defender_hunting_jobs_error_code_check CHECK (length(error_code) <= 128)
   , CONSTRAINT defender_hunting_jobs_execution_version_check CHECK (execution_version >= 0)
   , CONSTRAINT defender_hunting_jobs_filters_check CHECK (jsonb_typeof(filters) = CAST('object' AS text)
@@ -1431,14 +1350,14 @@ CREATE TABLE defender_hunting_jobs (
   , CONSTRAINT defender_hunting_jobs_idempotency_key_check CHECK (idempotency_key ~ CAST('^[a-zA-Z0-9_-]{1,128}$' AS text))
   , CONSTRAINT defender_hunting_jobs_message_check CHECK (length(message) <= 1024)
   , CONSTRAINT defender_hunting_jobs_partial_reason_check CHECK (partial_reason = CAST('hunting_row_limit' AS text))
-  , CONSTRAINT defender_hunting_jobs_permission_revision_check CHECK (permission_revision ~ CAST('^[a-f0-9]{64}$' AS text))
+
   , CONSTRAINT defender_hunting_jobs_provider_request_count_check CHECK (provider_request_count >= 0
                                                                      AND provider_request_count <= 12)
   , CONSTRAINT defender_hunting_jobs_provider_request_id_check CHECK (length(provider_request_id) >= 1
                                                                   AND length(provider_request_id) <= 256)
   , CONSTRAINT defender_hunting_jobs_provider_row_count_check CHECK (provider_row_count >= 0
                                                                  AND provider_row_count <= 201)
-  , CONSTRAINT defender_hunting_jobs_qualification_configuration_revisio_check CHECK (qualification_configuration_revision > 0)
+
   , CONSTRAINT defender_hunting_jobs_query_version_check CHECK (query_version = 3)
   , CONSTRAINT defender_hunting_jobs_request_hash_check CHECK (request_hash ~ CAST('^[a-f0-9]{64}$' AS text))
   , CONSTRAINT defender_hunting_jobs_result_scope_id_check CHECK (length(result_scope_id) >= 1
@@ -1454,6 +1373,7 @@ CREATE TABLE defender_hunting_jobs (
                                                                           , CAST('inconclusive' AS text)]))
   , CONSTRAINT defender_hunting_jobs_stored_row_count_check CHECK (stored_row_count >= 0
                                                                AND stored_row_count <= 200)
+
   , CONSTRAINT defender_hunting_jobs_target_scope_hash_check CHECK (target_scope_hash ~ CAST('^[a-f0-9]{64}$' AS text))
   , CONSTRAINT defender_hunting_jobs_template_id_check CHECK (template_id = ANY(ARRAY[CAST('agents_inventory' AS text)
                                                                                     , CAST('agent_activity' AS text)
@@ -1568,133 +1488,6 @@ CREATE TABLE defender_hunting_rows (
   , CONSTRAINT defender_hunting_rows_pkey PRIMARY KEY (snapshot_id, row_ordinal)
 );
 
-CREATE TABLE defender_hunting_qualification_evidence (
-    id uuid NOT NULL
-  , tenant_id text NOT NULL
-  , authorization_principal_id text NOT NULL
-  , result_scope_id text NOT NULL
-  , result_scope_kind text NOT NULL
-  , result_scope_configuration_revision bigint
-  , token_mode text NOT NULL
-  , capability_id text NOT NULL
-  , template_id text NOT NULL
-  , target_scope_hash text NOT NULL
-  , approved_scope jsonb NOT NULL
-  , contract_revision text NOT NULL
-  , permission_revision text NOT NULL
-  , configuration_revision bigint NOT NULL
-  , approved_by text NOT NULL
-  , qualified_job_id uuid NOT NULL
-  , provider_request_id text
-  , qualified_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('24:00:00' AS interval) NOT NULL
-  , CONSTRAINT defender_hunting_qualification_authorization_principal_id_check CHECK (length(authorization_principal_id) >= 1
-                                                                                  AND length(authorization_principal_id) <= 256)
-  , CONSTRAINT defender_hunting_qualification_evi_configuration_revision_check CHECK (configuration_revision > 0)
-  , CONSTRAINT defender_hunting_qualification_eviden_permission_revision_check CHECK (permission_revision ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_qualification_eviden_provider_request_id_check CHECK (length(provider_request_id) >= 1
-                                                                                  AND length(provider_request_id) <= 256)
-  , CONSTRAINT defender_hunting_qualification_evidence_approved_by_check CHECK (length(approved_by) >= 1
-                                                                            AND length(approved_by) <= 256)
-  , CONSTRAINT defender_hunting_qualification_evidence_approved_scope_check CHECK (jsonb_typeof(approved_scope) = CAST('object' AS text)
-                                                                               AND octet_length(CAST(approved_scope AS text)) <= 8192)
-  , CONSTRAINT defender_hunting_qualification_evidence_capability_id_check CHECK (capability_id = ANY(ARRAY[CAST('defender.hunting.delegated' AS text)
-                                                                                                          , CAST('defender.hunting.application' AS text)]))
-  , CONSTRAINT defender_hunting_qualification_evidence_check CHECK ((result_scope_kind = CAST('principal' AS text)
-                                                                 AND result_scope_configuration_revision IS NULL
-                                                                 AND token_mode = CAST('delegated' AS text)
-                                                                 AND capability_id = CAST('defender.hunting.delegated' AS text)
-                                                                 AND result_scope_id = authorization_principal_id)
-                                                                 OR (result_scope_kind = CAST('application' AS text)
-                                                                 AND result_scope_configuration_revision > 0
-                                                                 AND token_mode = CAST('application' AS text)
-                                                                 AND capability_id = CAST('defender.hunting.application' AS text)))
-  , CONSTRAINT defender_hunting_qualification_evidence_contract_revision_check CHECK (contract_revision ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_qualification_evidence_result_scope_id_check CHECK (length(result_scope_id) >= 1
-                                                                                AND length(result_scope_id) <= 256)
-  , CONSTRAINT defender_hunting_qualification_evidence_result_scope_kind_check CHECK (result_scope_kind = ANY(ARRAY[CAST('principal' AS text)
-                                                                                                                  , CAST('application' AS text)]))
-  , CONSTRAINT defender_hunting_qualification_evidence_target_scope_hash_check CHECK (target_scope_hash ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_qualification_evidence_template_id_check CHECK (template_id = ANY(ARRAY[CAST('agents_inventory' AS text)
-                                                                                                      , CAST('agent_activity' AS text)
-                                                                                                      , CAST('agent_tools' AS text)]))
-  , CONSTRAINT defender_hunting_qualification_evidence_tenant_id_check CHECK (length(tenant_id) >= 1
-                                                                          AND length(tenant_id) <= 128)
-  , CONSTRAINT defender_hunting_qualification_evidence_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                                    , CAST('application' AS text)]))
-  , CONSTRAINT defender_hunting_qualification_evidence_pkey PRIMARY KEY (id)
-  , CONSTRAINT defender_hunting_qualification_evidence_qualified_job_id_key UNIQUE (qualified_job_id)
-);
-
-CREATE TABLE defender_hunting_retained_scopes (
-    id uuid NOT NULL
-  , tenant_id text NOT NULL
-  , authorization_principal_id text NOT NULL
-  , result_scope_id text NOT NULL
-  , result_scope_kind text NOT NULL
-  , result_scope_configuration_revision bigint
-  , result_scope_configuration_key bigint GENERATED ALWAYS AS (COALESCE(result_scope_configuration_revision
-                                                                      , CAST(0 AS bigint))) STORED
-  , token_mode text NOT NULL
-  , capability_id text NOT NULL
-  , template_id text NOT NULL
-  , target_scope_hash text NOT NULL
-  , approved_scope jsonb NOT NULL
-  , query_version integer NOT NULL
-  , contract_revision text NOT NULL
-  , permission_revision text NOT NULL
-  , configuration_revision bigint NOT NULL
-  , approved_by text NOT NULL
-  , source_qualification_job_id uuid NOT NULL
-  , approved_at timestamp with time zone NOT NULL
-  , qualified_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , expires_at timestamp with time zone NOT NULL
-  , revoked_at timestamp with time zone
-  , revoked_by text
-  , CONSTRAINT defender_hunting_retained_scop_authorization_principal_id_check CHECK (length(authorization_principal_id) >= 1
-                                                                                  AND length(authorization_principal_id) <= 256)
-  , CONSTRAINT defender_hunting_retained_scopes_approved_by_check CHECK (length(approved_by) >= 1
-                                                                     AND length(approved_by) <= 256)
-  , CONSTRAINT defender_hunting_retained_scopes_approved_scope_check CHECK (jsonb_typeof(approved_scope) = CAST('object' AS text)
-                                                                        AND octet_length(CAST(approved_scope AS text)) <= 8192)
-  , CONSTRAINT defender_hunting_retained_scopes_capability_id_check CHECK (capability_id = ANY(ARRAY[CAST('defender.hunting.delegated' AS text)
-                                                                                                   , CAST('defender.hunting.application' AS text)]))
-  , CONSTRAINT defender_hunting_retained_scopes_check CHECK (qualified_at >= approved_at
-                                                         AND expires_at = (approved_at + CAST('30 days' AS interval)))
-  , CONSTRAINT defender_hunting_retained_scopes_check1 CHECK ((revoked_at IS NULL
-                                                           AND revoked_by IS NULL)
-                                                           OR (revoked_at IS NOT NULL
-                                                           AND revoked_by IS NOT NULL))
-  , CONSTRAINT defender_hunting_retained_scopes_check2 CHECK ((result_scope_kind = CAST('principal' AS text)
-                                                           AND result_scope_configuration_revision IS NULL
-                                                           AND token_mode = CAST('delegated' AS text)
-                                                           AND capability_id = CAST('defender.hunting.delegated' AS text)
-                                                           AND result_scope_id = authorization_principal_id)
-                                                           OR (result_scope_kind = CAST('application' AS text)
-                                                           AND result_scope_configuration_revision > 0
-                                                           AND token_mode = CAST('application' AS text)
-                                                           AND capability_id = CAST('defender.hunting.application' AS text)))
-  , CONSTRAINT defender_hunting_retained_scopes_configuration_revision_check CHECK (configuration_revision > 0)
-  , CONSTRAINT defender_hunting_retained_scopes_contract_revision_check CHECK (contract_revision ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_retained_scopes_permission_revision_check CHECK (permission_revision ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_retained_scopes_query_version_check CHECK (query_version = 3)
-  , CONSTRAINT defender_hunting_retained_scopes_result_scope_id_check CHECK (length(result_scope_id) >= 1
-                                                                         AND length(result_scope_id) <= 256)
-  , CONSTRAINT defender_hunting_retained_scopes_result_scope_kind_check CHECK (result_scope_kind = ANY(ARRAY[CAST('principal' AS text)
-                                                                                                           , CAST('application' AS text)]))
-  , CONSTRAINT defender_hunting_retained_scopes_revoked_by_check CHECK (length(revoked_by) >= 1
-                                                                    AND length(revoked_by) <= 256)
-  , CONSTRAINT defender_hunting_retained_scopes_target_scope_hash_check CHECK (target_scope_hash ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT defender_hunting_retained_scopes_template_id_check CHECK (template_id = ANY(ARRAY[CAST('agents_inventory' AS text)
-                                                                                               , CAST('agent_activity' AS text)
-                                                                                               , CAST('agent_tools' AS text)]))
-  , CONSTRAINT defender_hunting_retained_scopes_tenant_id_check CHECK (length(tenant_id) >= 1
-                                                                   AND length(tenant_id) <= 128)
-  , CONSTRAINT defender_hunting_retained_scopes_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                             , CAST('application' AS text)]))
-  , CONSTRAINT defender_hunting_retained_scopes_pkey PRIMARY KEY (id)
-);
-
 CREATE TABLE copilot_quarantine_status_observations (
     id uuid NOT NULL
   , tenant_id text NOT NULL
@@ -1723,6 +1516,7 @@ CREATE TABLE copilot_quarantine_status_observations (
 );
 
 CREATE TABLE copilot_quarantine_jobs (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT copilot_quarantine_jobs_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
@@ -1878,6 +1672,7 @@ CREATE TABLE copilot_quarantine_attempts (
 
 CREATE TABLE copilot_quarantine_audit (
     id uuid NOT NULL
+  , origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT copilot_quarantine_audit_origin_check CHECK (audit_origin_valid(origin))
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
   , actor_username text NOT NULL
@@ -1899,7 +1694,9 @@ CREATE TABLE copilot_quarantine_audit (
   , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('90 days' AS interval) NOT NULL
   , CONSTRAINT copilot_quarantine_audit_action_check CHECK (action = ANY(ARRAY[CAST('quarantine' AS text)
                                                                              , CAST('unquarantine' AS text)
-                                                                             , CAST('reconcile' AS text)]))
+                                                                             , CAST('reconcile' AS text)
+                                                                             , CAST('resume' AS text)
+                                                                             , CAST('cancel' AS text)]))
   , CONSTRAINT copilot_quarantine_audit_actor_name_check CHECK (length(actor_name) >= 1
                                                             AND length(actor_name) <= 256)
   , CONSTRAINT copilot_quarantine_audit_actor_username_check CHECK (length(actor_username) >= 1
@@ -2037,17 +1834,7 @@ CREATE TABLE copilot_quarantine_qualifications (
 CREATE TABLE operational_state (
     singleton boolean DEFAULT TRUE NOT NULL
   , mode text NOT NULL
-  , provider_work_enabled boolean NOT NULL
-  , restored_from_at timestamp with time zone
-  , deletion_reviewed_at timestamp with time zone
-  , access_reviewed_at timestamp with time zone
   , updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-  , CONSTRAINT operational_state_check CHECK ((restored_from_at IS NULL
-                                           AND deletion_reviewed_at IS NULL
-                                           AND access_reviewed_at IS NULL)
-                                           OR (restored_from_at IS NOT NULL
-                                           AND deletion_reviewed_at IS NOT NULL
-                                           AND access_reviewed_at IS NOT NULL))
   , CONSTRAINT operational_state_mode_check CHECK (mode = ANY(ARRAY[CAST('normal' AS text)
                                                                   , CAST('maintenance' AS text)]))
   , CONSTRAINT operational_state_singleton_check CHECK (singleton)
@@ -2273,7 +2060,6 @@ CREATE TABLE agent_usage_associations (
                                                    END) STORED
   , basis text DEFAULT CAST('admin_reviewed' AS text) NOT NULL
   , reviewed_by text NOT NULL
-  , reviewed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
   , CONSTRAINT agent_usage_associations_basis_check CHECK (basis = CAST('admin_reviewed' AS text))
   , CONSTRAINT agent_usage_associations_check CHECK (source <> CAST('graph_packages' AS text)
                                                   OR environment_id = CAST('' AS text))
@@ -2386,6 +2172,7 @@ CREATE TABLE data_principal_epochs (
     tenant_id text NOT NULL
   , principal_id text NOT NULL
   , epoch bigint DEFAULT 0 NOT NULL
+  , bearer_issued_after bigint DEFAULT 0 NOT NULL CONSTRAINT data_principal_epochs_bearer_issued_after_check CHECK (bearer_issued_after >= 0)
   , CONSTRAINT data_principal_epochs_epoch_check CHECK (epoch >= 0)
   , CONSTRAINT data_principal_epochs_principal_id_check CHECK (length(principal_id) >= 1
                                                            AND length(principal_id) <= 256)
@@ -2718,6 +2505,7 @@ CREATE TABLE data_generation_pins (
 );
 
 CREATE TABLE data_exports (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT data_exports_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
@@ -2924,6 +2712,7 @@ CREATE TABLE official_usage_history_memberships (
 );
 
 CREATE TABLE official_usage_ingestions (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT official_usage_ingestions_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
@@ -3491,6 +3280,7 @@ CREATE TABLE inventory_control_pending (
 );
 
 CREATE TABLE inventory_mutation_stages (
+    origin jsonb NOT NULL DEFAULT '${JSON.stringify(unknownOrigin)}'::jsonb CONSTRAINT inventory_mutation_stages_origin_check CHECK (audit_origin_valid(origin)),
     id uuid NOT NULL
   , tenant_id text NOT NULL
   , principal_id text NOT NULL
@@ -3633,6 +3423,7 @@ CREATE VIEW audit_projection
                                                           , error_code
                                                           , request_path
                                                           , metadata
+                                                          , origin
      FROM public.audit_events
      ORDER BY tenant_id
             , principal_id
@@ -3858,7 +3649,7 @@ BEGIN
     IS DISTINCT FROM (OLD.tenant_id,OLD.principal_id,OLD.token_mode,OLD.capability,OLD.action,OLD.request_hash,OLD.idempotency_key,OLD.access_update,OLD.confirmation_hash,OLD.confirmation_summary,OLD.confirmed_at,OLD.reassign_user_id,OLD.created_at,OLD.deadline_at,OLD.expires_at)
   THEN RAISE EXCEPTION 'job intent is immutable'; END IF;
   RETURN NEW;
-END$$;
+END $$;
 
 CREATE FUNCTION protect_item_target()
 RETURNS trigger
@@ -4844,10 +4635,10 @@ END$$;
 
 CREATE FUNCTION protect_inventory_mutation_stage()
 RETURNS trigger
-LANGUAGE plpgsql
+LANGUAGE plpgsql SET search_path TO pg_catalog,public
 AS $$
 BEGIN
-  IF OLD.confirmation_hash IS NOT NULL AND (to_jsonb(NEW)-'job_id') IS DISTINCT FROM (to_jsonb(OLD)-'job_id')
+  IF OLD.confirmation_hash IS NOT NULL AND (to_jsonb(NEW)-ARRAY['job_id','origin']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['job_id','origin'])
     THEN RAISE EXCEPTION 'mutation confirmation is immutable'; END IF;
   RETURN NEW;
 END$$;
@@ -5555,12 +5346,6 @@ CREATE INDEX official_usage_audit_expiry
 CREATE INDEX official_usage_bundle_receipts_expiry
   ON official_usage_bundle_receipts (expires_at);
 
-CREATE INDEX purview_audit_qualifications_scope
-  ON purview_audit_qualifications (tenant_id, result_scope_id, created_at DESC);
-
-CREATE INDEX purview_audit_qualifications_expiry
-  ON purview_audit_qualifications (expires_at);
-
 CREATE INDEX purview_audit_jobs_scope
   ON purview_audit_jobs (tenant_id, result_scope_id, created_at DESC, id DESC);
 
@@ -5630,43 +5415,6 @@ CREATE INDEX defender_hunting_rows_scope_v18
                           , result_scope_configuration_revision
                           , snapshot_id
                           , row_ordinal);
-
-CREATE INDEX defender_hunting_qualification_scope_v19
-  ON defender_hunting_qualification_evidence (tenant_id
-                                            , result_scope_kind
-                                            , result_scope_id
-                                            , result_scope_configuration_revision
-                                            , template_id
-                                            , target_scope_hash
-                                            , expires_at);
-
-CREATE UNIQUE INDEX defender_hunting_retained_scope_active_v21
-  ON defender_hunting_retained_scopes (tenant_id
-                                     , authorization_principal_id
-                                     , result_scope_kind
-                                     , result_scope_id
-                                     , result_scope_configuration_key
-                                     , token_mode
-                                     , capability_id
-                                     , template_id
-                                     , target_scope_hash
-                                     , query_version
-                                     , contract_revision
-                                     , permission_revision
-                                     , configuration_revision)
-  WHERE revoked_at IS NULL;
-
-CREATE INDEX defender_hunting_retained_scope_visibility_v21
-  ON defender_hunting_retained_scopes (tenant_id
-                                     , result_scope_kind
-                                     , result_scope_id
-                                     , result_scope_configuration_revision
-                                     , expires_at
-                                     , id);
-
-CREATE INDEX defender_hunting_jobs_retained_scope_v21
-  ON defender_hunting_jobs (retained_scope_id)
-  WHERE retained_scope_id IS NOT NULL;
 
 CREATE INDEX copilot_quarantine_status_target_v22
   ON copilot_quarantine_status_observations (tenant_id
@@ -6106,21 +5854,13 @@ ALTER TABLE official_usage_state ADD CONSTRAINT official_usage_state_active_set_
 
 ALTER TABLE official_usage_confirmations ADD CONSTRAINT official_usage_confirmations_target_set_id_tenant_id_fkey FOREIGN KEY (target_set_id, tenant_id) REFERENCES official_usage_sets (id, tenant_id) ON DELETE CASCADE;
 
-ALTER TABLE purview_audit_qualifications ADD CONSTRAINT purview_audit_qualification_job_v17 FOREIGN KEY (job_id) REFERENCES purview_audit_jobs (id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
-
-ALTER TABLE purview_audit_jobs ADD CONSTRAINT purview_audit_job_qualification_v17 FOREIGN KEY (qualification_id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) REFERENCES purview_audit_qualifications (id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key);
-
 ALTER TABLE purview_audit_records ADD CONSTRAINT purview_audit_records_job_id_tenant_id_result_principal_id_fkey FOREIGN KEY (job_id, tenant_id, result_scope_id) REFERENCES purview_audit_jobs (id, tenant_id, result_scope_id) ON DELETE CASCADE;
 
 ALTER TABLE purview_audit_records ADD CONSTRAINT purview_audit_record_job_v17 FOREIGN KEY (job_id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) REFERENCES purview_audit_jobs (id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key);
 
-ALTER TABLE defender_hunting_jobs ADD CONSTRAINT defender_hunting_jobs_retained_scope_id_fkey FOREIGN KEY (retained_scope_id) REFERENCES defender_hunting_retained_scopes (id) ON DELETE RESTRICT;
-
 ALTER TABLE defender_hunting_snapshots ADD CONSTRAINT defender_hunting_snapshots_job_id_tenant_id_result_scope_k_fkey FOREIGN KEY (job_id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) REFERENCES defender_hunting_jobs (id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) ON DELETE CASCADE;
 
 ALTER TABLE defender_hunting_rows ADD CONSTRAINT defender_hunting_rows_snapshot_id_tenant_id_result_scope_k_fkey FOREIGN KEY (snapshot_id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) REFERENCES defender_hunting_snapshots (id, tenant_id, result_scope_kind, result_scope_id, result_scope_configuration_key) ON DELETE CASCADE;
-
-ALTER TABLE defender_hunting_qualification_evidence ADD CONSTRAINT defender_hunting_qualification_evidence_qualified_job_id_fkey FOREIGN KEY (qualified_job_id) REFERENCES defender_hunting_jobs (id) ON DELETE CASCADE;
 
 ALTER TABLE copilot_quarantine_job_items ADD CONSTRAINT copilot_quarantine_job_items_job_id_fkey FOREIGN KEY (job_id) REFERENCES copilot_quarantine_jobs (id) ON DELETE CASCADE;
 
@@ -7002,8 +6742,8 @@ REVOKE ALL PRIVILEGES
   ON FUNCTION inventory_classification_fact_guard ()
   FROM PUBLIC;
 
-INSERT INTO operational_state (singleton, mode, provider_work_enabled)
-VALUES (TRUE, 'normal', TRUE);
+INSERT INTO operational_state (singleton, mode)
+VALUES (TRUE, 'normal');
 
 INSERT INTO data_lifecycle_progress (worker)
 VALUES ('records')
@@ -7013,3 +6753,4 @@ VALUES ('records')
      , ('report_payloads')
      , ('report_staging');
 `;
+export const currentSchemaSql: string = auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql;

@@ -10,10 +10,10 @@ import type {
   PowerPlatformResource,
 } from "./powerPlatformInventory.js";
 
-export type UnifiedAgentSource = "graph_packages" | "power_platform";
+type UnifiedAgentSource = "graph_packages" | "power_platform";
 export type InventoryReportSummary = Omit<CandidateAgentUsageSummary, "context"> & { reportSetId: string | null };
 export type InventoryReportContext = { reports: ReportMetadata; revision: string; expiresAt: string | null };
-export type UnifiedAgentSourceFilter = "all" | UnifiedAgentSource | "both";
+type UnifiedAgentSourceFilter = "all" | UnifiedAgentSource | "both";
 export const unifiedAgentInventoryScopes = ["catalog", "power_platform_only", "all"] as const;
 export type UnifiedAgentInventoryScope = typeof unifiedAgentInventoryScopes[number];
 export type UnifiedAgentPresence = "graph_packages" | "power_platform" | "both";
@@ -27,9 +27,8 @@ export const unifiedAgentSortKeys = [
 ] as const;
 export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
-// Legacy API views; the category selector uses the catalog's raw type facets instead.
-export const unifiedAgentQuickViews = ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const;
-export const unifiedAgentViews = [...unifiedAgentQuickViews, "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
+export const unifiedAgentViews = ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed",
+  "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
 export type UnifiedAgentView = typeof unifiedAgentViews[number];
 export const unifiedAgentAccessFilters = ["all", "available", "unavailable", "unknown"] as const;
 export type UnifiedAgentAccessFilter = typeof unifiedAgentAccessFilters[number];
@@ -78,9 +77,7 @@ export function parseUnifiedAgentRecordId(value: string): UnifiedAgentTarget | u
   return undefined;
 }
 
-export type UnifiedAgentLinkEvidence = PackageAgentLinkEvidence;
-
-export type UnifiedAgentSourceObservation = {
+type UnifiedAgentSourceObservation = {
   id: string;
   snapshotId: string;
   observedAt: string;
@@ -111,7 +108,7 @@ export type UnifiedAgentPowerPlatformObservation = UnifiedAgentSourceObservation
   verification: InventorySnapshotVerification | null;
 };
 
-export type UnifiedAgentSourceError = {
+type UnifiedAgentSourceError = {
   source: UnifiedAgentSource;
   code:
     | "snapshot_unavailable"
@@ -184,10 +181,10 @@ export type UnifiedAgentRecord = {
   usage?: InventoryReportSummary;
   identity: {
     state: UnifiedAgentLinkState;
-    evidence: UnifiedAgentLinkEvidence[];
+    evidence: PackageAgentLinkEvidence[];
     packageEvidence: Array<{
       packageId: string;
-      evidence: UnifiedAgentLinkEvidence[];
+      evidence: PackageAgentLinkEvidence[];
     }>;
     reason: string | null;
     warnings?: PackageAgentIdentityWarning[];

@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import type { InventorySourceAwareDetail, PowerPlatformResource, UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
+import type { PowerPlatformResource, UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
+import type { InventorySourceAwareDetail } from "../../backend/src/types/workbench";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import { fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
@@ -75,6 +76,14 @@ const catalog: UnifiedAgentInventoryPage = {
 };
 
 async function mockScopedCatalog(page: Page, inventory: UnifiedAgentInventoryPage = catalog) {
+  await page.route(url => url.pathname === "/api/agent-inventory/health", route => {
+    expect(route.request().method()).toBe("GET");
+    return route.fulfill({ json: {
+      freshness: inventory.freshness, summary: inventory.summary, verification: inventory.verification,
+      identityCollection: inventory.identityCollection, sources: inventory.sources,
+      partial: inventory.partial, errors: inventory.errors,
+    } });
+  });
   await page.route(url => url.pathname === "/api/agent-inventory", route => {
     const params = inventoryFixtureQuery(route);
     const inventoryScope = params.get("inventoryScope") === "power_platform_only" ? "power_platform_only"
@@ -115,7 +124,7 @@ test("expired package details stay in diagnostics without an admin attention war
   await expect(page.getByRole("region", { name: "Unified agents" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Inventory needs attention/ })).toHaveCount(0);
   await page.getByRole("button", { name: "Sync", exact: true }).click();
-  await expect(page.getByText("Sources checked", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", {name:"Inventory health",exact:true}).getByText("Details pending", { exact: true })).toBeVisible();
   await expect(page.getByText("What needs attention", { exact: true })).toHaveCount(0);
   await expect(page.getByText(/awaiting identity metadata/)).toHaveCount(0);
   await page.getByRole("button", { name: "View diagnostics", exact: true }).click();
@@ -142,7 +151,7 @@ test("catalog-first scopes stay compact and retain matched enrichment across nav
   await expect(page.getByText(/Agents in the Microsoft 365 package catalog|package records represent|Counts can differ from the admin portal/)).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Agent inventory overview" }).getByRole("group", { name: "Inventory scope" })).toHaveCount(0);
   await expect(page.locator(".agent-inventory-overview > .agent-overview-metrics")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("2");
+  await expect(page.getByRole("button", { name: "Show admin-permitted agents", exact: true })).toContainText("2");
   await table.getByRole("button", { name: "Columns", exact: true }).click();
   await page.getByRole("dialog", { name: "Choose agent columns" }).getByRole("checkbox", { name: "Environment", exact: true }).check();
   await page.keyboard.press("Escape");
@@ -159,7 +168,7 @@ test("catalog-first scopes stay compact and retain matched enrichment across nav
   await expect(scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true }))
     .toHaveAccessibleDescription(/no confirmed match in the saved package catalog/);
   await expect(page.getByText(/no confirmed match in the saved package catalog/)).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("0");
+  await expect(page.getByRole("button", { name: "Show admin-permitted agents", exact: true })).toContainText("0");
   await page.reload();
   await expect(scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(table.locator("tbody tr")).toHaveCount(1);

@@ -530,14 +530,19 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
 
   if (!active) {
     if (!onOpenSync) return null;
-    if (state?.onboardingRequired) return <FirstSyncNotice state={state} loading={loading} busy={Boolean(busy)} error={error}
+    if (state?.onboardingRequired) return <FirstSyncNotice state={state} loading={loading} busy={busy} error={error}
       stale={stateReadFailed}
       automaticRefresh={automaticRefresh} cannotStart={cannotStart}
       onStart={sources => { if (!loadController.current) void start("initial", sources); }}
-      onCheckStatus={checkStatus} onOpenSync={onOpenSync} onOpenPermissions={openPermissions} />;
+      onCancel={() => {
+        if (!currentRun) return;
+        onCancelRequested?.();
+        void perform("cancel", signal => cancelDataSyncRun(currentRun.id, { signal }));
+      }}
+      onCheckStatus={checkStatus} onOpenPermissions={openPermissions} />;
     if (!state && error) return <section className="data-sync-panel" aria-label="Workspace status">
       <h2>Workspace status is unavailable</h2>
-      <p>We could not check whether your workspace is ready. Retry the status check, or open Sync for details.</p>
+      <p>We could not check whether your workspace is ready. Retry the status check.</p>
       <div className="error-banner" role="alert">{error}</div>
       <div className="first-sync-actions">
         <WorkbenchActionGate actionId="data-sync.read" compact>
@@ -545,8 +550,6 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
             {loading ? "Checking status..." : "Retry status check"}
           </button>
         </WorkbenchActionGate>
-        <button type="button" className="secondary" onClick={onOpenSync}>View sync details</button>
-        <button type="button" className="secondary" onClick={openPermissions}>Review permissions</button>
       </div>
     </section>;
     return null;

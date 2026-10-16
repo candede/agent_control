@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdoptionGroup, AdoptionPage } from "../../../backend/src/types/adoption";
 import { ApiError } from "../api/client";
@@ -41,7 +41,7 @@ beforeEach(() => {
     ...reportPage([{ value: field === "company" ? "Contoso" : "HR", count: 1 }]),
   }));
 });
-afterEach(() => { vi.resetAllMocks(); });
+afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); });
 
 describe("Adoption", () => {
   it("shows both independent lists without collapsed sections or creator details", async () => {
@@ -70,6 +70,39 @@ describe("Adoption", () => {
       revision={0} reportContext={null} onOpenPerson={onOpenPerson} /></SavedQueryProvider>);
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
     expect(change).toHaveBeenLastCalledWith({ ...route, reportSetId: reports.setId, search: "" });
+  });
+  it("waits for typing to settle before reading matching groups", async () => {
+    const content = (search: string) => <SavedQueryProvider><AdoptionView route={{ ...route, search, company: "Contoso" }}
+      change={change} revision={0} reportContext={null} onOpenPerson={onOpenPerson} /></SavedQueryProvider>;
+    const view = render(content(""));
+    await screen.findByText("Maya");
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    view.rerender(content("h"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    view.rerender(content("hr"));
+    expect(screen.getByRole("searchbox", { name: "Search groups" })).toHaveValue("hr");
+    expect(screen.queryByText("Maya")).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Matching groups" })).toHaveTextContent("Updating...");
+    await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+      expect.objectContaining({ search: "hr", company: "Contoso", limit: 5 }), expect.any(AbortSignal));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByText("Maya")).toBeVisible();
+  });
+  it("does not start a pending search after leaving Adoption", async () => {
+    const content = (search: string) => <SavedQueryProvider><AdoptionView route={{ ...route, search }}
+      change={change} revision={0} reportContext={null} onOpenPerson={onOpenPerson} /></SavedQueryProvider>;
+    const view = render(content(""));
+    await screen.findByText("Maya");
+    vi.useFakeTimers();
+    view.rerender(content("hr"));
+    view.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(1);
   });
   it.each(["HR", " "])("uses the shared inline X for entered search %j and preserves group filters", async text => {
     const filtered = { ...route, search: text, company: "Contoso", department: "HR",

@@ -8,6 +8,7 @@ import { retainRecordData } from "../db/dataRetention.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput, selectionIdentity as fixtureIdentity } from "../../scripts/largeTenantFixtures.js";
 import { digest } from "../db/dataBounds.js";
+import { unknownOrigin, withActionOrigin } from "./actionOrigin.js";
 
 describe("persisted bounded exports", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -50,6 +51,20 @@ describe("persisted bounded exports", () => {
   }, 30_000);
   afterAll(async () => { await fixture?.close(); });
   const create = () => exports.create(selectionIdentity, { selectionId, queryHash, kind: "copilot_users", filename: "users.csv" });
+  it("persists one initiating origin with acceptance, preserves it through replay/build, and attributes cancellation separately", async () => {
+    const mcp = { ...unknownOrigin, channel: "mcp" as const, integrationClientId: "33333333-3333-3333-3333-333333333333", requestId: randomUUID() };
+    const web = { ...unknownOrigin, channel: "webapp" as const, integrationClientId: "22222222-2222-2222-2222-222222222222", requestId: randomUUID() };
+    const input = { selectionId, queryHash, kind: "copilot_users" as const, filename: "users.csv", idempotencyKey: randomUUID() };
+    const id = await withActionOrigin(mcp, () => exports.create(selectionIdentity, input));
+    expect(await withActionOrigin(web, () => exports.create(selectionIdentity, input))).toBe(id);
+    await withActionOrigin(web, () => exports.build(id, selectionIdentity, ["Name"], async function* () { yield [{ Name: "=1+1" }]; }));
+    await withActionOrigin(web, () => exports.cancel(id, selectionIdentity));
+    expect((await fixture.runtime.query("SELECT origin FROM data_exports WHERE id=$1", [id])).rows[0].origin).toEqual(mcp);
+    expect((await eventsFor(id)).map(event => [event.phase, event.status])).toEqual([
+      ["build", "started"], ["build", "succeeded"], ["cancel", "started"], ["cancel", "succeeded"],
+    ]);
+    await expect(fixture.runtime.query("UPDATE data_exports SET origin=$2 WHERE id=$1", [id, web])).rejects.toThrow("immutable");
+  });
   it("persists bounded chunks, defends formulas, polls metadata, verifies stream integrity without files", async () => {
     const id = await create();
     await exports.build(id, selectionIdentity, ["Name"], async function* () {
@@ -136,7 +151,8 @@ describe("persisted bounded exports", () => {
       await building.catch(() => {});
     }
     expect(await exports.status(id, selectionIdentity)).toMatchObject({ status: "cancelled" });
-    expect((await eventsFor(id)).map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "build").map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "cancel").map(event => event.status)).toEqual(["started", "succeeded"]);
     const expired = await create(), independentlyOwned = await create();
     await fixture.operator.query("UPDATE data_exports SET expires_at=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])", [[expired, independentlyOwned]]);
     expect(await exports.expire(expired)).toBe(1);
@@ -273,7 +289,8 @@ describe("persisted bounded exports", () => {
     await requester.cancel(id, selectionIdentity);
     expect(await exports.status(id, selectionIdentity)).toMatchObject({ status: "cancelled" });
     await expect(exports.download(id, selectionIdentity, new AbortController().signal).next()).rejects.toThrow("export_not_ready");
-    expect((await eventsFor(id)).map(event => event.status)).toEqual(["started", "succeeded"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "build").map(event => event.status)).toEqual(["started", "succeeded"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "cancel").map(event => event.status)).toEqual(["started", "succeeded"]);
   });
   it("retains selected roots past page TTL but never past artifact expiry, and collects terminal chunks", async () => {
     const id = await create();
@@ -305,7 +322,8 @@ describe("persisted bounded exports", () => {
     await expect(requester.create(selectionIdentity, { ...input, ids: undefined })).rejects.toMatchObject({ code: "export_idempotency_conflict" });
     await exports.cancel(id, selectionIdentity);
     expect(await requester.create(selectionIdentity, input)).toBe(id);
-    expect((await eventsFor(id)).map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "build").map(event => event.status)).toEqual(["started", "cancelled"]);
+    expect((await eventsFor(id)).filter(event => event.phase === "cancel").map(event => event.status)).toEqual(["started", "succeeded"]);
   });
   it("rolls back cancellation and its receipt when the account fence changes during auditing", async () => {
     const id = await create();

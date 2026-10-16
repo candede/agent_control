@@ -77,7 +77,7 @@ describe("read-source job projection", () => {
   };
   const packageJob: Parameters<typeof packageRefreshJobSummary>[0] = {
     id: "package-1", authorizationPrincipalId: "viewer", tokenMode: "delegated", scopeKind: "broad",
-    catalogOnly: true, autoDetails: false,
+    autoDetails: false,
     requestedIds: [], status: "succeeded", pageCount: 2, observedCount: 25, totalRecords: 25, snapshotId: "snapshot-1",
     ...dates,
   };

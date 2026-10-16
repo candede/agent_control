@@ -205,25 +205,6 @@ describe("selected users and reports client boundary", () => {
       expect.not.objectContaining({ selectionId }), expect.any(AbortSignal));
   });
 
-  it("does not read, migrate, acknowledge or clear retired browser report storage", async () => {
-    const key = "agent-control:usage-reports:v1";
-    localStorage.setItem(key, JSON.stringify({ users: [{ displayName: "Untrusted legacy identity" }] }));
-    localStorage.setItem("unrelated-cutover-sentinel", "preserve");
-    const get = vi.spyOn(Storage.prototype, "getItem"), remove = vi.spyOn(Storage.prototype, "removeItem");
-    try {
-      render(<CopilotUsersView />);
-      await screen.findByRole("button", { name: "User 1" });
-      expect(screen.queryByText("Untrusted legacy identity")).not.toBeInTheDocument();
-      expect(get).not.toHaveBeenCalledWith(key);
-      expect(remove).not.toHaveBeenCalledWith(key);
-      expect(api.readReportPage).toHaveBeenCalledOnce();
-      expect(localStorage.getItem("unrelated-cutover-sentinel")).toBe("preserve");
-    } finally {
-      get.mockRestore(); remove.mockRestore();
-      localStorage.removeItem(key); localStorage.removeItem("unrelated-cutover-sentinel");
-    }
-  });
-
   it.each([false, true])("checks only export metadata before a native download; invalidated=%s", async invalidated => {
     vi.useFakeTimers();
     const ready = { id: "export-download", status: "ready" as const, rows: 50000, bytes: 20000000,

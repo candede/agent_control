@@ -1,7 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
-import type { CapabilityView, InventorySourceAwareDetail, UnifiedAgentRecord } from "../src/api/client";
+import type { CapabilityView, UnifiedAgentRecord } from "../src/api/client";
+import type { InventorySourceAwareDetail } from "../../backend/src/types/workbench";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { fulfillInventoryPage } from "./selectedInventoryFixture";
@@ -108,9 +109,10 @@ test("legacy Agent Builder details use saved people without directory permission
     await expect(person.locator("details")).toHaveCount(0);
   }
   await expect(dialog.getByText("Agent name not reported; showing its resource ID.")).toBeVisible();
-  await expect(dialog.getByText("Technical details", { exact: true })).toHaveCount(0);
+  const technical = dialog.getByRole("region", { name: "Technical details", exact: true });
+  await expect(technical).toBeVisible();
   await expect(dialog.getByText("Authoring tool (raw)")).toHaveCount(0);
-  await expect(dialog.getByText("Agent ID").locator("..")).toContainText(nativeId);
+  await expect(technical.getByText("Agent ID").locator("..")).toContainText(nativeId);
   expect(lookups).toEqual([]);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -126,7 +128,7 @@ test("missing creator lookup is bounded, shows errors, and retries without hidin
   const unexpected = await mockPeopleInventory(page, record);
   await page.clock.setFixedTime(new Date(layoutTime));
   const capability: CapabilityView = {
-    definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
     decision: {
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],
@@ -194,7 +196,7 @@ test("fresh negative and failure evidence is not automatically retried and prese
   const unexpected = await mockPeopleInventory(page, record);
   await page.clock.setFixedTime(new Date(layoutTime));
   const capability: CapabilityView = {
-    definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
     decision: {
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],

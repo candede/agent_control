@@ -36,6 +36,34 @@ const record: PurviewAuditRecord = {
 };
 
 describe("Purview audit failure persistence", () => {
+  it.each(["cancel", "delete"] as const)("fences application %s by the authorization owner before writing", async action => {
+    const repository = new PurviewAuditRepository();
+    mocks.query.mockReset().mockResolvedValue({ rows: [], rowCount: 0 });
+    mocks.commit.mockClear();
+    await expect(repository[action]({
+      tenantId: "tenant-a", authorizationPrincipalId: "reader-b",
+      resultScopes: [{ kind: "application", scopeId: "application-client", configurationRevision: 7 }],
+    }, id)).rejects.toMatchObject({ code: "not_found" });
+    expect(mocks.query).toHaveBeenCalledOnce();
+    const [sql, values] = mocks.query.mock.calls[0];
+    expect(sql).toContain("authorization_principal_id=");
+    expect(sql).toContain("FOR UPDATE");
+    expect(values).toContain("reader-b");
+    expect(values).toContain("application-client");
+    expect(values).toContain(7);
+    expect(mocks.commit).not.toHaveBeenCalled();
+  });
+
+  it("rejects a delegated read scope belonging to another principal", async () => {
+    const repository = new PurviewAuditRepository();
+    mocks.query.mockReset();
+    await expect(repository.listJobs({
+      tenantId: "tenant-a", authorizationPrincipalId: "reader-b",
+      resultScopes: [{ kind: "principal", scopeId: "reader-a", configurationRevision: null }],
+    })).rejects.toMatchObject({ code: "scope_mismatch" });
+    expect(mocks.query).not.toHaveBeenCalled();
+  });
+
   it.each(["cancel", "delete"] as const)("does not commit %s after saved-data authority changes during the write", async action => {
     const repository = new PurviewAuditRepository();
     const controller = new AbortController();
@@ -43,7 +71,7 @@ describe("Purview audit failure persistence", () => {
     mocks.commit.mockClear();
     mocks.query.mockReset().mockImplementation(async (statement: string) => {
       if (statement.includes(action === "cancel" ? "UPDATE purview_audit_jobs" : "DELETE FROM purview_audit_jobs")) controller.abort(failure);
-      return { rows: [{ qualification_id: null }], rowCount: 1 };
+      return { rows: [{ id }], rowCount: 1 };
     });
     await expect(repository[action](scope, id, () => controller.signal.throwIfAborted())).rejects.toBe(failure);
     expect(mocks.commit).not.toHaveBeenCalled();
@@ -66,8 +94,8 @@ describe("Purview audit failure persistence", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each((["submit", "approve"] as const).flatMap(action => (["authorization", "admissions"] as const).map(mode => ({ action, mode }))))(
-    "does not commit $action after $mode changes during the write", async ({ action, mode }) => {
+  it.each(["authorization", "admissions"] as const)(
+    "does not commit submission after %s changes during the write", async mode => {
       const repository = new PurviewAuditRepository();
       const controller = new AbortController();
       const reason = mode === "authorization" ? new AppError(401, "authorization_expired", "Initiating authority changed.")
@@ -82,38 +110,24 @@ describe("Purview audit failure persistence", () => {
       });
       try {
         const assertCurrent = () => { if (mode === "authorization") controller.signal.throwIfAborted(); };
-        await expect(action === "submit"
-          ? repository.submit(scope, { idempotencyKey: "fenced-submission", filters }, assertCurrent)
-          : repository.approveQualification(scope, { filters, capabilityId: "purview.audit.search.delegated",
-            contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
-            approvedBy: scope.authorizationPrincipalId }, assertCurrent)).rejects.toBe(reason);
+        await expect(repository.submit(scope, { idempotencyKey: "fenced-submission", filters }, assertCurrent)).rejects.toBe(reason);
         expect(mocks.commit).not.toHaveBeenCalled();
       } finally { admission.mockRestore(); }
     },
   );
 
-  it.each([true, false])("preserves minimized rows as partial when the durable execution deadline expires (complete: %s)", async complete => {
+  it.each([true, false])("rejects publication begun after the durable execution deadline (complete: %s)", async complete => {
     const repository = new PurviewAuditRepository();
-    const getJob = vi.spyOn(repository, "getJob").mockResolvedValue(undefined);
     const result: PurviewAuditResult = { records: [record], pageCount: 1, providerRowCount: 1, storedRowCount: 1,
       byteCount: 1024, unknownFieldCount: 0, complete, nextLink: complete ? null : "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider/records?$skiptoken=next",
       partialReason: complete ? null : "audit_job_expired" };
     mocks.commit.mockClear();
-    mocks.query.mockReset().mockResolvedValue({ rows: [], rowCount: 1 }).mockResolvedValueOnce({
-      rows: [{ deadline_at: new Date(Date.now() - 1_000), expires_at: new Date(Date.now() + 60_000) }], rowCount: 1,
+    mocks.query.mockReset().mockResolvedValueOnce({
+      rows: [{ filters, deadline_at: new Date(Date.now() - 1_000), expires_at: new Date(Date.now() + 60_000) }], rowCount: 1,
     });
-    try {
-      await repository.publish(scope, id, execution, result);
-      expect(mocks.commit).toHaveBeenCalledOnce();
-      expect(mocks.query.mock.calls[1][0]).toContain("INSERT INTO purview_audit_records");
-      expect(JSON.parse(mocks.query.mock.calls[1][1][5])).toMatchObject([{ wrapper_id: "wrapper-1", content_available: false }]);
-      const update = mocks.query.mock.calls.find(([statement]) => statement.includes("UPDATE purview_audit_jobs"))!;
-      expect(update[1][5]).toBe("partial");
-      expect(update[1][11]).toBe(false);
-      expect(update[1][14]).toBe("audit_job_expired");
-      const qualification = mocks.query.mock.calls.find(([statement]) => statement.includes("UPDATE purview_audit_qualifications"))!;
-      expect(qualification[1]).toEqual([scope.tenantId, id, false, "audit_job_expired"]);
-    } finally { getJob.mockRestore(); }
+    await expect(repository.publish(scope, id, execution, result)).rejects.toMatchObject({ code: "audit_job_expired" });
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.query).toHaveBeenCalledOnce();
   });
 
   it("does not publish expired local caches even to preserve partial rows", async () => {
@@ -122,7 +136,7 @@ describe("Purview audit failure persistence", () => {
       byteCount: 1024, unknownFieldCount: 0, complete: false, nextLink: null, partialReason: "audit_job_expired" };
     mocks.commit.mockClear();
     mocks.query.mockReset().mockResolvedValueOnce({
-      rows: [{ deadline_at: new Date(Date.now() - 1_000), expires_at: new Date(Date.now() - 1_000) }], rowCount: 1,
+      rows: [{ filters, deadline_at: new Date(Date.now() - 1_000), expires_at: new Date(Date.now() - 1_000) }], rowCount: 1,
     });
     await expect(repository.publish(scope, id, execution, result)).rejects.toMatchObject({ code: "audit_job_expired" });
     expect(mocks.commit).not.toHaveBeenCalled();
@@ -140,7 +154,7 @@ describe("Purview audit failure persistence", () => {
     mocks.commit.mockClear();
     mocks.query.mockReset().mockImplementation(async (statement: string) => {
       if (statement.includes("SELECT * FROM purview_audit_jobs")) return {
-        rows: [{ deadline_at: new Date(now + 1_000), expires_at: new Date(now + (deadline === "cache" ? 1_000 : 60_000)) }], rowCount: 1,
+        rows: [{ filters, deadline_at: new Date(now + 1_000), expires_at: new Date(now + (deadline === "cache" ? 1_000 : 60_000)) }], rowCount: 1,
       };
       if (statement.includes("INSERT INTO purview_audit_records")) vi.setSystemTime(now + 2_000);
       return { rows: [], rowCount: 1 };
@@ -161,7 +175,7 @@ describe("Purview audit failure persistence", () => {
     } finally { getJob.mockRestore(); vi.useRealTimers(); }
   });
 
-  it.each(["execution", "cache"] as const)("rechecks the %s deadline after finalizing job and qualification state", async deadline => {
+  it.each(["execution", "cache"] as const)("rechecks the %s deadline after finalizing job state", async deadline => {
     const repository = new PurviewAuditRepository();
     const getJob = vi.spyOn(repository, "getJob").mockResolvedValue(undefined);
     const now = Date.now();
@@ -172,9 +186,9 @@ describe("Purview audit failure persistence", () => {
     mocks.commit.mockClear();
     mocks.query.mockReset().mockImplementation(async (statement: string) => {
       if (statement.includes("SELECT * FROM purview_audit_jobs")) return {
-        rows: [{ deadline_at: new Date(now + 1_000), expires_at: new Date(now + (deadline === "cache" ? 1_000 : 60_000)) }], rowCount: 1,
+        rows: [{ filters, deadline_at: new Date(now + 1_000), expires_at: new Date(now + (deadline === "cache" ? 1_000 : 60_000)) }], rowCount: 1,
       };
-      if (statement.includes("UPDATE purview_audit_qualifications")) vi.setSystemTime(now + 1_000);
+      if (statement.includes("UPDATE purview_audit_jobs SET status=")) vi.setSystemTime(now + 1_000);
       return { rows: [], rowCount: 1 };
     });
     try {
@@ -186,7 +200,6 @@ describe("Purview audit failure persistence", () => {
         await publication;
         const finalization = mocks.query.mock.calls.at(-1)!;
         expect(finalization[0]).toContain("status='partial',page_complete=false");
-        expect(finalization[0]).toContain("SET status='inconclusive'");
         expect(finalization[1]).toEqual([id, "audit_job_expired", expect.stringContaining("preserved records are partial")]);
         expect(mocks.commit).toHaveBeenCalledOnce();
       }
@@ -204,7 +217,7 @@ describe("Purview audit failure persistence", () => {
         byteCount: 2, unknownFieldCount: 0, complete: true, nextLink: null, partialReason: null };
       mocks.commit.mockClear();
       mocks.query.mockReset().mockImplementation(async (statement: string) => {
-        if (statement.includes("UPDATE purview_audit_qualifications")) controller.abort(reason);
+        if (statement.includes("UPDATE purview_audit_jobs SET status=")) controller.abort(reason);
         return { rows: [{ deadline_at: new Date(Date.now() + 60_000) }], rowCount: 1 };
       });
       try {

@@ -8,7 +8,7 @@ import { PermissionDetails } from "./PermissionDetails";
 const now = Date.parse("2026-09-24T00:00:00Z");
 function fixture(): CapabilityView {
   return {
-    definition: capabilityDefinitions[0],
+    enabled: true, definition: capabilityDefinitions[0],
     decision: {
       capabilityId: capabilityDefinitions[0].id, status: "missing_permission", authorized: false, fresh: true,
       checkedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60000).toISOString(),

@@ -24,7 +24,7 @@ vi.mock("../db/pool.js", () => ({
 
 beforeEach(async () => {
   await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
-    mode: "normal", provider_work_enabled: true, restored_from_at: null, deletion_reviewed_at: null, access_reviewed_at: null,
+    mode: "normal",
   }] }) });
 });
 afterEach(() => vi.restoreAllMocks());
@@ -34,7 +34,7 @@ describe("data sync admission ownership", () => {
     const f = fixture();
     let closed = false, committed = false;
     vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
-      if (closed) throw new AppError(503, "provider_requalification_required", "Provider admissions closed.");
+      if (closed) throw new AppError(503, "maintenance", "Provider admissions closed.");
     });
     const commit = (fence?: () => void) => {
       closed = true;
@@ -56,7 +56,7 @@ describe("data sync admission ownership", () => {
     try {
       const request = operation === "submit" ? f.service.start(f.user, { mode: "full", clearSavedData: true })
         : operation === "automatic" ? f.service.automaticRefresh(f.user) : f.service.retry(f.user, f.run.id, ["users"]);
-      await expect(request).rejects.toMatchObject({ code: "provider_requalification_required" });
+      await expect(request).rejects.toMatchObject({ code: "maintenance" });
       expect(committed).toBe(false);
       expect(f.repository.pausePrincipal).not.toHaveBeenCalled();
       expect(f.packages.submit).not.toHaveBeenCalled();

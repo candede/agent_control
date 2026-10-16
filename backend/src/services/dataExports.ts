@@ -9,13 +9,14 @@ import { csvValue } from "./csvEncoding.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { invalidExportSelectionSql } from "../db/dataRetention.js";
 import type { AuditActor } from "../types/audit.js";
+import { currentActionOrigin, initiatingOrigin } from "./actionOrigin.js";
 import { peakCheckpoint } from "./peakMemory.js";
 import { operationalLog } from "./telemetry.js";
 import { requireAdmissions } from "./maintenance.js";
 
 export type ExportKind = "copilot_users" | "official_agents" | "official_users" | "graph_packages" | "power_platform_agents" | "unified_agents";
 export type ExportAudit = (client: pg.PoolClient, event: {
-  id: string; exportId: string; kind: ExportKind; phase: "build" | "download";
+  id: string; exportId: string; kind: ExportKind; phase: "build" | "download" | "cancel";
   status: "started" | "succeeded" | "failed" | "cancelled" | "inconclusive"; rows: number; bytes: number;
   errorCode?: string; checksum?: string; completedAt?: string;
 }) => Promise<void>;
@@ -52,6 +53,14 @@ export class DataExports {
   }, assertCurrent?: () => void) {
     input = { ...input, ids: input.ids?.slice(), actor: input.actor && { tenantId: input.actor.tenantId,
       homeAccountId: input.actor.homeAccountId, username: input.actor.username, displayName: input.actor.displayName } };
+    if (input.actor) {
+      if (input.actor.tenantId !== identity.tenantId || input.actor.homeAccountId !== identity.principalId
+        || typeof input.actor.username !== "string" || !input.actor.username.trim() || input.actor.username.length > 256
+        || typeof input.actor.displayName !== "string" || input.actor.displayName.length > 256) {
+        throw new AppError(400, "invalid_audit_actor", "Export actor must match the verified administrator.");
+      }
+      initiatingOrigin(input.actor);
+    }
     if (input.ids && (input.ids.length > 5000 || new Set(input.ids).size !== input.ids.length
       || input.ids.some(id => typeof id !== "string" || !id || id.length > 512 || /[\0\p{Cs}]/u.test(id)))) throw new Error("export_explicit_ids");
     let id = randomUUID();
@@ -79,14 +88,14 @@ export class DataExports {
       const count = (await client.query(`SELECT count(*)::int AS n FROM data_exports WHERE tenant_id=$1
         AND status='queued' AND expires_at>clock_timestamp()`, [identity.tenantId])).rows[0].n;
       if (count >= 10) throw dataAdmissionError("export_queue_full");
-      await client.query(`INSERT INTO data_exports(id,tenant_id,principal_id,selection_id,query_hash,kind,status,filename,deadline_at,expires_at,selection_mode,created_at,actor,idempotency_key,request_hash)
+      await client.query(`INSERT INTO data_exports(id,tenant_id,principal_id,selection_id,query_hash,kind,status,filename,deadline_at,expires_at,selection_mode,created_at,actor,idempotency_key,request_hash,origin)
         VALUES($1,$2,$3,$4,$5,$6,'queued',$7,statement_timestamp()+interval '15 minutes',
-          LEAST(statement_timestamp()+interval '30 minutes',$8),$9,statement_timestamp(),$10::jsonb,$11,$12)`,
+          LEAST(statement_timestamp()+interval '30 minutes',$8),$9,statement_timestamp(),$10::jsonb,$11,$12,$13)`,
       [id, identity.tenantId, identity.principalId, input.selectionId, input.queryHash, input.kind, input.filename,
         new Date(Math.min(...pins.map(pin => (pin.expires_at as Date).getTime()))), input.ids === undefined ? "all" : "explicit",
         input.actor ? JSON.stringify({ tenantId: input.actor.tenantId, homeAccountId: input.actor.homeAccountId,
           username: input.actor.username, displayName: input.actor.displayName }) : null,
-        input.idempotencyKey ?? null, input.idempotencyKey ? requestHash : null]);
+        input.idempotencyKey ?? null, input.idempotencyKey ? requestHash : null, currentActionOrigin()]);
       for (let offset = 0; offset < (input.ids?.length ?? 0); offset += 250) {
         const rows = input.ids!.slice(offset, offset + 250).map((identity, index) => ({ identity, ordinal: offset + index }));
         const batch = encodeBatch(rows, [id, identity.tenantId]);
@@ -100,6 +109,19 @@ export class DataExports {
       if (!committed) throw error;
       operationalLog("error", "export_post_commit_cleanup_failed", { ...errorTelemetry(error), jobId: id });
       return id;
+    });
+  }
+
+  private async waitForAuthorization(lease: ExportLease) {
+    await this.connections.run(async client => {
+      const row = (await client.query(`UPDATE data_exports SET status='queued',owner=NULL,lease_until=NULL,
+        row_count=0,byte_count=0,chunk_count=0,error_code='authorization_required'
+        WHERE id=$1 AND owner=$2 AND lease_version=$3 AND status='building' RETURNING kind`,
+      [lease.id, lease.owner, lease.version])).rows[0];
+      if (!row) return;
+      await client.query("DELETE FROM data_export_chunks WHERE export_id=$1", [lease.id]);
+      await this.audit(client, { id: lease.id, exportId: lease.id, kind: row.kind, phase: "build", status: "inconclusive",
+        rows: 0, bytes: 0, errorCode: "authorization_required" });
     });
   }
 
@@ -147,7 +169,7 @@ export class DataExports {
           WHERE status='building' AND lease_until>clock_timestamp()`, [identity.tenantId])).rows[0];
         if (counts.global >= 4 || counts.tenant >= 2) throw dataAdmissionError("export_admission");
         const owner = randomUUID();
-        const updated = (await client.query(`UPDATE data_exports SET status='building',owner=$2,lease_version=lease_version+1,
+        const updated = (await client.query(`UPDATE data_exports SET status='building',error_code=NULL,owner=$2,lease_version=lease_version+1,
           lease_until=LEAST(deadline_at,expires_at,clock_timestamp()+interval '60 seconds') WHERE id=$1 RETURNING lease_until`, [id, owner])).rows[0];
         lease = { id, owner, version: row.lease_version + 1, identity,
           deadline: Math.min(row.deadline_at.getTime(), row.expires_at.getTime()), leaseUntil: updated.lease_until.getTime(),
@@ -176,6 +198,7 @@ export class DataExports {
     const assertBuilding = () => {
       if (Date.now() >= owned.deadline) cancellation.abort(new Error("export_deadline"));
       heartbeat.signal.throwIfAborted();
+      control?.assertCurrent?.();
     };
     const assertLease = (leaseUntil: number) => {
       assertBuilding();
@@ -193,12 +216,14 @@ export class DataExports {
         const cancelled = reason === "export_cancelled" || reason === "export_shutdown" || parent?.aborted && error === parent.reason;
         const code = reason !== undefined && codes.includes(reason) ? reason : cancelled ? "export_cancelled" : "export_build_failed";
         const details = error instanceof AppError ? error.details as { limit?: number; observed?: number } | undefined : undefined;
-        settlement = this.fail(owned, code, details, Boolean(cancelled)).catch(failure => {
+        settlement = (error instanceof AppError && error.status === 401
+          ? this.waitForAuthorization(owned) : this.fail(owned, code, details, Boolean(cancelled))).catch(failure => {
           operationalLog("error", "export_audit_completion_failed", errorTelemetry(failure, "audit_completion_failed"));
           control?.settlementFailed?.(new AggregateError([error, failure], "export_work_and_settlement_failed"));
           throw failure;
         });
       }
+
       return settlement;
     };
     const aborted = () => {
@@ -333,7 +358,7 @@ export class DataExports {
         await this.assertChunks(client, id, ordinal, bytes);
         await this.audit(client, { id, exportId: id, kind: row.kind, phase: "build", status: "succeeded", rows, bytes, checksum });
         leaseUntil = (await this.fence(client, owned)).lease_until.getTime();
-        await client.query("UPDATE data_exports SET status='ready',checksum=$2 WHERE id=$1", [id, checksum]);
+        await client.query("UPDATE data_exports SET status='ready',error_code=NULL,checksum=$2 WHERE id=$1", [id, checksum]);
       }, false, heartbeat.signal, id, () => assertLease(leaseUntil), () => { published = true; });
     } catch (error) {
       if (published) {
@@ -421,8 +446,11 @@ export class DataExports {
         assertCurrent?.();
         const row = await this.current(client, id, identity);
         if (["queued", "building", "ready"].includes(row.status)) {
+          const lifecycle = { id: randomUUID(), exportId: id, kind: row.kind, phase: "cancel" as const, rows: row.row_count, bytes: exactCount(row.byte_count) };
+          await this.audit(client, { ...lifecycle, status: "started" });
           await client.query("UPDATE data_exports SET status='cancelled' WHERE id=$1", [id]);
           if (row.status !== "ready") await this.audit(client, { id, exportId: id, kind: row.kind, phase: "build", status: "cancelled", rows: row.row_count, bytes: exactCount(row.byte_count), errorCode: "export_cancelled" });
+          await this.audit(client, { ...lifecycle, status: "succeeded" });
         }
       }, false, undefined, id, assertCurrent, () => { committed = true; });
     } catch (error) {

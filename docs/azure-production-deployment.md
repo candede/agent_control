@@ -101,8 +101,8 @@ After deployment:
 
 1. Confirm `/api/health` and `/api/ready` return success.
 2. Sign in with an assigned Viewer account and an assigned Admin account.
-3. Open **Permissions** and check the required capabilities.
-4. Refresh each enabled source from **Sync**.
+3. Confirm initial read-only synchronization starts automatically after sign-in.
+4. Review **Sync** source progress; use **Permissions** for actual access failures.
 5. Verify saved inventory, users, reports, and activity.
 6. Test each approved write with an exact reviewed target.
 7. Confirm monitoring, backup retention, budget alerts, and network rules.

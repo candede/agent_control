@@ -14,7 +14,7 @@ import { UsageReportContext } from "./UsageReportContext";
 import "./officialUsage.css";
 import "./listTable.css";
 
-export type AgentFilters = Pick<ReportQuery, "search" | "creatorType" | "startDate" | "endDate" | "sort" | "order">;
+type AgentFilters = Pick<ReportQuery, "search" | "creatorType" | "startDate" | "endDate" | "sort" | "order">;
 type Props = { setId?: string; activityWindowDays?: number; revision?: number };
 export function ReportingView(props: Props) {
   const principal = useReportPrincipalScope();

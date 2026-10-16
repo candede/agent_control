@@ -35,7 +35,7 @@ beforeAll(async () => {
   const signature = createHmac("sha256", config.sessionSecret).update(id).digest("base64").replace(/=+$/g, "");
   await new Promise<void>((resolve, reject) => application.store.set(id, {
     cookie: new session.Cookie({ maxAge: 600_000 }), tenantId: config.tenants[0].tenantId, accountId: principalId,
-    clientId: config.tenants[0].clientId, rolesValidatedAt: Date.now(), csrfToken: "synthetic",
+    clientId: config.tenants[0].clientId, signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "synthetic",
     user: { tenantId: config.tenants[0].tenantId, homeAccountId: principalId,
       username: "fixture@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"] },
   }, error => error ? reject(error) : resolve()));

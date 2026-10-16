@@ -26,6 +26,9 @@ $script:mutateSource = $false
 $script:changeDuringCapture = $false
 $script:enumerations = 0
 $script:wrongOwner = $false
+$script:candidateInputs = @()
+$script:candidateHash = ''
+$script:replacePostgresOnAppStart = $false
 $script:answers = [Collections.Generic.Queue[string]]::new()
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message }; $script:checks++ }
 function Fails([scriptblock]$Action,[string]$Pattern) {
@@ -40,12 +43,12 @@ function Get-Command {
 function git {
     $global:LASTEXITCODE = 0
     Assert ($args -contains 'compose.yaml' -and $args -contains 'Dockerfile') 'Source inventory omitted required Docker/Compose inputs.'
-    Assert ($args -contains 'docs' -and $args -notcontains 'plans' -and $args -notcontains 'plans/admin-poc-production/README.md') 'Source inventory must use current documentation, not historical plans.'
+    Assert ($args -contains 'docs' -and $args -contains 'knip.json' -and $args -notcontains 'plans') 'Source inventory must include current documentation and analysis configuration.'
     $script:enumerations++
     if ($script:changeDuringCapture -and $script:enumerations -eq 2) {
         [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'changed-during-capture')
     }
-    return (@('Dockerfile','.dockerignore','compose.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') -join "`0") + "`0"
+    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
 }
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
@@ -77,7 +80,12 @@ function docker {
     if ($Arguments[0] -eq 'info') { return '29.7.2' }
     if ($line -eq 'compose|version|--short') { return '2.30.0' }
     if ($Arguments[0] -eq 'volume') { if ($script:currentFingerprint) { return $context.Volume }; return '' }
+    if ($Arguments[0] -eq 'image' -and $Arguments[1] -eq 'inspect') {
+        if ($Arguments[3] -eq '{{.Id}}') { return $(if ($Arguments[-1] -eq 'candidate-runtime:local') {$script:runtime} else {$script:operator}) }
+        return $script:candidateHash
+    }
     if ($Arguments[0] -eq 'build') {
+        Assert ($Arguments -contains '--provenance=false') 'Local rebuild attestation timestamps would break exact reset/runtime identity.'
         $target = $Arguments[[Array]::IndexOf($Arguments,'--target')+1]
         $image = switch ($target) { 'runtime' {$script:runtime} 'operator' {$script:operator} 'qualification' {$script:qualification} }
         $source = $Arguments[-1]
@@ -98,15 +106,28 @@ function docker {
     }
     if ($Arguments[0] -eq 'stop') { $script:containers[$Arguments[-1]].running=$false; return }
     if ($Arguments[0] -eq 'run') {
+        if ($Arguments[-1] -match 'Built output link') { return '{"hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","count":198}' }
+        if ($Arguments[-1] -match 'readFileSync\("backend/scripts/database.ts"\)') {
+            return (@{cli=(Get-FileHash -LiteralPath (Join-Path $root 'backend/scripts/database.ts')).Hash.ToLowerInvariant();schemaFingerprint=$script:targetFingerprint}|ConvertTo-Json -Compress)
+        }
+        if ($Arguments -contains 'backend/scripts/backup.ts') {
+            $mount = @($Arguments | Where-Object { $_ -match 'target=/backups$' })[0]
+            $directory = ($mount -replace '^type=bind,source=','') -replace ',target=/backups$',''
+            $file = Join-Path $directory ([IO.Path]::GetFileName($Arguments[-1]))
+            Write-LocalText $file 'synthetic-protected-checkpoint'
+            Write-LocalText "$file.json" (@{schemaFingerprint=$script:currentFingerprint;sha256=(Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()} | ConvertTo-Json)
+            return
+        }
         if ($Arguments[-1] -eq 'preflight') {
             if ($script:preflightOverride) { return $script:preflightOverride }
             if ($script:currentFingerprint -and $script:currentFingerprint -cne $script:targetFingerprint) {
                 throw 'database_schema_reset_required: explicit -DbReset is required.'
             }
-            return (@{state=$(if ($script:currentFingerprint) {'current'} else {'fresh'});currentFingerprint=$script:currentFingerprint;targetFingerprint=$script:targetFingerprint} | ConvertTo-Json -Compress)
+            return (@{state=$(if (-not $script:currentFingerprint) {'fresh'} else {'current'});currentFingerprint=$script:currentFingerprint;targetFingerprint=$script:targetFingerprint} | ConvertTo-Json -Compress)
         }
-        if ($Arguments -contains 'preflight-reset') { return '{"outcome":"succeeded"}' }
-        if ($Arguments[-1] -eq 'initialize') { $script:currentFingerprint=$script:targetFingerprint }
+        if ($Arguments -contains 'preflight-reset') { return '{"outcome":"succeeded","database":"agentcontrol","exists":true}' }
+        if ($Arguments -contains 'initialize') { $script:currentFingerprint=$script:targetFingerprint }
+        if ($Arguments -contains 'resume') { $script:operationalMode='normal' }
         if ($Arguments -contains 'reset') { $script:currentFingerprint=$null }
         return
     }
@@ -116,6 +137,10 @@ function docker {
             $service = $Arguments[-1]
             $id = if ($service -eq 'app') {'a' * 64} else {'b' * 64}
             $script:containers[$id]=@{service=$service;running=$true;image=$(if ($service -eq 'app') {$script:runtime} else {'sha256:' + ('d' * 64)})}
+            if ($service -eq 'app' -and $script:replacePostgresOnAppStart) {
+                $script:containers.Remove(('b' * 64))
+                $script:containers[('e' * 64)]=@{service='postgres';running=$true;image=('sha256:' + ('d' * 64))}
+            }
         }
     }
 }
@@ -153,14 +178,21 @@ try {
     Assert ($preflight -lt $runtimeBuild) 'Database compatibility was not checked before runtime compilation.'
     Assert (($script:calls -join "`n") -match '\|--no-recreate\|--wait\|') 'Preflight could recreate PostgreSQL before draining the application.'
     Assert (Test-Path -LiteralPath (Join-Path $context.State 'deployment.json')) 'Successful deployment did not record its identity.'
+    Assert ($script:operationalMode -eq 'normal' -and ($script:calls -join "`n") -match 'database\.ts\|resume') 'Normal deployment blocked automatic first sync.'
     Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Source snapshot was not removed.'
     $receipt=(Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
     $health=$script:healthCalls
+    $appliedComposeFiles=$context.AppliedComposeFiles -join '|'
     $messages=Run-Deploy
     Assert (($messages -join "`n").Contains('ALREADY RUNNING')) 'Unchanged healthy start was not a no-op.'
+    Assert (($context.AppliedComposeFiles -join '|') -ceq $appliedComposeFiles) 'No-op relabeled an unapplied snapshot as the container Compose ownership.'
     Assert ($script:healthCalls -eq $health+1) 'No-op skipped fresh host readiness.'
     Assert (-not (($script:calls -join "`n") -match '(?m)\|stop\||database\.ts\|initialize$|\|90\|app$')) 'No-op restarted the app or initialized the database.'
     Assert ((Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash -ceq $receipt) 'No-op rewrote its deployment identity.'
+    $script:operationalMode='maintenance'
+    $messages=Run-Deploy
+    Assert ($script:operationalMode -eq 'normal' -and ($messages -join "`n").Contains('ALREADY RUNNING') -and
+        -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Normal start left a healthy deployment stuck in saved-only admission.'
     $script:runtime='sha256:' + ('e' * 64)
     $messages=Run-Deploy
     Assert (($script:calls -join "`n") -match '\|stop\|--timeout\|130\|app') 'Changed image was not drained.'
@@ -206,15 +238,30 @@ try {
     Assert (-not (($script:calls -join "`n") -match '\|stop\||database\.ts\|(initialize|reset)|\|--target\|runtime\|')) 'Changed schema was automatically converted.'
     $messages=Run-Deploy -DbReset 3>$null
     Assert ($context.DbResetStarted -and ($script:calls -join "`n") -match 'database\.ts\|reset\|agentcontrol') 'Explicit reset no longer recreates only the selected database.'
-    Assert (($script:calls -join "`n") -match '(?m)database\.ts\|initialize$' -and -not (($script:calls -join "`n") -match 'backup\.ts|pg_dump')) 'Explicit reset did not initialize directly without a pre-reset backup.'
-    $script:failure='database\.ts\|initialize$'
-    Fails { Run-Deploy -DbReset 3>$null } 'Simulated Docker failure'
+    Assert (($script:calls -join "`n") -match '(?m)database\.ts\|initialize$' -and -not (($script:calls -join "`n") -match 'backup\.ts|pg_dump')) 'Explicit reset did not initialize the current schema without a pre-reset backup.'
+    Assert ($script:operationalMode -eq 'normal' -and ($script:calls -join "`n") -match 'database\.ts\|resume') 'Completed reset did not return to normal operation.'
     $initializing=Join-Path $context.State 'control/database-initializing'
+    $operationPath=Join-Path $context.State 'deployment-operation.json'
+    $completedOperation=Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json -AsHashtable
+    $completedOperation.candidate='f'*64
+    Write-LocalText $operationPath ($completedOperation | ConvertTo-Json -Depth 30)
+    $messages=Run-Deploy -DbReset 3>$null
+    $freshOperation=Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json -AsHashtable
+    Assert ($context.DbResetStarted -and @($script:calls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'A completed pinned receipt blocked a new explicit reset.'
+    Assert ($freshOperation.step -eq 'verified' -and $freshOperation.resetStatus -eq 'completed' -and -not $freshOperation.candidate) 'A new ordinary reset retained the previous pinned operation identity.'
+    $messages=Run-Deploy -DbReset 3>$null
+    Assert ($context.DbResetStarted -and @($script:calls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'A completed ordinary receipt silently skipped a new explicit reset.'
+    $messages=Run-Deploy
+    Assert (($messages -join "`n").Contains('ALREADY RUNNING') -and
+        -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|(reset|initialize)\|')) 'Ordinary start after a completed reset repeated destructive work.'
+    Write-LocalText $initializing 'pending'
+    $script:failure='database\.ts\|initialize(?:\|closed)?$'
+    Fails { Run-Deploy 3>$null } 'Simulated Docker failure'
     Assert (Test-Path -LiteralPath $initializing) 'Failed database initialization lost its repair marker.'
     $script:failure=''
     $script:currentFingerprint=$script:targetFingerprint
     $messages=Run-Deploy
-    Assert (($script:calls -join "`n") -match '(?m)database\.ts\|initialize$' -and -not (($script:calls -join "`n") -match 'database\.ts\|reset\|')) 'Retry skipped failed grants because fingerprints matched, or repeated a destructive reset without authorization.'
+    Assert (($script:calls -join "`n") -match '(?m)database\.ts\|initialize(?:\|closed)?$' -and -not (($script:calls -join "`n") -match 'database\.ts\|reset\|')) 'Retry skipped failed grants because fingerprints matched, or repeated a destructive reset without authorization.'
     Assert (-not (Test-Path -LiteralPath $initializing)) 'Successful initialization retained an obsolete repair marker.'
     $script:ready=$false
     Fails { Run-Deploy } 'readiness failure'
@@ -227,7 +274,7 @@ try {
     [IO.File]::WriteAllText($receiptPath,$validReceipt)
     $lock=[IO.File]::Open((Join-Path $root "artifacts/local-operations/$($context.Project).lock"),'Open','ReadWrite','None')
     try {
-        foreach ($operation in @('Deploy','Stop','EditConfig','Reset','Backup')) {
+        foreach ($operation in @('Deploy','Stop','EditConfig','Retain','Backup')) {
             $script:calls.Clear()
             Fails { Invoke-LocalDeployment $context $operation } 'Another operation'
             Assert ($script:calls.Count -eq 0) 'Concurrent project operation reached Docker.'
@@ -251,5 +298,138 @@ try {
     Fails { Run-Deploy } 'Database preflight failed'
     Assert (-not (($script:calls -join "`n") -match '\|--target\|runtime\||\|stop\|')) 'Failed preflight reached runtime compilation or shutdown.'
     $script:failure=''
+    # Real candidate consumer with mocked immutable images and the existing executor.
+    $script:candidateInputs=@('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','backend/scripts/database.ts')
+    foreach ($path in $script:candidateInputs) {
+        $destination=Join-Path $root $path
+        [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
+        if ($path -eq 'backend/scripts/database.ts') { Write-LocalText $destination 'synthetic-operator-bytes' }
+        else { Copy-Item -LiteralPath (Join-Path $repository $path) -Destination $destination }
+    }
+    $candidateDirectory=Join-Path $root 'artifacts/candidate'
+    [IO.Directory]::CreateDirectory($candidateDirectory) | Out-Null
+    $context.SourceEvidenceFile=Join-Path $candidateDirectory 'source.json'
+    $frozen=New-LocalBuildSnapshot $context
+    $script:runtime='sha256:' + ('9'*64)
+    $script:candidateHash=$context.SourceHash
+    $script:targetFingerprint='e671d8d1fda5d0276bcfac9db8a879a78feea048eb0e84127727e894781f5244'
+    $context.Candidate=Join-Path $candidateDirectory 'build.json'
+    Write-LocalText $context.Candidate (@{schemaContract='current-only';schemaFingerprint=$script:targetFingerprint
+        sourceRoot=$frozen.Root;sourceManifest=$context.SourceEvidenceFile;sourceManifestHash=$context.SourceHash
+        builtFilesHash=('c'*64);builtFileCount=198;operatorCliSha256=(Get-FileHash -LiteralPath (Join-Path $root 'backend/scripts/database.ts')).Hash.ToLowerInvariant()
+        images=@{runtime=@{tag='candidate-runtime:local';id=$script:runtime;sourceManifestHash=$context.SourceHash}
+            operator=@{tag='candidate-operator:local';id=$script:operator;sourceManifestHash=$context.SourceHash}}} | ConvertTo-Json -Depth 6)
+    $context.CandidateSha256=(Get-FileHash -LiteralPath $context.Candidate).Hash.ToLowerInvariant()
+    $secretPath=Join-Path $context.State 'secrets/tenants.json'
+    $savedRegistry=[IO.File]::ReadAllText($secretPath)
+    $beforeIdentity=Get-LocalDeploymentIdentity $context @()
+    Write-LocalText $secretPath ($savedRegistry+"`n")
+    $changedIdentity=Get-LocalDeploymentIdentity $context @()
+    Assert ($beforeIdentity.secretConfiguration -cne $changedIdentity.secretConfiguration -and
+        $beforeIdentity.database -ceq $changedIdentity.database) 'Exact secret configuration binding missed tenant registry changes or changed the database identity.'
+    Write-LocalText $secretPath $savedRegistry
+    $script:currentFingerprint=$script:targetFingerprint
+    function Get-LocalReleaseTarget {
+        param($Context)
+        return [ordered]@{project=$Context.Project;root=$Context.Root;state=$Context.State;dockerContext='owned';engine='owned-engine';endpoint='owned'
+            origin=$Context.PublicUrl;port=$Context.Port;tenantRegistryHash=('1'*64);secretBinding=('2'*64)
+            configuration=@{'settings.json'=(Get-FileHash -LiteralPath (Join-Path $Context.State 'settings.json')).Hash.ToLowerInvariant()
+                'compose.env'=(Get-FileHash -LiteralPath (Join-Path $Context.State 'compose.env')).Hash.ToLowerInvariant()}
+            containers=@(@{service='postgres';id=('b'*64);image=('sha256:' + ('d'*64))},@{service='app';id=('a'*64);image=$script:runtime})
+            schema=@{fingerprint=$script:currentFingerprint};databaseAction=$Context.DatabaseAction}
+    }
+    function Get-LocalReleaseObservations { param($Context) return @{fixture='bounded synthetic observation'} }
+    $context.ReadOnly=$true
+    $before=(Get-FileHash -LiteralPath (Join-Path $context.State 'compose.env')).Hash
+    $report=Run-Deploy
+    $evidence=@($report | Where-Object { $_ -is [Collections.IDictionary] })[0]
+    $context.ExpectedPreflight=$evidence.preflight
+    Assert ($evidence.status -ceq 'deployment_pending' -and -not $evidence.productionMutation) 'Read-only candidate preflight fabricated deployment.'
+    Assert (-not (($script:calls -join "`n") -match '\|up\||\|stop\||backend/scripts/database\.ts\|(?!preflight)|backup.ts|\|update\|') -and
+        (Get-FileHash -LiteralPath (Join-Path $context.State 'compose.env')).Hash -ceq $before) 'Read-only candidate preflight changed the installation.'
+    $context.ReadOnly=$false
+    $context.CandidateSha256='0'*64
+    Fails { Run-Deploy } 'digest mismatch'
+    $context.CandidateSha256=(Get-FileHash -LiteralPath $context.Candidate).Hash.ToLowerInvariant()
+    $approved=$context.ExpectedPreflight
+    $context.ExpectedPreflight='0'*64
+    Fails { Run-Deploy } 'preflight identity changed'
+    Assert (-not (($script:calls -join "`n") -match 'backend/scripts/database\.ts\||\|stop\|')) 'Unapproved preflight drained or contacted the database.'
+    $context.ExpectedPreflight=$approved
+    $script:failure='backup.ts'
+    Fails { Run-Deploy } 'Simulated Docker failure'
+    Assert ((Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance')) -and
+        -not (($script:calls -join "`n") -match 'database\.ts\|resume')) 'Failed checkpoint did not keep maintenance active.'
+    $script:failure='database\.ts\|resume'
+    Fails { Run-Deploy } 'Simulated Docker failure'
+    $progress=Get-Content -LiteralPath (Join-Path $context.State 'deployment-operation.json') -Raw | ConvertFrom-Json
+    Assert ($progress.step -ceq 'checkpointed' -and (Test-Path -LiteralPath $progress.checkpoint)) 'Interrupted release lost its protected checkpoint receipt.'
+    $checkpointHash=(Get-FileHash -LiteralPath $progress.checkpoint).Hash
+    Write-LocalText $progress.checkpoint 'tampered'
+    $script:failure=''
+    Fails { Run-Deploy } 'checkpoint changed'
+    Write-LocalText $progress.checkpoint 'synthetic-protected-checkpoint'
+    Assert ((Get-FileHash -LiteralPath $progress.checkpoint).Hash -ceq $checkpointHash) 'Synthetic checkpoint was not restored exactly.'
+    $script:ready=$false
+    Fails { Run-Deploy } 'readiness failure'
+    Assert (-not (($script:calls -join "`n") -match 'backup.ts') -and ($script:calls -join "`n") -match 'database\.ts\|resume') 'Resume recreated the checkpoint or failed to return to normal operation.'
+    $script:ready=$true
+    $script:replacePostgresOnAppStart=$true
+    $beforeReceipt=(Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
+    Fails { Run-Deploy } 'PostgreSQL identity changed'
+    Assert ((Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance')) -and
+        (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash -ceq $beforeReceipt) 'Changed PostgreSQL identity was published as a verified release.'
+    $script:replacePostgresOnAppStart=$false
+    $script:containers.Remove(('e' * 64))
+    $script:containers[('b' * 64)]=@{service='postgres';running=$true;image=('sha256:' + ('d'*64))}
+    $messages=Run-Deploy
+    $applied=Get-Content -LiteralPath (Join-Path $context.State 'deployment.json') -Raw | ConvertFrom-Json
+    $progress=Get-Content -LiteralPath (Join-Path $context.State 'deployment-operation.json') -Raw | ConvertFrom-Json
+    Assert ($applied.candidate -ceq $context.CandidateSha256 -and $applied.schemaFingerprint -ceq $script:targetFingerprint -and
+        $progress.step -ceq 'verified') 'Resumed exact candidate did not persist its verified release identity.'
+    Assert (-not (($script:calls -join "`n") -match '^build\||backup.ts|reset\|') -and (Test-Path -LiteralPath $frozen.Root)) 'Pinned deployment rebuilt/deleted its candidate or replayed destructive work.'
+    $appStarts = @($script:calls | Where-Object { $_ -match '\|up\|' -and $_ -match '\|app$' })
+    Assert ($appStarts.Count -eq 1 -and $appStarts[0] -match '\|--no-deps\|') 'Pinned app startup can recreate the approved retained PostgreSQL dependency.'
+    $messages=Run-Deploy
+    Assert (-not (($script:calls -join "`n") -match '\|stop\||backup.ts|maintenance\|confirmed') -and
+        (Get-FileHash -LiteralPath $progress.checkpoint).Hash -ceq $checkpointHash) 'Verified pinned deployment replayed its maintenance/checkpoint.'
+    $context.ReadOnly=$true
+    $resetReport=Run-Deploy -DbReset
+    $resetEvidence=@($resetReport | Where-Object { $_ -is [Collections.IDictionary] })[0]
+    Assert ($resetEvidence.preflight -cne $context.ExpectedPreflight -and $resetEvidence.target.databaseAction -eq 'reset') 'Reset action is not bound in read-only approval identity.'
+    $context.ReadOnly=$false
+    Fails { Run-Deploy -DbReset } 'different approved action'
+    Assert (-not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Normal release approval authorized a reset.'
+    $context.ExpectedPreflight=$resetEvidence.preflight
+    $script:failure='preflight-reset'
+    Fails { Run-Deploy -DbReset } 'Database preflight failed'
+    Assert (-not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Failed exact reset preflight drained the app.'
+    $script:failure='initialize'
+    Fails { Run-Deploy -DbReset } 'Simulated Docker failure'
+    $operation=Get-Content -LiteralPath (Join-Path $context.State 'deployment-operation.json') -Raw|ConvertFrom-Json
+    Assert ($operation.resetStatus -eq 'completed' -and (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance'))) 'Completed reset with initialization failure lost honest maintenance recovery evidence.'
+    $script:failure=''
+    $messages=Run-Deploy -DbReset
+    Assert (-not (($script:calls -join "`n") -match 'database\.ts\|reset\||backup.ts') -and
+        ($script:calls -join "`n") -match 'database\.ts\|resume') 'Reset resume repeated destruction or failed to return to normal operation.'
+    $messages=Run-Deploy -DbReset
+    Assert (($messages -join "`n").Contains('ALREADY RUNNING') -and
+        -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|(reset|initialize)\|')) 'Verified pinned reset rerun repeated work.'
+    $script:currentFingerprint='0'*64
+    $context.ReadOnly=$true
+    $unknownReport=Run-Deploy -DbReset
+    $context.ExpectedPreflight=@($unknownReport | Where-Object { $_ -is [Collections.IDictionary] })[0].preflight
+    $context.ReadOnly=$false
+    $script:failure='database\.ts\|reset\|'
+    Fails { Run-Deploy -DbReset } 'Simulated Docker failure'
+    $operation=Get-Content -LiteralPath (Join-Path $context.State 'deployment-operation.json') -Raw|ConvertFrom-Json
+    Assert ($operation.resetStatus -eq 'attempted' -and $context.DbResetStarted -and
+        (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance'))) 'Unknown destructive failure was not honestly fenced.'
+    $script:failure=''
+    Fails { Run-Deploy -DbReset } 'Reset outcome is unknown'
+    Assert (-not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Unknown reset failure automatically repeated destructive work.'
+    Write-LocalText (Join-Path $frozen.Root 'backend/input.ts') 'changed-frozen-source'
+    Fails { Run-Deploy } 'Candidate source changed'
+    Assert (-not (($script:calls -join "`n") -match '\|stop\||backend/scripts/database\.ts\|')) 'Tampered candidate reached production operations.'
     Write-Host "Passed $script:checks redesigned local-runtime assertions (mocked Docker; no deployment)."
 } finally { Remove-Item -LiteralPath $root -Recurse -Force }

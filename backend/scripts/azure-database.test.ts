@@ -73,7 +73,7 @@ describe("Azure database identity and sequencing guards", () => {
       .resolves.toMatchObject({ currentFingerprint: schemaFingerprint, targetFingerprint: schemaFingerprint });
   });
 
-  it("keeps maintenance closed through drain and reopens with provider work disabled", async () => {
+  it("keeps maintenance closed through drain and resumes normal provider work on reopen", async () => {
     expect(await enterAzureMaintenance(initialized.operator, initialized.name)).toMatchObject({ mode: "maintenance" });
     await initialized.operator.query(
       `INSERT INTO jobs(id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,
@@ -89,10 +89,10 @@ describe("Azure database identity and sequencing guards", () => {
     await expect(verifyAzureDrain(initialized.operator, initialized.name)).resolves.toMatchObject({ execution_owners: 0 });
     await expect(reopenAzureDatabase(initialized.operator, initialized.name)).resolves.toMatchObject({
       mode: "normal",
-      providerWorkEnabled: false,
+      providerWorkEnabled: true,
     });
-    expect((await initialized.operator.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0])
-      .toEqual({ mode: "normal", provider_work_enabled: false });
+    expect((await initialized.operator.query("SELECT mode FROM operational_state")).rows[0])
+      .toEqual({ mode: "normal" });
     await expect(reopenAzureDatabase(initialized.operator, initialized.name)).rejects.toThrow("requires the exact database");
   });
 

@@ -7,7 +7,7 @@ import { responsibilityFixture } from "../src/test/agentResponsibilityFixture";
 
 async function openUser(page: Page) {
   await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
-  const unexpected = await mockLayoutApi(page);
+  const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
   await page.clock.install({ time: new Date(layoutTime) });
   const reads = { users: 0, responsibility: 0, refresh: 0 };
   const writes: string[] = [];
@@ -34,8 +34,12 @@ async function openUser(page: Page) {
       nextCheckAt: new Date(Date.parse(layoutTime) + reads.refresh * 60_000).toISOString(),
     } });
   });
+  const firstRefresh = page.waitForResponse(response => isAutomaticRefreshRequest(response.request()) && response.ok());
   await page.goto("/users");
+  await (await firstRefresh).finished();
+  await page.clock.runFor(1_000);
   await page.getByRole("button", { name: "Ada", exact: true }).click();
+  expect(reads.refresh).toBe(1);
   return { dialog: page.getByRole("dialog", { name: "Ada", exact: true }), reads, writes, unexpected };
 }
 
@@ -120,18 +124,28 @@ test("user tabs and agent filters persist through real refreshes with keyboard n
   await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await expect(search).toHaveValue("research");
   const userReads = reads.users;
+  const usageRefresh = page.waitForResponse(response => isAutomaticRefreshRequest(response.request()) && response.ok());
   await page.clock.runFor(65_000);
-  await expect.poll(() => reads.users).toBeGreaterThan(userReads);
+  await (await usageRefresh).finished();
+  await expect.poll(async () => {
+    await page.clock.runFor(1_000);
+    return reads.users;
+  }).toBeGreaterThan(userReads);
   await expect(dialog.getByRole("tab", { name: "Usage & agents", exact: true })).toHaveAttribute("aria-selected", "true");
   await expect(search).toHaveValue("research");
   await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).focus();
   await page.keyboard.press("End");
   await expect(dialog.getByRole("tab", { name: "Logs", exact: true })).toBeFocused();
-  const preset = dialog.getByRole("combobox", { name: "Search preset", exact: true });
+  const preset = dialog.getByRole("combobox", { name: "Log type", exact: true });
   await preset.selectOption("copilot_studio_admin");
   const purviewUserReads = reads.users;
+  const logsRefresh = page.waitForResponse(response => isAutomaticRefreshRequest(response.request()) && response.ok());
   await page.clock.runFor(65_000);
-  await expect.poll(() => reads.users).toBeGreaterThan(purviewUserReads);
+  await (await logsRefresh).finished();
+  await expect.poll(async () => {
+    await page.clock.runFor(1_000);
+    return reads.users;
+  }).toBeGreaterThan(purviewUserReads);
   await expect(dialog.getByRole("tab", { name: "Logs", exact: true })).toHaveAttribute("aria-selected", "true");
   await expect(preset).toHaveValue("copilot_studio_admin");
   await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).click();

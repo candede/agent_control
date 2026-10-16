@@ -13,7 +13,7 @@ class DatabaseSchemaError extends Error {
   readonly code = "database_schema_reset_required";
 
   constructor() {
-    super("The saved database does not match this build's current schema. Explicitly reset the owned development database before initialization. No data was converted or reset.");
+    super("The saved database does not match the current schema. Use an explicitly confirmed database reset or current-schema operator recovery. No data was converted or reset.");
   }
 }
 
@@ -30,13 +30,50 @@ async function inspectSchema(database: Pick<pg.PoolClient, "query">) {
   }
   const saved = await database.query<{ fingerprint: string }>("SELECT fingerprint FROM app_schema WHERE singleton=true");
   if (saved.rows.length !== 1 || saved.rows[0].fingerprint !== schemaFingerprint) throw new DatabaseSchemaError();
-  return { state: "current" as const, currentFingerprint: schemaFingerprint, targetFingerprint: schemaFingerprint };
+  return { state: "current" as const,
+    currentFingerprint: saved.rows[0].fingerprint, targetFingerprint: schemaFingerprint };
 }
 
 export async function preflightSchema(database: pg.Pool) {
   return transaction(database, async client => {
     await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-    return inspectSchema(client);
+    const result = await inspectSchema(client);
+    if (result.currentFingerprint) {
+      await verifySchema(client);
+      const role = (await client.query<{ valid: boolean }>(`SELECT
+        NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
+        AND NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=pg_roles.oid)
+        AND NOT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace AND relowner=pg_roles.oid)
+        AND NOT has_table_privilege('agentcontrol_app','app_schema','INSERT,UPDATE,DELETE,TRUNCATE')
+        AND has_table_privilege('agentcontrol_app','data_principal_epochs','SELECT,INSERT,UPDATE')
+        AND NOT has_table_privilege('agentcontrol_app','data_principal_epochs','DELETE,TRUNCATE')
+        AND has_table_privilege('agentcontrol_app','audit_events','SELECT,INSERT')
+        AND NOT has_table_privilege('agentcontrol_app','audit_events','UPDATE,DELETE,TRUNCATE')
+        AND has_table_privilege('agentcontrol_app','copilot_quarantine_audit','SELECT,INSERT')
+        AND NOT has_table_privilege('agentcontrol_app','copilot_quarantine_audit','UPDATE,DELETE,TRUNCATE')
+        AND has_table_privilege('agentcontrol_app','official_usage_audit','SELECT,INSERT')
+        AND NOT has_table_privilege('agentcontrol_app','official_usage_audit','UPDATE,DELETE,TRUNCATE')
+        AS valid FROM pg_roles WHERE rolname='agentcontrol_app'`)).rows[0];
+      if (!role?.valid) throw new Error("Runtime role drift; operator recovery required.");
+      await client.query("SET LOCAL ROLE agentcontrol_app");
+      await verifySchema(client);
+      await client.query("RESET ROLE");
+    }
+    return result;
+  });
+}
+
+export async function setDeploymentAdmission(database: pg.Pool) {
+  return transaction(database, async client => {
+    await client.query("SELECT pg_advisory_xact_lock(3650101)");
+    if ((await client.query("SELECT current_user AS name")).rows[0]?.name !== "agentcontrol_admin") {
+      throw new Error("Deployment admission requires agentcontrol_admin.");
+    }
+    const result = await inspectSchema(client);
+    if (!result.currentFingerprint) throw new Error("Deployment admission requires the initialized current schema.");
+    await verifySchema(client);
+    const resumed = await client.query("UPDATE operational_state SET mode='normal',updated_at=clock_timestamp() WHERE singleton");
+    if (resumed.rowCount !== 1) throw new Error("Operational state is missing; normal operation was not resumed.");
   });
 }
 
@@ -103,6 +140,9 @@ export async function grantRuntime(database: pg.Pool) {
     GRANT SELECT, INSERT, UPDATE ON package_mutation_qualifications TO agentcontrol_app;
     GRANT SELECT, INSERT ON audit_events TO agentcontrol_app;
     GRANT SELECT ON audit_projection TO agentcontrol_app;
+    DO $$ BEGIN IF to_regprocedure('public.audit_origin_valid(jsonb)') IS NOT NULL THEN
+      GRANT EXECUTE ON FUNCTION audit_origin_valid(jsonb) TO agentcontrol_app;
+    END IF; END $$;
     GRANT SELECT,INSERT,UPDATE ON data_principal_epochs,data_scope_epochs TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON data_generations,data_generation_heads,
       data_read_selections,data_exports TO agentcontrol_app;
@@ -130,12 +170,10 @@ export async function grantRuntime(database: pg.Pool) {
     GRANT SELECT,INSERT ON data_sync_source_jobs TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE ON agent_people_cache TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON agent_identity_cache TO agentcontrol_app;
-    GRANT SELECT,INSERT,UPDATE ON purview_audit_qualifications TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON purview_audit_jobs TO agentcontrol_app;
     GRANT SELECT,INSERT ON purview_audit_records TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON defender_hunting_jobs TO agentcontrol_app;
-    GRANT SELECT,INSERT ON defender_hunting_snapshots,defender_hunting_rows,defender_hunting_qualification_evidence TO agentcontrol_app;
-    GRANT SELECT,INSERT,UPDATE ON defender_hunting_retained_scopes TO agentcontrol_app;
+    GRANT SELECT,INSERT ON defender_hunting_snapshots,defender_hunting_rows TO agentcontrol_app;
     GRANT SELECT,INSERT ON copilot_quarantine_status_observations,copilot_quarantine_audit,copilot_quarantine_qualifications TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE ON copilot_quarantine_jobs,copilot_quarantine_job_items,copilot_quarantine_attempts,copilot_quarantine_canary_approvals TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON official_usage_staging,official_usage_staged_rows,official_usage_confirmations TO agentcontrol_app;
@@ -146,6 +184,14 @@ export async function grantRuntime(database: pg.Pool) {
     GRANT EXECUTE ON FUNCTION inventory_maker_sharing_valid(jsonb) TO agentcontrol_app;
     GRANT SELECT,INSERT,DELETE ON agent_usage_associations TO agentcontrol_app;
     GRANT SELECT ON agent_usage_state TO agentcontrol_app;
+    DO $$ BEGIN
+      IF to_regprocedure('public.audit_origin_valid(jsonb)') IS NOT NULL THEN
+        GRANT EXECUTE ON FUNCTION audit_origin_valid(jsonb) TO agentcontrol_app;
+      END IF;
+      IF to_regclass('public.agent_control_receipts') IS NOT NULL THEN
+        GRANT SELECT,INSERT,UPDATE,DELETE ON agent_control_receipts TO agentcontrol_app;
+      END IF;
+    END $$;
   `);
 }
 
@@ -188,6 +234,7 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
     await slice.open();
     Object.assign(affected, await metrics.run(() => retainRecordData(client, Math.min(batchSize, 250), slice)));
     await remove("sessions", "sessions", "expire<clock_timestamp()");
+    await remove("agentControlReceipts", "agent_control_receipts", "retained_until<clock_timestamp()");
     const expiredJob = "EXISTS(SELECT 1 FROM jobs j WHERE j.id=target.job_id AND j.expires_at<clock_timestamp() AND (j.lease_until IS NULL OR j.lease_until<clock_timestamp()))";
     await remove("jobAttempts", "job_attempts", expiredJob);
     await remove("jobItems", "job_items", `${expiredJob} AND NOT EXISTS(SELECT 1 FROM job_attempts a WHERE a.item_id=target.id)`);
@@ -231,14 +278,8 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
       "status='inconclusive',error_code='audit_job_expired',message='The local Audit Search deadline expired; remote work may continue.',remote_work_may_continue=attempted_at IS NOT NULL,finished_at=clock_timestamp(),execution_owner=NULL,updated_at=clock_timestamp()");
     await remove("purviewRecords", "purview_audit_records", `EXISTS(SELECT 1 FROM purview_audit_jobs j
       WHERE j.id=target.job_id AND j.expires_at<clock_timestamp() AND j.status NOT IN ('running','reconciling_create'))`);
-    await update("purviewQualificationJobs", "purview_audit_qualifications", `EXISTS(SELECT 1 FROM purview_audit_jobs j
-      WHERE j.id=target.job_id AND j.expires_at<clock_timestamp() AND j.status NOT IN ('running','reconciling_create'))`, "job_id=NULL");
     await remove("purviewJobs", "purview_audit_jobs", `expires_at<clock_timestamp() AND status NOT IN ('running','reconciling_create')
-      AND NOT EXISTS(SELECT 1 FROM purview_audit_records r WHERE r.job_id=target.id)
-      AND NOT EXISTS(SELECT 1 FROM purview_audit_qualifications q WHERE q.job_id=target.id)`);
-    await update("purviewQualificationExpiry", "purview_audit_qualifications",
-      "expires_at<clock_timestamp() AND status IN ('approved','qualified')", "status='expired',updated_at=clock_timestamp()");
-    await remove("purviewQualifications", "purview_audit_qualifications", "expires_at<clock_timestamp()-interval '30 days' AND job_id IS NULL");
+      AND NOT EXISTS(SELECT 1 FROM purview_audit_records r WHERE r.job_id=target.id)`);
     await update("defenderExpiredWork", "defender_hunting_jobs",
       "status IN ('running','waiting_authorization') AND (deadline_at<=clock_timestamp() OR activation_count>=4 OR provider_request_count>=12)",
       "status='inconclusive',error_code=CASE WHEN deadline_at<=clock_timestamp() THEN 'hunting_job_expired' WHEN activation_count>=4 THEN 'hunting_activation_limit' ELSE 'hunting_provider_request_limit' END,message='The bounded hunting deadline expired before publication.',finished_at=clock_timestamp(),execution_owner=NULL,updated_at=clock_timestamp()");
@@ -249,9 +290,6 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
       AND NOT EXISTS(SELECT 1 FROM defender_hunting_rows r WHERE r.snapshot_id=target.id)`);
     await remove("defenderJobs", "defender_hunting_jobs", `expires_at<clock_timestamp() AND status<>'running'
       AND NOT EXISTS(SELECT 1 FROM defender_hunting_snapshots s WHERE s.job_id=target.id)`);
-    await remove("defenderQualifications", "defender_hunting_qualification_evidence", "expires_at<clock_timestamp()");
-    await remove("defenderRetainedScopes", "defender_hunting_retained_scopes",
-      "expires_at<clock_timestamp() AND NOT EXISTS (SELECT 1 FROM defender_hunting_jobs job WHERE job.retained_scope_id=defender_hunting_retained_scopes.id)");
     await update("quarantineExpiredWork", "copilot_quarantine_jobs",
       "status='running' AND (deadline_at<=clock_timestamp() OR attempts>=10)",
       "status='inconclusive',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()");
@@ -435,7 +473,7 @@ async function main() {
   const resetting = command === "preflight-reset" || command === "reset";
   const database = new pg.Pool(resetting ? { ...settings, database: "postgres" } : settings);
   try {
-    if (!["preflight", "preflight-reset", "reset", "initialize", "retain"].includes(command)) throw new Error("Unsupported database operator command.");
+    if (!["preflight", "preflight-reset", "reset", "initialize", "retain", "maintenance", "resume"].includes(command)) throw new Error("Unsupported database operator command.");
     if (resetting) {
       const operation = command === "reset" ? resetDatabase : preflightDatabaseReset;
       const result = await operation(database, settings.database ?? "", process.argv[3] ?? "");
@@ -443,6 +481,19 @@ async function main() {
     } else if (command === "preflight") {
       const schema = await preflightSchema(database);
       console.log(JSON.stringify({ event: "database_operator_command", command, outcome: "succeeded", ...schema }));
+    } else if (command === "maintenance") {
+      if (process.argv[3] !== "confirmed") throw new Error("Maintenance requires explicit operator confirmation.");
+      await transaction(database, async client => {
+        await client.query("SELECT pg_advisory_xact_lock(3650101)");
+        if ((await client.query("SELECT current_user AS name")).rows[0]?.name !== "agentcontrol_admin") throw new Error("Maintenance requires agentcontrol_admin.");
+        const schema = await inspectSchema(client);
+        if (!schema.currentFingerprint) throw new Error("Maintenance requires an initialized schema.");
+        await verifySchema(client);
+        await client.query("UPDATE operational_state SET mode='maintenance',updated_at=clock_timestamp() WHERE singleton");
+      });
+    } else if (command === "resume") {
+      if (process.argv[3] !== "confirmed") throw new Error("Admission requires explicit operator confirmation.");
+      await setDeploymentAdmission(database);
     } else if (command === "retain") {
       if (process.argv[3] !== "confirmed") throw new Error("Retention requires an explicit confirmed target.");
       const batchSize = Number(process.argv[4] ?? 1_000);
@@ -450,6 +501,7 @@ async function main() {
       console.log(JSON.stringify({ event: "retention_cleanup", outcome: "succeeded", ...result }));
     }
     else {
+      if (process.argv[3]) throw new Error("Initialization does not accept admission options.");
       await bootstrap(database, secretValue("APP_PGPASSWORD") ?? "");
       await initializeSchema(database);
       await grantRuntime(database);

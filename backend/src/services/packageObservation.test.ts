@@ -320,14 +320,19 @@ describe("persistable package text", () => {
 
   it.each([
     { field: "displayName", limit: 256 },
-    { field: "shortDescription", limit: 4096 },
-    { field: "longDescription", limit: 32768 },
   ] as const)("bounds $field without splitting Unicode characters", ({ field, limit }) => {
     const prefix = "x".repeat(limit - 1);
     expect(allowlistedPackage({ ...base, [field]: prefix + "😀tail" })[field]).toBe(prefix);
     const complete = "x".repeat(limit - 2) + "😀";
     expect(allowlistedPackage({ ...base, [field]: complete + "tail" })[field]).toBe(complete);
     expect(allowlistedPackage({ ...base, [field]: "x".repeat(limit + 1) })[field]).toBe("x".repeat(limit));
+  });
+
+  it.each(["shortDescription", "longDescription"] as const)("retains complete saved %s instead of silently truncating at the old inline limit", field => {
+    const text = "Unicode 🧭\n".repeat(4000);
+    expect(allowlistedPackage({ ...base, [field]: text })[field]).toBe(text);
+    expect(() => allowlistedPackage({ ...base, [field]: "x".repeat(dataLimits.agentDefinitionBytes + 1) }))
+      .toThrow(expect.objectContaining({ code: "inventory_about_bytes" }));
   });
 
   it.each([

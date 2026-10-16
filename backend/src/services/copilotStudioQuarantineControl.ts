@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { NativeInventory } from "../db/nativeInventory.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
@@ -11,10 +11,11 @@ import { capabilities } from "./capabilities.js";
 import { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 import { copilotStudioQuarantineJobs, launchCopilotStudioQuarantineJob } from "./copilotStudioQuarantineJobs.js";
 import { requireProviderAdmissions } from "./operationalState.js";
+import { initiatingActor } from "./actionOrigin.js";
 
 type ControlDependencies = {
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  delegatedToken: typeof acquireDelegatedToken;
+  revalidateUser: typeof revalidateAuthorizedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
   requireAvailable: typeof capabilities.requireAvailable;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
@@ -23,8 +24,8 @@ type ControlDependencies = {
 };
 
 const defaultDependencies: ControlDependencies = {
-  revalidateUser: revalidateAuthenticatedUser,
-  delegatedToken: acquireDelegatedToken,
+  revalidateUser: revalidateAuthorizedUser,
+  delegatedToken: acquireAuthorizedToken,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
@@ -94,7 +95,7 @@ export class CopilotStudioQuarantineControlService {
       return this.repository.submit(scope, {
         action: input.action,
         targets: frozen,
-        actor: userActor(current),
+        actor: initiatingActor(userActor(current)),
         authority,
         requestPath: "/api/quarantine/jobs",
         idempotencyKey: input.idempotencyKey,

@@ -251,7 +251,7 @@ test("workbench first-sync recovery remains reachable when the header fills a sh
         <progress value="1" max="3" aria-label="First sync sources saved"></progress></div>
       <p>Resolve the waiting step, or cancel the run in Sync before trying again.</p>
       <div class="first-sync-actions"><button class="secondary" disabled>Checking status...</button>
-        <button class="secondary">View sync details</button><button class="secondary">Review permissions</button></div>
+        <button class="secondary">Review permissions</button></div>
     </div></div></dialog>`);
   const dialog = page.getByRole("dialog", { includeHidden: true });
   await expect(dialog).toBeHidden();
@@ -265,7 +265,7 @@ test("workbench first-sync recovery remains reachable when the header fills a sh
     for (const [width, height] of [[320, 200], [600, 200], [760, 240], [320, 640], [1440, 900]]) {
       await page.setViewportSize({ width, height });
       expect(await body.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-      for (const name of ["View sync details", "Review permissions"]) {
+      for (const name of ["Review permissions"]) {
         const button = dialog.getByRole("button", { name });
         await button.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
         await expect(button, `Recovery must be reachable at ${width}x${height} with ${fontSize}px text`).toBeInViewport({ ratio: 1 });
@@ -915,7 +915,7 @@ test("data sync first-sync and exact-run dialogs retain recovery controls withou
         <li><div><strong>Users</strong><span>Complete</span></div><p>100 users saved</p></li>
         <li><div><strong>Graph packages</strong><span>Sign-in required</span></div><a href="/api/auth/login">Sign in again</a></li></ul>
       <div class="first-sync-actions"><button disabled>Retry incomplete sources</button>
-        <button class="secondary">Retry status check</button><button class="secondary">View sync details</button></div>
+        <button class="secondary">Retry status check</button></div>
     </div>` : `<div class="error-banner" role="alert">${reference} Showing the last reported run status.</div>
       <button class="secondary">Retry status check</button>
       <dl class="data-sync-run-facts"><div><dt>Run</dt><dd><code>${reference}</code></dd></div>
@@ -942,7 +942,7 @@ test("data sync first-sync and exact-run dialogs retain recovery controls withou
         const body = page.locator(".workbench-dialog-body");
         expect(await body.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
           `Recovery dialog must not scroll horizontally at ${width}px with ${fontSize}px text`).toBe(true);
-        for (const name of ["Review permissions", "Retry status check", firstSync ? "View sync details" : "Back to workspace"]) {
+        for (const name of ["Review permissions", "Retry status check", ...(firstSync ? [] : ["Back to workspace"])]) {
           const button = page.getByRole("button", { name, exact: true });
           await button.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
           await expect(button).toBeInViewport({ ratio: 1 });
@@ -1043,7 +1043,7 @@ test("inventory controls and recovery messages fit with bulk selection on narrow
     <div class="agent-table-stack" aria-busy="true"><div class="agent-grid">
       <div class="agent-grid-toolbar"><div class="agent-grid-tools">
         <section class="catalog-controls" aria-label="Filters"><div class="agent-query-bar">
-          <label class="agent-search-field"><span class="sr-only">Search</span>
+          <label class="agent-search-field agent-search-field-clearable"><span class="sr-only">Search</span>
             <input type="search" placeholder="Search agents by name, publisher or ID"></label>
           <div class="inventory-facet inventory-facet-compact agent-view-control">
             <select aria-label="Show agents" aria-busy="true"><option>All agents</option></select>

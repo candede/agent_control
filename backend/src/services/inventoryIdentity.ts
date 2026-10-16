@@ -9,7 +9,7 @@ export type InventoryIdentityRecord = {
   identifiers: InventoryIdentifier[];
 };
 
-export type InventoryIdentityScope = Pick<InventoryIdentityRecord, "nativeId" | "tenantId" | "environmentId" | "sourceSystem" | "resourceType">;
+type InventoryIdentityScope = Pick<InventoryIdentityRecord, "nativeId" | "tenantId" | "environmentId" | "sourceSystem" | "resourceType">;
 
 export type IdentityResolution =
   | { status: "resolved"; candidate: InventoryIdentityScope; matchedKind: InventoryIdentifierKind }

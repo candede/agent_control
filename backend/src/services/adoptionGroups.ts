@@ -5,6 +5,13 @@ import { reportRelationsSql } from "../db/officialReportQueries.js";
 import type { AdoptionAgent, AdoptionGroup, AdoptionPage, AdoptionPerson } from "../types/adoption.js";
 import type { LargeTenantUsersReports, ReportReadContext } from "./largeTenantUsersReports.js";
 import { SelectionError } from "./dataSelections.js";
+import { selectedInventorySourcesSql } from "../db/inventoryAuthority.js";
+
+const maxGroupItems = 16_384;
+function assertGroupItems(rows: unknown[]) {
+  if (rows.length > maxGroupItems) throw new AppError(413, "adoption_page_too_large",
+    "These groups exceed the page size limit. Search for a specific company and department to narrow the page.");
+}
 
 const groupRelations = `${reportRelationsSql}, adoption_users AS MATERIALIZED (
   SELECT c.*,nullif(btrim(company),'') AS company_label,
@@ -60,11 +67,17 @@ const agentRelations = `, current_sources AS MATERIALIZED (
   SELECT * FROM creators UNION SELECT * FROM used
 )`;
 
-export function adoptionDataset(reports: LargeTenantUsersReports, context: ReportReadContext) {
+export function adoptionDataset(reports: LargeTenantUsersReports, context: ReportReadContext, inventorySelectionId?: string) {
   const { company, department, adoptionChamps, adoptionAgents } = context.query;
   const values: unknown[] = [...reports.parameters(context), context.query.search ?? "", context.identity.principalId,
     JSON.stringify({ company, department, adoptionChamps, adoptionAgents })];
-  const relations = `${groupRelations}${agentRelations}, group_evidence AS (
+  let agents = agentRelations;
+  if (inventorySelectionId) {
+    values.push(inventorySelectionId);
+    agents = agents.replace(`SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND principal_id=$8
+    AND authority_expires_at>transaction_timestamp()`, () => selectedInventorySourcesSql("$4", "$8", "NULL", "$10"));
+  }
+  const relations = `${groupRelations}${agents}, group_evidence AS (
     SELECT g.*,
       EXISTS(SELECT 1 FROM adoption_users u WHERE u.group_id=g.identity
         AND (coalesce(u.responses,u.bridge_responses,0)>0
@@ -145,7 +158,8 @@ export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTe
       ORDER BY created DESC,responses DESC NULLS LAST,agents::bigint DESC,lower(name) COLLATE "C",identity) AS rank
     FROM person_metrics
   ) SELECT *,rank<=3 AND (created>0 OR coalesce(responses,0)>0) AS champion FROM ranked
-    ORDER BY group_id,rank`, detailValues)).rows : [];
+    ORDER BY group_id,rank LIMIT ${maxGroupItems + 1}`, detailValues)).rows : [];
+  assertGroupItems(peopleRows);
   const agentsRows = groupIds.length ? (await client.query(`${sql}, group_agents AS (
     SELECT DISTINCT u.group_id,a.agent_id FROM user_agents a JOIN adoption_users u ON u.identity=a.user_id
     WHERE u.group_id=ANY($10::text[])
@@ -153,18 +167,27 @@ export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTe
     (SELECT string_agg(DISTINCT f.text_value,' / ' ORDER BY f.text_value) FROM inventory_facts f
       WHERE f.generation_id=a.generation_id AND f.identity=a.identity AND f.kind='platform'
         AND f.value IN ('copilotstudio','microsoft365copilotagentbuilder')) AS type,
-    (SELECT coalesce(nullif(btrim(p.residual->>'longDescription'),''),nullif(btrim(p.residual->'details'->>'description'),''),
-      nullif(btrim(p.residual->>'shortDescription'),''))
+    (SELECT left(coalesce(description.long_about,description.native_about,description.short_about),2048)
       FROM current_sources s JOIN inventory_records p
         ON p.generation_id=s.source_generation_id AND p.identity=s.source_identity
+      CROSS JOIN LATERAL (
+        SELECT coalesce(nullif(btrim(p.residual->>'longDescription'),''),chunk.long_about) AS long_about,
+          coalesce(nullif(btrim(p.residual->'details'->>'description'),''),chunk.native_about) AS native_about,
+          coalesce(nullif(btrim(p.residual->>'shortDescription'),''),chunk.short_about) AS short_about
+        FROM (SELECT max(payload->>'text') FILTER(WHERE kind='about:long') AS long_about,
+          max(payload->>'text') FILTER(WHERE kind='about:native') AS native_about,
+          max(payload->>'text') FILTER(WHERE kind='about:short') AS short_about
+          FROM inventory_facts WHERE generation_id=p.generation_id AND identity=p.identity AND value='0'
+            AND kind IN ('about:long','about:native','about:short')) chunk
+      ) description
       WHERE s.agent_id=a.identity
-        AND coalesce(nullif(btrim(p.residual->>'longDescription'),''),nullif(btrim(p.residual->'details'->>'description'),''),
-          nullif(btrim(p.residual->>'shortDescription'),'')) IS NOT NULL
-      ORDER BY CASE WHEN nullif(btrim(p.residual->>'longDescription'),'') IS NOT NULL THEN 0
-        WHEN nullif(btrim(p.residual->'details'->>'description'),'') IS NOT NULL THEN 1 ELSE 2 END,
+        AND coalesce(description.long_about,description.native_about,description.short_about) IS NOT NULL
+      ORDER BY CASE WHEN description.long_about IS NOT NULL THEN 0
+        WHEN description.native_about IS NOT NULL THEN 1 ELSE 2 END,
         s.source,s.native_id LIMIT 1) AS description
     FROM group_agents g JOIN current_agents a ON a.identity=g.agent_id
-    ORDER BY g.group_id,lower(a.display_name) COLLATE "C",a.identity`, detailValues)).rows : [];
+    ORDER BY g.group_id,lower(a.display_name) COLLATE "C",a.identity LIMIT ${maxGroupItems + 1}`, detailValues)).rows : [];
+  assertGroupItems(agentsRows);
   const people = new Map<string, AdoptionPerson[]>(), agents = new Map<string, AdoptionAgent[]>();
   for (const row of peopleRows) {
     const list = people.get(row.group_id) ?? [];

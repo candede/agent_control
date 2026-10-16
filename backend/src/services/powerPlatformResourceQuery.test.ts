@@ -54,6 +54,19 @@ describe("PowerPlatformResourceQueryClient", () => {
   });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
+  it("saves complete observed native About without retaining unrelated authoring/provider fields", async () => {
+    const description = "Observed native description 🧭\n".repeat(1500);
+    const client = new PowerPlatformResourceQueryClient(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false,
+      data: [{ ...resource, properties: { description, instructions: "not-authorized-raw-authoring-text" } }],
+    }));
+    const [value] = (await tinyNativePages(client, "token")).resources;
+    expect(value.details.description).toBe(description);
+    expect(value.details).not.toHaveProperty("instructions");
+    expect(value.provenance.description).toEqual({ sourceSystem: "power_platform", path: "properties.description", maturity: "observed" });
+    const saved = powerPlatformInventoryRecord(value);
+    expect(restoreInventoryRecord(saved.residual, saved.facts, "power_platform")).toMatchObject({ details: { description } });
+  });
   it("retains opposite maker-sharing observations and captured configuration independently of Graph availability", async () => {
     const data = [true, false].map((entireTenant, index) => ({ ...resource, id: `/resources/agent-${index}`,
       name: `agent-${index}`, properties: {

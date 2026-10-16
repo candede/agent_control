@@ -62,7 +62,7 @@ test("recent Users and Agents revisits render within two frames without data req
   try {
     for (let index = 0; index < 3; index++) {
       await cachedClick(primary(page, "Agents"), "Service desk assistant",
-        'button[aria-label="Show available to end users"] strong', "2");
+        'button[aria-label="Show admin-permitted agents"] strong', "2");
       await expect(page.getByRole("combobox", { name: "Report set" })).toBeEnabled();
       await expect(page.getByRole("button", { name: "Show reported used agents" }).locator("strong")).toHaveText("2");
       await cachedClick(primary(page, "Users"), "Ada",
@@ -118,16 +118,16 @@ test("catalog and additional Power Platform reuse independent pages without unkn
   const additional = page.getByRole("button", { name: "Additional Power Platform agents", exact: true });
   try {
     await additional.click();
-    await expect(additional.locator("strong").getByLabel("Loading count")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Show available to end users" }).locator("strong").getByLabel("Loading count")).toBeVisible();
+    await expect(additional.locator("strong .skeleton-count")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Show admin-permitted agents" }).locator("strong .skeleton-count")).toBeVisible();
   } finally { releaseNative(); }
   await expect(page.getByText(native.displayName, { exact: true })).toBeVisible();
   const held = await holdRepeatedReads(page);
   try {
     for (let index = 0; index < 3; index++) {
-      await cachedClick(catalog, "Service desk assistant", 'button[aria-label="Show available to end users"] strong', "2");
+      await cachedClick(catalog, "Service desk assistant", 'button[aria-label="Show admin-permitted agents"] strong', "2");
       await expect(page.getByText(native.displayName, { exact: true })).toHaveCount(0);
-      await cachedClick(additional, native.displayName, 'button[aria-label="Show available to end users"] strong', "1");
+      await cachedClick(additional, native.displayName, 'button[aria-label="Show admin-permitted agents"] strong', "1");
       await expect(page.getByText("Service desk assistant", { exact: true })).toHaveCount(0);
       await expect(catalog.locator("strong")).toHaveText("3");
       await expect(additional.locator("strong")).toHaveText("1");

@@ -76,8 +76,8 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
     const runtime = new pg.Pool({ ...databaseSettings(), database: target, user: "agentcontrol_app", password: fixturePassword });
     try {
       await verifySchema(runtime);
-      expect((await runtime.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0])
-        .toEqual({ mode: "maintenance", provider_work_enabled: false });
+      expect((await runtime.query("SELECT mode FROM operational_state")).rows[0])
+        .toEqual({ mode: "maintenance" });
       expect((await runtime.query("SELECT count(*)::int AS n FROM data_principal_epochs WHERE tenant_id='after-backup-snapshot'")).rows[0].n).toBe(0);
       expect((await runtime.query("SELECT count(*)::int AS n FROM package_record_rows WHERE scope_id=$1", [root.scopeId])).rows[0].n).toBe(3);
       await expect(runtime.query("TRUNCATE package_record_rows")).rejects.toThrow("permission denied");
@@ -87,9 +87,9 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
       try {
         const address = server.address() as { port: number }, ready = `http://127.0.0.1:${address.port}/api/ready`;
         expect((await fetch(ready)).status).toBe(503);
-        expect(await reopenRestoredDatabase(fixture.operator, target)).toEqual({ mode: "normal", providerWorkEnabled: false });
+        expect(await reopenRestoredDatabase(fixture.operator, target)).toEqual({ mode: "normal", providerWorkEnabled: true });
         expect((await fetch(ready)).status).toBe(200);
-        expect((await runtime.query("SELECT provider_work_enabled FROM operational_state")).rows[0].provider_work_enabled).toBe(false);
+        expect((await runtime.query("SELECT mode FROM operational_state")).rows[0].mode).toBe("normal");
       } finally {
         application.store.close();
         server.closeAllConnections();

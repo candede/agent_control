@@ -9,16 +9,16 @@ export type DefenderHuntingTokenMode = "delegated" | "application";
 export type DefenderHuntingResultScope =
   | { kind: "principal"; scopeId: string; configurationRevision: null }
   | { kind: "application"; scopeId: string; configurationRevision: number };
-export type DefenderHuntingJobStatus = "waiting_authorization" | "running" | "succeeded" | "partial" | "failed" | "cancelled" | "inconclusive";
-export type DefenderHuntingPartialReason = "hunting_row_limit";
-export type DefenderHuntingFieldState = "value" | "null" | "empty" | "unavailable";
+type DefenderHuntingJobStatus = "waiting_authorization" | "running" | "succeeded" | "partial" | "failed" | "cancelled" | "inconclusive";
+type DefenderHuntingPartialReason = "hunting_row_limit";
+type DefenderHuntingFieldState = "value" | "null" | "empty" | "unavailable";
 export type DefenderInventoryDetailState = "not_supplied" | "empty" | "present_unqualified_shape" | "not_exposed";
 
 export function isDefenderHuntingRequestId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
 }
 
-export type DefenderHuntingAssociation =
+type DefenderHuntingAssociation =
   | { status: "resolved"; sourceSystem: "power_platform" | "graph_packages"; nativeId: string; resourceType: string; environmentId: string | null; matchedKind: "entra_agent_id" }
   | { status: "unresolved"; reason: "no_documented_exact_identifier" | "no_documented_cross_source_relation" | "blueprint_is_parent_not_equivalence" }
   | { status: "ambiguous"; reason: "multiple_exact_candidates"; candidateCount: number };
@@ -169,48 +169,9 @@ export type DefenderHuntingQueryResult = {
   partialReason: DefenderHuntingPartialReason | null;
 };
 
-export type DefenderHuntingQualificationBinding = {
-  capabilityId: "defender.hunting.delegated" | "defender.hunting.application";
-  contractRevision: string;
-  permissionRevision: string;
-  configurationRevision: number;
-  approvedBy: string;
-};
-
-export type DefenderHuntingAuthorityBinding = Omit<DefenderHuntingQualificationBinding, "approvedBy">;
-
-export type DefenderHuntingQualificationEvidence = DefenderHuntingAuthorityBinding & {
-  templateId: DefenderHuntingTemplateId;
-  targetScopeHash: string;
-  approvedScope: Omit<DefenderHuntingFilters, "startDateTime" | "endDateTime">;
-  queryVersion: 3;
-  approvedBy: string;
-  qualifiedAt: string;
-  expiresAt: string;
-};
-
-export type DefenderHuntingRetainedScope = DefenderHuntingAuthorityBinding & {
-  id: string;
-  resultScope: DefenderHuntingResultScope;
-  tokenMode: DefenderHuntingTokenMode;
-  templateId: DefenderHuntingTemplateId;
-  targetScopeHash: string;
-  approvedScope: Omit<DefenderHuntingFilters, "startDateTime" | "endDateTime">;
-  queryVersion: 3;
-  approvedBy: string;
-  sourceQualificationJobId: string;
-  approvedAt: string;
-  qualifiedAt: string;
-  expiresAt: string;
-  revokedAt: string | null;
-};
-
-export type DefenderHuntingRetainedScopeBinding = {
-  id: string;
-  authority: DefenderHuntingAuthorityBinding;
-};
-
 export type DefenderHuntingJob = {
+  origin?: import("./actionOrigin.js").AuditOriginV1;
+  initiatingActor?: import("./audit.js").AuditActor | null;
   id: string;
   authorizationPrincipalId: string;
   resultScope: DefenderHuntingResultScope;
@@ -218,7 +179,6 @@ export type DefenderHuntingJob = {
   status: DefenderHuntingJobStatus;
   filters: DefenderHuntingFilters;
   queryVersion: 3;
-  retainedScopeId: string | null;
   localRequestId: string;
   providerRequestId: string | null;
   providerRequestCount: number;
@@ -233,7 +193,6 @@ export type DefenderHuntingJob = {
   unobservedRange: { startDateTime: string; endDateTime: string } | null;
   snapshotId: string | null;
   priorSuccessfulJobId: string | null;
-  qualification: DefenderHuntingQualificationBinding | null;
   errorCode?: string;
   message?: string;
   cancelRequested: boolean;

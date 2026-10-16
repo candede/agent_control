@@ -6,7 +6,7 @@ import type { UserSourcePlan } from "../../../backend/src/types/userSources";
 import { normalizeReportSearch as normalized } from "../api/reportData";
 import { combinedUser, historySet, overviewAgent, reportAgent, reportPage, reports, reportSetId, reportUser } from "./reportDataFixture";
 
-export const selectedFixtureNow = new Date("2026-09-18T10:00:00.000Z");
+const selectedFixtureNow = new Date("2026-09-18T10:00:00.000Z");
 export const selectedFixtureReports: ReportMetadata = {
   ...reports, reportingPeriod: { startDate: "2026-08-14", endDate: "2026-09-12", days: 30, provenance: "operator_asserted" },
   acceptedAt: "2026-09-12T10:00:00.000Z", periodAgeDays: 6, acceptedAgeDays: 6, staleAfterDays: 35,
@@ -177,7 +177,7 @@ export function selectedRelationshipsPage(query: ReportQuery = {}, owner: Pick<R
   return { ...result, counts: { total: scoped.length, filtered: rows.length },
     analytics: { ...result.analytics, ...responseAnalytics(rows.map(row => row.responses)) } };
 }
-export function selectedAgentDetail(agentId = agents[0].agentId): OfficialReportDetail<ReportAgent> {
+function selectedAgentDetail(agentId = agents[0].agentId): OfficialReportDetail<ReportAgent> {
   const value = agents.find(row => row.agentId === agentId);
   if (!value) throw new Error(`Unknown selected fixture agent: ${agentId}`);
   const page = fixturePage([]);

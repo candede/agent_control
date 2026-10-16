@@ -28,7 +28,6 @@ const job = {
   scope_kind: "broad",
   target_count: 0,
   result_revision: "2026-09-22 00:00:00+00",
-  catalog_only: false,
   auto_details: false,
   status: "waiting_authorization",
   page_count: 0,
@@ -56,6 +55,23 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("package refresh admission", () => {
+  it("materializes scoped recent detail targets once instead of rescanning job history per catalog row", async () => {
+    query.mockResolvedValue(emptyResult);
+    await expect(new PackageRefreshJobs().claimDueDetails(scope, scope.principalId)).resolves.toBeNull();
+    const candidate = query.mock.calls.find(([sql]) => String(sql).includes("AS catalog_revision_hash"));
+    expect(candidate).toBeDefined();
+    const statement = String(candidate![0]);
+    expect(statement).toContain("WITH recent_detail_attempts AS MATERIALIZED");
+    expect(statement).toContain("SELECT DISTINCT t.target_id,t.catalog_revision_hash");
+    expect(statement).toContain("attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details");
+    expect(statement).toContain("LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id");
+    expect(statement).toContain("attempted.catalog_revision_hash=");
+    expect(statement).toContain("r.native_id=ANY($3::text[]) OR attempted.target_id IS NULL");
+    expect(statement).not.toContain("OR NOT EXISTS");
+    expect(statement).toContain('THEN 0 ELSE 1 END,r.native_id COLLATE "C" LIMIT 20');
+    expect(candidate![1]).toEqual([scope.tenantId, scope.principalId, []]);
+  });
+
   it("rejects an expired idempotent replay instead of returning an undefined job", async () => {
     query.mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce(emptyResult)

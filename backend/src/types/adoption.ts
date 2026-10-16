@@ -12,6 +12,7 @@ export type AdoptionPerson = {
 export type AdoptionAgent = {
   id: string;
   name: string;
+  /** Bounded preview. Full saved text is provided by the selected inventory About contract. */
   description: string | null;
   type: string | null;
 };

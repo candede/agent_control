@@ -64,7 +64,7 @@ describe("data sync durable admission", () => {
     const f = admissionFixture();
     const validation = beginAccountSessionValidation(f.scope.tenantId, f.scope.principalId);
     const controller = new AbortController();
-    const reason = new AppError(503, "provider_requalification_required", "Provider admissions closed.");
+    const reason = new AppError(503, "maintenance", "Provider admissions closed.");
     let closed = false;
     f.onWrite = async () => {
       if (boundary === "session") await activateAccountSession(f.scope.tenantId, f.scope.principalId, async () => undefined);
@@ -136,7 +136,6 @@ function admissionFixture() {
     if (statement.startsWith("INSERT INTO data_sync_runs") || statement.startsWith("UPDATE data_sync_run_sources")) await f.onWrite();
     if (statement.startsWith("SELECT requested.source_id")) return result([{ source_id: "users" }]);
     if (statement.startsWith("SELECT 1 FROM official_usage_state report")) return result();
-    if (statement.startsWith("SELECT count(*)")) return result([{ count: 0 }]);
     if (statement.startsWith("SELECT id,mode,status,started_at,updated_at,completed_at")) {
       if (statement.includes(",automatic") && f.readFailure) throw f.readFailure;
       return statement.includes("AND status IN") ? result() : result([{

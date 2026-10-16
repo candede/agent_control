@@ -199,7 +199,7 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
     const old = graph;
     await assert.rejects(() => source("packages", 100_001), (error: unknown) => {
       telemetry.write({ event: "source-boundary-error", limit: 100_000, observed: 100_001, error: String(error) });
-      return error instanceof Error && /limit|rows|count|quota/i.test(error.message);
+      return error instanceof Error && "code" in error && error.code === "provider_result_limit";
     });
     const head = (await database.query("SELECT baseline_id,revision FROM inventory_roots WHERE scope_id=$1 AND current", [old.scopeId])).rows[0];
     assert.equal(head.baseline_id, old.baselineId); assert.equal(String(head.revision), old.revision);
@@ -893,8 +893,8 @@ async function capacityBackup(database: pg.Pool, telemetry: CapacityTelemetry) {
     restored = await restore(operator, "/evidence/capacity.dump", target);
     const checked = new pg.Pool({ ...databaseSettings(), database: target, max: 1,application_name: "agent-control-capacity-operator" });
     try {
-      const state = (await checked.query("SELECT mode,provider_work_enabled FROM operational_state WHERE singleton")).rows[0];
-      assert.equal(state.mode, "maintenance"); assert.equal(state.provider_work_enabled, false);
+      const state = (await checked.query("SELECT mode FROM operational_state WHERE singleton")).rows[0];
+      assert.equal(state.mode, "maintenance");
       const schema = (await checked.query("SELECT fingerprint FROM app_schema WHERE singleton=true")).rows[0];
       telemetry.write({ event: "large-restore", target, bytes, writes, state, schema, tables: Object.keys(restored).length,
         churnFailure: writerFailure ? failure(writerFailure) : null });

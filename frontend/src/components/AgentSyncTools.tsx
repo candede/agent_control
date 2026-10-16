@@ -105,7 +105,7 @@ export function AgentSyncTools({
               {currentInventory.identityCollection.pendingDetails ? <dl className="sync-inventory-counts" aria-label="Package detail freshness">
                 <div><dt>Not yet collected</dt><dd>{currentInventory.identityCollection.pendingDetails.missing.toLocaleString()}</dd></div>
                 <div><dt>Previously collected, expired</dt><dd>{currentInventory.identityCollection.pendingDetails.stale.toLocaleString()}</dd></div>
-                <div><dt>Compatibility recheck needed</dt><dd>{currentInventory.identityCollection.pendingDetails.invalidated.toLocaleString()}</dd></div>
+                <div><dt>Invalidated, refresh needed</dt><dd>{currentInventory.identityCollection.pendingDetails.invalidated.toLocaleString()}</dd></div>
               </dl> : null}
             </> : null}
             <p>These are detail-freshness counts, not a count of valid metadata or matched agents. Expired details were already collected; they are not missing agents. Scheduled detail refreshes require no administrator action.</p>

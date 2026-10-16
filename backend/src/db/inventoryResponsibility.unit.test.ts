@@ -95,5 +95,5 @@ it("captures inventory exact-person requests before selected acquisition yields"
   });
   expect((await inventory.people("selection", identity, ids))[0].objectId).toBe(objectId);
   expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-    [identity.tenantId, identity.principalId, "directory", [objectId], at, "delegated", true]);
+    [identity.tenantId, identity.principalId, "directory", [objectId], at, "delegated", false]);
 });

@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
+import session from "express-session";
+import { config } from "../config.js";
+import { withAuthority } from "../auth/authorityContext.js";
+import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
+import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { InventoryGenerations } from "../db/inventoryGenerations.js";
@@ -7,8 +12,10 @@ import * as maintenance from "./maintenance.js";
 import * as operationalState from "./operationalState.js";
 import { InventoryRuntime } from "./inventoryRuntime.js";
 import { StreamedInventory } from "./streamedInventory.js";
+import { AppError } from "../errors.js";
 
-afterEach(() => vi.restoreAllMocks());
+const tenants = config.tenants;
+afterEach(() => { config.tenants = tenants; vi.restoreAllMocks(); });
 
 describe("inventory publication wakeups", () => {
   it("coalesces arrivals during an active sweep without losing the next sweep", async () => {
@@ -71,6 +78,61 @@ describe("inventory sweep cancellation and retention", () => {
     const metadata = vi.spyOn(runtime.stages, "gcMetadataSlice").mockResolvedValue({ removed: {}, rows: 0, bytes: 0 });
     return { database, runtime, query, scopeId, root, progress, roots, content, metadata };
   }
+
+  async function credential(f: ReturnType<typeof fixture>, principalId: string) {
+    const tenant = { tenantId: f.root.tenantId, clientId: "synthetic-api", clientSecret: "synthetic", domains: ["example.invalid"] };
+    config.tenants = [tenant];
+    const epochs = { sessionEpoch: async () => "0" };
+    const principal = await browserRequestPrincipal({ tenantId: tenant.tenantId, clientId: tenant.clientId, accountId: principalId,
+      user: { tenantId: tenant.tenantId, homeAccountId: principalId, username: "operator@example.invalid",
+        displayName: "Synthetic operator", roles: ["AgentControl.Viewer"] },
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), cookie: new session.Cookie({ expires: new Date(Date.now() + 60_000) }) }, null, epochs);
+    return createBrowserCredentials(principal, epochs);
+  }
+  async function retain(f: ReturnType<typeof fixture>, principalId: string, credentials?: ReturnType<typeof createBrowserCredentials>) {
+    const source = credentials ?? await credential(f,principalId);
+    vi.mocked(f.database.query).mockResolvedValueOnce({ command: "SELECT", rows: [], rowCount: 0, fields: [], oid: 0 })
+      .mockResolvedValueOnce({ command: "SELECT", rows: [], rowCount: 0, fields: [], oid: 0 });
+    await withAuthority(source, () => f.runtime.enqueue({ tenantId: f.root.tenantId, principalId }, false));
+    return source;
+  }
+
+  it.each(["inventory_input_fenced","inventory_control_changed"] as const)("re-reads bounded publication after a concurrent %s fence",async code=>{
+    const f=fixture();
+    vi.spyOn(f.runtime,"publishControls").mockResolvedValue(0);
+    vi.spyOn(f.runtime,"publishNativeControls").mockResolvedValue(0);
+    vi.mocked(f.database.query).mockResolvedValue({command:"SELECT",rows:[],rowCount:0,fields:[],oid:0});
+    const enqueue=vi.spyOn(f.runtime,"enqueue").mockResolvedValue(false)
+      .mockRejectedValueOnce(code==="inventory_input_fenced"?new Error(code):new AppError(409,code,"Concurrent verified publication."));
+    await f.runtime.settleControls({tenantId:f.root.tenantId,principalId:"synthetic-principal"},AbortSignal.timeout(1_000));
+    expect(enqueue).toHaveBeenCalledTimes(2);
+  });
+  it("surfaces unexpected publication errors instead of retrying or clearing pending state",async()=>{
+    const f=fixture(),failure=new Error("unexpected publication failure");
+    const publish=vi.spyOn(f.runtime,"publishControls").mockRejectedValue(failure);
+    await expect(f.runtime.settleControls({tenantId:f.root.tenantId,principalId:"synthetic-principal"},AbortSignal.timeout(1_000)))
+      .rejects.toBe(failure);
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("does not erase a renewed pending source when an older publication loses authority", async () => {
+    const f = fixture(), original = await retain(f, "synthetic-principal");
+    const replacement = await credential(f,"synthetic-principal");
+    vi.mocked(f.database.query).mockResolvedValue({ command: "SELECT", rows: [
+      { tenant_id: f.root.tenantId, principal_id: "synthetic-principal", id: "1" },
+    ], rowCount: 1, fields: [], oid: 0 });
+    const publish = vi.spyOn(f.runtime, "publishControls").mockResolvedValue(0);
+    publish.mockImplementationOnce(async () => { await retain(f, "synthetic-principal",replacement); original.revoke(); return 0; });
+    const native = vi.spyOn(f.runtime, "publishNativeControls").mockResolvedValue(0);
+    vi.spyOn(f.runtime, "collect").mockResolvedValue(false);
+    await f.runtime.pass();
+    replacement.assertCurrent();
+    expect(native).not.toHaveBeenCalled();
+    vi.spyOn(f.runtime, "enqueue").mockResolvedValue(false);
+    await f.runtime.pass();
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(native).toHaveBeenCalledOnce();
+  });
 
   it("does not enqueue canonical work when the sweep is cancelled during a source read", async () => {
     const f = fixture();
@@ -170,6 +232,8 @@ describe("inventory sweep cancellation and retention", () => {
 
   it("does not begin another principal's publication after persisted maintenance closes", async () => {
     const f = fixture();
+    await retain(f, "first");
+    await retain(f, "second");
     let closed = false;
     vi.mocked(operationalState.readOperationalState).mockImplementation(async () => ({
       mode: closed ? "maintenance" : "normal", providerWorkEnabled: true, restoredFromAt: null,
@@ -191,6 +255,7 @@ describe("inventory sweep cancellation and retention", () => {
   it.each(["package", "native", "canonical request"] as const)(
     "does not admit the next publication slice after persisted maintenance closes during %s work", async stage => {
       const f = fixture();
+      await retain(f, "synthetic-principal");
       let closed = false;
       vi.mocked(operationalState.readOperationalState).mockImplementation(async () => ({
         mode: closed ? "maintenance" : "normal", providerWorkEnabled: true, restoredFromAt: null,

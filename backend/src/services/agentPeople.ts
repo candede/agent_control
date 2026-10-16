@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { AgentPeopleRepository, type AgentPeopleGeneration, type AgentPersonObservation } from "../db/agentPeople.js";
 import type { DataSyncScope, UserSourcePublication } from "../db/dataSync.js";
 import { pool } from "../db/pool.js";
@@ -16,8 +16,8 @@ import { operationalLog } from "./telemetry.js";
 type Dependencies = {
   repository: Pick<AgentPeopleRepository, "generation" | "referencedIds" | "directoryIds" | "read" | "save">;
   directory: Pick<DirectoryPrincipalsClient, "resolve">;
-  revalidateUser: typeof revalidateAuthenticatedUser;
-  delegatedToken: typeof acquireDelegatedToken;
+  revalidateUser: typeof revalidateAuthorizedUser;
+  delegatedToken: typeof acquireAuthorizedToken;
   requireAvailable: typeof capabilities.requireAvailable;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
@@ -36,8 +36,8 @@ export class AgentPeopleService {
   constructor(database: pg.Pool = pool, dependencies: Partial<Dependencies> = {}) {
     this.dependencies = {
       repository: new AgentPeopleRepository(database), directory: new DirectoryPrincipalsClient(),
-      revalidateUser: revalidateAuthenticatedUser,
-      delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      revalidateUser: revalidateAuthorizedUser,
+      delegatedToken: acquireAuthorizedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, now: () => new Date(), ...dependencies,

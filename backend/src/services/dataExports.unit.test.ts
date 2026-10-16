@@ -17,6 +17,22 @@ import { InventoryQueries } from "../db/inventoryQueries.js";
 import { flushDataWorkMetrics } from "./dataMetrics.js";
 import { inventoryExportColumns } from "./inventoryExports.js";
 import { config } from "../config.js";
+import { withAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource, RequestPrincipal } from "../types/requestPrincipal.js";
+
+function exportAuthority(identity: SelectionIdentity): DelegatedCredentialSource {
+  let revoked = false;
+  const principal: RequestPrincipal = { ...identity, apiClientId: "synthetic-api", localAccountId: "synthetic-local",
+    username: "exporter@example.invalid", displayName: "Exporter", roles: ["AgentControl.Viewer"], providerRoleIds: [],
+    transport: "browser", integrationClientId: "synthetic-api", rolesValidatedAt: Date.now(),
+    authenticatedAt: Date.now(), expiresAt: Date.now() + 300_000 };
+  return { principal, reference: { ...identity, id: "synthetic-export-source", apiClientId: principal.apiClientId,
+    transport: principal.transport, integrationClientId: principal.integrationClientId, expiresAt: principal.expiresAt },
+    expiresAt: principal.expiresAt, assertCurrent: vi.fn(() => {
+      if (revoked || Date.now() >= principal.expiresAt) throw new AppError(401, "authorization_required", "Export authority ended.");
+    }), revalidate: async () => { throw new Error("Exports cannot revalidate or obtain provider tokens."); },
+    acquire: async () => { throw new Error("Saved exports cannot acquire provider tokens."); }, revoke: () => { revoked = true; } };
+}
 
 const configuredTenants = config.tenants;
 
@@ -58,8 +74,7 @@ describe("export dispatcher maintenance admissions", () => {
     vi.stubEnv("MAINTENANCE_FILE", undefined);
     const database = new pg.Pool({ max: 4 });
     const reports = new LargeTenantUsersReports(database, "synthetic-dispatch-maintenance-secret", 35);
-    const state = { mode: "normal", provider_work_enabled: true, restored_from_at: null,
-      deletion_reviewed_at: null, access_reviewed_at: null };
+    const state = { mode: "normal" };
     const job = { id: "11111111-1111-4111-8111-111111111111", kind: "official_users",
       tenant_id: "tenant-a", principal_id: "principal-a", authorization_hash: "viewer", session_epoch: "1",
       actor: { tenantId: "tenant-a", homeAccountId: "principal-a", username: "exporter@example.invalid", displayName: "Exporter" } };
@@ -67,6 +82,7 @@ describe("export dispatcher maintenance admissions", () => {
     const query = vi.spyOn(database, "query").mockImplementation(async statement => {
       const sql = String(statement);
       if (sql.includes("FROM operational_state")) return { command: "SELECT", oid: 0, fields: [], rowCount: 1, rows: [{ ...state }] };
+      if (sql.startsWith("UPDATE data_exports")) return { command: "UPDATE", oid: 0, fields: [], rowCount: 1, rows: [] };
       if (sql.includes("FROM data_exports")) {
         const rows = queuedJobs();
         return { command: "SELECT", oid: 0, fields: [], rowCount: rows.length, rows };
@@ -83,7 +99,11 @@ describe("export dispatcher maintenance admissions", () => {
     const status = vi.spyOn(OfficialReportExports.prototype, "status").mockResolvedValue(queued);
     const build = vi.spyOn(OfficialReportExports.prototype, "build").mockResolvedValue();
     const fail = vi.spyOn(DataExports.prototype, "failPending").mockResolvedValue();
-    return { dispatcher: new ReportExportDispatcher(reports), state, job, queuedJobs, query, retain, sweep, expire, status, queued, build, fail };
+    const dispatcher = new ReportExportDispatcher(reports);
+    const identity = { tenantId: job.tenant_id, principalId: job.principal_id, authorizationHash: job.authorization_hash, sessionEpoch: job.session_epoch };
+    const source = exportAuthority(identity);
+    withAuthority(source, () => dispatcher.enqueue(job.id, identity, false));
+    return { dispatcher, source, state, job, queuedJobs, query, retain, sweep, expire, status, queued, build, fail };
   }
 
   it("does not start lifecycle maintenance or exports while the database is in maintenance", async () => {
@@ -98,13 +118,57 @@ describe("export dispatcher maintenance admissions", () => {
     await f.dispatcher.drain();
   });
 
-  it("allows saved-data exports without provider requalification", async () => {
+  it("allows saved-data exports in normal mode", async () => {
     const f = fixture();
-    f.state.provider_work_enabled = false;
     f.dispatcher.wake();
     await vi.advanceTimersByTimeAsync(0);
     expect(f.build).toHaveBeenCalledOnce();
     expect(f.fail).not.toHaveBeenCalled();
+    await f.dispatcher.drain();
+  });
+
+  it("does not borrow a new request's authority for a revoked initiating export", async () => {
+    const f = fixture();
+    f.status.mockImplementationOnce(async () => { f.source.revoke(); return f.queued; });
+    f.dispatcher.wake();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.build).not.toHaveBeenCalled();
+    expect(f.fail).not.toHaveBeenCalled();
+    await f.dispatcher.drain();
+  });
+
+  it("keeps restart work queued for explicit same-principal idempotent reauthorization", async () => {
+    const f = fixture(), restarted = new ReportExportDispatcher(f.dispatcher.reports);
+    restarted.wake();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.build).not.toHaveBeenCalled();
+    expect(f.query).toHaveBeenCalledWith(expect.stringContaining("error_code='authorization_required'"), [f.job.id]);
+    await restarted.drain();
+    const identity = { tenantId: f.job.tenant_id, principalId: f.job.principal_id,
+      authorizationHash: f.job.authorization_hash, sessionEpoch: f.job.session_epoch };
+    withAuthority(exportAuthority(identity), () => restarted.enqueue(f.job.id, identity, false));
+    restarted.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.build).toHaveBeenCalledOnce();
+    await restarted.drain();
+  });
+
+  it("does not erase explicit renewed authorization when an older active build settles", async () => {
+    const f = fixture();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.build.mockImplementationOnce(async () => { await held; f.source.assertCurrent(); });
+    f.dispatcher.wake();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.build).toHaveBeenCalledOnce();
+    const identity = { tenantId: f.job.tenant_id, principalId: f.job.principal_id,
+      authorizationHash: f.job.authorization_hash, sessionEpoch: f.job.session_epoch };
+    withAuthority(exportAuthority(identity), () => f.dispatcher.enqueue(f.job.id, identity, false));
+    f.source.revoke(); release();
+    await vi.advanceTimersByTimeAsync(0);
+    f.dispatcher.wake();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.build).toHaveBeenCalledTimes(2);
     await f.dispatcher.drain();
   });
 
@@ -220,17 +284,18 @@ describe("export dispatcher maintenance admissions", () => {
     expect(f.fail).not.toHaveBeenCalled();
   });
 
-  it.each(["read failure", "missing singleton", "invalid provider flag", "incomplete review"])(
+  it.each(["read failure", "missing singleton", "invalid mode", "duplicate singleton"])(
     "keeps exports queued when the final maintenance check has a %s", async outcome => {
     const f = fixture();
     vi.mocked(operationalLog).mockClear();
     f.status.mockImplementationOnce(async () => {
       if (outcome === "read failure") f.query.mockRejectedValueOnce(new Error("Private database detail."));
       else if (outcome === "missing singleton") f.query.mockImplementationOnce(async () => ({ command: "SELECT", oid: 0, fields: [], rowCount: 0, rows: [] }));
-      else f.query.mockImplementationOnce(async () => ({ command: "SELECT", oid: 0, fields: [], rowCount: 1, rows: [{
-        ...f.state, provider_work_enabled: outcome === "invalid provider flag" ? "false" : true,
-        restored_from_at: outcome === "incomplete review" ? new Date() : null,
-      }] }));
+      else {
+        const row = { mode: outcome === "invalid mode" ? "invalid" : "normal" };
+        const rows = outcome === "duplicate singleton" ? [row, row] : [row];
+        f.query.mockImplementationOnce(async () => ({ command: "SELECT", oid: 0, fields: [], rowCount: rows.length, rows }));
+      }
       return f.queued;
     });
     f.dispatcher.wake();
@@ -1154,8 +1219,7 @@ function inventoryLifecycle() {
         vi.spyOn(OfficialReportImports.prototype, "sweep").mockResolvedValue(0);
         vi.mocked(database.query).mockImplementation(async statement => ({ command: "SELECT", oid: 0, fields: [], rowCount: 1,
           rows: String(statement).includes("FROM operational_state") ? [{
-            mode: "normal", provider_work_enabled: true, restored_from_at: null,
-            deletion_reviewed_at: null, access_reviewed_at: null,
+            mode: "normal",
           }] : [{
             id, kind: "official_users", tenant_id: identity.tenantId, principal_id: identity.principalId,
             authorization_hash: identity.authorizationHash, session_epoch: identity.sessionEpoch,
@@ -1165,6 +1229,7 @@ function inventoryLifecycle() {
         vi.spyOn(OfficialReportExports.prototype, "status").mockRejectedValue(new AppError(409, "selection_invalidated", "Selection retired."));
         const settle = vi.spyOn(DataExports.prototype, "failPending").mockRejectedValue(new Error("synthetic audit write failure"));
         const dispatcher = new ReportExportDispatcher(reports);
+        withAuthority(exportAuthority(identity), () => dispatcher.enqueue(id, identity, false));
         dispatcher.wake();
         await vi.waitFor(() => expect(settle).toHaveBeenCalledWith(id, "selection_invalidated"));
         await expect(dispatcher.drain()).resolves.toBeUndefined();
@@ -1184,7 +1249,7 @@ function inventoryLifecycle() {
         await engine.cancel(id, identity);
         expect(await engine.status(id, identity)).toMatchObject({ status: "cancelled" });
         expect(audit.mock.calls.map(([, event]) => [event.phase, event.status]))
-          .toEqual([["build", "succeeded"], ["download", "started"], ["download", "succeeded"]]);
+          .toEqual([["build", "succeeded"], ["download", "started"], ["download", "succeeded"], ["cancel", "started"], ["cancel", "succeeded"]]);
       });
 
       it.each(["build", "download"] as const)("rejects extra persisted chunks during %s instead of ignoring them", async phase => {
@@ -1230,7 +1295,8 @@ function inventoryLifecycle() {
         await rejected;
         await engine.cancel(id, identity);
         expect(metadata.status).toBe("cancelled");
-        expect(audit.mock.calls.map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "build").map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "cancel").map(([, event]) => event.status)).toEqual(["started", "succeeded"]);
       });
 
       it("does not start a producer cancelled between lease admission and local signal registration", async () => {
@@ -1253,7 +1319,8 @@ function inventoryLifecycle() {
         await expect(engine.build(id, identity, ["Name"], source)).rejects.toThrow("export_fenced");
         expect(source).not.toHaveBeenCalled();
         expect(metadata.status).toBe("cancelled");
-        expect(audit.mock.calls.map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "build").map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "cancel").map(([, event]) => event.status)).toEqual(["started", "succeeded"]);
       });
 
       it("records failed completion when the native transport cannot finish the final payload", async () => {
@@ -1403,7 +1470,8 @@ function inventoryLifecycle() {
         await expect(engine.cancel(id, identity)).resolves.toBeUndefined();
         await rejected;
         expect(metadata.status).toBe("cancelled");
-        expect(audit.mock.calls.map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "build").map(([, event]) => event.status)).toEqual(["cancelled"]);
+        expect(audit.mock.calls.filter(([, event]) => event.phase === "cancel").map(([, event]) => event.status)).toEqual(["started", "succeeded"]);
       });
 
       it("settles an admitted download start when post-COMMIT cleanup fails before the first yield", async () => {

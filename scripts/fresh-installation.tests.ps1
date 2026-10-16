@@ -51,6 +51,7 @@ Assert-Refused { Assert-FreshInstallationContext $context (Join-Path $root '.loc
 function New-Container([string]$Service) {
     $mounts = if ($Service -eq 'app') {
         @(
+            @{Type='bind';Source=(Join-Path $context.State 'agent-sharing-diagnostics');Destination='/run/agent-sharing-diagnostics';RW=$true}
             @{Type='bind';Source=(Join-Path $context.State 'control');Destination='/run/control';RW=$false}
             @{Type='bind';Source=(Join-Path $context.State 'secrets/tenants.json');Destination='/run/secrets/tenants.json';RW=$false}
             @{Type='bind';Source=(Join-Path $context.State 'secrets/session');Destination='/run/secrets/session';RW=$false}
@@ -62,7 +63,7 @@ function New-Container([string]$Service) {
             @{Type='bind';Source=(Join-Path $context.State 'secrets/postgres-admin');Destination='/run/secrets/postgres-admin';RW=$false}
         )
     }
-    $ports = if ($Service -eq 'app') { @{'3001/tcp'=@(@{HostIp='127.0.0.1';HostPort='43127'})} } else { @{} }
+    $ports = @{}
     return (@{
         Id=('a'*64);Image=('sha256:'+'b'*64);Name="/$($context.Project)-$Service-1"
         Config=@{Labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.service'=$Service
@@ -108,29 +109,60 @@ foreach ($mutation in @(
     Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 }
 Assert-Refused { Assert-FreshInstallationContainer $context (New-Container 'app') }
+$context.VerifiedApp = New-Container 'app'
+Assert-FreshInstallationContainer $context (New-Container 'app')
+$script:checks++
+foreach ($mutation in @(
+    {param($c) $c.Id=('c'*64)},
+    {param($c) $c.Image=('sha256:'+'d'*64)},
+    {param($c) $c.Config.Labels.'com.docker.compose.project.config_files'='foreign.yaml'}
+)) {
+    $bad = New-Container 'app'
+    & $mutation $bad
+    Assert-Refused { Assert-FreshInstallationContainer $context $bad }
+}
+$context.Remove('VerifiedApp')
 $context.Remove('VerifiedPostgres')
 Assert-Refused { Assert-FreshInstallationContainer $context $verifiedPostgres }
 $context.Remove('AppliedComposeFiles')
-foreach ($binding in @(@{HostIp='0.0.0.0';HostPort='43127'},@{HostIp='127.0.0.1';HostPort='3002'})) {
-    $bad = New-Container app; $bad.HostConfig.PortBindings.'3001/tcp'=@($binding)
+foreach ($binding in @(@{HostIp='0.0.0.0';HostPort='43127'},@{HostIp='127.0.0.1';HostPort='3002'},@{HostIp='127.0.0.1';HostPort='43127'})) {
+    $bad = New-Container app; $bad.HostConfig.PortBindings = [pscustomobject]@{'3001/tcp'=@($binding)}
     Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 }
+$unpublished = New-Container app; $unpublished.HostConfig.PortBindings = $null
+Assert-FreshInstallationContainer $context $unpublished
+$script:checks++
+$bad = New-Container app; $bad.Mounts[0].Source = (Join-Path $root '.local/seha/agent-sharing-diagnostics')
+Assert-Refused { Assert-FreshInstallationContainer $context $bad }
+$bad = New-Container app; $bad.Mounts[0].RW = $false
+Assert-Refused { Assert-FreshInstallationContainer $context $bad }
+$bad = New-Container app; $bad.Mounts += $bad.Mounts[0]
+Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 $bad = New-Container postgres; $bad.Mounts[0].Name='seha_data'
 Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 $bad = New-Container app; $bad.Config.Labels.'io.agent-control.source-sha256'='other'
 Assert-Refused { Assert-FreshInstallationContainer $context $bad }
 $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'fresh-installation.ps1'))
+Assert-True ($source.Contains('ports: !reset []')) 'Fresh Compose must remove inherited app host publication, not merge an empty list.'
+$installation = (Get-Command Invoke-FreshInstallation).ScriptBlock.ToString()
 Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy')) 'Fresh runner no longer uses the real Deploy boundary.'
 Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks')) 'Fresh installation proof must explicitly execute full qualification.'
 Assert-True ($source.Contains('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset') -and
-    -not $source.Contains('-Action Start') -and -not $source.Contains('DROP DATABASE')) 'Reset qualification must use the real guarded deployment boundary.'
+    -not $installation.Contains('-Action Start') -and -not $installation.Contains('DROP DATABASE')) 'Reset qualification must use the real guarded deployment boundary.'
+Assert-True ($installation.Contains('CurrentSchemaOnly') -and
+    $installation.Contains('verifiedStartAfterResetNoReplay') -and
+    $installation.Contains('$operational.mode -cne ''normal''')) 'Current-only fixture must resume normal operation and verify non-destructive start after reset.'
+Assert-True ([regex]::Matches($installation,[regex]::Escape('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset')).Count -eq 1) 'Fresh verification must request one reset, then use ordinary start to verify no replay.'
 Assert-True ($source.Contains("Invoke-FreshFirstSync `$context `$Directory 'collected'") -and
-    $source.Contains("Invoke-FreshFirstSync `$context `$Directory 'recollected'")) 'First collection must run before and after explicit reset.'
+    -not $source.Contains("Invoke-FreshFirstSync `$context `$Directory 'recollected'")) 'Current-only verification must not run live Microsoft requests.'
+$compiledFixture = [IO.File]::ReadAllText((Join-Path $root 'backend/scripts/restart-runtime.mjs'))
+Assert-True ($compiledFixture.Contains('await loadOperationalState(pool)') -and
+    $compiledFixture.Contains('return () => assertAccountSessionValidation(validation)') -and
+    $compiledFixture.Contains('signedInAt, rolesValidatedAt: signedInAt')) 'Standalone compiled fixtures must load actual operational state and retain real captured-generation validation and immutable synthetic session issuance.'
 $persistence = $source.IndexOf('Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter')
 $collection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'collected'")
 $reset = $source.IndexOf('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset')
-$recollection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'recollected'")
-Assert-True ($persistence -ge 0 -and $persistence -lt $collection -and $collection -lt $reset -and $reset -lt $recollection) 'Exact empty-schema fingerprints must precede collection; populated data must then be reset and recollected.'
+Assert-True ($persistence -ge 0 -and $persistence -lt $collection -and $collection -lt $reset -and $source.Contains("firstSyncAfterReset='not_run'")) 'Persistence/optional collection must precede reset; recollection remains closed after reset.'
 Assert-True ($source.Contains('$peak -gt $container.HostConfig.Memory') -and
     $source.Contains('(max|oom|oom_kill) [1-9]')) 'Compiled runtime resource pressure must not be accepted as headroom.'
 Assert-True ($source.Contains('$limit -ne $container.HostConfig.Memory') -and
@@ -150,8 +182,7 @@ foreach ($fingerprint in @($null,'','invalid',('b'*64))) {
 }
 $after.schemaFingerprint=$before.schemaFingerprint
 Assert-True ($source.Contains("'backend/scripts/database.ts','preflight'") -and
-    $source.Contains('schemaFingerprint=$schema.targetFingerprint') -and -not $source.Contains('schemaVersion') -and
-    -not $source.Contains('schema_migrations')) 'Fresh qualification still records historical schema evidence.'
+    $source.Contains('schemaFingerprint=$schema.targetFingerprint')) 'Fresh verification must record the exact current schema fingerprint.'
 $after.tables.sessions.hash='changed'
 Assert-Refused { Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter }
 $after.tables.sessions.hash='same';$after.tables.data_lifecycle_progress.count=5

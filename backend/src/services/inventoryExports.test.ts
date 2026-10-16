@@ -12,6 +12,7 @@ import { DataExports } from "./dataExports.js";
 import { inventoryExportColumns, inventoryExportSource, type InventoryExportKind } from "./inventoryExports.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { retainRecordData } from "../db/dataRetention.js";
+import { saveUsageInventory, usageIdentity } from "../db/agentUsageTestSupport.js";
 
 describe("durable selected inventory exports", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -37,6 +38,48 @@ describe("durable selected inventory exports", () => {
     const selection = await inventory.capture(identity, root.scopeId);
     return { identity, selection };
   }
+
+  it("exports complete saved About chunks through the existing bounded source child rows", async () => {
+    const scope = { tenantId: selectionIdentity.tenantId, principalId: randomUUID() };
+    const text = {
+      "about:long": "Complete long Ω🧭 ".repeat(2200),
+      "about:short": "Complete short Ω🧭 ".repeat(1800),
+      "about:native": "Complete native Ω🧭 ".repeat(1800),
+    };
+    await saveUsageInventory(fixture.runtime, scope, [{
+      packages: ["about-export-package"],
+      packageFields: { longDescription: text["about:long"], shortDescription: text["about:short"] },
+      native: { nativeId: randomUUID(), environmentId: randomUUID(), description: text["about:native"] },
+    }]);
+    const identity = await usageIdentity(fixture.runtime, scope);
+    const roots = await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
+      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_canonical'`, [scope.tenantId, scope.principalId]);
+    expect(roots.rows).toHaveLength(1);
+    const selection = await inventory.capture(identity, roots.rows[0].id, { inventoryScope: "all" });
+    const kind = "unified_agents";
+    const id = await exports.create(identity, { selectionId: selection.id, queryHash: selection.queryHash,
+      kind, filename: "complete-about.csv" });
+    await exports.build(id, identity, inventoryExportColumns[kind], inventoryExportSource(inventory, identity));
+    const chunks: Buffer[] = [];
+    for await (const chunk of exports.download(id, identity, new AbortController().signal)) chunks.push(chunk);
+    const rows: Record<string, string>[] = parseCsv(Buffer.concat(chunks).toString("utf8"), { columns: true, bom: true });
+    for (const [kind, expected] of Object.entries(text)) {
+      const parts = rows.filter(row => row.recordType === "child" && row.childKind === kind);
+      expect(parts.length).toBeGreaterThan(1);
+      const actual = parts.map(row => {
+        const child: unknown = JSON.parse(row.childData);
+        if (!child || typeof child !== "object" || !("payload" in child) || !child.payload
+          || typeof child.payload !== "object" || !("text" in child.payload) || typeof child.payload.text !== "string") {
+          throw new Error("Saved About export must retain a typed text child.");
+        }
+        expect(row.sourceIdentity).toBeTruthy();
+        expect(row.sourceGenerationId).toBeTruthy();
+        return child.payload.text;
+      }).join("");
+      expect(actual).toBe(expected);
+    }
+    expect(await exports.status(id, identity)).toMatchObject({ status: "ready", rows: rows.length });
+  });
 
   it.each(["queued", "ready"] as const)("revokes a %s artifact and collects its retained pins after reviewed associations change", async status => {
     const { identity, selection } = await select(1, true);

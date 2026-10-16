@@ -130,9 +130,10 @@ export class OfficialReportHistory {
   }
   async expireInTransaction(client: pg.PoolClient, tenantId: string, limit = 4) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 4) throw new Error("official_history_expiry_batch");
+      await this.prepareRead(client, tenantId);
+      if (!(await client.query(`${historyIntegritySql} SELECT 1 FROM invalid_sets LIMIT 1`, [tenantId, null])).rowCount) return 0;
       await this.lock(client, tenantId);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`official-usage:${tenantId}`]);
-      await this.prepareRead(client, tenantId);
       const rows = (await client.query(`${historyIntegritySql} SELECT id FROM invalid_sets ORDER BY id LIMIT $3`, [tenantId, null, limit])).rows;
       for (const row of rows) {
         await this.invalidate(client, tenantId, row.id, true);

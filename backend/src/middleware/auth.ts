@@ -5,10 +5,15 @@ import { revalidateAuthenticatedUser } from "../auth/msal.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation, getValidatedSessionIdentity } from "../db/sessions.js";
 import { capabilities } from "../services/capabilities.js";
 import { hasAppRole, type AppRole, type CapabilityId } from "../types/capability.js";
+import { requestUser } from "./requestAuthentication.js";
 
 export const roleRevalidationIntervalMs = 5 * 60 * 1000;
 
 export const requireSession: RequestHandler = async (request, _response, next) => {
+  if (request.authentication) {
+    try { request.authentication.assertCurrent(); next(); } catch (error) { next(error); }
+    return;
+  }
   const identity = getValidatedSessionIdentity(request.session);
   if (!identity) {
     request.session.destroy(error => next(error ?? AppError.unauthorized()));
@@ -49,7 +54,7 @@ function saveSession(request: Request) {
 
 export function requireRoles(...roles: AppRole[]): RequestHandler {
   return (request, _response, next) => {
-    if (!request.session.user || !roles.some(role => hasAppRole(request.session.user!.roles, role))) {
+    if (!roles.some(role => hasAppRole(requestUser(request).roles, role))) {
       next(new AppError(403, "missing_internal_role", "The required Agent Control app role is not assigned."));
       return;
     }
@@ -60,8 +65,7 @@ export function requireRoles(...roles: AppRole[]): RequestHandler {
 export function requireCapability(capabilityId: CapabilityId): RequestHandler {
   return async (request, _response, next) => {
     try {
-      if (!request.session.user) throw AppError.unauthorized();
-      await capabilities.requireAvailable(capabilityId, request.session.user);
+      await capabilities.requireAvailable(capabilityId, requestUser(request));
       next();
     } catch (error) {
       next(error);
@@ -70,6 +74,7 @@ export function requireCapability(capabilityId: CapabilityId): RequestHandler {
 }
 
 export const requireCsrf: RequestHandler = (request, _response, next) => {
+  if (request.authentication?.principal.transport === "bearer") { request.authentication.assertCurrent(); next(); return; }
   const supplied = request.get("x-csrf-token");
   const expected = request.session.csrfToken;
   const left = Buffer.from(supplied ?? "");
@@ -82,6 +87,11 @@ export const requireCsrf: RequestHandler = (request, _response, next) => {
 };
 
 export function requestScope(request: Request) {
+  if (request.authentication) {
+    request.authentication.assertCurrent();
+    const { tenantId, principalId } = request.authentication.principal;
+    return { tenantId, principalId };
+  }
   const identity = getValidatedSessionIdentity(request.session);
   if (!identity) throw AppError.unauthorized();
   return { tenantId: identity.tenantId, principalId: identity.accountId };

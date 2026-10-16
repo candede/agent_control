@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 
 // This mode is piped only into the exact owned, read-only fresh-installation container.
 if (process.argv[2] === "first-sync") {
@@ -17,13 +17,17 @@ if (process.argv[2] === "first-sync") {
   const { GraphPackagesClient } = await import("/app/backend/dist/services/graphPackages.js");
   const { InventoryRuntime } = await import("/app/backend/dist/services/inventoryRuntime.js");
   const { DataGenerations } = await import("/app/backend/dist/db/dataGenerations.js");
+  const { beginAccountSessionValidation, assertAccountSessionValidation } = await import("/app/backend/dist/db/sessions.js");
+  const { loadOperationalState } = await import("/app/backend/dist/services/operationalState.js");
   const tenant = config.tenants[0];
   assert.equal(config.tenants.length, 1);
   assert.deepEqual(tenant.domains, ["example.invalid"]);
   assert.equal((await pool.query("SELECT count(*)::int AS count FROM inventory_roots")).rows[0].count, 0);
+  await loadOperationalState(pool);
   const user = { tenantId: tenant.tenantId, homeAccountId: "fresh-installation-reader",
     displayName: "Synthetic first collection", username: "fixture@example.invalid", roles: ["AgentControl.Viewer"] };
   const scope = { tenantId: user.tenantId, principalId: user.homeAccountId };
+  const signedInAt = Date.now();
   const runtime = new InventoryRuntime(pool, async () => {});
   let providerCalls = 0;
   const records = Array.from({ length: 1001 }, (_, index) => ({
@@ -41,6 +45,12 @@ if (process.argv[2] === "first-sync") {
     observeOperation: async (_capability, _user, operation) => operation(() => {}),
     delegatedToken: async () => "synthetic-first-collection", revalidateUser: async () => user,
     requireAvailable: async () => {}, applicationPrincipalId: () => undefined,
+    beginOperationValidation: (_capability, actor) => {
+      assert.equal(actor.tenantId, scope.tenantId);
+      assert.equal(actor.homeAccountId, scope.principalId);
+      const validation = beginAccountSessionValidation(actor.tenantId, actor.homeAccountId);
+      return () => assertAccountSessionValidation(validation);
+    },
     applicationToken: async () => { throw new Error("Unexpected application authentication"); },
     requireApplicationDataScope: async () => { throw new Error("Unexpected application scope"); },
     streams: database => new StreamedInventory(database, provider), wait: async () => {},
@@ -49,7 +59,7 @@ if (process.argv[2] === "first-sync") {
   app.use(express.json());
   app.use((request, _response, next) => {
     request.session = { user, tenantId: user.tenantId, accountId: user.homeAccountId, clientId: tenant.clientId,
-      rolesValidatedAt: Date.now(), csrfToken: "synthetic-first-sync-csrf", destroy: callback => callback() };
+      signedInAt, rolesValidatedAt: signedInAt, csrfToken: "synthetic-first-sync-csrf", destroy: callback => callback() };
     next();
   });
   app.use("/api", createInventoryDataRouter(pool));
@@ -157,8 +167,17 @@ const { runCopilotStudioQuarantineJob,reconcileCopilotStudioQuarantineJob }=awai
 const { createProviderQueryBody }=await import("/app/backend/dist/services/graphAuditSearch.js");
 const { GraphPackagesClient }=await import("/app/backend/dist/services/graphPackages.js");
 const { DataGenerations,generationHeartbeat }=await import("/app/backend/dist/db/dataGenerations.js");
+const { beginAccountSessionValidation,assertAccountSessionValidation }=await import("/app/backend/dist/db/sessions.js");
+const { loadOperationalState }=await import("/app/backend/dist/services/operationalState.js");
 const generations=new DataGenerations(pool);
 const scope={tenantId:"11111111-1111-4111-8111-111111111111",principalId:"phase01-fixture-principal"};
+await loadOperationalState(pool);
+const beginOperationValidation=(_capability,actor)=>{
+  assert.equal(actor.tenantId,scope.tenantId);
+  assert.equal(actor.homeAccountId,scope.principalId);
+  const validation=beginAccountSessionValidation(actor.tenantId,actor.homeAccountId);
+  return ()=>assertAccountSessionValidation(validation);
+};
 const purviewReadScope={tenantId:scope.tenantId,resultScopes:[{kind:"principal",scopeId:scope.principalId,configurationRevision:null}]};
 const defenderResultScope={kind:"principal",scopeId:scope.principalId,configurationRevision:null};
 const defenderAuthority={capabilityId:"defender.hunting.delegated",contractRevision:"d".repeat(64),permissionRevision:"e".repeat(64),configurationRevision:1};
@@ -201,7 +220,7 @@ let purviewInterruptedCreate;
 let purviewInterruptedPoll;
 const purviewUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"],providerRoles:[],providerRoleScope:"unknown"};
 const purviewService=new PurviewAuditService(purviewRepository,{
-  observeOperation,
+  observeOperation,beginOperationValidation,
   delegatedToken:async()=>"explicit-fixture-authorization",
   applicationToken:async()=>{throw new Error("application token not expected");},
   revalidateUser:async()=>purviewUser,
@@ -220,7 +239,9 @@ const purviewService=new PurviewAuditService(purviewRepository,{
 });
 const defenderUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"],providerRoles:[],providerRoleScope:"unknown"};
 const defenderService=new DefenderHuntingService(defenderRepository,{
-  observeOperation,
+  observeOperation,beginOperationValidation,
+  requireAvailable:async()=>({authorized:true}),
+  recordProviderEvidence:async()=>({authorized:true}),
   delegatedToken:async()=>"explicit-fixture-authorization",
   applicationToken:async()=>{throw new Error("application token not expected");},
   revalidateUser:async()=>defenderUser,
@@ -230,8 +251,8 @@ const defenderService=new DefenderHuntingService(defenderRepository,{
   auditLog:()=>({startEvent:async()=>({id:"defender-restart-audit"}),completeEvent:async()=>undefined}),
   runQuery:async(_token,_filters,options)=>{
     defenderProviderCalls+=1;
-    await options.beforeRequest();
-    await options.onResponse("defender-provider-resumed");
+    await options.beforeRequest(options.signal);
+    await options.onResponse("defender-provider-resumed",options.signal);
     return {rows:[],providerRowCount:0,storedRowCount:0,byteCount:2,complete:true,partialReason:null};
   },
 });
@@ -394,7 +415,7 @@ try {
   assert.equal((await quarantineRepository.get(scope,receipt.quarantineSent)).canReconcile,false);
   const inventoryUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"],providerRoleIds:["f2ef992c-3afb-46b9-b7cf-a126ee74c451"]};
   const inventoryService=new PowerPlatformInventoryService(inventoryRepository,{
-    observeOperation,
+    observeOperation,beginOperationValidation,
     delegatedToken:async()=>"explicit-fixture-authorization",revalidateUser:async()=>inventoryUser,requireAvailable:async()=>undefined,
     streams:database=>new StreamedInventory(database,undefined,{
       pages:async function*(_token,_types,options){
@@ -411,7 +432,7 @@ try {
   assert.equal(inventoryScans,1);
   const packageUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"]};
   const packageService=new PackageInventoryService(packageRepository,{
-    observeOperation,
+    observeOperation,beginOperationValidation,
     delegatedToken:async()=>"explicit-fixture-authorization",applicationToken:async()=>{throw new Error("application token not expected");},revalidateUser:async()=>packageUser,
     requireAvailable:async()=>undefined,requireApplicationDataScope:async()=>{throw new Error("application scope not expected");},applicationPrincipalId:()=>undefined,
     streams:database=>new StreamedInventory(database,{
@@ -423,8 +444,10 @@ try {
     wait:async()=>undefined,
   });
   await packageService.start(packageUser,receipt.packageInterrupted,"delegated");
-  for (let attempt=0;attempt<100&&(await packageRepository.getJob(scope,receipt.packageInterrupted)).status!=="succeeded";attempt+=1) await new Promise(resolve=>setTimeout(resolve,10));
-  assert.equal((await packageRepository.getJob(scope,receipt.packageInterrupted)).status,"succeeded");
+  for (let attempt=0;attempt<100&&!["succeeded","failed"].includes((await packageRepository.getJob(scope,receipt.packageInterrupted)).status);attempt+=1) await new Promise(resolve=>setTimeout(resolve,10));
+  const missingPackage=await packageRepository.getJob(scope,receipt.packageInterrupted);
+  assert.equal(missingPackage.status,"failed");
+  assert.equal(missingPackage.errorCode,"not_found");
   assert.equal((await packageRepository.getJob(scope,receipt.packageCompleted)).status,"succeeded");
   assert.equal(packageScans,1);
   await purviewService.start(purviewUser,receipt.purviewInterruptedCreate,"delegated");
@@ -444,18 +467,46 @@ try {
   dispatcher.start();
   try {
     let status=await exports.status(receipt.exportId,exportIdentity);
+    for(let attempt=0;attempt<100&&status.error!=="authorization_required";attempt+=1){
+      assert.equal(status.status,"queued");
+      await new Promise(resolve=>setTimeout(resolve,100));
+      status=await exports.status(receipt.exportId,exportIdentity);
+    }
+    assert.equal(status.status,"queued");
+    assert.equal(status.error,"authorization_required");
+    const { config }=await import("/app/backend/dist/config.js");
+    const { default:session }=await import("/app/node_modules/express-session/index.js");
+    const sessionId=randomUUID(),signedInAt=Date.now(),csrfToken="restart-synthetic-export-csrf";
+    await new Promise((resolve,reject)=>store.set(sessionId,{
+      cookie:new session.Cookie({maxAge:600_000}),tenantId:scope.tenantId,accountId:scope.principalId,
+      clientId:config.tenants[0].clientId,signedInAt,rolesValidatedAt:signedInAt,csrfToken,user:exportActor,
+    },error=>error?reject(error):resolve()));
+    const signature=createHmac("sha256",config.sessionSecret).update(sessionId).digest("base64").replace(/=+$/g,"");
+    const headers={Cookie:`agent-control.sid=${encodeURIComponent(`s:${sessionId}.${signature}`)}`,
+      Origin:config.frontendOrigin,"x-csrf-token":csrfToken,"Content-Type":"application/json"};
+    const resumed=await fetch("http://127.0.0.1:3001/api/data-exports",{
+      method:"POST",headers,body:JSON.stringify({selectionId:receipt.exportSelectionId,kind:"official_users",
+        idempotencyKey:receipt.exportIdempotencyKey}),signal:AbortSignal.timeout(10_000),
+    });
+    assert.equal(resumed.status,202,await resumed.clone().text());
+    assert.deepEqual(await resumed.json(),{id:receipt.exportId});
     for(let attempt=0;attempt<100&&status.status!=="ready";attempt+=1){
       assert.ok(["queued","building"].includes(status.status));
-      await new Promise(resolve=>setTimeout(resolve,20));
+      await new Promise(resolve=>setTimeout(resolve,100));
       status=await exports.status(receipt.exportId,exportIdentity);
     }
     assert.equal(status.status,"ready");assert.ok(status.rows>0);
+    const download=await fetch(`http://127.0.0.1:3001/api/data-exports/${receipt.exportId}/download`,{
+      headers,signal:AbortSignal.timeout(10_000),
+    });
+    assert.equal(download.status,200,await download.clone().text());
     let bytes=0;
-    for await(const chunk of exports.engine.download(receipt.exportId,exportIdentity,new AbortController().signal)) {
+    for await(const chunk of download.body) {
       assert.ok(chunk.length<=262144);bytes+=chunk.length;
     }
     assert.equal(bytes,status.bytes);
-    console.log(JSON.stringify({event:"compiled_report_export_restart_proof",outcome:"passed",rows:status.rows,bytes}));
+    console.log(JSON.stringify({event:"compiled_report_export_restart_proof",outcome:"passed",rows:status.rows,bytes,
+      automaticResume:false,freshBrowserAuthorization:true,idempotencyRetained:true,canonicalHttpDownload:true}));
   } finally { await dispatcher.drain(); }
   console.log(JSON.stringify({event:"runtime_recreation_proof",outcome:"passed",writesAfterExplicitAuthorization:2,completedReplays:0,uncertainReplays:0,canarySentReplays:0,canaryQualifications:0,quarantineProviderCallsAtStartup:0,quarantineCompletedReplays:0,quarantineSentReplays:0,quarantineWritesAfterExplicitAuthorization:1,quarantineReconciliationWrites:0,inventoryScansBeforeExplicitAuthorization:0,inventoryScansAfterExplicitAuthorization:1,packageScansBeforeExplicitAuthorization:0,packageScansAfterExplicitAuthorization:1,purviewProviderCallsAtStartup:0,purviewCreatesAfterResume:0,purviewReconciliationsAfterResume:1,purviewPollsAfterResume:purviewProviderCalls.get,purviewDownloadsAfterResume:2,purviewCompletedReplays:0,defenderProviderCallsAtStartup:0,defenderQueriesAfterExplicitResume:1,defenderCompletedReplays:0}));
 } finally {

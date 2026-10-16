@@ -501,7 +501,7 @@ def summarize(directory, mode):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
-    parser.add_argument("--mode", choices=("query", "full", "probe"), default="full")
+    parser.add_argument("--mode", choices=("query", "full", "probe", "web"), default="full")
     args = parser.parse_args()
     result = summarize(args.directory, args.mode)
     result["interpreter"] = {"path": "scripts/capacity-results.py",

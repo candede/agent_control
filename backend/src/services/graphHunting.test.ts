@@ -218,7 +218,7 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     expect(() => validateDefenderHuntingFilters({ ...filters(), operations: ["DeleteEverything"] }, { now })).toThrowError(expect.objectContaining({ code: "invalid_hunting_filters" }));
     expect(() => validateDefenderHuntingFilters({ ...filters(), actorObjectIds: ["not-an-object-id"] }, { now })).toThrowError(expect.objectContaining({ code: "invalid_hunting_filters" }));
     expect(() => validateDefenderHuntingFilters({ ...filters(), startDateTime: "2026-09-01T00:00:00.000Z" }, { now })).toThrowError(expect.objectContaining({ code: "invalid_hunting_range" }));
-    expect(() => validateDefenderHuntingFilters(filters("agents_inventory"), { now, qualification: true })).not.toThrow();
+    expect(() => validateDefenderHuntingFilters(filters("agents_inventory"), { now })).not.toThrow();
   });
 
   it.each(["startDateTime", "endDateTime"] as const)("rejects normalized invalid calendar instants in %s", field => {

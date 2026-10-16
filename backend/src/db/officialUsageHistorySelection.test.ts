@@ -17,6 +17,26 @@ describe("live relational official history selection", () => {
   beforeAll(async () => { fixture = await testDatabase(); }, 30_000);
   afterAll(async () => { await fixture?.close(); });
 
+  it("does not block a no-op history expiry behind an active selected reader", async () => {
+    const tenantId = "history-read-only-expiry";
+    const history = new OfficialReportHistory(fixture.runtime);
+    const scopeId = await history.ensure(tenantId);
+    const reader = await fixture.operator.connect(), maintenance = await fixture.runtime.connect();
+    try {
+      await reader.query("BEGIN");
+      await reader.query("SELECT id FROM data_scope_epochs WHERE id=$1 FOR SHARE", [scopeId]);
+      await maintenance.query("BEGIN");
+      await maintenance.query("SET LOCAL lock_timeout='250ms'");
+      expect(await history.expireInTransaction(maintenance, tenantId)).toBe(0);
+      await maintenance.query("COMMIT");
+    } finally {
+      await maintenance.query("ROLLBACK");
+      maintenance.release();
+      await reader.query("ROLLBACK");
+      reader.release();
+    }
+  });
+
   it("pins 32 retained sets with one root and preserves acceptance continuity", async () => {
     const identity = { ...selectionIdentity, tenantId: "history-32", principalId: "viewer-not-importer" };
     const history = new OfficialReportHistory(fixture.runtime);

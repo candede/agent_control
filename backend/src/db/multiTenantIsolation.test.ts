@@ -168,16 +168,16 @@ describe("multi-tenant repositories with overlapping provider and principal iden
         tenantId: current.scope.tenantId, sourceSystem: "power_platform", nativeId, resourceType: agentType, environmentId,
         identifiers: [{ kind: "entra_agent_id", value: identityId }],
       }))).toMatchObject({ status: "resolved", candidate: { tenantId: current.scope.tenantId, nativeId } });
-      expect(await identities.read(current.scope, current.source)).toMatchObject({ objectId: identityId, applicationId: identityId });
+      expect((await identities.readState(current.scope, current.source)).value).toMatchObject({ objectId: identityId, applicationId: identityId });
       for (const other of saved.filter(value => value !== current)) {
         await expect(current.selected.queries.page(other.selected.selection.id, current.selected.identity))
           .rejects.toMatchObject({ code: "selection_invalidated" });
         await expect(new NativeInventory(fixture.runtime).resolveQuarantineTargets(current.scope, other.source.snapshotId, [nativeId]))
           .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
         expect(await repository.getJob(current.scope, other.job.id)).toBeUndefined();
-        expect(await identities.read(current.scope, other.source)).toBeNull();
+        expect(await identities.readState(current.scope, other.source)).toEqual({ status: "missing" });
         await identities.invalidate(current.scope, other.source);
-        expect(await identities.read(other.scope, other.source)).not.toBeNull();
+        expect((await identities.readState(other.scope, other.source)).value).toMatchObject({ objectId: identityId, applicationId: identityId });
         await expect(identities.saveFailure(current.scope, other.source, { status: "authorization_required", code: "missing_permission" }, async () => {}))
           .rejects.toMatchObject({ code: "agent_identity_source_changed" });
       }

@@ -287,7 +287,7 @@ describe("service-free saved people boundaries", () => {
     });
     expect(h.metadata).toHaveBeenCalledWith(h.client, { ...originalScope, tokenMode: "delegated" }, at);
     expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [originalScope.tenantId, originalScope.principalId, "directory-generation", [firstId], at, "delegated"]);
+      [originalScope.tenantId, originalScope.principalId, "directory-generation", [firstId], at, "delegated", true]);
     expect(projected).toMatchObject(original);
     expect(projected.people?.owner).toBe(projected.people?.createdBy);
     expect(projected.people?.owner).toBe(projected.people?.lastModifiedBy);
@@ -353,6 +353,6 @@ describe("service-free saved people boundaries", () => {
     expect(projected.powerPlatformResource).toEqual(native.powerPlatformResource);
     expect(agentColumnValue(projected, "owner")).toBe(` ${firstId} `);
     expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [h.scope.tenantId, h.scope.principalId, "directory-generation", [firstId], at, "delegated"]);
+      [h.scope.tenantId, h.scope.principalId, "directory-generation", [firstId], at, "delegated", true]);
   });
 });

@@ -1,4 +1,4 @@
-export const copilotAppActivityStaleAfterDays = 3;
+const copilotAppActivityStaleAfterDays = 3;
 export const copilotAppActivityPeriod = "D28";
 export const copilotAppActivityReportVersion = "v2";
 

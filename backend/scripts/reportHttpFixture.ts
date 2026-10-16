@@ -21,7 +21,8 @@ export async function reportHttpFixture() {
     const id = randomUUID(), signature = createHmac("sha256", config.sessionSecret).update(id).digest("base64").replace(/=+$/g, "");
     await new Promise<void>((resolve, reject) => application.store.set(id, {
       cookie: new session.Cookie({ maxAge: 600000 }), tenantId: user.tenantId, accountId: user.homeAccountId,
-      clientId: config.tenants[0].clientId, csrfToken: "report-http-csrf", rolesValidatedAt: Date.now(), user: { ...user, roles },
+      clientId: config.tenants[0].clientId, csrfToken: "report-http-csrf",
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), user: { ...user, roles },
     }, error => error ? reject(error) : resolve()));
     return `agent-control.sid=${encodeURIComponent(`s:${id}.${signature}`)}`;
   }

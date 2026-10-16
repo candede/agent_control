@@ -1,6 +1,6 @@
 import type { Page, Route } from "@playwright/test";
-import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
-import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncState, type StartDataSyncInput } from "../src/api/client";
+import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
+import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncState, type PackageDetailSyncState, type StartDataSyncInput } from "../src/api/client";
 import { mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { createUnifiedVerification } from "../src/test/inventoryVerification";
 import { fulfillInventoryPage } from "./selectedInventoryFixture";
@@ -16,11 +16,34 @@ export const initial: DataSyncState = {
   })),
 };
 
-export async function mockSync(page: Page, firstState: DataSyncState, retainedRuns: DataSyncRun[] = []) {
+export async function mockSync(page: Page, firstState: DataSyncState, retainedRuns: DataSyncRun[] = [],
+  { automaticInitial = false }: { automaticInitial?: boolean } = {}) {
   const unexpected = await mockLayoutApi(page);
   let state = firstState;
   const starts: StartDataSyncInput[] = [];
   const reads: string[] = [];
+  const automaticStarts: DataSyncRun[] = [];
+  const startRun = (input: StartDataSyncInput, automatic = false) => {
+    const run: DataSyncRun = {
+      id: "11111111-1111-4111-8111-111111111111", mode: input.mode, automatic, status: "running",
+      startedAt: "2026-09-15T10:00:00.000Z", updatedAt: "2026-09-15T10:00:00.000Z", completedAt: null,
+      sources: initial.sources.filter(source => input.sources ? input.sources.includes(source.source) : source.source !== "usage_reports").map(source => ({
+        ...source,
+        status: source.source === "users" && !input.sources ? "succeeded" : "running",
+        count: source.source === "users" ? input.sources ? 17 : 42 : source.source === "graph_packages" ? 650 : 2451,
+        lastSuccessAt: source.source === "users" && !input.sources ? "2026-09-15T10:00:00.000Z" : null,
+        message: source.source === "graph_packages" ? "Reading the next page of Graph packages." : "",
+      })),
+    };
+    const sources = state.sources.map(source => {
+      const finished = run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded");
+      if (finished) return finished;
+      return input.clearSavedData && source.source !== "usage_reports"
+        ? { ...source, status: "not_started" as const, count: null, lastSuccessAt: null } : source;
+    });
+    state = { ...state, run, sources, onboardingRequired: needsOnboarding(sources) };
+    return run;
+  };
   const rejectRequest = (route: Route) => {
     const url = new URL(route.request().url());
     unexpected.push(`${route.request().method()} ${url.pathname}${url.search}`);
@@ -43,16 +66,27 @@ export async function mockSync(page: Page, firstState: DataSyncState, retainedRu
     const path = url.pathname;
     if (url.search) return rejectRequest(route);
     if (isAutomaticRefreshRequest(route.request())) {
+      if (automaticInitial && !state.run && state.onboardingRequired) automaticStarts.push(startRun({ mode: "initial" }, true));
+      const revision = (id: DataSyncSourceId) => {
+        const source = state.sources.find(source => source.source === id);
+        return JSON.stringify([source?.lastSuccessAt, source?.count]);
+      };
       return route.fulfill({ json: {
-        run: state.run, detailJob: null,
-        revisions: Object.fromEntries(automaticDataSyncSourceIds.map(id => {
-          const source = state.sources.find(source => source.source === id);
-          return [id, JSON.stringify([source?.lastSuccessAt, source?.count])];
-        })),
-        nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+        ...automaticRefreshFixture({
+          users: revision("users"), graph_packages: revision("graph_packages"), power_platform: revision("power_platform"),
+        }),
+        run: state.run,
       } });
     }
     if (route.request().method() === "GET") {
+      if (path === "/api/data-sync/package-details") {
+        reads.push(path);
+        if (state.sources.find(source => source.source === "graph_packages")?.lastSuccessAt) return route.fallback();
+        return route.fulfill({ json: {
+          status: "not_collected", total: 0, fresh: 0, pending: 0, eligible: 0, job: null,
+          message: "Collect the Graph package catalog before exact package details.",
+        } satisfies PackageDetailSyncState });
+      }
       if (path !== "/api/data-sync/state" && !/^\/api\/data-sync\/runs\/[^/]+$/.test(path)) return rejectRequest(route);
       reads.push(path);
       if (path === "/api/data-sync/state") return route.fulfill({ json: state });
@@ -65,27 +99,9 @@ export async function mockSync(page: Page, firstState: DataSyncState, retainedRu
     }
     const input = route.request().postDataJSON() as StartDataSyncInput;
     starts.push(input);
-    const run: DataSyncRun = {
-      id: "11111111-1111-4111-8111-111111111111", mode: input.mode, status: "running",
-      startedAt: "2026-09-15T10:00:00.000Z", updatedAt: "2026-09-15T10:00:00.000Z", completedAt: null,
-      sources: initial.sources.filter(source => input.sources ? input.sources.includes(source.source) : source.source !== "usage_reports").map(source => ({
-        ...source,
-        status: source.source === "users" && !input.sources ? "succeeded" : "running",
-        count: source.source === "users" ? input.sources ? 17 : 42 : source.source === "graph_packages" ? 650 : 2451,
-        lastSuccessAt: source.source === "users" && !input.sources ? "2026-09-15T10:00:00.000Z" : null,
-        message: source.source === "graph_packages" ? "Reading the next page of Graph packages." : "",
-      })),
-    };
-    const sources = state.sources.map(source => {
-      const finished = run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded");
-      if (finished) return finished;
-      return input.clearSavedData && source.source !== "usage_reports"
-        ? { ...source, status: "not_started" as const, count: null, lastSuccessAt: null } : source;
-    });
-    state = { ...state, run, sources, onboardingRequired: needsOnboarding(sources) };
-    return route.fulfill({ status: 202, json: run });
+    return route.fulfill({ status: 202, json: startRun(input) });
   });
-  return { starts, reads, unexpected, finish(completedAt?: string) {
+  return { starts, automaticStarts, reads, unexpected, finish(completedAt?: string) {
     if (!state.run) throw new Error("Expected a sync run before completion.");
     completedAt ??= new Date(Date.parse(state.run.updatedAt) + 60_000).toISOString();
     const completed = state.run.sources.map(source => ({

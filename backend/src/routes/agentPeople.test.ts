@@ -7,6 +7,7 @@ import { activateAccountSession, revokeAccountSessionMutations } from "../db/ses
 import { AppError, errorHandler } from "../errors.js";
 import { createUnifiedAgentsRouter } from "./unifiedAgents.js";
 import { LiveInventory } from "../db/liveInventory.js";
+import { loadOperationalState } from "../services/operationalState.js";
 
 const mocks = vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -65,6 +66,9 @@ beforeAll(async () => {
   });
 });
 beforeEach(async () => {
+  await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
+    mode: "normal",
+  }] }) });
   await activateAccountSession(config.tenants[0].tenantId!, "reader", async () => {});
   vi.resetAllMocks();
   mocks.generation.mockResolvedValue("initial");

@@ -17,6 +17,7 @@ import { InventoryQueries } from "../src/db/inventoryQueries.js";
 import { peakCheckpoint } from "../src/services/peakMemory.js";
 import { capacityInput, fixtureFetch } from "./capacityRuntime.js";
 import { capacityWithCleanup } from "./capacityBackground.js";
+import { loadOperationalState } from "../src/services/operationalState.js";
 export { capacityBudgets } from "./capacityRuntime.js";
 function percentiles(values: number[]) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -120,6 +121,7 @@ export async function runCapacity(mode: string) {
   }, 5000);
   const outcome: Record<string, unknown> = { seed: capacitySeed, mode, database: fixture.name, startedAt: new Date().toISOString() };
   try {
+    await loadOperationalState(database);
     const schema = {
       identity: (await database.query("SELECT fingerprint FROM app_schema WHERE singleton=true")).rows[0],
       role: (await database.query(`SELECT current_user AS role,current_database() AS database,
@@ -133,7 +135,13 @@ export async function runCapacity(mode: string) {
     const { capacityHttp } = await import("./capacityHttp.js");
     outcome.appBootstrap = await capacityHttp(database,telemetry,undefined,"capacity-bootstrap","bootstrap");
     telemetry.write({ event: "authenticated-app-bootstrap",result: outcome.appBootstrap });
-    if (mode === "full") {
+    if (mode === "web") {
+      outcome.web = await capacityHttp(database,telemetry,undefined,"capacity-main","web");
+      outcome.functionalStatus = "passed";
+      outcome.status = "inconclusive";
+      outcome.qualificationNote = "Focused genuine initial sync, 1008 admitted HTTP reads/download and compiled 100k UI; not all 29 profiles or full-tier capacity acceptance.";
+      process.exitCode = 2;
+    } else if (mode === "full") {
       outcome.profiles = await (await import("./capacityWorkloads.js")).fullCapacity(database, telemetry);
       outcome.functionalStatus = (outcome.profiles as { status: string }[]).every(profile => profile.status === "passed") ? "passed" : "failed";
       outcome.status = outcome.functionalStatus === "failed" ? "failed" : "inconclusive";

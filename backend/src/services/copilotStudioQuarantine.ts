@@ -52,7 +52,7 @@ export class CopilotStudioQuarantineClient {
   private readonly retryPolicy: RetryPolicy;
 
   constructor(
-    private readonly fetcher: FetchLike = fetch,
+    private readonly fetcher: FetchLike = (input, init) => fetch(input, init),
     retryPolicy: Partial<RetryPolicy> = {},
     private readonly requestTimeoutMs = defaultRequestTimeoutMs,
     private readonly now: () => Date = () => new Date(),

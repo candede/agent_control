@@ -29,6 +29,7 @@ describe("capability registry", () => {
     expect(capabilityDefinitions.filter(definition => definition.mode === "application")).toHaveLength(3);
     expect(capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id)).toEqual([
       "graph.package.access.manage", "graph.package.block.manage", "graph.agentIdentity.read", "graph.licenses.read", "powerPlatform.quarantine.manage",
+      "purview.audit.search.delegated", "purview.audit.search.application", "defender.hunting.delegated", "defender.hunting.application",
       "reports.copilotUsage.read",
     ]);
     expect(capabilityDefinitions.find(definition => definition.id === "reports.official.import")).toMatchObject({
@@ -39,7 +40,7 @@ describe("capability registry", () => {
     });
     expect(JSON.stringify(capabilityDefinitions)).not.toMatch(/Phase\s*0?5|owning.*phase/i);
     for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand"
-      && definition.id !== "reports.copilotUsage.read")) {
+      && (definition.id.startsWith("graph.") || definition.id === "powerPlatform.quarantine.manage"))) {
       expect(definition.probe.description).toContain("Microsoft authorizes the delegated request when it runs.");
       expect(definition.configuration.join(" ")).not.toMatch(/qualification|canary|disabled/i);
     }
@@ -54,6 +55,15 @@ describe("capability registry", () => {
     expect(capabilityDefinitions.find(definition => definition.id === "graph.licenses.read")?.permissions).toEqual(["User.Read.All", "LicenseAssignment.Read.All"]);
     for (const definition of capabilityDefinitions.filter(definition => definition.id.startsWith("graph.package.read."))) {
       expect(definition.probe.description).toMatch(/Response-size\/time-bounded.*first-page.*documented filter.*without following pagination/);
+    }
+  });
+
+  it("runs audit and hunting reads on demand with current Viewer authority", () => {
+    for (const id of ["purview.audit.search.delegated", "purview.audit.search.application", "defender.hunting.delegated", "defender.hunting.application"] as const) {
+      expect(capabilityDefinitions.find(definition => definition.id === id)).toMatchObject({
+        internalRoles: ["AgentControl.Viewer"], probe: { kind: "on_demand", adapterRegistered: true },
+      });
+      expect(supportsAutomaticCapabilityCheck(id)).toBe(id.endsWith(".delegated"));
     }
   });
 

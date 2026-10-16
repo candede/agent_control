@@ -83,13 +83,13 @@ describe("record-backed operator persistence", () => {
     const imports = new OfficialReportImports(restored.runtime);
     const upload = await imports.open(identity, { bundleId: randomUUID() });
     try {
-      await prepareRestoredDatabase(fixture.operator, restored.operator, new Date());
+      await prepareRestoredDatabase(fixture.operator, restored.operator);
       expect((await restored.runtime.query("SELECT state,stored_bytes::text FROM official_usage_ingestions WHERE id=$1", [upload.id])).rows[0])
         .toEqual({ state: "cancelled", stored_bytes: "0" });
       expect((await restored.runtime.query("SELECT epoch::text FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2",
         [identity.tenantId, identity.principalId])).rows[0].epoch).toBe("1");
-      expect((await restored.runtime.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0])
-        .toEqual({ mode: "maintenance", provider_work_enabled: false });
+      expect((await restored.runtime.query("SELECT mode FROM operational_state")).rows[0])
+        .toEqual({ mode: "maintenance" });
     } finally {
       await upload.cancel();
       await restored.close();
@@ -147,7 +147,7 @@ describe("record-backed operator persistence", () => {
         };
       });
       try {
-        await prepareRestoredDatabase(fixture.operator, restored.operator, new Date());
+        await prepareRestoredDatabase(fixture.operator, restored.operator);
         expect(maximumRows).toBe(250);
         expect(maximumBytes).toBeLessThanOrEqual(1024 ** 2);
         expect(maximumMutation).toBe(250);
@@ -157,8 +157,8 @@ describe("record-backed operator persistence", () => {
       expect((await restored.operator.query("SELECT count(*)::int AS count FROM copilot_quarantine_status_observations")).rows[0].count).toBe(549);
       expect((await restored.operator.query("SELECT id FROM copilot_quarantine_status_observations WHERE id=ANY($1::uuid[])", [changed])).rows).toEqual([]);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM data_principal_epochs WHERE tenant_id LIKE $1 AND epoch=0", [`${prefix}%`])).rows[0].count).toBe(551);
-      expect((await restored.operator.query("SELECT mode,provider_work_enabled FROM operational_state")).rows[0])
-        .toEqual({ mode: "maintenance", provider_work_enabled: false });
+      expect((await restored.operator.query("SELECT mode FROM operational_state")).rows[0])
+        .toEqual({ mode: "maintenance" });
     } finally { await restored.close(); }
   });
 });

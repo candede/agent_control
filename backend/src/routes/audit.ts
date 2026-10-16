@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { AppError, errorTelemetry } from "../errors.js";
@@ -9,6 +10,7 @@ import { operationalLog } from "../services/telemetry.js";
 import type { AuditScope, AuditStatus, LocalAuditAction } from "../types/audit.js";
 import { auditMaximumOffset, auditMaximumSearchLength, isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
+import { originCsv, parseOriginFilters, unknownOrigin } from "../services/actionOrigin.js";
 
 export const auditRouter = Router();
 
@@ -22,13 +24,10 @@ const auditActions = new Set<LocalAuditAction>([
   "export-audit-search",
   "view-hunting",
   "export-hunting",
-  "approve-hunting",
-  "qualify-hunting",
   "submit-hunting",
   "query-hunting",
   "cancel-hunting",
   "delete-hunting",
-  "revoke-hunting-scope",
   "export-package-inventory",
   "export-power-platform-inventory",
   "export-agent-inventory",
@@ -37,6 +36,7 @@ const auditActions = new Set<LocalAuditAction>([
   "export-administrative-audit",
   "associate-agent-usage",
   "remove-agent-usage-association",
+  "resume-control", "cancel-control", "reconcile-control",
 ]);
 const auditStatuses = new Set<AuditStatus>([
   "requested",
@@ -70,6 +70,7 @@ policyRoute(auditRouter, "get", "/audit/events", { access: "authenticated", data
 
 export function parseAuditEventsQuery(query: Record<string, unknown>) {
   return {
+    ...parseOriginFilters(query),
     limit: parseLimit(firstQueryValue(query.limit)),
     offset: parseOffset(firstQueryValue(query.offset)),
     agentId: firstQueryValue(query.agentId),
@@ -84,7 +85,7 @@ export function parseAuditEventsQuery(query: Record<string, unknown>) {
   };
 }
 
-policyRoute(auditRouter, "post", "/audit/events/export.csv", {
+policyRoute(auditRouter, "post", "/audit/events/export.csv", { browserOnly: true,
   access: "authenticated", dataClass: "local_audit_export", roles: ["AgentControl.Viewer"], csrf: true,
 }, async (request, response) => {
   const ids: unknown = request.body?.ids;
@@ -97,7 +98,7 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", {
   const audit = getAuditLog(requestScope(request));
   const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
   const receipt = await audit.startEvent({ operationId: `export-administrative-audit:${randomUUID()}`, action: "export-administrative-audit",
-    scope: "bulk", agentId: "local-administrative-audit", actor: request.session.user!, requestPath: request.path,
+    scope: "bulk", agentId: "local-administrative-audit", actor: requestUser(request), requestPath: request.path,
     metadata: { source: "local_administrative_audit" } });
   try {
     await validateSession();
@@ -105,12 +106,13 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", {
     if (events.length !== ids.length) throw new AppError(404, "not_found", "An audit export event is absent, expired or outside the current source scope.");
     const selected = JSON.stringify(events);
     const columns = ["sourceSystem", "eventId", "startedAt", "completedAt", "agentId", "agentName", "action", "status", "message",
-      "errorCode", "actorName", "actorUsername", "operationId"] as const;
+      "errorCode", "actorName", "actorUsername", "operationId", ...Object.keys(originCsv(unknownOrigin))];
     const csv = buildBoundedCsv(columns, events.map(event => ({
       sourceSystem: "local_administrative_audit", eventId: event.id, startedAt: event.startedAt, completedAt: event.completedAt,
       agentId: event.agentId, agentName: event.agentDisplayName, action: event.action, status: event.status,
       message: event.message, errorCode: event.errorCode, actorName: event.actor.displayName, actorUsername: event.actor.username,
       operationId: event.operationId,
+      ...originCsv(event.origin ?? unknownOrigin),
     })), { maximumRows: 100, maximumBytes: 1_000_000, deadlineAt });
     await publishBoundedCsv(request, response, "administrative-audit.csv", csv.buffer, {
       deadlineAt, validate: () => validateSession(async () => {

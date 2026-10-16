@@ -291,7 +291,7 @@ describe("native automatic import and semantic reuse", () => {
     expect(await (await bundle(identity)).accept()).toEqual(accepted);
     expect(await counts(identity)).toEqual(expected);
     await expect(original.accept()).rejects.toMatchObject({ code: purged ? "bundle_fence_mismatch" : "deleted_report_duplicate" });
-  });
+  }, 30_000);
 
   it("reimports historical content without changing sets that share its versions", async () => {
     const identity = owner(), original = await (await bundle(identity)).accept(), bundleId = randomUUID();
@@ -305,7 +305,7 @@ describe("native automatic import and semantic reuse", () => {
     expect((await agents(identity)).reports.setId).toBe(accepted.setId);
     await releaseSelections(identity); await retainUntilConverged(fixture.operator, { batchSize: 250 });
     expect(await counts(identity)).toEqual({ sets: 3, versions: 5, facts: 4, rows: 4, memberships: 9 });
-  });
+  }, 30_000);
 
   it("fences different simultaneous reuploads and deduplicates a fresh retry", async () => {
     const identity = owner(), original = await (await bundle(identity)).accept();

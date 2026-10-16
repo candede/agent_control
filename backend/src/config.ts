@@ -8,6 +8,13 @@ export type TenantConfiguration = {
   clientSecret: string;
   domains: readonly string[];
   displayName: string;
+  integration?: TenantIntegration;
+};
+
+export type TenantIntegration = {
+  clientId: string;
+  audience: string;
+  scope: "AgentControl.Access";
 };
 
 const identifierPattern = /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -95,6 +102,9 @@ function readTenantConfigurations(): TenantConfiguration[] {
 function parseTenantConfiguration(value: unknown, label: string): TenantConfiguration {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a tenant profile.`);
   const profile = value as Record<string, unknown>;
+  if (Object.keys(profile).some(key => !["tenantId", "clientId", "clientSecret", "domains", "displayName", "integration"].includes(key))) {
+    throw new Error(`${label}: unknown tenant profile field.`);
+  }
   if (typeof profile.tenantId !== "string" || !identifierPattern.test(profile.tenantId)
     || typeof profile.clientId !== "string" || !identifierPattern.test(profile.clientId)) {
     throw new Error(`${label}: tenantId and clientId must be GUIDs.`);
@@ -121,7 +131,21 @@ function parseTenantConfiguration(value: unknown, label: string): TenantConfigur
     clientSecret: profile.clientSecret,
     domains,
     displayName: typeof profile.displayName === "string" ? profile.displayName.trim() : profile.tenantId.toLowerCase(),
+    ...(profile.integration === undefined ? {} : { integration: parseTenantIntegration(profile.integration, profile.clientId, label) }),
   };
+}
+
+function parseTenantIntegration(value: unknown, apiClientId: string, label: string): TenantIntegration {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}: integration must be an object.`);
+  const integration = value as Record<string, unknown>;
+  if (Object.keys(integration).some(key => !["clientId", "audience", "scope"].includes(key))
+    || typeof integration.clientId !== "string" || !identifierPattern.test(integration.clientId)
+    || integration.clientId.toLowerCase() === apiClientId.toLowerCase()
+    || typeof integration.audience !== "string" || integration.audience.toLowerCase() !== apiClientId.toLowerCase()
+    || integration.scope !== "AgentControl.Access") {
+    throw new Error(`${label}: integration requires a distinct clientId GUID, the exact API clientId audience, and AgentControl.Access scope; no other fields are supported.`);
+  }
+  return { clientId: integration.clientId.toLowerCase(), audience: integration.audience.toLowerCase(), scope: integration.scope };
 }
 
 function assertUniqueTenants(profiles: readonly TenantConfiguration[]) {

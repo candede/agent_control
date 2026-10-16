@@ -8,7 +8,7 @@ import type {
 } from "../types/officialReportRecords.js";
 import { AppError } from "../errors.js";
 
-export const officialUsageParserVersion = "1";
+const officialUsageParserVersion = "1";
 
 export class OfficialUsageValidationError extends AppError {
   constructor(code: string, message: string) {

@@ -10,6 +10,7 @@ import { AuditLogView } from "./AuditLogView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchDialog } from "./WorkbenchDialog";
+import { unknownOrigin } from "../../../backend/src/types/actionOrigin";
 
 mockNativeDialogs();
 
@@ -33,6 +34,12 @@ const associationEvent: AuditEvent = {
     reportAgentHash: "c".repeat(64), targetSelectionHash: "d".repeat(64), changed: false,
   },
 };
+const originEvent: AuditEvent = { ...associationEvent, metadata: undefined, agentDisplayName: "Managed target",
+  origin: { ...unknownOrigin, channel: "mcp", integrationClientId: "33333333-3333-3333-3333-333333333333",
+    client: { id: { value: "caller-a", evidence: "reported" }, name: { value: "=1+1", evidence: "reported" },
+      version: { value: "1", evidence: "reported" } },
+    callingAgent: { id: { value: "agent-a", evidence: "reported" }, name: { value: "<script>alert(1)</script>", evidence: "reported" } },
+    requestId: "11111111-1111-1111-1111-111111111111", mcpCallId: "call-1" } };
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -41,6 +48,55 @@ beforeEach(() => {
 });
 
 describe("AuditLogView routing", () => {
+  it("renders origin independently of managed target and displays inert per-field evidence with keyboard focus", async () => {
+    window.history.replaceState({}, "", "/audit");
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [originEvent] });
+    render(<AuditLogView agents={[]} />);
+    const table = await screen.findByRole("region", { name: "Audit events" });
+    expect(within(table).getByRole("columnheader", { name: "Origin" })).toBeVisible();
+    expect(table).toHaveTextContent("Managed target");
+    expect(table).toHaveTextContent("Client: =1+1");
+    const trigger = within(table).getByRole("button", { name: `View origin details for ${originEvent.id}` });
+    trigger.focus(); await userEvent.keyboard("{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Event details" });
+    expect(within(dialog).getByRole("button", { name: "Close" })).toHaveFocus();
+    expect(dialog).toHaveTextContent("<script>alert(1)</script> (reported)");
+    expect(dialog).toHaveTextContent("Integration application (authenticated when known)");
+    expect(dialog).toHaveTextContent("Reported labels are not verified identities.");
+    expect(dialog.querySelector("script")).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+  it("keeps unrecorded historical origin explicitly unknown", async () => {
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{ ...associationEvent, metadata: undefined }] });
+    render(<AuditLogView agents={[]} />);
+    await userEvent.click(await screen.findByRole("button", { name: `View origin details for ${associationEvent.id}` }));
+    const dialog = screen.getByRole("dialog", { name: "Event details" });
+    expect(dialog).toHaveTextContent("Origin: Unknown / historical");
+    expect(dialog).toHaveTextContent("Unknown (unknown)");
+    expect(dialog).not.toHaveTextContent("Origin: Web app");
+  });
+  it("restores all origin filters, invalidates page/detail/export on channel change, and preserves exact current-page IDs", async () => {
+    window.history.replaceState({}, "", "/audit?origin=mcp&integration=33333333-3333-3333-3333-333333333333&client=caller-a&callingAgent=agent-a&page=3");
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 300, value: [originEvent] });
+    let signal!: AbortSignal;
+    vi.mocked(downloadAdministrativeAuditCsv).mockImplementation((_ids, supplied) => { signal = supplied!; return new Promise(() => undefined); });
+    render(<WorkbenchActionProvider value={workbenchActions}><AuditLogView agents={[]} /></WorkbenchActionProvider>);
+    await screen.findByRole("region", { name: "Audit events" });
+    expect(getAuditEvents).toHaveBeenCalledWith(expect.objectContaining({ offset: 200, originChannel: "mcp",
+      originIntegrationClientId: originEvent.origin!.integrationClientId, originClientId: "caller-a", originCallingAgentId: "agent-a" }), expect.anything());
+    await userEvent.click(screen.getByRole("button", { name: "Export current audit page CSV" }));
+    expect(downloadAdministrativeAuditCsv).toHaveBeenCalledWith([originEvent.id], expect.any(AbortSignal));
+    await userEvent.click(screen.getByRole("button", { name: `View origin details for ${originEvent.id}` }));
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Origin" }), "unknown");
+    await waitFor(() => expect(signal.aborted).toBe(true));
+    await waitFor(() => expect(getAuditEvents).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0, originChannel: "unknown" }), expect.anything()));
+    expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).has("page")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => expect(window.location.search).toBe(""));
+  });
   it("does not cancel a background audit dialog when Escape belongs to a native workbench dialog", async () => {
     const overflow = document.body.style.overflow, onClose = vi.fn();
     vi.mocked(getAuditEvents).mockResolvedValue({ value: [associationEvent], count: 1 });
@@ -114,13 +170,10 @@ describe("AuditLogView routing", () => {
 
   it.each([
     ["reassign", "Reassign owner"],
-    ["approve-hunting", "Approve Defender hunting qualification"],
-    ["qualify-hunting", "Run Defender hunting qualification"],
     ["submit-hunting", "Submit Defender hunt"],
     ["query-hunting", "Query Defender hunting"],
     ["cancel-hunting", "Cancel Defender hunt"],
     ["delete-hunting", "Delete Defender hunt"],
-    ["revoke-hunting-scope", "Revoke saved Defender scope"],
     ["export-official-usage-aggregate", "Export agent usage report"],
     ["export-official-usage-users", "Export user usage report"],
     ["export-administrative-audit", "Export administrative audit"],

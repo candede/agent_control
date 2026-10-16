@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { currentActionOrigin, parseStoredOrigin } from "../services/actionOrigin.js";
 import { isProxy } from "node:util/types";
 import { setTimeout as delay } from "node:timers/promises";
 import type pg from "pg";
@@ -20,7 +21,7 @@ import { measurePublication } from "../services/peakMemory.js";
 import { completeReportVersionSql } from "./reportCapacitySchema.js";
 import { operationalLog } from "../services/telemetry.js";
 
-type Lease = { id: string; owner: string; identity: SelectionIdentity };
+type Lease = { id: string; owner: string; identity: SelectionIdentity; origin: import("../types/actionOrigin.js").AuditOriginV1 };
 export type ReportImportIntent = { bundleId: string; correctionOfSetId?: string; rejectDuplicateKind?: boolean };
 export type ReportAcceptance = { stagingId: string; revision: number; contentHash: string; expectedActiveRevision: string };
 export type ReportConfirmation = { id: string; setId: string; operation: "select" | "delete"; activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };
@@ -130,7 +131,7 @@ export class OfficialReportImports {
       ...(supplied.correctionOfSetId === undefined ? {} : { correctionOfSetId: reportUuid(supplied.correctionOfSetId) }),
       rejectDuplicateKind: supplied.rejectDuplicateKind ?? false };
     await this.history.ensure(identity.tenantId);
-    const lease: Lease = { id: randomUUID(), owner: randomUUID(), identity };
+    const lease: Lease = { id: randomUUID(), owner: randomUUID(), identity, origin: currentActionOrigin() };
     await this.connections.run(async client => {
       await this.authorize(client, identity);
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
@@ -152,9 +153,9 @@ export class OfficialReportImports {
       if (intent.correctionOfSetId && !(await client.query(`SELECT 1 FROM official_usage_sets WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL`,
         [intent.correctionOfSetId, identity.tenantId])).rowCount) throw new AppError(409, "invalid_correction", "Correction target is unavailable.");
       await this.quotas(client, identity, intent.bundleId, 0);
-      await client.query(`INSERT INTO official_usage_ingestions(id,tenant_id,principal_id,bundle_id,correction_of,owner,session_epoch,state,lease_until,deadline_at,expires_at,reject_duplicate_kind)
-        VALUES($1,$2,$3,$4,$5,$6,$7,'streaming',clock_timestamp()+interval '60 seconds',clock_timestamp()+interval '30 minutes',clock_timestamp()+interval '30 minutes',$8)`,
-      [lease.id, identity.tenantId, identity.principalId, intent.bundleId, intent.correctionOfSetId ?? null, lease.owner, identity.sessionEpoch, intent.rejectDuplicateKind ?? false]);
+      await client.query(`INSERT INTO official_usage_ingestions(id,tenant_id,principal_id,bundle_id,correction_of,owner,session_epoch,state,lease_until,deadline_at,expires_at,reject_duplicate_kind,origin)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'streaming',clock_timestamp()+interval '60 seconds',clock_timestamp()+interval '30 minutes',clock_timestamp()+interval '30 minutes',$8,$9)`,
+      [lease.id, identity.tenantId, identity.principalId, intent.bundleId, intent.correctionOfSetId ?? null, lease.owner, identity.sessionEpoch, intent.rejectDuplicateKind ?? false, lease.origin]);
     }, false, parent);
     const cancellation = new AbortController();
     const heartbeat = generationHeartbeat(() => this.connections.run(async client => {
@@ -207,10 +208,10 @@ export class OfficialReportImports {
             for (const other of previous) {
               await client.query("UPDATE official_usage_ingestions SET state='cancelled' WHERE id=$1", [other.id]);
               await client.query("UPDATE official_usage_staging SET status='replaced' WHERE id=$1", [other.staging_id]);
-              await this.audit(client, identity, "discarded", result!.kind, other.staging_id, null);
+              await this.audit(client, identity, "discarded", result!.kind, other.staging_id, null, lease.origin);
             }
             await client.query("UPDATE official_usage_ingestions SET state='ready' WHERE id=$1", [lease.id]);
-            await this.audit(client, identity, "staged", result!.kind, finalized.id, result!.rowCount);
+            await this.audit(client, identity, "staged", result!.kind, finalized.id, result!.rowCount, lease.origin);
             return previous.map(other => other.id as string);
           }, false, heartbeat.signal);
           await heartbeat.stop();
@@ -453,7 +454,7 @@ export class OfficialReportImports {
       let acceptedBundle: string | undefined;
       let receipt: { setId: string; activeRevision: string; complete: boolean } | undefined;
       for (const input of inputs) {
-        const stage = (await client.query(`SELECT s.*,i.id AS ingestion_id,i.owner,i.version_id AS pending_version,
+        const stage = (await client.query(`SELECT s.*,i.id AS ingestion_id,i.owner,i.origin AS initiating_origin,i.version_id AS pending_version,
           i.state AS ingestion_state,i.acceptance_revision::text,i.lease_until,i.deadline_at
           FROM official_usage_staging s JOIN official_usage_ingestions i ON i.staging_id=s.id
           WHERE s.id=$1 AND s.tenant_id=$2 AND s.actor_principal_id=$3 AND s.expires_at>clock_timestamp()
@@ -584,7 +585,8 @@ export class OfficialReportImports {
       if ("cleanup" in prepared) for (const id of prepared.cleanup!) await this.cleanupAccepted(id);
       return prepared.receipt;
     }
-    const leases = prepared.stages.map(stage => ({ id: stage.ingestion_id as string, owner: stage.owner as string, identity }));
+    const leases = prepared.stages.map(stage => ({ id: stage.ingestion_id as string, owner: stage.owner as string, identity,
+      origin: parseStoredOrigin(stage.initiating_origin) }));
     const heartbeat = generationHeartbeat(() => this.connections.run(async client => {
       for (const lease of leases) {
         await this.fence(client, lease);
@@ -746,9 +748,9 @@ export class OfficialReportImports {
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND state IN ('streaming','validating','ready','accepting') RETURNING staging_id,kind,row_count`,
       [ingestionId, identity.tenantId, identity.principalId])).rows[0];
       if (row?.staging_id) await client.query("UPDATE official_usage_staging SET status='cancelled' WHERE id=$1 AND status='active'", [row.staging_id]);
-      if (row) await client.query(`INSERT INTO official_usage_audit(id,tenant_id,actor_principal_id,action,target_kind,target_id,row_count,outcome,error_code)
-        VALUES($1,$2,$3,'discarded',$4,$5,$6,'rejected','upload_cancelled')`,
-      [randomUUID(), identity.tenantId, identity.principalId, row.kind, row.staging_id ?? ingestionId, row.row_count]);
+      if (row) await client.query(`INSERT INTO official_usage_audit(id,tenant_id,actor_principal_id,action,target_kind,target_id,row_count,outcome,error_code,origin)
+        VALUES($1,$2,$3,'discarded',$4,$5,$6,'rejected','upload_cancelled',$7)`,
+      [randomUUID(), identity.tenantId, identity.principalId, row.kind, row.staging_id ?? ingestionId, row.row_count, currentActionOrigin()]);
     });
     await this.cleanupIngestion(ingestionId);
   }
@@ -856,8 +858,8 @@ export class OfficialReportImports {
         return rows + staged;
       });
   }
-  private async audit(client: pg.PoolClient, identity: SelectionIdentity, action: "staged" | "accepted" | "selected" | "deleted" | "discarded", kind: OfficialUsageReportKind | null, id: string, rows: number | null) {
-    await client.query(`INSERT INTO official_usage_audit(id,tenant_id,actor_principal_id,action,target_kind,target_id,row_count,outcome)
-      VALUES($1,$2,$3,$4,$5,$6,$7,'succeeded')`, [randomUUID(), identity.tenantId, identity.principalId, action, kind, id, rows]);
+  private async audit(client: pg.PoolClient, identity: SelectionIdentity, action: "staged" | "accepted" | "selected" | "deleted" | "discarded", kind: OfficialUsageReportKind | null, id: string, rows: number | null, origin = currentActionOrigin()) {
+    await client.query(`INSERT INTO official_usage_audit(id,tenant_id,actor_principal_id,action,target_kind,target_id,row_count,outcome,origin)
+      VALUES($1,$2,$3,$4,$5,$6,$7,'succeeded',$8)`, [randomUUID(), identity.tenantId, identity.principalId, action, kind, id, rows, origin]);
   }
 }

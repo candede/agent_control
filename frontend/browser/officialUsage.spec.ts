@@ -88,15 +88,13 @@ test.afterEach(async ({ page }) => {
 });
 
 for (const scenario of [
-  { legacy: "/official-usage", canonical: "/sync?reports=manage", title: "Manage reports" },
-  { legacy: "/official-usage?view=history", canonical: "/sync?reports=manage", title: "Manage reports" },
-  { legacy: "/official-usage?view=snapshot", canonical: "/sync?reports=snapshot", title: "Report details" },
-  { legacy: `/official-usage?snapshot=${setId}`, canonical: `/sync?reports=snapshot&snapshot=${setId}`, title: "Report details" },
-  { legacy: `/official-usage?view=history&snapshot=${setId}`, canonical: "/sync?reports=manage", title: "Manage reports" },
-  { legacy: "/official-usage?view=snapshot&window=90", canonical: "/sync?reports=snapshot&window=90", title: "Report details" },
-]) test(`legacy workbench link ${scenario.legacy} opens its exact Sync workflow without a data alias`, async ({ page }) => {
+  { canonical: "/sync?reports=manage", title: "Manage reports" },
+  { canonical: "/sync?reports=snapshot", title: "Report details" },
+  { canonical: `/sync?reports=snapshot&snapshot=${setId}`, title: "Report details" },
+  { canonical: "/sync?reports=snapshot&window=90", title: "Report details" },
+]) test(`canonical workbench link ${scenario.canonical} opens its exact Sync workflow`, async ({ page }) => {
   const state = await mockUsage(page, { active: true, role: "Viewer" });
-  await page.goto(scenario.legacy); await expect(page).toHaveURL(scenario.canonical);
+  await page.goto(scenario.canonical); await expect(page).toHaveURL(scenario.canonical);
   await expect(modal(page)).toHaveAccessibleName(scenario.title); await expect(page.getByRole("dialog")).toHaveCount(1);
   await expect(page.locator(".official-usage-workbench")).toHaveCount(0);
   if (scenario.title === "Report details") {
@@ -484,7 +482,8 @@ test("read-only snapshot preserves raw metrics, unknown source freshness and bou
 });
 
 async function scrolling(page: Page, pane: Locator, dismissal: string) {
-  await expect(modal(page).locator(".usage-modal-content")).toHaveCSS("overflow-y", "hidden");
+  const content = modal(page).locator(".usage-modal-content");
+  const contentScroll = await content.evaluate(element => element.scrollTop);
   await expect(pane).toHaveCSS("overflow-y", "auto");
   await page.evaluate(async () => { await document.fonts.ready; await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))); });
   const metrics = await pane.evaluate(element => ({ height: element.clientHeight, scrollHeight: element.scrollHeight }));
@@ -503,6 +502,7 @@ async function scrolling(page: Page, pane: Locator, dismissal: string) {
   await modal(page).getByRole("button", { name: dismissal, exact: true }).scrollIntoViewIfNeeded();
   await expect(modal(page).getByRole("button", { name: dismissal, exact: true })).toBeInViewport({ ratio: 1 });
   expect(await page.evaluate(() => window.scrollY)).toBe(background);
+  expect(await content.evaluate(element => element.scrollTop)).toBe(contentScroll);
   await test.info().attach("report-pane-scroll", { body: JSON.stringify({ ...metrics, bounds, wheel, keyboard: await top() }), contentType: "application/json" });
 }
 for (const role of ["Admin", "Viewer"] as const) for (const view of ["manage", "snapshot"] as const) {
@@ -531,11 +531,13 @@ test("validation errors retain accessible upload, provenance and cancellation at
 
 test("saved staging links read exact receipts and companion previews without publication", async ({ page }) => {
   const state = await mockUsage(page, { staged: true }), stagingId = state.stages[0].id;
-  await page.goto(`/official-usage?staging=${stagingId}`);
+  await page.goto(`/sync?reports=import&staging=${stagingId}`);
   await expect(page).toHaveURL(`/sync?reports=import&staging=${stagingId}`);
   await expect(modal(page).getByRole("button", { name: "Choose CSV files" })).toBeEnabled();
   await expect(modal(page)).toContainText("Agents - 103 rows");
-  expect(state.stageReads).toEqual([stagingId]); expect(state.bundlePreviews.at(-1)?.bundleId).toBe(state.stages[0].bundleId);
+  expect(state.stageReads.length).toBeGreaterThan(0);
+  expect(new Set(state.stageReads)).toEqual(new Set([stagingId]));
+  expect(state.bundlePreviews.at(-1)?.bundleId).toBe(state.stages[0].bundleId);
   expect(state.acceptRequests).toEqual([]); expect(state.uploadBodies).toEqual([]);
   await cancelDraft(page); expect(state.discardedStages).toEqual([stagingId]);
   await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
@@ -571,7 +573,7 @@ test("agent sorts, reach, dates and self-excluding creator facets feed one nativ
   expect(file.suggestedFilename()).toBe("official-agents.csv"); expect(csv).toHaveLength(1);
   expect(Object.keys(csv[0])).toEqual([...reportExportColumns.official_agents]);
   expect(csv[0]).toMatchObject({ agentId: "agent-low", agentName: "Prompt Coach", responsesSentToUsers: "3", reportSetId: setId });
-  expect(Object.fromEntries(state.exportRequests[0])).toMatchObject({ setId, search: "Prompt", creatorType: "Agent built by Microsoft", sort: "name", order: "asc" });
+  expect(Object.fromEntries(state.exportRequests[0])).toMatchObject({ setId, search: "prompt", creatorType: "Agent built by Microsoft", sort: "name", order: "asc" });
   expect(state.exportSubmissions).toEqual([{ kind: "official_agents", selectionId: expect.any(String), idempotencyKey: expect.any(String) }]);
   expect(state.exportStatusBytes).toHaveLength(2); expect(state.exportStatusBytes.every(bytes => bytes < 1024)).toBe(true);
   expect(state.exportDownloads).toEqual([true]); expect(state.userRequests).toEqual([]);

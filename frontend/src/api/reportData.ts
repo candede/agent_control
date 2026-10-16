@@ -2,8 +2,8 @@ import { ApiError, captureRequestSession, request } from "./client";
 import type { ReportQuery, CombinedUser, ReportUser, ReportAgent, ReportHistorySet, ReportOverviewAgent, ReportListPage, ReportPage } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail, OfficialReportExportRequest, OfficialReportExportStatus, OfficialReportFacetPage,
   OfficialReportImportIntent, OfficialReportPreview, OfficialReportBundlePreview, OfficialReportBundleAcceptance, OfficialReportBundleInspection, OfficialReportAccepted,
-  OfficialReportConfirmation, OfficialReportConfirmed, OfficialReportDiagnostics,
-  CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageCandidates, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
+  OfficialReportConfirmation, OfficialReportConfirmed,
+  CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
 
 export type ReportPageRequest = ReportQuery & { selectionId?: string; inventorySelectionId?: string; cursor?: string; limit?: number };
 export function normalizeReportSearch(value: string): string {
@@ -79,17 +79,12 @@ export function reportExportDownload(id: string) {
 export function readAgentReportSummary(recordId: string, query: { selectionId?: string; inventorySelectionId?: string; setId?: string }, signal?: AbortSignal) {
   return request<CandidateAgentUsageSummary>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage${reportQueryString(query)}`, { signal });
 }
-export function readAgentReportHistory(recordId: string, query: { selectionId: string; inventorySelectionId?: string; limit?: number; cursor?: string }, signal?: AbortSignal) {
+export function readAgentReportHistory(recordId: string, query: { selectionId: string; inventorySelectionId?: string; limit?: number; cursor?: string;
+  compareFromSetId?: string; compareToSetId?: string }, signal?: AbortSignal) {
   return request<CandidateAgentUsageHistory>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-history${reportQueryString(query)}`, { signal });
 }
 export function readAgentReportAssociations(recordId: string, query: { selectionId: string; inventorySelectionId?: string; setId?: string; limit?: number; cursor?: string }, signal?: AbortSignal) {
   return request<CandidateAgentUsageAssociations>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations${reportQueryString(query)}`, { signal });
-}
-export function readAgentReportCandidates(recordId: string,
-  query: { selectionId?: string; inventoryRevision?: string; cursor?: string; limit?: number; search?: string }, signal?: AbortSignal) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  return request<CandidateAgentUsageCandidates>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-candidates${params.size ? `?${params}` : ""}`, { signal });
 }
 export function mutateAgentReportAssociation(recordId: string, input: CandidateAgentUsageMutation, operation: "associate" | "remove", signal?: AbortSignal, inventorySelectionId?: string) {
   return request<CandidateAgentUsageContext>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations${reportQueryString({ inventorySelectionId })}`, {
@@ -116,6 +111,3 @@ export const previewReportBundle = (id: string, signal?: AbortSignal, options: O
 export const acceptReportBundle = (id: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) => post<OfficialReportAccepted>(`/api/official-usage/bundles/${encodeURIComponent(id)}/accept`, input, signal);
 export const previewReportOperation = (id: string, operation: "select" | "delete", signal?: AbortSignal) => post<OfficialReportConfirmation>(`/api/official-usage/sets/${encodeURIComponent(id)}/preview`, { operation }, signal);
 export const confirmReportOperation = (input: OfficialReportConfirmation, signal?: AbortSignal) => post<OfficialReportConfirmed>(`/api/official-usage/confirmations/${encodeURIComponent(input.id)}`, input, signal);
-export function readReportDiagnostics(id: string, cursor?: string, signal?: AbortSignal) {
-  return request<OfficialReportDiagnostics>(`/api/official-usage/staging/${encodeURIComponent(id)}/diagnostics${reportQueryString({ cursor, limit: 50 })}`, { signal });
-}

@@ -4,6 +4,7 @@ import { pool } from "../db/pool.js";
 import type { AuditEvent, CompleteAuditEvent, ListAuditEventsQuery, StartAuditEvent } from "../types/audit.js";
 import { auditDefaultPageSize, auditMaximumOffset, auditMetadata, isAuditOperationPrefix } from "../types/audit.js";
 import { AppError } from "../errors.js";
+import { initiatingOrigin, parseStoredOrigin, originFilterColumns } from "./actionOrigin.js";
 
 export type DataScope = { tenantId: string; principalId: string };
 type Database = Pick<pg.Pool, "query">;
@@ -17,7 +18,7 @@ export class AuditLog {
     if (event.actor.tenantId !== this.scope.tenantId || event.actor.homeAccountId !== this.scope.principalId) {
       throw new Error("Audit actor scope mismatch.");
     }
-    const record: AuditEvent = { ...event, id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "started", metadata: auditMetadata(event.metadata) };
+    const record: AuditEvent = { ...event, origin: event.origin ? parseStoredOrigin(event.origin) : initiatingOrigin(event.actor), id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "started", metadata: auditMetadata(event.metadata) };
     await this.append(record);
     return record;
   }
@@ -27,20 +28,20 @@ export class AuditLog {
       if (event.actor.tenantId !== this.scope.tenantId || event.actor.homeAccountId !== this.scope.principalId) {
         throw new Error("Audit actor scope mismatch.");
       }
-      return { ...event, id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "requested", metadata: auditMetadata(event.metadata) } as AuditEvent;
+      return { ...event, origin: event.origin ? parseStoredOrigin(event.origin) : initiatingOrigin(event.actor), id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "requested", metadata: auditMetadata(event.metadata) } as AuditEvent;
     });
     if (!records.length) return records;
     await this.database.query(`INSERT INTO audit_events
       (id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,target_blocked_state,
-       agent_id,agent_display_name,started_at,status,message,error_code,request_path,metadata)
+       agent_id,agent_display_name,started_at,status,message,error_code,request_path,metadata,origin)
       SELECT gen_random_uuid(),entry.event_id,entry.operation_id,$2,$3,entry.actor_username,entry.actor_name,entry.scope,entry.action,entry.target_blocked_state,
-        entry.agent_id,entry.agent_display_name,entry.started_at,'requested',entry.message,entry.error_code,entry.request_path,entry.metadata
+        entry.agent_id,entry.agent_display_name,entry.started_at,'requested',entry.message,entry.error_code,entry.request_path,entry.metadata,entry.origin
       FROM jsonb_to_recordset($1::jsonb) AS entry(event_id text,operation_id text,actor_username text,actor_name text,scope text,action text,
-        target_blocked_state boolean,agent_id text,agent_display_name text,started_at timestamptz,message text,error_code text,request_path text,metadata jsonb)`, [JSON.stringify(records.map(record => ({
+        target_blocked_state boolean,agent_id text,agent_display_name text,started_at timestamptz,message text,error_code text,request_path text,metadata jsonb,origin jsonb)`, [JSON.stringify(records.map(record => ({
         event_id: record.id, operation_id: record.operationId, actor_username: record.actor.username, actor_name: record.actor.displayName,
         scope: record.scope, action: record.action, target_blocked_state: record.targetBlockedState ?? null, agent_id: record.agentId,
         agent_display_name: record.agentDisplayName ?? null, started_at: record.startedAt, message: record.message ?? null,
-        error_code: record.errorCode ?? null, request_path: record.requestPath, metadata: record.metadata ?? null,
+        error_code: record.errorCode ?? null, request_path: record.requestPath, metadata: record.metadata ?? null, origin: record.origin,
       }))), this.scope.tenantId, this.scope.principalId]);
     return records;
   }
@@ -49,7 +50,7 @@ export class AuditLog {
     const current = await this.getEvent(id);
     if (!current) throw new Error("Audit event was not found in this scope.");
     const record: AuditEvent = {
-      ...current, ...update,
+      ...current, ...update, origin: current.origin,
       completedAt: update.completedAt ?? new Date().toISOString(),
       message: update.message?.slice(0, 4096), errorCode: update.errorCode?.slice(0, 256),
       metadata: update.metadata ? { ...current.metadata, ...auditMetadata(update.metadata) } : current.metadata,
@@ -61,12 +62,12 @@ export class AuditLog {
   private async append(event: AuditEvent) {
     await this.database.query(`INSERT INTO audit_events
       (id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,target_blocked_state,
-       agent_id,agent_display_name,started_at,completed_at,status,message,error_code,request_path,metadata)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+       agent_id,agent_display_name,started_at,completed_at,status,message,error_code,request_path,metadata,origin)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
     [randomUUID(), event.id, event.operationId, this.scope.tenantId, this.scope.principalId,
       event.actor.username, event.actor.displayName, event.scope, event.action, event.targetBlockedState ?? null,
       event.agentId, event.agentDisplayName ?? null, event.startedAt, event.completedAt ?? null, event.status,
-      event.message ?? null, event.errorCode ?? null, event.requestPath, event.metadata ?? null]);
+      event.message ?? null, event.errorCode ?? null, event.requestPath, event.metadata ?? null, event.origin]);
   }
 
   async getEvent(id: string) {
@@ -91,13 +92,17 @@ export class AuditLog {
       const value = query[key as keyof ListAuditEventsQuery];
       if (value !== undefined) { values.push(value); clauses.push(`${column}=$${values.length}`); }
     }
+    for (const [key, column] of Object.entries(originFilterColumns)) {
+      const value = query[key as keyof ListAuditEventsQuery];
+      if (value !== undefined) { values.push(value); clauses.push(`${column}=$${values.length}`); }
+    }
     if (query.operationIdPrefix) {
       values.push(escapeLike(query.operationIdPrefix) + "%");
       clauses.push(`operation_id ILIKE $${values.length} ESCAPE '\\'`);
     }
     if (query.search) {
       values.push(`%${escapeLike(query.search)}%`);
-      clauses.push(`concat_ws(' ',agent_id,agent_display_name,actor_username,actor_name,operation_id,message,error_code) ILIKE $${values.length} ESCAPE '\\'`);
+      clauses.push(`concat_ws(' ',agent_id,agent_display_name,actor_username,actor_name,operation_id,message,error_code,origin#>>'{client,name,value}',origin#>>'{callingAgent,name,value}') ILIKE $${values.length} ESCAPE '\\'`);
     }
     return { sql: clauses.join(" AND "), values };
   }
@@ -146,7 +151,7 @@ function toEvent(row: Record<string, unknown>): AuditEvent {
     actor: { tenantId: row.tenant_id, homeAccountId: row.principal_id, username: row.actor_username, displayName: row.actor_name },
     startedAt: (row.started_at as Date).toISOString(), completedAt: (row.completed_at as Date | null)?.toISOString(),
     status: row.status, message: row.message ?? undefined, errorCode: row.error_code ?? undefined,
-    requestPath: row.request_path, metadata: auditMetadata(row.metadata),
+    requestPath: row.request_path, metadata: auditMetadata(row.metadata), origin: parseStoredOrigin(row.origin),
   } as AuditEvent;
 }
 

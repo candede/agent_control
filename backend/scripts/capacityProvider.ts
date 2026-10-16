@@ -9,12 +9,12 @@ import { capacityHttpLoad } from "./capacityHttpLoad.js";
 export const capacitySeed = "ltdp-06-v1";
 export const fixtureTenant = "11111111-1111-4111-8111-111111111111";
 export const otherTenant = "22222222-2222-4222-8222-222222222222";
-export const fixtureEnvironment = "66666666-6666-4666-8666-666666666666";
-export const otherEnvironment = "77777777-7777-4777-8777-777777777777";
-export const botId = (i: number) => `55555555-5555-4555-8555-${String(i).padStart(12, "0")}`;
+const fixtureEnvironment = "66666666-6666-4666-8666-666666666666";
+const otherEnvironment = "77777777-7777-4777-8777-777777777777";
+const botId = (i: number) => `55555555-5555-4555-8555-${String(i).padStart(12, "0")}`;
 export const expectedCanonical = (count: number) => 2*count-2;
-export const sku = "33333333-3333-4333-8333-333333333333";
-export const plan = "a62f8878-de10-42f3-b68f-6149a25ceb97";
+const sku = "33333333-3333-4333-8333-333333333333";
+const plan = "a62f8878-de10-42f3-b68f-6149a25ceb97";
 export const key = (i: number) => String(i).padStart(6, "0");
 export const userId = (i: number) => `44444444-4444-4444-8444-${String(i).padStart(12, "0")}`;
 export const activityLine = (i: number) => `2026-09-30,user-${key(i)}@example.invalid,User ${key(i)},2026-09-30,2026-09-30,,,,,,,,${copilotAppActivityPeriod.slice(1)}\n`;
@@ -49,7 +49,7 @@ export function fileBoundaryLine(i: number) {
   const padding = "界".repeat(Math.floor(paddingBytes/3))+"x".repeat(paddingBytes%3);
   return line.slice(0,position)+padding+line.slice(position);
 }
-export function highDegreeLine(kind: "agents" | "users" | "userAgents", i: number) {
+function highDegreeLine(kind: "agents" | "users" | "userAgents", i: number) {
   if (kind === "users") return "user-000000@example.invalid,User 000000,10000,10000,2026-09-30\n";
   if (kind === "agents") return `agent-${key(i)},Agent ${key(i)},Your org,1,0,1,2026-09-30\n`;
   return `agent-${key(i)},Agent ${key(i)},Your org,user-000000@example.invalid,1,2026-09-30\n`;

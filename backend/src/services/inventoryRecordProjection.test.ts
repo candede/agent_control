@@ -18,6 +18,35 @@ const retiredKinds = ["presence", "linkState", "availability", "management"];
 afterEach(() => vi.restoreAllMocks());
 
 describe("inventory record projections", () => {
+  it("round-trips full large Unicode About through bounded ordered child facts with provenance", () => {
+    const text = "Full source About 🧭\n".repeat(9000);
+    const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, longDescription: text });
+    const record = packageInventoryRecord(value);
+    expect(record.residual.longDescription).toBeUndefined();
+    const chunks = record.facts.filter(fact => fact.kind === "about:long");
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every(fact => Buffer.byteLength(JSON.stringify(fact.payload)) < 262144)).toBe(true);
+    expect(restoreInventoryRecord(record.residual, record.facts, "packages")).toEqual(value);
+  });
+
+  it("supplies allowlisted provenance when old saved detail omitted its formerly required object", () => {
+    const input = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false });
+    Object.defineProperty(input, "provenance", { value: undefined });
+    const record = packageInventoryRecord(input);
+    expect(record.residual.provenance).toEqual(allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false }).provenance);
+  });
+  it("retains the exact four-MiB native About boundary without expanding the ordinary component/list envelope", () => {
+    const text = "🧭".repeat(1024 * 1024);
+    const value: PowerPlatformResource = { ...native, details: { description: text },
+      provenance: { description: { sourceSystem: "power_platform", path: "properties.description", maturity: "observed" } } };
+    const record = powerPlatformInventoryRecord(value);
+    expect(record.residual.details).not.toHaveProperty("description");
+    expect(record.facts.filter(fact => fact.kind === "about:native").every(fact => Buffer.byteLength(JSON.stringify(fact.payload)) < 262144)).toBe(true);
+    expect(restoreInventoryRecord(record.residual, record.facts, "power_platform")).toMatchObject({ details: { description: text }, provenance: value.provenance });
+    expect(buildRecords([], [value], [], null, null)[0].powerPlatformResource?.details.description).toBeUndefined();
+    expect(() => powerPlatformInventoryRecord({ ...value, details: { description: `${text}x` } }))
+      .toThrow(expect.objectContaining({ code: "inventory_about_bytes" }));
+  });
   it("round-trips namespaced maker sharing and observed Graph telemetry without changing identity or admin availability", () => {
     const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, availableTo: "allowedForAll",
       activeUsers: 3, totalSessions: 5, totalRunTimeInHours: 0.1, exceptionRate: 0, ownerId: null });

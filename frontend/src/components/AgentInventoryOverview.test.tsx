@@ -47,7 +47,7 @@ describe("inventory dashboard exact report context", () => {
       }, error: null } },
       inventoryOverview: { availableToUsers: 1250, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 1250 },
     }} />);
-    expect(screen.getByRole("button", { name: "Show available to end users" })).toHaveTextContent("1,250");
+    expect(screen.getByRole("button", { name: "Show admin-permitted agents" })).toHaveTextContent("1,250");
     await waitFor(() => expect(screen.queryByText("Loading selected report evidence...")).not.toBeInTheDocument());
   });
 

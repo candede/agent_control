@@ -250,17 +250,12 @@ describe.sequential("Data sync repository", () => {
     for (const user of users) {
       const plans = await reader.plans(selected.id, identity(owner), user.identity.objectId);
       expect(plans.counts.total).toBe(user.servicePlans.length);
-      expect(plans.value).toEqual(user.servicePlans.toSorted((left, right) => left.servicePlanId.localeCompare(right.servicePlanId)));
+      expect(plans.value).toEqual(user.servicePlans.map(plan => ({
+        ...plan, assignedDateTime: plan.assignedDateTime ? new Date(plan.assignedDateTime).toISOString() : null,
+      })).toSorted((left, right) => left.servicePlanId.localeCompare(right.servicePlanId)));
       expect(plans.value).not.toBe(first.value);
       if (plans.value.length) expect(plans.value[0]).not.toBe(first.value[0]);
     }
-  });
-
-  it("removes the old snapshot containers and whole-source getter/writer surface instead of decoding or converting them", async () => {
-    expect((await fixture.runtime.query(`SELECT to_regclass('public.copilot_usage_snapshots') AS snapshots,
-      to_regclass('public.copilot_usage_source_state') AS source_state`)).rows[0]).toEqual({ snapshots: null, source_state: null });
-    const methods = Object.getOwnPropertyNames(DataSyncRepository.prototype);
-    for (const method of ["getDirectorySource", "getUserSources", "publishDirectory", "publishAppActivity"]) expect(methods).not.toContain(method);
   });
 
   it.each(["directory", "app_activity"] as const)(

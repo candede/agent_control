@@ -99,7 +99,8 @@ describe("WorkbenchActionGate", () => {
       const definition = capabilityDefinitions.find(item => item.id === `graph.package.read.${mode}`)!;
       const onClick = vi.fn();
       const value: typeof capabilityContext = { ...capabilityContext, now, views: [{
-        definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+        ...(mode === "application" ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
+        enabled: true, definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
           verification: "provider", previewQualification: "not_required", remediation: [],
           checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 1_000).toISOString() },
       }] };
@@ -124,7 +125,7 @@ describe("WorkbenchActionGate", () => {
     const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
     const value: typeof capabilityContext = { ...capabilityContext, pending: true,
       views: state === "missing" ? [] : [{
-        definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
+        enabled: true, definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
           previewQualification: "not_required", remediation: [] },
       }],
     };
@@ -139,14 +140,14 @@ describe("WorkbenchActionGate", () => {
   it("does not imply that a delegated recheck runs an unchecked application capability", () => {
     const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
     render(<CapabilityContext value={{ ...capabilityContext, pending: true, views: [{
-      definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
+      enabled: true, definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
         previewQualification: "not_required", remediation: [] },
     }] }}><WorkbenchActionProvider value={workbenchActions}>
       <WorkbenchActionGate actionId="packages.refresh.application.resume"><button type="button">Resume</button></WorkbenchActionGate>
     </WorkbenchActionProvider></CapabilityContext>);
     expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
     expect(screen.queryByText("Checking capability status.")).not.toBeInTheDocument();
-    expect(screen.getByText(/explicitly approved bounded application-scope/)).toBeVisible();
+    expect(screen.getByText(/Microsoft validates the configured application identity when it runs/)).toBeVisible();
   });
 
   it("blocks clicks until exact signed-in action metadata is available", async () => {

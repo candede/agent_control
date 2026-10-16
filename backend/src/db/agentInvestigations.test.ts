@@ -1,10 +1,8 @@
-import { createHash } from "node:crypto";
 import pg from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { DefenderHuntingRepository, huntingTargetScopeHash, type DefenderHuntingReadScope } from "./defenderHunting.js";
+import { DefenderHuntingRepository, type DefenderHuntingReadScope } from "./defenderHunting.js";
 import { PurviewAuditRepository } from "./purviewAudit.js";
 import { LiveInventory } from "./liveInventory.js";
-import type { DefenderHuntingFilters } from "../types/defenderHunting.js";
 import { AgentInvestigationsService } from "../services/agentInvestigations.js";
 import type { AgentIdentityCacheState } from "./agentIdentity.js";
 import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestigations.js";
@@ -14,16 +12,14 @@ const bot = "22222222-2222-4222-8222-222222222222";
 const resultScope = { kind: "principal" as const, scopeId: "reader-a", configurationRevision: null };
 const scope: DefenderHuntingReadScope = {
   tenantId: "tenant-a", authorizationPrincipalId: "reader-a", resultScopes: [resultScope], entraAgentIds: [entra],
-  qualifications: [{ resultScope, authority: { capabilityId: "defender.hunting.delegated", configurationRevision: 1, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64) } }],
 };
-const filters: DefenderHuntingFilters = { templateId: "agents_inventory", startDateTime: "2026-09-09T10:00:00.000Z", endDateTime: "2026-09-09T11:00:00.000Z",
-  agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] };
 
 function database() {
   const query = vi.fn(async (sql: string, _values: unknown[]) => ({
     rows: sql.includes("count(*)") ? [{ count: 0 }] : [], rowCount: 0,
   }));
-  return { query };
+  const client = Object.assign(new pg.Client(), { query, release: vi.fn() });
+  return { query, connect: vi.fn(async () => client) };
 }
 
 function expectExactFilter(sql: string, values: unknown[], column: string) {
@@ -43,8 +39,7 @@ describe("agent-scoped saved-query isolation", () => {
     expect(query).toHaveBeenCalledOnce();
   });
 
-  it.each(["entra_app_id", "entra_agent_id"] as const)(
-    "withholds %s investigation scope when another environment changes during the identity read", async kind => {
+  it("withholds typed investigation scope when another environment changes during the identity read", async () => {
       const database = new pg.Pool({ max: 4 });
       const client = Object.assign(new pg.Client(), { release: vi.fn() });
       const connect = vi.spyOn(database, "connect").mockResolvedValue(client);
@@ -63,23 +58,23 @@ describe("agent-scoped saved-query isolation", () => {
           generation_id: "55555555-5555-4555-8555-555555555555", identity: "native-a", observed_at: now, expires_at: expiresAt,
           residual: { type: "microsoft.copilotstudio/agents", tenantId: "tenant-a", nativeId: "native-a",
             environmentId: "environment-a", agentKind: "copilot_studio_agent", provenance: {
-              entraAppId: { sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga" },
               entraAgentId: { sourceSystem: "power_platform", path: "properties.entraAgentId", maturity: "ga" },
             } },
         }];
-        else if (sql.includes("SELECT kinds.kind,identifier.value")) rows = [{ kind, value: entra }];
-        else if (sql.includes("SELECT DISTINCT c.normalized_native_id")) {
+        else if (sql.includes("SELECT kinds.kind,identifier.value")) rows = [{ kind: "entra_agent_id", value: entra }];
+        else if (sql.includes("SELECT DISTINCT ON (c.normalized_native_id")) {
           rows = [
-            { normalized_native_id: "native-a", normalized_environment_id: "environment-a", tenant_id: "tenant-a" },
+            { native_id: "native-a", environment_id: "environment-a", tenant_id: "tenant-a", identifier_value: entra },
             ...(inventoryRevision === "2" ? [{
-              normalized_native_id: "native-b", normalized_environment_id: "environment-b", tenant_id: "tenant-a",
+              native_id: "native-b", environment_id: "environment-b", tenant_id: "tenant-a", identifier_value: entra,
             }] : []),
           ];
           // A cross-environment collision changes the root, not this agent's row or native snapshot.
           if (changed) inventoryRevision = "2";
         } else if (!["BEGIN ISOLATION LEVEL REPEATABLE READ", "COMMIT", "ROLLBACK"].includes(sql)
           && !sql.includes("SELECT substr(kind,8) AS role")) throw new Error("Unexpected live investigation query.");
-        return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
+        return { command: /^(BEGIN|COMMIT|ROLLBACK)(?: |$)/.exec(sql)?.[1] ?? "SELECT",
+          rowCount: rows.length, oid: 0, fields: [], rows };
       });
       const mappings = { readState: vi.fn(async (): Promise<AgentIdentityCacheState> => ({
         status: "resolved", value: { objectId: entra, applicationId: entra, checkedAt: now.toISOString(), expiresAt: expiresAt.toISOString(),
@@ -90,7 +85,7 @@ describe("agent-scoped saved-query isolation", () => {
       const actor = { tenantId: "tenant-a", principalId: "reader-a" };
       try {
         await expect(service.defenderScope(actor, `agent:${entra}`)).resolves.toMatchObject({
-          entraAgentApplicationIds: [entra], entraAgentIds: kind === "entra_agent_id" ? [entra] : [],
+          entraAgentApplicationIds: [entra], entraAgentIds: [entra],
         });
         changed = true;
         await expect(service.resolve(actor, `agent:${entra}`)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
@@ -116,8 +111,6 @@ describe("agent-scoped saved-query isolation", () => {
       expect(sql).not.toContain("job.filters->>'templateId'='agents_inventory'");
       expect(sql).toContain("job.filters->'agentIds'='[]'::jsonb");
     }
-    const target = { ...filters, templateId: "agent_activity" as const, operations: ["InvokeAgent"] };
-    expect(huntingTargetScopeHash({ ...target, entraAgentApplicationIds: [entra] })).not.toBe(huntingTargetScopeHash({ ...target, entraAgentIds: [entra] }));
   });
 
   it("filters exact single-agent history in SQL before both pagination and counting", async () => {
@@ -128,44 +121,34 @@ describe("agent-scoped saved-query isolation", () => {
     for (const [sql, values] of db.query.mock.calls) {
       expectExactFilter(sql, values, "job.filters");
       expect(values[0]).toBe("tenant-a");
-      expect(sql).toContain("job.authorization_principal_id=");
-      expect(sql).toContain("retained.revoked_at IS NULL");
+      expect(sql).toContain("job.result_scope_id=");
     }
     const pageSql = db.query.mock.calls[0][0];
     expect(pageSql.indexOf("job.filters->'entraAgentIds'")).toBeLessThan(pageSql.lastIndexOf("LIMIT"));
     expect(db.query.mock.calls[0][1].slice(-2)).toEqual([2, 4]);
   });
 
-  it("uses the same exact identity binding for job, qualifications, retained scopes and mutations", async () => {
+  it("uses the same exact identity binding for saved jobs and mutations", async () => {
     const db = database();
     const repository = new DefenderHuntingRepository(db as never);
     await repository.getJob(scope, bot);
-    await repository.listQualificationEvidence(scope);
-    await repository.listRetainedScopes(scope);
-    await expect(repository.cancel(scope, bot)).rejects.toMatchObject({ code: "hunting_job_state" });
-    await expect(repository.delete(scope, bot)).rejects.toMatchObject({ code: "hunting_job_state" });
-    await expect(repository.revokeRetainedScope(scope, bot, "delegated", "reader-a")).rejects.toMatchObject({ code: "not_found" });
-    for (const [index, [sql, values]] of db.query.mock.calls.entries()) {
-      expectExactFilter(sql, values, index === 1 ? "evidence.approved_scope" : index === 2 || index === 5 ? "retained.approved_scope" : "job.filters");
+    await expect(repository.cancel(scope, bot)).rejects.toMatchObject({ code: "not_found" });
+    await expect(repository.delete(scope, bot)).rejects.toMatchObject({ code: "not_found" });
+    const bound = db.query.mock.calls.filter(([sql]) => /job\.filters/.test(sql));
+    expect(bound).toHaveLength(3);
+    for (const [sql, values] of bound) {
+      expectExactFilter(sql, values, "job.filters");
     }
+    expect(db.query.mock.calls.some(([sql]) => /(?:UPDATE|DELETE FROM) defender_hunting_jobs/.test(sql))).toBe(false);
     for (const entraAgentIds of [[], [entra, bot], ["not-an-entra-id"]]) {
       await expect(repository.listJobs({ ...scope, entraAgentIds })).rejects.toMatchObject({ code: "scope_mismatch" });
     }
   });
 
-  it("preserves the legacy hash when typed filters are absent and separates it from typed identity scopes", () => {
-    const legacy = createHash("sha256").update(JSON.stringify({
-      templateId: "agents_inventory", agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [],
-    })).digest("hex");
-    expect(huntingTargetScopeHash(filters)).toBe(legacy);
-    expect(huntingTargetScopeHash({ ...filters, entraAgentIds: [entra] })).not.toBe(legacy);
-    expect(huntingTargetScopeHash({ ...filters, agentIds: [entra] })).not.toBe(huntingTargetScopeHash({ ...filters, entraAgentIds: [entra] }));
-  });
-
   it("restricts saved Purview rows to current authorized scopes and exact environment/bot before paging/count/search", async () => {
     const db = database();
     const repository = new PurviewAuditRepository(db as never);
-    await expect(repository.agentRecords({ tenantId: "tenant-a", resultScopes: [resultScope,
+    await expect(repository.agentRecords({ tenantId: "tenant-a", authorizationPrincipalId: "reader-a", resultScopes: [resultScope,
       { kind: "application", scopeId: "application-a", configurationRevision: 7 }] },
     { environmentId: "Environment-A", botId: bot }, { limit: 10, offset: 30, search: "some%actor", operation: "BotCreate" }))
       .resolves.toEqual({ value: [], count: 0, limit: 10, offset: 30 });

@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router, type Request, type Response } from "express";
 import { AppError } from "../errors.js";
 import { capabilities } from "../services/capabilities.js";
@@ -9,12 +10,12 @@ import { appRoles } from "../types/capability.js";
 export const capabilitiesRouter = Router();
 
 policyRoute(capabilitiesRouter, "get", "/capabilities", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json({ value: await capabilities.list(request.session.user!) });
+  response.json({ value: await capabilities.list(requestUser(request)) });
 });
 
 policyRoute(capabilitiesRouter, "get", "/capabilities/check-progress", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.setHeader("Cache-Control", "no-store");
-  response.json({ progress: capabilities.checkProgress(request.session.user!, retryFailedOption(request)) });
+  response.json({ progress: capabilities.checkProgress(requestUser(request), retryFailedOption(request)) });
 });
 
 policyRoute(capabilitiesRouter, "post", "/capabilities/check", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
@@ -23,20 +24,20 @@ policyRoute(capabilitiesRouter, "post", "/capabilities/check", { access: "authen
   }
   const retryFailed = retryFailedOption(request);
   response.json({ value: await withConnectionSignal(response, signal =>
-    capabilities.check(request.session.user!, { retryFailed, signal })) });
+    capabilities.check(requestUser(request), { retryFailed, signal })) });
 });
 
 policyRoute(capabilitiesRouter, "post", "/capabilities/:id/probe", { access: "authenticated", dataClass: "configuration", roles: [...appRoles], csrf: true }, async (request, response) => {
   const definition = getCapabilityDefinition(String(request.params.id));
   if (!definition) throw new AppError(404, "capability_not_found", "Capability was not found.");
-  response.json(await withConnectionSignal(response, signal => capabilities.refresh(definition.id, request.session.user!, signal)));
+  response.json(await withConnectionSignal(response, signal => capabilities.refresh(definition.id, requestUser(request), signal)));
 });
 
-policyRoute(capabilitiesRouter, "put", "/capabilities/:id/configuration", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
+policyRoute(capabilitiesRouter, "put", "/capabilities/:id/configuration", { browserOnly: true, access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const definition = getCapabilityDefinition(String(request.params.id));
   if (!definition) throw new AppError(404, "capability_not_found", "Capability was not found.");
   if (typeof request.body?.enabled !== "boolean" || typeof request.body?.sharedDataScope !== "boolean") throw new AppError(400, "invalid_configuration", "enabled and sharedDataScope must be booleans.");
-  const result=await capabilities.configureApplication(definition.id, request.session.user!, request.body.enabled, request.body.sharedDataScope);
+  const result=await capabilities.configureApplication(definition.id, requestUser(request), request.body.enabled, request.body.sharedDataScope);
   operationalLog("info", "capability_configuration_changed", { capabilityId: definition.id, outcome: "updated" });
   response.json(result);
 });

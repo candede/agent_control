@@ -58,6 +58,7 @@ export async function capacityHttpLoad(input: { cookie: string; action: "readers
   assert.ok(typeof initial.selection.id === "string");
   for (const [index, row] of initial.value.entries()) assert.equal(row.id, `package-${String(index).padStart(6, "0")}`);
   const warmup = { requests: 1, milliseconds: performance.now() - warmingAt, bytes: Buffer.byteLength(warmingText),
+    selectionId: initial.selection.id,
     scope: "One separately measured cold selection; 1008 concurrent warm requests below still perform real authorization and selected-read fences." };
   const outcomes = await Promise.allSettled(Array.from({ length: 12 }, async (_, reader) => {
     let selection: string | undefined = initial.selection.id, cursor: string | undefined, offset = 0, requests = 0, failures = 0;
@@ -65,6 +66,7 @@ export async function capacityHttpLoad(input: { cookie: string; action: "readers
     const histogram: Record<string, number> = {}, errors: string[] = [];
     const successfulHistograms: Record<string,Record<string,number>> = {}, failedHistogram: Record<string,number> = {};
     for (let request = 0; request < 84; request++) {
+      await delay(1500,undefined,{ signal });
       signal.throwIfAborted();
       const started = performance.now(), query = new URLSearchParams({ limit: "100" });
       if (selection) query.set("selectionId", selection);

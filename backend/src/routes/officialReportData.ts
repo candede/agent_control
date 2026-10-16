@@ -1,3 +1,4 @@
+import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router, type Request, type RequestHandler } from "express";
 import { once } from "node:events";
 import { requestScope } from "../middleware/auth.js";
@@ -17,8 +18,10 @@ import { config } from "../config.js";
 import { abortableRead, createExportPublicationValidator } from "../services/csvExport.js";
 import { operationalLog } from "../services/telemetry.js";
 import { readAdoptionGroups } from "../services/adoptionGroups.js";
+import { SavedReadContracts } from "../services/savedReadContracts.js";
+import type { AgentRelationship } from "../types/savedReadContracts.js";
 
-export type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
+type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
 export type ReportHandlerOptions = {
   reports: LargeTenantUsersReports;
   inventory?: InventoryQueries;
@@ -67,8 +70,9 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   const router = Router(), reports = options.reports, imports = new OfficialReportImports(reports.database), usage = new OfficialAgentUsage(reports);
   const inventoryUsage = new OfficialAgentUsage(reports, options.inventory ?? new InventoryQueries(reports.database,
     config.sessionSecret, reports.staleAfterDays, undefined, { source: "inventory_canonical", tokenMode: "delegated" }));
+  const savedReads = new SavedReadContracts(reports, inventoryUsage.inventory!);
   router.use((_request, response, next) => { response.setHeader("Cache-Control", "private, no-store"); next(); });
-  const route = (method: RouteMethod, path: string, access: "read" | "admin", ...handlers: RequestHandler[]) => {
+  const route = (method: RouteMethod, path: string, access: "read" | "admin" | "browser-read" | "browser-admin", ...handlers: RequestHandler[]) => {
     const dataClass = path.startsWith("/copilot-usage/") ? "licensed_copilot_usage"
       : path.startsWith("/data-exports") ? "data_export"
         : path.startsWith("/agent-inventory/") ? path.endsWith("/usage-candidates") ? "official_usage_association_candidates" : "official_usage_association"
@@ -77,8 +81,8 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
               : path.startsWith("/official-usage/aggregate") ? "official_usage_aggregate"
                 : /^\/official-usage\/(?:staging|bundles)(?:\/|$)/.test(path) ? "official_usage_import"
                   : /^\/official-usage\/(?:sets|confirmations)\//.test(path) ? "official_usage_metadata" : "official_usage_user";
-    policyRoute(router, method, path, { access: "authenticated", dataClass,
-      roles: [access === "read" ? "AgentControl.Viewer" : "AgentControl.Admin"], ...(method === "get" ? {} : { csrf: true }) }, ...handlers);
+    policyRoute(router, method, path, { access: "authenticated", dataClass, ...(access.startsWith("browser-") ? { browserOnly: true } : {}),
+      roles: [access.endsWith("read") ? "AgentControl.Viewer" : "AgentControl.Admin"], ...(method === "get" ? {} : { csrf: true }) }, ...handlers);
   };
   const failSafe = (handler: RequestHandler): RequestHandler => async (request, response, next) => {
     try { response.setHeader("Cache-Control", "private, no-store"); await handler(request, response, next); }
@@ -92,10 +96,12 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       } else next(mapped);
     }
   };
-  async function selected(request: Request, endpoint: ReportEndpoint, facet = false, candidate = false, child = false, localReport = false) {
+  async function selected(request: Request, endpoint: ReportEndpoint, facet = false, candidate = false, child = false, localReport = false,
+    ignored: readonly string[] = []) {
     pageOptions(request.query);
     const who = await options.identity(request);
     const raw = { ...request.query };
+    for (const key of ignored) delete raw[key];
     if (localReport && (raw.selectionId !== undefined || raw.cursor !== undefined)) delete raw.setId;
     if (facet) { delete raw.search; delete raw.field; }
     if (candidate) delete raw.inventoryRevision;
@@ -122,10 +128,11 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     });
     return { ...who, id, childQuery };
   }
-  async function selectedAgentUsage(request: Request, users = false) {
+  async function selectedAgentUsage(request: Request, users = false, history = false) {
     const setId = request.query.setId === undefined ? undefined : reportUuid(request.query.setId).toLowerCase();
-    if (request.query.inventorySelectionId === undefined) return { ...await selected(request, "official_agents", false, false, users, true), reader: usage, setId };
-    const allowed = ["inventorySelectionId", "selectionId", "cursor", "limit", "setId", ...(users ? ["search"] : [])];
+    const comparison = history ? ["compareFromSetId", "compareToSetId"] : [];
+    if (request.query.inventorySelectionId === undefined) return { ...await selected(request, "official_agents", false, false, users, true, comparison), reader: usage, setId };
+    const allowed = ["inventorySelectionId", "selectionId", "cursor", "limit", "setId", ...(users ? ["search"] : []), ...comparison];
     if (Object.keys(request.query).some(key => !allowed.includes(key))) throw new AppError(400, "invalid_usage_query", "Unsupported selected inventory usage query.");
     pageOptions(request.query);
     const who = await options.identity(request), id = reportUuid(request.query.inventorySelectionId).toLowerCase();
@@ -162,6 +169,33 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   route("get", "/copilot-usage/users/unresolved-identities", "read", failSafe(async (request, response) => {
     const context = await selected(request, "copilot_users");
     response.json(await reports.page(context.id, context.identity, { ...pageOptions(request.query), endpoint: "unresolved" }));
+  }));
+  route("get", "/copilot-usage/users/resolve", "read", failSafe(async (request, response) => {
+    const username = reportIdentifier(request.query.username);
+    const query = { ...request.query }; delete query.username;
+    if (Object.keys(query).some(key => !["selectionId", "setId"].includes(key))) throw new AppError(400, "invalid_usage_query", "Use one exact username and saved selection.");
+    if (query.selectionId !== undefined && query.setId !== undefined) throw new AppError(400, "invalid_usage_query", "A pinned selection already fixes its report set.");
+    const who = await options.identity(request);
+    const id = query.selectionId === undefined ? (await reports.capture(who.identity, who.tokenMode, "copilot_users",
+      query.setId === undefined ? {} : { setId: reportUuid(query.setId) })).id : reportUuid(query.selectionId);
+    response.json(await savedReads.resolve(id, who.identity, username));
+  }));
+  route("get", "/copilot-usage/users/:objectId/agent-relationships", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["selectionId", "inventorySelectionId", "relationship", "cursor", "limit"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Use exact pinned relationship selections.");
+    }
+    const relationship = scalar(request.query.relationship, 16);
+    if (!["used", "created", "owned", "modified"].includes(relationship)) throw new AppError(400, "invalid_usage_query", "Use used, created, owned or modified.");
+    const who = await options.identity(request);
+    response.json(await savedReads.relationships(reportUuid(request.query.selectionId), who.identity,
+      reportUuid(request.query.inventorySelectionId), reportUuid(request.params.objectId).toLowerCase(), relationship as AgentRelationship, pageOptions(request.query)));
+  }));
+  route("get", "/copilot-usage/adoption/champions", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["selectionId", "inventorySelectionId", "cursor", "limit"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Use a pinned exact adoption group selection.");
+    }
+    const who = await options.identity(request);
+    response.json(await savedReads.champions(reportUuid(request.query.selectionId), who.identity, reportUuid(request.query.inventorySelectionId), pageOptions(request.query)));
   }));
   route("get", "/copilot-usage/users/:objectId", "read", failSafe(async (request, response) => {
     const context = await selected(request, "copilot_users");
@@ -223,37 +257,37 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       childQuery: context.childQuery }));
   }));
 
-  route("post", "/official-usage/staging", "admin",
+  route("post", "/official-usage/staging", "browser-admin",
     officialReportMultipart(imports, async request => (await options.identity(request)).identity));
-  route("get", "/official-usage/staging/:id", "admin", failSafe(async (request, response) => {
+  route("get", "/official-usage/staging/:id", "browser-admin", failSafe(async (request, response) => {
     response.json(await imports.preview((await options.identity(request)).identity, reportUuid(request.params.id)));
   }));
-  route("post", "/official-usage/bundles/:id/preview", "admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/bundles/:id/preview", "browser-admin", failSafe(async (request, response) => {
     const forDiscard = request.body?.forDiscard;
     if (forDiscard !== undefined && typeof forDiscard !== "boolean") {
       throw new AppError(400, "invalid_import_intent", "Bundle cleanup inspection must be a boolean.");
     }
     response.json(await imports.bundle((await options.identity(request)).identity, reportUuid(request.params.id), { forDiscard }));
   }));
-  route("post", "/official-usage/bundles/:id/accept", "admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/bundles/:id/accept", "browser-admin", failSafe(async (request, response) => {
     response.json(await imports.acceptBundle((await options.identity(request)).identity, reportUuid(request.params.id), request.body));
   }));
-  route("post", "/official-usage/staging/:id/accept", "admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/staging/:id/accept", "browser-admin", failSafe(async (request, response) => {
     response.json(await imports.accept((await options.identity(request)).identity, { ...request.body, stagingId: reportUuid(request.params.id) }));
   }));
-  route("delete", "/official-usage/staging/:id", "admin", failSafe(async (request, response) => {
+  route("delete", "/official-usage/staging/:id", "browser-admin", failSafe(async (request, response) => {
     const who = await options.identity(request);
     const id = reportUuid(request.params.id);
     await imports.discard(who.identity, id);
     response.status(204).end();
   }));
-  route("get", "/official-usage/staging/:id/diagnostics", "admin", failSafe(async (request, response) => {
+  route("get", "/official-usage/staging/:id/diagnostics", "browser-admin", failSafe(async (request, response) => {
     response.json(await imports.diagnostics((await options.identity(request)).identity, reportUuid(request.params.id), pageOptions(request.query), reports.codec));
   }));
-  route("post", "/official-usage/sets/:id/preview", "admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/sets/:id/preview", "browser-admin", failSafe(async (request, response) => {
     response.json(await imports.confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
   }));
-  route("post", "/official-usage/confirmations/:id", "admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/confirmations/:id", "browser-admin", failSafe(async (request, response) => {
     if (reportUuid(request.body?.id) !== reportUuid(request.params.id)) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
     response.json(await imports.confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
   }));
@@ -263,12 +297,14 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json((await who.reader.summaries(who.id, who.identity, [recordId], who.setId))[0]);
   }));
   route("get", "/agent-inventory/:recordId/usage-history", "read", failSafe(async (request, response) => {
-    if (Object.keys(request.query).some(key => !["inventorySelectionId", "selectionId", "cursor", "limit"].includes(key))) {
+    if (Object.keys(request.query).some(key => !["inventorySelectionId", "selectionId", "cursor", "limit", "compareFromSetId", "compareToSetId"].includes(key))) {
       throw new AppError(400, "invalid_usage_query", "Unsupported agent history query parameter.");
     }
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
-    const who = await selectedAgentUsage(request);
-    response.json(await who.reader.history(who.id, who.identity, recordId, pageOptions(request.query)));
+    if ((request.query.compareFromSetId === undefined) !== (request.query.compareToSetId === undefined)) throw new AppError(400, "invalid_usage_query", "Both history comparison IDs are required.");
+    const who = await selectedAgentUsage(request, false, true);
+    response.json(await who.reader.history(who.id, who.identity, recordId, { ...pageOptions(request.query),
+      ...(request.query.compareFromSetId === undefined ? {} : { compareFromSetId: reportUuid(request.query.compareFromSetId), compareToSetId: reportUuid(request.query.compareToSetId) }) }));
   }));
   route("get", "/agent-inventory/:recordId/usage-candidates", "admin", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
@@ -293,16 +329,16 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await who.reader.users(who.id, who.identity, recordId, { ...pageOptions(request.query), search: who.childQuery?.search,
       ...(who.setId ? { setId: who.setId } : {}) }));
   }));
-  for (const method of ["post", "delete"] as const) route(method, "/agent-inventory/:recordId/usage-associations", "admin", failSafe(async (request, response) => {
+  for (const method of ["post", "delete"] as const) route(method, "/agent-inventory/:recordId/usage-associations", "browser-admin", failSafe(async (request, response) => {
     const input = officialAgentUsageMutation(request.body);
     if (Object.keys(request.query).some(key => key !== "inventorySelectionId") || method === "post" && !input.target || method === "delete" && input.target) throw new AppError(400, "invalid_agent_usage", "Association action mismatch.");
     const inventoryId = request.query.inventorySelectionId === undefined ? undefined : reportUuid(request.query.inventorySelectionId).toLowerCase();
     if (inventoryId && (method !== "delete" || inventoryId !== input.selectionId)) throw new SelectionError("invalid_cursor");
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);
-    response.json(await (inventoryId ? inventoryUsage : usage).mutate((await options.identity(request)).identity, recordId, input, request.session.user!));
+    response.json(await (inventoryId ? inventoryUsage : usage).mutate((await options.identity(request)).identity, recordId, input, requestUser(request)));
   }));
-  const producer = (request: Request) => new OfficialReportExports(reports, request.session.user!);
-  route("post", "/data-exports", "read", failSafe(async (request, response) => {
+  const producer = (request: Request) => new OfficialReportExports(reports, requestUser(request));
+  route("post", "/data-exports", "browser-read", failSafe(async (request, response) => {
     const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
     const assertCurrent = await validate();
     const who = await options.identity(request), exports = producer(request);
@@ -316,21 +352,21 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     (await validate())();
     response.status(202).json({ id });
   }));
-  route("get", "/data-exports/:id", "read", failSafe(async (request, response) => {
+  route("get", "/data-exports/:id", "browser-read", failSafe(async (request, response) => {
     const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
     await validate();
     const status = await producer(request).status(reportUuid(request.params.id), (await options.identity(request)).identity);
     (await validate())();
     response.json(status);
   }));
-  route("delete", "/data-exports/:id", "read", failSafe(async (request, response) => {
+  route("delete", "/data-exports/:id", "browser-read", failSafe(async (request, response) => {
     const validate = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
     const assertCurrent = await validate();
     await producer(request).engine.cancel(reportUuid(request.params.id), (await options.identity(request)).identity, assertCurrent);
     (await validate())();
     response.status(204).end();
   }));
-  route("get", "/data-exports/:id/download", "read", failSafe(async (request, response) => {
+  route("get", "/data-exports/:id/download", "browser-read", failSafe(async (request, response) => {
     const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer", reports.database);
     const who = await options.identity(request), exports = producer(request), id = reportUuid(request.params.id);
     const status = await exports.engine.status(id, who.identity);

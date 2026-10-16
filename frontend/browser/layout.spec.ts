@@ -10,13 +10,13 @@ const cases = [
   { name: "agents", path: "/agents", ready: ".agent-table-stack tbody tr",
     fields: [".agent-filter-fields"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
-    fields: [".user-activity-controls .agent-query-bar"] },
+    fields: [".user-activity-controls .agent-filter-fields"] },
   { name: "report-snapshot", path: "/sync?reports=snapshot", ready: ".reporting-view tbody tr",
     fields: [".report-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
   { name: "user-purview", path: "/users", ready: ".copilot-users-table tbody tr",
-    fields: [".purview-search-primary", ".purview-structured-filters > div"] },
+    fields: [".purview-search-primary"] },
   { name: "agent-investigation", path: "/agents?detail=graph_packages%3Alayout-package-1&detailTab=audit-security", ready: ".hunting-history-table tbody tr",
     fields: [".hunting-primary-fields"] },
   { name: "permissions", path: "/permissions", ready: ".permission-issue-list > li",
@@ -55,7 +55,7 @@ for (const scenario of cases) {
       await page.getByRole("button", { name: "Ada", exact: true }).click();
       await page.getByRole("tab", { name: "Logs", exact: true }).click();
       await expect(page.locator(".purview-history-table tbody tr")).toBeVisible();
-      await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toBeVisible();
+      await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveCount(0);
       await page.locator(".purview-history-table").getByRole("button", { name: /View/ }).click();
       await expect(page.locator(".purview-results tbody tr").first()).toBeVisible();
     }
@@ -104,13 +104,13 @@ for (const scenario of cases) {
           await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
         });
         await page.evaluate(() => window.scrollTo(0, 0));
-        if (scenario.name === "agents") {
+        if (["agents", "users"].includes(scenario.name)) {
           await page.getByRole("button", { name: "Filters", exact: true }).click();
-          await expect(page.getByRole("dialog", { name: "Filter agents", exact: true })).toBeVisible();
+          await expect(page.getByRole("dialog", { name: scenario.name === "agents" ? "Filter agents" : "Filter users", exact: true })).toBeVisible();
         }
         await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}.png`), fullPage: true, animations: "disabled" });
         await assertLayout(page, scenario.fields, `${scenario.name} at ${width}px`);
-        if (scenario.name === "agents") {
+        if (["agents", "users"].includes(scenario.name)) {
           const selector = ".agent-filter-fields";
           const expectedColumns = width === 360 ? 1 : 2;
           const columns = await page.locator(selector).evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
@@ -119,7 +119,7 @@ for (const scenario of cases) {
           await expect(page.getByRole("button", { name: "Filters", exact: true })).toBeFocused();
         }
         if (scenario.name === "agent-investigation") {
-          await expect(page.getByRole("region", { name: "Defender log coverage and setup" })).toBeVisible();
+          await expect(page.getByRole("region", { name: "Defender log coverage and setup" })).toHaveCount(0);
           await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
           await expect(page.getByLabel("Actor object IDs", { exact: true })).toHaveCount(0);
           await page.screenshot({ path: info.outputPath(`agent-investigation-${width}-activity-filters.png`), fullPage: true, animations: "disabled" });
@@ -171,11 +171,11 @@ test("Agents workspace places the real saved-inventory table within 330px on des
   await expect(overview.getByText("Reported used agents", { exact: true }).locator("..").locator("strong")).toHaveText("2");
   await expect(overview.getByText("Loading selected report evidence...", { exact: true })).toHaveCount(0);
   await expect(overview.locator(".metric")).toHaveCount(4);
-  for (const label of ["Agents in catalog", "Available to end users", "Reported used agents", "Reported active · 30 days"]) {
+  for (const label of ["Agents in catalog", "Admin-permitted agents", "Reported used agents", "Reported active · 30 days"]) {
     await expect(overview.getByText(label, { exact: true })).toBeVisible();
   }
   await expect(overview.getByText("Agents in catalog", { exact: true }).locator("..")).toContainText("Partial data");
-  await expect(overview.getByText("Available to end users", { exact: true }).locator("..")).toContainText("Partial data");
+  await expect(overview.getByText("Admin-permitted agents", { exact: true }).locator("..")).toContainText("Partial data");
   const measurements = [];
   for (const viewport of [{ width: 1440, height: 900 }, { width: 1280, height: 800 }]) {
     await page.setViewportSize(viewport);
@@ -227,12 +227,12 @@ test("the compact metric strip distinguishes unavailable sources and missing rep
   await page.goto("/agents");
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
   await expect(overview.locator(".metric")).toHaveCount(4);
-  for (const label of ["Agents in catalog", "Available to end users", "Reported used agents", "Reported active · 30 days"]) {
+  for (const label of ["Agents in catalog", "Admin-permitted agents", "Reported used agents", "Reported active · 30 days"]) {
     const metric = overview.getByText(label, { exact: true }).locator("..");
     await expect(metric.locator("strong")).toHaveText("Unknown");
   }
   await expect(overview.getByRole("button", { name: "Show agents in catalog", exact: true })).toBeDisabled();
-  await expect(overview.getByRole("button", { name: "Show available to end users", exact: true })).toBeDisabled();
+  await expect(overview.getByRole("button", { name: "Show admin-permitted agents", exact: true })).toBeDisabled();
   await expect(overview.getByText("Agents in catalog", { exact: true }).locator("..")).toContainText("Partial data");
   await expect(overview.getByText("Reported used agents", { exact: true }).locator("..")).toContainText("No selected report data");
   await expect(overview.getByText("Reported active · 30 days", { exact: true }).locator("..")).toContainText("No selected report data");

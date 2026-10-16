@@ -37,7 +37,7 @@ describe("users/report route-to-client boundary", () => {
     const id = randomUUID(), signature = createHmac("sha256", config.sessionSecret).update(id).digest("base64").replace(/=+$/g, "");
     const data = { cookie: new session.Cookie({ maxAge: 600000 }),
       tenantId, accountId: principalId, clientId: config.tenants[0].clientId, csrfToken: "cutover-csrf",
-      rolesValidatedAt: Date.now(), user: { ...usageAudit(identity).actor, tenantId, homeAccountId: principalId, roles },
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), user: { ...usageAudit(identity).actor, tenantId, homeAccountId: principalId, roles },
     };
     const write = () => new Promise<void>((resolve, reject) => application.store.set(id, data, error => error ? reject(error) : resolve()));
     if (tenantId === identity.tenantId) await write();
@@ -329,16 +329,28 @@ describe("users/report route-to-client boundary", () => {
     const current = await api("/official-usage/history?limit=1");
     expect((await current.json() as ReportPage<ReportHistorySet>).counts.total).toBe(34);
   }, 60_000);
-  it("discovers durable queued work after dispatcher replacement and audits ready cancellation", async () => {
+  it("requires fresh request authorization to dispatch durable queued work after replacement and audits ready cancellation", async () => {
     const original = reportRuntime(fixture.runtime), replacement = new ReportExportDispatcher(reports);
     await original.drain();
+    let restoreEnqueue = () => {};
     try {
       const selected = await (await api("/official-usage/users")).json() as ReportPage<ReportUser>;
-      const queued = await api("/data-exports", { method: "POST", body: JSON.stringify({ selectionId: selected.selection.id, kind: "official_users" }) });
+      const intent = { selectionId: selected.selection.id, kind: "official_users", idempotencyKey: randomUUID() };
+      const queued = await api("/data-exports", { method: "POST", body: JSON.stringify(intent) });
       expect(queued.status).toBe(202);
       const job = await queued.json() as OfficialReportExportStatus;
       expect((await fixture.runtime.query("SELECT status,owner FROM data_exports WHERE id=$1", [job.id])).rows[0]).toEqual({ status: "queued", owner: null });
       replacement.start();
+      await vi.waitFor(async () => {
+        expect(await (await api(`/data-exports/${job.id}`)).json()).toMatchObject({
+          status:"queued",error:"authorization_required",
+        });
+      }, { timeout:10000,interval:100 });
+      const enqueue = vi.spyOn(original, "enqueue").mockImplementation(replacement.enqueue.bind(replacement));
+      restoreEnqueue = () => { enqueue.mockRestore(); };
+      const resumed = await api("/data-exports", { method: "POST", body: JSON.stringify(intent) });
+      expect(resumed.status).toBe(202);
+      expect(await resumed.json()).toEqual({ id: job.id });
       await vi.waitFor(async () => {
         const status = await api(`/data-exports/${job.id}`);
         expect(status.status).toBe(200);
@@ -349,11 +361,16 @@ describe("users/report route-to-client boundary", () => {
       expect((await (await api(`/data-exports/${job.id}`)).json() as OfficialReportExportStatus).status).toBe("cancelled");
       const download = await api(`/data-exports/${job.id}/download`);
       expect(download.status).toBe(409); expect(download.headers.get("content-disposition")).toBeNull();
-      expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM audit_events
-        WHERE tenant_id=$1 AND action='export-official-usage-users' AND status='cancelled' AND error_code='export_cancelled'`,
-      [identity.tenantId])).rows[0].n).toBe(1);
-    } finally { await replacement.drain(); original.start(); }
-  });
+      expect((await fixture.runtime.query(`SELECT action,status,error_code FROM audit_events
+        WHERE tenant_id=$1 AND operation_id=$2 ORDER BY action,status`,
+      [identity.tenantId,`data-export:${job.id}`])).rows).toEqual([
+        { action:"cancel-control",status:"started",error_code:null },
+        { action:"cancel-control",status:"succeeded",error_code:null },
+        { action:"export-official-usage-users",status:"started",error_code:null },
+        { action:"export-official-usage-users",status:"succeeded",error_code:null },
+      ]);
+    } finally { restoreEnqueue(); await replacement.drain(); original.start(); }
+  }, 30_000);
   it("withholds the final CSV chunk when completion validation fails instead of reporting a successful attachment", async () => {
     const selected = await (await api("/official-usage/users")).json() as ReportPage<ReportUser>;
     const job = await (await api("/data-exports", { method: "POST",
@@ -363,8 +380,10 @@ describe("users/report route-to-client boundary", () => {
     }, { timeout: 10000, interval: 100 });
     const original = DataExports.prototype.download;
     const download = vi.spyOn(DataExports.prototype, "download").mockImplementation(async function* (this: DataExports, ...args: Parameters<DataExports["download"]>) {
-      yield* original.apply(this, args);
-      throw new Error("synthetic_final_audit_failure");
+      const [id, who, signal, publication] = args;
+      if (!publication) throw new Error("Expected native download publication boundary.");
+      yield* original.call(this, id, who, signal, { ...publication,
+        finish: async () => { throw new Error("synthetic_final_audit_failure"); } });
     });
     try {
       const response = await api(`/data-exports/${job.id}/download`);
@@ -373,7 +392,7 @@ describe("users/report route-to-client boundary", () => {
       expect(response.headers.get("content-type")).not.toContain("text/csv");
       expect((await response.text()).length).toBeLessThan(4096);
     } finally { download.mockRestore(); }
-  });
+  }, 30_000);
   it.each(["correction", "deletion"] as const)("dispatches real persisted work, serves CSV bytes natively and invalidates all domains on nonactive %s", async operation => {
     const history = await (await api("/official-usage/history?limit=3")).json() as ReportPage<ReportHistorySet>;
     const overview = await (await api("/official-usage/overview?limit=1")).json() as ReportPage<unknown>;

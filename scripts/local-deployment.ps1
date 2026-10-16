@@ -77,6 +77,9 @@ function Read-LocalSettings {
         }
     } catch { throw 'Project settings must be a valid JSON object. Restore settings.json before continuing.' }
     finally { if ($document) { $document.Dispose() } }
+    if (@($settings.Keys | Where-Object { $_ -cnotin @('port','publicUrl','tenants') }).Count) {
+        throw 'Project settings contain unsupported fields. Use only port, publicUrl and tenants.'
+    }
     if ($settings.Contains('port') -and ($settings.port -isnot [long] -and $settings.port -isnot [int] -or $settings.port -lt 1024 -or $settings.port -gt 65535)) {
         throw 'Saved project port must be an integer from 1024 to 65535. Repair settings.json before continuing.'
     }
@@ -192,7 +195,7 @@ App roles (separate from API permissions):
     AgentControl.Viewer  Observe inventory, reports and investigations.
     AgentControl.Admin   All viewing plus supported changes, imports and configuration.
   Admin includes Viewer access; only one role assignment is needed.
-  Replace legacy role assignments explicitly; they do not grant these new roles.
+  Assign only the Viewer or Admin role.
   Sign out and back in after assignment. Provider permissions still apply.
 
 Provider-side requirements still apply to the signed-in user:
@@ -207,7 +210,7 @@ APIs). CSV report import and local application audit need no external API permis
 Consent alone does not enable unsupported operations or qualify provider writes.
 
 This wizard displays guidance only; it does not verify or grant permissions.
-See docs/deployment-setup.md and docs/provider-contract-inventory-2026-09-08.md
+See docs/deployment-setup.md and docs/provider-contracts.md
 for setup details and capability-specific requirements.
 
 '@
@@ -278,6 +281,7 @@ function Read-LocalTenantProfile {
         domains = @($Current.domains)
     }
     if ($Current.displayName) { $profile.displayName = [string]$Current.displayName }
+    if ($Current.integration) { $profile.integration = $Current.integration }
     if ($Edit -or -not $profile.tenantId) { $profile.tenantId = Read-LocalIdentifier 'Entra tenant ID (directory GUID)' $profile.tenantId -AllowEmpty:$AllowIncomplete }
     if ($Edit -or -not $profile.clientId) { $profile.clientId = Read-LocalIdentifier 'Entra client ID (application GUID)' $profile.clientId -AllowEmpty:$AllowIncomplete }
     if ($Edit -or -not $profile.clientSecret) { $profile.clientSecret = Read-LocalClientSecret $profile.clientSecret -AllowEmpty:$AllowIncomplete }
@@ -299,6 +303,7 @@ function Get-LocalTenantMetadata {
     return ,@(foreach ($profile in $Profiles) {
         $metadata = [ordered]@{ tenantId = $profile.tenantId; clientId = $profile.clientId; domains = @($profile.domains) }
         if ($profile.displayName) { $metadata.displayName = $profile.displayName }
+        if ($profile.integration) { $metadata.integration = $profile.integration }
         $metadata
     })
 }
@@ -349,11 +354,6 @@ function Read-LocalConfiguration {
     $settingsFile = Join-Path $state 'settings.json'
     $registryFile = Join-Path $secretDirectory 'tenants.json'
     $hasRegistry = Test-Path -LiteralPath $registryFile -PathType Leaf
-    foreach ($name in @('tenantId','clientId','tenantDomains','tenantDisplayName')) {
-        if ($settings.Contains($name)) {
-            throw 'Standalone tenant settings are no longer supported. Configure TENANTS_JSON through secrets/tenants.json and remove the obsolete settings fields; no credentials were converted.'
-        }
-    }
     if ($hasRegistry) {
         $profiles = ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText($registryFile))
         if ($settings.Contains('tenants') -and
@@ -363,9 +363,6 @@ function Read-LocalConfiguration {
         }
     } else {
         if ($settings.Contains('tenants')) { throw 'Protected tenant registry is missing. Restore secrets/tenants.json; saved tenants must not be discarded or regenerated.' }
-        if (Test-Path -LiteralPath (Join-Path $secretDirectory 'client-secret')) {
-            throw 'Standalone client-secret configuration is no longer supported. Configure TENANTS_JSON through secrets/tenants.json; the old file was not read or converted.'
-        }
         $profiles = @(@{ tenantId=''; clientId=''; clientSecret=''; domains=@() })
     }
     $previousProfiles = ConvertTo-Json -InputObject $profiles -Depth 20 -Compress
@@ -406,8 +403,8 @@ function Read-LocalConfiguration {
     $registryChanged = $complete -and (-not $hasRegistry -or (ConvertTo-Json -InputObject $profiles -Depth 20 -Compress) -cne $previousProfiles)
     $identityChanged = $false
     if ($complete) {
-        $oldIdentity = @($previousMetadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')" }) -join "`n"
-        $newIdentity = @($metadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')" }) -join "`n"
+        $oldIdentity = @($previousMetadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')|$(ConvertTo-Json -InputObject $_.integration -Compress)" }) -join "`n"
+        $newIdentity = @($metadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')|$(ConvertTo-Json -InputObject $_.integration -Compress)" }) -join "`n"
         $identityChanged = $oldIdentity -ine $newIdentity
         $settings.tenants = $metadata
     }
@@ -502,7 +499,8 @@ function Assert-LocalPort {
 
 function Invoke-LocalOperator {
     param($Context,[string[]]$Command,[string]$BackupDirectory,[switch]$Capture)
-    $arguments = @('run','--rm','--network',$Context.Network,
+    $arguments = @('run','--rm','--memory','1536m','--cpus','1.5','--cap-drop','ALL','--security-opt','no-new-privileges:true',
+        '-e','NODE_OPTIONS=--max-old-space-size=768','-e','TSX_DISABLE_CACHE=1','--network',$Context.Network,
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly",
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",
         '-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e','PGDATABASE=agentcontrol','-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app')
@@ -666,11 +664,11 @@ function Remove-ExpiredLocalBackups {
 }
 
 function Invoke-LocalDeployment {
-    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Start','Reset','Retain','Reopen','Backup','Restore')][string]$Action,
-        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset,[switch]$ForceChecks)
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore')][string]$Action,
+        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[switch]$DbReset,[switch]$ForceChecks)
     $operationLock = $null
     try {
-        if ($Action -ne 'Test') {
+        if ($Action -ne 'Test' -and -not $Context.ReadOnly) {
             $directory = Join-Path $Context.Root 'artifacts/local-operations'
             [IO.Directory]::CreateDirectory($directory) | Out-Null
             try { $operationLock = [IO.File]::Open((Join-Path $directory "$($Context.Project).lock"),'OpenOrCreate','ReadWrite','None') }
@@ -681,8 +679,8 @@ function Invoke-LocalDeployment {
 }
 
 function Invoke-LocalDeploymentCore {
-    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Start','Reset','Retain','Reopen','Backup','Restore')][string]$Action,
-        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset,[switch]$ForceChecks)
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore')][string]$Action,
+        [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[switch]$DbReset,[switch]$ForceChecks)
     if ($DbReset -and $Action -ne 'Deploy') { throw '-DbReset is supported only by the start deployment workflow.' }
     if ($ForceChecks -and $Action -notin @('Deploy','Test')) { throw '-ForceChecks is supported only by start or the internal Test action.' }
     $Context.DbResetStarted = $false
@@ -697,15 +695,8 @@ function Invoke-LocalDeploymentCore {
     }
     $volumes = Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture
     $existing = $Context.Volume -in ($volumes -split "`n")
-    if ($Action -eq 'Reset') {
-        if ($ConfirmReset -cne "$($Context.Project)/$($Context.Volume)") { throw "Destructive reset denied. Exact confirmation required: $($Context.Project)/$($Context.Volume)" }
-        if (-not (Test-Path -LiteralPath (Join-Path $Context.State 'compose.env'))) { throw 'Reset requires the original project configuration for target verification.' }
-        Invoke-DockerCommand ($Context.Compose + @('down','--volumes','--remove-orphans'))
-        Remove-Item -LiteralPath $Context.State -Recurse -Force
-        return
-    }
     if ($Action -notin @('Deploy','EditConfig','Test') -and -not $existing) { throw 'Expected project volume is missing. Stop for recovery; use start for a new installation.' }
-    Initialize-LocalState $Context $existing -Onboard:($Action -in @('Deploy','Start')) -Edit:($Action -eq 'EditConfig')
+    Initialize-LocalState $Context $existing -Edit:($Action -eq 'EditConfig')
     if ($Action -eq 'EditConfig') { return }
     $marker = Join-Path $Context.State 'control/maintenance'
     if ($Action -eq 'Retain') {
@@ -732,38 +723,5 @@ function Invoke-LocalDeploymentCore {
         Invoke-LocalOperator $Context $command $directory
         Write-Host "$Action verified: $filename"
         return
-    }
-    $reauthenticate = Join-Path $Context.State 'control/reauthenticate'
-    if (Test-Path -LiteralPath $reauthenticate) {
-        Write-LocalText $marker 'maintenance'
-        if ($Action -eq 'Start') {
-            Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
-            Invoke-DockerCommand ($Context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
-        }
-        Invoke-DockerCommand ($Context.Compose + @('exec','-T','postgres','psql','-U','agentcontrol_admin','-d','agentcontrol','-v','ON_ERROR_STOP=1','-c','DELETE FROM public.sessions;'))
-        Remove-Item -LiteralPath $reauthenticate
-    }
-    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
-    try {
-        Invoke-DockerCommand ($Context.Compose + @('up','-d','--no-build','--wait','--wait-timeout','90','app'))
-        $healthEndpoint = $Context.Url
-        if ($Context.IsolatedHealthContainer) {
-            if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or
-                $Context.IsolatedHealthContainer -cne "$($Context.Project)-app-1" -or
-                $Context.Port -in @(3001,3002)) { throw 'Isolated readiness cannot target a retained installation.' }
-            $health = Get-LocalHealth $Context.Url -IsolatedContainer $Context.IsolatedHealthContainer
-            $healthEndpoint = "container://$($Context.IsolatedHealthContainer):3001"
-        } else { $health = Get-LocalHealth $Context.Url }
-        if (-not $health.authConfigured) { throw 'App sign-in configuration is missing despite saved onboarding settings. Check the project secret mounts and Compose configuration, then rerun start.' }
-    } catch {
-        [IO.File]::WriteAllText($marker,'maintenance')
-        throw
-    }
-    Write-Host 'Deployment verification summary'
-    Write-Host '[AUTOMATED CHECKS] NOT RUN: this internal Start action only starts the existing images.'
-    Write-Host "[LOCAL READINESS] PASSED: $healthEndpoint (database/schema readiness and sign-in configuration)."
-    if ($Context.PublicUrl -cne $Context.Url) {
-        Write-Host "Open $($Context.PublicUrl) to sign in. Local health is verified; tunnel reachability is not checked."
-        Show-LocalTunnelGuidance $Context.Port
     }
 }

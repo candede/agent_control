@@ -19,7 +19,6 @@ describe("streamed package refresh contract", () => {
     const job = await jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: scope.principalId,
       idempotencyKey: randomUUID() });
     expect(job.snapshotId).toBeNull();
-    expect(job).not.toHaveProperty("catalogOnly");
     expect(await jobs.markRunning(scope, job.id)).toBe(true);
     const next = new URL(buildCopilotAgentsListUrl());
     next.searchParams.set("$skiptoken", "second");
@@ -46,7 +45,7 @@ describe("streamed package refresh contract", () => {
     });
     const runtime = new InventoryRuntime(fixture.runtime, async () => {});
     try {
-      await runtime.pass();
+      await runtime.settleControls(scope, new AbortController().signal);
       expect((await fixture.runtime.query(`SELECT r.row_count FROM inventory_roots r
         JOIN data_scope_epochs s ON s.id=r.scope_id WHERE s.tenant_id=$1 AND s.principal_id=$2
           AND s.source='inventory_canonical' AND r.current`, [scope.tenantId, scope.principalId])).rows)

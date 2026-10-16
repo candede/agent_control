@@ -17,7 +17,7 @@ import { OfficialUsageImportPanel, type OfficialUsageImportHandle } from "./Offi
 vi.mock("../api/reportData", async original => {
   const actual = await original<typeof import("../api/reportData")>();
   return { ...actual, stageReport: vi.fn(), readReportStage: vi.fn(), discardReportStage: vi.fn(), previewReportBundle: vi.fn(), acceptReportBundle: vi.fn(),
-    readReportDiagnostics: vi.fn(), previewReportOperation: vi.fn(), confirmReportOperation: vi.fn(),
+    previewReportOperation: vi.fn(), confirmReportOperation: vi.fn(),
     reportPages: { ...actual.reportPages, agents: vi.fn() } };
 });
 mockNativeDialogs();
@@ -84,9 +84,6 @@ beforeEach(() => {
     if (stages.some(stage => stage.id === id && stage.status === "accepted")) throw new ApiError(409, "staging_unavailable", "Cannot discard an accepted stage");
     stages = stages.filter(stage => stage.id !== id);
   });
-  vi.mocked(api.readReportDiagnostics).mockResolvedValue({ value: [{ ordinal: 0, agentId: "agent-1", username: null, code: "agent_bridge_mismatch" }],
-    counts: { total: 100000, filtered: 100000 }, preview: { id: "stage", revision: 1, contentHash: "a".repeat(64) },
-    page: { limit: 50, nextCursor: "next-diagnostic", previousCursor: null } });
   vi.mocked(api.previewReportOperation).mockResolvedValue({ id: "selection-confirmation", setId: reportSetId, operation: "select",
     activeRevision: reports.activeRevision, historyRevision: reports.historyRevision, historyEpoch: reports.historyEpoch, hash: "c".repeat(64) });
   vi.mocked(api.confirmReportOperation).mockResolvedValue({ activeSetId: reportSetId, activeRevision: "5" });
@@ -128,7 +125,6 @@ describe("streamed complete-set import confirmation", () => {
     expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["Cancel import", "Import reports"]);
     expect(screen.queryByLabelText("Reporting start")).not.toBeInTheDocument();
     expect(screen.queryByText(/activity_range|Resume staging ID|bounded staging|tenant-visible/)).not.toBeInTheDocument();
-    expect(api.readReportDiagnostics).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).not.toHaveBeenCalled();
   });
   it("streams three companions, saves without selecting, verifies exact data and finishes only on Close", async () => {

@@ -177,7 +177,8 @@ test("viewing a different saved report never changes the Agents report selection
   const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
   await expect(manager.getByRole("button", { name: /Make current|View current snapshot/ })).toHaveCount(0);
   await expect(manager.getByRole("combobox", { name: "Report set", exact: true })).toHaveCount(0);
-  const saved = manager.getByRole("row").filter({ hasText: state.first.id });
+  const saved = manager.getByRole("row").filter({ has: page.getByRole("cell", {name:"Saved",exact:true}) });
+  await expect(saved).toHaveCount(1);
   await expect(saved).toContainText("Saved");
   await saved.getByRole("button", { name: "View report", exact: true }).click();
   const details = page.getByRole("dialog", { name: "Report details", exact: true });
@@ -185,7 +186,8 @@ test("viewing a different saved report never changes the Agents report selection
   expect(state.snapshotRequests.at(-1)?.get("setId")).toBe(state.first.id);
   expect(state.mutations).toEqual(["preview", "confirm"]);
   await details.getByRole("button", { name: "Back to reports", exact: true }).click();
-  const current = manager.getByRole("row").filter({ hasText: state.second.id });
+  const current = manager.getByRole("row").filter({ has: page.getByRole("cell", {name:"Current",exact:true}) });
+  await expect(current).toHaveCount(1);
   await expect(current).toContainText("Current");
   await expect(current.locator("time[datetime='2026-07-01']")).toBeVisible();
   await manager.getByRole("button", { name: "Close reports", exact: true }).click();

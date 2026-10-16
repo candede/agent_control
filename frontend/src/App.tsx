@@ -121,9 +121,6 @@ import {
   agentRouteSearch,
   dataSyncRouteSearch,
   parseDataSyncRoute,
-  migrateOfficialUsageRoute,
-  migrateSecurityRoute,
-  migrateJobsRoute,
   parseAgentRoute,
   parseUsersRoute,
   usersRouteSearch,
@@ -239,21 +236,6 @@ function readViewSearch(...views: WorkbenchViewId[]) {
   return views.includes(parseWorkbenchView(window.location.pathname)) ? window.location.search : "";
 }
 
-function readInitialAgentRoute() {
-  const jobsRedirect = migrateJobsRoute(window.location.pathname);
-  if (jobsRedirect) window.history.replaceState({ ...window.history.state, view: "sync" }, "", jobsRedirect);
-  const securityRedirect = migrateSecurityRoute(window.location.pathname);
-  if (securityRedirect) window.history.replaceState({ ...window.history.state, view: "agents" }, "", securityRedirect);
-  const reports = migrateOfficialUsageRoute(window.location.pathname, window.location.search);
-  if (reports) window.history.replaceState({ ...window.history.state, view: "sync" }, "", workbenchUrl("sync", reports));
-  const syncRoute = parseDataSyncRoute(window.location.search);
-  if (parseWorkbenchView(window.location.pathname) === "agents" && (syncRoute.syncRunId || (syncRoute.refreshJobId && !parseAgentRoute(window.location.search).controlJobId))) {
-    window.history.replaceState({ ...window.history.state, view: "sync" }, "", workbenchUrl("sync", dataSyncRouteSearch(syncRoute)));
-  }
-  // Sync retains inventory filters and exact job links for saved-data verification.
-  return parseAgentRoute(readViewSearch("agents", "sync"));
-}
-
 function App() {
   const [savedQueries] = useState(createSavedQueryClient);
   const [routeAvailable, setRouteAvailable] = useState(() => isWorkbenchPath(window.location.pathname));
@@ -269,10 +251,11 @@ function App() {
 function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSavedQueryClient> }) {
   const statusObservationAvailable = useBrowserAvailability();
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
-  const [initialAgentRoute] = useState(readInitialAgentRoute);
-  const [syncReportRoute, setSyncReportRoute] = useState(() => parseDataSyncRoute(readViewSearch("sync")).reports);
+  const [initialAgentRoute] = useState(() => parseAgentRoute(readViewSearch("agents", "sync")));
+  const [initialDataSyncRoute] = useState(() => parseDataSyncRoute(readViewSearch("sync")));
+  const [syncReportRoute, setSyncReportRoute] = useState(initialDataSyncRoute.reports);
   const [powerPlatformJobSelection, setPowerPlatformJobSelection] = useState<{ id?: string; initialJob?: InventoryRefreshJob }>(
-    () => ({ id: parseDataSyncRoute(readViewSearch("sync")).powerPlatformJobId }),
+    () => ({ id: initialDataSyncRoute.powerPlatformJobId }),
   );
   const requestedPowerPlatformJobId = powerPlatformJobSelection.id;
   const selectPowerPlatformJob = useCallback((id: string | undefined, initialJob?: InventoryRefreshJob) => {
@@ -378,7 +361,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [requestedPackageRefreshJobId, setRequestedPackageRefreshJobId] = useState(initialAgentRoute.refreshJobId);
   const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
-  const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialAgentRoute.syncRunId);
+  const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialDataSyncRoute.syncRunId);
   const [syncSetup, setSyncSetup] = useState<{ owner: string; status: WorkspaceSetupStatus }>();
   const [pendingDataSyncPublication, setPendingDataSyncPublication] = useState<{
     owner: string;
@@ -689,7 +672,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         replaceRoute(parseWorkbenchView(window.location.pathname),
           workbenchUrl(parseWorkbenchView(window.location.pathname), publicRouteSearch()));
       }
-      readInitialAgentRoute();
       const view = parseWorkbenchView(window.location.pathname);
       const agentRoute = view === "agents" ? parseAgentRoute(window.location.search) : undefined;
       const retainDetail = agentRoute?.detailId !== undefined && agentRoute.detailId === requestedAgentDetailId
@@ -851,8 +833,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
       controlJobId: requestedPackageControlJobId,
-      source: "all",
-      linkState: "all",
       environmentId: agentEnvironmentFilter,
       inventorySnapshotId: requestedInventorySnapshotId,
       selectedPowerPlatformIds: [...new Set([...pendingPowerPlatformIds, ...selectedPowerPlatformTargets.keys()])],
@@ -911,7 +891,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       || (selectedUnifiedAgent?.id === requestedAgentDetailId && unifiedAgentDetailPage?.listPage === unifiedAgentPage)
       || (agentDetail?.id === requestedAgentDetailId && unifiedAgentDetailPage?.listPage === unifiedAgentPage)
       || loadingAgentDetailId === requestedAgentDetailId) return;
-    let unified = findUnifiedAgentRecord(unifiedAgentPage?.value ?? [], requestedAgentDetailId, agentEnvironmentFilter ?? undefined);
+    let unified = findUnifiedAgentRecord(unifiedAgentPage?.value ?? [], requestedAgentDetailId);
     const selectReferencedPackage = (record: UnifiedAgentRecord) => {
       const exact = record.packages.find(item => item.id === requestedAgentDetailId
         || unifiedAgentRecordId({ source: "graph_packages", packageId: item.id }) === requestedAgentDetailId);
@@ -1277,11 +1257,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const scopeEpoch = agentScopeEpochRef.current;
     void Promise.all([...pendingPowerPlatformIds].map(async key => {
       try {
-        const known = findUnifiedAgentRecord(unifiedAgentPage.value, key, agentEnvironmentFilter ?? undefined);
+        const known = findUnifiedAgentRecord(unifiedAgentPage.value, key);
         if (known) return { record: known };
-        const target = parseUnifiedAgentRecordId(key) ?? (agentEnvironmentFilter
-          ? { source: "power_platform" as const, nativeId: key, environmentId: agentEnvironmentFilter }
-          : undefined);
+        const target = parseUnifiedAgentRecordId(key);
         if (!target) throw new Error("An exact environment and native resource identity is required.");
         const recordId = unifiedAgentRecordId(target);
         const selectionId = unifiedAgentPage.selection?.id;
@@ -1336,7 +1314,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
     });
     return () => controller.abort();
-  }, [activeView, agentEnvironmentFilter, agentReloadRevision, pendingPowerPlatformIds, principalKey, requestedInventorySnapshotId, savedQueries, selectedPowerPlatformSnapshot, selectedPowerPlatformTargets, unifiedAgentPage, user]);
+  }, [activeView, agentReloadRevision, pendingPowerPlatformIds, principalKey, requestedInventorySnapshotId, savedQueries, selectedPowerPlatformSnapshot, selectedPowerPlatformTargets, unifiedAgentPage, user]);
 
   useEffect(
     () => {
@@ -3371,7 +3349,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? <AutomaticRefreshStatus
         status={automaticRefresh}
-        onOpenSync={() => navigateToView("sync")}
         onOpenPermissions={() => navigateToView("permissions")}
       /> : null}
       {error && !(visibleActiveView === "sync" && error === unifiedAgentReadError) ? <div className="error-banner">{error}</div> : null}
@@ -4396,9 +4373,6 @@ function errorMessage(error: unknown) {
     }
     if (error.code === "invalid_origin") return error.message;
     if (error.code === "maintenance") return `${error.message} Retry after maintenance ends.`;
-    if (error.code === "provider_requalification_required") {
-      return `${error.message} Contact the deployment administrator to review and requalify provider access.`;
-    }
     if (error.status === 403) {
       return `${error.message} Open Permissions for the current account's exact requirements. Consent does not assign roles or licenses.`;
     }

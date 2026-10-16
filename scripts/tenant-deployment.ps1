@@ -16,6 +16,10 @@ function Assert-DeploymentTenantProfiles {
     $domains = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($profile in $Profiles) {
         if ($profile -isnot [Collections.IDictionary] -and $profile -isnot [PSCustomObject]) { throw 'Tenant registry entries must be objects.' }
+        $names = if ($profile -is [Collections.IDictionary]) { @($profile.Keys) } else { @($profile.PSObject.Properties.Name) }
+        if (@($names | Where-Object { @('tenantId','clientId','clientSecret','domains','displayName','integration') -cnotcontains $_ }).Count) {
+            throw 'Tenant registry contains an unknown profile field.'
+        }
         foreach ($name in @('tenantId','clientId')) {
             if ($profile.$name -isnot [string] -or $profile.$name -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') {
                 throw 'Tenant registry tenantId and clientId must be GUIDs.'
@@ -36,6 +40,17 @@ function Assert-DeploymentTenantProfiles {
             $profile.displayName.Length -gt 128 -or $profile.displayName -match '[\x00-\x1f\x7f]')) {
             throw 'Tenant display name must contain 1 to 128 printable characters when supplied.'
         }
+        if ($names -ccontains 'integration') {
+            $integration = $profile.integration
+            if ($integration -isnot [Collections.IDictionary] -and $integration -isnot [PSCustomObject]) { throw 'Tenant integration must be an object.' }
+            $fields = if ($integration -is [Collections.IDictionary]) { @($integration.Keys) } else { @($integration.PSObject.Properties.Name) }
+            if (@($fields | Where-Object { @('clientId','audience','scope') -cnotcontains $_ }).Count -or
+                $integration.clientId -isnot [string] -or $integration.clientId -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+                $integration.clientId -ieq $profile.clientId -or $integration.audience -isnot [string] -or
+                $integration.audience -ine $profile.clientId -or $integration.scope -cne 'AgentControl.Access') {
+                throw 'Tenant integration requires a distinct clientId GUID, the exact API clientId audience, and AgentControl.Access scope; no other fields are supported.'
+            }
+        }
     }
 }
 
@@ -48,6 +63,11 @@ function ConvertFrom-DeploymentTenantRegistry {
         $profiles = [Collections.Generic.List[object]]::new()
         foreach ($entry in $document.RootElement.EnumerateArray()) {
             if ($entry.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Tenant registry entries must be objects.' }
+            foreach ($field in $entry.EnumerateObject()) {
+                if (@('tenantId','clientId','clientSecret','domains','displayName','integration') -cnotcontains $field.Name) {
+                    throw 'Tenant registry contains an unknown profile field.'
+                }
+            }
             $profile = [ordered]@{}
             # Preserve strings and case-sensitive field names exactly as Node's JSON parser does.
             foreach ($name in @('tenantId','clientId','clientSecret')) {
@@ -68,6 +88,16 @@ function ConvertFrom-DeploymentTenantRegistry {
             $property = [Text.Json.JsonElement]::new()
             if ($entry.TryGetProperty('displayName',[ref]$property)) {
                 $profile.displayName = if ($property.ValueKind -eq [Text.Json.JsonValueKind]::String) { $property.GetString() } else { $null }
+            }
+            $property = [Text.Json.JsonElement]::new()
+            if ($entry.TryGetProperty('integration',[ref]$property)) {
+                if ($property.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Tenant integration must be an object.' }
+                $integration = [ordered]@{}
+                foreach ($field in $property.EnumerateObject()) {
+                    if (@('clientId','audience','scope') -cnotcontains $field.Name) { throw 'Tenant integration contains an unknown field.' }
+                    $integration[$field.Name] = if ($field.Value.ValueKind -eq [Text.Json.JsonValueKind]::String) { $field.Value.GetString() } else { $null }
+                }
+                $profile.integration = $integration
             }
             $profiles.Add($profile)
         }

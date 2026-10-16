@@ -10,7 +10,7 @@ function requiredHost(name: string) {
   return value;
 }
 
-export async function prepareAzurePointInTimeRestore(
+async function prepareAzurePointInTimeRestore(
   current: pg.Pool,
   restored: pg.Pool,
   restoredFromAt: Date,
@@ -21,7 +21,7 @@ export async function prepareAzurePointInTimeRestore(
   }
   const targets = assertDistinctDatabaseTargets(current, restored);
   if (targets.current.host === targets.restored.host) throw new Error("Azure PITR validation requires a separate isolated restored server.");
-  await prepareRestoredDatabase(current, restored, restoredFromAt);
+  await prepareRestoredDatabase(current, restored);
   await grantRuntime(restored);
   if (!reopen) return { mode: "maintenance" as const, providerWorkEnabled: false, servingDatabaseChanged: false };
   const state = await reopenPreparedRestoredDatabase(current, restored);

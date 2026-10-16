@@ -20,7 +20,6 @@ import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
 import { AuditLog } from "./auditLog.js";
 import { DataSyncRepository } from "../db/dataSync.js";
-import { loadOperationalState } from "./operationalState.js";
 import { usageIdentity } from "../db/agentUsageTestSupport.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -321,7 +320,7 @@ describe("Durable bulk execution", () => {
       { delay: async () => undefined },
     );
     const job=await jobs.submit(scope,input());
-    await runBulkJob(job.id,scope,false,jobs,provider,async () => "ephemeral-token");
+    await runBulkJob(job.id,scope,false,jobs,provider,async () => "ephemeral-token",AbortSignal.timeout(100));
     expect(await jobs.get(job.id,scope)).toMatchObject({ status: "failed", failed: 1 });
     expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual({
       timestamp: expect.any(String), level: "error",
@@ -416,7 +415,7 @@ describe("Durable bulk execution", () => {
     expect((await jobs.items(cancelledJob.id, await usageIdentity(fixture.runtime, scope))).value).toMatchObject([{ reconciliationStatus: "required" }]);
   });
 
-  it.each(["maintenance", "provider_requalification_required"] as const)(
+  it.each(["maintenance"] as const)(
     "stops reconciliation at every admission boundary when %s applies",
     async errorCode => {
       for (const stage of ["start", "authorization", "lock", "readback", "publication", "next-item"] as const) {
@@ -433,11 +432,7 @@ describe("Durable bulk execution", () => {
         await runBulkJob(job.id, owner, false, jobs, provider, async () => "ephemeral-token");
         const revision = await controlReceiptCount(owner);
         const closeAdmissions = async () => {
-          if (errorCode === "maintenance") vi.stubEnv("MAINTENANCE_MODE", "true");
-          else {
-            await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=false WHERE singleton=true");
-            await loadOperationalState(fixture.runtime);
-          }
+          vi.stubEnv("MAINTENANCE_MODE", "true");
         };
         const read = provider.getPackageDetails.bind(provider);
         const reads = vi.spyOn(provider, "getPackageDetails").mockImplementation(async (...args) => {
@@ -472,8 +467,6 @@ describe("Durable bulk execution", () => {
           if (stage !== "next-item") expect(await controlReceiptCount(owner), stage).toBe(revision);
         } finally {
           vi.unstubAllEnvs();
-          await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
-          await loadOperationalState(fixture.runtime);
           vi.restoreAllMocks();
         }
         const resumed = await reconcileBulkJob(job.id, owner, jobs, provider, async () => "ephemeral-token");

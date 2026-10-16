@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { testDatabase } from "../../scripts/testDatabase.js";
+import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
 import { directoryRecord, generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { DataGenerations } from "../db/dataGenerations.js";
+import { BoundedPool } from "../db/boundedPool.js";
 import { UserSourcesRepository, userSourceFactsSql, userSourceObjectIds, userSourcePeopleInRead, userSourceSqlParameters } from "../db/userSources.js";
 import { summarizeCopilotServices } from "./copilotServicePlans.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
@@ -517,6 +518,46 @@ describe("dormant user-source foundation", () => {
         WHERE s.principal_id=$1`, [input.scope.principalId])).rows[0].generation_id).toBeNull();
     });
 
+  it("keeps cold metadata and concurrent foreground access responsive with 4000 directory and 2250 activity rows", async () => {
+    const identity = { ...selectionIdentity, principalId: "cold-metadata-matches" };
+    const stages = new UserSourceStages(fixture.runtime);
+    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const idFor = (index: number) => `00000000-0000-0000-0000-${String(index + 1).padStart(12, "0")}`;
+    await stages.execute(input, async lease => {
+      const key = await stages.query(lease, "discovery", "cold-metadata-directory");
+      for (let first = 0; first < 4000; first += 250) {
+        await stages.directory(lease, key, Array.from({ length: 250 }, (_, index) => sourceUser(idFor(first + index))));
+      }
+      await stages.finishQuery(lease, key);
+    }, { beforePublish: async () => {} });
+    await stages.execute({ ...input, scope: { ...input.scope, source: "app_activity" } }, async lease => {
+      const key = await stages.query(lease, "activity", "cold-metadata-activity");
+      for (let first = 0; first < 2250; first += 250) {
+        await stages.activity(lease, key, Array.from({ length: 250 }, (_, index) => activitySourceRecord(
+          parseReportUser([date, `${idFor(first + index)}@example.invalid`, "", date, "", "", "", "", "", "", "", "", "28"]), first + index)));
+      }
+      await stages.finishQuery(lease, key);
+    }, { beforePublish: async () => {} });
+    await fixture.operator.query("ANALYZE directory_user_rows; ANALYZE app_activity_rows");
+    const readMetadata = async (repository: UserSourcesRepository) => repository.connections.selectedRead(async client => {
+      await client.query("SET LOCAL statement_timeout='2000ms'");
+      const start = performance.now();
+      const metadata = await repository.metadataInRead(client, { ...identity, tokenMode: "delegated" }, new Date());
+      expect(metadata.directory.rowCount).toBe(4000);
+      expect(metadata.app_activity).toMatchObject({ rowCount: 2250, state: "available" });
+      expect(performance.now() - start).toBeLessThan(1000);
+    });
+    await readMetadata(new UserSourcesRepository(fixture.runtime, "synthetic-cold-metadata-secret-at-least-32-bytes"));
+    const bounded = new BoundedPool({ ...fixture.runtime.options, password: fixturePassword, max: 4 });
+    try {
+      const repository = new UserSourcesRepository(bounded, "synthetic-concurrent-metadata-secret");
+      const start = performance.now();
+      await Promise.all([readMetadata(repository), readMetadata(repository), readMetadata(repository), bounded.query("SELECT 1")]);
+      expect(performance.now() - start).toBeLessThan(1500);
+      expect(bounded.admissionState).toEqual({ foreground: 0, queue: 0 });
+    } finally { await bounded.end(); }
+  }, 30_000);
+
   it("retains duplicate CSV identities as ambiguous, including object-ID/UPN alias collisions", async () => {
     const stages = new UserSourceStages(fixture.runtime);
     const identity = { ...selectionIdentity, principalId: "activity-ambiguity" };
@@ -565,7 +606,7 @@ describe("dormant user-source foundation", () => {
     const identity = { ...selectionIdentity, principalId: "child-ceiling" };
     const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
     const user = sourceUser(firstId);
-    user.servicePlans = Array.from({ length: 1000 }, (_, index) => ({ ...user.servicePlans[0], servicePlanId: `plan-${String(index).padStart(4, "0")}` }));
+    user.servicePlans = Array.from({ length: 1000 }, (_, index) => ({ ...user.servicePlans[0], servicePlanId: `70000000-0000-4000-8000-${String(index).padStart(12, "0")}` }));
     user.servicePlans[0].assignedDateTime = "2026-01-01T00:00:00.1234567Z";
     const publish = () => stages.execute(input, async lease => {
       const key = await stages.query(lease, "discovery", "child-ceiling");
@@ -586,7 +627,7 @@ describe("dormant user-source foundation", () => {
       cursor = page.page.nextCursor ?? undefined;
     } while (cursor);
     expect(count).toBe(1000);
-    user.servicePlans.push({ ...user.servicePlans[0], servicePlanId: "plan-excess" });
+    user.servicePlans.push({ ...user.servicePlans[0], servicePlanId: "70000000-0000-4000-8000-000000001000" });
     await expect(publish()).rejects.toMatchObject({ code: "provider_schema" });
     expect((await fixture.runtime.query("SELECT generation_id FROM data_generation_heads WHERE scope_id=$1", [good.scopeId])).rows[0].generation_id).toBe(good.generationId);
   });
@@ -806,8 +847,14 @@ describe("dormant user-source foundation", () => {
     await repository.savePeople(identity, [{ objectId: secondId, displayName: "Expired", userPrincipalName: "expired@example.invalid",
       status: "resolved", checkedAt: new Date(Date.now() - 8 * 86_400_000).toISOString() }], async () => {});
     selected = await repository.capture(identity, "delegated");
-    const row = { id: "agent", powerPlatformResource: { tenantId: identity.tenantId, createdBy: firstId,
-      details: { ownerId: firstId, lastModifiedBy: secondId } }, people: { lastModifiedBy: { displayName: "stale" } } } as unknown as UnifiedAgentRecord;
+    const row: UnifiedAgentRecord = { id: "agent", displayName: "Saved native", presence: "power_platform", environmentId: "environment", packages: [],
+      powerPlatformResource: { tenantId: identity.tenantId, nativeId: "native", type: "microsoft.copilotstudio/agents",
+        environmentId: "environment", location: null, displayName: "Saved native", createdAt: null, createdBy: firstId, lastPublishedAt: null,
+        sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "agent", lifecycle: "unknown",
+        identityConfidence: "exact_native", identifiers: [], provenance: {}, details: { ownerId: firstId, lastModifiedBy: secondId }, unknownFieldCount: 0 },
+      identity: { state: "unmatched", reason: null, evidence: [], packageEvidence: [] },
+      observations: { graphPackages: null, powerPlatform: null, packageSnapshots: {} },
+      people: { lastModifiedBy: { objectId: secondId, displayName: "stale", userPrincipalName: null, status: "resolved", checkedAt: new Date().toISOString() } } };
     const [projected] = await repository.projectPeople(selected.id, identity, [row]);
     expect(projected.people?.owner?.displayName).toBe("Owner");
     expect(projected.people?.createdBy?.displayName).toBe("Owner");

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type pg from "pg";
 import { observeDataWork } from "./dataMetrics.js";
-import { revalidateAuthenticatedUser } from "../auth/msal.js";
+import { revalidateAuthorizedUser } from "../auth/msal.js";
 import { DataGenerations, type BeginGeneration } from "../db/dataGenerations.js";
 import { finalizeDataSyncRun } from "../db/dataSync.js";
 import { InventoryGenerations, inventorySelector, type InventoryIntent } from "../db/inventoryGenerations.js";
@@ -14,6 +14,8 @@ import { maintenanceActive } from "./maintenance.js";
 import { readOperationalState } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
 import { StreamedInventory } from "./streamedInventory.js";
+import { currentAuthority, pruneAuthorities, withAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 
 type Scope = { tenantId: string; principalId: string };
 type Domain = "packages" | "power_platform";
@@ -77,9 +79,10 @@ export class InventoryRuntime {
   private stopped = false;
   private requested = false;
   private after = "";
+  private readonly authorities = new Map<string, DelegatedCredentialSource>();
   constructor(readonly database: pg.Pool, private readonly authorize = async (scope: Scope, signal: AbortSignal) => {
     signal.throwIfAborted();
-    const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
+    const user = await revalidateAuthorizedUser(scope.tenantId, scope.principalId);
     if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Viewer")) {
       throw AppError.unauthorized();
     }
@@ -89,6 +92,7 @@ export class InventoryRuntime {
     this.stages = new InventoryGenerations(database);
   }
   private readonly assertCurrent = () => {
+    currentAuthority()?.assertCurrent();
     this.validateCurrent?.();
     if (this.stopped || maintenanceActive()) {
       throw new AppError(503, "maintenance", "Inventory publication is paused for maintenance.");
@@ -122,6 +126,16 @@ export class InventoryRuntime {
   async enqueue(scope: Scope, schedule = true, signal?: AbortSignal) {
     signal?.throwIfAborted();
     this.assertCurrent();
+    const source = currentAuthority();
+    if (source) {
+      pruneAuthorities(this.authorities);
+      source.assertCurrent();
+      if (source.principal.tenantId !== scope.tenantId || source.principal.principalId !== scope.principalId) throw AppError.unauthorized();
+      if (this.authorities.size >= 10_000 && !this.authorities.has(`${scope.tenantId}\0${scope.principalId}`)) {
+        throw new AppError(503, "credential_capacity", "Inventory authorization capacity is full.");
+      }
+      this.authorities.set(`${scope.tenantId}\0${scope.principalId}`, source);
+    }
     const pending = await this.database.query(`SELECT 1 WHERE EXISTS(SELECT 1 FROM inventory_control_pending
       WHERE tenant_id=$1 AND principal_id=$2) OR EXISTS(SELECT 1 FROM inventory_native_control_pending
       WHERE tenant_id=$1 AND principal_id=$2)`, [scope.tenantId, scope.principalId]);
@@ -143,7 +157,7 @@ export class InventoryRuntime {
     if (this.timer && schedule) this.wake();
     return roots.length > 0;
   }
-  async publishControls(scope: Scope, signal = new AbortController().signal) {
+  private async pruneControls(scope: Scope, signal: AbortSignal) {
     this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
@@ -156,6 +170,9 @@ export class InventoryRuntime {
               AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.target_id COLLATE "C" LIMIT 250)`, [scope.tenantId, scope.principalId]);
     }, false, signal, undefined, this.assertCurrent);
+  }
+  async publishControls(scope: Scope, signal = new AbortController().signal) {
+    await this.pruneControls(scope, signal);
     const pending = (await this.database.query(`SELECT p.target_id,p.observation_id,p.updated_at
       FROM inventory_control_pending p WHERE p.tenant_id=$1 AND p.principal_id=$2
         AND EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
@@ -196,7 +213,7 @@ export class InventoryRuntime {
     this.assertCurrent();
     return pending.length;
   }
-  async publishNativeControls(scope: Scope, signal = new AbortController().signal) {
+  private async pruneNativeControls(scope: Scope, signal: AbortSignal) {
     this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
@@ -208,6 +225,9 @@ export class InventoryRuntime {
               AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.scope_id,p.identity LIMIT 250)`, [scope.tenantId, scope.principalId]);
     }, false, signal, undefined, this.assertCurrent);
+  }
+  async publishNativeControls(scope: Scope, signal = new AbortController().signal) {
+    await this.pruneNativeControls(scope, signal);
     const pending = (await this.database.query(`SELECT p.scope_id,p.identity,p.observation_id,p.updated_at,s.selector,observation.observed_at AS receipt_observed_at,
       observation.resource_native_id,observation.environment_id,observation.bot_id,
       observation.is_bot_quarantined,observation.provider_updated_at,
@@ -269,7 +289,19 @@ export class InventoryRuntime {
     do {
       signal.throwIfAborted();
       this.assertCurrent();
-      await this.reconcile(scope, signal);
+      try {
+        await this.reconcile(scope, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        this.assertCurrent();
+        const raced = error instanceof AppError && error.code === "inventory_control_changed"
+          || error instanceof Error && error.message === "inventory_input_fenced";
+        if (!raced) throw error;
+        // Another publisher can settle the same receipt or advance a source
+        // between discovery and its lock. Re-read only; never replay a writer.
+        await delay(100, undefined, { signal });
+        continue;
+      }
       const pending = await this.database.query(`SELECT 1 WHERE
         EXISTS(SELECT 1 FROM inventory_control_pending WHERE tenant_id=$1 AND principal_id=$2)
         OR EXISTS(SELECT 1 FROM inventory_native_control_pending WHERE tenant_id=$1 AND principal_id=$2)
@@ -328,9 +360,20 @@ export class InventoryRuntime {
     for (const row of scopes) {
       if (this.stopped || signal.aborted || maintenanceActive()) return false;
       const scope = { tenantId: row.tenant_id, principalId: row.principal_id };
+      const authorityKey = `${scope.tenantId}\0${scope.principalId}`, source = this.authorities.get(authorityKey);
       try {
-        await this.reconcile(scope, signal);
+        if (source) await withAuthority(source, () => this.reconcile(scope, signal));
+        else {
+          await this.pruneControls(scope, signal);
+          await this.requireAdmissions(signal);
+          await this.pruneNativeControls(scope, signal);
+        }
       } catch (error) {
+        if (error instanceof AppError && error.status === 401) {
+          if (this.authorities.get(authorityKey) === source) this.authorities.delete(authorityKey);
+          this.after = row.id;
+          continue;
+        }
         if (error instanceof AppError && error.code === "maintenance") return false;
         operationalLog("error", "inventory_scope_reconciliation_failed", errorTelemetry(error, "inventory_scope_reconciliation_failed"));
       }

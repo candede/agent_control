@@ -16,7 +16,7 @@ import { selectedCohortRead } from "./selectedCohortFixture";
 import { parseSelectedCsv, selectedImportData, selectedImportMetadata, selectedImportPeriod, selectedImportRowHash, type SelectedCsvFixture } from "./selectedImportData";
 import { usageCsvFixture } from "./usageCsvFixture";
 
-export const importInstant = "2026-09-12T14:45:00.000Z";
+const importInstant = "2026-09-12T14:45:00.000Z";
 export const importedSetId = "11111111-1111-4111-8111-111111111111";
 export const retainedSetId = "99999999-9999-4999-8999-999999999999";
 const initialBundle = "22222222-2222-4222-8222-222222222222";
@@ -208,7 +208,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       homeAccountId: "usage-admin", roles: [`AgentControl.${options.role ?? "Admin"}`] }, csrfToken: "fixture-csrf", roleAssignmentRequired: false });
     if (path === "/api/workbench/metadata") return respond({ views: workbenchViews, actions: workbenchActions });
     if (path === "/api/capabilities" || path === "/api/capabilities/check") return respond({
-      value: capabilityDefinitions.map(definition => ({ definition, decision: { capabilityId: definition.id, status: definition.mode === "local" ? "available" : "unavailable",
+      value: capabilityDefinitions.map(definition => ({ enabled: true, definition, decision: { capabilityId: definition.id, status: definition.mode === "local" ? "available" : "unavailable",
         authorized: definition.mode === "local", fresh: true, verification: "local", previewQualification: "not_required", remediation: [] } })),
     });
     if (path === "/api/official-usage/staging") {

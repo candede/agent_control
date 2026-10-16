@@ -22,6 +22,7 @@ beforeEach(async () => {
   await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
   vi.mocked(requireProviderAdmissions).mockImplementation(() => undefined);
   vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined));
+  vi.spyOn(bulkJobs, "settleControlPublications").mockResolvedValue(undefined);
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -894,7 +895,7 @@ describe("bulk job execution boundaries", () => {
   it("pauses unsent work when provider admission closes during the pre-read", async () => {
     let admitted = true;
     vi.mocked(requireProviderAdmissions).mockImplementation(() => {
-      if (!admitted) throw new AppError(503, "provider_requalification_required", "Provider work is disabled.");
+      if (!admitted) throw new AppError(503, "maintenance", "Provider work is disabled.");
     });
     const repository = fakeRepository();
     const fetcher = vi.fn<FetchLike>(async () => {
@@ -913,7 +914,7 @@ describe("bulk job execution boundaries", () => {
   it("keeps a sent write inconclusive when admission closes before readback", async () => {
     let admitted = true;
     vi.mocked(requireProviderAdmissions).mockImplementation(() => {
-      if (!admitted) throw new AppError(503, "provider_requalification_required", "Provider work is disabled.");
+      if (!admitted) throw new AppError(503, "maintenance", "Provider work is disabled.");
     });
     const repository = fakeRepository();
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
@@ -931,7 +932,7 @@ describe("bulk job execution boundaries", () => {
       expect.anything(),
       "item",
       "inconclusive",
-      expect.objectContaining({ errorCode: "provider_requalification_required" }),
+      expect.objectContaining({ errorCode: "maintenance" }),
     );
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
@@ -1032,7 +1033,7 @@ describe("bulk job execution boundaries", () => {
 
     await runBulkJob("job", scope, false, repository, new GraphPackagesClient(fetcher, { maxAttempts: 1, now: () => elapsed }), async () => "token");
 
-    expect(publications).toBe(1);
+    expect(publications).toBe(2);
     expect(repository.markSent).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
     expect(repository.finishItem).toHaveBeenCalledExactlyOnceWith(expect.anything(), "item", "succeeded",
@@ -1053,7 +1054,7 @@ describe("bulk job execution boundaries", () => {
           await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
         } else if (cause === "capability") current = false;
         else vi.mocked(requireProviderAdmissions).mockImplementation(() => {
-          throw new AppError(503, "provider_requalification_required", "Synthetic provider admission closure.");
+          throw new AppError(503, "maintenance", "Synthetic provider admission closure.");
         });
         assertCurrent?.();
         publications += 1;

@@ -1,5 +1,6 @@
 // Reviewed final-schema inventory. New DDL must explicitly update this contract.
 export const backupTableKeys: Readonly<Record<string, readonly string[]>> = {
+  agent_control_receipts: ["id"],
   agent_identity_cache: ["tenant_id", "principal_id", "record_id"],
   agent_people_cache: ["tenant_id", "principal_id", "object_id"],
   agent_usage_associations: ["tenant_id", "report_set_id", "report_agent_id"],
@@ -35,8 +36,6 @@ export const backupTableKeys: Readonly<Record<string, readonly string[]>> = {
   data_sync_source_jobs: ["run_id", "source_id", "attempt"],
   data_sync_success_markers: ["tenant_id", "principal_id", "source_id"],
   defender_hunting_jobs: ["id"],
-  defender_hunting_qualification_evidence: ["id"],
-  defender_hunting_retained_scopes: ["id"],
   defender_hunting_rows: ["snapshot_id", "row_ordinal"],
   defender_hunting_snapshots: ["id"],
   directory_service_plan_rows: ["generation_id", "identity"],
@@ -94,7 +93,6 @@ export const backupTableKeys: Readonly<Record<string, readonly string[]>> = {
   power_platform_record_rows: ["generation_id", "identity"],
   power_platform_refresh_jobs: ["id"],
   purview_audit_jobs: ["id"],
-  purview_audit_qualifications: ["id"],
   purview_audit_records: ["job_id", "wrapper_id"],
   sessions: ["sid"],
   source_identifiers: ["id"],
